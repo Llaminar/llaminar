@@ -49,6 +49,7 @@ namespace llaminar2
         const void *gpu_ptr = nullptr;  ///< GPU buffer pointer (nullptr if CPU-only)
         std::optional<DeviceId> device; ///< GPU device for backend lookup
         size_t vocab_local = 0;         ///< Local vocab size (columns in logits_local)
+        size_t vocab_offset = 0;        ///< Global token id represented by local column 0
         TensorBase *tensor = nullptr;   ///< Tensor pointer for CPU fallback (data())
         void *stream = nullptr;         ///< Explicit GPU stream (must match forward pass stream)
 
@@ -428,6 +429,101 @@ namespace llaminar2
     };
 
     /**
+     * @brief Explicit reset contract for request-owned inference state.
+     *
+     * Historically this boundary was named `clear_cache()`, which hid several
+     * different lifetimes behind one word. The live sequence state is actually
+     * owned by four independent families:
+     * - main KV plus hybrid recurrent state (GDN/short-conv) owned by the
+     *   model runner's live sequence;
+     * - MTP sidecar KV, verifier/publication mailboxes, and speculative
+     *   handoffs owned by the active MTP transaction;
+     * - model-local request state such as MoE runtime placement tables and
+     *   decode/rebalance histograms owned by the graph builder;
+     * - logical positions, sequence lengths, and terminal-row metadata owned
+     *   by the request boundary.
+     *
+     * A reset request names which owners cross the boundary and whether
+     * replay-safe graph captures may remain alive. Implementations must fail
+     * loudly when asked for a boundary they cannot represent; they must not
+     * silently degrade into a broader or narrower reset.
+     */
+    struct InferenceStateResetRequest
+    {
+        /**
+         * @brief Semantic boundary that initiated the reset.
+         */
+        enum class Boundary
+        {
+            Request,       ///< New prompt/session or benchmark iteration.
+            PrefixRestore, ///< Prefix hit import replaces live state.
+            HardReset,     ///< Replay/workspace teardown; no graph preservation.
+        };
+
+        Boundary boundary = Boundary::Request;
+        bool reset_kv = true;               ///< Clear main and PP KV payloads.
+        bool reset_gdn = true;              ///< Clear hybrid GDN/short-conv payloads.
+        bool reset_mtp = true;              ///< Clear MTP sidecars and transaction state.
+        bool reset_model_runtime = true;    ///< Clear graph-owned MoE/model request state.
+        bool reset_logical_sequence = true; ///< Clear positions, lengths, terminal rows.
+        bool preserve_replay_safe_graphs = true; ///< Keep proven replay-safe graph captures.
+        const char *reason = "request-boundary";
+
+        /**
+         * @brief Build the standard new-request reset used by serving and tests.
+         */
+        static InferenceStateResetRequest requestBoundary(const char *why)
+        {
+            InferenceStateResetRequest request;
+            request.boundary = Boundary::Request;
+            request.reset_kv = true;
+            request.reset_gdn = true;
+            request.reset_mtp = true;
+            request.reset_model_runtime = true;
+            request.reset_logical_sequence = true;
+            request.preserve_replay_safe_graphs = true;
+            request.reason = why ? why : "request-boundary";
+            return request;
+        }
+
+        /**
+         * @brief Build the standard prefix-restore reset.
+         *
+         * Prefix restore is a replacement of live request state with a cached
+         * prefix snapshot.  KV/GDN/MTP/logical sequence owners are always
+         * cleared before importing the snapshot.  Model-local runtime state is
+         * cleared only when the prefix entry has no explicit model-runtime
+         * snapshot; otherwise the caller restores that owner immediately after
+         * this reset.  Replay-safe graph captures are discarded here because a
+         * restored prefix may replace device-side pointer tables, mailboxes, or
+         * recurrent payloads captured by earlier request execution.
+         */
+        static InferenceStateResetRequest prefixRestoreBoundary(
+            const char *why,
+            bool reset_model_runtime_owner)
+        {
+            InferenceStateResetRequest request;
+            request.boundary = Boundary::PrefixRestore;
+            request.reset_kv = true;
+            request.reset_gdn = true;
+            request.reset_mtp = true;
+            request.reset_model_runtime = reset_model_runtime_owner;
+            request.reset_logical_sequence = true;
+            request.preserve_replay_safe_graphs = false;
+            request.reason = why ? why : "prefix-restore";
+            return request;
+        }
+
+        /**
+         * @brief Return true when every live request-state owner crosses.
+         */
+        bool resetsAllLiveRequestOwners() const
+        {
+            return reset_kv && reset_gdn && reset_mtp && reset_logical_sequence;
+        }
+    };
+
+    /**
      * @brief Optional high-level decode-step result for orchestration-aware callers.
      *
      * Low-level runners expose forward() plus explicit sampling. Runners wrapped
@@ -489,6 +585,20 @@ namespace llaminar2
          * @return true if forward succeeded
          */
         virtual bool forward(const int *tokens, int seq_len) = 0;
+
+        /**
+         * @brief Run a prompt/suffix prefill forward pass.
+         *
+         * Unlike generic forward(), this must keep prefill phase semantics even
+         * when the request already has a nonzero cached position. Prefix-cache
+         * partial hits use this for suffix prefill; MTP verifier continuations
+         * should continue to use forward() so they can request decode-equivalent
+         * short-continuation behavior explicitly.
+         */
+        virtual bool forwardPrefill(const int *tokens, int seq_len)
+        {
+            return forward(tokens, seq_len);
+        }
 
         /**
          * @brief Run a single-batch forward pass from device-resident token IDs.
@@ -797,6 +907,61 @@ namespace llaminar2
          * and terminal hidden/state restoration on an explicit device stream.
          */
         virtual bool supportsDeviceResidentMTPSpecStatePublication() const { return false; }
+
+        /**
+         * @brief True when a grouped decode-equivalent verifier may publish
+         *        accepted state through the host-visible step-plan contract.
+         *
+         * This is narrower than supportsMTPSpecStatePublication().  The older
+         * capability means callers may choose the direct all-position verifier
+         * policy.  This capability is for the middle lane where grouped
+         * verifier rows have already been proven decode-equivalent, the caller
+         * has built the same MTPSpecStepPlanBatch a serial replay would have
+         * produced, and the runner can publish those accepted rows without
+         * advertising the broader direct all-position policy.
+         *
+         * @return true when publishGroupedDecodeEquivalentMTPSpecStateBatch()
+         *         is legal for the most recent grouped verifier graph.
+         *
+         * @note A true return value here must not imply that
+         *       supportsMTPSpecStatePublication() is also true.  Keeping those
+         *       two capabilities separate is what prevents the policy layer
+         *       from silently upgrading a decode-equivalent grouped row proof
+         *       into direct all-position publication.
+         */
+        virtual bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Publish accepted verifier state for a grouped
+         *        decode-equivalent outcome.
+         *
+         * Implementations must preserve the same semantics as
+         * publishAcceptedMTPSpecStateBatch() for the provided step plans, but
+         * may be enabled when supportsMTPSpecStatePublication() remains false.
+         * This keeps the grouped-outcome MTP lane from silently promoting the
+         * stronger direct all-position policy.
+         *
+         * @param plans Host-visible publication plans derived from a grouped
+         *        decode-equivalent verifier outcome.  The accepted counts and
+         *        restore rows must already match the serial replay contract.
+         * @param error Optional destination for a human-readable failure reason.
+         * @return true if every live-state component was published from the
+         *         grouped verifier rows and the runner's host mirrors were left
+         *         consistent with the accepted token count.
+         */
+        virtual bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr)
+        {
+            (void)plans;
+            if (error)
+                *error =
+                    "runner does not support grouped decode-equivalent MTP spec-state publication";
+            return false;
+        }
 
         /**
          * @brief Publish the accepted verifier state prefix into live model state.
@@ -1387,6 +1552,50 @@ namespace llaminar2
         }
 
         /**
+         * @brief Append one shifted MTP KV row from a checkpoint's terminal hidden.
+         *
+         * Grouped verifier publication proves the accepted state after the
+         * verifier forward has already produced newer hidden rows.  At that
+         * point `commitMTPShiftedRowFromCurrentTerminalHidden()` is too broad:
+         * it is allowed to refresh PREFIX_TERMINAL_HIDDEN from the latest
+         * verifier tensor, which can publish a shifted row for token[i] using
+         * token[i + 1]'s hidden source.  This helper imports only the terminal
+         * hidden payload carried by `checkpoint`, leaves KV/GDN/position state
+         * untouched, and then appends the shifted sidecar row from that explicit
+         * base row.
+         *
+         * `position_offset_override`, when supplied, must describe the same
+         * logical base token count as `checkpoint.cached_tokens`.  A mismatch is
+         * a caller bug because the hidden row and shifted-KV append position
+         * would refer to different serial-decode boundaries.
+         *
+         * @param checkpoint Prefix checkpoint captured before speculative MTP
+         *        sidecar/verifier work. It must contain a terminal-hidden payload
+         *        for the runner or participant that receives it.
+         * @param token Token whose depth-0 shifted MTP row should be appended.
+         * @param already_appended_tokens Number of shifted rows for this logical
+         *        token sequence that already exist before this append.
+         * @param allow_speculative_discard Whether extra speculative shifted rows
+         *        may be truncated before appending the checkpoint-backed row.
+         * @param position_offset_override Optional expected main cached-token
+         *        count for the checkpoint boundary.
+         */
+        virtual bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1)
+        {
+            (void)checkpoint;
+            (void)token;
+            (void)already_appended_tokens;
+            (void)allow_speculative_discard;
+            (void)position_offset_override;
+            return false;
+        }
+
+        /**
          * @brief Append one shifted MTP KV row from a device-resident target token.
          *
          * Penalty-free stochastic GPU decode can defer the first main-token host
@@ -1804,10 +2013,12 @@ namespace llaminar2
         /**
          * @brief Reset request-scoped inference state before a new prompt/session.
          *
-         * Despite the historical name, this is not a graph-cache teardown API.
-         * Callers use it at request boundaries, benchmark iteration boundaries,
-         * and after hard replay/restore failures when the next token stream must
-         * start from an empty live sequence.
+         * This is the named state-lifetime boundary. Callers use it at request
+         * boundaries, benchmark iteration boundaries, and after hard
+         * replay/restore failures when the next token stream must start from an
+         * empty live sequence. The request object names which first-class state
+         * owners are crossing the boundary: KV/GDN, MTP, and logical sequence
+         * metadata.
          *
          * Implementations must clear all live sequence state:
          * - main and MTP KV cache contents;
@@ -1821,7 +2032,28 @@ namespace llaminar2
          * - device contexts and backend-owned model allocations.
          *
          * A future destructive topology/workspace reset should use a different,
-         * explicitly named API.  Do not overload clear_cache() for that purpose.
+         * explicitly named API.
+         */
+        virtual void resetInferenceState(const InferenceStateResetRequest &request)
+        {
+            if (request.boundary != InferenceStateResetRequest::Boundary::Request ||
+                !request.resetsAllLiveRequestOwners() ||
+                !request.reset_model_runtime ||
+                !request.preserve_replay_safe_graphs)
+            {
+                throw std::invalid_argument(
+                    "IInferenceRunner::resetInferenceState fallback only supports full "
+                    "request-boundary resets that preserve replay-safe graph captures");
+            }
+            clear_cache();
+        }
+
+        /**
+         * @brief Compatibility wrapper for the historical request-boundary reset.
+         *
+         * New code should call resetInferenceState() with an explicit
+         * InferenceStateResetRequest. This name remains for older tests and
+         * adapter interfaces while the API migration proceeds.
          */
         virtual void clear_cache() = 0;
 
@@ -2241,6 +2473,29 @@ namespace llaminar2
             (void)draft_tokens;
             (void)draft_token_count;
             (void)first_draft_slot;
+            return false;
+        }
+
+        /**
+         * @brief Stage one resolved target token into a device target sample slot.
+         *
+         * LocalTP rank-level stochastic sampling reduces per-shard compact
+         * candidates into one full-vocab token.  Once that token is known, each
+         * child runner still needs it in the same runner-owned device slot used
+         * by native device samplers, so later sidecar and verifier graph inputs
+         * can consume a stable device pointer instead of a host token row.
+         *
+         * Implementations must enqueue the upload on an explicit backend stream
+         * and record the usual target-sample readiness event.  Returning false
+         * is a hard capability failure for callers that selected the device
+         * token path.
+         */
+        virtual bool stageStochasticTargetTokenForDeviceSampling(
+            int32_t target_token,
+            int target_sample_slot = 0)
+        {
+            (void)target_token;
+            (void)target_sample_slot;
             return false;
         }
 

@@ -33,6 +33,8 @@
 #include <unordered_map>
 #include <cstddef>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 
 namespace llaminar2
 {
@@ -65,8 +67,10 @@ namespace llaminar2
      * @brief Get sharding mode for a stage key using a schema-provided config map
      *
      * Preferred overload: uses a model-specific StageShardingConfig returned
-     * by ISchemaFactory::getStageShardingConfig(). Falls back to UNKNOWN for
-     * stage types not present in the map.
+     * by ISchemaFactory::getStageShardingConfig(). Returns UNKNOWN for stage
+     * types not present in the map.  Callers that combine multi-device
+     * snapshots must treat UNKNOWN as a contract error, not as permission to
+     * choose an arbitrary TP participant.
      *
      * @param stage_key The snapshot key (e.g., "layer0_ATTENTION_CONTEXT")
      * @param config    Stage type → SnapshotShardingMode map from the schema factory
@@ -112,29 +116,38 @@ namespace llaminar2
         // Static mapping of stage types to sharding modes
         // Note: These match the Megatron-style tensor parallelism sharding
 
-        // Embedding - replicated across devices (each device has full embedding table)
+        // Vocab-parallel embedding publishes row-parallel partial rows before
+        // the explicit embedding allreduce and replicated rows after it.
         if (stage_type == "EMBEDDING")
+            return SnapshotShardingMode::ROW_PARALLEL;
+        if (stage_type == "EMBEDDING_ALLREDUCED")
             return SnapshotShardingMode::REPLICATED;
 
         // Attention projections - column-parallel (split on num_heads)
         if (stage_type == "Q_PROJECTION" || stage_type == "K_PROJECTION" ||
-            stage_type == "V_PROJECTION" || stage_type == "QKV_PROJECTION")
+            stage_type == "V_PROJECTION" || stage_type == "QKV_PROJECTION" ||
+            stage_type == "Q_NORM" || stage_type == "K_NORM")
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
         // RoPE outputs - column-parallel (split on num_heads for Q, num_kv_heads for K)
-        if (stage_type == "Q_ROPE" || stage_type == "K_ROPE")
+        if (stage_type == "Q_ROPE" || stage_type == "K_ROPE" ||
+            stage_type == "KV_APPEND_SOURCE_K" || stage_type == "KV_APPEND_SOURCE_V" ||
+            stage_type == "KV_CACHE_K" || stage_type == "KV_CACHE_V" ||
+            stage_type == "ATTENTION_EFFECTIVE_K" || stage_type == "ATTENTION_EFFECTIVE_V")
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
         // Attention context - column-parallel (split on num_heads)
-        if (stage_type == "ATTENTION_CONTEXT")
+        if (stage_type == "ATTENTION_CONTEXT" || stage_type == "ATTENTION_CONTEXT_GATED")
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
-        // Attention output (Wo) - row-parallel (AllReduce combines partial results)
+        // Attention output (Wo) - row-parallel before AllReduce, replicated after it.
         if (stage_type == "ATTENTION_OUTPUT")
             return SnapshotShardingMode::ROW_PARALLEL;
+        if (stage_type == "ATTENTION_OUTPUT_ALLREDUCED")
+            return SnapshotShardingMode::REPLICATED;
 
         // Attention norms - replicated
-        if (stage_type == "ATTENTION_NORM")
+        if (stage_type == "ATTENTION_NORM" || stage_type == "ATTENTION_RESIDUAL")
             return SnapshotShardingMode::REPLICATED;
 
         // FFN gate/up projections - column-parallel (split on d_ff)
@@ -149,6 +162,8 @@ namespace llaminar2
         // FFN down - row-parallel (AllReduce combines partial results)
         if (stage_type == "FFN_DOWN")
             return SnapshotShardingMode::ROW_PARALLEL;
+        if (stage_type == "FFN_DOWN_ALLREDUCED")
+            return SnapshotShardingMode::REPLICATED;
 
         // FFN residual - replicated (after AllReduce)
         if (stage_type == "FFN_RESIDUAL")
@@ -225,8 +240,11 @@ namespace llaminar2
          *
          * For COLUMN_PARALLEL: Concatenates device outputs along column dimension
          * For ROW_PARALLEL: Sums same-shaped per-device partials
-         * For REPLICATED: Uses the first full-device output
+         * For REPLICATED: Verifies every device published the same full output,
+         * then uses the first full-device output as the combined view
          * For GATHERED: Uses already-gathered combined output
+         * For UNKNOWN: Fails explicitly; callers must extend the schema/runtime
+         *   sharding contract before comparing a multi-device semantic snapshot.
          *
          * @return true if combination was successful
          */
@@ -298,9 +316,45 @@ namespace llaminar2
             else if (mode == SnapshotShardingMode::REPLICATED)
             {
                 // Replicated stages already contain the full result on each device.
+                // Treat disagreement as a snapshot contract failure: post-collective
+                // diagnostics must not silently choose one participant and hide a
+                // divergent allreduce output.
                 const auto &first = device_data[0];
                 combined_rows = first.rows;
                 combined_cols = first.cols;
+                const size_t element_count = first.data.size();
+                constexpr float kReplicatedAbsTolerance = 1.0e-5f;
+                constexpr float kReplicatedRelTolerance = 1.0e-6f;
+                for (size_t device_index = 1; device_index < device_data.size(); ++device_index)
+                {
+                    const auto &dev = device_data[device_index];
+                    if (dev.rows != combined_rows ||
+                        dev.cols != combined_cols ||
+                        dev.data.size() != element_count)
+                    {
+                        combined_valid = false;
+                        combined_data.clear();
+                        combined_rows = 0;
+                        combined_cols = 0;
+                        return false;
+                    }
+                    for (size_t i = 0; i < element_count; ++i)
+                    {
+                        const float a = first.data[i];
+                        const float b = dev.data[i];
+                        const float diff = std::fabs(a - b);
+                        const float scale = std::max(std::fabs(a), std::fabs(b));
+                        if (diff > kReplicatedAbsTolerance &&
+                            diff > scale * kReplicatedRelTolerance)
+                        {
+                            combined_valid = false;
+                            combined_data.clear();
+                            combined_rows = 0;
+                            combined_cols = 0;
+                            return false;
+                        }
+                    }
+                }
                 combined_data = first.data;
                 combined_valid = true;
                 return true;
@@ -316,13 +370,11 @@ namespace llaminar2
                 return true;
             }
 
-            // Unknown mode - just use first device
-            const auto &first = device_data[0];
-            combined_rows = first.rows;
-            combined_cols = first.cols;
-            combined_data = first.data;
-            combined_valid = true;
-            return true;
+            combined_valid = false;
+            combined_data.clear();
+            combined_rows = 0;
+            combined_cols = 0;
+            return false;
         }
 
         /**

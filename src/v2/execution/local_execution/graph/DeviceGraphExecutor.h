@@ -368,6 +368,27 @@ namespace llaminar2
             const char *context = nullptr);
 
         /**
+         * @brief Publish the terminal captured mutable state row from a graph.
+         *
+         * GDN/short-conv stages can execute against speculative state slots when
+         * snapshot/verifier capture is enabled. The graph may then have correct
+         * tensor outputs while the backend-owned live recurrent state still
+         * points at the pre-graph value. This helper restores the final real row
+         * into stage-owned live state on the graph stream before callers observe,
+         * snapshot, or prefix-cache that live state.
+         *
+         * This is intentionally graph-generic: prefix cache, parity snapshots,
+         * and future runtime-state transactions should all depend on the same
+         * publication primitive instead of each feature inventing its own GDN
+         * state side path.
+         */
+        bool publishCapturedTerminalStateAfterGraphExecution(
+            ComputeGraph &graph,
+            int terminal_row,
+            void *producer_stream_override = nullptr,
+            const char *context = nullptr);
+
+        /**
          * @brief Pre-register graph-stable snapshot buffers before GPU graph capture.
          *
          * Captured parity diagnostics record device-to-device snapshot copies as
@@ -443,6 +464,8 @@ namespace llaminar2
             std::vector<ArenaWriteBinding> cached_arena_writes;
             bool arena_writes_cached = false;
         };
+
+        using GraphCaptureBoundaryHook = std::function<bool(const std::string &)>;
 
         /**
          * @brief Persistent cache of graph segments for cached graph replay
@@ -607,7 +630,8 @@ namespace llaminar2
                                               const std::unordered_set<std::string> *collective_nodes = nullptr,
                                               bool collectives_graph_capturable = false,
                                               bool force_recapture = false,
-                                              bool defer_final_sync = false);
+                                              bool defer_final_sync = false,
+                                              GraphCaptureBoundaryHook before_begin_capture = {});
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -621,6 +645,7 @@ namespace llaminar2
             bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
             bool defer_final_sync = false;             ///< Caller will synchronize the replay stream through a following operation.
             int max_segment_failures = 4;
+            GraphCaptureBoundaryHook before_begin_capture; ///< Optional domain-level fence before stream capture begins.
         };
 
         /**

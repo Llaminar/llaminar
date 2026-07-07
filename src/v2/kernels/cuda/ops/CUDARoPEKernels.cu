@@ -31,6 +31,18 @@
 
 namespace
 {
+    bool ropeLaunchOk(const char *name)
+    {
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::fprintf(stderr, "[%s] CUDA launch failed: %s\n",
+                         name, cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
     // Device memory cache for inverse frequencies
     struct InvFreqCache
     {
@@ -1030,9 +1042,7 @@ extern "C"
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim, rotary_dim);
         }
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_fp32_v3");
     }
 
     /**
@@ -1063,9 +1073,7 @@ extern "C"
         rope_fp32_decode_kernel<<<total_blocks, threads_per_block, 0, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, rotary_dim);
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_fp32_decode_v3");
     }
 
     /**
@@ -1099,9 +1107,7 @@ extern "C"
         rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim, device_params);
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_fp32_contiguous_v3");
     }
 
     /**
@@ -1141,9 +1147,7 @@ extern "C"
             rope_bf16_kernel_v3<<<num_blocks, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim, rotary_dim);
         }
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_bf16_v3");
     }
 
     /**
@@ -1173,9 +1177,7 @@ extern "C"
         rope_bf16_decode_kernel<<<total_blocks, threads_per_block, 0, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, rotary_dim);
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_bf16_decode_v3");
     }
 
     /**
@@ -1209,9 +1211,7 @@ extern "C"
         rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim, device_params);
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_bf16_contiguous_v3");
     }
 
     /**
@@ -1251,9 +1251,7 @@ extern "C"
             rope_fp16_kernel_v3<<<num_blocks, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim, rotary_dim);
         }
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_fp16_v3");
     }
 
     /**
@@ -1283,9 +1281,7 @@ extern "C"
         rope_fp16_decode_kernel<<<total_blocks, threads_per_block, 0, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, rotary_dim);
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_fp16_decode_v3");
     }
 
     /**
@@ -1319,9 +1315,7 @@ extern "C"
         rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, rotary_dim, device_params);
 
-        (void)cudaGetLastError(); // Clear stale errors
-        cudaError_t err = cudaGetLastError();
-        return err == cudaSuccess;
+        return ropeLaunchOk("cudaOps_rope_fp16_contiguous_v3");
     }
 
     // =========================================================================

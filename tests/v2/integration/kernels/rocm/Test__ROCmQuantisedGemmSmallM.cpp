@@ -9,7 +9,9 @@
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "loaders/ModelContext.h"
 #include "loaders/ModelContextConfig.h"
 #include "tensors/Tensors.h"
@@ -20,15 +22,18 @@
 #include "../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #ifdef HAVE_ROCM
@@ -71,6 +76,23 @@ namespace
         const char *label;
         WeightCreator create;
         float min_cosine;
+    };
+
+    /**
+     * @brief One production-weight representative for each ROCm MoE native-VNNI codegroup.
+     *
+     * Grouped MoE verifier prefill dispatches by native-VNNI codebook id, not by
+     * the original GGUF tensor class.  Several GGUF formats collapse to the same
+     * codegroup after GPU repack, so this table intentionally keeps exactly one
+     * representative per advertised grouped-prefill codebook.  The test below
+     * proves the codegroup dispatch surface rather than spending time on format
+     * aliases that reach the same templated HIP instantiation.
+     */
+    struct NativeCodegroupCase
+    {
+        const char *label; ///< Human-readable format name used in failure messages.
+        uint8_t codebook_id;
+        WeightCreator create;
     };
 
     class ScopedEnv
@@ -196,6 +218,57 @@ namespace
         for (size_t i = 0; i < n; ++i)
             max_diff = std::max(max_diff, std::fabs(a[i] - b[i]));
         return max_diff;
+    }
+
+    /**
+     * @brief Return the Euclidean norm of a host float span.
+     *
+     * The all-codegroup grouped-MoE sweep compares grouped verifier rows against
+     * the production rowwise decode entry points.  A shared failure can make both
+     * paths return all zeroes, which would make equality metrics look deceptively
+     * good.  The norm check below keeps every codegroup honest: the serial path
+     * must produce meaningful, nonzero verifier rows before grouped equivalence is
+     * accepted.
+     */
+    double l2Norm(const float *values, size_t n)
+    {
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < n; ++i)
+            sum_sq += static_cast<double>(values[i]) * static_cast<double>(values[i]);
+        return std::sqrt(sum_sq);
+    }
+
+    /**
+     * @brief Location and values for the largest grouped-vs-serial difference.
+     */
+    struct MaxDifference
+    {
+        size_t index = 0;
+        float actual = 0.0f;
+        float reference = 0.0f;
+        float abs_diff = 0.0f;
+    };
+
+    /**
+     * @brief Find the single output element with the largest absolute delta.
+     *
+     * When a codebook fails, the row/column and raw values are more useful than a
+     * lone aggregate metric.  The grouped verifier kernels are template-dispatched
+     * by codebook id, so a max-difference breadcrumb usually points directly at the
+     * faulty decode or publication path.
+     */
+    MaxDifference maxDifference(const float *actual, const float *reference, size_t n)
+    {
+        MaxDifference result{};
+        for (size_t i = 0; i < n; ++i)
+        {
+            const float diff = std::fabs(actual[i] - reference[i]);
+            if (diff > result.abs_diff)
+            {
+                result = MaxDifference{i, actual[i], reference[i], diff};
+            }
+        }
+        return result;
     }
 
     /**
@@ -388,6 +461,566 @@ namespace
             {"IQ1_M", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ1_MRandom(shape, seed); }, 0.985f},
         };
+    }
+
+    /**
+     * @brief Create deterministic IQ3_S weights that do not collapse to zero.
+     *
+     * `TestTensorFactory::createIQ3_SRandom()` currently generates legal-looking
+     * but low-entropy sign/high-bit fields.  That is fine for constructor smoke
+     * tests, but it is too weak for the MoE grouped verifier sweep: we need every
+     * codebook representative to drive nonzero gate, up, and down work through the
+     * native-VNNI repack and decode kernels.  This local fixture mirrors the ROCm
+     * repack test pattern with bounded scales so the regression remains focused on
+     * grouped decode equivalence rather than on global test-data policy.
+     */
+    std::unique_ptr<TensorBase> createNonzeroIQ3SForGroupedMoE(
+        const std::vector<size_t> &shape,
+        uint32_t seed)
+    {
+        constexpr size_t block_size = IQ3_SBlock::BLOCK_SIZE;
+        const size_t rows = shape.at(0);
+        const size_t cols = shape.at(1);
+        const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+        const size_t total_blocks = rows * blocks_per_row;
+
+        std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ3_SBlock));
+        auto *blocks = reinterpret_cast<IQ3_SBlock *>(raw_data.data());
+        for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+        {
+            IQ3_SBlock &block = blocks[block_idx];
+            block.d = 0x3000; // FP16 0.125: strong enough to be nonzero, small enough to avoid overflow.
+
+            for (size_t j = 0; j < std::size(block.qs); ++j)
+            {
+                block.qs[j] = static_cast<uint8_t>(
+                    (seed + block_idx * 37u + j * 13u) & 0xffu);
+            }
+            for (size_t j = 0; j < std::size(block.qh); ++j)
+            {
+                block.qh[j] = static_cast<uint8_t>(
+                    ((seed >> 3) + block_idx * 11u + j * 29u) & 0xffu);
+            }
+            for (size_t j = 0; j < std::size(block.signs); ++j)
+            {
+                block.signs[j] = static_cast<uint8_t>(
+                    (0x5au ^ seed ^ (block_idx * 17u + j * 7u)) & 0xffu);
+            }
+
+            for (size_t j = 0; j < std::size(block.scales); ++j)
+            {
+                const uint8_t lo = static_cast<uint8_t>((1u + seed + block_idx + j) & 0x3u);
+                const uint8_t hi = static_cast<uint8_t>((2u + (seed >> 2) + block_idx + j) & 0x3u);
+                block.scales[j] = static_cast<uint8_t>(lo | (hi << 4));
+            }
+        }
+
+        return std::make_unique<IQ3_STensor>(shape, raw_data);
+    }
+
+    /**
+     * @brief Create bounded IQ4_XS weights for the grouped-MoE equivalence sweep.
+     *
+     * IQ4_XS stores each 32-column sub-block scale as `d * (ls - 32)`.  The generic
+     * random factory uses a low `ls` value that is legal but creates very large
+     * verifier outputs after the gate/up, SiLU, and down chain.  That magnifies
+     * harmless single-ULP accumulation-order differences into an absolute delta of
+     * roughly one, which is noisy for a regression whose purpose is grouped decode
+     * equivalence.  This fixture keeps `ls` just above 32 and varies payload bytes
+     * deterministically so codebook 4 still executes real nonzero work.
+     */
+    std::unique_ptr<TensorBase> createBoundedIQ4XSForGroupedMoE(
+        const std::vector<size_t> &shape,
+        uint32_t seed)
+    {
+        constexpr size_t block_size = IQ4_XSBlock::BLOCK_SIZE;
+        const size_t rows = shape.at(0);
+        const size_t cols = shape.at(1);
+        const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+        const size_t total_blocks = rows * blocks_per_row;
+
+        std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ4_XSBlock));
+        auto *blocks = reinterpret_cast<IQ4_XSBlock *>(raw_data.data());
+        for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+        {
+            IQ4_XSBlock &block = blocks[block_idx];
+            block.d = 0x2400; // FP16 0.015625 keeps MoE verifier rows in a stable range.
+            block.scales_h = 0;
+            std::memset(block.scales_l, 0, sizeof(block.scales_l));
+
+            for (int sub = 0; sub < 8; ++sub)
+            {
+                const uint16_t ls = static_cast<uint16_t>(
+                    33u + ((seed + block_idx + static_cast<size_t>(sub)) & 0x3u));
+                block.scales_l[sub / 2] |= static_cast<uint8_t>(
+                    (ls & 0x0fu) << (4 * (sub & 1)));
+                block.scales_h |= static_cast<uint16_t>(
+                    ((ls >> 4) & 0x3u) << (2 * sub));
+            }
+
+            for (size_t j = 0; j < std::size(block.qs); ++j)
+            {
+                const uint8_t lo = static_cast<uint8_t>(
+                    (seed + block_idx * 19u + j * 5u) & 0x0fu);
+                const uint8_t hi = static_cast<uint8_t>(
+                    ((seed >> 4) + block_idx * 23u + j * 7u) & 0x0fu);
+                block.qs[j] = static_cast<uint8_t>(lo | (hi << 4));
+            }
+        }
+
+        return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+    }
+
+    /**
+     * @brief ROCm grouped-MoE NativeVNNI codegroups that claim verifier prefill support.
+     *
+     * Keep this table aligned with `groupedDecodeSupportsCodebook()` in
+     * `ROCmMoEKernel.cpp` and the `LAUNCH_*_IF_PRESENT` macros in
+     * `ROCmMoEGroupedPrefillKernels.hip`.  A missing entry means a codegroup can
+     * be advertised to production without ever proving rowwise decode
+     * equivalence in the focused GEMM/MTP integration suite.
+     */
+    std::vector<NativeCodegroupCase> nativeMoECodegroupCases()
+    {
+        return {
+            {"Q4_0", 0, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_0Random(shape, seed); }},
+            {"IQ4_XS", 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return createBoundedIQ4XSForGroupedMoE(shape, seed); }},
+            {"Q4_K", 5, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_KRandom(shape, seed); }},
+            {"Q5_0", 6, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_0Random(shape, seed); }},
+            {"Q5_K", 7, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_KRandom(shape, seed); }},
+            {"Q6_K", 8, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ6_KRandom(shape, seed); }},
+            {"Q3_K", 9, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ3_KRandom(shape, seed); }},
+            {"Q2_K", 10, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ2_KRandom(shape, seed); }},
+            {"IQ3_S", 11, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return createNonzeroIQ3SForGroupedMoE(shape, seed); }},
+            {"IQ3_XXS", 12, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }},
+            {"IQ2_S", 13, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }},
+            {"IQ2_XS", 14, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }},
+            {"IQ2_XXS", 15, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }},
+            {"IQ1_S", 16, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }},
+            {"IQ1_M", 17, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }},
+            {"Q8_0", 19, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ8_0Random(shape, seed); }},
+        };
+    }
+
+    std::unique_ptr<DeviceWorkspaceManager> bindMoEWorkspace(
+        ROCmMoEKernel &kernel,
+        int max_seq_len,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        int top_k)
+    {
+        const WorkspaceRequirements requirements =
+            MoEWorkspaceBuffers::rocmMoE(
+                max_seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            requirements.total_bytes_with_alignment() + 16 * 1024 * 1024);
+        if (!workspace->allocate(requirements))
+            return nullptr;
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    }
+
+    /**
+     * @brief Assert that the last grouped MoE verifier run used the optimized prefill path.
+     *
+     * Accuracy alone is not enough for these regressions: a rowwise serial path
+     * could be correct while proving nothing about the grouped verifier kernels
+     * that MTP publishes from.  The perfstats records are therefore part of the
+     * contract.  They prove that routing used the compact small-M planner and
+     * that gate/up took the K-partitioned grouped-prefill implementation.
+     */
+    void expectMoEGroupedVerifierPerfStats(
+        const char *label,
+        int seq_len,
+        int num_experts,
+        int top_k)
+    {
+        bool saw_small_grouping = false;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.rocm_moe_small_prefill_grouping_calls"}))
+        {
+            const auto slots_it = record.tags.find("total_slots");
+            const auto experts_it = record.tags.find("num_experts");
+            const auto topk_it = record.tags.find("top_k");
+            saw_small_grouping =
+                saw_small_grouping ||
+                (slots_it != record.tags.end() &&
+                 slots_it->second == std::to_string(seq_len * top_k) &&
+                 experts_it != record.tags.end() &&
+                 experts_it->second == std::to_string(num_experts) &&
+                 topk_it != record.tags.end() &&
+                 topk_it->second == std::to_string(top_k));
+        }
+
+        bool saw_grouped_prefill = false;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"}))
+        {
+            auto tag_equals = [&](const char *key, const std::string &value)
+            {
+                const auto it = record.tags.find(key);
+                return it != record.tags.end() && it->second == value;
+            };
+            saw_grouped_prefill =
+                saw_grouped_prefill ||
+                (tag_equals("seq_len", std::to_string(seq_len)) &&
+                 tag_equals("top_k", std::to_string(top_k)) &&
+                 tag_equals("active_expert_slots", std::to_string(num_experts)) &&
+                 tag_equals("gateup_kparts", "4"));
+        }
+
+        EXPECT_TRUE(saw_small_grouping)
+            << label << " must exercise ROCm compact small-M expert grouping\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.rocm_moe_small_prefill_grouping_calls"}, 40);
+        EXPECT_TRUE(saw_grouped_prefill)
+            << label << " must exercise ROCm grouped K-part verifier prefill\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"}, 40);
+    }
+
+    /**
+     * @brief Prove a ROCm MoE grouped verifier codegroup equals rowwise decode.
+     *
+     * This helper deliberately compares grouped prefill against the production
+     * M=1 table-decode entry points, not against a CPU or FP32 oracle.  MTP
+     * verifier rows publish device state produced by these exact backend paths;
+     * therefore the grouped result must match what serial decode would have
+     * produced for the same quantized codebook, route ids, route weights, and
+     * hidden rows.
+     */
+    void runROCmMoECodegroupVerifierRowsMatchSerialDecode(
+        const NativeCodegroupCase &format,
+        int seq_len)
+    {
+#ifndef HAVE_ROCM
+        (void)format;
+        (void)seq_len;
+        GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+        constexpr int d_model = 256;
+        constexpr int intermediate = 256;
+        constexpr int num_experts = 4;
+        constexpr int top_k = 4;
+        const DeviceId device = DeviceId::rocm(0);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess)
+            << format.label << " explicit HIP stream";
+
+        ROCmMoEKernel moe_kernel(0);
+        static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
+        auto moe_workspace = bindMoEWorkspace(
+            moe_kernel,
+            /*max_seq_len=*/4,
+            d_model,
+            intermediate,
+            num_experts,
+            top_k);
+        ASSERT_NE(moe_workspace, nullptr) << format.label << " MoE workspace";
+
+        std::vector<std::unique_ptr<TensorBase>> owned_weights;
+        std::vector<GpuPreparedGemm> prepared_weights;
+        owned_weights.reserve(static_cast<size_t>(num_experts * 3));
+        prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
+
+        auto add_prepared = [&](int rows,
+                                int cols,
+                                uint32_t seed,
+                                const char *role) -> ITensorGemm *
+        {
+            auto weight = format.create(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                seed);
+            auto *weight_ptr = weight.get();
+            owned_weights.push_back(std::move(weight));
+            prepared_weights.push_back(makeGpuPreparedGemm(
+                weight_ptr,
+                device,
+                std::string("test.rocm_moe.all_codegroups.") +
+                    format.label + "." + role + "." + std::to_string(seed),
+                ModelContextId{970000 + static_cast<uint64_t>(seed)}));
+
+            auto *kernel = prepared_weights.back().kernel;
+            DeviceNativeVNNIMatrixDesc desc{};
+            const bool exported = kernel->exportNativeVNNIMatrixDesc(desc);
+            EXPECT_TRUE(exported)
+                << format.label << " descriptor export for " << role;
+            if (!exported)
+                return nullptr;
+            EXPECT_EQ(desc.codebook_id, format.codebook_id)
+                << format.label << " must exercise the intended native-VNNI codegroup";
+            if (desc.codebook_id != format.codebook_id)
+                return nullptr;
+            return kernel;
+        };
+
+        struct ExpertGemmTriplet
+        {
+            ITensorGemm *gate = nullptr;
+            ITensorGemm *up = nullptr;
+            ITensorGemm *down = nullptr;
+        };
+
+        std::array<ExpertGemmTriplet, num_experts> experts{};
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            experts[static_cast<size_t>(expert)].gate =
+                add_prepared(intermediate, d_model,
+                             1000u + static_cast<uint32_t>(expert),
+                             "gate");
+            ASSERT_NE(experts[static_cast<size_t>(expert)].gate, nullptr);
+            experts[static_cast<size_t>(expert)].up =
+                add_prepared(intermediate, d_model,
+                             2000u + static_cast<uint32_t>(expert),
+                             "up");
+            ASSERT_NE(experts[static_cast<size_t>(expert)].up, nullptr);
+            experts[static_cast<size_t>(expert)].down =
+                add_prepared(d_model, intermediate,
+                             3000u + static_cast<uint32_t>(expert),
+                             "down");
+            ASSERT_NE(experts[static_cast<size_t>(expert)].down, nullptr);
+        }
+
+        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
+        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
+        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const auto &triplet = experts[static_cast<size_t>(expert)];
+            ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(
+                gate_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(
+                up_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(
+                down_descs[static_cast<size_t>(expert)]));
+        }
+
+        const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+            gate_descs.data(),
+            up_descs.data(),
+            num_experts,
+            d_model,
+            intermediate);
+        ASSERT_GE(gateup_table, 0) << format.label << " gate/up table";
+        const int down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+            down_descs.data(),
+            num_experts,
+            d_model,
+            intermediate);
+        ASSERT_GE(down_table, 0) << format.label << " down table";
+
+        auto hidden = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        for (size_t i = 0; i < hidden->numel(); ++i)
+        {
+            hidden->mutable_data()[i] =
+                0.017f * static_cast<float>(static_cast<int>(i % 37) - 18) +
+                0.003f * static_cast<float>(static_cast<int>((i / 11) % 23) - 11);
+        }
+        ASSERT_TRUE(hidden->ensureOnDevice(device, stream))
+            << format.label << " hidden upload M=" << seq_len;
+
+        auto routing_indices = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+        auto routing_weights = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+        for (int row = 0; row < seq_len; ++row)
+        {
+            float weight_sum = 0.0f;
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int slot = row * top_k + route;
+                routing_indices->mutable_data()[static_cast<size_t>(slot)] =
+                    static_cast<float>((row + route) % num_experts);
+                routing_weights->mutable_data()[static_cast<size_t>(slot)] =
+                    0.10f + 0.017f *
+                                static_cast<float>((row * 7 + route * 3) % 9);
+                weight_sum += routing_weights->mutable_data()[static_cast<size_t>(slot)];
+            }
+            for (int route = 0; route < top_k; ++route)
+            {
+                routing_weights->mutable_data()[static_cast<size_t>(row * top_k + route)] /=
+                    weight_sum;
+            }
+        }
+        ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+        ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+        std::vector<float> rowwise_expected(
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            auto hidden_row = TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(d_model)});
+            std::copy(hidden->data() + static_cast<size_t>(row) * d_model,
+                      hidden->data() + static_cast<size_t>(row + 1) * d_model,
+                      hidden_row->mutable_data());
+            ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream));
+
+            std::array<int, top_k> expert_ids = {};
+            std::array<float, top_k> expert_weights = {};
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int slot = row * top_k + route;
+                expert_ids[static_cast<size_t>(route)] =
+                    static_cast<int>(routing_indices->data()[static_cast<size_t>(slot)]);
+                expert_weights[static_cast<size_t>(route)] =
+                    routing_weights->data()[static_cast<size_t>(slot)];
+            }
+
+            std::array<std::shared_ptr<FP32Tensor>, top_k> gate_owned;
+            std::array<std::shared_ptr<FP32Tensor>, top_k> up_owned;
+            std::array<ITensor *, top_k> gate_outputs = {};
+            std::array<ITensor *, top_k> up_outputs = {};
+            for (int route = 0; route < top_k; ++route)
+            {
+                gate_owned[static_cast<size_t>(route)] =
+                    TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(intermediate)});
+                up_owned[static_cast<size_t>(route)] =
+                    TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(intermediate)});
+                ASSERT_TRUE(gate_owned[static_cast<size_t>(route)]->ensureOnDevice(device, stream));
+                ASSERT_TRUE(up_owned[static_cast<size_t>(route)]->ensureOnDevice(device, stream));
+                gate_outputs[static_cast<size_t>(route)] =
+                    gate_owned[static_cast<size_t>(route)].get();
+                up_outputs[static_cast<size_t>(route)] =
+                    up_owned[static_cast<size_t>(route)].get();
+            }
+
+            auto decode_output = TestTensorFactory::createFP32(
+                {1u, static_cast<size_t>(d_model)});
+            ASSERT_TRUE(decode_output->ensureOnDevice(device, stream));
+            ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromTable(
+                hidden_row.get(),
+                expert_ids.data(),
+                gateup_table,
+                top_k,
+                gate_outputs.data(),
+                up_outputs.data(),
+                d_model,
+                intermediate))
+                << format.label << " rowwise gate/up row=" << row;
+            ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
+                gate_outputs.data(),
+                up_outputs.data(),
+                expert_ids.data(),
+                expert_weights.data(),
+                down_table,
+                top_k,
+                decode_output.get(),
+                d_model,
+                intermediate))
+                << format.label << " rowwise down row=" << row;
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            decode_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            std::copy(decode_output->data(),
+                      decode_output->data() + d_model,
+                      rowwise_expected.begin() +
+                          static_cast<size_t>(row) * static_cast<size_t>(d_model));
+        }
+
+        auto grouped_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
+
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
+            routing_indices.get(),
+            routing_weights.get(),
+            seq_len,
+            num_experts,
+            top_k))
+            << format.label << " grouped expert planning M=" << seq_len;
+        ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
+            hidden.get(),
+            grouped_output.get(),
+            gateup_table,
+            down_table,
+            seq_len,
+            d_model,
+            intermediate,
+            num_experts,
+            top_k))
+            << format.label << " grouped verifier prefill M=" << seq_len;
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+
+        expectMoEGroupedVerifierPerfStats(
+            format.label,
+            seq_len,
+            num_experts,
+            top_k);
+
+        const size_t output_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const auto label = std::string("ROCm MoE grouped verifier codegroup ") +
+                           format.label + " M=" + std::to_string(seq_len) +
+                           " must match rowwise serial decode";
+        const auto metrics = [&]()
+        {
+            const float *actual = grouped_output->data();
+            const float *reference = rowwise_expected.data();
+            const float cos = cosineSim(actual, reference, output_count);
+            const float rel_l2 = relativeL2(actual, reference, output_count);
+            const float max_abs = maxAbsDiff(actual, reference, output_count);
+            const double skl = symmetricSoftmaxKL(actual, reference, output_count);
+            const double actual_norm = l2Norm(actual, output_count);
+            const double reference_norm = l2Norm(reference, output_count);
+            const auto max_diff = maxDifference(actual, reference, output_count);
+            const size_t max_row = max_diff.index / static_cast<size_t>(d_model);
+            const size_t max_col = max_diff.index % static_cast<size_t>(d_model);
+            LOG_INFO("[SmallM][MoECodegroup] " << format.label
+                                               << " codebook="
+                                               << static_cast<int>(format.codebook_id)
+                                               << " M=" << seq_len
+                                               << " cosine=" << cos
+                                               << " rel_l2=" << rel_l2
+                                               << " symmetric_kl=" << skl
+                                               << " max_abs=" << max_abs
+                                               << " actual_norm=" << actual_norm
+                                               << " reference_norm=" << reference_norm
+                                               << " max_row=" << max_row
+                                               << " max_col=" << max_col
+                                               << " actual_at_max=" << max_diff.actual
+                                               << " reference_at_max=" << max_diff.reference);
+            return std::tuple<float, float, float, double>(cos, rel_l2, max_abs, skl);
+        }();
+        ASSERT_GT(l2Norm(rowwise_expected.data(), output_count), 1.0e-7)
+            << label << " produced an all-zero serial decode witness";
+        ASSERT_GT(l2Norm(grouped_output->data(), output_count), 1.0e-7)
+            << label << " produced an all-zero grouped decode witness";
+        EXPECT_GE(std::get<0>(metrics), 0.99995f) << label;
+        EXPECT_LE(std::get<1>(metrics), 5.0e-3f) << label;
+        EXPECT_LE(std::get<2>(metrics), 2.5e-1f) << label;
+        EXPECT_LE(std::get<3>(metrics), 1.0e-5) << label;
+
+        static_cast<ITensorKernel &>(moe_kernel).setGPUStream(nullptr);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
     }
 
     template <typename CreateWeights>
@@ -4303,6 +4936,39 @@ TEST(Test__ROCmQuantisedGemmSmallM, MixedCodebookQwen36GDNQkvZPairSmallMMatchesS
             {10240, 6144},
             {"qkv", "z"});
     }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, ROCmMoERoutedVerifierSmallM234_AllNativeCodegroupsMatchSerialDecode)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv force_gateup_kpart("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE", "1");
+    ScopedEnv force_gateup_kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS", "4");
+    ScopedEnv force_parallel_down("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE", "1");
+    ScopedEnv force_fused_swiglu_quant("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED", "1");
+
+    /*
+     * The grouped routed MoE verifier path is a composition of codebook
+     * dispatch, compact route planning, gate/up split-K reduction, SwiGLU Q8
+     * publication, and down projection publication.  Dense GEMV codebook sweeps
+     * prove the individual matrix multiply helpers; this sweep proves the full
+     * MoE grouped verifier transaction against rowwise serial decode for every
+     * native-VNNI codegroup ROCm currently advertises.
+     */
+    for (const auto &format : nativeMoECodegroupCases())
+    {
+        SCOPED_TRACE(format.label);
+        for (int verifier_rows : {2, 3, 4})
+        {
+            runROCmMoECodegroupVerifierRowsMatchSerialDecode(
+                format,
+                verifier_rows);
+        }
+    }
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverride)

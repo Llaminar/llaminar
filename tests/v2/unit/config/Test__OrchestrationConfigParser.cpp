@@ -80,6 +80,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
     EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
     EXPECT_EQ(config.moe_rebalance.window_size, 256);
+    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 0);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 0u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor,
               moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor);
@@ -1063,6 +1064,7 @@ moe:
     rebalance_window: 64
     rebalance_max_window: 512
     rebalance_window_growth: 2.5
+    rebalance_prefill_window_tokens: 96
     dynamic_imbalance_threshold_permille: 1125
     dynamic_min_improvement_permille: 20
     dynamic_max_swaps_per_layer: 6
@@ -1087,6 +1089,7 @@ moe:
     EXPECT_EQ(config.moe_rebalance.window_size, 64);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 512);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.5f);
+    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 96);
     EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1125u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 20u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 6u);
@@ -1112,6 +1115,7 @@ moe_rebalance: off
 moe_rebalance_window: 128
 moe_rebalance_max_window: 1024
 moe_rebalance_window_growth: 1.25
+moe_rebalance_prefill_window_tokens: 192
 moe_dynamic_imbalance_threshold_permille: 1050
 moe_dynamic_min_improvement_permille: 0
 moe_dynamic_max_swaps_per_layer: 8
@@ -1136,6 +1140,7 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 1024);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 1.25f);
+    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 192);
     EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1050u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 0u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 8u);
@@ -1712,6 +1717,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-rebalance-window", "128",
                     "--moe-rebalance-max-window", "2048",
                     "--moe-rebalance-window-growth", "2.0",
+                    "--moe-rebalance-prefill-window", "384",
                     "--moe-dynamic-imbalance-threshold-permille", "1100",
                     "--moe-dynamic-min-improvement-permille", "10",
                     "--moe-dynamic-max-swaps-per-layer", "7",
@@ -1732,6 +1738,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 2048);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.0f);
+    EXPECT_EQ(config.moe_rebalance.prefill_window_tokens, 384);
     EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1100u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 10u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 7u);

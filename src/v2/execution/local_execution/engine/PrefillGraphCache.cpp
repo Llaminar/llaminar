@@ -491,10 +491,11 @@ namespace llaminar2
     /**
      * @brief Split reusable lazy initialization from request-local warmup state.
      *
-     * Ready entries keep their executable graphs. Warmup/Initialized entries keep
-     * only the fact that first-use stage/kernel setup has happened; they are not
-     * allowed to replay, and they cannot capture until the executor prepares
-     * fresh request metadata and reruns strict capture-readiness preflight.
+     * Ready entries lose their executable graphs and are demoted to Initialized.
+     * Warmup/Initialized entries keep only the fact that first-use stage/kernel
+     * setup has happened. No entry may replay, and no entry may capture until
+     * the executor prepares fresh request metadata and reruns strict
+     * capture-readiness preflight.
      */
     PrefillGraphRequestResetSummary PrefillGraphCache::prepareEntriesForRequestReset()
     {
@@ -507,7 +508,12 @@ namespace llaminar2
                 entry.capture->hasExecutable();
             if (ready_for_replay)
             {
-                ++summary.ready_preserved;
+                entry.phase = PrefillGraphPhase::Initialized;
+                entry.capture.reset();
+                entry.node_count = 0;
+                entry.replay_count = 0;
+                lifecycle_stats_[key].initialized_count++;
+                ++summary.ready_demoted;
                 continue;
             }
 
@@ -532,26 +538,18 @@ namespace llaminar2
             ++summary.dropped;
         }
 
-        if (summary.initialized > 0 || summary.dropped > 0)
+        if (summary.ready_demoted > 0 || summary.initialized > 0 || summary.dropped > 0)
         {
             last_invalidation_reason_ = PrefillGraphRejectReason::RequestStateReset;
-            LOG_INFO("[PrefillGraphCache] Request reset preserved "
-                     << summary.ready_preserved
-                     << " ready prefill graph executables, kept "
+            LOG_INFO("[PrefillGraphCache] Request reset demoted "
+                     << summary.ready_demoted
+                     << " ready prefill graph executable(s), kept "
                      << summary.initialized
                      << " entries as lazy-initialized only, and dropped "
                      << summary.dropped
                      << " stale entries");
         }
         return summary;
-    }
-
-    /**
-     * @brief Backward-compatible reset helper for callers that only need drops.
-     */
-    size_t PrefillGraphCache::preserveReadyEntriesAcrossRequestReset()
-    {
-        return prepareEntriesForRequestReset().dropped;
     }
 
     void PrefillGraphCache::invalidate(const PrefillGraphCacheKey &key)

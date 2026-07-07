@@ -41,6 +41,7 @@
 #include <atomic>
 #include <cstdio>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 
 namespace llaminar2
@@ -461,7 +462,7 @@ namespace llaminar2
          * @brief Emit one structured Phase 9.8 verifier-economy snapshot.
          *
          * The snapshot is intentionally separate from decode timers. It lets
-         * dashboards distinguish a correct serial fallback from an economical
+         * dashboards distinguish a diagnostic serial oracle from an economical
          * grouped/resident verifier path without adding per-token hot-path
          * logging overhead when perfstats are disabled.
          */
@@ -490,10 +491,79 @@ namespace llaminar2
             bool rollback);
         GenerationResult decodeStepMTP();
         void clearBatchedDecodeState();
-        bool forwardPrefillTokens(
+        /**
+         * @brief Return true when LLEP prefill has current-window state semantics.
+         *
+         * LeastLoadedEP route planning is deliberately a current-window policy:
+         * the same token span can produce different route assignments if it is
+         * planned inside a larger prefill transaction.  This helper centralizes
+         * the mode check so cache-enabled and cache-disabled prefill paths share
+         * one request-boundary definition for KV, GDN, MTP, and MoE runtime
+         * state.
+         *
+         * @return true when either the execution plan or user config selects
+         *         LeastLoadedEP rebalance mode.
+         */
+        bool leastLoadedEPPrefillUsesStableWindows() const;
+
+        /**
+         * @brief Resolve the stable prefill transaction size for LLEP.
+         *
+         * A configured @c prefill_window_tokens value is the first-class owner
+         * of LLEP prefill state lifetime.  Prefix cache may supply an explicit
+         * block boundary only when that owner is unset and cache restore is
+         * active for the request.  Returning zero means the historical
+         * single-transaction prefill behavior is still in force.
+         *
+         * @param prefix_cache_block_size Coordinated prefix-cache block size for
+         *        this request, or zero when prefix cache is not active.
+         * @param prefix_cache_enabled Whether restored prefix state is active
+         *        for this request.
+         * @return Positive stable transaction size, or zero for no segmentation.
+         */
+        int stableLLEPPrefillWindowTokens(
+            int prefix_cache_block_size,
+            bool prefix_cache_enabled) const;
+
+        /**
+         * @brief Forward one indivisible prefill transaction through the runner.
+         *
+         * This method owns the existing activation-graph bucket scheduling
+         * contract for a single caller-visible prefill transaction.  Callers that
+         * need higher-level semantic boundaries, such as prefix-cache LLEP block
+         * boundaries, must split before entering this method.
+         *
+         * @param tokens Pointer to the first token in this transaction.
+         * @param token_count Number of real tokens in this transaction.
+         * @param failure_message User-visible context to attach to hard failures.
+         * @return true when the runner completed the transaction successfully.
+         */
+        bool forwardSinglePrefillTransaction(
             const int *tokens,
             int token_count,
             const std::string &failure_message);
+
+        /**
+         * @brief Forward prefill tokens, optionally split by a stable transaction size.
+         *
+         * A positive @p stable_segment_tokens turns the call into a sequence of
+         * indivisible prefill transactions of that size, plus one terminal
+         * remainder.  The split is used for prefix-cache LLEP prefill so a fresh
+         * cache miss, a partial-hit suffix, and an uncached full prompt all cross
+         * identical semantic request boundaries.
+         *
+         * @param tokens Pointer to the first token to prefill.
+         * @param token_count Number of tokens to prefill.
+         * @param failure_message User-visible context to attach to hard failures.
+         * @param stable_segment_tokens Stable transaction size, or zero to keep
+         *        the historical single-transaction behavior.
+         * @return true when every required prefill transaction succeeds.
+         */
+        bool forwardPrefillTokens(
+            const int *tokens,
+            int token_count,
+            const std::string &failure_message,
+            int stable_segment_tokens = 0);
         void recordMoERebalanceRawExpertRelease(
             const std::string &domain_id,
             const std::string &device);
@@ -531,6 +601,15 @@ namespace llaminar2
 
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
+        /**
+         * @brief Owns TP-combined snapshot views returned through the orchestration API.
+         *
+         * RankOrchestrator keeps per-device snapshots and can assemble a semantic
+         * tensor-parallel view on demand.  IOrchestrationRunner callers only ask
+         * for snapshot keys, so this cache gives the returned pointer a stable
+         * lifetime without leaking local-TP topology details to parity tests.
+         */
+        mutable std::unordered_map<std::string, std::vector<float>> snapshot_combined_cache_;
 
         struct PendingMoERebalanceUpdate
         {

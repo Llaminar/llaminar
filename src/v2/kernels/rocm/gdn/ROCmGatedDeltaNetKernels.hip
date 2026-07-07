@@ -1384,6 +1384,17 @@ bool rocmGDN_deinterleave_qkv(
     int k_dst_dim = n_v_heads * d_k;
     int v_dim = n_v_heads * d_v;
     int total = seq_len * (q_dst_dim + k_dst_dim + v_dim);
+    if (seq_len <= 0 || n_k_heads <= 0 || n_v_heads <= 0 ||
+        d_k <= 0 || d_v <= 0 || total <= 0)
+    {
+        fprintf(stderr,
+                "[rocmGDN_deinterleave_qkv] invalid launch geometry: "
+                "seq_len=%d n_k_heads=%d n_v_heads=%d d_k=%d d_v=%d "
+                "global_v_offset=%d total=%d stream=%p\n",
+                seq_len, n_k_heads, n_v_heads, d_k, d_v,
+                global_v_offset, total, stream);
+        return false;
+    }
 
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
@@ -1396,7 +1407,17 @@ bool rocmGDN_deinterleave_qkv(
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmGDN_deinterleave_qkv] %s\n", hipGetErrorString(err));
+        int current_device = -1;
+        (void)hipGetDevice(&current_device);
+        fprintf(stderr,
+                "[rocmGDN_deinterleave_qkv] %s "
+                "(seq_len=%d n_k_heads=%d n_v_heads=%d d_k=%d d_v=%d "
+                "global_v_offset=%d total=%d blocks=%d requested_device=%d current_device=%d "
+                "merged=%p out_q=%p out_k=%p out_v=%p stream=%p)\n",
+                hipGetErrorString(err), seq_len, n_k_heads, n_v_heads,
+                d_k, d_v, global_v_offset, total, blocks,
+                device_idx, current_device,
+                (const void *)merged, (void *)out_q, (void *)out_k, (void *)out_v, stream);
         return false;
     }
     if (llaminar2::debugEnv().rocm.gdn_sync)

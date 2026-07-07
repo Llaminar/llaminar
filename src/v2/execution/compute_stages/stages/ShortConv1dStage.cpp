@@ -416,8 +416,19 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        /*
+         * GPU publication must restore only the backend-owned live state here.
+         * LocalTP workers can run this method concurrently on different devices,
+         * and the hybrid cache mirror behind params_.conv_state is not part of
+         * the stream-ordered GPU mutation contract.  Passing it into the CUDA or
+         * HIP backend makes the backend enqueue a D2H refresh and synchronize
+         * the verifier stream, which is both too expensive for the MTP hot path
+         * and unsafe when the mirror is not host-addressable in a replicated
+         * device-state lane.  Prefix-cache export and diagnostics refresh host
+         * mirrors through explicit adoption/observation paths instead.
+         */
         return params_.kernel->restoreVerifierStateCaptureRow(
-            params_.conv_state,
+            nullptr,
             row,
             stream ? stream : gpuStream());
     }

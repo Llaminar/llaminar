@@ -32,12 +32,14 @@ namespace llaminar2
         bool has_hybrid_state = false;
         bool has_terminal_hidden = false;
         bool has_terminal_logits = false;
+        bool has_model_runtime_state = false;
 
         std::shared_ptr<std::vector<uint8_t>> kv_storage;
         std::shared_ptr<std::vector<uint8_t>> hybrid_storage;
         std::shared_ptr<std::vector<uint8_t>> mtp_storage;
         std::shared_ptr<std::vector<uint8_t>> terminal_hidden_storage;
         std::shared_ptr<std::vector<uint8_t>> terminal_logits_storage;
+        std::shared_ptr<std::vector<uint8_t>> model_runtime_state_storage;
         std::shared_ptr<TensorBase> device_kv_storage;
         std::shared_ptr<TensorBase> device_hybrid_storage;
         std::shared_ptr<TensorBase> device_mtp_storage;

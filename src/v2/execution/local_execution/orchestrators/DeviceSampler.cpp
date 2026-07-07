@@ -13,6 +13,7 @@
 #include "../../../utils/Sampler.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <random>
@@ -77,6 +78,14 @@ namespace llaminar2
         std::vector<DeviceResult> results;
         results.reserve(infos.size());
         size_t col_offset = 0;
+        const bool use_explicit_vocab_offsets =
+            std::any_of(
+                infos.begin(),
+                infos.end(),
+                [](const LogitsLocalInfo &info)
+                {
+                    return info.vocab_offset != 0;
+                });
 
         for (const auto &info : infos)
         {
@@ -160,7 +169,9 @@ namespace llaminar2
             LOG_TRACE("[DeviceSampler::sampleGreedyFromLocalInfos] local_argmax="
                       << max_idx << " val=" << max_val << " offset=" << col_offset);
 
-            results.push_back({max_val, max_idx, col_offset});
+            const size_t global_offset =
+                use_explicit_vocab_offsets ? info.vocab_offset : col_offset;
+            results.push_back({max_val, max_idx, global_offset});
             col_offset += info.vocab_local;
         }
 
@@ -190,6 +201,153 @@ namespace llaminar2
         }
 
         return best_token;
+    }
+
+    bool DeviceSampler::sampleGreedyRowsFromLocalInfos(
+        const std::vector<LogitsLocalInfo> &infos,
+        int start_row,
+        int row_count,
+        int32_t *out_tokens)
+    {
+        if (infos.size() < 2 || start_row < 0 || row_count <= 0 || !out_tokens)
+            return false;
+
+        struct ShardRows
+        {
+            size_t col_offset = 0;
+            std::vector<float> values;
+            std::vector<int> indices;
+        };
+
+        std::vector<ShardRows> shard_rows;
+        shard_rows.reserve(infos.size());
+        size_t col_offset = 0;
+        const bool use_explicit_vocab_offsets =
+            std::any_of(
+                infos.begin(),
+                infos.end(),
+                [](const LogitsLocalInfo &info)
+                {
+                    return info.vocab_offset != 0;
+                });
+
+        for (const auto &info : infos)
+        {
+            if (!info || info.vocab_local == 0 || !info.tensor)
+                return false;
+
+            const auto &shape = info.tensor->shape();
+            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+            const size_t cols = info.vocab_local;
+            const size_t row_stride = logitsRowStride(info);
+            if (cols == 0 ||
+                row_stride < cols ||
+                static_cast<size_t>(start_row) >= rows ||
+                static_cast<size_t>(start_row + row_count) > rows ||
+                cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+
+            ShardRows rows_out;
+            rows_out.col_offset =
+                use_explicit_vocab_offsets ? info.vocab_offset : col_offset;
+            rows_out.values.assign(static_cast<size_t>(row_count), 0.0f);
+            rows_out.indices.assign(static_cast<size_t>(row_count), -1);
+
+            if (info.device.has_value() && info.device->is_gpu())
+            {
+                /*
+                 * The backend batched argmax API assumes contiguous rows. If a
+                 * tensor has padded local-logit rows, keep the exact old
+                 * per-row sampler path instead of silently reading padding.
+                 */
+                if (!info.gpu_ptr || row_stride != cols || !info.stream)
+                    return false;
+
+                IBackend *backend = getBackendFor(*info.device);
+                if (!backend ||
+                    !info.argmax_partial_vals ||
+                    !info.argmax_partial_idxs ||
+                    info.argmax_partial_capacity < row_count)
+                {
+                    return false;
+                }
+
+                const auto *base = static_cast<const float *>(info.gpu_ptr);
+                const void *first_row =
+                    base + static_cast<size_t>(start_row) * row_stride;
+                if (!backend->argmaxF32BatchedRows(
+                        first_row,
+                        row_count,
+                        static_cast<int>(cols),
+                        info.device->gpu_ordinal(),
+                        rows_out.values.data(),
+                        rows_out.indices.data(),
+                        info.stream,
+                        info.argmax_partial_vals,
+                        info.argmax_partial_idxs,
+                        info.argmax_partial_capacity))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                const float *data = info.tensor->fp32_data();
+                if (!data)
+                    return false;
+
+                for (int i = 0; i < row_count; ++i)
+                {
+                    const float *row_data =
+                        data +
+                        static_cast<size_t>(start_row + i) * row_stride;
+                    int max_idx = 0;
+                    float max_val = row_data[0];
+                    for (size_t col = 1; col < cols; ++col)
+                    {
+                        if (row_data[col] > max_val)
+                        {
+                            max_val = row_data[col];
+                            max_idx = static_cast<int>(col);
+                        }
+                    }
+                    rows_out.values[static_cast<size_t>(i)] = max_val;
+                    rows_out.indices[static_cast<size_t>(i)] = max_idx;
+                }
+            }
+
+            shard_rows.push_back(std::move(rows_out));
+            col_offset += cols;
+        }
+
+        for (int row = 0; row < row_count; ++row)
+        {
+            int best_token = -1;
+            float best_value = -std::numeric_limits<float>::infinity();
+            for (const auto &shard : shard_rows)
+            {
+                const int local_index = shard.indices[static_cast<size_t>(row)];
+                if (local_index < 0)
+                    return false;
+                const int token =
+                    static_cast<int>(shard.col_offset) + local_index;
+                const float value = shard.values[static_cast<size_t>(row)];
+                if (value > best_value ||
+                    (value == best_value &&
+                     (best_token < 0 || token < best_token)))
+                {
+                    best_value = value;
+                    best_token = token;
+                }
+            }
+            if (best_token < 0)
+                return false;
+            out_tokens[row] = static_cast<int32_t>(best_token);
+        }
+
+        return true;
     }
 
     int DeviceSampler::sample(

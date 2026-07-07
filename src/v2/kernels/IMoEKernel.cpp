@@ -297,7 +297,8 @@ namespace llaminar2
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens,
         int num_experts, int top_k,
-        const DeviceMoERebalanceStatus *transfer_status)
+        const DeviceMoERebalanceStatus *transfer_status,
+        const DeviceMoERebalanceApplyStatus *apply_status)
     {
         (void)runtime_layer;
         (void)current_tokens;
@@ -305,6 +306,7 @@ namespace llaminar2
         (void)num_experts;
         (void)top_k;
         (void)transfer_status;
+        (void)apply_status;
         LOG_ERROR("[IMoEKernel] LeastLoadedEP transfer-backed prefill route assignment "
                   "was requested on a backend that does not implement current-batch LLEP");
         throw std::logic_error(

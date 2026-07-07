@@ -393,6 +393,36 @@ TEST_F(StageDumpInfoTest, RMSNormStage_GetDumpInfo)
     EXPECT_TRUE(hasOutput(info, "output"));
 }
 
+TEST_F(StageDumpInfoTest, GatedRMSNormStage_DumpInfoUsesFeatureDim)
+{
+    int seq_len = 4;
+    int active_width = 128;
+    int backing_width = 256;
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(backing_width)});
+    auto gate = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(active_width)});
+    auto gamma = TestTensorFactory::createFP32Ones({static_cast<size_t>(active_width)});
+
+    GatedRMSNormStage::Params params;
+    params.input = input.get();
+    params.gate = gate.get();
+    params.output = input.get();
+    params.gamma = gamma.get();
+    params.seq_len = seq_len;
+    params.feature_dim = active_width;
+    params.norm_dim = 64;
+
+    GatedRMSNormStage stage(params);
+    StageDumpInfo info = stage.getDumpInfo();
+
+    ASSERT_EQ(info.outputs.size(), 1u);
+    EXPECT_STREQ(info.outputs[0].name, "output");
+    EXPECT_EQ(info.outputs[0].rows, static_cast<size_t>(seq_len));
+    EXPECT_EQ(info.outputs[0].cols, static_cast<size_t>(active_width));
+}
+
 // =============================================================================
 // RoPEStage Tests
 // =============================================================================

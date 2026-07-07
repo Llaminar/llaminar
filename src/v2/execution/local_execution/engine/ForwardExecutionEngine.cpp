@@ -86,7 +86,14 @@ namespace llaminar2
             return mutex;
         }
 
-        /// @brief Return the absolute chunk offset for raw server-style inputs.
+        /// @brief Return the absolute logical-token offset for prefill-style inputs.
+        ///
+        /// `token_offset` is the first-class request-range owner for prepared
+        /// prefill chunks. Raw server/orchestrator inputs historically carried
+        /// only `position_offset`; treating that as the logical-token offset
+        /// keeps restored-prefix suffix prefill aligned with RoPE, KV append,
+        /// and replay metadata until every caller is migrated to an explicit
+        /// non-optional request range.
         int effectiveTokenOffset(const ForwardInput &input)
         {
             return input.token_offset != 0 ? input.token_offset : input.position_offset;
@@ -129,7 +136,7 @@ namespace llaminar2
             return IComputeStage::PrefillReplayParams{
                 effectiveRealSeqLen(input),
                 effectiveBucketSeqLen(input),
-                input.token_offset};
+                effectiveTokenOffset(input)};
         }
 
         /// @brief Collect stages that need real-token metadata for padded prefill execution.
@@ -424,8 +431,10 @@ namespace llaminar2
             return plan;
         }
 
+        const int token_offset = effectiveTokenOffset(input);
+
         plan.padding_required = !plan.selection.exact;
-        plan.chunk.token_offset = input.token_offset;
+        plan.chunk.token_offset = token_offset;
         plan.chunk.real_count = real_seq_len;
         plan.chunk.bucket_seq_len = plan.selection.bucket_seq_len;
         plan.chunk.token_ids = padPrefillTokensToBucket(
@@ -436,7 +445,7 @@ namespace llaminar2
         plan.chunk.position_ids = buildPrefillChunkPositionIds(
             real_seq_len,
             plan.selection.bucket_seq_len,
-            input.token_offset,
+            token_offset,
             input.batch_size);
 
         if (plan.chunk.token_ids.empty() || plan.chunk.position_ids.empty())
@@ -1678,10 +1687,8 @@ namespace llaminar2
         {
             updatePrefillReplayParamStages(input, forward_cache.prefill_replay_param_stages);
         }
-        const int *cached_position_ids =
-            !forward_cache.position_ids.empty()
-                ? forward_cache.position_ids.data()
-                : input.position_ids;
+        const int *replay_position_ids =
+            selectForwardReplayHostPositionIds(forward_cache, input);
         for (auto *stage : forward_cache.dynamic_param_stages)
         {
             stage->updateDynamicParams(input.position_offset, input.seq_len);
@@ -1691,10 +1698,10 @@ namespace llaminar2
                     input.position_ids_device,
                     input.seq_len);
             }
-            else if (cached_position_ids)
+            else if (replay_position_ids)
             {
                 stage->updateDynamicPositionIds(
-                    cached_position_ids,
+                    replay_position_ids,
                     input.seq_len);
             }
         }
@@ -1822,6 +1829,18 @@ namespace llaminar2
                     1.0,
                     "decode",
                     input.device.toString());
+            }
+            if (capture_policy.allow_cached_graph_replay)
+            {
+                const DeviceId capture_device = ctx->deviceId();
+                capture_policy.before_begin_capture =
+                    [&host, &input, capture_device](const std::string &boundary_name) -> bool
+                {
+                    return host.waitAtDecodeGraphCaptureBoundary(
+                        input,
+                        capture_device,
+                        boundary_name);
+                };
             }
             const bool wants_all_position_sync_defer =
                 all_position_verifier &&
@@ -2342,6 +2361,25 @@ namespace llaminar2
             return true;
         };
 
+        auto publishPrefillCapturedTerminalState = [&](void *stream,
+                                                       const char *context) -> bool
+        {
+            const int terminal_row = real_seq_len - 1;
+            if (!executor_.publishCapturedTerminalStateAfterGraphExecution(
+                    *forward_cache.graph,
+                    terminal_row,
+                    stream,
+                    context))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph terminal state publication failed"
+                          << (context ? std::string(" during ") + context : std::string{})
+                          << " real_seq_len=" << real_seq_len
+                          << " bucket_seq_len=" << bucket_seq_len);
+                return false;
+            }
+            return true;
+        };
+
         auto ensurePrefillCaptureStream = [&]() -> std::pair<IWorkerGPUContext *, void *>
         {
             IWorkerGPUContext *gpu_ctx = gpuContextForPrefill();
@@ -2376,6 +2414,13 @@ namespace llaminar2
             // Post-replay callbacks (KV cache head advance, histogram boundaries)
             for (auto *stage : forward_cache.replay_callback_stages)
                 stage->onGraphReplayed();
+
+            if (!publishPrefillCapturedTerminalState(
+                    stream,
+                    "prefill_graph_replay"))
+            {
+                return false;
+            }
 
             if (!executor_.publishSnapshotsAfterGraphExecution(
                     *forward_cache.graph,
@@ -2447,8 +2492,28 @@ namespace llaminar2
                           << input.seq_len);
                 return false;
             }
-            gpu_ctx->synchronizeStream(stream);
+            if (!gpu_ctx->synchronizeStreamChecked(stream))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture stream synchronization failed for seq_len="
+                          << input.seq_len << " on " << input.device.toString());
+                return false;
+            }
             gpu_ctx->clearLastError();
+
+            const std::string capture_begin_boundary =
+                "before_begin:seq=" + std::to_string(input.seq_len) +
+                ":real=" + std::to_string(real_seq_len) +
+                ":bucket=" + std::to_string(bucket_seq_len) +
+                ":offset=" + std::to_string(input.position_offset);
+            if (!host.waitAtPrefillGraphCaptureBoundary(
+                    input,
+                    input.device,
+                    capture_begin_boundary))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture begin rendezvous failed for seq_len="
+                          << input.seq_len << " on " << input.device.toString());
+                return false;
+            }
 
             gpu_ctx->setGraphCaptureActive(true);
             if (!cache.beginCapture(key, gpu_ctx, stream))
@@ -2483,6 +2548,21 @@ namespace llaminar2
                 return false;
             }
 
+            const std::string capture_launch_boundary =
+                "before_launch_after_capture:seq=" + std::to_string(input.seq_len) +
+                ":real=" + std::to_string(real_seq_len) +
+                ":bucket=" + std::to_string(bucket_seq_len) +
+                ":offset=" + std::to_string(input.position_offset);
+            if (!host.waitAtPrefillGraphCaptureBoundary(
+                    input,
+                    input.device,
+                    capture_launch_boundary))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture launch rendezvous failed for seq_len="
+                          << input.seq_len << " on " << input.device.toString());
+                return false;
+            }
+
             // Kernels recorded during HIP/CUDA stream capture are not executed
             // until the executable graph is launched. Launch once immediately so
             // the capture request produces logits and advances device state.
@@ -2505,6 +2585,13 @@ namespace llaminar2
             {
                 if (stage && stage->type() != ComputeStageType::KV_CACHE_APPEND)
                     stage->onGraphReplayed();
+            }
+
+            if (!publishPrefillCapturedTerminalState(
+                    stream,
+                    "prefill_graph_capture_launch"))
+            {
+                return false;
             }
 
             if (!executor_.publishSnapshotsAfterGraphExecution(
@@ -2636,6 +2723,13 @@ namespace llaminar2
 
         if (!exec_success)
             return false;
+
+        if (!publishPrefillCapturedTerminalState(
+                nullptr,
+                "prefill_graph_warmup"))
+        {
+            return false;
+        }
 
         if (!executor_.publishSnapshotsAfterGraphExecution(
                 *forward_cache.graph,
@@ -2988,9 +3082,27 @@ namespace llaminar2
 
             for (auto *stage : cache_miss_dynamic_param_stages)
             {
+                /*
+                 * Cache misses can still enter executor-side graph capture.
+                 * Refresh explicit position rows after stream binding so RoPE
+                 * captures the current request/chunk positions, not only the
+                 * scalar offset baked into the graph build.
+                 */
                 stage->updateDynamicParams(
                     effective_input.position_offset,
                     effective_input.seq_len);
+                if (effective_input.position_ids_device)
+                {
+                    stage->updateDynamicDevicePositionIds(
+                        effective_input.position_ids_device,
+                        effective_input.seq_len);
+                }
+                else if (effective_input.position_ids)
+                {
+                    stage->updateDynamicPositionIds(
+                        effective_input.position_ids,
+                        effective_input.seq_len);
+                }
             }
 
             if (!host.waitBeforeForwardGraphExecution(
@@ -3009,6 +3121,22 @@ namespace llaminar2
         // Sync the stream at the forward pass boundary (same as cached path above)
         if (success)
         {
+            if (!is_decode && effectiveRealSeqLen(effective_input) > 0)
+            {
+                const int terminal_row = effectiveRealSeqLen(effective_input) - 1;
+                if (!executor_.publishCapturedTerminalStateAfterGraphExecution(
+                        graph,
+                        terminal_row,
+                        nullptr,
+                        should_cache
+                            ? "prefill_cache_miss"
+                            : "prefill_eager"))
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish captured terminal prefill state after cache miss");
+                    return false;
+                }
+            }
+
             IDeviceContext *sync_ctx = host.getDeviceContext(effective_input.device);
             if (sync_ctx)
             {
@@ -3195,6 +3323,23 @@ namespace llaminar2
             {
                 auto *node = cache.graph->getNode(node_name);
                 if (node && node->stage && node->stage->type() == type)
+                    visitor(node->stage.get());
+            }
+        }
+    }
+
+    void ForwardExecutionEngine::forEachCachedStage(
+        const std::function<void(IComputeStage *)> &visitor) const
+    {
+        for (const auto &[sig, cache] : cache_)
+        {
+            (void)sig;
+            if (!cache.valid || !cache.graph)
+                continue;
+            for (const auto &node_name : cache.graph->getExecutionOrder())
+            {
+                auto *node = cache.graph->getNode(node_name);
+                if (node && node->stage)
                     visitor(node->stage.get());
             }
         }

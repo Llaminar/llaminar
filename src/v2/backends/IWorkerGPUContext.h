@@ -305,6 +305,20 @@ namespace llaminar2
         virtual void synchronizeEvent(void *event) = 0;
 
         /**
+         * @brief Synchronize the CPU with an event and report backend status.
+         *
+         * This companion is intended for diagnostic/timing paths that need to
+         * attribute asynchronous GPU failures to a specific recorded event.
+         */
+        virtual bool synchronizeEventChecked(void *event)
+        {
+            if (!event)
+                return false;
+            synchronizeEvent(event);
+            return true;
+        }
+
+        /**
          * @brief Compute elapsed time in milliseconds between two recorded events
          * @param start Event recorded before the operation
          * @param stop Event recorded after the operation
@@ -374,6 +388,22 @@ namespace llaminar2
          * @thread_safety Thread-safe, can be called from any thread
          */
         virtual void synchronize() = 0;
+
+        /**
+         * @brief Wait for all work on this device to complete and report backend status.
+         *
+         * This status-bearing companion to synchronize() is used by graph-capture
+         * boundary fences so asynchronous CUDA/HIP failures stop at the boundary
+         * that observes them.
+         *
+         * @return true when the device completed successfully, false when the backend reported an error.
+         * @thread_safety Thread-safe, can be called from any thread
+         */
+        virtual bool synchronizeChecked()
+        {
+            synchronize();
+            return true;
+        }
 
         /**
          * @brief Synchronize a specific stream (CPU blocks until stream completes)

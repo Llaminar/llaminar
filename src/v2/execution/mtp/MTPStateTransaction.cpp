@@ -1,3 +1,14 @@
+/**
+ * @file MTPStateTransaction.cpp
+ * @brief Validates MTP decode state transitions and runtime-state snapshots.
+ *
+ * MTP publication, rollback, and prefix restore all mutate long-lived
+ * inference state.  The comparisons in this file therefore favor explicit,
+ * diagnostic-rich failures over tolerant fallbacks so request-boundary bugs are
+ * reported at the owning state surface: positions, KV caches, GDN state, or
+ * terminal hidden/logits.
+ */
+
 #include "MTPStateTransaction.h"
 
 #include <algorithm>
@@ -237,6 +248,76 @@ namespace llaminar2
                         lhs.k_payload_hash != rhs.k_payload_hash ||
                         lhs.v_payload_hash != rhs.v_payload_hash)
                     {
+                        auto append_segment_hashes =
+                            [](std::ostringstream &msg,
+                               const char *name,
+                               bool lhs_available,
+                               bool rhs_available,
+                               int lhs_start,
+                               int rhs_start,
+                               int lhs_tokens,
+                               int rhs_tokens,
+                               uint64_t lhs_k_hash,
+                               uint64_t rhs_k_hash,
+                               uint64_t lhs_v_hash,
+                               uint64_t rhs_v_hash)
+                        {
+                            if (!lhs_available && !rhs_available)
+                                return;
+                            msg << " " << name
+                                << "_available=" << (lhs_available ? "yes" : "no")
+                                << "/" << (rhs_available ? "yes" : "no")
+                                << " start=" << lhs_start << "/" << rhs_start
+                                << " tokens=" << lhs_tokens << "/" << rhs_tokens
+                                << " k_hash=" << lhs_k_hash << "/" << rhs_k_hash
+                                << " v_hash=" << lhs_v_hash << "/" << rhs_v_hash;
+                        };
+                        auto append_named_segment_hashes =
+                            [](std::ostringstream &msg,
+                               const std::vector<PrefixKVSegmentProbe> &lhs_segments,
+                               const std::vector<PrefixKVSegmentProbe> &rhs_segments)
+                        {
+                            if (lhs_segments.empty() && rhs_segments.empty())
+                                return;
+                            msg << " named_segments=";
+                            const size_t count =
+                                std::max(lhs_segments.size(), rhs_segments.size());
+                            for (size_t i = 0; i < count; ++i)
+                            {
+                                const PrefixKVSegmentProbe *lhs_segment =
+                                    i < lhs_segments.size() ? &lhs_segments[i] : nullptr;
+                                const PrefixKVSegmentProbe *rhs_segment =
+                                    i < rhs_segments.size() ? &rhs_segments[i] : nullptr;
+                                if (i > 0)
+                                    msg << ";";
+                                msg << "[";
+                                msg << "name="
+                                    << (lhs_segment
+                                            ? lhs_segment->name
+                                            : (rhs_segment ? rhs_segment->name : "<missing>"));
+                                msg << " available="
+                                    << (lhs_segment && lhs_segment->hash_available ? "yes" : "no")
+                                    << "/"
+                                    << (rhs_segment && rhs_segment->hash_available ? "yes" : "no");
+                                msg << " start="
+                                    << (lhs_segment ? lhs_segment->token_start : -1)
+                                    << "/"
+                                    << (rhs_segment ? rhs_segment->token_start : -1);
+                                msg << " tokens="
+                                    << (lhs_segment ? lhs_segment->token_count : -1)
+                                    << "/"
+                                    << (rhs_segment ? rhs_segment->token_count : -1);
+                                msg << " k_hash="
+                                    << (lhs_segment ? lhs_segment->k_payload_hash : 0)
+                                    << "/"
+                                    << (rhs_segment ? rhs_segment->k_payload_hash : 0);
+                                msg << " v_hash="
+                                    << (lhs_segment ? lhs_segment->v_payload_hash : 0)
+                                    << "/"
+                                    << (rhs_segment ? rhs_segment->v_payload_hash : 0);
+                                msg << "]";
+                            }
+                        };
                         std::ostringstream msg;
                         msg << label << " KV payload hash mismatch at cache "
                             << cache_idx
@@ -250,6 +331,36 @@ namespace llaminar2
                             << rhs.k_payload_hash
                             << " v_hash=" << lhs.v_payload_hash << "/"
                             << rhs.v_payload_hash;
+                        append_segment_hashes(
+                            msg,
+                            "leading",
+                            lhs.leading_segment_hash_available,
+                            rhs.leading_segment_hash_available,
+                            0,
+                            0,
+                            lhs.leading_segment_tokens,
+                            rhs.leading_segment_tokens,
+                            lhs.leading_k_payload_hash,
+                            rhs.leading_k_payload_hash,
+                            lhs.leading_v_payload_hash,
+                            rhs.leading_v_payload_hash);
+                        append_segment_hashes(
+                            msg,
+                            "trailing",
+                            lhs.trailing_segment_hash_available,
+                            rhs.trailing_segment_hash_available,
+                            lhs.trailing_segment_start,
+                            rhs.trailing_segment_start,
+                            lhs.trailing_segment_tokens,
+                            rhs.trailing_segment_tokens,
+                            lhs.trailing_k_payload_hash,
+                            rhs.trailing_k_payload_hash,
+                            lhs.trailing_v_payload_hash,
+                            rhs.trailing_v_payload_hash);
+                        append_named_segment_hashes(
+                            msg,
+                            lhs.segments,
+                            rhs.segments);
                         return mismatch(msg.str());
                     }
                 }

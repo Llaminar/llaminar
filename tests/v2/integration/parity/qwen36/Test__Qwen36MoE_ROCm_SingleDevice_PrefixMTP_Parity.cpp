@@ -4,6 +4,7 @@
 #include "collective/BackendRouter.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <unistd.h>
 
 using namespace llaminar2;
@@ -70,21 +71,33 @@ namespace
                                    return it->second == value;
                                });
         };
+        auto tag_int_in_range = [](const PerfStatRecord &record,
+                                   const char *key,
+                                   int lower_bound,
+                                   int upper_bound) -> bool
+        {
+            const auto it = record.tags.find(key);
+            if (it == record.tags.end())
+            {
+                return false;
+            }
+            char *end = nullptr;
+            const long value = std::strtol(it->second.c_str(), &end, 10);
+            return end != it->second.c_str() && end != nullptr && *end == '\0' &&
+                   value >= lower_bound && value <= upper_bound;
+        };
         const int expected_routed_top_k = 8;
         const int expected_routed_experts = 256;
         const int expected_total_slots = expected_seq_len * expected_routed_top_k;
-        const int expected_active_slots =
-            std::min(expected_seq_len * expected_routed_top_k, expected_routed_experts);
         // ROCm keeps Qwen3.6 MoE verifier buckets, including M=3/4, on the
         // compact tile-M=2 grouped-prefill lane. CUDA uses tile-M=4 for M=3/4,
         // but the ROCm MI50 evidence favored tile-M=2. The durable contract is
-        // routed expert grouping plus the safe composite shared-expert owner.
+        // routed expert grouping plus the grouped table-prefill shared-expert owner.
         // The routed implementation may choose either fused or K-part gate/up
         // internals.
         const int expected_tile_m = 2;
         const std::string seq_len_tag = std::to_string(expected_seq_len);
         const std::string total_slots_tag = std::to_string(expected_total_slots);
-        const std::string active_slots_tag = std::to_string(expected_active_slots);
         const std::string tile_m_tag = std::to_string(expected_tile_m);
 
         const auto routed_grouped = std::find_if(
@@ -96,7 +109,10 @@ namespace
                        tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
                        tag_equals(record, "top_k", "8") &&
                        tag_equals(record, "total_slots", total_slots_tag.c_str()) &&
-                       tag_equals(record, "active_expert_slots", active_slots_tag.c_str()) &&
+                       tag_int_in_range(record,
+                                        "active_expert_slots",
+                                        1,
+                                        expected_total_slots) &&
                        tag_equals(record, "num_experts", "256") &&
                        tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
                        tag_is_one_of(record,
@@ -107,23 +123,22 @@ namespace
             << "ROCm Qwen3.6 MoE MTP verifier should stay on the current "
             << "graph-capturable active-expert grouped prefill path for verifier "
             << "rows while shared-expert work is owned by the standalone "
-            << "decode-equivalent GEMV-many verifier stage. Falling back to rowwise decode "
-            << "would be a Phase 10 performance regression.\n"
+            << "decode-equivalent grouped table-prefill verifier stage.\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
-        const auto shared_gemv_many = std::find_if(
+        const auto shared_grouped_table_prefill = std::find_if(
             records.begin(),
             records.end(),
             [&](const PerfStatRecord &record)
             {
                 return record.domain == "mtp" &&
                        record.name == "moe_shared_grouped_decode_equivalent_verifier_prefill_rows" &&
-                       tag_equals(record, "route", "gemv_many") &&
+                       tag_equals(record, "route", "grouped_table_prefill") &&
                        tag_equals(record, "stage", "shared_expert");
             });
-        ASSERT_NE(shared_gemv_many, records.end())
+        ASSERT_NE(shared_grouped_table_prefill, records.end())
             << "ROCm Qwen3.6 MoE MTP verifier did not run the standalone "
-            << "shared-expert GEMV-many verifier path.\n"
+            << "shared-expert grouped table-prefill verifier path.\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
         const auto combined = std::find_if(

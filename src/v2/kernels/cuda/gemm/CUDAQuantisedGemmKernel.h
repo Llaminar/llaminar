@@ -485,8 +485,16 @@ namespace llaminar2
              * @brief Already-quantized small-M activations -> native-VNNI GEMV.
              *
              * Used by fused activation paths that quantize a derived activation
-             * once, for example silu(gate)*up. Tests may pass false for
-             * use_specialized_small_m_kernel to compare against serial M=1 GEMVs.
+             * once, for example silu(gate)*up. Passing false for
+             * use_specialized_small_m_kernel is no longer a row-replay escape
+             * hatch; grouped specialized NativeVNNI is the only production path.
+             *
+             * @param execution_stream Optional explicit CUDA stream captured by
+             *        the caller at the start of a fused multi-projection launch.
+             *        LocalTP workers may reset request-scoped kernel dynamic
+             *        state concurrently on sibling devices, so decode-equivalent
+             *        publication paths must not depend on this kernel's mutable
+             *        gpu_stream_ member after dispatch begins.
              */
             bool multiply_quantized_small_m_gemv(
                 const int8_t *d_A_int8,
@@ -495,15 +503,34 @@ namespace llaminar2
                 const float *d_bias,
                 int m, int n, int k,
                 float alpha, float beta,
-                bool use_specialized_small_m_kernel = true);
+                bool use_specialized_small_m_kernel = true,
+                void *execution_stream = nullptr);
 
-            bool multiply_quantized_m1_via_small_m_gemv(
+            /**
+             * @brief Already-quantized M=1 activations -> canonical decode GEMV.
+             *
+             * MTP verifier publication compares grouped rows against serial
+             * decode.  This helper is the public serial-decode transaction after
+             * activation quantization: it launches the generated M=1 NativeVNNI
+             * GEMV on the caller's explicit stream, with no padded small-M
+             * detour and no alternate reduction order.  Keeping the call wrapped
+             * in one named helper lets fused QKV/gate-up paths and ordinary GEMM
+             * stages share the same strict oracle.
+             *
+             * @param execution_stream Optional explicit CUDA stream captured by
+             *        the caller at the start of a fused multi-projection launch.
+             *        When omitted, the kernel's bound stage stream is used.  A
+             *        null stream is rejected because verifier publication must
+             *        never enqueue work on CUDA's default stream.
+             */
+            bool multiply_quantized_m1_decode_gemv(
                 const int8_t *d_A_int8,
                 const float *d_scales_A_blockwise,
                 float *d_C,
                 const float *d_bias,
                 int n, int k,
-                float alpha, float beta);
+                float alpha, float beta,
+                void *execution_stream = nullptr);
 
             /**
              * @brief FP32 activations → quantize → INT8 GEMM → Q8_1 output

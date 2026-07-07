@@ -418,7 +418,8 @@ namespace llaminar2
                 collective_nodes,
                 policy.collectives_graph_capturable,
                 policy.force_recapture,
-                policy.defer_final_sync);
+                policy.defer_final_sync,
+                policy.before_begin_capture);
 
             if (success)
             {
@@ -461,7 +462,8 @@ namespace llaminar2
                                                                const std::unordered_set<std::string> *collective_nodes,
                                                                bool collectives_graph_capturable,
                                                                bool force_recapture,
-                                                               bool defer_final_sync)
+                                                               bool defer_final_sync,
+                                                               GraphCaptureBoundaryHook before_begin_capture)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -600,7 +602,8 @@ namespace llaminar2
                         {
                             mark_arena_write_dirty(id, device);
                         });
-                }};
+                },
+                nullptr};
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
@@ -732,7 +735,8 @@ namespace llaminar2
             [&](GraphSegment &segment, void *stream)
             {
                 post_captured_segment_launch(segment, stream);
-            }};
+            },
+            before_begin_capture};
 
         // Capture-phase hooks: same as replay hooks except post_launch skips
         // onGraphReplayed() callbacks. During capture, execute() already ran
@@ -759,7 +763,8 @@ namespace llaminar2
                         mark_arena_write_dirty(id, device);
                     },
                     /*skip_replay_callbacks=*/true);
-            }};
+            },
+            before_begin_capture};
 
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
         {

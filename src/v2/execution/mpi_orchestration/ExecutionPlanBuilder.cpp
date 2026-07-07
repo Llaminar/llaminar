@@ -329,6 +329,24 @@ namespace llaminar2
             // For CPU devices, match by NUMA node
             if (device.isCPU())
             {
+                /*
+                 * A one-rank local execution plan owns the whole host, not
+                 * just the socket whose index equals local_rank.  This matters
+                 * for explicit local CPU tensor-parallel domains such as
+                 * cpu:0,cpu:1: both NUMA participants are valid and both are
+                 * serviced by rank 0.  Multi-rank jobs keep the stricter
+                 * socket-to-local-rank ownership heuristic below so a
+                 * rank-qualified CPU domain still catches missing ranks.
+                 */
+                if (cluster_inventory.world_size == 1)
+                {
+                    const int numa_nodes = std::max(1, rank_inv.numa_nodes);
+                    if (device.numa_node < 0 || device.numa_node < numa_nodes)
+                    {
+                        return rank_inv.rank;
+                    }
+                }
+
                 // CPU device is typically on the rank's NUMA node
                 // Simple heuristic: rank N owns CPU on NUMA node rank % numa_nodes
                 if (device.numa_node == rank_inv.local_rank % std::max(1, rank_inv.numa_nodes))

@@ -147,7 +147,8 @@ namespace llaminar2
         // Clear cache on the stage we own
         if (my_stage_index_ >= 0 && stages_[my_stage_index_].runner)
         {
-            stages_[my_stage_index_].runner->clear_cache();
+            stages_[my_stage_index_].runner->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("pipeline-runner"));
         }
 
         // Reset position

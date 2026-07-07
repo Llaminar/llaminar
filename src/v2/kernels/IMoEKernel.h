@@ -250,6 +250,46 @@ namespace llaminar2
             MoERoutingResult &host_result,
             const int *device_effective_seq_len);
 
+        /**
+         * @brief Route MTP verifier rows with grouped serial-row-equivalent math.
+         *
+         * MTP verifier batches contain M=1..4 logical decode rows, but any accepted
+         * prefix may later be published into live state.  That makes ordinary
+         * small-prefill router math unsafe: a batched GEMM can accumulate gate
+         * logits in a different order than serial decode, changing top-k weights
+         * enough to drift downstream MoE outputs.  Backends that support this
+         * method must therefore compute every row with the same per-row math,
+         * K traversal, and reduction contract as M=1 decode while batching the
+         * verifier rows economically.  Row replay is a diagnostic oracle only;
+         * production implementations must publish the per-row top-k tensors
+         * directly from grouped backend work.
+         *
+         * Implementations must be graph-capturable on GPU backends:
+         * - no host top-k mirrors or stream synchronization,
+         * - no H2D copies from stack-owned row indices,
+         * - no allocation after graph warmup has declared the route workspace.
+         *
+         * The default deliberately returns false; verifier correctness should fail
+         * loudly on a backend that has not implemented the rowwise contract.
+         */
+        virtual bool routeVerifierRowsDecodeEquivalent(
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights)
+        {
+            (void)hidden;
+            (void)gate_weights;
+            (void)seq_len;
+            (void)d_model;
+            (void)num_experts;
+            (void)top_k;
+            (void)normalize_weights;
+            (void)output_indices;
+            (void)output_weights;
+            return false;
+        }
+
         /// Decode-only runtime-table routing path. GPU implementations may
         /// keep top-k results entirely device-resident and optionally fill the
         /// legacy routing tensors for existing staged consumers.
@@ -337,13 +377,18 @@ namespace llaminar2
             const int *host_token_indices, int num_tokens, int d_model);
 
         /**
-         * @brief Copy one logical row between tensors without host-side index staging.
+         * @brief Diagnostic/test helper that copies one logical row between tensors.
          *
-         * This is the verifier publication primitive: MTP row replay often needs
-         * "row N of the all-position tensor" copied into a one-row scratch tensor.
-         * GPU backends must implement this as a kernel that receives @p row_index
-         * by value so the hot path never enqueues H2D copies from stack-owned
-         * host indices.
+         * This API exists to probe backend row-addressing and tensor-residency
+         * handoffs in focused tests.  It must not be used as a production MTP
+         * verifier path: grouped verifier execution is required to consume the
+         * full verifier row set directly, preserve serial-decode math order, and
+         * publish state without looping through one-row scratch tensors.
+         *
+         * GPU backends still implement this as a tiny row-copy kernel so tests
+         * can validate device-side addressing without staging host-owned index
+         * arrays.  Production code should prefer grouped gather/scatter or
+         * explicit grouped verifier kernels.
          */
         virtual bool copyTokenRowFromTensor(
             ITensor *source, ITensor *row_buffer,
@@ -357,12 +402,13 @@ namespace llaminar2
             int num_tokens, int d_model);
 
         /**
-         * @brief Write one scratch row into a logical row of a destination tensor.
+         * @brief Diagnostic/test helper that writes one scratch row into a tensor.
          *
-         * The destination row is overwritten, not accumulated.  Decode-equivalent
-         * verifier replay zeroes or owns its destination row before writing, so a
-         * direct row store is both clearer and cheaper than scatter-add with a
-         * host-staged `{row, 1.0}` pair.
+         * The destination row is overwritten, not accumulated.  This is useful
+         * for focused coherence tests that need to seed a device tensor row, but
+         * it is not a verifier publication primitive.  Production MTP verifier
+         * rows must use grouped decode-equivalent execution and grouped
+         * publication paths rather than row-by-row scratch writes.
          */
         virtual bool writeTokenRowToTensor(
             ITensor *destination, ITensor *row_buffer,
@@ -583,6 +629,13 @@ namespace llaminar2
          * This variant consumes FP32 routing index tensors directly on device and
          * avoids the decode-time D2H top-k synchronization. Implementations may
          * return false to let stages fall back to the host-routed table path.
+         *
+         * @param expert_mask Optional host-side local-compute mask with one byte
+         * per logical expert.  When present, backends must convert route ids for
+         * masked-off experts to `-1` in their tiny device metadata buffer before
+         * launching descriptor-table kernels.  The original routing tensor is not
+         * modified because histograms and runtime placement publication still need
+         * the model's true top-k ids.
          */
         virtual bool groupedExpertGateUpDecodeFromRouting(
             const TensorBase *input,
@@ -592,7 +645,8 @@ namespace llaminar2
             ITensor *const *gate_outputs,
             ITensor *const *up_outputs,
             int d_model,
-            int intermediate)
+            int intermediate,
+            const uint8_t *expert_mask = nullptr)
         {
             (void)input;
             (void)routing_indices;
@@ -602,6 +656,7 @@ namespace llaminar2
             (void)up_outputs;
             (void)d_model;
             (void)intermediate;
+            (void)expert_mask;
             return false;
         }
 
@@ -667,7 +722,9 @@ namespace llaminar2
          *
          * Reads FP32 routing_indices and routing_weights directly on device,
          * selecting expert descriptors by expert id without host-side dynamic
-         * expert dispatch.
+         * expert dispatch.  If @p expert_mask is present, masked-off experts must
+         * be converted to inactive `-1` route ids in backend-owned scratch before
+         * the down kernel reads descriptor tables.
          */
         virtual bool groupedExpertDownDecodeFromRouting(
             ITensor *const *gate_tensors,
@@ -678,7 +735,8 @@ namespace llaminar2
             int top_k,
             ITensor *output,
             int d_model,
-            int intermediate)
+            int intermediate,
+            const uint8_t *expert_mask = nullptr)
         {
             (void)gate_tensors;
             (void)up_tensors;
@@ -689,6 +747,7 @@ namespace llaminar2
             (void)output;
             (void)d_model;
             (void)intermediate;
+            (void)expert_mask;
             return false;
         }
 
@@ -910,6 +969,42 @@ namespace llaminar2
         }
 
         /**
+         * @brief Project per-participant prefill LLEP transfer requests into one
+         *        domain-visible compact payload plan.
+         *
+         * Unlike decode maintenance, prefill LLEP can publish destination-local
+         * transfer requests from every participant after current-batch route
+         * planning.  This graph-capturable projection gathers those requests,
+         * emits the same merged plan on every participant, and remaps payload
+         * slots so each source has a unique compact payload lane across all
+         * destinations.  The router top-k choices are not changed here.
+         */
+        virtual bool projectPrefillLeastLoadedDomainCommands(
+            const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+            uint32_t plan_capacity,
+            DeviceMoERebalancePlanEntry *local_plan_entries,
+            uint32_t *local_plan_count,
+            DeviceMoERebalanceCommandBufferHeader *local_command_header,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceStatus *status,
+            uint32_t payload_slot_capacity,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)gathered_plan_entries;
+            (void)gathered_command_headers;
+            (void)plan_capacity;
+            (void)local_plan_entries;
+            (void)local_plan_count;
+            (void)local_command_header;
+            (void)config;
+            (void)status;
+            (void)payload_slot_capacity;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
          * @brief Materialize current-batch LLEP weight-transfer requirements
          *        into the standard rebalance command buffer ABI.
          *
@@ -938,10 +1033,12 @@ namespace llaminar2
          * The source descriptor buffer is produced by
          * packDeviceRebalanceSourceDescriptors().  This method packs only the
          * entries where this participant is the source into the local payload
-         * lane indexed as [destination_participant][plan_index] for the active
-         * command wave.  NCCL/RCCL allgather then moves these staging slots; the
-         * destination unpacks locally.  Device kernels must not read peer device
-         * pointers directly.
+         * lane indexed by the command's source-local compact payload slot for
+         * the active command wave.  NCCL/RCCL allgather then moves these staging
+         * slots; the destination unpacks locally.  Device kernels must not read
+         * peer device pointers directly.  Implementations initialize `status`
+         * for the whole transfer wave here; the matching unpack call appends
+         * destination-side counters to the same record.
          */
         virtual bool packDeviceRebalanceCompactPayloads(
             const DeviceMoERebalancePlanEntry *plan_entries,
@@ -997,6 +1094,14 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Unpack gathered expert payload slots into local transfer slots.
+         *
+         * This call intentionally preserves the `status` record written by the
+         * preceding pack call.  Source-side pack errors and destination-side
+         * unpack errors are published as one transfer-wave status so the graph
+         * controller can fail the wave before apply observes incomplete payloads.
+         */
         virtual bool unpackDeviceRebalanceCollectivePayloads(
             const DeviceMoERebalancePlanEntry *plan_entries,
             const uint32_t *plan_count,
@@ -1358,7 +1463,8 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            const DeviceMoERebalanceStatus *transfer_status);
+            const DeviceMoERebalanceStatus *transfer_status,
+            const DeviceMoERebalanceApplyStatus *apply_status);
 
         /**
          * @brief Gather one expert's fixed-capacity prefill batch from runtime grouping.

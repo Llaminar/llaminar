@@ -36,6 +36,7 @@
 #include "collective/backends/RCCLBackend.h"
 #include "collective/backends/RCCLDynamicLoader.h"
 #include "collective/DeviceGroup.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
@@ -714,9 +715,11 @@ namespace llaminar2
      * @brief Regress graph-captured grouped RCCL allreduce on participant streams.
      *
      * Prefill/decode captured collective graphs put every LocalTP participant
-     * stream into HIP graph capture, then rely on LocalTPContext to enqueue one
-     * grouped RCCL allreduce across those explicit streams. This small test
-     * exercises that capture contract without loading a model.
+     * stream into HIP graph capture and set GraphCaptureGuard while stages run.
+     * This test exercises that exact contract without loading a model.  It
+     * protects against the historical bug where guarded capture used
+     * independent participant-local RCCL launches instead of the grouped
+     * rcclGroupStart/rcclGroupEnd shape that ROCm accepts inside capture.
      */
     TEST_F(RCCLAllreduceAccuracyTest, ViaLocalTPContext_GraphCapturedGroupedOnStreamAllreduce)
     {
@@ -784,12 +787,16 @@ namespace llaminar2
                     start_cv.wait(lock, [&]() { return start_signal; });
                 }
 
-                const bool ok = tp_ctx_->allreduceOnStream(
-                    tensors[i].get(),
-                    "GraphCapturedGroupedOnStream",
-                    count,
-                    streams[i],
-                    "fp32");
+                bool ok = false;
+                {
+                    GraphCaptureGuard guard;
+                    ok = tp_ctx_->allreduceOnStream(
+                        tensors[i].get(),
+                        "GraphCapturedGroupedOnStream",
+                        count,
+                        streams[i],
+                        "fp32");
+                }
                 if (!ok)
                 {
                     all_success.store(false, std::memory_order_release);

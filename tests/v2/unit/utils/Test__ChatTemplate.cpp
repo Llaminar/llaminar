@@ -6,6 +6,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "qwen/qwen35/Qwen35ChatTemplate.generated.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Sampler.h"
 
@@ -650,6 +651,30 @@ TEST(Test__ChatTemplate, ThinkingModeAppendsStartTag)
     // Non-thinking mode may also have tags (model-dependent) but outputs differently
     EXPECT_NE(with_think, without_think)
         << "Thinking enabled vs disabled should produce different output";
+}
+
+TEST(Test__ChatTemplate, Qwen35CommunityTemplateHonorsNonThinkingControls)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    ASSERT_TRUE(tmpl->isThinkingModel());
+
+    std::vector<ChatMessage> messages = {
+        {"system", "<|think_off|>\nYou are a strict JSON renderer."},
+        {"user", "Return {\"answer\":\"ok\"} and no prose."},
+    };
+
+    std::string rendered = tmpl->apply(messages, true, false);
+    EXPECT_EQ(rendered.find("<|think_off|>"), std::string::npos)
+        << "Template control marker must not reach model input: " << rendered;
+    EXPECT_NE(rendered.find("<think>\n\n</think>\n\n"), std::string::npos)
+        << "Non-thinking Qwen prompts must close the thinking block before generation: "
+        << rendered;
+
+    std::string marker_overrides_true = tmpl->apply(messages, true, true);
+    EXPECT_NE(marker_overrides_true.find("<think>\n\n</think>\n\n"), std::string::npos)
+        << "<|think_off|> should override API thinking=true for deterministic E2E prompts: "
+        << marker_overrides_true;
 }
 
 // ============================================================================

@@ -778,6 +778,16 @@ namespace llaminar2
 
             const int d_v = config.gdn_state_size;
             const int d_k = d_v;
+            const int full_key_dim = n_k_heads_full * d_k;
+            const int full_value_dim = config.gdn_inner_size > 0
+                                           ? config.gdn_inner_size
+                                           : n_v_heads_full * d_v;
+            const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
+            const int full_recurrence_state_size = n_v_heads_full * d_k * d_v;
+            const int full_conv_state_size =
+                config.gdn_conv_kernel_size > 1
+                    ? full_qkv_dim * (config.gdn_conv_kernel_size - 1)
+                    : 0;
             const int key_dim = n_k_heads * d_k;
             const int value_dim = config.gdn_inner_size > 0
                                       ? (config.gdn_inner_size * n_v_heads / n_v_heads_full)
@@ -792,6 +802,8 @@ namespace llaminar2
                 state.d_k = d_k;
                 state.d_v = d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
+                state.full_recurrence_state_size = full_recurrence_state_size;
+                state.full_conv_state_size = full_conv_state_size;
                 state.initialize(qkv_dim);
             }
 

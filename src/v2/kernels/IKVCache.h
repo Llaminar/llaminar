@@ -39,6 +39,14 @@ namespace llaminar2
          *
          * The token range is logical within the sequence, not a physical ring row
          * range. Implementations may remap global_layer through first_layer_index().
+         *
+         * GPU implementations require @ref stream to be a non-null explicit
+         * stream for any import or non-empty export. The caller, not the cache,
+         * owns ordering that stream after graph replay, prefix restore/truncate,
+         * accepted MTP publication, and other live inference-state producers.
+         * Falling back to a default stream would hide lifetime bugs at the
+         * request boundary, so GPU caches must fail clearly when a streamful
+         * access is required but missing.
          */
         struct KVCacheLogicalBlockDescriptor
         {
@@ -272,6 +280,18 @@ namespace llaminar2
 
         /**
          * @brief Export a logical KV block into packed native-precision buffers.
+         *
+         * Exported floating payloads use the canonical logical-block
+         * serialization defined by the KV cache codec: positive and negative
+         * zero are normalized to positive zero while every non-zero payload bit
+         * is preserved.  Prefix caches and diagnostics must compare this
+         * canonical byte representation, not incidental backend scratch bytes.
+         *
+         * CPU caches copy synchronously from host memory. GPU caches enqueue
+         * device-to-host copies on @ref KVCacheLogicalBlockDescriptor::stream
+         * and synchronize that explicit stream before returning. Callers must
+         * first order the stream through the live inference-state observation
+         * boundary so the export cannot race graph-captured KV writers.
          */
         virtual bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
         {
@@ -283,6 +303,12 @@ namespace llaminar2
 
         /**
          * @brief Import a packed logical KV block into this cache.
+         *
+         * CPU caches copy synchronously into host memory. GPU caches enqueue
+         * host-to-device payload copies and sequence-metadata publication on
+         * @ref KVCacheLogicalBlockDescriptor::stream. Prefix restore and
+         * related mutation paths must pass a stream that has already waited for
+         * any live-state producers they are about to overwrite.
          */
         virtual bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
         {
@@ -440,6 +466,51 @@ namespace llaminar2
         virtual bool get_kv(int layer, int seq_idx,
                             const ITensor **out_k, const ITensor **out_v,
                             int *out_kv_len = nullptr) const = 0;
+
+        /**
+         * @brief Return a graph-snapshot-only direct physical KV view.
+         *
+         * Normal readers should use get_kv(), which may linearize wrapped ring
+         * buffers. This hook is for graph-captured diagnostics that need a
+         * stable device pointer before and after an append stage. Implementations
+         * must return false when the requested logical token span is not a
+         * direct contiguous physical range.
+         */
+        virtual bool get_kv_snapshot_view(int layer, int seq_idx,
+                                          int token_count,
+                                          ITensor **out_k, ITensor **out_v,
+                                          int *out_kv_len = nullptr)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)token_count;
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = 0;
+            return false;
+        }
+
+        virtual bool get_kv_snapshot_view(int layer, int seq_idx,
+                                          int token_count,
+                                          const ITensor **out_k, const ITensor **out_v,
+                                          int *out_kv_len = nullptr) const
+        {
+            ITensor *k = nullptr;
+            ITensor *v = nullptr;
+            const bool ok = const_cast<IKVCache *>(this)->get_kv_snapshot_view(
+                layer, seq_idx, token_count, &k, &v, out_kv_len);
+            if (ok)
+            {
+                if (out_k)
+                    *out_k = k;
+                if (out_v)
+                    *out_v = v;
+            }
+            return ok;
+        }
 
         // Convenience overloads for seq_idx=0
         bool get_kv(int layer, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr)

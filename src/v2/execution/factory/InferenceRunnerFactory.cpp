@@ -1148,10 +1148,94 @@ namespace llaminar2
         bool bypass_tensor_parallel = false;
         bool dense_decode_replicated_subset = false;
         bool dense_decode_mirrored_embedding_only = false;
+        bool replicated_terminal_lm_head_only = false;
+        bool replicated_terminal_bindings_only = false;
     };
 
-    static bool includeWeightInDenseDecodeReplicatedPlan(const std::string &weight_name)
+    /**
+     * @brief Return true when LocalTP MTP needs a replicated terminal head.
+     *
+     * This is narrower than dense decode replication.  It materializes
+     * output_norm/output.weight without cloning the whole dense transformer
+     * stack, allowing the MTP verifier to avoid a tiny logits collective while
+     * keeping ordinary TP prefill/decode sharded.
+     */
+    bool needsLocalTPMirroredMTPHeadWeights(const GraphConfig &graph_config)
     {
+        return graph_config.mtp.enabled &&
+               graph_config.mtp.mirror_full_head_for_local_tp &&
+               graph_config.lm_head_column_parallel &&
+               graph_config.tp_config &&
+               graph_config.tp_ctx &&
+               graph_config.tp_ctx->isLocal();
+    }
+
+    /**
+     * @brief Return true when a terminal PP decode sidecar needs an embedding table.
+     *
+     * Main terminal PP stages do not own token_embd.weight, but the MTP decode
+     * sidecar can still embed shifted draft rows locally before LM-head
+     * verification. Weight plans for decode-replicated dense sidecars must carry
+     * that explicit owner boundary; otherwise the orchestrator either fails
+     * fast for a missing mirrored embedding or, worse, silently builds a sidecar
+     * without the table it semantically owns.
+     */
+    bool requiresTerminalMTPSidecarEmbedding(
+        const GraphConfig &graph_config,
+        const FactoryPPStageConfig *pp_config)
+    {
+        return graph_config.mtp.enabled &&
+               pp_config != nullptr &&
+               pp_config->has_lm_head;
+    }
+
+    /**
+     * @brief Locate trailing nextn/MTP source layers in a planned weight list.
+     *
+     * Qwen3.6 marks a sidecar layer with blk.N.nextn.eh_proj.weight, but most
+     * of that same sidecar layer's weights keep normal transformer names such
+     * as blk.N.attn_q.weight or blk.N.ffn_gate_exps.weight.  Dense decode
+     * filtering therefore needs the source layer index, not only a string
+     * match on ".nextn.", to keep the complete verifier block.
+     */
+    static std::unordered_set<int> discoverDenseDecodeMTPSourceLayers(
+        const WeightValidationResult &validation)
+    {
+        std::unordered_set<int> source_layers;
+        for (const auto &[weight_name, _] : validation.weights_to_load)
+        {
+            if (weight_name.find(".nextn.eh_proj.weight") == std::string::npos)
+                continue;
+
+            const int layer = inferWeightLayer(weight_name);
+            if (layer >= 0)
+                source_layers.insert(layer);
+        }
+        return source_layers;
+    }
+
+    static bool includeWeightInDenseDecodeReplicatedPlan(
+        const std::string &weight_name,
+        const std::unordered_set<int> &mtp_source_layers)
+    {
+        /*
+         * Qwen3.6 stores the MTP verifier sidecar as a trailing blk.N.nextn
+         * block.  That block can contain MoE expert tensors whose names look
+         * routed (ffn_*_exps), but they are not ordinary base-layer routed
+         * expert residency.  The verifier is dense decode work: every
+         * phase-split decode participant must own the complete nextn block so
+         * grouped MTP rows remain mathematically identical to serial decode.
+         */
+        const int layer = inferWeightLayer(weight_name);
+        if (layer >= 0 && mtp_source_layers.find(layer) != mtp_source_layers.end())
+            return true;
+
+        if (weight_name.find(".nextn.") != std::string::npos ||
+            weight_name.rfind("mtp.", 0) == 0)
+        {
+            return true;
+        }
+
         const WeightRole role = inferWeightRole(weight_name);
         // Shared experts are always-on dense FFN work; only routed experts are
         // excluded from the dense/shared replicated subset.
@@ -1229,8 +1313,13 @@ namespace llaminar2
                                                 ? WeightSliceSpec{}
                                                 : vocabSliceSpecForAssignment(tp_config, device, options.tp_rank_override);
         const int pp_stage = pp_config ? pp_config->first_layer : -1;
+        const std::unordered_set<int> dense_decode_mtp_source_layers =
+            options.dense_decode_replicated_subset
+                ? discoverDenseDecodeMTPSourceLayers(validation)
+                : std::unordered_set<int>{};
 
-        if (!pp_config || pp_config->has_embedding || options.include_terminal_mtp_embedding)
+        if (!options.replicated_terminal_lm_head_only &&
+            (!pp_config || pp_config->has_embedding || options.include_terminal_mtp_embedding))
         {
             /**
              * Terminal PP stages normally do not own the main embedding stage,
@@ -1309,10 +1398,16 @@ namespace llaminar2
             }
         }
 
+        if (options.replicated_terminal_lm_head_only ||
+            options.replicated_terminal_bindings_only)
+            return plan;
+
         for (const auto &[weight_name, is_optional] : validation.weights_to_load)
         {
             if (options.dense_decode_replicated_subset &&
-                !includeWeightInDenseDecodeReplicatedPlan(weight_name))
+                !includeWeightInDenseDecodeReplicatedPlan(
+                    weight_name,
+                    dense_decode_mtp_source_layers))
             {
                 continue;
             }
@@ -2922,24 +3017,46 @@ namespace llaminar2
         }
 
         std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
+        const bool needs_mirrored_mtp_head =
+            needsLocalTPMirroredMTPHeadWeights(graph_config);
         if ((graph_config.dense_tp_decode_replicated ||
-             graph_config.dense_tp_decode_mirrored_embedding) &&
+             graph_config.dense_tp_decode_mirrored_embedding ||
+             needs_mirrored_mtp_head) &&
             graph_config.tp_config)
         {
+            const bool replicated_terminal_lm_head_only =
+                needs_mirrored_mtp_head &&
+                !graph_config.dense_tp_decode_replicated &&
+                !graph_config.dense_tp_decode_mirrored_embedding;
+            const bool replicated_terminal_bindings_only =
+                needs_mirrored_mtp_head &&
+                !graph_config.dense_tp_decode_replicated &&
+                graph_config.dense_tp_decode_mirrored_embedding;
+            const FactoryPPStageConfig *decode_pp_config =
+                config.pp_stage_config.has_value()
+                    ? &config.pp_stage_config.value()
+                    : nullptr;
             auto decode_weight_plan = buildSingleDeviceWeightPlan(
                 *weight_mgr,
                 *model_ctx,
                 validation,
                 device,
                 graph_config.tp_config.get(),
-                nullptr,
+                decode_pp_config,
                 SingleDeviceWeightPlanOptions{
+                    .include_terminal_mtp_embedding =
+                        requiresTerminalMTPSidecarEmbedding(graph_config, decode_pp_config),
                     .tp_rank_override = graph_config.local_rank,
                     .bypass_tensor_parallel = true,
                     .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
                     .dense_decode_mirrored_embedding_only =
                         graph_config.dense_tp_decode_mirrored_embedding &&
-                        !graph_config.dense_tp_decode_replicated,
+                        !graph_config.dense_tp_decode_replicated &&
+                        !needs_mirrored_mtp_head,
+                    .replicated_terminal_lm_head_only =
+                        replicated_terminal_lm_head_only,
+                    .replicated_terminal_bindings_only =
+                        replicated_terminal_bindings_only,
                 });
             if (!installPreparedWeightStoreForPlan(*weight_mgr, config, decode_weight_plan, "[InferenceRunner] decode replicated dense"))
                 return false;
@@ -3935,8 +4052,80 @@ namespace llaminar2
                 return nullptr;
             }
 
+            std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
+            const bool needs_mirrored_mtp_head =
+                needsLocalTPMirroredMTPHeadWeights(graph_config);
+            if ((graph_config.dense_tp_decode_replicated ||
+                 graph_config.dense_tp_decode_mirrored_embedding ||
+                 needs_mirrored_mtp_head) &&
+                graph_config.tp_config)
+            {
+                const bool replicated_terminal_lm_head_only =
+                    needs_mirrored_mtp_head &&
+                    !graph_config.dense_tp_decode_replicated &&
+                    !graph_config.dense_tp_decode_mirrored_embedding;
+                const bool replicated_terminal_bindings_only =
+                    needs_mirrored_mtp_head &&
+                    !graph_config.dense_tp_decode_replicated &&
+                    graph_config.dense_tp_decode_mirrored_embedding;
+                /*
+                 * The decode-replicated dense sidecar is an alternate weight
+                 * source for this runner, not a full-model escape hatch. In
+                 * nested TP-in-PP it must obey the same PP stage ownership as
+                 * the primary frozen set so terminal stages do not demand an
+                 * embedding table they do not own, and non-terminal stages do
+                 * not accidentally materialize LM-head bindings.
+                 */
+                auto decode_weight_plan = buildSingleDeviceWeightPlan(
+                    *concrete_weight_mgr,
+                    *concrete_model_ctx,
+                    validation,
+                    device,
+                    graph_config.tp_config.get(),
+                    &pp_cfg,
+                    SingleDeviceWeightPlanOptions{
+                        .include_terminal_mtp_embedding =
+                            requiresTerminalMTPSidecarEmbedding(graph_config, &pp_cfg),
+                        .tp_rank_override = graph_config.local_rank,
+                        .bypass_tensor_parallel = true,
+                        .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
+                        .dense_decode_mirrored_embedding_only =
+                            graph_config.dense_tp_decode_mirrored_embedding &&
+                            !graph_config.dense_tp_decode_replicated &&
+                            !needs_mirrored_mtp_head,
+                        .replicated_terminal_lm_head_only =
+                            replicated_terminal_lm_head_only,
+                        .replicated_terminal_bindings_only =
+                            replicated_terminal_bindings_only,
+                    });
+                if (!installPreparedWeightStoreForPlan(
+                        *concrete_weight_mgr,
+                        config,
+                        decode_weight_plan,
+                        "[InferenceRunner] PP stage decode replicated dense"))
+                {
+                    return nullptr;
+                }
+
+                auto decode_frozen_weights = concrete_weight_mgr->materialize(decode_weight_plan);
+                if (!concrete_weight_mgr->prepareWeightsForDevice(
+                        decode_frozen_weights,
+                        device,
+                        /*include_expert_jobs=*/false))
+                {
+                    LOG_ERROR("[InferenceRunner] PP stage replicated dense decode weight preparation failed for device "
+                              << device.to_string()
+                              << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
+                    return nullptr;
+                }
+                decode_replicated_dense_weights =
+                    std::make_unique<FrozenModelWeightSet>(std::move(decode_frozen_weights));
+            }
+
             orchestrator->setFrozenWeightSet(
                 std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
+            if (decode_replicated_dense_weights)
+                orchestrator->setDecodeReplicatedDenseWeightSet(std::move(decode_replicated_dense_weights));
             orchestrator->initializePreparedWeightStore(device);
         }
         else
@@ -4038,24 +4227,46 @@ namespace llaminar2
                     }
 
                     std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
+                    const bool needs_mirrored_mtp_head =
+                        needsLocalTPMirroredMTPHeadWeights(graph_config);
                     if ((graph_config.dense_tp_decode_replicated ||
-                         graph_config.dense_tp_decode_mirrored_embedding) &&
+                         graph_config.dense_tp_decode_mirrored_embedding ||
+                         needs_mirrored_mtp_head) &&
                         graph_config.tp_config)
                     {
+                        const bool replicated_terminal_lm_head_only =
+                            needs_mirrored_mtp_head &&
+                            !graph_config.dense_tp_decode_replicated &&
+                            !graph_config.dense_tp_decode_mirrored_embedding;
+                        const bool replicated_terminal_bindings_only =
+                            needs_mirrored_mtp_head &&
+                            !graph_config.dense_tp_decode_replicated &&
+                            graph_config.dense_tp_decode_mirrored_embedding;
+                        const FactoryPPStageConfig *decode_pp_config =
+                            config.pp_stage_config.has_value()
+                                ? &config.pp_stage_config.value()
+                                : nullptr;
                         auto decode_weight_plan = buildSingleDeviceWeightPlan(
                             *concrete_weight_mgr,
                             *concrete_model_ctx,
                             validation,
                             device,
                             graph_config.tp_config.get(),
-                            nullptr,
+                            decode_pp_config,
                             SingleDeviceWeightPlanOptions{
+                                .include_terminal_mtp_embedding =
+                                    requiresTerminalMTPSidecarEmbedding(graph_config, decode_pp_config),
                                 .tp_rank_override = graph_config.local_rank,
                                 .bypass_tensor_parallel = true,
                                 .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
                                 .dense_decode_mirrored_embedding_only =
                                     graph_config.dense_tp_decode_mirrored_embedding &&
-                                    !graph_config.dense_tp_decode_replicated,
+                                    !graph_config.dense_tp_decode_replicated &&
+                                    !needs_mirrored_mtp_head,
+                                .replicated_terminal_lm_head_only =
+                                    replicated_terminal_lm_head_only,
+                                .replicated_terminal_bindings_only =
+                                    replicated_terminal_bindings_only,
                             });
                         if (!installPreparedWeightStoreForPlan(
                                 *concrete_weight_mgr,

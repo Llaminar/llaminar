@@ -867,6 +867,10 @@ namespace llaminar2
         {
             errors.push_back("MoE rebalance window growth factor must be > 0");
         }
+        if (moe_rebalance.prefill_window_tokens < 0)
+        {
+            errors.push_back("MoE rebalance prefill window tokens must be >= 0");
+        }
 
         // Validate precision strings
         {
@@ -1060,6 +1064,8 @@ namespace llaminar2
         oss << "    rebalance_window: " << moe_rebalance.window_size << "\n";
         oss << "    rebalance_max_window: " << moe_rebalance.max_window_size << "\n";
         oss << "    rebalance_window_growth: " << moe_rebalance.window_growth_factor << "\n";
+        oss << "    rebalance_prefill_window_tokens: "
+            << moe_rebalance.prefill_window_tokens << "\n";
         oss << "    dynamic_imbalance_threshold_permille: "
             << moe_rebalance.dynamic_imbalance_threshold_per_mille << "\n";
         oss << "    dynamic_min_improvement_permille: "
@@ -1082,6 +1088,14 @@ namespace llaminar2
             << moe_rebalance.device_min_router_spread_improvement_per_payload_slot << "\n";
         oss << "    device_max_post_wave_load_spread_permille: "
             << moe_rebalance.device_max_post_wave_load_spread_per_mille << "\n";
+        oss << "    device_llep_alpha: "
+            << moe_rebalance.device_llep_alpha_numerator
+            << "/" << moe_rebalance.device_llep_alpha_denominator << "\n";
+        oss << "    device_llep_lambda: "
+            << moe_rebalance.device_llep_lambda_numerator
+            << "/" << moe_rebalance.device_llep_lambda_denominator << "\n";
+        oss << "    device_llep_enable_balanced_skip: "
+            << (moe_rebalance.device_llep_enable_balanced_skip ? "true" : "false") << "\n";
         oss << "    release_raw_expert_weights: "
             << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
 
@@ -1116,6 +1130,8 @@ namespace llaminar2
         oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
         oss << "    max_request_batch: " << mtp.max_request_batch << "\n";
         oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
+        oss << "    mirror_full_head_for_local_tp: "
+            << (mtp.mirror_full_head_for_local_tp ? "true" : "false") << "\n";
         oss << "    depth_policy: " << mtpDepthPolicyModeToString(mtp.depth_policy.mode) << "\n";
         oss << "    min_draft_tokens: " << mtp.depth_policy.min_depth << "\n";
         oss << "    max_draft_tokens: " << mtp.depth_policy.max_depth << "\n";

@@ -523,11 +523,12 @@ Implemented or partially implemented:
   local span slice. Transfer-command materialization also avoids dead plan-buffer
   zero-fill and uses a deterministic parallel no-overflow fast path with shared
   transfer staging and parallel status bookkeeping.
-- 2026-07-02 validation after tuning current-batch LLEP assignment and
-  materialization: `V2_Perf_MoELLEPDeterminism`,
-  `V2_Integration_CUDAMoEKernel`, `V2_Integration_ROCmMoEKernel`, and focused
-  CUDA2/ROCm2 Qwen3.6 LLEP `PrefillParity`, `DecodeParity`, and
-  `LongContextDecodeParity` passed.
+- 2026-07-02 validation after tuning grouped route scatter, Dynamic
+  maintenance, current-batch LLEP assignment, and materialization:
+  `V2_Perf_MoELLEPDeterminism`, `V2_Integration_CUDAMoEKernel`,
+  `V2_Integration_ROCmMoEKernel`, and focused phase-split CUDA2/ROCm2 Qwen3.6
+  Dynamic/LLEP `PrefillParity`, `DecodeParity`, `LongContextDecodeParity`, and
+  Dynamic `SnapshotInfrastructure` passed.
 - 2026-07-01 validation after exposing device movement-cost gates: integration
   and release builds passed; focused config/DebugEnv/LLEP tests passed; full
   unit suite passed (`514/514`).
@@ -647,6 +648,7 @@ keeps only the current design signal:
 
 | Scenario | Result | Takeaway |
 | --- | --- | --- |
+| CUDA/ROCm MoE deterministic maintenance, grouped route, and payload movement perf, 512 tokens, 256 experts, top-k 8, 4 participants, 2026-07-02 | `V2_Perf_MoELLEPDeterminism`: grouped prefill routes are CUDA `62.58 us` and ROCm `192.34 us` with hash `5063458188956773059`; Dynamic maintenance pack/controller is CUDA `156.97 us` and ROCm `521.71 us` with plan hash `10755319433736730929`; payload movement/apply improved to CUDA `281.48 us` and ROCm `512.52 us` with hash `16961506041180432709`. Component rows: CUDA pack `57.77 us`, bucket copy `39.55 us`, unpack `54.15 us`, apply `118.93 us`; ROCm pack `78.12 us`, bucket copy `39.89 us`, unpack `70.19 us`, apply `267.90 us`. | The deterministic grouped scatter uses block-wide chunked slot scans instead of one lane per expert. Plain Dynamic ownership planning has a gated fast path that bypasses the generic LLEP/hot-cache controller body while still using the shared ownership-swap helper. Payload pack/unpack no longer collapses to byte copies when the slot header leaves payload data 8/4/2-byte aligned rather than 16-byte aligned, and unpack now launches against the selected transfer-slot bucket instead of full plan capacity. Apply remains the largest remaining movement component, especially on ROCm. |
 | CUDA/ROCm current-batch LLEP deterministic kernel perf, 512 tokens, 256 experts, top-k 8, 4 participants, 2026-07-02 | `V2_Perf_MoELLEPDeterminism`: CUDA assignment `4.28 us`, CUDA transfer-command materialization `5.58 us`; ROCm assignment `11.55 us`, ROCm materialization `34.70 us`. Hashes matched across backends: route assignment `9513987820616991619`, transfer plan `345862852378021593`. | Assignment no longer has the single-thread/per-expert route-slot walk (`~415 us` CUDA and `~1285 us` ROCm before tuning). ROCm materialization dropped from `~86 us` to `~35 us` by removing dead zero-fill and parallelizing the no-overflow command path, while preserving deterministic command order. |
 | CUDA2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 122.74 vs 125.80 tok/s decode; prefill 3235.87 vs 3227.29 tok/s | Dynamic path is healthy after the CUDA descriptor rebind fix. This sample had no payload movement (`payload_bucket_slots=0`, `apply_changed_layers=0`), so it proves overhead recovery, not policy benefit. |
 | ROCm2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 66.13 vs 65.63 tok/s decode; prefill 1145.22 vs 1144.90 tok/s | ROCm stayed healthy after the shared rebind guard. This sample also had no movement, so policy tuning still needs movement-positive traces. |
@@ -747,6 +749,31 @@ Performance gates:
 - Router top-k expert ids and route weights must remain exact.
 - Shared experts follow dense policy. Routed experts are the only rebalanced
   experts.
+
+## Parity Profiling Snapshot
+
+Added an opt-in parity wall-time profiler via `LLAMINAR_PARITY_PROFILE=1`.
+Focused Qwen3.6 MoE ExpertOverlay decode parity runs show the slow tests are
+dominated by full two-device runner construction, not the decode/snapshot
+comparison body:
+
+- CUDA2 LLEP decode parity: 69.7s test wall; 61.9s setup, 52.0s
+  `createRankOrchestrator`, 9.1s model context load, 6.0s decode parity body,
+  0.9s total decode graph execution for three steps.
+- ROCm2 LLEP decode parity, warm run: 104.5s test wall; 89.0s setup, 74.2s
+  `createRankOrchestrator`, 9.2s model context load, 5.3s LocalTP/RCCL context,
+  13.1s decode parity body, 2.3s total decode graph execution for three steps.
+- ROCm2 Dynamic decode parity: 105.2s test wall; 93.0s setup, 76.8s
+  `createRankOrchestrator`, 9.0s model context load, 6.9s LocalTP/RCCL context,
+  10.1s decode parity body, 2.4s total decode graph execution for three steps.
+- PyTorch snapshot `.npy` loads are not material at this scale: about 1,203
+  loads take under 80ms total once snapshots already exist. Layer comparison is
+  about 140-160ms total for three decode steps.
+
+The main suite-speed target is therefore reuse or amortization of
+`RankOrchestrator` setup and device weight finalization/upload/preparation
+across parity cases, or separating kernel-level decode profiling from full
+runner reconstruction when the full production graph is not required.
 
 ## Next Work
 

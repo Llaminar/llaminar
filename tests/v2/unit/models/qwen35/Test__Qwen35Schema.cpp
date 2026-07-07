@@ -327,6 +327,29 @@ TEST(Test__Qwen35Schema, CreatesValidSchema)
     EXPECT_FALSE(schema.required_params.empty());
 }
 
+TEST(Test__Qwen35Schema, SnapshotShardingDeclaresCapturedDenseSemanticKeys)
+{
+    Qwen35SchemaFactory factory;
+    StageShardingConfig sharding = factory.getStageShardingConfig();
+
+    EXPECT_EQ(sharding.at("EMBEDDING"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("EMBEDDING_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("ATTENTION_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("ATTENTION_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("FFN_DOWN"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("FFN_DOWN_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("Q_NORM"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("K_NORM"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("KV_APPEND_SOURCE_K"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("KV_CACHE_K"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("GDN_Z_PROJECTION"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("GDN_ALPHA"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("GDN_BETA"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("GDN_CONV1D_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("GDN_DELTA_RULE_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("GDN_NORM_GATE_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
+}
+
 TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
 {
     Qwen35SchemaFactory factory;

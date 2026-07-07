@@ -150,7 +150,8 @@ namespace llaminar2
     {
         if (initialized_ && inner_runner_)
         {
-            inner_runner_->clear_cache();
+            inner_runner_->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("multi-domain-orchestrator"));
         }
     }
 

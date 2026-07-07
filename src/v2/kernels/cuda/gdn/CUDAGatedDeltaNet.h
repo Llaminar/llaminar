@@ -255,6 +255,12 @@ namespace llaminar2
             return state_size_ > 0 ? static_cast<size_t>(state_size_) * sizeof(float) : 0;
         }
 
+        size_t largestStateBytes() const override
+        {
+            const int largest_state_size = std::max(state_size_, secondary_state_size_);
+            return largest_state_size > 0 ? static_cast<size_t>(largest_state_size) * sizeof(float) : 0;
+        }
+
         /// Allocate GPU state buffer for the recurrence state [n_heads * d_k * d_v]
         void allocateState(int state_size)
         {
@@ -556,6 +562,41 @@ namespace llaminar2
             return true;
         }
 
+        bool exportStateForSize(int target_state_size, void *dst_host, void *dst_device, void *stream) override
+        {
+            if (target_state_size <= 0)
+                return true;
+            if (!dst_host && !dst_device)
+                return false;
+
+            const float *src = nullptr;
+            if (gpu_state_ && state_size_ == target_state_size)
+                src = gpu_state_;
+            else if (secondary_gpu_state_ && secondary_state_size_ == target_state_size)
+                src = secondary_gpu_state_;
+            if (!src)
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (dst_device)
+            {
+                auto *dst = static_cast<float *>(dst_device);
+                if (stream)
+                    cudaGDN_gpu_memcpy_async(dst, src, static_cast<size_t>(target_state_size), stream);
+                else
+                    cudaGDN_gpu_memcpy(dst, src, static_cast<size_t>(target_state_size));
+            }
+            else
+            {
+                auto *dst = static_cast<float *>(dst_host);
+                if (stream)
+                    cudaGDN_gpu_memcpy_d2h_async(dst, src, static_cast<size_t>(target_state_size), stream);
+                else
+                    cudaGDN_gpu_memcpy_d2h(dst, src, static_cast<size_t>(target_state_size));
+            }
+            return true;
+        }
+
         bool importState(const void *src_host, const void *src_device, void *stream) override
         {
             if (stateBytes() == 0)
@@ -578,6 +619,33 @@ namespace llaminar2
             {
                 cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
             }
+            return true;
+        }
+
+        bool importStateForSize(int target_state_size, const void *src_host, const void *src_device, void *stream) override
+        {
+            if (target_state_size <= 0)
+                return true;
+            const auto *src = static_cast<const float *>(src_host ? src_host : src_device);
+            if (!src)
+                return false;
+            if (!ensureActiveState(target_state_size, "CUDAGatedDeltaNet::importStateForSize"))
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (stream)
+                cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(target_state_size), stream);
+            else
+                cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(target_state_size));
+            /*
+             * Prefix restore and accepted-state publication replace the active
+             * live state.  A previously allocated request-batched bank may
+             * still have the right shape but contain zeroed or stale per-request
+             * state, so force the next request-batched prefill to reseed it from
+             * the freshly imported active bank.
+             */
+            request_state_bank_state_size_ = 0;
+            request_state_bank_capacity_ = 0;
             return true;
         }
 

@@ -8,11 +8,13 @@
 
 #include "CuBLASGemmKernel.h"
 #include "backends/IWorkerGPUContext.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 
 #include <iostream>
 #include <stdexcept>
 #include <array>
+#include <cstdlib>
 #include <vector>
 
 #ifdef HAVE_CUDA
@@ -552,7 +554,8 @@ namespace llaminar2
             const std::vector<float *> &d_C_matrices,
             int M, int N, int K,
             bool transA, bool transB,
-            float alpha, float beta)
+            float alpha, float beta,
+            DeviceWorkspaceManager *workspace_override)
         {
             if (!handle_)
             {
@@ -592,15 +595,24 @@ namespace llaminar2
             }
 
             CUDA_CHECK(cudaSetDevice(device_id_));
+            cublasStatus_t stream_status =
+                cublasSetStream(handle_, static_cast<cudaStream_t>(gpu_stream_));
+            if (stream_status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] cublasSetStream failed: "
+                          << static_cast<int>(stream_status));
+                return false;
+            }
 
-            if (!workspace_)
+            DeviceWorkspaceManager *effective_workspace = workspace_override ? workspace_override : workspace_;
+            if (!effective_workspace)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Batched pointer workspace is not bound");
                 return false;
             }
-            auto *d_A_array = static_cast<const float **>(workspace_->getBuffer(kBatchedSameAAArray));
-            auto *d_B_array = static_cast<const float **>(workspace_->getBuffer(kBatchedSameABArray));
-            auto *d_C_array = static_cast<float **>(workspace_->getBuffer(kBatchedSameACArray));
+            auto *d_A_array = static_cast<const float **>(effective_workspace->getBuffer(kBatchedSameAAArray));
+            auto *d_B_array = static_cast<const float **>(effective_workspace->getBuffer(kBatchedSameABArray));
+            auto *d_C_array = static_cast<float **>(effective_workspace->getBuffer(kBatchedSameACArray));
             if (!d_A_array || !d_B_array || !d_C_array)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Missing batched pointer workspace buffers");
@@ -633,7 +645,40 @@ namespace llaminar2
                 d_C_array);
             CUDA_CHECK(cudaGetLastError());
 
-            CUBLAS_CHECK(cublasSgemmBatched(
+            if (DebugEnv::envValue("LLAMINAR_CUBLAS_BSAMEA_DIAG") != nullptr)
+            {
+                cudaStreamCaptureStatus pre_capture_status = cudaStreamCaptureStatusNone;
+                const cudaError_t pre_capture_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(gpu_stream_), &pre_capture_status);
+                fprintf(stderr,
+                        "[CuBLASGemmKernel::execute_batched_same_a] pre-cublas diag: "
+                        "device_id=%d stream=%p capture_status=%d capture_query=%s "
+                        "M=%d N=%d K=%d batch=%d d_A_array=%p d_B_array=%p d_C_array=%p\n",
+                        device_id_,
+                        gpu_stream_,
+                        static_cast<int>(pre_capture_status),
+                        cudaGetErrorString(pre_capture_err),
+                        M,
+                        N,
+                        K,
+                        batch_count,
+                        static_cast<const void *>(d_A_array),
+                        static_cast<const void *>(d_B_array),
+                        static_cast<void *>(d_C_array));
+                if (pre_capture_err == cudaSuccess &&
+                    pre_capture_status == cudaStreamCaptureStatusNone)
+                {
+                    const cudaError_t pre_sync_err =
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                    fprintf(stderr,
+                            "[CuBLASGemmKernel::execute_batched_same_a] pre-cublas pointer-stage sync: %s\n",
+                            cudaGetErrorString(pre_sync_err));
+                    if (pre_sync_err != cudaSuccess)
+                        return false;
+                }
+            }
+
+            cublasStatus_t status = cublasSgemmBatched(
                 handle_,
                 opB, opA,
                 N, M, K,
@@ -642,7 +687,43 @@ namespace llaminar2
                 d_A_array, lda,
                 &beta,
                 d_C_array, ldc,
-                batch_count));
+                batch_count);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                int current_device = -1;
+                (void)cudaGetDevice(&current_device);
+                cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+                const cudaError_t capture_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(gpu_stream_), &capture_status);
+                const cudaError_t sticky_err = cudaPeekAtLastError();
+                fprintf(stderr,
+                        "[CuBLASGemmKernel::execute_batched_same_a] cublasSgemmBatched failed: "
+                        "status=%d device_id=%d current_device=%d stream=%p capture_status=%d "
+                        "capture_query=%s sticky=%s M=%d N=%d K=%d batch=%d "
+                        "d_A=%p d_A_array=%p d_B_array=%p d_C_array=%p "
+                        "B0=%p B1=%p C0=%p C1=%p workspace=%p\n",
+                        static_cast<int>(status),
+                        device_id_,
+                        current_device,
+                        gpu_stream_,
+                        static_cast<int>(capture_status),
+                        cudaGetErrorString(capture_err),
+                        cudaGetErrorString(sticky_err),
+                        M,
+                        N,
+                        K,
+                        batch_count,
+                        static_cast<const void *>(d_A),
+                        static_cast<const void *>(d_A_array),
+                        static_cast<const void *>(d_B_array),
+                        static_cast<void *>(d_C_array),
+                        batch_count > 0 ? static_cast<const void *>(b[0]) : nullptr,
+                        batch_count > 1 ? static_cast<const void *>(b[1]) : nullptr,
+                        batch_count > 0 ? static_cast<void *>(c[0]) : nullptr,
+                        batch_count > 1 ? static_cast<void *>(c[1]) : nullptr,
+                        static_cast<void *>(effective_workspace));
+                return false;
+            }
 
             return true;
         }
@@ -727,7 +808,8 @@ namespace llaminar2
             const std::vector<const float *> &,
             const std::vector<float *> &,
             int, int, int,
-            bool, bool, float, float)
+            bool, bool, float, float,
+            DeviceWorkspaceManager *)
         {
             return false;
         }

@@ -55,6 +55,10 @@
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
 #include "../../factory/FactoryPPStageConfig.h" // For FactoryPPStageConfig (circular-dependency-safe)
+#include "../../mtp/MTPSpecStateContract.h"
+#include "../../../kernels/common/SamplingMath.h"
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -432,6 +436,27 @@ namespace llaminar2
          * @return true if forward pass succeeded on all devices
          */
         bool forward(const int *tokens, int seq_len) override;
+        bool forwardPrefill(const int *tokens, int seq_len) override;
+        /**
+         * @brief Run a LocalTP forward where every child consumes its own
+         *        staged device-token row.
+         *
+         * prepareMTPVerifierInputTokensOnDevice*() returns a rank-owned bundle
+         * of child token pointers.  This override fans the bundle out through
+         * the TP worker pool so all collective participants enter the verifier
+         * graph together.
+         */
+        bool forwardWithDeviceTokenIds(
+            const int *token_shadow,
+            const void *token_ids_device,
+            int seq_len) override;
+        bool supportsPrefillChunkSchedule(int seq_len) const override;
+        bool forwardPrefillChunkSchedule(
+            const int *tokens,
+            int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int pad_token_id,
+            bool allow_padded_execution) override;
         DeviceId primaryDeviceId() const override;
 
         /**
@@ -474,6 +499,17 @@ namespace llaminar2
         bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index = 0) override;
+        /**
+         * @brief Return a rank-owned aggregate of child resident logical-state
+         *        mailboxes after grouped compact publication.
+         *
+         * The returned handle is an identity token for RankOrchestrator; callers
+         * must pass it back to rank-level resident-state methods rather than
+         * dereferencing its device-row pointers directly.  Rank then dispatches
+         * the matching child-owned mailbox handle to every LocalTP participant.
+         */
+        DeviceResidentLogicalSequenceStateHandle
+        deviceResidentLogicalSequenceState() const override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -487,6 +523,12 @@ namespace llaminar2
             int position_offset_override = -1,
             int already_appended_shifted_kv_tokens = -1) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
             int32_t token,
             int already_appended_tokens,
             bool allow_speculative_discard = false,
@@ -520,6 +562,20 @@ namespace llaminar2
          * own KV/recurrent/terminal-hidden slice from the same speculative step.
          */
         bool supportsMTPSpecStatePublication() const override;
+        /**
+         * @brief True when every active participant supports the grouped
+         *        decode-equivalent publication lane.
+         *
+         * Rank-level publication is a collective live-state mutation.  The rank
+         * can only advertise grouped decode-equivalent publication when each
+         * LocalTP child or PP stage can consume the same clamped
+         * MTPSpecStepPlanBatch through its own narrow grouped-publish entry
+         * point.
+         *
+         * @return true when all active rank participants support the narrow
+         *         grouped decode-equivalent publisher.
+         */
+        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override;
         MTPVerifierRowCapability mtpVerifierRowCapability() const override;
         MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
 
@@ -545,6 +601,58 @@ namespace llaminar2
          * recurrent state, or terminal hidden buffers.
          */
         bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        /**
+         * @brief Publish a grouped decode-equivalent MTP transaction on every
+         *        LocalTP or LocalPP participant.
+         *
+         * The rank first clamps accepted counts through the same common-prefix
+         * coordination used by direct batch publication.  It then calls each
+         * child runner's grouped decode-equivalent publisher, not the ordinary
+         * direct publisher, so LocalTP can use grouped verifier rows without
+         * accidentally advertising the stronger all-position contract.
+         *
+         * @param plans Host-visible accepted-row plan for every logical request.
+         * @param error Optional destination for the first participant failure.
+         * @return true when every participant published the common accepted
+         *         prefix and no child observed a divergent publication plan.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        /**
+         * @brief True when rank-owned compact verifier outcomes can drive
+         *        grouped accepted-state publication.
+         *
+         * Multi-child LocalTP does not have a single participant device mailbox
+         * for the entire rank.  It can still avoid row replay: the rank reduces
+         * sharded verifier logits into the shared compact SamplingMath outcome,
+         * builds the canonical accepted-row transaction, and fans that plan out
+         * through every child's grouped decode-equivalent publisher.
+         */
+        bool supportsDeviceResidentMTPSpecStatePublication() const override;
+        /**
+         * @brief Publish LocalTP accepted state from a rank-owned compact outcome.
+         *
+         * The outcome handle must have been produced by
+         * verifyGreedyAllPositionBatchOutcomeOnDeviceResident() on this same
+         * RankOrchestrator instance.  Publication uses grouped child APIs only;
+         * it must not call serial row replay or promote LocalTP to the broader
+         * direct all-position publication capability.
+         */
+        bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+            const DeviceSpeculativePublicationRequest &request,
+            std::string *error = nullptr) override;
+        /**
+         * @brief Refresh rank host mirrors after grouped compact publication.
+         *
+         * The child runners already published live state during
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  This method only
+         * adopts the accepted boundary into RankOrchestrator's aggregate
+         * position/sequence mirrors.
+         */
+        bool adoptDeviceResidentMTPSpecPublishedHostState(
             const MTPSpecStepPlanBatch &plans,
             std::string *error = nullptr) override;
         const float *getAllPositionLogits() const override;
@@ -589,6 +697,18 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /**
+         * @brief Materialize a rank-owned compact verifier handle for response
+         *        bookkeeping.
+         *
+         * This is a compatibility bridge.  It copies from small rank-owned
+         * compact arrays, not from row replay, and the publication path consumes
+         * the same compact summary before this bridge is needed for response
+         * tokens.
+         */
+        bool copyDeviceSpeculativeOutcomesToHost(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
         bool supportsDeviceStochasticMTPVerification() const override;
         bool buildStochasticDistributionOnDevice(
             DeviceLogitsSource source,
@@ -639,6 +759,9 @@ namespace llaminar2
             const int32_t *draft_tokens,
             int draft_token_count,
             int first_draft_slot = 0) override;
+        bool stageStochasticTargetTokenForDeviceSampling(
+            int32_t target_token,
+            int target_sample_slot = 0) override;
         const void *prepareMTPVerifierInputTokensOnDevice(
             int32_t first_token,
             int first_draft_slot,
@@ -700,6 +823,10 @@ namespace llaminar2
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
             bool use_vllm_probability_rejection = false) override;
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
         void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
 
@@ -791,11 +918,12 @@ namespace llaminar2
          * @brief Reset request-scoped live inference state on every participant.
          *
          * This is the multi-device request boundary corresponding to
-         * IInferenceRunner::clear_cache().  It must clear KV/recurrent state,
-         * logical positions, pending handoffs, and request-local metadata across
-         * all child runners in lockstep while preserving child graph topology,
-         * prepared weights, workspaces, and device contexts.
+         * IInferenceRunner::resetInferenceState(). It must clear KV/GDN,
+         * logical positions, MTP sidecars/handoffs, and request-local metadata
+         * across all child runners in lockstep while preserving child graph
+         * topology, prepared weights, workspaces, and device contexts.
          */
+        void resetInferenceState(const InferenceStateResetRequest &request) override;
         void clear_cache() override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
@@ -1146,7 +1274,13 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @return true if forward pass succeeded on all devices
          */
-        bool forwardTP(const int *tokens, int seq_len);
+        bool forwardTP(
+            const int *tokens,
+            int seq_len,
+            bool force_prefill_phase = false,
+            const PrefillChunkSchedulerPolicy *chunk_schedule_policy = nullptr,
+            int chunk_schedule_pad_token_id = 0,
+            bool chunk_schedule_allow_padded_execution = false);
 
         /**
          * @brief Execute forward pass in PP mode (sequential)
@@ -1158,16 +1292,17 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @return true if forward pass succeeded
          */
-        bool forwardPP(const int *tokens, int seq_len);
+        bool forwardPP(const int *tokens, int seq_len, bool force_prefill_phase = false);
 
         /**
-         * @brief Worker watchdog timeout for the current TP lifecycle phase.
+         * @brief Worker join timeout for TP runner operations.
          *
-         * The first TP forward can spend a long time lazily materializing per-device
-         * graphs and GPU workspaces before every participant reaches its first
-         * collective. Steady-state forwards keep the configured fail-fast timeout.
+         * Collective timeouts are enforced inside LocalTP/NCCL/RCCL rendezvous
+         * calls. Worker joins wait for the per-device runner operation to finish
+         * so snapshot-heavy parity/debug forwards are not mistaken for a stuck
+         * single collective.
          */
-        int effectiveTPWorkerCollectTimeoutMs() const;
+        int effectiveTPWorkerJoinTimeoutMs() const;
 
         /**
          * @brief Return the PP stage that owns MTP sidecar execution.
@@ -1187,9 +1322,40 @@ namespace llaminar2
         const IInferenceRunner *finalPPSidecarRunner() const;
 
         /**
+         * @brief Refresh rank-owned public sequence metadata from the primary child runner.
+         *
+         * DeviceGraphOrchestrator instances own the real KV, recurrent, short-conv,
+         * terminal-hidden, and logits payloads.  RankOrchestrator still exposes
+         * aggregate `position`, `padded_seq_len`, and `sequence_lengths` through
+         * the same IInferenceRunner API, and debug/replay code reads those values
+         * when comparing committed MTP state against serial replay.
+         *
+         * MTP spec-state publication is unusual because a verifier graph may first
+         * advance rank-level bookkeeping for all verifier rows, then each child
+         * runner publishes only the accepted prefix.  After publication succeeds,
+         * the rank wrapper must adopt the child-visible accepted boundary so a
+         * rejected correction token remains pending instead of looking as though
+         * the rank already consumed it.
+         */
+        void refreshAggregateSequenceStateFromPrimaryRunnerAfterPublication();
+
+        /**
          * @brief Aggregate stats from all device runners
          */
         void aggregateStats() const;
+
+        /**
+         * @brief Apply runtime-specific TP snapshot sharding overrides.
+         *
+         * Static schemas describe architectural defaults, but some snapshot
+         * lifetimes depend on the concrete model dimensions and TP degree.  GQA
+         * K/V streams are the important example: when n_kv_heads is smaller
+         * than the TP degree, every participant owns the complete K/V view
+         * rather than a column slice.  This helper keeps K/V projection, RoPE,
+         * append-source, cache, and effective-attention snapshots under one
+         * first-class runtime owner instead of scattering ad hoc overrides.
+         */
+        void applyRuntimeSnapshotShardingOverrides();
 
         SnapshotShardingMode resolveSnapshotShardingMode(const std::string &key) const;
         bool phaseSplitReplicatedDecodeSnapshotsActive() const;
@@ -1298,6 +1464,200 @@ namespace llaminar2
         /// Lazy-initialized on first TP forward call.
         std::unique_ptr<TPWorkerPool> tp_worker_pool_;
         bool tp_first_forward_completed_ = false;
+        /**
+         * @brief Scoped switch that routes rank fan-out to grouped child APIs.
+         *
+         * publishAcceptedMTPSpecStateBatch() owns the common-prefix clamping and
+         * parallel worker-pool dispatch code.  Reusing it avoids a second
+         * publication state machine, but this flag makes the child calls use
+         * publishGroupedDecodeEquivalentMTPSpecStateBatch() while the grouped
+         * wrapper is active.
+         */
+        bool grouped_decode_equivalent_spec_publication_scope_ = false;
+
+        /**
+         * @brief Rank-owned compact greedy verifier outcome for LocalTP.
+         *
+         * The single-device device-resident ABI carries one compact metadata
+         * pointer.  A LocalTP rank spans multiple devices, so the rank stores
+         * the already-reduced compact SamplingMath outcome and uses it to build
+         * grouped accepted-state plans for every child runner.  These arrays are
+         * overwritten by the next resident-compatible verifier outcome.
+         */
+        std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens>
+            rank_compact_output_tokens_{};
+        std::array<int, sampling_math::kSpeculativeBatchMetaCount>
+            rank_compact_output_meta_{};
+        enum class RankCompactOutcomeKind : uint8_t
+        {
+            None,
+            Greedy,
+            Stochastic
+        };
+        RankCompactOutcomeKind rank_compact_outcome_kind_ =
+            RankCompactOutcomeKind::None;
+        std::vector<int32_t> rank_compact_last_draft_tokens_;
+        std::vector<int32_t> rank_compact_last_stop_tokens_;
+        std::vector<const void *> rank_mtp_verifier_child_token_inputs_;
+        int rank_mtp_verifier_child_token_count_ = 0;
+
+        /**
+         * @brief LocalTP stochastic distribution slot capacity.
+         *
+         * The grouped MTP verifier needs one slot per speculative comparison
+         * row plus one bonus/first-token slot.  Keep the rank scratch shape
+         * identical to the backend compact-summary ABI so the rank-level
+         * reducer and single-device GPU reducers share the same bounds.
+         */
+        static constexpr int kRankStochasticMaxSlots =
+            sampling_math::kSpeculativeBatchMaxOutputTokens;
+
+        /**
+         * @brief Rank-owned compact stochastic target tables for LocalTP.
+         *
+         * Multi-child LocalTP cannot ask one child to build a full-vocab
+         * stochastic distribution because every child owns only one LM-head
+         * shard.  RankOrchestrator therefore gathers only each shard's top-k
+         * candidates, merges those small candidate lists, and stores the final
+         * compact tables here for the later verifier reducer.  These arrays are
+         * small: at most `(max verifier rows + bonus) * 256` entries.
+         */
+        std::array<int,
+                   kRankStochasticMaxSlots * sampling_math::kMaxTopK>
+            rank_stochastic_target_token_ids_{};
+        std::array<float,
+                   kRankStochasticMaxSlots * sampling_math::kMaxTopK>
+            rank_stochastic_target_probs_{};
+        std::array<int, kRankStochasticMaxSlots>
+            rank_stochastic_target_top_k_{};
+        std::array<int32_t, kRankStochasticMaxSlots>
+            rank_stochastic_target_sample_tokens_{};
+        std::array<int32_t, kRankStochasticMaxSlots>
+            rank_stochastic_draft_sample_tokens_{};
+        std::vector<int32_t> rank_stochastic_staged_draft_tokens_;
+
+        /**
+         * @brief Build one rank-owned stochastic distribution from TP shards.
+         *
+         * @param source Which logits surface to read from each child runner.
+         * @param row Logical row within that surface.
+         * @param buffer Target or draft compact table namespace.
+         * @param slot Compact distribution slot to write.
+         * @param params Sampling parameters; `top_k` must be in [1, 256].
+         * @param vocab_size Full vocabulary size across all shards.
+         * @return true when the rank compact table was populated.
+         */
+        bool buildRankStochasticDistributionFromLocalTP(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size);
+
+        /**
+         * @brief Build several contiguous target rows from TP shard logits.
+         *
+         * This is the LocalTP counterpart to backend batched target-table
+         * construction.  It consumes one local-logits view per child and reuses
+         * it for every requested row so graph-produced all-position logits are
+         * ordered behind the same producer streams.
+         */
+        bool buildRankStochasticTargetDistributionsFromLocalTPRows(
+            DeviceLogitsSource source,
+            int first_row,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size);
+
+        /**
+         * @brief Sample a rank-owned compact distribution with a caller draw.
+         *
+         * The sampled token is recorded in the rank target/draft sample slot so
+         * later device-token verifier input composition can resolve deferred
+         * sentinels without reading full logits or replaying verifier rows.
+         */
+        bool sampleRankStochasticDistribution(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold,
+            int32_t *out_token);
+
+        /**
+         * @brief Install one rank-resolved target token into every child slot.
+         *
+         * The LocalTP rank reducer owns the compact full-vocab sample decision,
+         * but each child graph owns the device buffer consumed by sidecar and
+         * verifier token-row materialization.  This helper fans the small token
+         * upload through the child runner API so production verifier setup can
+         * use child device-slot plans instead of row-wide host staging.
+         */
+        bool stageRankStochasticTargetTokenForLocalTP(int slot, int32_t token);
+
+        /**
+         * @brief Install rank-resolved draft tokens into every child slot.
+         *
+         * Draft proposals are sampled once at rank scope from TP-sharded MTP
+         * logits.  Every participant then receives the same compact token in
+         * its runner-owned draft slot, preserving the participant-symmetric
+         * sidecar sequence while avoiding full-logit gather or verifier row
+         * replay.
+         */
+        bool stageRankStochasticDraftTokensForLocalTP(
+            const int32_t *tokens,
+            int token_count,
+            int first_slot);
+
+        /**
+         * @brief Ask every child to materialize a verifier row from device slots.
+         *
+         * Entry zero may be a host scalar or a child target sample slot; draft
+         * entries always come from staged child draft sample slots.  The return
+         * value is the same rank-owned child-pointer bundle consumed by
+         * forwardWithDeviceTokenIds().
+         */
+        const void *prepareRankVerifierTokenSlotsForLocalTP(
+            bool first_token_from_device,
+            int32_t first_token,
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens);
+
+        /**
+         * @brief Compose and stage the verifier token row for every TP child.
+         *
+         * LocalTP stochastic sampling resolves full-vocab tokens at the rank
+         * level.  Child graphs still need a device-resident token row for the
+         * verifier forward, so RankOrchestrator builds the tiny logical row and
+         * asks each child to stage it with its existing host-row staging API.
+         */
+        const void *stageRankVerifierTokenRowForLocalTP(
+            const int32_t *tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count);
+
+        /**
+         * @brief Return a previously sampled rank draft token slot.
+         */
+        int32_t rankStochasticDraftSampleToken(int slot) const;
+
+        /**
+         * @brief Return a previously sampled rank target token slot.
+         */
+        int32_t rankStochasticTargetSampleToken(int slot) const;
+        mutable std::vector<DeviceResidentLogicalSequenceStateHandle>
+            rank_resident_child_logical_state_handles_;
+        mutable std::array<int32_t, 1> rank_resident_logical_state_marker_{};
+        mutable int rank_resident_logical_state_stream_token_ = 0;
+        mutable int rank_resident_logical_state_ready_event_token_ = 0;
+        mutable uint64_t rank_resident_logical_state_epoch_ = 1;
+        MTPSpecStepPlanBatch rank_last_device_outcome_step_plans_;
+        int rank_compact_outcome_stream_token_ = 0;
+        int rank_compact_outcome_ready_event_token_ = 0;
+        bool rank_compact_outcome_valid_ = false;
+        bool rank_compact_outcome_published_ = false;
 
         /// Guard against registering duplicate sibling histogram callbacks.
         bool local_tp_moe_histogram_syncs_wired_ = false;

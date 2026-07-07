@@ -25,6 +25,7 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <stdexcept>
 
 namespace
 {
@@ -191,6 +192,16 @@ namespace llaminar2
                 debug_append_source_v_cols_ = 0;
             }
 
+            size_t requested_cache_snapshot_rows = 0;
+            if (debugEnv().attention.debug_kv_cache_snapshot &&
+                debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx))
+            {
+                const int cached_tokens =
+                    params_.kv_cache->get_cached_tokens(params_.layer_idx, seq_idx);
+                requested_cache_snapshot_rows =
+                    static_cast<size_t>(std::max(0, cached_tokens + num_tokens));
+            }
+
             if (shouldUseDecodeEquivalentVerifierAppend(num_tokens, params_.batch_size, params_.seq_len))
             {
                 success = params_.kv_cache->appendVerifierRowsDecodeEquivalent(
@@ -264,6 +275,10 @@ namespace llaminar2
 
             if (success)
             {
+                if (requested_cache_snapshot_rows > 0)
+                {
+                    debug_cache_snapshot_rows_ = requested_cache_snapshot_rows;
+                }
                 // Snapshot callbacks may request KV cache contents from
                 // buildDumpInfoImpl().  The executor often builds dump info
                 // before execute() for coherence, so force a post-append
@@ -1495,9 +1510,19 @@ namespace llaminar2
             ITensor *cache_k = nullptr;
             ITensor *cache_v = nullptr;
             int kv_len = 0;
-            if (params_.kv_cache->get_kv(
-                    params_.layer_idx, params_.seq_idx, &cache_k, &cache_v, &kv_len) &&
-                kv_len > 0 && cache_k && cache_v)
+            const int cached_tokens =
+                params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
+            const int append_tokens =
+                replay_advance_tokens_ > 0
+                    ? replay_advance_tokens_
+                    : (params_.num_tokens > 0 ? params_.num_tokens : static_cast<int>(params_.K->rows()));
+            const int expected_tokens =
+                debug_cache_snapshot_rows_ > 0
+                    ? static_cast<int>(debug_cache_snapshot_rows_)
+                    : std::max(0, cached_tokens + append_tokens);
+            if (params_.kv_cache->get_kv_snapshot_view(
+                    params_.layer_idx, params_.seq_idx, expected_tokens, &cache_k, &cache_v, &kv_len) &&
+                kv_len == expected_tokens && kv_len > 0 && cache_k && cache_v)
             {
                 const size_t rows = static_cast<size_t>(kv_len);
                 const size_t k_cols = cache_k->cols();
@@ -1513,19 +1538,20 @@ namespace llaminar2
             }
             else
             {
-                const int cached_tokens =
-                    params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
-                const int append_tokens =
-                    params_.num_tokens > 0 ? params_.num_tokens : static_cast<int>(params_.K->rows());
-                const size_t expected_rows =
-                    static_cast<size_t>(std::max(0, cached_tokens + append_tokens));
-                const size_t k_cols = params_.K ? (params_.K->shape().size() > 1 ? params_.K->shape()[1] : params_.K->cols()) : 0;
-                const size_t v_cols = params_.V ? (params_.V->shape().size() > 1 ? params_.V->shape()[1] : params_.V->cols()) : 0;
-                if (expected_rows > 0 && k_cols > 0 && params_.K)
-                    info.addOutput("cache_k", params_.K, expected_rows, k_cols);
-                if (expected_rows > 0 && v_cols > 0 && params_.V)
-                    info.addOutput("cache_v", params_.V, expected_rows, v_cols);
+                throw std::runtime_error(
+                    "KV cache debug snapshot requested but cache could not expose a direct snapshot view for layer=" +
+                    std::to_string(params_.layer_idx) +
+                    " seq=" + std::to_string(params_.seq_idx) +
+                    " expected_tokens=" + std::to_string(expected_tokens));
             }
+        }
+        else if (debugEnv().attention.debug_kv_append_source_snapshot &&
+                 debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx) &&
+                 !debugEnv().attention.debug_kv_cache_snapshot)
+        {
+            LOG_WARN("[KVCacheAppendStage] KV append source snapshot is enabled for layer="
+                     << params_.layer_idx
+                     << " but KV cache snapshot is disabled in DebugEnv");
         }
 
         info.addScalarInt("layer_idx", params_.layer_idx);

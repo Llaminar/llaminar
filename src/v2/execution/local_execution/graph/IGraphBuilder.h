@@ -86,10 +86,28 @@ namespace llaminar2
         const void *position_ids_device = nullptr;
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
-        int position_offset = 0;           ///< KV cache position offset (legacy fallback)
+        /**
+         * @brief Absolute logical position for decode and legacy prefill callers.
+         *
+         * Decode paths use this as the current KV/RoPE position.  Prefill
+         * callers should prefer @ref token_offset for the owned request range;
+         * graph helpers may still treat this value as a compatibility fallback
+         * when @ref token_offset is left at its default.
+         */
+        int position_offset = 0;
         int real_seq_len = 0;              ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
         int bucket_seq_len = 0;            ///< Fixed bucket length for graph shape (0 = seq_len)
-        int token_offset = 0;              ///< Chunk offset within the original prompt
+        /**
+         * @brief Absolute token offset of the first real token in this prefill range.
+         *
+         * This is the first-class owner for prefill chunk/request boundaries.
+         * Restored-prefix suffix prefill, padded graph-bucket replay, KV append
+         * metadata, and position-id generation must all observe this same
+         * value.  A value of zero is both the default and the valid offset for
+         * the beginning of a request; callers with a non-zero logical cursor
+         * must set it explicitly.
+         */
+        int token_offset = 0;
         int prefill_chunk_index = 0;       ///< Stable chunk ordinal for chunked graph-captured prefill.
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
@@ -273,6 +291,28 @@ namespace llaminar2
         virtual void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
         {
             (void)material;
+        }
+
+        /**
+         * @brief Capture model-owned runtime state needed to continue from a prefix block.
+         *
+         * Prefix payloads already store KV, hybrid recurrence, MTP state, and terminal
+         * logits/hidden rows. Dynamic model features that affect subsequent execution
+         * but are not part of those tensors, such as graph-facing MoE placement banks,
+         * can serialize same-runner runtime state here.
+         */
+        virtual bool capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream)
+        {
+            (void)stream;
+            state.clear();
+            return true;
+        }
+
+        /// Restore state captured by capturePrefixCacheRuntimeState().
+        virtual bool restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream)
+        {
+            (void)stream;
+            return state.empty();
         }
 
         // =====================================================================
@@ -497,13 +537,33 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Reset model-internal recurrence state
+         * @brief Reset model-internal request state at an ordinary request boundary.
          *
-         * Called by clear_cache() to reset any persistent state that lives
-         * across decode steps (e.g., GDN conv/recurrence state in Qwen3.5).
-         * Standard attention-only models need not override this.
+         * Called by typed inference-state reset when a completed request gives
+         * ownership of model-local runtime state back to the graph builder.
+         * Implementations may preserve graph-replay-compatible baseline state
+         * here, such as descriptor tables captured by warm decode graphs.
+         * Prefix restore uses resetPrefixCacheRuntimeStateWithoutSnapshot()
+         * instead when the cache block has no model-runtime payload.
          */
         virtual void resetState() {}
+
+        /**
+         * @brief Reset model runtime state for prefix restore without a payload.
+         *
+         * A prefix-cache restore is a replacement of live request state, not an
+         * ordinary request rollover.  When the matched prefix block does not
+         * carry model-owned runtime bytes, the graph builder must install an
+         * explicit "no prefix-owned model runtime" state before suffix prefill.
+         * This is intentionally distinct from resetState(): resetState() may
+         * keep graph-replay-compatible baseline state, while this boundary must
+         * not resurrect dynamic MoE placement, LLEP transfer slots, histograms,
+         * or other request-local state from a previous request.
+         */
+        virtual void resetPrefixCacheRuntimeStateWithoutSnapshot()
+        {
+            resetState();
+        }
 
         // =====================================================================
         // Utility Methods

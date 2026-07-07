@@ -383,11 +383,13 @@ namespace llaminar2
     {
         for (auto &entry : entries_)
         {
-            entry.runner->clear_cache();
+            entry.runner->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("global-stage-registry"));
         }
         if (compatibility_runner_)
         {
-            compatibility_runner_->clear_cache();
+            compatibility_runner_->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("global-stage-registry"));
         }
     }
 
@@ -572,6 +574,48 @@ namespace llaminar2
                  ok;
         }
         return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::commitMTPShiftedRowFromCheckpointTerminalHiddenAll(
+        const PrefixStateSnapshot &checkpoint,
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!checkpoint.valid || checkpoint.participant_snapshots.empty())
+            return false;
+
+        size_t participant_index = 0;
+        bool saw_runner = false;
+        bool ok = true;
+        auto commit_runner = [&](IInferenceRunner &runner)
+        {
+            saw_runner = true;
+            if (participant_index >= checkpoint.participant_snapshots.size())
+            {
+                ok = false;
+                return;
+            }
+            ok = runner.commitMTPShiftedRowFromCheckpointTerminalHidden(
+                     checkpoint.participant_snapshots[participant_index++],
+                     token,
+                     already_appended_tokens,
+                     allow_speculative_discard,
+                     position_offset_override) &&
+                 ok;
+        };
+
+        for (auto &entry : entries_)
+        {
+            commit_runner(*entry.runner);
+        }
+        if (compatibility_runner_)
+        {
+            commit_runner(*compatibility_runner_);
+        }
+        return saw_runner && ok &&
+               participant_index == checkpoint.participant_snapshots.size();
     }
 
     bool StageRunnerRegistry::setComputeAllPositionLogitsAll(bool enabled)
@@ -1420,6 +1464,23 @@ namespace llaminar2
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.commitMTPShiftedRowFromCurrentTerminalHiddenAll(
+            token,
+            already_appended_tokens,
+            allow_speculative_discard,
+            position_offset_override);
+    }
+
+    bool GlobalOrchestrator::commitMTPShiftedRowFromCheckpointTerminalHidden(
+        const PrefixStateSnapshot &checkpoint,
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.commitMTPShiftedRowFromCheckpointTerminalHiddenAll(
+            checkpoint,
             token,
             already_appended_tokens,
             allow_speculative_discard,

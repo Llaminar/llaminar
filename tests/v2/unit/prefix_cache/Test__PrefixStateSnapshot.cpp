@@ -64,6 +64,29 @@ TEST(Test__PrefixStateSnapshot, ClampedToKeepsTerminalPartialBlock)
     EXPECT_TRUE(clamped.has_terminal_logits);
 }
 
+TEST(Test__PrefixStateSnapshot, ClampedToPreservesModelRuntimeRestorePolicy)
+{
+    PrefixLookupResult hit;
+    hit.supported = true;
+    hit.cache_enabled = true;
+    hit.cached_tokens = 8;
+    hit.block_size = 4;
+    hit.restore_model_runtime_state = false;
+    hit.restore_hybrid_state_for_suffix_prefill = true;
+    hit.blocks.push_back(makeBlock(0, 0, 4, false, false, false, false));
+    hit.blocks.push_back(makeBlock(1, 4, 4, false, false, false, true));
+
+    PrefixLookupResult clamped = hit.clampedTo(4);
+
+    EXPECT_EQ(clamped.cached_tokens, 4);
+    EXPECT_FALSE(clamped.restore_model_runtime_state)
+        << "Partial prefix continuations must be able to restore KV without "
+           "also restoring optimization-only MoE placement runtime state.";
+    EXPECT_TRUE(clamped.restore_hybrid_state_for_suffix_prefill)
+        << "Partial prefix continuations must preserve the request to restore "
+           "GDN state before suffix prefill.";
+}
+
 TEST(Test__PrefixStateSnapshot, ClampedToTrimsHybridBlocksWithoutRestorableState)
 {
     PrefixLookupResult hit;

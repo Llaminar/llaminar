@@ -64,6 +64,18 @@ extern "C"
 }
 #endif
 
+#ifdef HAVE_CUDA
+namespace llaminar2
+{
+    namespace nccl_backend_detail
+    {
+        bool cudaSetDeviceOrdinal(int device_ordinal);
+        bool cudaMemcpyAsyncSameDevice(void *dst, const void *src, size_t bytes, int device_ordinal, void *stream);
+        bool cudaMemsetAsyncDevice(void *dst, int value, size_t bytes, int device_ordinal, void *stream);
+    }
+}
+#endif
+
 #ifdef HAVE_ROCM
 namespace llaminar2
 {
@@ -3204,11 +3216,7 @@ namespace llaminar2
             return false;
         if (!backend_impl_->isMultiGpuSingleProcess())
             return false;
-#ifdef HAVE_ROCM
-        if (backend_ == CollectiveBackendType::RCCL)
-            return backend_impl_->supportsAllreduceSingleDeviceOnStream();
-#endif
-        return backend_impl_->supportsAllgatherSingleDeviceOnStream();
+        return backend_impl_->supportsAllreduceSingleDeviceOnStream();
     }
 
     bool LocalTPContext::supportsCollectiveSidebandOnStreamGraphCapture() const
@@ -3221,6 +3229,200 @@ namespace llaminar2
         if (!backend_impl_->isMultiGpuSingleProcess())
             return false;
         return backend_impl_->supportsAllreduceWithSidebandsMultiOnStreams();
+    }
+
+    /**
+     * @brief Reusable LocalTP barrier for named GPU graph-capture lifecycle boundaries.
+     *
+     * The rendezvous protects multi-device graph capture from asymmetric phase
+     * transitions. Without this barrier one participant can start HIP/CUDA stream
+     * capture while another participant is still synchronizing or publishing the
+     * previous eager prefill chunk; ROCm then reports capture-implicit stream
+     * dependency errors and the following RCCL group launch fails. The barrier is
+     * intentionally strict and aborts the LocalTP context on mismatched names,
+     * duplicate arrivals, or timeout so later collectives do not limp onward in a
+     * poisoned state.
+     */
+    bool LocalTPContext::graphCaptureBoundaryRendezvous(
+        const std::string &boundary_name,
+        int device_index,
+        int timeout_ms)
+    {
+        if (degree() <= 1)
+            return true;
+
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryRendezvous: invalid slot "
+                      << device_index << " degree=" << degree()
+                      << " boundary=" << boundary_name);
+            requestAbort();
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(graph_capture_boundary_mutex_);
+        if (abort_requested_.load(std::memory_order_acquire))
+            return false;
+
+        auto reset_generation_state = [&]()
+        {
+            graph_capture_boundary_arrivals_ = 0;
+            graph_capture_boundary_departures_ = 0;
+            graph_capture_boundary_ready_ = false;
+            graph_capture_boundary_result_ = false;
+            graph_capture_boundary_name_.clear();
+            graph_capture_boundary_error_.clear();
+            graph_capture_boundary_seen_.clear();
+            ++graph_capture_boundary_generation_;
+        };
+
+        auto fail_generation = [&](const std::string &error)
+        {
+            graph_capture_boundary_result_ = false;
+            graph_capture_boundary_error_ = error;
+            reset_generation_state();
+            abort_requested_.store(true, std::memory_order_release);
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryRendezvous: " << error);
+            lock.unlock();
+            graph_capture_boundary_cv_.notify_all();
+        };
+
+        while (graph_capture_boundary_arrivals_ >= degree() &&
+               graph_capture_boundary_departures_ > 0 &&
+               !abort_requested_.load(std::memory_order_acquire))
+        {
+            graph_capture_boundary_cv_.wait(lock);
+        }
+        if (abort_requested_.load(std::memory_order_acquire))
+            return false;
+
+        const uint64_t my_generation = graph_capture_boundary_generation_;
+        const int arrival_order = graph_capture_boundary_arrivals_++;
+
+        auto depart_generation = [&]() -> bool
+        {
+            const bool result = graph_capture_boundary_ready_ &&
+                                graph_capture_boundary_result_ &&
+                                !abort_requested_.load(std::memory_order_acquire);
+            ++graph_capture_boundary_departures_;
+            if (graph_capture_boundary_departures_ >= degree())
+            {
+                reset_generation_state();
+                lock.unlock();
+                graph_capture_boundary_cv_.notify_all();
+            }
+            return result;
+        };
+
+        if (arrival_order >= degree())
+        {
+            fail_generation("arrival overflow boundary=" + boundary_name);
+            return false;
+        }
+
+        if (arrival_order == 0)
+        {
+            graph_capture_boundary_ready_ = false;
+            graph_capture_boundary_result_ = false;
+            graph_capture_boundary_name_ = boundary_name;
+            graph_capture_boundary_error_.clear();
+            graph_capture_boundary_seen_.assign(static_cast<size_t>(degree()), false);
+        }
+        else if (graph_capture_boundary_name_ != boundary_name)
+        {
+            fail_generation("boundary mismatch expected=" +
+                            (graph_capture_boundary_name_.empty() ? std::string("(none)") : graph_capture_boundary_name_) +
+                            " actual=" + (boundary_name.empty() ? std::string("(none)") : boundary_name));
+            return false;
+        }
+
+        if (graph_capture_boundary_seen_[static_cast<size_t>(device_index)])
+        {
+            fail_generation("duplicate slot arrival slot=" + std::to_string(device_index) +
+                            " boundary=" + boundary_name);
+            return false;
+        }
+        graph_capture_boundary_seen_[static_cast<size_t>(device_index)] = true;
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_graph_capture_boundary_arrival"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " generation=" << my_generation
+                      << " slot=" << device_index
+                      << " arrival_order=" << arrival_order
+                      << " degree=" << degree()
+                      << " boundary=" << boundary_name);
+        }
+
+        if (arrival_order + 1 < degree())
+        {
+            auto ready = [&]()
+            {
+                return abort_requested_.load(std::memory_order_acquire) ||
+                       graph_capture_boundary_generation_ > my_generation ||
+                       (graph_capture_boundary_generation_ == my_generation &&
+                        graph_capture_boundary_ready_);
+            };
+
+            bool completed = true;
+            if (timeout_ms > 0)
+            {
+                completed = graph_capture_boundary_cv_.wait_for(
+                    lock,
+                    std::chrono::milliseconds(timeout_ms),
+                    ready);
+            }
+            else
+            {
+                graph_capture_boundary_cv_.wait(lock, ready);
+            }
+
+            if (!completed)
+            {
+                fail_generation("timeout waiting for graph-capture boundary peers boundary=" +
+                                boundary_name +
+                                " arrivals=" + std::to_string(graph_capture_boundary_arrivals_) +
+                                " degree=" + std::to_string(degree()));
+                return false;
+            }
+
+            if (graph_capture_boundary_generation_ != my_generation &&
+                !graph_capture_boundary_ready_)
+            {
+                return false;
+            }
+
+            return depart_generation();
+        }
+
+        for (int i = 0; i < degree(); ++i)
+        {
+            if (i >= static_cast<int>(graph_capture_boundary_seen_.size()) ||
+                !graph_capture_boundary_seen_[static_cast<size_t>(i)])
+            {
+                fail_generation("missing graph-capture boundary participant slot=" +
+                                std::to_string(i) +
+                                " boundary=" + boundary_name);
+                return false;
+            }
+        }
+
+        graph_capture_boundary_result_ = true;
+        graph_capture_boundary_ready_ = true;
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_graph_capture_boundary_released"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " generation=" << my_generation
+                      << " boundary=" << boundary_name);
+        }
+        graph_capture_boundary_cv_.notify_all();
+        return depart_generation();
     }
 
     bool LocalTPContext::allreduceWithSidebandsOnStream(
@@ -3827,91 +4029,131 @@ namespace llaminar2
                           << " backend=" << collectiveBackendTypeToString(backend_));
                 return false;
             }
-#ifdef HAVE_ROCM
-            if (backend_ == CollectiveBackendType::RCCL)
-            {
-                /*
-                 * RCCL allgather can report successful capture on this stack
-                 * while replaying as a no-op. Emulate allgather with captured
-                 * allreduce over a full receive buffer: every participant
-                 * zeros the full buffer, copies its local payload into its own
-                 * disjoint slice, then sums all slices. This is graph-safe
-                 * because captured RCCL allreduce is the validated primitive.
-                 */
-                const size_t element_bytes = collectiveDataTypeBytes(dtype);
-                const size_t local_bytes = send_count * element_bytes;
-                const size_t full_count = send_count * static_cast<size_t>(degree());
-                const size_t full_bytes = full_count * element_bytes;
-                auto *recv_bytes = static_cast<unsigned char *>(full_recv);
-                const auto *send_bytes = static_cast<const unsigned char *>(local_send);
-                const auto *recv_begin = recv_bytes;
-                const auto *recv_end = recv_bytes + full_bytes;
-                const auto *send_begin = send_bytes;
-                const auto *send_end = send_bytes + local_bytes;
-                if (send_begin < recv_end && recv_begin < send_end)
-                {
-                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: RCCL graph-captured allreduce emulation requires non-overlapping send/recv buffers"
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                    return false;
-                }
 
-                const int ordinal = devices_[static_cast<size_t>(device_index)].device_ordinal;
-                if (!rccl_backend_detail::hipSetDeviceOrdinal(ordinal))
+            /*
+             * Graph-captured LocalTP raw allgather is implemented as a
+             * deterministic publish-and-sum transaction on both NCCL and RCCL:
+             *
+             *   1. Each participant zeroes its full receive buffer.
+             *   2. Each participant copies its local payload into its own
+             *      disjoint receive slice on the same explicit stream.
+             *   3. The validated graph-captured allreduce primitive sums the
+             *      full buffers so every participant receives every slice.
+             *
+             * This keeps the maintenance graphs on one graph-safe collective
+             * primitive and avoids backend-specific allgather replay behavior
+             * from deciding whether the MoE rebalance planner sees its peer
+             * histograms.
+             */
+            const size_t element_bytes = collectiveDataTypeBytes(dtype);
+            if (element_bytes == 0)
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawOnStream: unsupported dtype"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                          << " dtype=" << static_cast<int>(dtype));
+                return false;
+            }
+            const size_t degree_size = static_cast<size_t>(degree());
+            const size_t local_bytes = send_count * element_bytes;
+            const size_t full_count = send_count * degree_size;
+            const size_t full_bytes = full_count * element_bytes;
+            auto *recv_bytes = static_cast<unsigned char *>(full_recv);
+            const auto *send_bytes = static_cast<const unsigned char *>(local_send);
+            const auto *recv_begin = recv_bytes;
+            const auto *recv_end = recv_bytes + full_bytes;
+            const auto *send_begin = send_bytes;
+            const auto *send_end = send_bytes + local_bytes;
+            const char *backend_name =
+                backend_ == CollectiveBackendType::NCCL ? "NCCL" : "RCCL";
+            if (send_begin < recv_end && recv_begin < send_end)
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawOnStream: graph-captured allreduce emulation requires non-overlapping send/recv buffers"
+                          << " backend=" << backend_name
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
+            }
+
+            const int ordinal = devices_[static_cast<size_t>(device_index)].device_ordinal;
+            bool device_ops_ok = false;
+            if (backend_ == CollectiveBackendType::NCCL)
+            {
+#ifdef HAVE_CUDA
+                device_ops_ok = nccl_backend_detail::cudaSetDeviceOrdinal(ordinal) &&
+                                nccl_backend_detail::cudaMemsetAsyncDevice(
+                                    full_recv,
+                                    0,
+                                    full_bytes,
+                                    ordinal,
+                                    producer_stream);
+                if (device_ops_ok)
                 {
-                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: hipSetDevice failed for RCCL allgather emulation"
-                              << " ordinal=" << ordinal
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                    return false;
-                }
-                if (!rccl_backend_detail::hipMemsetAsyncDevice(
-                        full_recv,
-                        0,
-                        full_bytes,
-                        ordinal,
-                        producer_stream))
-                {
-                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: hipMemsetAsync failed for RCCL allgather emulation"
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                    return false;
-                }
-                void *slice =
-                    recv_bytes + static_cast<size_t>(device_index) * local_bytes;
-                if (!rccl_backend_detail::hipMemcpyAsyncSameDevice(
+                    void *slice =
+                        recv_bytes + static_cast<size_t>(device_index) * local_bytes;
+                    device_ops_ok = nccl_backend_detail::cudaMemcpyAsyncSameDevice(
                         slice,
                         local_send,
                         local_bytes,
                         ordinal,
-                        producer_stream))
-                {
-                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: hipMemcpyAsync failed for RCCL allgather emulation"
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
-                    return false;
+                        producer_stream);
                 }
-                if (!backend_impl_->allreduceSingleDeviceOnStream(
-                        full_recv,
-                        full_count,
-                        dtype,
-                        CollectiveOp::ALLREDUCE_SUM,
-                        device_index,
-                        producer_stream))
-                {
-                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: RCCL allreduce-backed allgather emulation failed"
-                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                              << " backend_error=" << backend_impl_->lastError());
-                    return false;
-                }
-                return true;
-            }
+#else
+                (void)ordinal;
+                device_ops_ok = false;
 #endif
-            if (!backend_impl_->allgatherSingleDeviceOnStream(
-                    local_send,
+            }
+            else
+            {
+#ifdef HAVE_ROCM
+                device_ops_ok = rccl_backend_detail::hipSetDeviceOrdinal(ordinal) &&
+                                rccl_backend_detail::hipMemsetAsyncDevice(
+                                    full_recv,
+                                    0,
+                                    full_bytes,
+                                    ordinal,
+                                    producer_stream);
+                if (device_ops_ok)
+                {
+                    void *slice =
+                        recv_bytes + static_cast<size_t>(device_index) * local_bytes;
+                    device_ops_ok = rccl_backend_detail::hipMemcpyAsyncSameDevice(
+                        slice,
+                        local_send,
+                        local_bytes,
+                        ordinal,
+                        producer_stream);
+                }
+#else
+                (void)ordinal;
+                device_ops_ok = false;
+#endif
+            }
+            if (!device_ops_ok)
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawOnStream: graph-captured local slice publication failed"
+                          << " backend=" << backend_name
+                          << " ordinal=" << ordinal
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
+            }
+
+            const std::string emulated_allreduce_stage =
+                (stage_name.empty() ? std::string("raw_allgather")
+                                    : stage_name) +
+                (backend_ == CollectiveBackendType::NCCL
+                     ? "_nccl_graph_allgather_sum"
+                     : "_rccl_graph_allgather_sum");
+            if (!allreduceGroupedOnExplicitStreams(
                     full_recv,
-                    send_count,
+                    full_count,
                     dtype,
                     device_index,
-                    producer_stream))
+                    producer_stream,
+                    emulated_allreduce_stage,
+                    "raw_allgather_emulation",
+                    nullptr))
             {
-                LOG_ERROR("LocalTPContext::allgatherRawOnStream: on-stream allgather failed"
+                LOG_ERROR("LocalTPContext::allgatherRawOnStream: allreduce-backed graph allgather emulation failed"
+                          << " backend=" << backend_name
                           << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
                           << " backend_error=" << backend_impl_->lastError());
                 return false;
@@ -4749,6 +4991,19 @@ namespace llaminar2
 
             if (grouped_onstream_allreduce_graph_capture_active_)
             {
+                if (backend_ == CollectiveBackendType::RCCL)
+                {
+                    /*
+                     * For RCCL graph capture the final arrival records the
+                     * entire rcclGroupStart/rcclGroupEnd bundle across every
+                     * captured participant stream. Earlier arrivals must only
+                     * observe that grouped launch outcome; issuing their own
+                     * participant-local rcclAllReduce would duplicate the
+                     * captured collective and can poison HIP capture state.
+                     */
+                    return depart_generation();
+                }
+
                 const bool ready_to_enqueue =
                     grouped_onstream_allreduce_ready_ &&
                     grouped_onstream_allreduce_result_ &&
@@ -4828,6 +5083,54 @@ namespace llaminar2
 
         if (grouped_onstream_allreduce_graph_capture_active_)
         {
+            if (backend_ == CollectiveBackendType::RCCL)
+            {
+                /*
+                 * RCCL single-process graph capture must enqueue the
+                 * participant streams through one grouped launch.  The
+                 * previous participant-local branch issued independent
+                 * rcclAllReduce calls from each worker thread; that can
+                 * fail during HIP capture with an "unhandled cuda error"
+                 * even though the same streams are graph-capturable when
+                 * wrapped in rcclGroupStart/rcclGroupEnd.  The final
+                 * arrival owns the complete stream/buffer set, so it can
+                 * record the exact grouped operation that ordinary
+                 * explicit-stream RCCL execution uses without falling back
+                 * to non-captured execution.
+                 */
+                if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+                {
+                    fail_generation(std::string("RCCL graph-captured grouped allreduce requires grouped explicit-stream support backend=") +
+                                    collectiveBackendTypeToString(backend_));
+                    return false;
+                }
+
+                const bool enqueue_ok = backend_impl_->allreduceMultiOnStreams(
+                    grouped_onstream_allreduce_buffers_,
+                    effective_count,
+                    dtype,
+                    CollectiveOp::ALLREDUCE_SUM,
+                    grouped_onstream_allreduce_streams_);
+                grouped_onstream_allreduce_result_ = enqueue_ok;
+                grouped_onstream_allreduce_ready_ = true;
+                if (!enqueue_ok)
+                {
+                    grouped_onstream_allreduce_error_ =
+                        backend_impl_ ? backend_impl_->lastError() : std::string("missing backend");
+                    abort_requested_.store(true, std::memory_order_release);
+                    LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: graph-captured grouped RCCL launch failed"
+                              << " backend=" << collectiveBackendTypeToString(backend_)
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                              << " error=" << grouped_onstream_allreduce_error_);
+                }
+                else
+                {
+                    first_onstream_collective_completed_.store(true, std::memory_order_release);
+                }
+                grouped_onstream_allreduce_cv_.notify_all();
+                return depart_generation(enqueue_ok);
+            }
+
             if (!backend_impl_ || !backend_impl_->supportsAllreduceSingleDeviceOnStream())
             {
                 fail_generation(std::string("backend does not support graph-captured participant-local allreduce backend=") +

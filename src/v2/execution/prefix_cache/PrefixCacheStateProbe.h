@@ -1,3 +1,14 @@
+/**
+ * @file PrefixCacheStateProbe.h
+ * @brief Runtime state probe records for prefix-cache, KV, GDN, and MTP diagnostics.
+ *
+ * The structures in this file are intentionally value-oriented snapshots:
+ * callers can capture them at request boundaries, compare them in parity tests,
+ * and print compact hashes without retaining ownership of live inference
+ * buffers.  KV segment hashes make prefix restore failures localizable without
+ * copying full model caches into ordinary test output.
+ */
+
 #pragma once
 
 #include "backends/DeviceId.h"
@@ -13,6 +24,33 @@ namespace llaminar2
 {
     class IKVCache;
 
+    /**
+     * @brief Hash of one requested logical KV token range.
+     *
+     * Prefix-restore diagnostics often need to isolate a bad suffix chunk
+     * without copying an entire model cache into the failure message.  This
+     * structure records the logical token range that was requested plus the
+     * byte hashes exported from the cache when that full range was available.
+     */
+    struct PrefixKVSegmentProbe
+    {
+        std::string name;
+        int token_start = 0;
+        int token_count = 0;
+        bool hash_available = false;
+        size_t k_payload_bytes = 0;
+        size_t v_payload_bytes = 0;
+        uint64_t k_payload_hash = 0;
+        uint64_t v_payload_hash = 0;
+    };
+
+    /**
+     * @brief Per-layer KV state captured by PrefixRuntimeStateSnapshot.
+     *
+     * The leading/trailing fields are kept for stable legacy diagnostics.
+     * Newer failure analysis should prefer @ref segments, which can describe
+     * several named logical ranges in the same cache payload.
+     */
     struct PrefixKVLayerProbe
     {
         int cache_layer = 0;
@@ -25,6 +63,22 @@ namespace llaminar2
         size_t v_payload_bytes = 0;
         uint64_t k_payload_hash = 0;
         uint64_t v_payload_hash = 0;
+
+        bool leading_segment_hash_available = false;
+        int leading_segment_tokens = 0;
+        size_t leading_k_payload_bytes = 0;
+        size_t leading_v_payload_bytes = 0;
+        uint64_t leading_k_payload_hash = 0;
+        uint64_t leading_v_payload_hash = 0;
+
+        bool trailing_segment_hash_available = false;
+        int trailing_segment_start = 0;
+        int trailing_segment_tokens = 0;
+        size_t trailing_k_payload_bytes = 0;
+        size_t trailing_v_payload_bytes = 0;
+        uint64_t trailing_k_payload_hash = 0;
+        uint64_t trailing_v_payload_hash = 0;
+        std::vector<PrefixKVSegmentProbe> segments;
     };
 
     struct PrefixKVCacheProbe
@@ -55,6 +109,11 @@ namespace llaminar2
         size_t conv_device_bytes = 0;
         uint64_t recurrence_device_hash = 0;
         uint64_t conv_device_hash = 0;
+        bool local_device_state_hash_available = false;
+        size_t recurrence_local_device_bytes = 0;
+        size_t conv_local_device_bytes = 0;
+        uint64_t recurrence_local_device_hash = 0;
+        uint64_t conv_local_device_hash = 0;
         bool recurrence_all_zero = true;
         bool conv_all_zero = true;
         /**

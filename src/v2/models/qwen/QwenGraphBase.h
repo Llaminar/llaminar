@@ -333,6 +333,8 @@ namespace llaminar2
         bool decode_replicated_dense_graph_active_ = false;
         bool replicated_attention_state_graph_active_ = false;
         bool decode_mirrored_embedding_graph_active_ = false;
+        bool mtp_mirrored_lm_head_graph_active_ = false;
+        bool mtp_kv_cache_only_graph_active_ = false;
 
         // =====================================================================
         // Helpers
@@ -343,12 +345,47 @@ namespace llaminar2
         bool denseTPAllreduceEnabledForCurrentGraph() const;
         bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;
         bool hasLayerWeightSource() const;
+        /**
+         * @brief Return whether replicated dense decode has layer bindings.
+         *
+         * Stage-owned global bindings are validated at the orchestrator setup
+         * boundary and again by modelEmbeddingTable()/modelLMHead() when those
+         * stages are actually built.  This predicate gates dense layer execution
+         * only, which keeps PP stages that do not own embedding or LM head from
+         * requiring globals they will never consume.
+         */
         bool hasDecodeReplicatedDenseWeightSource() const;
+
+        /**
+         * @brief Render the replicated dense decode binding state for hard failures.
+         *
+         * @return Compact list of present/missing required replicated decode bindings.
+         */
+        std::string describeDecodeReplicatedDenseBindingState() const;
         bool useDecodeReplicatedDenseWeights() const;
         bool hasDecodeMirroredEmbeddingWeightSource() const;
         bool useDecodeMirroredEmbeddingWeights() const;
+        bool hasMirroredMTPHeadWeightSource() const;
+        bool localTPMirroredMTPHeadConfigured() const;
+        bool mirroredMTPHeadActiveForVerifierTokens(int total_tokens) const;
+        bool useMirroredMTPHeadWeights() const;
         bool useFullVocabEmbeddingForCurrentGraph() const;
+        bool usesVocabParallelEmbeddingForCurrentGraph() const;
+        int embeddingVocabOffsetForCurrentGraph(DeviceId device) const;
         bool useReplicatedAttentionStateWeights() const;
+        /**
+         * @brief Decide whether the current LM-head stage writes a local vocab shard.
+         *
+         * Ordinary TP prefill/decode uses the primary column-parallel path only
+         * while dense TP allreduce is active for the graph.  Phase-split
+         * decode-replicated verifier rows deliberately use the replicated
+         * full-vocab LM head so their logits are produced by the same binding
+         * and prepared GEMM descriptor as rowwise serial decode.
+         *
+         * @param logits_local Candidate output tensor for local-vocab logits.
+         * @return true when LMHeadStage must bind the primary sharded LM head.
+         */
+        bool useColumnParallelLMHeadForGraph(TensorBase *logits_local) const;
         bool denseDecodeReplicatedActiveForTokens(int total_tokens) const;
         bool denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const;
         bool replicatedAttentionStateActiveForTokens(int total_tokens) const;
@@ -372,6 +409,53 @@ namespace llaminar2
             bool previous_;
             bool previous_attention_;
             bool previous_embedding_;
+            bool previous_mtp_head_;
+        };
+
+        /**
+         * @brief Temporarily select replicated full-vocab LM-head bindings for MTP.
+         *
+         * Dedicated MTP sidecar graphs do not necessarily set
+         * compute_all_position_logits, so they cannot rely on
+         * DecodeReplicatedDenseScope's verifier-row detection.  This scope lets
+         * sidecar builders opt into the mirrored terminal head only for the
+         * rows whose logits are consumed by the MTP sampler/verifier.
+         */
+        class MirroredMTPHeadScope
+        {
+        public:
+            MirroredMTPHeadScope(QwenGraphBase &owner, bool active);
+            ~MirroredMTPHeadScope();
+
+            MirroredMTPHeadScope(const MirroredMTPHeadScope &) = delete;
+            MirroredMTPHeadScope &operator=(const MirroredMTPHeadScope &) = delete;
+
+        private:
+            QwenGraphBase &owner_;
+            bool previous_;
+        };
+
+        /**
+         * @brief Mark construction of an MTP shifted-KV-only sidecar graph.
+         *
+         * These sidecar graphs run inside the same decode-replicated binding
+         * scope as verifier rows so prepared weight references stay aligned,
+         * but their Q/K/V projections can still be local TP shards.  The
+         * phase-split full-prefill KV handoff must therefore remain eligible
+         * even while decode-replicated graph state is active.
+         */
+        class MTPKVCacheOnlyScope
+        {
+        public:
+            MTPKVCacheOnlyScope(QwenGraphBase &owner, bool active);
+            ~MTPKVCacheOnlyScope();
+
+            MTPKVCacheOnlyScope(const MTPKVCacheOnlyScope &) = delete;
+            MTPKVCacheOnlyScope &operator=(const MTPKVCacheOnlyScope &) = delete;
+
+        private:
+            QwenGraphBase &owner_;
+            bool previous_;
         };
 
         LayerWeightBindings layerWeightBindingsForGraph(int layer_idx) const;
@@ -379,9 +463,25 @@ namespace llaminar2
         TensorBase *modelEmbeddingTable() const;
         TensorBase *modelFinalNorm() const;
         TensorBase *modelLMHead() const;
+        /**
+         * @brief Resolve the LM-head tensor for a specific output layout.
+         *
+         * Column-parallel logits use the primary sharded LM-head binding.
+         * Full-vocab logits use modelLMHead(), which selects the replicated
+         * dense decode view when DecodeReplicatedDenseScope is active.
+         */
+        TensorBase *modelLMHeadForGraph(bool column_parallel) const;
         const WeightBinding *modelEmbeddingBinding() const;
         const WeightBinding *modelFinalNormBinding() const;
         const WeightBinding *modelLMHeadBinding() const;
+        /**
+         * @brief Resolve the prepared-weight binding paired with modelLMHeadForGraph().
+         *
+         * Keeping tensor and PreparedWeightRef selection in one place prevents a
+         * verifier graph from pairing a primary sharded tensor with a replicated
+         * prepared GEMM descriptor, or vice versa.
+         */
+        const WeightBinding *modelLMHeadBindingForGraph(bool column_parallel) const;
         std::optional<PreparedWeightRef> preparedRefForGraphWeight(
             const WeightBinding *binding,
             DeviceId device) const;

@@ -2394,7 +2394,9 @@ namespace llaminar2
             //
             // Handles optional bias in a single fused kernel launch.
             // =========================================================================
-            if (use_gpu_path && m > 1 && m <= 4)
+            if (use_gpu_path &&
+                g_rocm_native_vnni_decode_equivalent_scope &&
+                m > 1 && m <= 4)
             {
                 ensureWeightsConverted();
 
@@ -3501,6 +3503,7 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
                 const bool needs_block_sums =
+                    g_rocm_native_vnni_decode_equivalent_scope &&
                     all_projections_native_vnni && m >= 2 && m <= 4 && (k % 32) == 0;
                 const bool quant_ok = needs_block_sums
                     ? rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
@@ -3600,6 +3603,7 @@ namespace llaminar2
             // =========================================================================
 #ifdef HAVE_ROCM
             const bool small_m_native_verifier_fused =
+                g_rocm_native_vnni_decode_equivalent_scope &&
                 all_projections_native_vnni && m >= 2 && m <= 4;
             if (m > 2 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
@@ -4753,6 +4757,7 @@ namespace llaminar2
                 float *d_prefill_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
 
                 const bool supports_native_small_m =
+                    g_rocm_native_vnni_decode_equivalent_scope &&
                     native_vnni_fused && m >= 2 && m <= 4;
                 if (supports_native_small_m)
                 {
@@ -5011,9 +5016,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1 || m > 4)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier projection requires M=2..4, got M="
+                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier projection requires M=1..4, got M="
                           << m);
                 return false;
             }
@@ -6010,6 +6015,7 @@ namespace llaminar2
 
                 // Step 1: Fused SwiGLU + blockwise quantize → d_A_int8 + d_scales_A_blockwise
                 const bool needs_block_sums =
+                    g_rocm_native_vnni_decode_equivalent_scope &&
                     impl_->has_native_vnni && m >= 2 && m <= 4 && (k % 32) == 0;
                 const bool swiglu_quant_ok = needs_block_sums
                     ? hipOps_fused_swiglu_quantize_blockwise_with_sums(
@@ -6032,6 +6038,7 @@ namespace llaminar2
                 // are tiny (M=2..4), so do not fall through to the generic prefill
                 // GEMM once this route is selected.
                 const bool supports_native_small_m =
+                    g_rocm_native_vnni_decode_equivalent_scope &&
                     impl_->has_native_vnni && m >= 2 && m <= 4 &&
                     alpha == 1.0f && beta == 0.0f;
                 if (supports_native_small_m)
@@ -6199,9 +6206,9 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1 || m > 4)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier SwiGLU requires M=2..4, got M="
+                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier SwiGLU requires M=1..4, got M="
                           << m);
                 return false;
             }

@@ -1383,11 +1383,13 @@ namespace llaminar2::moe_rebalance_policy
     {
         const uint32_t valid_mask = validParticipantMask(config.participant_count);
         resident_mask &= valid_mask;
-        if (desc.owner_participant >= 0 &&
-            desc.owner_participant < static_cast<int32_t>(config.participant_count))
-        {
-            resident_mask |= participantBit(static_cast<uint32_t>(desc.owner_participant));
-        }
+
+        /*
+         * Domain-root planning is allowed to prefer the static owner when a
+         * resident source must be selected, but it must not convert ownership
+         * into residency.  The GPU payload packer can only copy bytes from a
+         * participant whose bit is already present in the runtime resident mask.
+         */
         const bool replicated = (resident_mask & (resident_mask - 1u)) != 0u;
         if (replicated)
             return true;

@@ -71,7 +71,10 @@ namespace
         bool fp32_allgather_ok = false;
         bool int32_allgather_ok = false;
         bool int8_allgather_ok = false;
+        bool k_allgather_ok = false;
+        bool v_allgather_ok = false;
         hipError_t begin_status = hipSuccess;
+        hipError_t pre_collective_status = hipSuccess;
         hipError_t end_status = hipSuccess;
         hipError_t instantiate_status = hipSuccess;
         hipError_t launch_status = hipSuccess;
@@ -186,6 +189,51 @@ namespace
         }
     }
 
+    /**
+     * @brief Copies a rank-major two-shard FP32 allgather result to host and verifies both shards.
+     *
+     * LocalTP raw allgather writes shard 0 followed by shard 1 on every
+     * participating device.  This helper intentionally checks the complete
+     * payload rather than sampling so late-row K/V corruption cannot hide in
+     * the tail of a large prefix handoff.
+     *
+     * @param backend ROCm backend used to copy device memory back to the host.
+     * @param device ROCm ordinal that owns @p device_buffer.
+     * @param device_buffer Device pointer containing two rank-major shards.
+     * @param shard_count Number of FP32 elements in each rank-local shard.
+     * @param first_value Expected value for rank 0's shard.
+     * @param second_value Expected value for rank 1's shard.
+     * @param label Diagnostic label included in assertion messages.
+     */
+    void expectGatheredFloatShards(
+        IBackend *backend,
+        int device,
+        const float *device_buffer,
+        size_t shard_count,
+        float first_value,
+        float second_value,
+        const char *label)
+    {
+        ASSERT_NE(backend, nullptr);
+        ASSERT_NE(device_buffer, nullptr);
+
+        std::vector<float> host(shard_count * 2);
+        ASSERT_TRUE(backend->deviceToHost(
+            host.data(),
+            device_buffer,
+            host.size() * sizeof(float),
+            device));
+        for (size_t i = 0; i < shard_count; ++i)
+        {
+            ASSERT_FLOAT_EQ(host[i], first_value)
+                << label << ": device " << device
+                << " rank0 shard mismatch at element " << i;
+            ASSERT_FLOAT_EQ(host[shard_count + i], second_value)
+                << label << ": device " << device
+                << " rank1 shard mismatch at element " << i;
+        }
+    }
+
     void captureDecodeAllreduceGraph(
         ILocalTPContext &ctx,
         TensorBase *tensor0,
@@ -255,6 +303,111 @@ namespace
 
         std::thread t0(capture_worker, 0, tensor0, stream0, &result0);
         std::thread t1(capture_worker, 1, tensor1, stream1, &result1);
+        t0.join();
+        t1.join();
+    }
+
+    /**
+     * @brief Capture a prefill-like stream segment with work before RCCL allreduce.
+     *
+     * The E2E prefix prefill graph records an embedding kernel before the
+     * embedding_allreduce collective. A collective-only graph can succeed even
+     * when RCCL rejects a grouped collective appended after existing captured
+     * nodes, so this helper records a simple HIP memset before the same LocalTP
+     * on-stream allreduce.  The memset targets a separate scratch allocation so
+     * the test still proves the captured RCCL payload preserves nonzero
+     * per-rank activation values and not merely that an all-zero tensor can be
+     * replayed.
+     *
+     * @param ctx LocalTP context under test.
+     * @param tensor0 Device-0 tensor to reduce in place.
+     * @param tensor1 Device-1 tensor to reduce in place.
+     * @param stream0 Capture stream for ROCm device 0.
+     * @param stream1 Capture stream for ROCm device 1.
+     * @param count FP32 element count reduced by the collective.
+     * @param result0 Capture status for device 0.
+     * @param result1 Capture status for device 1.
+     */
+    void capturePrefillLikeAllreduceGraph(
+        ILocalTPContext &ctx,
+        TensorBase *tensor0,
+        TensorBase *tensor1,
+        void *stream0,
+        void *stream1,
+        void *scratch0,
+        void *scratch1,
+        size_t count,
+        CaptureResult &result0,
+        CaptureResult &result1)
+    {
+        Barrier ready_to_capture(2);
+        Barrier captured_collective(2);
+
+        auto capture_worker = [&](int device,
+                                  TensorBase *tensor,
+                                  void *stream,
+                                  void *scratch,
+                                  CaptureResult *result)
+        {
+            result->begin_status = hipSetDevice(device);
+            if (result->begin_status == hipSuccess)
+            {
+                result->begin_status = hipStreamBeginCapture(
+                    static_cast<hipStream_t>(stream),
+                    hipStreamCaptureModeRelaxed);
+            }
+
+            ready_to_capture.arriveAndWait();
+
+            if (result->begin_status == hipSuccess)
+            {
+                result->pre_collective_status = hipMemsetAsync(
+                    scratch,
+                    0,
+                    sizeof(uint32_t),
+                    static_cast<hipStream_t>(stream));
+                if (result->pre_collective_status == hipSuccess)
+                {
+                    GraphCaptureGuard guard;
+                    result->collective_ok = ctx.allreduceOnStream(
+                        tensor,
+                        "embedding_allreduce",
+                        count,
+                        stream,
+                        "fp32");
+                }
+            }
+
+            captured_collective.arriveAndWait();
+
+            if (result->begin_status == hipSuccess)
+            {
+                result->end_status = hipSetDevice(device);
+                if (result->end_status == hipSuccess)
+                {
+                    result->end_status = hipStreamEndCapture(
+                        static_cast<hipStream_t>(stream),
+                        &result->graph);
+                }
+            }
+
+            if (result->end_status == hipSuccess && result->graph)
+            {
+                result->instantiate_status = hipSetDevice(device);
+                if (result->instantiate_status == hipSuccess)
+                {
+                    result->instantiate_status = hipGraphInstantiate(
+                        &result->exec,
+                        result->graph,
+                        nullptr,
+                        nullptr,
+                        0);
+                }
+            }
+        };
+
+        std::thread t0(capture_worker, 0, tensor0, stream0, scratch0, &result0);
+        std::thread t1(capture_worker, 1, tensor1, stream1, scratch1, &result1);
         t0.join();
         t1.join();
     }
@@ -599,6 +752,138 @@ namespace
         EXPECT_NE(result.graph, nullptr) << name;
         EXPECT_EQ(result.instantiate_status, hipSuccess) << name;
         EXPECT_NE(result.exec, nullptr) << name;
+    }
+
+    /**
+     * @brief Capture, instantiate, launch, and verify a two-device RCCL allreduce graph.
+     *
+     * This helper mirrors the inference graph-capture shape used by LocalTP
+     * workers: each ROCm device captures its own stream on its own host thread,
+     * and LocalTPContext coordinates one grouped RCCL on-stream collective
+     * across those participant streams. Keeping the payload size configurable
+     * lets tests cover both small decode collectives and prefill-sized
+     * embedding/hidden-state allreduces.
+     *
+     * @param count FP32 elements per device buffer.
+     * @param label Diagnostic label for assertion messages.
+     * @param capture_repetitions Number of capture/launch cycles to run on the same context and streams.
+     * @param pre_collective_work Record a HIP operation before the allreduce, matching prefill segments.
+     */
+    void runCapturedAllreduceGraphPayload(
+        size_t count,
+        const char *label,
+        int capture_repetitions = 1,
+        bool pre_collective_work = false)
+    {
+        auto *rocm_backend = getROCmBackend();
+        ASSERT_NE(rocm_backend, nullptr);
+        if (rocm_backend->deviceCount() < 2)
+        {
+            GTEST_SKIP() << "Requires 2+ ROCm GPUs, found " << rocm_backend->deviceCount();
+        }
+
+        std::vector<GlobalDeviceAddress> devices = {
+            GlobalDeviceAddress::rocm(0),
+            GlobalDeviceAddress::rocm(1)};
+
+        auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::RCCL);
+        ASSERT_NE(ctx, nullptr);
+
+        auto tensor0 = TestTensorFactory::createFP32({count});
+        auto tensor1 = TestTensorFactory::createFP32({count});
+        TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+        TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+
+        ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::rocm(1)));
+
+        void *stream0 = rocm_backend->createStream(0);
+        void *stream1 = rocm_backend->createStream(1);
+        ASSERT_NE(stream0, nullptr);
+        ASSERT_NE(stream1, nullptr);
+        void *scratch0 = nullptr;
+        void *scratch1 = nullptr;
+        if (pre_collective_work)
+        {
+            ASSERT_EQ(hipSetDevice(0), hipSuccess) << label;
+            ASSERT_EQ(hipMalloc(&scratch0, sizeof(uint32_t)), hipSuccess)
+                << label << " device0 scratch allocation failed";
+            ASSERT_EQ(hipSetDevice(1), hipSuccess) << label;
+            ASSERT_EQ(hipMalloc(&scratch1, sizeof(uint32_t)), hipSuccess)
+                << label << " device1 scratch allocation failed";
+        }
+
+        ASSERT_GT(capture_repetitions, 0) << label;
+        float expected_value = 0.0f;
+        for (int repetition = 0; repetition < capture_repetitions; ++repetition)
+        {
+            CaptureResult result0;
+            CaptureResult result1;
+            if (pre_collective_work)
+            {
+                capturePrefillLikeAllreduceGraph(
+                    *ctx,
+                    tensor0.get(),
+                    tensor1.get(),
+                    stream0,
+                    stream1,
+                    scratch0,
+                    scratch1,
+                    count,
+                    result0,
+                    result1);
+            }
+            else
+            {
+                captureDecodeAllreduceGraph(
+                    *ctx,
+                    tensor0.get(),
+                    tensor1.get(),
+                    stream0,
+                    stream1,
+                    count,
+                    result0,
+                    result1);
+            }
+
+            expectCapturedGraphReady(result0, "allreduce0");
+            expectCapturedGraphReady(result1, "allreduce1");
+            EXPECT_EQ(result0.pre_collective_status, hipSuccess) << label << " repetition " << repetition;
+            EXPECT_EQ(result1.pre_collective_status, hipSuccess) << label << " repetition " << repetition;
+            ASSERT_FALSE(::testing::Test::HasFailure()) << label << " repetition " << repetition;
+
+            ASSERT_EQ(hipSetDevice(0), hipSuccess) << label;
+            result0.launch_status = hipGraphLaunch(
+                result0.exec,
+                static_cast<hipStream_t>(stream0));
+            ASSERT_EQ(hipSetDevice(1), hipSuccess) << label;
+            result1.launch_status = hipGraphLaunch(
+                result1.exec,
+                static_cast<hipStream_t>(stream1));
+            EXPECT_EQ(result0.launch_status, hipSuccess) << label << " repetition " << repetition;
+            EXPECT_EQ(result1.launch_status, hipSuccess) << label << " repetition " << repetition;
+
+            ASSERT_TRUE(rocm_backend->synchronizeStream(stream0, 0)) << label << " repetition " << repetition;
+            ASSERT_TRUE(rocm_backend->synchronizeStream(stream1, 1)) << label << " repetition " << repetition;
+
+            expected_value = repetition == 0 ? 3.0f : expected_value * 2.0f;
+            destroyCaptureResult(result0);
+            destroyCaptureResult(result1);
+        }
+
+        const float *data0 = tensor0->data();
+        const float *data1 = tensor1->data();
+        ASSERT_NE(data0, nullptr) << label;
+        ASSERT_NE(data1, nullptr) << label;
+        for (size_t i = 0; i < count; ++i)
+        {
+            EXPECT_FLOAT_EQ(data0[i], expected_value) << label << " device0 mismatch at index " << i;
+            EXPECT_FLOAT_EQ(data1[i], expected_value) << label << " device1 mismatch at index " << i;
+        }
+        freeDevicePtr(0, scratch0);
+        freeDevicePtr(1, scratch1);
+        rocm_backend->destroyStream(stream0, 0);
+        rocm_backend->destroyStream(stream1, 1);
     }
 
     void runRcclDecodeMaintenanceOverlapLab(RcclOverlapPattern pattern)
@@ -1006,6 +1291,175 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_Completes
     rocm_backend->destroyStream(stream1, 1);
 }
 
+/**
+ * @brief Prefill-sized RCCL on-stream graph capture must be legal.
+ *
+ * The Qwen3.6 MoE ROCm2TP prefix tests capture an embedding_allreduce over a
+ * full prefill bucket. A small decode-sized captured allreduce can pass while
+ * the larger prefill payload still trips RCCL/HIP capture constraints, so this
+ * regression locks the payload class that failed in the E2E suite.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_PrefillPayloadCompletes)
+{
+    constexpr size_t kPrefillSeqLen = 256;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    runCapturedAllreduceGraphPayload(
+        kPrefillSeqLen * kQwen36MoEHiddenDim,
+        "prefill-sized captured RCCL allreduce");
+}
+
+/**
+ * @brief Repeated prefill-sized capture must not poison later RCCL capture.
+ *
+ * Prefix-cache validation captures and resets a prefill graph before capturing
+ * another prefill graph on the same LocalTP/RCCL machinery. This regression
+ * keeps the second capture honest so stale grouped-launch or stream-capture
+ * state cannot hide behind a one-shot success.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_RepeatedPrefillPayloadCompletes)
+{
+    constexpr size_t kPrefillSeqLen = 256;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    runCapturedAllreduceGraphPayload(
+        kPrefillSeqLen * kQwen36MoEHiddenDim,
+        "repeated prefill-sized captured RCCL allreduce",
+        2);
+}
+
+/**
+ * @brief Prefill-like captured stream work before RCCL must remain legal.
+ *
+ * This is the closest local reproduction of the E2E embedding_allreduce
+ * failure: each participant stream already contains captured GPU work before
+ * the final-arrival thread records the grouped RCCL allreduce.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_PrefillLikeSegmentCompletes)
+{
+    constexpr size_t kPrefillSeqLen = 256;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    runCapturedAllreduceGraphPayload(
+        kPrefillSeqLen * kQwen36MoEHiddenDim,
+        "prefill-like captured RCCL allreduce",
+        1,
+        true);
+}
+
+/**
+ * @brief Regress repeated prefill-like captures on the same RCCL context.
+ *
+ * Long-context bucketed prefill warms a bucket, captures it on the next chunk,
+ * launches the captured graph, and later captures the same prefill-shaped
+ * collective pattern again.  A single pre-collective work item is not enough
+ * coverage for that lifecycle because stale stream/capture bookkeeping can
+ * survive the first graph launch and only poison the following capture.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_RepeatedPrefillLikeSegmentCompletes)
+{
+    constexpr size_t kPrefillSeqLen = 256;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    runCapturedAllreduceGraphPayload(
+        kPrefillSeqLen * kQwen36MoEHiddenDim,
+        "repeated prefill-like captured RCCL allreduce",
+        2,
+        true);
+}
+
+/**
+ * @brief LocalTP prefill graph-capture boundaries must be domain-wide barriers.
+ *
+ * The ROCm2TP dynamic prefix path warms a prefill bucket and then captures the
+ * same bucket on the following chunk.  Before this regression, one participant
+ * could enter HIP graph capture while its sibling was still finishing the eager
+ * warmup tail, leaving a sticky capture-implicit stream dependency error that
+ * later surfaced as rcclGroupEnd invalid usage.  This test locks the ownership
+ * rule at the LocalTP boundary: the early participant cannot cross the boundary
+ * until every sibling arrives, and the same context can reuse the barrier for
+ * the next capture lifecycle boundary.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, PrefillGraphCaptureBoundaryRendezvousBlocksUntilAllParticipantsArrive)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ ROCm GPUs, found " << rocm_backend->deviceCount();
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr int kTimeoutMs = 30000;
+    const std::string first_boundary =
+        "prefill_graph:before_begin:seq=256:bucket=256:test";
+    std::atomic<bool> early_entered{false};
+    std::atomic<bool> early_returned{false};
+    bool early_ok = false;
+
+    std::thread early([&]()
+                      {
+                          early_entered.store(true, std::memory_order_release);
+                          early_ok = ctx->graphCaptureBoundaryRendezvous(
+                              first_boundary,
+                              0,
+                              kTimeoutMs);
+                          early_returned.store(true, std::memory_order_release);
+                      });
+
+    while (!early_entered.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(early_returned.load(std::memory_order_acquire))
+        << "slot 0 crossed the capture boundary before slot 1 arrived";
+
+    const bool late_ok = ctx->graphCaptureBoundaryRendezvous(
+        first_boundary,
+        1,
+        kTimeoutMs);
+    early.join();
+
+    EXPECT_TRUE(early_ok);
+    EXPECT_TRUE(late_ok);
+
+    const std::string second_boundary =
+        "prefill_graph:before_launch_after_capture:seq=256:bucket=256:test";
+    std::atomic<bool> second_early_entered{false};
+    std::atomic<bool> second_early_returned{false};
+    bool second_early_ok = false;
+
+    std::thread second_early([&]()
+                             {
+                                 second_early_entered.store(true, std::memory_order_release);
+                                 second_early_ok = ctx->graphCaptureBoundaryRendezvous(
+                                     second_boundary,
+                                     1,
+                                     kTimeoutMs);
+                                 second_early_returned.store(true, std::memory_order_release);
+                             });
+
+    while (!second_early_entered.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(second_early_returned.load(std::memory_order_acquire))
+        << "slot 1 crossed the reused capture boundary before slot 0 arrived";
+
+    const bool second_late_ok = ctx->graphCaptureBoundaryRendezvous(
+        second_boundary,
+        0,
+        kTimeoutMs);
+    second_early.join();
+
+    EXPECT_TRUE(second_early_ok);
+    EXPECT_TRUE(second_late_ok);
+}
+
 TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_OnStreamGraphCapture_Completes)
 {
     auto *rocm_backend = getROCmBackend();
@@ -1282,6 +1736,237 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_OnStreamGraphCapture_Comple
     freeDevicePtr(1, send_i8_1);
     freeDevicePtr(0, recv_i8_0);
     freeDevicePtr(1, recv_i8_1);
+}
+
+/**
+ * @brief Regresses large back-to-back K/V raw allgathers inside RCCL graph capture.
+ *
+ * Qwen phase-split prefill publishes full K and V state by capturing two
+ * adjacent LocalTP raw allgathers.  The payload here matches the order and
+ * size class of that handoff so graph-captured RCCL allgather emulation must
+ * replay correct bytes for both K and V, including the late rows that are
+ * restored by prefix-cache partial hits.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBackKVPayloads_ReplaysCorrectly)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ ROCm GPUs, found " << rocm_backend->deviceCount();
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    constexpr size_t tokens = 640;
+    constexpr size_t local_kv_dim = 256;
+    constexpr size_t shard_count = tokens * local_kv_dim;
+
+    float *send_k0 = nullptr;
+    float *send_k1 = nullptr;
+    float *send_v0 = nullptr;
+    float *send_v1 = nullptr;
+    float *recv_k0 = nullptr;
+    float *recv_k1 = nullptr;
+    float *recv_v0 = nullptr;
+    float *recv_v1 = nullptr;
+    allocateAndUpload<float>(0, std::vector<float>(shard_count, 1.0f), &send_k0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count, 2.0f), &send_k1);
+    allocateAndUpload<float>(0, std::vector<float>(shard_count, 3.0f), &send_v0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count, 4.0f), &send_v1);
+    allocateAndUpload<float>(0, std::vector<float>(shard_count * 2, -1.0f), &recv_k0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count * 2, -1.0f), &recv_k1);
+    allocateAndUpload<float>(0, std::vector<float>(shard_count * 2, -1.0f), &recv_v0);
+    allocateAndUpload<float>(1, std::vector<float>(shard_count * 2, -1.0f), &recv_v1);
+
+    CapturedAllgatherResources resources0;
+    CapturedAllgatherResources resources1;
+    resources0.capture_stream = rocm_backend->createStream(0);
+    resources1.capture_stream = rocm_backend->createStream(1);
+    ASSERT_NE(resources0.capture_stream, nullptr);
+    ASSERT_NE(resources1.capture_stream, nullptr);
+
+    Barrier ready_to_capture(2);
+    Barrier captured_collective(2);
+    Barrier ready_to_launch(2);
+    CaptureResult result0;
+    CaptureResult result1;
+
+    auto capture_worker = [&](int device,
+                              const float *send_k,
+                              const float *send_v,
+                              float *recv_k,
+                              float *recv_v,
+                              CapturedAllgatherResources *resources,
+                              CaptureResult *result)
+    {
+        result->begin_status = hipSetDevice(device);
+        if (result->begin_status == hipSuccess)
+        {
+            result->begin_status = hipStreamBeginCapture(
+                static_cast<hipStream_t>(resources->capture_stream),
+                hipStreamCaptureModeRelaxed);
+        }
+
+        ready_to_capture.arriveAndWait();
+
+        if (result->begin_status == hipSuccess)
+        {
+            GraphCaptureGuard guard;
+            result->k_allgather_ok = ctx->allgatherRawOnStream(
+                send_k,
+                recv_k,
+                shard_count,
+                CollectiveDataType::FLOAT32,
+                device,
+                resources->capture_stream,
+                "large_kv_raw_allgather_K");
+            result->v_allgather_ok = ctx->allgatherRawOnStream(
+                send_v,
+                recv_v,
+                shard_count,
+                CollectiveDataType::FLOAT32,
+                device,
+                resources->capture_stream,
+                "large_kv_raw_allgather_V");
+            result->collective_ok =
+                result->k_allgather_ok &&
+                result->v_allgather_ok;
+        }
+
+        captured_collective.arriveAndWait();
+
+        if (result->begin_status == hipSuccess &&
+            result->end_status == hipSuccess &&
+            result->collective_ok)
+        {
+            result->end_status = hipSetDevice(device);
+            if (result->end_status == hipSuccess)
+            {
+                result->end_status = hipStreamEndCapture(
+                    static_cast<hipStream_t>(resources->capture_stream),
+                    &result->graph);
+            }
+        }
+
+        if (result->end_status == hipSuccess && result->graph)
+        {
+            result->instantiate_status = hipSetDevice(device);
+            if (result->instantiate_status == hipSuccess)
+            {
+                result->instantiate_status = hipGraphInstantiate(
+                    &result->exec,
+                    result->graph,
+                    nullptr,
+                    nullptr,
+                    0);
+            }
+        }
+
+        ready_to_launch.arriveAndWait();
+
+        if (result->instantiate_status == hipSuccess && result->exec)
+        {
+            result->launch_status = hipSetDevice(device);
+            if (result->launch_status == hipSuccess)
+            {
+                result->launch_status = hipGraphLaunch(
+                    result->exec,
+                    static_cast<hipStream_t>(resources->capture_stream));
+            }
+        }
+    };
+
+    std::thread t0(capture_worker,
+                   0,
+                   send_k0,
+                   send_v0,
+                   recv_k0,
+                   recv_v0,
+                   &resources0,
+                   &result0);
+    std::thread t1(capture_worker,
+                   1,
+                   send_k1,
+                   send_v1,
+                   recv_k1,
+                   recv_v1,
+                   &resources1,
+                   &result1);
+    t0.join();
+    t1.join();
+
+    EXPECT_EQ(result0.begin_status, hipSuccess);
+    EXPECT_EQ(result1.begin_status, hipSuccess);
+    EXPECT_TRUE(result0.k_allgather_ok);
+    EXPECT_TRUE(result1.k_allgather_ok);
+    EXPECT_TRUE(result0.v_allgather_ok);
+    EXPECT_TRUE(result1.v_allgather_ok);
+    EXPECT_TRUE(result0.collective_ok);
+    EXPECT_TRUE(result1.collective_ok);
+    EXPECT_EQ(result0.end_status, hipSuccess);
+    EXPECT_EQ(result1.end_status, hipSuccess);
+    EXPECT_NE(result0.graph, nullptr);
+    EXPECT_NE(result1.graph, nullptr);
+    EXPECT_EQ(result0.instantiate_status, hipSuccess);
+    EXPECT_EQ(result1.instantiate_status, hipSuccess);
+    EXPECT_EQ(result0.launch_status, hipSuccess);
+    EXPECT_EQ(result1.launch_status, hipSuccess);
+
+    ASSERT_TRUE(rocm_backend->synchronizeStream(resources0.capture_stream, 0));
+    ASSERT_TRUE(rocm_backend->synchronizeStream(resources1.capture_stream, 1));
+
+    expectGatheredFloatShards(
+        rocm_backend,
+        0,
+        recv_k0,
+        shard_count,
+        1.0f,
+        2.0f,
+        "large K allgather on device 0");
+    expectGatheredFloatShards(
+        rocm_backend,
+        1,
+        recv_k1,
+        shard_count,
+        1.0f,
+        2.0f,
+        "large K allgather on device 1");
+    expectGatheredFloatShards(
+        rocm_backend,
+        0,
+        recv_v0,
+        shard_count,
+        3.0f,
+        4.0f,
+        "large V allgather on device 0");
+    expectGatheredFloatShards(
+        rocm_backend,
+        1,
+        recv_v1,
+        shard_count,
+        3.0f,
+        4.0f,
+        "large V allgather on device 1");
+
+    destroyCaptureResult(result0);
+    destroyCaptureResult(result1);
+    destroyAllgatherResources(rocm_backend, 0, resources0);
+    destroyAllgatherResources(rocm_backend, 1, resources1);
+    freeDevicePtr(0, send_k0);
+    freeDevicePtr(1, send_k1);
+    freeDevicePtr(0, send_v0);
+    freeDevicePtr(1, send_v1);
+    freeDevicePtr(0, recv_k0);
+    freeDevicePtr(1, recv_k1);
+    freeDevicePtr(0, recv_v0);
+    freeDevicePtr(1, recv_v1);
 }
 
 TEST(Test__LocalTPRCCLGraphCapture, RCCLGroupedP2PMaintenanceGraph_AuxiliaryStream_TimingProbe)

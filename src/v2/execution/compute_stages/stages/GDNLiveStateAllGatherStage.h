@@ -71,6 +71,8 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
         bool isGraphCapturable() const override;
+        bool requiresPostVerifierStatePublication() const override;
+        bool publishPostVerifierStateRestore(void *stream = nullptr) override;
 
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
@@ -89,6 +91,7 @@ namespace llaminar2
         std::string fullConvBufferName() const;
         std::string localRecurrenceBufferName() const;
         std::string fullRecurrenceBufferName() const;
+        bool runLiveStateAllGather(const char *context);
     };
 
 } // namespace llaminar2

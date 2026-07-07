@@ -162,6 +162,9 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
 
         /// Target device for coherence management
 
@@ -196,12 +199,8 @@ namespace llaminar2
             TensorBase *C_base,
             ITensorGemm *gemm,
             int effective_n);
+        void clearCachedGemmStream();
 
-        // Reused one-row verifier scratch. Keeping this state on the stage avoids
-        // allocating transient tensors while the hot verifier path is iterating rows.
-        std::shared_ptr<FP32Tensor> verifier_gate_row_;
-        std::shared_ptr<FP32Tensor> verifier_input_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_row_;
     };
 
 } // namespace llaminar2

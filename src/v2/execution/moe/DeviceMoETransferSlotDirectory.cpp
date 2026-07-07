@@ -157,7 +157,8 @@ namespace llaminar2
             entry.descriptor.logical_expert_id = -1;
             entry.descriptor.owner_participant = static_cast<int32_t>(participant_id);
             entry.descriptor.local_slot = static_cast<int32_t>(slot);
-            entry.descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid);
+            entry.descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                      DeviceMoEExpertFlags::TransferSlot);
             entry.flags =
                 static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
                 static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
@@ -280,6 +281,33 @@ namespace llaminar2
             backend_->free(device_entries_, device_ordinal_);
             device_entries_ = nullptr;
         }
+    }
+
+    bool DeviceMoETransferSlotDirectory::descriptorForSlot(
+        uint32_t slot_index,
+        uint32_t logical_expert,
+        DeviceMoEExpertDescriptor &out) const
+    {
+        if (slot_index >= host_entries_.size())
+            return false;
+
+        const auto &entry = host_entries_[static_cast<size_t>(slot_index)];
+        if (!deviceMoETransferSlotReadyForCopy(
+                entry,
+                participant_id_,
+                /*layer=*/0,
+                /*expert=*/0))
+        {
+            return false;
+        }
+
+        out = entry.descriptor;
+        out.logical_expert_id = static_cast<int32_t>(logical_expert);
+        out.local_slot = static_cast<int32_t>(slot_index);
+        out.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                      DeviceMoEExpertFlags::Resident |
+                                      DeviceMoEExpertFlags::TransferSlot);
+        return true;
     }
 
     std::string DeviceMoETransferSlotDirectory::slotName(

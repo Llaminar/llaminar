@@ -118,6 +118,18 @@ namespace llaminar2
             void *producer_stream,
             const std::string &stage_name) override;
         bool supportsRawAllgatherOnStreamGraphCapture() const override;
+
+        /**
+         * @brief Coordinate every LocalTP participant at a named GPU graph-capture boundary.
+         *
+         * See ILocalTPContext::graphCaptureBoundaryRendezvous() for the lifecycle
+         * contract. The concrete implementation is cyclic and may be reused for
+         * successive prefill chunks and capture phases.
+         */
+        bool graphCaptureBoundaryRendezvous(
+            const std::string &boundary_name,
+            int device_index,
+            int timeout_ms) override;
         bool collectiveSidebandOnStream(
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
             int device_index,
@@ -406,6 +418,20 @@ namespace llaminar2
         size_t grouped_onstream_allreduce_sideband_count_{0};
         std::vector<LocalTPCollectiveSidebandBuffer> grouped_onstream_allreduce_reference_sidebands_;
         std::vector<std::vector<LocalTPCollectiveSidebandBuffer>> grouped_onstream_allreduce_sidebands_;
+
+        // =====================================================================
+        // GPU graph-capture lifecycle rendezvous.
+        // =====================================================================
+        mutable std::mutex graph_capture_boundary_mutex_;
+        std::condition_variable graph_capture_boundary_cv_;
+        uint64_t graph_capture_boundary_generation_{0};
+        int graph_capture_boundary_arrivals_{0};
+        int graph_capture_boundary_departures_{0};
+        bool graph_capture_boundary_ready_{false};
+        bool graph_capture_boundary_result_{false};
+        std::string graph_capture_boundary_name_;
+        std::string graph_capture_boundary_error_;
+        std::vector<bool> graph_capture_boundary_seen_;
 
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers

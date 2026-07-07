@@ -114,6 +114,45 @@ namespace
         void *stream_seen_by_stage_ = nullptr;
     };
 
+    class FakeCapturedStateStage final : public IComputeStage
+    {
+    public:
+        FakeCapturedStateStage(DeviceId device,
+                               bool has_capture,
+                               bool requires_capture = true,
+                               bool restore_ok = true)
+            : IComputeStage(device),
+              has_capture_(has_capture),
+              requires_capture_(requires_capture),
+              restore_ok_(restore_ok)
+        {
+        }
+
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        std::string name() const override { return "fake_captured_state_stage"; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        bool hasVerifierStateCapture() const override { return has_capture_; }
+        bool requiresVerifierStateCaptureForPublication() const override { return requires_capture_; }
+        bool restoreVerifierStateCaptureRow(int row, void *stream) override
+        {
+            ++restore_calls_;
+            last_row_ = row;
+            last_stream_ = stream;
+            return restore_ok_;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        int restore_calls_ = 0;
+        int last_row_ = -1;
+        void *last_stream_ = nullptr;
+
+    private:
+        bool has_capture_ = false;
+        bool requires_capture_ = true;
+        bool restore_ok_ = true;
+    };
+
     class FakeReplayGraphCapture final : public IGPUGraphCapture
     {
     public:
@@ -618,6 +657,122 @@ TEST(Test__ForwardGraphCache, InvalidateIdempotent)
     EXPECT_TRUE(cache.token_ids.empty());
 }
 
+/**
+ * @brief Verify replay-time host positions are owned by the current forward input.
+ *
+ * Bucketed prefill graph replay can reuse the same captured shape for a later
+ * prompt suffix chunk.  The cache therefore must not prefer graph-build
+ * position rows over fresh replay rows, because RoPE would rotate K with the
+ * previous chunk's absolute positions.
+ */
+TEST(Test__ForwardGraphCache, ReplayHostPositionIdsPreferCurrentInputOverCacheStorage)
+{
+    ForwardGraphCache cache;
+    cache.position_ids = {0, 1, 2, 3};
+
+    const std::vector<int> suffix_positions = {256, 257, 258, 259};
+    ForwardInput input;
+    input.position_ids = suffix_positions.data();
+    input.seq_len = static_cast<int>(suffix_positions.size());
+
+    const int *selected = selectForwardReplayHostPositionIds(cache, input);
+
+    ASSERT_EQ(selected, suffix_positions.data());
+    EXPECT_EQ(std::vector<int>(selected, selected + suffix_positions.size()),
+              suffix_positions);
+}
+
+/**
+ * @brief Verify cache-owned host positions are only a no-input compatibility fallback.
+ */
+TEST(Test__ForwardGraphCache, ReplayHostPositionIdsFallbackToCacheWhenInputHasNoRows)
+{
+    ForwardGraphCache cache;
+    cache.position_ids = {7, 8, 9};
+
+    ForwardInput input;
+    input.seq_len = static_cast<int>(cache.position_ids.size());
+
+    const int *selected = selectForwardReplayHostPositionIds(cache, input);
+
+    ASSERT_EQ(selected, cache.position_ids.data());
+    EXPECT_EQ(std::vector<int>(selected, selected + cache.position_ids.size()),
+              cache.position_ids);
+}
+
+/**
+ * @brief Verify device-resident replay positions remain the single source of truth.
+ */
+TEST(Test__ForwardGraphCache, ReplayHostPositionIdsDoNotMaskDeviceResidentRows)
+{
+    ForwardGraphCache cache;
+    cache.position_ids = {0, 1, 2};
+
+    const std::vector<int> host_shadow = {512, 513, 514};
+    ForwardInput input;
+    input.position_ids = host_shadow.data();
+    input.position_ids_device = reinterpret_cast<const void *>(0xCAFE);
+    input.seq_len = static_cast<int>(host_shadow.size());
+
+    EXPECT_EQ(selectForwardReplayHostPositionIds(cache, input), nullptr);
+}
+
+TEST(Test__DeviceGraphExecutor, CapturedTerminalStatePublishesCapturedStages)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cpu());
+
+    int stream_token = 0;
+    void *stream = &stream_token;
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        stream,
+        "unit"));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_row_, 7);
+    EXPECT_EQ(stage_ptr->last_stream_, stream);
+}
+
+TEST(Test__DeviceGraphExecutor, CapturedTerminalStateRequiresExplicitGPUStream)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cuda(0),
+        /*has_capture=*/true);
+    graph.addNode("captured", std::move(stage), DeviceId::cuda(0));
+
+    EXPECT_FALSE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/3,
+        nullptr,
+        "unit"));
+}
+
+TEST(Test__DeviceGraphExecutor, CapturedTerminalStateFailsWhenRequiredCaptureMissing)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/false,
+        /*requires_capture=*/true);
+    graph.addNode("missing_capture", std::move(stage), DeviceId::cpu());
+
+    EXPECT_FALSE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/0,
+        nullptr,
+        "unit"));
+}
+
 TEST(Test__GraphSegmentCache, ResetCanPreserveCaptureStream)
 {
     DeviceGraphExecutor::GraphSegmentCache cache;
@@ -1052,12 +1207,12 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecod
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
                   prefill),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
-        << "Exact prefill cache reset demotes warmup to Initialized and refreshes graph-facing buffers before capture/replay.";
+        << "Exact prefill keeps the captured parity/serving fast path; monolithic prefill graph-cache executables reset separately.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
                   bucketed_prefill),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
-        << "Ready bucketed prefill captures replay from refreshed graph-facing buffers.";
+        << "Bucketed prefill replay remains warm while request-local graph-cache entries are demoted.";
 }
 
 TEST(Test__ForwardReplayStatePolicy, RequestBoundaryResetsDecodeCachesWithCollectives)
@@ -1095,7 +1250,7 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryResetsDecodeCachesWithCollec
                   prefill,
                   /*graph_has_collective_nodes=*/true),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
-        << "The current regression is request-crossing decode replay; prefill cache reset has a separate "
+        << "The collective request-boundary guard applies to decode replay; prefill has a separate "
            "capture/readiness state machine.";
 }
 
@@ -2124,6 +2279,9 @@ TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
         &gpu_ctx,
         &capture_stream,
         /*segment_index=*/0,
+        /*current_step=*/0,
+        "unit_recapture",
+        DeviceGraphExecutor::GraphCaptureBoundaryHook{},
         [](ComputeNode &, void *)
         {
             return true;
@@ -2163,6 +2321,9 @@ TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
         &gpu_ctx,
         &capture_stream,
         /*segment_index=*/0,
+        /*current_step=*/0,
+        "unit_recapture",
+        DeviceGraphExecutor::GraphCaptureBoundaryHook{},
         [](ComputeNode &, void *)
         {
             return true;

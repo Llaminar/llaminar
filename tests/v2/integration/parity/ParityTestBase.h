@@ -56,6 +56,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <chrono>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -1725,6 +1726,13 @@ namespace llaminar2::test::parity
             std::optional<std::string> previous;
         };
 
+        struct ParityProfileRecord
+        {
+            size_t count = 0;
+            double total_ms = 0.0;
+            double max_ms = 0.0;
+        };
+
         std::string snapshotCacheKey() const
         {
             return config_.snapshot_dir + "|" + config_.model_path;
@@ -1800,6 +1808,108 @@ namespace llaminar2::test::parity
         }
 
     protected:
+        class ParityProfileScope
+        {
+        public:
+            ParityProfileScope(ParityTestBase *owner, std::string phase)
+                : owner_(owner),
+                  phase_(std::move(phase)),
+                  enabled_(owner_ && owner_->parityProfileEnabled()),
+                  start_(std::chrono::steady_clock::now())
+            {
+            }
+
+            ParityProfileScope(const ParityProfileScope &) = delete;
+            ParityProfileScope &operator=(const ParityProfileScope &) = delete;
+
+            ParityProfileScope(ParityProfileScope &&other) noexcept
+                : owner_(other.owner_),
+                  phase_(std::move(other.phase_)),
+                  enabled_(other.enabled_),
+                  start_(other.start_)
+            {
+                other.enabled_ = false;
+                other.owner_ = nullptr;
+            }
+
+            ~ParityProfileScope()
+            {
+                if (!enabled_ || !owner_)
+                    return;
+                const auto elapsed = std::chrono::steady_clock::now() - start_;
+                const double elapsed_ms =
+                    std::chrono::duration<double, std::milli>(elapsed).count();
+                owner_->recordParityProfile(phase_, elapsed_ms);
+            }
+
+        private:
+            ParityTestBase *owner_ = nullptr;
+            std::string phase_;
+            bool enabled_ = false;
+            std::chrono::steady_clock::time_point start_;
+        };
+
+        bool parityProfileEnabled() const
+        {
+            return isRank0() && DebugEnv::isTruthyEnv("LLAMINAR_PARITY_PROFILE");
+        }
+
+        ParityProfileScope profileParityScope(std::string phase)
+        {
+            return ParityProfileScope(this, std::move(phase));
+        }
+
+        void recordParityProfile(const std::string &phase, double elapsed_ms)
+        {
+            auto &record = parity_profile_records_[phase];
+            record.count += 1;
+            record.total_ms += elapsed_ms;
+            record.max_ms = std::max(record.max_ms, elapsed_ms);
+
+            if (DebugEnv::isTruthyEnv("LLAMINAR_PARITY_PROFILE_VERBOSE"))
+            {
+                std::cerr << "[parity-profile] case=" << cfg().name
+                          << " backend=" << getBackendName()
+                          << " phase=" << phase
+                          << " elapsed_ms=" << std::fixed << std::setprecision(3)
+                          << elapsed_ms << '\n';
+            }
+        }
+
+        void printParityProfileSummary()
+        {
+            if (!parityProfileEnabled() || parity_profile_records_.empty())
+                return;
+
+            std::vector<std::pair<std::string, ParityProfileRecord>> rows(
+                parity_profile_records_.begin(),
+                parity_profile_records_.end());
+            std::sort(
+                rows.begin(),
+                rows.end(),
+                [](const auto &lhs, const auto &rhs)
+                {
+                    if (lhs.second.total_ms != rhs.second.total_ms)
+                        return lhs.second.total_ms > rhs.second.total_ms;
+                    return lhs.first < rhs.first;
+                });
+
+            for (const auto &[phase, record] : rows)
+            {
+                const double avg_ms = record.count == 0
+                                          ? 0.0
+                                          : record.total_ms / static_cast<double>(record.count);
+                std::cerr << "[parity-profile-summary] case=" << cfg().name
+                          << " backend=" << getBackendName()
+                          << " phase=" << phase
+                          << " count=" << record.count
+                          << " total_ms=" << std::fixed << std::setprecision(3)
+                          << record.total_ms
+                          << " avg_ms=" << avg_ms
+                          << " max_ms=" << record.max_ms << '\n';
+            }
+        }
+
         void setScopedParityEnvOverride(const char *name, const std::string &value)
         {
             setParityEnvOverride(name, value);
@@ -1847,8 +1957,10 @@ namespace llaminar2::test::parity
         ParityConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
+        IInferenceRunner *borrowed_runner_ = nullptr;
         std::unordered_map<std::string, std::vector<float>> pytorch_snapshots_;
         mutable std::unordered_map<std::string, std::vector<float>> active_snapshot_combined_cache_;
+        std::unordered_map<std::string, ParityProfileRecord> parity_profile_records_;
         std::vector<SavedEnvValue> parity_env_overrides_;
 
         // MPI context for tensor-parallel tests (optional, null for single-rank)
@@ -1859,6 +1971,11 @@ namespace llaminar2::test::parity
         // Use setupOrchestrationRunner() to initialize orch_runner_, or
         // setupPipeline() to initialize runner_ (legacy path).
         std::unique_ptr<IOrchestrationRunner> orch_runner_;
+
+        IInferenceRunner *activeLegacyRunner() const
+        {
+            return runner_ ? runner_.get() : borrowed_runner_;
+        }
 
         int parityLayerCount() const
         {
@@ -2021,12 +2138,36 @@ namespace llaminar2::test::parity
          */
         virtual void setupDeviceSpecific() {}
 
+        virtual bool preserveParityPipelineCachesBetweenTests() const
+        {
+            return false;
+        }
+
+        void borrowParityPipeline(
+            std::shared_ptr<ModelContext> model_ctx,
+            IInferenceRunner *runner)
+        {
+            runner_.reset();
+            orch_runner_.reset();
+            model_ctx_ = std::move(model_ctx);
+            borrowed_runner_ = runner;
+            if (borrowed_runner_)
+                borrowed_runner_->enableSnapshotCapture();
+        }
+
+        void releaseBorrowedParityPipeline()
+        {
+            borrowed_runner_ = nullptr;
+            model_ctx_.reset();
+        }
+
         void SetUp() override
         {
             // Model parity is a production-path canary. Do not let an inherited
             // shell env or a previous test route it through deterministic GEMM.
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
+            auto parity_profile_scope = profileParityScope("set_up.total");
 #ifdef HAVE_CUDA
             cudaNativeVNNIPrefill_setDeterministicMode(false);
 #endif
@@ -2046,9 +2187,11 @@ namespace llaminar2::test::parity
             // TearDown() also clears, but this guards against incomplete teardown
             // from a prior test (crash, skip, or assertion failure) leaving stale
             // GEMM engines, embedding caches, or prepared-weight handles.
-            llaminar::v2::kernels::KernelFactory::clearCache();
+            if (!preserveParityPipelineCachesBetweenTests())
+                llaminar::v2::kernels::KernelFactory::clearCache();
 #ifdef HAVE_CUDA
-            llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
+            if (!preserveParityPipelineCachesBetweenTests())
+                llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
 #endif
 
             // Device-specific setup first (may skip)
@@ -2073,105 +2216,139 @@ namespace llaminar2::test::parity
             // AND the snapshot version matches the expected version.
             // This is critical for MPI_PROCS>1 tests where popen()/fork() inside
             // an MPI-managed process can crash the HNP event loop.
-            if (isRank0())
             {
-                bool need_regen = false;
+                auto scope = profileParityScope("set_up.snapshot_ready");
+                if (isRank0())
                 {
-                    std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
-                    need_regen = (s_generated_snapshots_.find(snapshotCacheKey()) == s_generated_snapshots_.end());
-                }
-
-                if (need_regen)
-                {
-                    // Check disk first — snapshots may exist from a prior test run
-                    auto metadata_path = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
-                    if (std::filesystem::exists(metadata_path))
+                    bool need_regen = false;
                     {
-                        int disk_version = readSnapshotVersion(metadata_path);
-                        if (disk_version >= kRequiredSnapshotVersion)
+                        std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
+                        need_regen = (s_generated_snapshots_.find(snapshotCacheKey()) == s_generated_snapshots_.end());
+                    }
+
+                    if (need_regen)
+                    {
+                        // Check disk first — snapshots may exist from a prior test run
+                        auto metadata_path = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
+                        if (std::filesystem::exists(metadata_path))
                         {
-                            LOG_INFO("[" << getBackendName() << " Parity] Found existing v" << disk_version
-                                         << " snapshots on disk: " << config_.snapshot_dir);
-                            need_regen = false;
-                        }
-                        else
-                        {
-                            LOG_WARN("[" << getBackendName() << " Parity] Stale snapshots (v"
-                                         << disk_version << " < required v" << kRequiredSnapshotVersion
-                                         << ") — regenerating: " << config_.snapshot_dir);
+                            int disk_version = readSnapshotVersion(metadata_path);
+                            if (disk_version >= kRequiredSnapshotVersion)
+                            {
+                                LOG_INFO("[" << getBackendName() << " Parity] Found existing v" << disk_version
+                                             << " snapshots on disk: " << config_.snapshot_dir);
+                                need_regen = false;
+                            }
+                            else
+                            {
+                                LOG_WARN("[" << getBackendName() << " Parity] Stale snapshots (v"
+                                             << disk_version << " < required v" << kRequiredSnapshotVersion
+                                             << ") — regenerating: " << config_.snapshot_dir);
+                            }
                         }
                     }
-                }
 
-                if (need_regen)
-                {
-                    if (!regeneratePyTorchSnapshots())
+                    if (need_regen)
                     {
-                        FAIL() << "PyTorch snapshot generation failed";
+                        if (!regeneratePyTorchSnapshots())
+                        {
+                            FAIL() << "PyTorch snapshot generation failed";
+                        }
+                        // Mark as generated
+                        std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
+                        s_generated_snapshots_.insert(snapshotCacheKey());
                     }
-                    // Mark as generated
-                    std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
-                    s_generated_snapshots_.insert(snapshotCacheKey());
-                }
-                else
-                {
-                    // Mark in cache so subsequent parameterized cases skip the disk check too
-                    std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
-                    s_generated_snapshots_.insert(snapshotCacheKey());
-                    LOG_DEBUG("[" << getBackendName() << " Parity] Reusing cached snapshots from: " << config_.snapshot_dir);
+                    else
+                    {
+                        // Mark in cache so subsequent parameterized cases skip the disk check too
+                        std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
+                        s_generated_snapshots_.insert(snapshotCacheKey());
+                        LOG_DEBUG("[" << getBackendName() << " Parity] Reusing cached snapshots from: " << config_.snapshot_dir);
+                    }
                 }
             }
-            mpiBarrier(); // All ranks wait for snapshots to be ready
+            {
+                auto scope = profileParityScope("set_up.snapshot_barrier");
+                mpiBarrier(); // All ranks wait for snapshots to be ready
+            }
         }
 
         void TearDown() override
         {
             // Barrier before teardown to ensure all ranks are done
-            mpiBarrier();
+            {
+                auto scope = profileParityScope("tear_down.initial_barrier");
+                mpiBarrier();
+            }
 
             // Ensure all GPU work that may reference graph stages or cached
             // prepared weights has completed before any owner is destroyed.
-#ifdef HAVE_CUDA
-            if (auto *cuda_backend = llaminar2::getCUDABackend())
             {
-                for (int d = 0; d < cuda_backend->deviceCount(); ++d)
+                auto scope = profileParityScope("tear_down.pre_destroy_gpu_sync");
+#ifdef HAVE_CUDA
+                if (auto *cuda_backend = llaminar2::getCUDABackend())
                 {
-                    cuda_backend->synchronize(d);
+                    for (int d = 0; d < cuda_backend->deviceCount(); ++d)
+                    {
+                        cuda_backend->synchronize(d);
+                    }
+                    cudaGetLastError();
                 }
-                cudaGetLastError();
-            }
 #endif
 #ifdef HAVE_ROCM
-            if (auto *rocm_backend = llaminar2::getROCmBackend())
-            {
-                for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                if (auto *rocm_backend = llaminar2::getROCmBackend())
                 {
-                    rocm_backend->synchronize(d);
+                    for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                    {
+                        rocm_backend->synchronize(d);
+                    }
+                }
+#endif
+            }
+
+            if (preserveParityPipelineCachesBetweenTests() && borrowed_runner_)
+            {
+                auto scope = profileParityScope("tear_down.reset_borrowed_pipeline");
+                activeClearSnapshots();
+                activeClearCache();
+                releaseBorrowedParityPipeline();
+            }
+            else
+            {
+                // Destroy graph/stage owners before clearing global kernel caches.
+                // The model context remains alive until after clearCache(), so tensor
+                // cache cleanup can still access tensor-owned packed caches safely.
+                {
+                    auto scope = profileParityScope("tear_down.destroy_runner");
+                    runner_.reset();
+                    orch_runner_.reset();
+                }
+
+                // CRITICAL: Clear kernel cache BEFORE destroying model context!
+                // KernelFactory::clearCache() accesses tensor->cache_ (CPU packed weights)
+                // to free resources. If we destroy the tensors first (via model_ctx_.reset()),
+                // clearCache() would be accessing freed memory (use-after-free).
+                {
+                    auto scope = profileParityScope("tear_down.clear_kernel_cache");
+                    llaminar::v2::kernels::KernelFactory::clearCache();
+                }
+
+                // CRITICAL: Clear embedding caches to prevent test pollution!
+                // The embedding kernels cache workspace-to-tensor mappings statically.
+                // Without clearing, subsequent tests may use stale cached pointers.
+#ifdef HAVE_CUDA
+                {
+                    auto scope = profileParityScope("tear_down.clear_embedding_cache");
+                    llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
+                }
+#endif
+
+                {
+                    auto scope = profileParityScope("tear_down.clear_model_and_snapshots");
+                    model_ctx_.reset();
+                    pytorch_snapshots_.clear();
                 }
             }
-#endif
-
-            // Destroy graph/stage owners before clearing global kernel caches.
-            // The model context remains alive until after clearCache(), so tensor
-            // cache cleanup can still access tensor-owned packed caches safely.
-            runner_.reset();
-            orch_runner_.reset();
-
-            // CRITICAL: Clear kernel cache BEFORE destroying model context!
-            // KernelFactory::clearCache() accesses tensor->cache_ (CPU packed weights)
-            // to free resources. If we destroy the tensors first (via model_ctx_.reset()),
-            // clearCache() would be accessing freed memory (use-after-free).
-            llaminar::v2::kernels::KernelFactory::clearCache();
-
-            // CRITICAL: Clear embedding caches to prevent test pollution!
-            // The embedding kernels cache workspace-to-tensor mappings statically.
-            // Without clearing, subsequent tests may use stale cached pointers.
-#ifdef HAVE_CUDA
-            llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
-#endif
-
-            model_ctx_.reset();
-            pytorch_snapshots_.clear();
 
             // CRITICAL: Synchronize and clear error state on all GPU devices!
             // After heterogeneous tests (CUDA+ROCm), the HIP runtime can be left
@@ -2179,29 +2356,44 @@ namespace llaminar2::test::parity
             // "invalid argument" on kernel launch. Synchronizing each backend
             // cleans up any lingering issues.
 #ifdef HAVE_CUDA
-            if (auto *cuda_backend = llaminar2::getCUDABackend())
             {
-                cuda_backend->synchronize(0);
-                // Clear CUDA sticky error state to prevent async kernel errors
-                // from one test case propagating to the next test's first CUDA API call.
-                cudaGetLastError();
+                auto scope = profileParityScope("tear_down.final_cuda_sync");
+                if (auto *cuda_backend = llaminar2::getCUDABackend())
+                {
+                    // Synchronize ALL CUDA devices, not just device 0. LocalTP
+                    // parity cases keep borrowed multi-GPU runners alive across
+                    // tests, and clear_cache() may enqueue request-reset work on
+                    // every participant stream.
+                    for (int d = 0; d < cuda_backend->deviceCount(); ++d)
+                    {
+                        cuda_backend->synchronize(d);
+                    }
+                    // Clear CUDA sticky error state to prevent async kernel
+                    // errors from one test case propagating to the next test's
+                    // first CUDA API call.
+                    cudaGetLastError();
+                }
             }
 #endif
 #ifdef HAVE_ROCM
-            if (auto *rocm_backend = llaminar2::getROCmBackend())
             {
-                // Synchronize ALL ROCm devices, not just device 0.
-                // TP configs use multiple ROCm GPUs; leaving device 1+
-                // unsynchronized causes ROCm runtime corruption (null pointer
-                // in memobj map) when the next test config allocates memory.
-                for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                auto scope = profileParityScope("tear_down.final_rocm_sync");
+                if (auto *rocm_backend = llaminar2::getROCmBackend())
                 {
-                    rocm_backend->synchronize(d);
+                    // Synchronize ALL ROCm devices, not just device 0.
+                    // TP configs use multiple ROCm GPUs; leaving device 1+
+                    // unsynchronized causes ROCm runtime corruption (null pointer
+                    // in memobj map) when the next test config allocates memory.
+                    for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                    {
+                        rocm_backend->synchronize(d);
+                    }
                 }
             }
 #endif
 
             // Close log file at end of test
+            printParityProfileSummary();
             Logger::getInstance().closeLogFile();
             restoreParityEnvOverrides();
         }
@@ -2268,9 +2460,11 @@ namespace llaminar2::test::parity
         {
             if (pytorch_snapshots_.find(name) != pytorch_snapshots_.end())
             {
+                auto scope = profileParityScope("pytorch_snapshot.cache_copy");
                 return pytorch_snapshots_[name];
             }
 
+            auto scope = profileParityScope("pytorch_snapshot.load_npy");
             std::string npy_path = config_.snapshot_dir + "/" + name + ".npy";
 
             try
@@ -3342,10 +3536,10 @@ namespace llaminar2::test::parity
                 // For single-step forward (prefill only), no decode needed
                 return true;
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
                 // Legacy path: use forward()
-                return runner_->forward(tokens.data(), tokens.size());
+                return runner->forward(tokens.data(), tokens.size());
             }
             LOG_ERROR("[Parity] No runner available - call setupPipeline() or setupOrchestrationRunner() first");
             return false;
@@ -3362,9 +3556,9 @@ namespace llaminar2::test::parity
             {
                 return orch_runner_->lastLogits();
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
-                return runner_->logits();
+                return runner->logits();
             }
             return nullptr;
         }
@@ -3380,9 +3574,9 @@ namespace llaminar2::test::parity
             {
                 return orch_runner_->vocabSize();
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
-                return static_cast<int>(runner_->vocab_size());
+                return static_cast<int>(runner->vocab_size());
             }
             return 0;
         }
@@ -3400,10 +3594,10 @@ namespace llaminar2::test::parity
             {
                 return orch_runner_->getSnapshot(key, out_size);
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
                 if (const auto *rank_orchestrator =
-                        dynamic_cast<const RankOrchestrator *>(runner_.get()))
+                        dynamic_cast<const RankOrchestrator *>(runner))
                 {
                     TPSnapshot tp_snapshot = rank_orchestrator->getTPSnapshot(key);
                     size_t combined_size = 0;
@@ -3416,7 +3610,7 @@ namespace llaminar2::test::parity
                         return cache.data();
                     }
                 }
-                return runner_->getSnapshot(key, out_size);
+                return runner->getSnapshot(key, out_size);
             }
             out_size = 0;
             return nullptr;
@@ -3433,9 +3627,9 @@ namespace llaminar2::test::parity
             {
                 return orch_runner_->getSnapshotKeys();
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
-                return runner_->getSnapshotKeys();
+                return runner->getSnapshotKeys();
             }
             return {};
         }
@@ -3658,9 +3852,9 @@ namespace llaminar2::test::parity
             {
                 orch_runner_->clearCache();
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
-                runner_->clear_cache();
+                runner->clear_cache();
             }
         }
 
@@ -3674,9 +3868,9 @@ namespace llaminar2::test::parity
             {
                 orch_runner_->clearSnapshots();
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
-                runner_->clearSnapshots();
+                runner->clearSnapshots();
             }
         }
 
@@ -3686,9 +3880,9 @@ namespace llaminar2::test::parity
             {
                 orch_runner_->setSnapshotCaptureFilter(keys);
             }
-            else if (runner_)
+            else if (auto *runner = activeLegacyRunner())
             {
-                runner_->setSnapshotCaptureFilter(keys);
+                runner->setSnapshotCaptureFilter(keys);
             }
         }
 
@@ -3696,8 +3890,8 @@ namespace llaminar2::test::parity
         {
             if (orch_runner_)
                 return orch_runner_->prefixStateProbe();
-            if (runner_)
-                return runner_->prefixStateProbe();
+            if (auto *runner = activeLegacyRunner())
+                return runner->prefixStateProbe();
             return {};
         }
 
@@ -3705,15 +3899,15 @@ namespace llaminar2::test::parity
         {
             if (orch_runner_)
                 return orch_runner_->primaryDeviceId();
-            if (runner_)
-                return runner_->primaryDeviceId();
+            if (auto *runner = activeLegacyRunner())
+                return runner->primaryDeviceId();
             return DeviceId::invalid();
         }
 
         ExecutionPath activeExecutionPath() const
         {
-            if (runner_)
-                return runner_->executionPath();
+            if (auto *runner = activeLegacyRunner())
+                return runner->executionPath();
             return ExecutionPath::GRAPH;
         }
 
@@ -3799,9 +3993,9 @@ namespace llaminar2::test::parity
                 return false;
             }
 
-            if (runner_)
+            if (auto *runner = activeLegacyRunner())
             {
-                return runner_->forward(tokens, token_count);
+                return runner->forward(tokens, token_count);
             }
 
             LOG_ERROR("[Parity] No runner available for "
@@ -3908,16 +4102,23 @@ namespace llaminar2::test::parity
             int token_count,
             const ParityGraphSnapshotPolicy &policy)
         {
+            const std::string phase_name = parityForwardPhaseName(phase);
+            auto total_scope = profileParityScope("forward." + phase_name + ".total");
             if (policy.enabled)
             {
+                auto scope = profileParityScope("forward." + phase_name + ".set_snapshot_filter");
                 activeSetSnapshotCaptureFilter(policy.snapshotCaptureFilter(phase));
             }
             else
             {
+                auto scope = profileParityScope("forward." + phase_name + ".clear_snapshot_filter");
                 activeSetSnapshotCaptureFilter({});
             }
-            if (!executeActiveParityForward(phase, tokens, token_count))
-                return false;
+            {
+                auto scope = profileParityScope("forward." + phase_name + ".execute");
+                if (!executeActiveParityForward(phase, tokens, token_count))
+                    return false;
+            }
 
             if (policy.enabled &&
                 phase == ParityForwardPhase::Prefill &&
@@ -3926,13 +4127,17 @@ namespace llaminar2::test::parity
                 policy.retry_prefill_after_warmup_for_capture &&
                 parityPrefillGraphWarmedOnly(activePrefixStateProbe()))
             {
+                auto scope = profileParityScope("forward." + phase_name + ".capture_retry");
                 activeClearCache();
                 activeClearSnapshots();
                 if (!executeActiveParityForward(phase, tokens, token_count))
                     return false;
             }
 
-            return validateParityGraphSnapshots(phase, policy);
+            {
+                auto scope = profileParityScope("forward." + phase_name + ".validate_snapshots");
+                return validateParityGraphSnapshots(phase, policy);
+            }
         }
 
         bool runParityForward(
@@ -3951,15 +4156,15 @@ namespace llaminar2::test::parity
         {
             if (orch_runner_)
                 return orch_runner_->usesDeviceSideMoERebalanceController();
-            if (runner_)
-                return runner_->usesDeviceSideMoERebalanceController();
+            if (auto *runner = activeLegacyRunner())
+                return runner->usesDeviceSideMoERebalanceController();
             return false;
         }
 
         uint64_t activeMoEPlacementEpoch() const
         {
-            if (runner_)
-                return runner_->moePlacementEpoch();
+            if (auto *runner = activeLegacyRunner())
+                return runner->moePlacementEpoch();
             return 0;
         }
 
@@ -3967,8 +4172,8 @@ namespace llaminar2::test::parity
         {
             if (orch_runner_)
                 return orch_runner_->moeRuntimeMovementEpoch();
-            if (runner_)
-                return runner_->moeRuntimeMovementEpoch();
+            if (auto *runner = activeLegacyRunner())
+                return runner->moeRuntimeMovementEpoch();
             return 0;
         }
 
@@ -4044,11 +4249,11 @@ namespace llaminar2::test::parity
         /**
          * @brief Check if a legacy runner is active
          *
-         * @return true if runner_ is set, false otherwise
+         * @return true if an owned or borrowed runner is active, false otherwise
          */
         bool hasLegacyRunner() const
         {
-            return runner_ != nullptr;
+            return activeLegacyRunner() != nullptr;
         }
 
         /**
@@ -4205,7 +4410,7 @@ namespace llaminar2::test::parity
             ParityTestSummary summary;
 
             // Require runner_ to be already set up
-            if (!runner_)
+            if (!activeLegacyRunner())
             {
                 LOG_ERROR("[Parity] runPrefillParity() called but runner_ is null - "
                           "ensure setupPipeline() or setupLocalPPPipeline() was called first");
@@ -4603,15 +4808,15 @@ namespace llaminar2::test::parity
 
             // Only setup pipeline if not already configured
             // (Test may have already called setupLocalTPPipeline() or similar)
-            if (!runner_)
+            if (!activeLegacyRunner())
             {
                 EXPECT_TRUE(setupPipeline()) << "Pipeline setup failed";
-                if (!runner_)
+                if (!activeLegacyRunner())
                     return summary;
             }
 
             // Try to cast to RankOrchestrator for TP snapshot access
-            auto *multi_device = dynamic_cast<RankOrchestrator *>(runner_.get());
+            auto *multi_device = dynamic_cast<RankOrchestrator *>(activeLegacyRunner());
             if (!multi_device)
             {
                 LOG_ERROR("[TP Parity] runner_ is not a RankOrchestrator - "
@@ -4973,7 +5178,7 @@ namespace llaminar2::test::parity
             DecodeParitySummary summary;
 
             // TP tests require pre-configured runner
-            if (!runner_)
+            if (!activeLegacyRunner())
             {
                 LOG_ERROR("[TP Decode Parity] runner_ is null - "
                           "ensure test calls setupLocalTPPipeline() or similar before runTPDecodeParity()");
@@ -4981,7 +5186,7 @@ namespace llaminar2::test::parity
             }
 
             // Verify we have a multi-device orchestrator
-            auto *multi_device = dynamic_cast<RankOrchestrator *>(runner_.get());
+            auto *multi_device = dynamic_cast<RankOrchestrator *>(activeLegacyRunner());
             if (!multi_device)
             {
                 LOG_ERROR("[TP Decode Parity] runner_ is not a RankOrchestrator - "
@@ -5385,6 +5590,7 @@ namespace llaminar2::test::parity
          */
         DecodeParitySummary runDecodeParity()
         {
+            auto decode_total_scope = profileParityScope("decode_parity.total");
             DecodeParitySummary summary;
 
             // Stages to compare per layer during decode (same as prefill)
@@ -5419,7 +5625,7 @@ namespace llaminar2::test::parity
             }
 
             // Require runner_ to be already set up
-            if (!runner_)
+            if (!activeLegacyRunner())
             {
                 LOG_ERROR("[Parity] runDecodeParity() called but runner_ is null - "
                           "ensure setupPipeline() or setupLocalPPPipeline() was called first");
@@ -5465,10 +5671,15 @@ namespace llaminar2::test::parity
 
             for (size_t step = 0; step < num_decode_steps; ++step)
             {
+                auto step_scope = profileParityScope("decode_parity.step.total");
                 std::string step_prefix = "decode_step" + std::to_string(step);
 
                 // Load PyTorch reference for this step
-                auto pytorch_lm_head = loadPyTorchSnapshot(step_prefix + "_LM_HEAD");
+                std::vector<float> pytorch_lm_head;
+                {
+                    auto scope = profileParityScope("decode_parity.step.load_lm_head");
+                    pytorch_lm_head = loadPyTorchSnapshot(step_prefix + "_LM_HEAD");
+                }
                 if (pytorch_lm_head.empty())
                 {
                     break; // No more decode snapshots
@@ -5480,7 +5691,10 @@ namespace llaminar2::test::parity
                 int current_token = pytorch_decode_tokens[step];
 
                 // Clear snapshots from previous step
-                activeClearSnapshots();
+                {
+                    auto scope = profileParityScope("decode_parity.step.clear_snapshots");
+                    activeClearSnapshots();
+                }
 
                 // Run single-token decode
                 std::vector<int> decode_token = {current_token};
@@ -5491,9 +5705,12 @@ namespace llaminar2::test::parity
                 EXPECT_TRUE(success) << "Decode step " << step << " failed";
                 if (!success)
                     continue;
-                exportActiveSnapshotsForParityDiagnostics(
-                    ParityForwardPhase::Decode,
-                    static_cast<int>(step));
+                {
+                    auto scope = profileParityScope("decode_parity.step.export_diagnostics");
+                    exportActiveSnapshotsForParityDiagnostics(
+                        ParityForwardPhase::Decode,
+                        static_cast<int>(step));
+                }
                 if (config_.moe_rebalance_exercise.enabled &&
                     config_.moe_rebalance_exercise.request_every_decode_steps > 0 &&
                     ((step + 1) % static_cast<size_t>(
@@ -5507,7 +5724,11 @@ namespace llaminar2::test::parity
 
                 // Get Llaminar's LM_HEAD output
                 size_t decode_logits_size;
-                const float *llaminar_logits = activeSnapshot("LM_HEAD", decode_logits_size);
+                const float *llaminar_logits = nullptr;
+                {
+                    auto scope = profileParityScope("decode_parity.step.lookup_lm_head");
+                    llaminar_logits = activeSnapshot("LM_HEAD", decode_logits_size);
+                }
                 if (!llaminar_logits)
                 {
                     LOG_WARN("No LM_HEAD snapshot for decode step " << step);
@@ -5535,6 +5756,7 @@ namespace llaminar2::test::parity
                 // Per-layer cosine similarity comparison for this decode step
                 // ---------------------------------------------------------------
                 {
+                    auto scope = profileParityScope("decode_parity.step.layer_compare");
                     int n_layers = parityLayerCount();
                     auto snapshot_keys = activeSnapshotKeys();
                     std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
@@ -5696,39 +5918,42 @@ namespace llaminar2::test::parity
                     }
                 }
 
-                step_stats.cosine_similarity = computeCosineSimilarity(
-                    llaminar_logits, pytorch_logits,
-                    std::min(decode_logits_size, pytorch_logits_count));
-
-                step_stats.kl_divergence = computeKLDivergence(
-                    llaminar_logits, pytorch_logits,
-                    decode_logits_size, vocab_size);
-
-                step_stats.top1_overlap = computeTopKOverlap(
-                    llaminar_logits, pytorch_logits,
-                    decode_logits_size, vocab_size, 1);
-
-                step_stats.top5_overlap = computeTopKOverlap(
-                    llaminar_logits, pytorch_logits,
-                    decode_logits_size, vocab_size, 5);
-
-                // Find argmax tokens
-                step_stats.llaminar_token = 0;
-                step_stats.pytorch_token = 0;
-                float max_l = llaminar_logits[0];
-                float max_p = pytorch_logits[0];
-
-                for (size_t i = 1; i < vocab_size; ++i)
                 {
-                    if (llaminar_logits[i] > max_l)
+                    auto scope = profileParityScope("decode_parity.step.logit_metrics");
+                    step_stats.cosine_similarity = computeCosineSimilarity(
+                        llaminar_logits, pytorch_logits,
+                        std::min(decode_logits_size, pytorch_logits_count));
+
+                    step_stats.kl_divergence = computeKLDivergence(
+                        llaminar_logits, pytorch_logits,
+                        decode_logits_size, vocab_size);
+
+                    step_stats.top1_overlap = computeTopKOverlap(
+                        llaminar_logits, pytorch_logits,
+                        decode_logits_size, vocab_size, 1);
+
+                    step_stats.top5_overlap = computeTopKOverlap(
+                        llaminar_logits, pytorch_logits,
+                        decode_logits_size, vocab_size, 5);
+
+                    // Find argmax tokens
+                    step_stats.llaminar_token = 0;
+                    step_stats.pytorch_token = 0;
+                    float max_l = llaminar_logits[0];
+                    float max_p = pytorch_logits[0];
+
+                    for (size_t i = 1; i < vocab_size; ++i)
                     {
-                        max_l = llaminar_logits[i];
-                        step_stats.llaminar_token = static_cast<int>(i);
-                    }
-                    if (pytorch_logits[i] > max_p)
-                    {
-                        max_p = pytorch_logits[i];
-                        step_stats.pytorch_token = static_cast<int>(i);
+                        if (llaminar_logits[i] > max_l)
+                        {
+                            max_l = llaminar_logits[i];
+                            step_stats.llaminar_token = static_cast<int>(i);
+                        }
+                        if (pytorch_logits[i] > max_p)
+                        {
+                            max_p = pytorch_logits[i];
+                            step_stats.pytorch_token = static_cast<int>(i);
+                        }
                     }
                 }
 
@@ -6028,6 +6253,7 @@ namespace llaminar2::test::parity
          */
         void assertDecodeParity(const DecodeParitySummary &summary)
         {
+            auto assert_scope = profileParityScope("assert_decode.total");
             // Skip if no decode steps were tested
             if (summary.steps_total == 0)
             {
@@ -6041,6 +6267,7 @@ namespace llaminar2::test::parity
             // Render table first (rank 0 only)
             if (isRank0())
             {
+                auto render_scope = profileParityScope("assert_decode.render_tables");
                 renderDecodeParityTable(summary, getBackendName());
 
                 // Render layer-by-layer breakdown for the first decode step
@@ -6053,7 +6280,10 @@ namespace llaminar2::test::parity
             }
 
             // Export CSV results
-            exportDecodeCSV(summary);
+            {
+                auto export_scope = profileParityScope("assert_decode.export_csv");
+                exportDecodeCSV(summary);
+            }
 
             // Assertions — skip on ranks that lack logit data (PP non-tail ranks)
             if (!has_logit_data)

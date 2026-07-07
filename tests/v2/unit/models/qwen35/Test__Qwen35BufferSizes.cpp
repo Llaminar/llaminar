@@ -67,9 +67,10 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3.5 has 20 main layer buffers, 17 MTP verifier sidecar buffers,
-    // and the compact LM-head verifier row scratch used by row-indexed MTP.
-    EXPECT_EQ(reqs.buffers.size(), 38u) << "Expected 38 layer buffers";
+    // Qwen3.5 has the main layer buffers, compact LM-head verifier row
+    // scratch, and 19 MTP verifier sidecar buffers including the phase-split
+    // full-prefill KV handoff rows.
+    EXPECT_EQ(reqs.buffers.size(), 40u) << "Expected 40 layer buffers";
 
     // ── Shared buffers ──
 
@@ -442,7 +443,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 38u);
+    EXPECT_EQ(reqs.buffers.size(), 40u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -500,4 +501,43 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     ASSERT_NE(mtp_logits, nullptr);
     EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 124160u);
+}
+
+TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLogits)
+{
+    Qwen35SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    GraphResolverConfig config{};
+    config.d_model = 2560;
+    config.n_heads = 16;
+    config.n_kv_heads = 4;
+    config.head_dim = 256;
+    config.vocab_size = 248320;
+    config.seq_len = 4096;
+    config.batch_size = 1;
+    config.local_n_heads = 8;
+    config.local_n_kv_heads = 2;
+    config.local_d_ff = 4608;
+    config.local_vocab = 124160;
+    config.custom_formulas["gdn_inner_size"] = 2048;
+    config.custom_formulas["gdn_qkv_dim"] = 4096;
+    config.custom_formulas["gdn_time_step_rank"] = 16;
+    config.custom_formulas["fa_q_full_dim"] = 4096;
+    config.custom_formulas["attn_output_dim"] = 2048;
+    config.custom_formulas["mtp_vocab"] = 248320;
+
+    auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
+
+    auto *mtp_logits = findBuf(reqs, "mtp_logits");
+    ASSERT_NE(mtp_logits, nullptr);
+    EXPECT_EQ(mtp_logits->shape[0], 4u);
+    EXPECT_EQ(mtp_logits->shape[1], 248320u)
+        << "Mirrored LocalTP MTP heads must have full-vocab sidecar storage.";
+
+    auto model_reqs = BufferAllocator::resolveModelBuffers(schema, config);
+    auto *logits_local = findBuf(model_reqs, "logits_local");
+    ASSERT_NE(logits_local, nullptr);
+    EXPECT_EQ(logits_local->shape[1], 124160u)
+        << "The mirrored MTP-head policy must not inflate ordinary TP logits_local.";
 }

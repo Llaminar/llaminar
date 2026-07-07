@@ -44,6 +44,23 @@ namespace llaminar2
         const std::vector<DeviceMoEExpertDirectoryEntry> &hostEntriesForTest() const { return host_entries_; }
         size_t plannedBytes() const { return planned_bytes_; }
         size_t slotPayloadBytes() const { return slot_payload_bytes_; }
+        /**
+         * @brief Materialize the live payload descriptor owned by a transfer slot.
+         *
+         * Prefix-cache MoE runtime restore stores the logical expert id and
+         * stable local slot id, while the directory remains the first-class owner
+         * of the VRAM payload buffers.  This method rebuilds a
+         * DeviceMoEExpertDescriptor from the directory's slot allocation without
+         * exposing the directory entry array or requiring a host copy from the
+         * device-side status table.  The caller supplies the logical expert id
+         * because a transfer slot may be reused for different experts over time.
+         *
+         * @return true when @p slot_index names an allocated slot with ready
+         *         gate/up/down NativeVNNI payload descriptors.
+         */
+        bool descriptorForSlot(uint32_t slot_index,
+                               uint32_t logical_expert,
+                               DeviceMoEExpertDescriptor &out) const;
 
     private:
         DeviceMoETransferSlotDirectory(

@@ -104,6 +104,30 @@ TEST(Test__WeightMetadataRegistry, RegistersSourceAndDerivedClone)
     EXPECT_EQ(clone_meta->slice.source_rows, 4u);
 }
 
+TEST(Test__WeightMetadataRegistry, SourceRegistrationRefreshesStalePointerIdentity)
+{
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8});
+
+    WeightMetadataRegistry registry;
+    ASSERT_TRUE(registry.registerSource(tensor.get(), "blk.31.ffn_down.weight", DeviceId::rocm(1)));
+
+    /*
+     * Reusing a raw TensorBase address across runner lifetimes must not let the
+     * previous graph binding identity leak into a newly loaded source tensor.
+     * The registry cannot observe destruction, so source registration is the
+     * request-boundary owner that refreshes stale pointer-keyed metadata.
+     */
+    ASSERT_TRUE(registry.registerSource(tensor.get(), "token_embd.weight", DeviceId::rocm(1)));
+
+    auto meta = registry.metadata(tensor.get());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->identity.canonical_name, "token_embd.weight");
+    EXPECT_EQ(meta->identity.role, WeightRole::Embedding);
+    EXPECT_EQ(meta->identity.layer, -1);
+    EXPECT_EQ(meta->identity.derivation, WeightDerivationKind::Source);
+    EXPECT_EQ(meta->residency.home_device, DeviceId::rocm(1));
+}
+
 TEST(Test__WeightMetadataRegistry, DescribeIncludesIdentity)
 {
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});
@@ -175,6 +199,56 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
     ASSERT_TRUE(clone_meta->identity.source_instance_id.has_value());
     EXPECT_EQ(*clone_meta->identity.source_instance_id, source_meta->identity.instance_id);
     EXPECT_EQ(clone_meta->residency.home_device, DeviceId::cuda(0));
+}
+
+TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
+{
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("token_embd.weight", {8, 4})
+                      .build();
+
+    WeightManager manager(*loader);
+    auto embedding = manager.getWeightForDevice("token_embd.weight", DeviceId::cpu());
+    ASSERT_NE(embedding, nullptr);
+
+    /*
+     * Simulate stale metadata for a reused TensorBase address.  Materialization
+     * may use metadata for slice and residency details, but the WeightPlan is
+     * the first-class owner of graph binding identity at runner construction.
+     */
+    auto stale_identity = makeSourceWeightIdentity(
+        "blk.31.ffn_down.weight",
+        ModelContextId{99},
+        123);
+    ASSERT_TRUE(manager.weightMetadataRegistry()->registerWeight(
+        embedding.get(),
+        stale_identity,
+        {},
+        WeightResidency{DeviceId::cpu(), DeviceId::cpu()}));
+
+    InferenceStrategy strategy;
+    strategy.model_id = ModelContextId{77};
+    strategy.devices = {DeviceId::cpu()};
+
+    WeightRequirement requirement;
+    requirement.canonical_name = "token_embd.weight";
+    requirement.required = true;
+    requirement.role = WeightRole::Embedding;
+    requirement.target_device = DeviceId::cpu();
+    requirement.lookup_device = DeviceId::cpu();
+
+    WeightPlan plan(strategy);
+    plan.add(requirement);
+
+    auto frozen = manager.materialize(plan);
+    ASSERT_NO_THROW((void)frozen.global("token_embd.weight"));
+
+    const auto &binding = frozen.global("token_embd.weight");
+    EXPECT_EQ(binding.identity.canonical_name, "token_embd.weight");
+    EXPECT_EQ(binding.identity.role, WeightRole::Embedding);
+    EXPECT_EQ(binding.identity.layer, -1);
+    EXPECT_EQ(binding.identity.logical_id, stableWeightLogicalId("token_embd.weight"));
+    EXPECT_EQ(binding.identity.model_id.value, 77u);
 }
 
 TEST(Test__WeightManagerMetadata, RegistersLocalTPSliceMetadata)

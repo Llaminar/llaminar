@@ -93,6 +93,12 @@ namespace llaminar2
             MoERoutingResult &host_result,
             const int *device_effective_seq_len) override;
 
+        bool routeVerifierRowsDecodeEquivalent(
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights) override;
+
         bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *gate_weights,
@@ -206,7 +212,8 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
             int num_experts, int top_k,
-            const DeviceMoERebalanceStatus *transfer_status) override;
+            const DeviceMoERebalanceStatus *transfer_status,
+            const DeviceMoERebalanceApplyStatus *apply_status) override;
 
         bool gatherPrefillExpertBatchFromRuntime(
             DeviceMoELayerRuntime *runtime_layer,
@@ -318,7 +325,8 @@ namespace llaminar2
             ITensor *const *gate_outputs,
             ITensor *const *up_outputs,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            const uint8_t *expert_mask = nullptr) override;
 
         /// @brief Execute graph-capturable grouped gate/up decode from runtime-table top-k ids.
         bool groupedExpertGateUpDecodeFromRuntime(
@@ -341,7 +349,8 @@ namespace llaminar2
             int top_k,
             ITensor *output,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            const uint8_t *expert_mask = nullptr) override;
 
         /// @brief Execute graph-capturable grouped SwiGLU/down decode from runtime-table ids and weights.
         bool groupedExpertDownDecodeFromRuntime(
@@ -416,6 +425,18 @@ namespace llaminar2
             uint32_t command_buffer_count = 1,
             const DeviceMoERebalanceWaveState *gathered_wave_states = nullptr,
             DeviceMoERebalanceWaveState *local_wave_states = nullptr) override;
+
+        bool projectPrefillLeastLoadedDomainCommands(
+            const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+            uint32_t plan_capacity,
+            DeviceMoERebalancePlanEntry *local_plan_entries,
+            uint32_t *local_plan_count,
+            DeviceMoERebalanceCommandBufferHeader *local_command_header,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceStatus *status,
+            uint32_t payload_slot_capacity,
+            uint32_t command_buffer_count = 1) override;
 
         bool materializePrefillLeastLoadedTransferCommands(
             const DeviceMoELayerRuntime *runtime_layer,

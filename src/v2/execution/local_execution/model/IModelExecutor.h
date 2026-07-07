@@ -142,13 +142,30 @@ namespace llaminar2
         int batch_size = 1;
         int seq_len = 0;            ///< Per-sequence length (single) or max length (batched)
         int *seq_lengths = nullptr; ///< Per-sequence lengths for batched (nullptr = all same)
-        int real_seq_len = 0;       ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
-        int bucket_seq_len = 0;     ///< Fixed bucket length for graph shape (0 = seq_len)
-        int token_offset = 0;       ///< Chunk offset within the original prompt
+        int real_seq_len = 0;   ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
+        int bucket_seq_len = 0; ///< Fixed bucket length for graph shape (0 = seq_len)
+        /**
+         * @brief Absolute token offset of the first real token in this prefill range.
+         *
+         * This field owns prefill request boundaries for raw, restored-prefix,
+         * and bucketed graph execution.  Consumers use it to derive position
+         * IDs and replay metadata, so callers resuming after an existing prefix
+         * must set it to the current logical cursor instead of relying on a
+         * default zero offset.
+         */
+        int token_offset = 0;
 
         // Position information (for decode mode)
         int *position_ids = nullptr; ///< Position IDs for RoPE (nullptr = auto)
-        int position_offset = 0;     ///< Offset for decode mode (current position)
+        /**
+         * @brief Decode/RoPE logical position and legacy prefill fallback.
+         *
+         * Decode callers use this as the current position.  Prefill callers
+         * should set @ref token_offset as the first-class request range; graph
+         * helpers may use this value only as a compatibility fallback when
+         * @ref token_offset has not been populated.
+         */
+        int position_offset = 0;
 
         // KV cache state
         IKVCache *kv_cache = nullptr; ///< KV cache (nullptr = no caching)

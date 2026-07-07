@@ -89,6 +89,7 @@ namespace llaminar2
         constexpr int kGroupedDescriptorTableSlots = 128;
         constexpr int kRouterGateCacheSlots = 128;
         constexpr int kHistogramLayerSlots = 128;
+        constexpr int kMaxVerifierRows = 4;
 
         inline int ceilDiv(int value, int divisor)
         {
@@ -165,7 +166,6 @@ namespace llaminar2
 
             constexpr int kMaxGateUpPartitions = 32;
             constexpr int kMaxDownPartitions = 16;
-            constexpr int kMaxVerifierRows = 4;
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
             const std::size_t verifier_splitk_slots =
                 static_cast<std::size_t>(std::min(max_seq_len, kMaxVerifierRows)) *
@@ -173,14 +173,20 @@ namespace llaminar2
             const std::size_t gateup_partial_slots =
                 std::max(decode_slots, verifier_splitk_slots);
 
-            add(reqs, DECODE_HIDDEN_INT8, static_cast<std::size_t>(d_model) * sizeof(int8_t));
-            add(reqs, DECODE_HIDDEN_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            add(reqs, DECODE_HIDDEN_INT8,
+                static_cast<std::size_t>(kMaxVerifierRows) *
+                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, DECODE_HIDDEN_SCALES,
+                static_cast<std::size_t>(kMaxVerifierRows) *
+                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             add(reqs, GATEUP_GATE_PARTIALS,
                 gateup_partial_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
             add(reqs, GATEUP_UP_PARTIALS,
                 gateup_partial_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
+            const std::size_t down_partial_slots =
+                std::max<std::size_t>(1u, verifier_splitk_slots);
             add(reqs, DOWN_PARTIALS,
-                kMaxDownPartitions * static_cast<std::size_t>(d_model) * sizeof(float));
+                down_partial_slots * kMaxDownPartitions * static_cast<std::size_t>(d_model) * sizeof(float));
             add(reqs, DECODE_SWIGLU_INT8,
                 decode_slots * static_cast<std::size_t>(intermediate) * sizeof(int8_t));
             add(reqs, DECODE_SWIGLU_SCALES,
@@ -259,8 +265,12 @@ namespace llaminar2
                 static_cast<std::size_t>(kHistogramLayerSlots) *
                     static_cast<std::size_t>(num_experts) * sizeof(uint64_t));
             add(reqs, ROCM_EXPERT_MASK, static_cast<std::size_t>(num_experts) * sizeof(bool));
-            add(reqs, ROCM_ROUTER_Q8_HIDDEN, static_cast<std::size_t>(d_model) * sizeof(int8_t));
-            add(reqs, ROCM_ROUTER_Q8_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            add(reqs, ROCM_ROUTER_Q8_HIDDEN,
+                static_cast<std::size_t>(kMaxVerifierRows) *
+                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, ROCM_ROUTER_Q8_SCALES,
+                static_cast<std::size_t>(kMaxVerifierRows) *
+                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             add(reqs, ROCM_ROUTER_Q8_GATE_WEIGHTS,
                 static_cast<std::size_t>(kRouterGateCacheSlots) *
                     static_cast<std::size_t>(num_experts) *

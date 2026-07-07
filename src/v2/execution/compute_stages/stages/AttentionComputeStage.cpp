@@ -375,8 +375,11 @@ namespace llaminar2
     void AttentionComputeStage::updateDynamicParams(int pos_offset, int seq_len)
     {
         params_.position_offset = pos_offset;
-        if (!cached_kernel_ || !params_.kv_cache || params_.layer_idx < 0)
+        if (!params_.kv_cache || params_.layer_idx < 0)
         {
+            dynamic_pre_append_cached_tokens_ = -1;
+            dynamic_logical_seq_len_ = 0;
+            dynamic_post_append_kv_len_ = 0;
             return;
         }
 
@@ -390,12 +393,22 @@ namespace llaminar2
                                         ? prefill_effective_seq_len_
                                         : seq_len;
 
+        const int pre_append_cached_tokens =
+            params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+        dynamic_pre_append_cached_tokens_ = pre_append_cached_tokens;
+        dynamic_logical_seq_len_ = logical_seq_len;
+        dynamic_post_append_kv_len_ = pre_append_cached_tokens + logical_seq_len;
+
+        if (!cached_kernel_)
+        {
+            return;
+        }
+
         // Propagate current stage stream to the kernel so device-side dynamic
         // params are uploaded on the same explicit stream used for capture/replay.
         cached_kernel_->setGPUStream(gpuStream());
 
-        int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-        kv_len += logical_seq_len; // This step will append logical_seq_len real tokens.
+        const int kv_len = dynamic_post_append_kv_len_;
         const int logical_pos_offset = std::max(0, kv_len - logical_seq_len);
         const int query_rows_for_params =
             dynamicAttentionParamRows(logical_seq_len, kv_len);
@@ -406,17 +419,15 @@ namespace llaminar2
             kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
             vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
         /*
-         * Device-derived attention params are for decode/replay, where the
-         * cache already contains older tokens and the graph body must discover
-         * the post-append KV length without a host scalar upload.  Ordinary
-         * prefill has `kv_len == logical_seq_len`; deriving params from the
-         * live cache counter there adds an unnecessary state owner and can make
-         * CUDA FA2 prefill consume stale/double-advanced cache metadata.
+         * GPU prefill graphs are reusable across request lifetimes. A graph
+         * captured for the first prompt chunk (pre_append_cached_tokens == 0)
+         * can later replay as a suffix after prefix restore. Always recording
+         * the device-count derivation node makes the graph topology invariant:
+         * the KV append kernel owns the device sequence state, and attention
+         * consumes that post-append state on the same stream.
          */
-        const bool decode_like_step = kv_len > logical_seq_len;
         const bool will_derive_from_device_count =
             params_.device_id.is_gpu() &&
-            decode_like_step &&
             !tq_cache &&
             params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
         if (!will_derive_from_device_count &&
@@ -692,16 +703,39 @@ namespace llaminar2
             return false;
         }
 
-        // Dynamic kv_len: query from KV cache at execution time if available
-        // This enables declarative graph construction where the stage runs after
-        // KVCacheAppendStage has already appended tokens
+        const bool padded_prefill_replay =
+            prefill_replay_params_set_ &&
+            prefill_effective_seq_len_ > 0 &&
+            prefill_bucket_seq_len_ > 0 &&
+            prefill_bucket_seq_len_ == params_.seq_len &&
+            prefill_effective_seq_len_ < params_.seq_len;
+        const int logical_seq_len = padded_prefill_replay
+                                        ? prefill_effective_seq_len_
+                                        : params_.seq_len;
+        const bool has_current_dynamic_sequence_state =
+            dynamic_pre_append_cached_tokens_ >= 0 &&
+            dynamic_logical_seq_len_ == logical_seq_len &&
+            dynamic_post_append_kv_len_ >= logical_seq_len;
+
+        // Dynamic kv_len: prefer the request-boundary sequence state recorded
+        // before KVCacheAppendStage. During GPU graph capture the host cache
+        // count and device count intentionally advance at different lifecycle
+        // points; this local mirror is the stable contract between the append
+        // owner and the attention consumer.
         int effective_kv_len = params_.kv_len;
         if (params_.kv_cache && params_.layer_idx >= 0)
         {
-            effective_kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-            if (effective_kv_len == 0)
+            if (has_current_dynamic_sequence_state)
             {
-                effective_kv_len = params_.seq_len; // Prefill case
+                effective_kv_len = dynamic_post_append_kv_len_;
+            }
+            else
+            {
+                effective_kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+                if (effective_kv_len == 0)
+                {
+                    effective_kv_len = params_.seq_len; // Prefill case
+                }
             }
             LOG_TRACE("[AttentionComputeStage] Dynamic kv_len from cache: " << effective_kv_len
                                                                             << " (static was: " << params_.kv_len << ")");
@@ -1026,17 +1060,10 @@ namespace llaminar2
                 vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
             const int *device_cached_tokens =
                 tq_cache ? nullptr : params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0);
-            const bool padded_prefill_replay =
-                prefill_replay_params_set_ &&
-                prefill_effective_seq_len_ > 0 &&
-                prefill_bucket_seq_len_ > 0 &&
-                prefill_bucket_seq_len_ == params_.seq_len &&
-                prefill_effective_seq_len_ < params_.seq_len;
-            const int logical_seq_len = padded_prefill_replay
-                                            ? prefill_effective_seq_len_
-                                            : params_.seq_len;
-            const bool decode_like_step = effective_kv_len > logical_seq_len;
-            if (device_cached_tokens && decode_like_step)
+            const bool needs_device_sequence_params =
+                has_current_dynamic_sequence_state ||
+                effective_kv_len > logical_seq_len;
+            if (device_cached_tokens && needs_device_sequence_params)
             {
                 const int query_rows_for_params =
                     dynamicAttentionParamRows(logical_seq_len, effective_kv_len);

@@ -1,3 +1,13 @@
+/**
+ * @file PrefixCacheStateProbe.cpp
+ * @brief Builds compact runtime-state diagnostics for prefix-cache parity tests.
+ *
+ * Probes intentionally read through public cache export interfaces so failures
+ * exercise the same logical ownership boundary used by prefix save/restore.
+ * Environment-controlled payload hashing is kept opt-in because full KV/GDN
+ * exports are expensive on long-context model runs.
+ */
+
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 
 #include "kernels/HybridKVCacheConfig.h"
@@ -7,6 +17,11 @@
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -32,6 +47,130 @@ namespace llaminar2
         bool envEnabled(const char *name)
         {
             return !DebugEnv::isFalseyEnv(name);
+        }
+
+        int envIntOrDefault(const char *name, int fallback)
+        {
+            const char *value = DebugEnv::envValue(name);
+            if (!value || !*value)
+                return fallback;
+            return std::atoi(value);
+        }
+
+        std::string trimCopy(const std::string &value)
+        {
+            size_t first = 0;
+            while (first < value.size() &&
+                   std::isspace(static_cast<unsigned char>(value[first])) != 0)
+            {
+                ++first;
+            }
+            size_t last = value.size();
+            while (last > first &&
+                   std::isspace(static_cast<unsigned char>(value[last - 1])) != 0)
+            {
+                --last;
+            }
+            return value.substr(first, last - first);
+        }
+
+        int parseNonNegativeIntStrict(
+            const std::string &value,
+            const char *field_name,
+            const std::string &segment_spec)
+        {
+            const std::string trimmed = trimCopy(value);
+            if (trimmed.empty())
+            {
+                throw std::runtime_error(
+                    std::string("empty ") + field_name +
+                    " in LLAMINAR_PREFIX_PROBE_KV_SEGMENTS entry '" +
+                    segment_spec + "'");
+            }
+
+            int parsed = 0;
+            for (char ch : trimmed)
+            {
+                if (!std::isdigit(static_cast<unsigned char>(ch)))
+                {
+                    throw std::runtime_error(
+                        std::string("non-numeric ") + field_name +
+                        " in LLAMINAR_PREFIX_PROBE_KV_SEGMENTS entry '" +
+                        segment_spec + "'");
+                }
+                parsed = parsed * 10 + (ch - '0');
+            }
+            return parsed;
+        }
+
+        std::vector<PrefixKVSegmentProbe> parseRequestedKVSegments()
+        {
+            const char *raw = DebugEnv::envValue("LLAMINAR_PREFIX_PROBE_KV_SEGMENTS");
+            if (!raw || !*raw)
+                return {};
+
+            std::vector<PrefixKVSegmentProbe> segments;
+            std::stringstream stream(raw);
+            std::string entry;
+            int unnamed_index = 0;
+            while (std::getline(stream, entry, ','))
+            {
+                std::stringstream semi_stream(entry);
+                std::string semi_entry;
+                while (std::getline(semi_stream, semi_entry, ';'))
+                {
+                    const std::string spec = trimCopy(semi_entry);
+                    if (spec.empty())
+                        continue;
+
+                    std::string name;
+                    std::string range = spec;
+                    const size_t equals_pos = spec.find('=');
+                    if (equals_pos != std::string::npos)
+                    {
+                        name = trimCopy(spec.substr(0, equals_pos));
+                        range = trimCopy(spec.substr(equals_pos + 1));
+                        if (name.empty())
+                        {
+                            throw std::runtime_error(
+                                "empty segment name in LLAMINAR_PREFIX_PROBE_KV_SEGMENTS entry '" +
+                                spec + "'");
+                        }
+                    }
+                    else
+                    {
+                        name = "segment" + std::to_string(unnamed_index++);
+                    }
+
+                    const size_t colon_pos = range.find(':');
+                    if (colon_pos == std::string::npos ||
+                        range.find(':', colon_pos + 1) != std::string::npos)
+                    {
+                        throw std::runtime_error(
+                            "LLAMINAR_PREFIX_PROBE_KV_SEGMENTS entry '" + spec +
+                            "' must use start:count or name=start:count");
+                    }
+
+                    PrefixKVSegmentProbe segment;
+                    segment.name = std::move(name);
+                    segment.token_start = parseNonNegativeIntStrict(
+                        range.substr(0, colon_pos),
+                        "token_start",
+                        spec);
+                    segment.token_count = parseNonNegativeIntStrict(
+                        range.substr(colon_pos + 1),
+                        "token_count",
+                        spec);
+                    if (segment.token_count <= 0)
+                    {
+                        throw std::runtime_error(
+                            "LLAMINAR_PREFIX_PROBE_KV_SEGMENTS entry '" + spec +
+                            "' must request a positive token_count");
+                    }
+                    segments.push_back(std::move(segment));
+                }
+            }
+            return segments;
         }
     } // namespace
 
@@ -80,6 +219,11 @@ namespace llaminar2
         probe.graph_capture_ready = cache.isGraphCaptureReady();
         probe.k_precision = cache.k_precision();
         probe.v_precision = cache.v_precision();
+        const bool hash_kv_segments =
+            envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS");
+        const std::vector<PrefixKVSegmentProbe> requested_segments =
+            hash_kv_segments ? parseRequestedKVSegments()
+                             : std::vector<PrefixKVSegmentProbe>{};
 
         const int safe_sequence_count = std::max(1, sequence_count);
         probe.layers.reserve(static_cast<size_t>(std::max(0, probe.n_layers)) *
@@ -129,6 +273,104 @@ namespace llaminar2
                         }
                     }
                 }
+                if (layer_probe.cached_tokens > 1 && hash_kv_segments)
+                {
+                    const int split_tokens = std::clamp(
+                        envIntOrDefault("LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", 4),
+                        1,
+                        layer_probe.cached_tokens - 1);
+
+                    auto hash_segment =
+                        [&](int token_start,
+                            int token_count,
+                            bool *available,
+                            size_t *k_bytes_out,
+                            size_t *v_bytes_out,
+                            uint64_t *k_hash_out,
+                            uint64_t *v_hash_out) -> void
+                    {
+                        if (token_start < 0 ||
+                            token_count <= 0 ||
+                            token_start > layer_probe.cached_tokens ||
+                            token_count > layer_probe.cached_tokens - token_start)
+                        {
+                            return;
+                        }
+                        const auto layout = cache.logicalBlockLayout(
+                            layer_probe.global_layer,
+                            token_count);
+                        if (layout.k_bytes == 0 || layout.v_bytes == 0)
+                            return;
+
+                        std::vector<uint8_t> k_bytes(layout.k_bytes);
+                        std::vector<uint8_t> v_bytes(layout.v_bytes);
+                        IKVCache::KVCacheLogicalBlockDescriptor desc;
+                        desc.layer = layer_probe.global_layer;
+                        desc.seq_idx = seq;
+                        desc.logical_token_start = token_start;
+                        desc.token_count = token_count;
+                        desc.stream = stream;
+                        if (!cache.exportLogicalBlock(
+                                desc,
+                                k_bytes.data(),
+                                v_bytes.data()))
+                        {
+                            return;
+                        }
+
+                        *available = true;
+                        *k_bytes_out = layout.k_bytes;
+                        *v_bytes_out = layout.v_bytes;
+                        *k_hash_out = hashByteBufferForPrefixProbe(
+                            k_bytes.data(),
+                            k_bytes.size());
+                        *v_hash_out = hashByteBufferForPrefixProbe(
+                            v_bytes.data(),
+                            v_bytes.size());
+                    };
+
+                    auto capture_named_segment =
+                        [&](PrefixKVSegmentProbe segment) -> PrefixKVSegmentProbe
+                    {
+                        hash_segment(
+                            segment.token_start,
+                            segment.token_count,
+                            &segment.hash_available,
+                            &segment.k_payload_bytes,
+                            &segment.v_payload_bytes,
+                            &segment.k_payload_hash,
+                            &segment.v_payload_hash);
+                        return segment;
+                    };
+
+                    layer_probe.leading_segment_tokens = split_tokens;
+                    hash_segment(
+                        0,
+                        split_tokens,
+                        &layer_probe.leading_segment_hash_available,
+                        &layer_probe.leading_k_payload_bytes,
+                        &layer_probe.leading_v_payload_bytes,
+                        &layer_probe.leading_k_payload_hash,
+                        &layer_probe.leading_v_payload_hash);
+
+                    layer_probe.trailing_segment_start = split_tokens;
+                    layer_probe.trailing_segment_tokens =
+                        layer_probe.cached_tokens - split_tokens;
+                    hash_segment(
+                        split_tokens,
+                        layer_probe.trailing_segment_tokens,
+                        &layer_probe.trailing_segment_hash_available,
+                        &layer_probe.trailing_k_payload_bytes,
+                        &layer_probe.trailing_v_payload_bytes,
+                        &layer_probe.trailing_k_payload_hash,
+                        &layer_probe.trailing_v_payload_hash);
+
+                    for (const auto &requested_segment : requested_segments)
+                    {
+                        layer_probe.segments.push_back(
+                            capture_named_segment(requested_segment));
+                    }
+                }
                 probe.layers.push_back(layer_probe);
             }
         }
@@ -147,6 +389,7 @@ namespace llaminar2
         }
 
         std::vector<uint8_t> device_state_bytes;
+        std::vector<uint8_t> local_device_state_bytes;
         const bool capture_device_state =
             envEnabled("LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE");
         if (capture_device_state)
@@ -169,8 +412,25 @@ namespace llaminar2
                     device_state_bytes.clear();
                 }
             }
+            if (metadata.host_bytes > 0)
+            {
+                local_device_state_bytes.resize(metadata.host_bytes);
+                HybridPrefixStateDescriptor desc;
+                desc.stream = stream;
+                desc.synchronize = true;
+                desc.include_host_state = true;
+                desc.include_device_state = false;
+                if (!hybrid->exportHybridPrefixState(
+                        desc,
+                        local_device_state_bytes.data(),
+                        nullptr))
+                {
+                    local_device_state_bytes.clear();
+                }
+            }
         }
         size_t device_offset = 0;
+        size_t local_device_offset = 0;
 
         std::vector<PrefixGDNLayerProbe> probes;
         probes.reserve(static_cast<size_t>(std::max(0, hybrid->gdnLayerCount())));
@@ -197,12 +457,40 @@ namespace llaminar2
                 state->recurrence_state.data(), state->recurrence_state.size());
             probe.conv_all_zero = floatBufferAllZeroForPrefixProbe(
                 state->conv_state.data(), state->conv_state.size());
+            if (!local_device_state_bytes.empty())
+            {
+                probe.recurrence_local_device_bytes =
+                    state->recurrence_state.size() * sizeof(float);
+                if (local_device_offset + probe.recurrence_local_device_bytes <=
+                    local_device_state_bytes.size())
+                {
+                    probe.recurrence_local_device_hash =
+                        hashByteBufferForPrefixProbe(
+                            local_device_state_bytes.data() + local_device_offset,
+                            probe.recurrence_local_device_bytes);
+                    probe.local_device_state_hash_available = true;
+                }
+                local_device_offset += probe.recurrence_local_device_bytes;
+
+                probe.conv_local_device_bytes =
+                    state->conv_state.size() * sizeof(float);
+                if (local_device_offset + probe.conv_local_device_bytes <=
+                    local_device_state_bytes.size())
+                {
+                    probe.conv_local_device_hash =
+                        hashByteBufferForPrefixProbe(
+                            local_device_state_bytes.data() + local_device_offset,
+                            probe.conv_local_device_bytes);
+                    probe.local_device_state_hash_available = true;
+                }
+                local_device_offset += probe.conv_local_device_bytes;
+            }
             if (!device_state_bytes.empty())
             {
                 if (auto *conv_kernel =
                         const_cast<IHybridKVCache *>(hybrid)->getConvKernel(layer))
                 {
-                    probe.conv_device_bytes = conv_kernel->stateBytes();
+                    probe.conv_device_bytes = conv_kernel->largestStateBytes();
                     if (device_offset + probe.conv_device_bytes <=
                         device_state_bytes.size())
                     {
@@ -218,7 +506,7 @@ namespace llaminar2
                         const_cast<IHybridKVCache *>(hybrid)->getRecurrenceKernel(layer))
                 {
                     probe.recurrence_device_bytes =
-                        recurrence_kernel->stateBytes();
+                        recurrence_kernel->largestStateBytes();
                     if (device_offset + probe.recurrence_device_bytes <=
                         device_state_bytes.size())
                     {

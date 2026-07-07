@@ -12,6 +12,7 @@
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
+#include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
@@ -54,6 +55,20 @@ namespace
         const auto writes = contract.allWrites();
         return std::any_of(writes.begin(), writes.end(),
                            [id](const BufferBinding &binding) { return binding.id == id; });
+    }
+
+    const BufferDescriptor *findBuffer(
+        const StageBufferRequirements &requirements,
+        const std::string &name)
+    {
+        const auto it = std::find_if(
+            requirements.buffers.begin(),
+            requirements.buffers.end(),
+            [&](const BufferDescriptor &buffer)
+            {
+                return buffer.name == name;
+            });
+        return it == requirements.buffers.end() ? nullptr : &(*it);
     }
 
     bool hasFingerprintField(
@@ -346,6 +361,27 @@ namespace
             histogram.mergeLayerCounts(0, counts.data(), static_cast<int>(counts.size()));
             if (reset_runtime_counts)
                 std::fill(counts.begin(), counts.end(), 0);
+            return true;
+        }
+        bool captureDecodeHistogramCounts(
+            std::vector<uint64_t> &selected_counts,
+            std::vector<uint64_t> &local_counts,
+            void * = nullptr) override
+        {
+            selected_counts = counts;
+            local_counts.assign(counts.size(), 0);
+            return true;
+        }
+        bool restoreDecodeHistogramCounts(
+            const uint64_t *selected_counts,
+            const uint64_t *,
+            size_t layer_count,
+            size_t expert_count,
+            void * = nullptr) override
+        {
+            if (layer_count != 1 || expert_count != counts.size() || !selected_counts)
+                return false;
+            counts.assign(selected_counts, selected_counts + expert_count);
             return true;
         }
         void resetDecodeHistogramCounts(void * = nullptr) override
@@ -1293,6 +1329,226 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherWhenAva
         << "A valid GDN live-state handoff lets replicated dense decode avoid the tiny GDN output allreduce.";
 }
 
+/**
+ * @brief MTP all-position verifier rows must publish GDN state through the handoff stage.
+ *
+ * The production MTP publisher restores accepted short-conv and recurrence rows
+ * from the verifier graph, then scans that same graph for post-restore
+ * publication stages.  If an all-position verifier graph is built directly from
+ * the replicated dense decode view, GDN capture rows are full-sized and no
+ * `GDNLiveStateAllGatherStage` appears, leaving the TP-local accepted row unable
+ * to refresh the full mirrored device bank used by the next replicated decode.
+ */
+TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierKeepsGDNStateTPLocalForPublicationHandoff)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+
+    GraphConfig config = makeGDNTPConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.compute_all_position_logits = true;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+    config.tp_device_idx = 0;
+
+    TensorArena arena;
+    LayerWeights base_layer = makeGDNTPLayerWeights(
+        arena, config, /*value_heads=*/1, /*row_parallel_out=*/true);
+    LayerWeights decode_layer = makeGDNTPLayerWeights(
+        arena, config, /*value_heads=*/2, /*row_parallel_out=*/false);
+
+    WeightBinding base_attn_norm = makeTestBinding(base_layer.attn_norm);
+    WeightBinding base_qkv = makeTestBinding(base_layer.attn_qkv);
+    WeightBinding base_gate = makeTestBinding(base_layer.attn_gate);
+    WeightBinding base_alpha = makeTestBinding(base_layer.ssm_alpha);
+    WeightBinding base_beta = makeTestBinding(base_layer.ssm_beta);
+    WeightBinding base_conv = makeTestBinding(base_layer.ssm_conv1d);
+    WeightBinding base_dt = makeTestBinding(base_layer.ssm_dt_bias);
+    WeightBinding base_a = makeTestBinding(base_layer.ssm_a);
+    WeightBinding base_norm = makeTestBinding(base_layer.ssm_norm);
+    WeightBinding base_out = makeTestBinding(base_layer.ssm_out);
+
+    WeightBinding decode_attn_norm = makeTestBinding(decode_layer.attn_norm);
+    WeightBinding decode_qkv = makeTestBinding(decode_layer.attn_qkv);
+    WeightBinding decode_gate = makeTestBinding(decode_layer.attn_gate);
+    WeightBinding decode_alpha = makeTestBinding(decode_layer.ssm_alpha);
+    WeightBinding decode_beta = makeTestBinding(decode_layer.ssm_beta);
+    WeightBinding decode_conv = makeTestBinding(decode_layer.ssm_conv1d);
+    WeightBinding decode_dt = makeTestBinding(decode_layer.ssm_dt_bias);
+    WeightBinding decode_a = makeTestBinding(decode_layer.ssm_a);
+    WeightBinding decode_norm = makeTestBinding(decode_layer.ssm_norm);
+    WeightBinding decode_out = makeTestBinding(decode_layer.ssm_out);
+
+    ModelWeightBindings base_bindings;
+    base_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &base_attn_norm;
+        layer.attn_qkv = &base_qkv;
+        layer.attn_gate = &base_gate;
+        layer.ssm_alpha = &base_alpha;
+        layer.ssm_beta = &base_beta;
+        layer.ssm_conv1d = &base_conv;
+        layer.ssm_dt_bias = &base_dt;
+        layer.ssm_a = &base_a;
+        layer.ssm_norm = &base_norm;
+        layer.ssm_out = &base_out;
+        return layer;
+    };
+
+    ModelWeightBindings decode_bindings;
+    decode_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &decode_attn_norm;
+        layer.attn_qkv = &decode_qkv;
+        layer.attn_gate = &decode_gate;
+        layer.ssm_alpha = &decode_alpha;
+        layer.ssm_beta = &decode_beta;
+        layer.ssm_conv1d = &decode_conv;
+        layer.ssm_dt_bias = &decode_dt;
+        layer.ssm_a = &decode_a;
+        layer.ssm_norm = &decode_norm;
+        layer.ssm_out = &decode_out;
+        return layer;
+    };
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeightBindings(base_bindings);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    CPUHybridRingKVCacheFP32 cache(
+        makeGDNTPHybridConfig(config),
+        *mpi,
+        config.n_layers,
+        /*batch_size=*/1,
+        config.max_seq_len,
+        config.n_kv_heads,
+        config.head_dim,
+        DeviceId::cpu());
+
+    ActivationBuffers verifier_buffers = makeGDNTPActivationBuffers(
+        arena, /*tokens=*/2, config, /*value_heads=*/1);
+    int position_ids[2] = {0, 1};
+    ComputeGraph verifier_graph = graph_builder.buildAttentionGraphForTokenCount(
+        decode_layer,
+        verifier_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        &cache,
+        position_ids,
+        DeviceId::cuda(0));
+
+    const auto *handoff_node = verifier_graph.getNode("layer0_gdn_live_state_allgather");
+    ASSERT_NE(handoff_node, nullptr)
+        << "MTP verifier publication needs a post-restore GDN state handoff stage in the verifier graph.";
+    const auto *handoff =
+        dynamic_cast<const GDNLiveStateAllGatherStage *>(handoff_node->stage.get());
+    ASSERT_NE(handoff, nullptr);
+    EXPECT_TRUE(handoff->requiresPostVerifierStatePublication());
+    EXPECT_TRUE(hasDependency(verifier_graph, "layer0_gdn_live_state_allgather", "layer0_gdn_recurrence"));
+    EXPECT_TRUE(hasDependency(verifier_graph, "layer0_gated_norm", "layer0_gdn_live_state_allgather"));
+    EXPECT_NE(verifier_graph.getNode("layer0_gdn_wo_allreduce"), nullptr)
+        << "Verifier GDN remains TP-local until the explicit local-to-full state handoff has run.";
+
+    const auto &params = handoff->getParams();
+    EXPECT_EQ(params.local_conv_state_floats, 18);
+    EXPECT_EQ(params.full_conv_state_floats, 36);
+    EXPECT_EQ(params.local_recurrence_state_floats, 4);
+    EXPECT_EQ(params.full_recurrence_state_floats, 8);
+}
+
+/**
+ * @brief Replicated prefill must not allgather GDN state that is already full-sized.
+ *
+ * Dynamic ExpertOverlay can install replicated dense/GDN weights before the
+ * long-context prefill path runs.  In that mode the GDN recurrence and
+ * short-conv kernels already own full mirrored state, so inserting
+ * GDNLiveStateAllGatherStage would ask the collective to write
+ * degree * local elements into a full buffer that is only local elements wide.
+ */
+TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedSkipsGDNLiveStateAllGatherWhenPrefillStateAlreadyFull)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+
+    GraphConfig config = makeGDNTPConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.tp_device_idx = 0;
+
+    TensorArena arena;
+    LayerWeights full_layer = makeGDNTPLayerWeights(
+        arena, config, /*value_heads=*/2, /*row_parallel_out=*/false);
+
+    WeightBinding attn_norm = makeTestBinding(full_layer.attn_norm);
+    WeightBinding qkv = makeTestBinding(full_layer.attn_qkv);
+    WeightBinding gate = makeTestBinding(full_layer.attn_gate);
+    WeightBinding alpha = makeTestBinding(full_layer.ssm_alpha);
+    WeightBinding beta = makeTestBinding(full_layer.ssm_beta);
+    WeightBinding conv = makeTestBinding(full_layer.ssm_conv1d);
+    WeightBinding dt = makeTestBinding(full_layer.ssm_dt_bias);
+    WeightBinding a = makeTestBinding(full_layer.ssm_a);
+    WeightBinding norm = makeTestBinding(full_layer.ssm_norm);
+    WeightBinding out = makeTestBinding(full_layer.ssm_out);
+
+    ModelWeightBindings replicated_bindings;
+    replicated_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &attn_norm;
+        layer.attn_qkv = &qkv;
+        layer.attn_gate = &gate;
+        layer.ssm_alpha = &alpha;
+        layer.ssm_beta = &beta;
+        layer.ssm_conv1d = &conv;
+        layer.ssm_dt_bias = &dt;
+        layer.ssm_a = &a;
+        layer.ssm_norm = &norm;
+        layer.ssm_out = &out;
+        return layer;
+    };
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeightBindings(replicated_bindings);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(replicated_bindings);
+
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    CPUHybridRingKVCacheFP32 cache(
+        makeGDNTPHybridConfig(config),
+        *mpi,
+        config.n_layers,
+        /*batch_size=*/1,
+        config.max_seq_len,
+        config.n_kv_heads,
+        config.head_dim,
+        DeviceId::cpu());
+
+    ActivationBuffers prefill_buffers = makeGDNTPActivationBuffers(
+        arena, /*tokens=*/2, config, /*value_heads=*/2);
+    int position_ids[2] = {0, 1};
+    ComputeGraph prefill_graph = graph_builder.buildAttentionGraphForTokenCount(
+        full_layer,
+        prefill_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        &cache,
+        position_ids,
+        DeviceId::cuda(0));
+
+    EXPECT_EQ(prefill_graph.getNode("layer0_gdn_live_state_allgather"), nullptr)
+        << "Full-sized replicated GDN prefill state must not run the TP-local allgather handoff.";
+    EXPECT_TRUE(hasDependency(prefill_graph, "layer0_gated_norm", "layer0_gdn_recurrence"));
+}
+
 TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherForModularRepeat)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
@@ -1493,11 +1749,21 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
     config.ffn_column_parallel = true;
     config.vocab_local = config.vocab_size;
 
-    TestableQwen35MoEGraph graph_builder(config, nullptr);
-    graph_builder.setDecodeReplicatedDenseWeightBindings(makeDecodeDenseBindingSource());
-
     TensorArena arena;
-    graph_builder.setWeights(makeFullForwardModelWeights(arena, config));
+    ModelWeights weights = makeFullForwardModelWeights(arena, config);
+
+    WeightBinding decode_embedding;
+    decode_embedding.tensor = weights.embedding_table;
+    WeightBinding decode_lm_head;
+    decode_lm_head.tensor = weights.lm_head;
+
+    ModelWeightBindings decode_bindings = makeDecodeDenseBindingSource();
+    decode_bindings.embedding_table = &decode_embedding;
+    decode_bindings.lm_head = &decode_lm_head;
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+    graph_builder.setWeights(weights);
     graph_builder.setBuffers(makeFullForwardModelBuffers(arena, /*tokens=*/2, config));
 
     std::vector<int> token_ids = {0, 1};
@@ -1559,6 +1825,66 @@ TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)
     EXPECT_EQ(sharding.getMode("blk.0.ffn_gate_exps.weight"), WeightShardingMode::ExpertParallel);
     EXPECT_EQ(sharding.getMode("blk.0.ffn_up_exps.weight"), WeightShardingMode::ExpertParallel);
     EXPECT_EQ(sharding.getMode("blk.0.ffn_down_exps.weight"), WeightShardingMode::ExpertParallel);
+}
+
+TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresPostCollectiveMoEKeys)
+{
+    Qwen35MoESchemaFactory factory;
+    StageShardingConfig sharding = factory.getStageShardingConfig();
+
+    EXPECT_EQ(sharding.at("MOE_EXPERT_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("MOE_SHARED_EXPERT_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("MOE_SHARED_GATE_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("MOE_COMBINED_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("MOE_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("MOE_COMBINED_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+}
+
+/**
+ * @brief MTP sidecars need MoE scratch capacity even when normal decode is one row.
+ *
+ * The main MoE graph and the MTP sidecar intentionally share the same
+ * `BufferId`s for routed/shared MoE scratch so snapshot names, stage contracts,
+ * and publication hooks stay stable.  During normal decode the resolver sees
+ * `seq_len == 1`, but a depth-0 sidecar can still replay up to the fixed
+ * verifier-row capacity.  Resolving these buffers to one row lets
+ * `MTP0_shared_expert_ffn` write four verifier rows into a one-row tensor.
+ */
+TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
+{
+    GraphConfig config = makeMoEConfig();
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    const GraphResolverConfig resolver_config =
+        graph_builder.getResolverConfig(/*seq_len=*/1);
+    const auto rows_it =
+        resolver_config.custom_formulas.find("moe_activation_rows");
+    ASSERT_NE(rows_it, resolver_config.custom_formulas.end());
+    EXPECT_EQ(rows_it->second, 4u);
+
+    Qwen35MoESchemaFactory factory;
+    const GraphSchema schema = factory.createSchema();
+    const StageBufferRequirements requirements =
+        BufferAllocator::resolveLayerBuffers(schema, resolver_config);
+
+    for (const char *name : {
+             "moe_expert_indices",
+             "moe_expert_weights",
+             "moe_combined_output",
+             "moe_shared_expert_output",
+             "moe_gate_scratch",
+             "moe_up_scratch",
+         })
+    {
+        const BufferDescriptor *buffer = findBuffer(requirements, name);
+        ASSERT_NE(buffer, nullptr) << name;
+        ASSERT_FALSE(buffer->shape.empty()) << name;
+        EXPECT_EQ(buffer->shape[0], 4u)
+            << name << " must reserve every depth-0 verifier row";
+    }
 }
 
 TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
@@ -1984,6 +2310,97 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
         << "Prefill runtime tables must not register stale decode histogram sync callbacks";
 }
 
+TEST(Test__Qwen35MoEGraph, PhaseSplitMTPSidecarDisablesGroupedSharedExpertDecodeShortcut)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t shared_params =
+        source.find("SharedExpertFFNStage::Params shared_params;");
+    ASSERT_NE(shared_params, std::string::npos)
+        << "The shared-expert stage construction block must remain visible to this wiring guard.";
+    const size_t shared_node =
+        source.find("graph.addNode(prefix + \"shared_expert_ffn\"", shared_params);
+    ASSERT_NE(shared_node, std::string::npos);
+    const std::string shared_body = source.substr(shared_params, shared_node - shared_params);
+
+    EXPECT_NE(shared_body.find("Phase-split MTP sidecars execute against the replicated dense-decode"),
+              std::string::npos)
+        << "The graph builder should explain why MTP sidecars do not use normal grouped shared-expert decode.";
+    const size_t policy =
+        shared_body.find("shared_params.disable_grouped_decode_shortcut");
+    ASSERT_NE(policy, std::string::npos)
+        << "Phase-split MTP verifier rows must request the SharedExpertFFNStage serial-decode oracle.";
+    const size_t policy_end = shared_body.find(";", policy);
+    ASSERT_NE(policy_end, std::string::npos);
+    const std::string policy_assignment = shared_body.substr(policy, policy_end - policy);
+    EXPECT_NE(policy_assignment.find("mtp_sidecar_context"), std::string::npos)
+        << "Only MTP sidecar graphs should bypass the normal one-token decode shortcut.";
+    EXPECT_NE(policy_assignment.find("config_.dense_tp_decode_replicated"), std::string::npos)
+        << "The bypass is required when MTP reads from the replicated dense decode weight set.";
+}
+
+TEST(Test__Qwen35MoEGraph, MTPSidecarUsesReplicatedDecodeBindingsForSharedExpertRefs)
+{
+    std::string qwen35_graph_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string moe_suffix = "models/qwen35moe/Qwen35MoEGraph.cpp";
+    const size_t moe_suffix_pos = qwen35_graph_path.find(moe_suffix);
+    ASSERT_NE(moe_suffix_pos, std::string::npos);
+    qwen35_graph_path.replace(
+        moe_suffix_pos,
+        moe_suffix.size(),
+        "models/qwen35/Qwen35Graph.cpp");
+
+    std::ifstream qwen35_graph(qwen35_graph_path);
+    ASSERT_TRUE(qwen35_graph.is_open()) << "Unable to open " << qwen35_graph_path;
+    const std::string qwen35_source(
+        (std::istreambuf_iterator<char>(qwen35_graph)),
+        std::istreambuf_iterator<char>());
+
+    const size_t mtp_builder =
+        qwen35_source.find("ComputeGraph Qwen35Graph::buildMTPGraph(");
+    ASSERT_NE(mtp_builder, std::string::npos);
+    const size_t mtp_missing_checks =
+        qwen35_source.find("const bool kv_cache_only = input.kv_cache_only;", mtp_builder);
+    ASSERT_NE(mtp_missing_checks, std::string::npos);
+    const std::string mtp_preamble =
+        qwen35_source.substr(mtp_builder, mtp_missing_checks - mtp_builder);
+    EXPECT_NE(mtp_preamble.find("DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);"),
+              std::string::npos)
+        << "MTP sidecar graph construction must resolve prepared refs from the same replicated decode view as its tensors.";
+
+    std::string qwen_base_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const size_t base_suffix_pos = qwen_base_path.find(moe_suffix);
+    ASSERT_NE(base_suffix_pos, std::string::npos);
+    qwen_base_path.replace(
+        base_suffix_pos,
+        moe_suffix.size(),
+        "models/qwen/QwenGraphBase.cpp");
+
+    std::ifstream qwen_base(qwen_base_path);
+    ASSERT_TRUE(qwen_base.is_open()) << "Unable to open " << qwen_base_path;
+    const std::string qwen_base_source(
+        (std::istreambuf_iterator<char>(qwen_base)),
+        std::istreambuf_iterator<char>());
+    const size_t merge_fn =
+        qwen_base_source.find("LayerWeightBindings mergeDenseDecodeBindings(");
+    ASSERT_NE(merge_fn, std::string::npos);
+    const size_t merge_end = qwen_base_source.find("return base;", merge_fn);
+    ASSERT_NE(merge_end, std::string::npos);
+    const std::string merge_body =
+        qwen_base_source.substr(merge_fn, merge_end - merge_fn);
+    EXPECT_NE(merge_body.find("base.moe_gate_exps = pick("), std::string::npos);
+    EXPECT_NE(merge_body.find("base.moe_up_exps = pick("), std::string::npos);
+    EXPECT_NE(merge_body.find("base.moe_down_exps = pick("), std::string::npos);
+    EXPECT_NE(merge_body.find("base.shared_expert_gate = pick("), std::string::npos);
+    EXPECT_NE(merge_body.find("base.shared_expert_up = pick("), std::string::npos);
+    EXPECT_NE(merge_body.find("base.shared_expert_down = pick("), std::string::npos);
+    EXPECT_NE(merge_body.find("base.shared_expert_gate_inp = pick("), std::string::npos);
+}
+
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceApplyPiggybacksOnRouting)
 {
     std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
@@ -2143,4 +2560,71 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSkipsDecodeHistogramSid
     EXPECT_NE(gate_body.find("DeviceMoERebalanceTransferMode::CollectiveSidebandPayload"),
               std::string::npos)
         << "Decode-side histogram sidebands may exist only behind the now-refused fixed-payload mode.";
+}
+
+TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByRole)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t finder =
+        source.find("Qwen35MoEGraph::findDeviceMoERebalanceMaintenanceBinding");
+    ASSERT_NE(finder, std::string::npos);
+    const size_t builder =
+        source.find("ComputeGraph Qwen35MoEGraph::buildDeviceMoERebalanceMaintenanceGraph",
+                    finder);
+    ASSERT_NE(builder, std::string::npos);
+    const std::string finder_body = source.substr(finder, builder - finder);
+
+    EXPECT_NE(finder_body.find("binding.role != GraphSideRebalanceBindingRole::DecodeMaintenance"),
+              std::string::npos)
+        << "Async decode maintenance must reject layer-local prefill LLEP bindings.";
+    EXPECT_NE(finder_body.find("binding.workspace_name.rfind(\"moe_device_rebalance_\", 0)"),
+              std::string::npos)
+        << "Decode maintenance bindings must point at the domain-wide decode workspace.";
+    EXPECT_NE(finder_body.find("multiple decode maintenance bindings"),
+              std::string::npos)
+        << "The graph builder must fail closed instead of making unordered binding selection.";
+
+    const size_t builder_end =
+        source.find("void Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial",
+                    builder);
+    ASSERT_NE(builder_end, std::string::npos);
+    const std::string builder_body = source.substr(builder, builder_end - builder);
+
+    EXPECT_NE(builder_body.find("findDeviceMoERebalanceMaintenanceBinding(device)"),
+              std::string::npos)
+        << "Maintenance graph construction must use the explicit decode-binding selector.";
+    EXPECT_EQ(builder_body.find("std::find_if"), std::string::npos)
+        << "Map-order selection can attach decode maintenance to a prefill LLEP binding.";
+
+    const size_t prefill_binding =
+        source.find("moe_graph_rebalance_bindings_[binding_key] = GraphSideRebalanceBinding{");
+    ASSERT_NE(prefill_binding, std::string::npos);
+    const size_t prefill_binding_end =
+        source.find("return &moe_graph_rebalance_bindings_", prefill_binding);
+    ASSERT_NE(prefill_binding_end, std::string::npos);
+    const std::string prefill_binding_body =
+        source.substr(prefill_binding, prefill_binding_end - prefill_binding);
+    EXPECT_NE(prefill_binding_body.find("GraphSideRebalanceBindingRole::PrefillLLEPTransfer"),
+              std::string::npos)
+        << "Prefill LLEP transfer bindings must be tagged as layer-local prefill bindings.";
+
+    const size_t decode_binding =
+        source.find("moe_graph_rebalance_bindings_[domain_key] = GraphSideRebalanceBinding{");
+    ASSERT_NE(decode_binding, std::string::npos);
+    const size_t decode_binding_end =
+        source.find("graph_rebalance_plan_inserted = true", decode_binding);
+    ASSERT_NE(decode_binding_end, std::string::npos);
+    const std::string decode_binding_body =
+        source.substr(decode_binding, decode_binding_end - decode_binding);
+    EXPECT_NE(decode_binding_body.find("GraphSideRebalanceBindingRole::DecodeMaintenance"),
+              std::string::npos)
+        << "Decode graph-side rebalance bindings must be tagged as maintenance bindings.";
+    EXPECT_EQ(decode_binding_body.find("GraphSideRebalanceBindingRole::PrefillLLEPTransfer"),
+              std::string::npos)
+        << "The domain-wide decode binding must not be tagged as a prefill transfer binding.";
 }

@@ -588,6 +588,18 @@ namespace llaminar2
          */
         int max_request_batch = 1;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
+        /**
+         * @brief Mirror the full verifier LM/MTP head on every LocalTP device.
+         *
+         * LocalTP speculative verification normally inherits the primary
+         * column-parallel LM-head layout, which makes each child produce only a
+         * vocab shard and forces a tiny cross-device logits collective before
+         * sampling.  When this flag is enabled, LocalTP verifier/sidecar graphs
+         * bind a replicated full-vocab terminal head instead.  The mode is
+         * intentionally LocalTP-only: GlobalTP still needs true cross-rank
+         * vocab ownership and candidate coordination.
+         */
+        bool mirror_full_head_for_local_tp = false;
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;
     };
@@ -1255,9 +1267,50 @@ namespace llaminar2
         uint32_t device_min_foreign_rows_per_transfer = 0;
         uint32_t device_min_router_spread_improvement_per_payload_slot = 128;
         uint32_t device_max_post_wave_load_spread_per_mille = 100;
+        /**
+         * @brief Least-Loaded EP capacity multiplier numerator for device planners.
+         *
+         * LLEP computes a per-participant routed-row capacity of
+         * ceil(total_rows * alpha_numerator / (participants * alpha_denominator)).
+         * The production default of 1/1 keeps the original mean-load capacity;
+         * integration probes can tighten alpha to force real transfer-backed
+         * migrations when they explicitly validate that path.
+         */
+        uint32_t device_llep_alpha_numerator = 1;
+        /**
+         * @brief Least-Loaded EP capacity multiplier denominator for device planners.
+         *
+         * Must remain non-zero.  Larger denominators make the planner spill more
+         * rows to non-owner participants, which is useful for deterministic
+         * migration coverage but should be tuned carefully for production.
+         */
+        uint32_t device_llep_alpha_denominator = 1;
+        /// Lambda numerator used by the balanced-standard-EP skip check.
+        uint32_t device_llep_lambda_numerator = 13;
+        /// Lambda denominator used by the balanced-standard-EP skip check.
+        uint32_t device_llep_lambda_denominator = 10;
+        /**
+         * @brief Permit LLEP to select the standard owner policy when loads are already balanced.
+         *
+         * The default preserves the economical production behavior.  Tests that
+         * are specifically named as LLEP migration coverage disable this so a
+         * green result cannot silently be a standard-EP no-op.
+         */
+        bool device_llep_enable_balanced_skip = true;
         int device_maintenance_slack_tokens = -1;
         int device_min_maintenance_period_tokens = -1;
         int device_initial_maintenance_period_tokens = -1;
+        /**
+         * @brief Fixed request-local prefill assignment window for LLEP.
+         *
+         * A value greater than zero makes OrchestrationRunner split LeastLoadedEP
+         * prefill into deterministic windows of this many real tokens.  The
+         * window is the first-class owner of current-window LLEP model-runtime
+         * state; prefix cache restores must align cached blocks to it.  Zero
+         * preserves the historical single-forward window unless prefix cache
+         * supplies an explicit block boundary.
+         */
+        int prefill_window_tokens = 0;
         bool release_raw_expert_weights = false;
     };
 

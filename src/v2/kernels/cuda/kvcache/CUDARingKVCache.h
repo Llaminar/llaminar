@@ -37,6 +37,7 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include "../../../backends/IWorkerGPUContext.h"     // Device context support
 #include "../../../tensors/BlockStructures.h"        // Q8_1Block
+#include "../../../tensors/TensorType.h"             // TensorType
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -167,6 +168,29 @@ namespace llaminar2
         virtual bool append(int layer, int seq_idx,
                             const void *d_k, const void *d_v,
                             int num_tokens, cudaStream_t stream) = 0;
+
+        /**
+         * @brief Capture-safe fused convert+append path.
+         *
+         * Used by appendWithStream() for precision-mismatch paths. This avoids
+         * routing graph-captured appends through cache-wide conversion scratch,
+         * which can be overwritten by another captured cache append before the
+         * original append consumes it.
+         */
+        virtual bool appendConvertedWithStream(int layer, int seq_idx,
+                                               const void *d_k_src, const void *d_v_src,
+                                               TensorType src_type,
+                                               int num_tokens, cudaStream_t stream)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)d_k_src;
+            (void)d_v_src;
+            (void)src_type;
+            (void)num_tokens;
+            (void)stream;
+            return false;
+        }
 
         // Convenience for single-sequence mode
         bool append(int layer, const void *d_k, const void *d_v,
@@ -470,6 +494,14 @@ namespace llaminar2
         bool get_kv(int layer, int seq_idx,
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  ITensor **out_k, ITensor **out_v,
+                                  int *out_kv_len = nullptr) override;
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  const ITensor **out_k, const ITensor **out_v,
+                                  int *out_kv_len = nullptr) const override;
 
         /**
          * @brief Append grouped verifier rows with serial-decode cache semantics.
@@ -545,6 +577,11 @@ namespace llaminar2
         bool append_typed(int layer, int seq_idx,
                           const DataT *d_k, const DataT *d_v,
                           int num_tokens, cudaStream_t stream);
+
+        bool appendConvertedWithStream(int layer, int seq_idx,
+                                       const void *d_k_src, const void *d_v_src,
+                                       TensorType src_type,
+                                       int num_tokens, cudaStream_t stream) override;
 
         // =====================================================================
         // IWorkspaceConsumer Interface
@@ -631,6 +668,7 @@ namespace llaminar2
         // Index 0 = K view, Index 1 = V view
         // Mutable because views are lazily created in const methods
         mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> tensor_views_;
+        mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> snapshot_tensor_views_;
 
         // Helper methods
         void allocate_entry(EntryT &entry);
@@ -655,8 +693,15 @@ namespace llaminar2
         // Kernel launchers
         void launch_append_kernel(EntryT &entry, const DataT *d_k, const DataT *d_v,
                                   int num_tokens, cudaStream_t stream);
+        /**
+         * @brief Launch a graph-capturable append kernel with explicit replay row ownership.
+         *
+         * @param d_head Device scalar containing the ring head for this replay.
+         * @param d_append_count Device scalar containing the real rows inside a captured bucket.
+         */
         void launch_append_kernel_dynamic(EntryT &entry, const DataT *d_k, const DataT *d_v,
-                                          const int *d_head, int num_tokens, cudaStream_t stream);
+                                          const int *d_head, const int *d_append_count,
+                                          int num_tokens, cudaStream_t stream);
         void launch_linearize_kernel(const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
                                      cudaStream_t stream);
         bool launch_gather_kernel(const std::vector<EntryT *> &entries,

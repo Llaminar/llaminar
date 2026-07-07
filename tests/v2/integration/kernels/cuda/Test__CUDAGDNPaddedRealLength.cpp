@@ -551,6 +551,222 @@ TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCap
     EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
 }
 
+TEST_F(Test__CUDAGDNPaddedRealLength, LocalStateSurvivesFullStateHandoffBeforeNextPrefillSegment)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    CudaStreamHandle stream;
+
+    /*
+     * TP GDN prefill runs local heads, then the live-state allgather imports a
+     * full-head state for downstream decode.  A later suffix prefill must swap
+     * back to the preserved local state slot; otherwise segmented prefill
+     * diverges from a monolithic prefill as soon as the next stateful layer
+     * reads its carry state.
+     */
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 128;
+    constexpr int d_v = 64;
+    constexpr int first_len = 5;
+    constexpr int second_len = 7;
+    constexpr int total_len = first_len + second_len;
+    constexpr int local_qk_stride = local_heads * d_k;
+    constexpr int local_v_stride = local_heads * d_v;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state_floats = full_heads * d_k * d_v;
+
+    const auto Q = makeSequenceRows(total_len, local_qk_stride, total_len, total_len, 0.0021f, 0.0f, 0.0f);
+    const auto K = makeSequenceRows(total_len, local_qk_stride, total_len, total_len, -0.0017f, 0.0f, 0.0f);
+    const auto V = makeSequenceRows(total_len, local_v_stride, total_len, total_len, 0.0029f, 0.0f, 0.0f);
+    const auto alpha = makeSequenceRows(total_len, local_heads, total_len, total_len, 0.031f, 0.0f, 0.0f);
+    const auto beta = makeSequenceRows(total_len, local_heads, total_len, total_len, -0.027f, 0.0f, 0.0f);
+    const std::vector<float> A_log(static_cast<size_t>(local_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(local_heads), 0.1f);
+    const auto initial_recurrence =
+        makeInitialState(static_cast<size_t>(local_recurrence_state), 0.0003f);
+
+    CudaFloatBuffer d_Q_ref(Q);
+    CudaFloatBuffer d_K_ref(K);
+    CudaFloatBuffer d_V_ref(V);
+    CudaFloatBuffer d_alpha_ref(alpha);
+    CudaFloatBuffer d_beta_ref(beta);
+    CudaFloatBuffer d_Q_handoff(Q);
+    CudaFloatBuffer d_K_handoff(K);
+    CudaFloatBuffer d_V_handoff(V);
+    CudaFloatBuffer d_alpha_handoff(alpha);
+    CudaFloatBuffer d_beta_handoff(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_ref_out(static_cast<size_t>(total_len) * local_v_stride, 0.0f);
+    CudaFloatBuffer d_handoff_out(static_cast<size_t>(total_len) * local_v_stride, 0.0f);
+
+    CUDAGatedDeltaNet ref_recurrence(cuda_ordinal_);
+    ref_recurrence.setGPUStream(stream.stream);
+    ref_recurrence.allocateGPUState(local_recurrence_state);
+    ASSERT_TRUE(ref_recurrence.importState(initial_recurrence.data(), nullptr, stream.stream));
+    ASSERT_TRUE(ref_recurrence.chunk_forward(
+        d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr,
+        d_A_log.ptr, d_dt_bias.ptr, d_ref_out.ptr, nullptr,
+        first_len, local_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    ASSERT_TRUE(ref_recurrence.chunk_forward(
+        d_Q_ref.ptr + static_cast<size_t>(first_len) * local_qk_stride,
+        d_K_ref.ptr + static_cast<size_t>(first_len) * local_qk_stride,
+        d_V_ref.ptr + static_cast<size_t>(first_len) * local_v_stride,
+        d_alpha_ref.ptr + static_cast<size_t>(first_len) * local_heads,
+        d_beta_ref.ptr + static_cast<size_t>(first_len) * local_heads,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_ref_out.ptr + static_cast<size_t>(first_len) * local_v_stride,
+        nullptr,
+        second_len, local_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(reference recurrence)");
+    std::vector<float> ref_recurrence_state(static_cast<size_t>(local_recurrence_state));
+    ASSERT_TRUE(ref_recurrence.exportState(ref_recurrence_state.data(), nullptr, nullptr));
+
+    CUDAGatedDeltaNet handoff_recurrence(cuda_ordinal_);
+    handoff_recurrence.setGPUStream(stream.stream);
+    handoff_recurrence.allocateGPUState(local_recurrence_state);
+    ASSERT_TRUE(handoff_recurrence.importState(initial_recurrence.data(), nullptr, stream.stream));
+    ASSERT_TRUE(handoff_recurrence.chunk_forward(
+        d_Q_handoff.ptr, d_K_handoff.ptr, d_V_handoff.ptr, d_alpha_handoff.ptr, d_beta_handoff.ptr,
+        d_A_log.ptr, d_dt_bias.ptr, d_handoff_out.ptr, nullptr,
+        first_len, local_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(handoff first recurrence segment)");
+    std::vector<float> first_segment_recurrence_state(static_cast<size_t>(local_recurrence_state));
+    ASSERT_TRUE(handoff_recurrence.exportState(first_segment_recurrence_state.data(), nullptr, nullptr));
+
+    std::vector<float> imported_full_recurrence_state =
+        makeInitialState(static_cast<size_t>(full_recurrence_state_floats), 0.00011f);
+    std::copy(first_segment_recurrence_state.begin(),
+              first_segment_recurrence_state.end(),
+              imported_full_recurrence_state.begin());
+    handoff_recurrence.allocateGPUState(full_recurrence_state_floats);
+    ASSERT_TRUE(handoff_recurrence.importState(imported_full_recurrence_state.data(), nullptr, stream.stream));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(import full recurrence state)");
+    ASSERT_EQ(handoff_recurrence.stateBytes(),
+              static_cast<size_t>(full_recurrence_state_floats) * sizeof(float));
+
+    ASSERT_TRUE(handoff_recurrence.chunk_forward(
+        d_Q_handoff.ptr + static_cast<size_t>(first_len) * local_qk_stride,
+        d_K_handoff.ptr + static_cast<size_t>(first_len) * local_qk_stride,
+        d_V_handoff.ptr + static_cast<size_t>(first_len) * local_v_stride,
+        d_alpha_handoff.ptr + static_cast<size_t>(first_len) * local_heads,
+        d_beta_handoff.ptr + static_cast<size_t>(first_len) * local_heads,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_handoff_out.ptr + static_cast<size_t>(first_len) * local_v_stride,
+        nullptr,
+        second_len, local_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(handoff recurrence continuation)");
+    std::vector<float> handoff_recurrence_state(static_cast<size_t>(local_recurrence_state));
+    ASSERT_TRUE(handoff_recurrence.exportState(handoff_recurrence_state.data(), nullptr, nullptr));
+
+    const auto ref_recurrence_out = d_ref_out.toHost();
+    const auto handoff_recurrence_out = d_handoff_out.toHost();
+    const auto recurrence_out_diff =
+        diffStats(handoff_recurrence_out, ref_recurrence_out,
+                  static_cast<size_t>(first_len) * local_v_stride,
+                  static_cast<size_t>(second_len) * local_v_stride);
+    const auto recurrence_state_diff =
+        diffStats(handoff_recurrence_state, ref_recurrence_state, 0, handoff_recurrence_state.size());
+    EXPECT_LT(recurrence_out_diff.first, 1e-5f);
+    EXPECT_LT(recurrence_out_diff.second, 1e-5);
+    EXPECT_LT(recurrence_state_diff.first, 1e-5f);
+    EXPECT_LT(recurrence_state_diff.second, 1e-5);
+
+    constexpr int local_channels = 24;
+    constexpr int full_channels = 48;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    const auto conv_input =
+        makeSequenceRows(total_len, local_channels, total_len, total_len, 0.018f, 0.0f, 0.0f);
+    const auto conv_weights = makeShortConvWeights(local_channels, kernel_size);
+    const auto conv_bias = makeBias(local_channels);
+    const auto initial_conv =
+        makeInitialState(static_cast<size_t>(local_conv_state), 0.004f);
+
+    CudaFloatBuffer d_conv_input_ref(conv_input);
+    CudaFloatBuffer d_conv_input_handoff(conv_input);
+    CudaFloatBuffer d_conv_weight(conv_weights);
+    CudaFloatBuffer d_conv_bias(conv_bias);
+    CudaFloatBuffer d_conv_ref_out(static_cast<size_t>(total_len) * local_channels, 0.0f);
+    CudaFloatBuffer d_conv_handoff_out(static_cast<size_t>(total_len) * local_channels, 0.0f);
+
+    CUDAShortConvolution ref_conv(cuda_ordinal_);
+    ref_conv.setGPUStream(stream.stream);
+    ref_conv.allocateGPUState(local_conv_state);
+    ASSERT_TRUE(ref_conv.importState(initial_conv.data(), nullptr, stream.stream));
+    ASSERT_TRUE(ref_conv.forward(
+        d_conv_input_ref.ptr, d_conv_weight.ptr, d_conv_bias.ptr,
+        d_conv_ref_out.ptr, nullptr,
+        first_len, local_channels, kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(ref_conv.forward(
+        d_conv_input_ref.ptr + static_cast<size_t>(first_len) * local_channels,
+        d_conv_weight.ptr, d_conv_bias.ptr,
+        d_conv_ref_out.ptr + static_cast<size_t>(first_len) * local_channels,
+        nullptr,
+        second_len, local_channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(reference short-conv)");
+    std::vector<float> ref_conv_state(static_cast<size_t>(local_conv_state));
+    ASSERT_TRUE(ref_conv.exportState(ref_conv_state.data(), nullptr, nullptr));
+
+    CUDAShortConvolution handoff_conv(cuda_ordinal_);
+    handoff_conv.setGPUStream(stream.stream);
+    handoff_conv.allocateGPUState(local_conv_state);
+    ASSERT_TRUE(handoff_conv.importState(initial_conv.data(), nullptr, stream.stream));
+    ASSERT_TRUE(handoff_conv.forward(
+        d_conv_input_handoff.ptr, d_conv_weight.ptr, d_conv_bias.ptr,
+        d_conv_handoff_out.ptr, nullptr,
+        first_len, local_channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(handoff first short-conv segment)");
+    std::vector<float> first_segment_conv_state(static_cast<size_t>(local_conv_state));
+    ASSERT_TRUE(handoff_conv.exportState(first_segment_conv_state.data(), nullptr, nullptr));
+
+    std::vector<float> imported_full_conv_state =
+        makeInitialState(static_cast<size_t>(full_conv_state), 0.006f);
+    std::copy(first_segment_conv_state.begin(),
+              first_segment_conv_state.end(),
+              imported_full_conv_state.begin());
+    handoff_conv.allocateGPUState(full_conv_state);
+    ASSERT_TRUE(handoff_conv.importState(imported_full_conv_state.data(), nullptr, stream.stream));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(import full short-conv state)");
+    ASSERT_EQ(handoff_conv.stateBytes(),
+              static_cast<size_t>(full_conv_state) * sizeof(float));
+
+    ASSERT_TRUE(handoff_conv.forward(
+        d_conv_input_handoff.ptr + static_cast<size_t>(first_len) * local_channels,
+        d_conv_weight.ptr, d_conv_bias.ptr,
+        d_conv_handoff_out.ptr + static_cast<size_t>(first_len) * local_channels,
+        nullptr,
+        second_len, local_channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(handoff short-conv continuation)");
+    std::vector<float> handoff_conv_state(static_cast<size_t>(local_conv_state));
+    ASSERT_TRUE(handoff_conv.exportState(handoff_conv_state.data(), nullptr, nullptr));
+
+    const auto ref_conv_out = d_conv_ref_out.toHost();
+    const auto handoff_conv_out = d_conv_handoff_out.toHost();
+    const auto conv_out_diff =
+        diffStats(handoff_conv_out, ref_conv_out,
+                  static_cast<size_t>(first_len) * local_channels,
+                  static_cast<size_t>(second_len) * local_channels);
+    const auto conv_state_diff =
+        diffStats(handoff_conv_state, ref_conv_state, 0, handoff_conv_state.size());
+    EXPECT_LT(conv_out_diff.first, 1e-6f);
+    EXPECT_LT(conv_out_diff.second, 1e-6);
+    EXPECT_LT(conv_state_diff.first, 1e-6f);
+    EXPECT_LT(conv_state_diff.second, 1e-6);
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDecode)
 {
     SKIP_IF_NO_CUDA();

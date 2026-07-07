@@ -128,6 +128,7 @@ namespace llaminar2
         bool waitEventChecked(void *event, void *stream) override;
         bool queryEventChecked(void *event, bool &ready) override;
         void synchronizeEvent(void *event) override;
+        bool synchronizeEventChecked(void *event) override;
         float eventElapsedTime(void *start, void *stop) override;
 
         // =========================================================================
@@ -149,6 +150,7 @@ namespace llaminar2
         // =========================================================================
 
         void synchronize() override;
+        bool synchronizeChecked() override;
         void synchronizeStream(void *stream) override;
         bool synchronizeStreamChecked(void *stream) override;
         void insertStreamDependency(void *dependent_stream, void *dependency_stream) override;

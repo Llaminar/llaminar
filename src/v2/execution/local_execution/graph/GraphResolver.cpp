@@ -1106,6 +1106,15 @@ namespace llaminar2
                 return it->second;
             return 4;
         }
+        if (formula == "mtp_vocab")
+        {
+            auto it = config.custom_formulas.find(formula);
+            if (it != config.custom_formulas.end())
+                return it->second;
+            return static_cast<size_t>(config.local_vocab > 0
+                                           ? config.local_vocab
+                                           : config.vocab_size);
+        }
 
         // Model-provided custom formulas (e.g., GDN dimensions)
         {

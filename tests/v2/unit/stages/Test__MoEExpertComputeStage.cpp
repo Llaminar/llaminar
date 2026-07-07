@@ -22,15 +22,19 @@
 #include "loaders/PreparedWeightStore.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "mocks/MockComputeStage.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/PreparedWeightTestHarness.h"
 
+#include <cstdlib>
 #include <cmath>
 #include <numeric>
 #include <algorithm>
 #include <array>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 using namespace llaminar2;
@@ -39,6 +43,63 @@ using namespace llaminar2::testing;
 
 namespace
 {
+    /**
+     * @brief Temporarily set an environment variable for perfstats assertions.
+     *
+     * PerfStatsCollector intentionally reads its enablement from process
+     * environment so production code has no test-only switches.  These unit
+     * regressions need counters to prove the grouped verifier route was
+     * exercised, so the tests scope that environment mutation tightly.
+     */
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old_value = std::getenv(name_.c_str());
+            if (old_value)
+                old_value_ = std::string(old_value);
+            if (value)
+                setenv(name_.c_str(), value, 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_)
+                setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
+    };
+
+    bool hasPerfCounterWithRoute(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *route)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.domain != domain || record.name != name)
+                    return false;
+                const auto it = record.tags.find("route");
+                return it != record.tags.end() && it->second == route;
+            });
+    }
+
     class CapturingMoEKernel : public IMoEKernel
     {
     public:
@@ -1133,6 +1194,9 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
 
 TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierMatchesSerialDecode)
 {
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    PerfStatsCollector::reset();
+
     const int d = 256;
     const int inter = 256;
 
@@ -1196,10 +1260,33 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierMatchesSerialDecode)
             d,
             "shared expert verifier");
     }
+
+    const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
+    EXPECT_TRUE(hasPerfCounterWithRoute(
+        records,
+        "mtp",
+        "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
+        "cpu_grouped_verifier_hooks"))
+        << "CPU shared expert verifier must use grouped verifier hooks, not row replay.\n"
+        << PerfStatsCollector::summaryString({"mtp", "kernel"});
+    EXPECT_TRUE(std::any_of(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "cpu_native_vnni_grouped_verifier_swiglu_down_calls";
+        }))
+        << "CPU shared expert verifier must exercise the grouped SwiGLU/down kernel.\n"
+        << PerfStatsCollector::summaryString({"mtp", "kernel"});
+    PerfStatsCollector::reset();
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S)
 {
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    PerfStatsCollector::reset();
+
     const int d = 256;
     const int inter = 256;
     const int experts = 4;
@@ -1285,10 +1372,23 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S)
             d,
             "IQ3S routed expert verifier");
     }
+
+    const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
+    EXPECT_TRUE(hasPerfCounterWithRoute(
+        records,
+        "mtp",
+        "moe_routed_grouped_decode_equivalent_verifier_prefill_rows",
+        "cpu_expert_slot_grouped"))
+        << "CPU routed expert verifier must use grouped expert-slot execution, not row replay.\n"
+        << PerfStatsCollector::summaryString({"mtp", "kernel"});
+    PerfStatsCollector::reset();
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S_TopK8)
 {
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    PerfStatsCollector::reset();
+
     const int d = 256;
     const int inter = 256;
     const int experts = 16;
@@ -1374,10 +1474,23 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S_To
             d,
             "IQ3S top-k8 routed expert verifier");
     }
+
+    const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
+    EXPECT_TRUE(hasPerfCounterWithRoute(
+        records,
+        "mtp",
+        "moe_routed_grouped_decode_equivalent_verifier_prefill_rows",
+        "cpu_expert_slot_grouped"))
+        << "CPU top-k8 routed expert verifier must use grouped expert-slot execution.\n"
+        << PerfStatsCollector::summaryString({"mtp", "kernel"});
+    PerfStatsCollector::reset();
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_QwenSizedQ4KQ5K_TopK8)
 {
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    PerfStatsCollector::reset();
+
     const int d = 2048;
     const int inter = 512;
     const int experts = 32;
@@ -1485,6 +1598,16 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_QwenSiz
             d,
             "Qwen-sized Q4K/Q5K top-k8 routed expert verifier");
     }
+
+    const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
+    EXPECT_TRUE(hasPerfCounterWithRoute(
+        records,
+        "mtp",
+        "moe_routed_grouped_decode_equivalent_verifier_prefill_rows",
+        "cpu_expert_slot_grouped"))
+        << "CPU Qwen-sized routed expert verifier must use grouped expert-slot execution.\n"
+        << PerfStatsCollector::summaryString({"mtp", "kernel"});
+    PerfStatsCollector::reset();
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_NullWeightsReturnsError)

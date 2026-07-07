@@ -11,6 +11,7 @@
 #include "../../../utils/Logger.h"
 #include "IInferenceRunner.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -26,7 +27,8 @@ namespace llaminar2
 
 
     LogitsGatherer::LogitsGatherer(int vocab_size, size_t max_tokens, BackendResolver backend_resolver)
-        : backend_resolver_(backend_resolver)
+        : vocab_size_(vocab_size > 0 ? static_cast<size_t>(vocab_size) : 0),
+          backend_resolver_(backend_resolver)
     {
         if (vocab_size > 0 && max_tokens > 0)
         {
@@ -73,13 +75,20 @@ namespace llaminar2
         if (!backend)
             return;
 
-        size_t pin_bytes = buffer_->numel() * sizeof(float);
+        const size_t pin_elements = std::min(buffer_->numel(), vocab_size_);
+        if (pin_elements == 0)
+            return;
+
+        size_t pin_bytes = pin_elements * sizeof(float);
         if (backend->pinHostMemory(buffer_->mutable_data(), pin_bytes))
         {
             pinned_ = true;
             pinned_device_type_ = device.type; // Remember which backend pinned it
-            LOG_DEBUG("LogitsGatherer: Pinned buffer (" << (pin_bytes / 1024) << " KB) for "
-                                                        << device.toString());
+            LOG_DEBUG("LogitsGatherer: Pinned decode row prefix (" << (pin_bytes / 1024)
+                                                                    << " KB of "
+                                                                    << ((buffer_->numel() * sizeof(float)) / 1024)
+                                                                    << " KB buffer) for "
+                                                                    << device.toString());
         }
     }
 
@@ -115,6 +124,14 @@ namespace llaminar2
         size_t total_vocab = 0;
         for (const auto &info : device_infos)
             total_vocab += info.vocab_local;
+        const bool use_explicit_vocab_offsets =
+            std::any_of(
+                device_infos.begin(),
+                device_infos.end(),
+                [](const LogitsLocalInfo &info)
+                {
+                    return info.vocab_offset != 0;
+                });
 
         const bool has_full_vocab = full_vocab_size > 0;
         bool replicated_full_vocab = has_full_vocab && device_infos.size() > 1;
@@ -184,6 +201,20 @@ namespace llaminar2
                       << total_vocab << " does not match full vocab " << full_vocab_size);
             return false;
         }
+        if (use_explicit_vocab_offsets)
+        {
+            for (const auto &info : device_infos)
+            {
+                if (info.vocab_offset + info.vocab_local > total_vocab)
+                {
+                    LOG_ERROR("LogitsGatherer::gatherLocalInfos: vocab shard offset "
+                              << info.vocab_offset << " plus local vocab "
+                              << info.vocab_local << " exceeds total vocab "
+                              << total_vocab);
+                    return false;
+                }
+            }
+        }
 
         size_t expected_output_size = seq_len * total_vocab;
         if (buffer_->numel() < expected_output_size)
@@ -203,7 +234,9 @@ namespace llaminar2
             size_t col_offset = 0;
             for (const auto &info : device_infos)
             {
-                float *dst = output + col_offset;
+                const size_t dst_offset =
+                    use_explicit_vocab_offsets ? info.vocab_offset : col_offset;
+                float *dst = output + dst_offset;
                 size_t copy_bytes = info.vocab_local * sizeof(float);
 
                 if (info.gpu_ptr && info.device.has_value())
@@ -293,7 +326,11 @@ namespace llaminar2
             for (size_t dev = 0; dev < device_data.size(); ++dev)
             {
                 const float *src = device_data[dev] + row * device_strides[dev];
-                float *dst = output + row * total_vocab + col_offset;
+                const size_t dst_offset =
+                    use_explicit_vocab_offsets
+                        ? device_infos[dev].vocab_offset
+                        : col_offset;
+                float *dst = output + row * total_vocab + dst_offset;
                 std::memcpy(dst, src, device_infos[dev].vocab_local * sizeof(float));
                 col_offset += device_infos[dev].vocab_local;
             }

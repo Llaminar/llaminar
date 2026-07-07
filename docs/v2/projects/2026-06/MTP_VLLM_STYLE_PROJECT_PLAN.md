@@ -13,6 +13,17 @@ accepted-count state machine: draft state lives in speculative slots, target
 verification produces accepted counts and output tokens, and only accepted
 state slots are published to live model state.
 
+2026-07-06 update: CUDA2 ExpertOverlay Dynamic + prefix-cache + MTP long-context
+parity now passes after prefix restore without a model-runtime snapshot destroys
+depth-0 MTP sidecar graph caches instead of preserving graph objects whose MoE
+runtime tables were intentionally reset. The focused regression is
+`PrefixRestoreWithoutModelRuntimeInvalidatesMTPSidecarGraphs`; E2E evidence is
+`PrefixCacheMTPRestore_CUDA2TPDynamicPhaseSplit` passing in `288.7s` with
+`mtp.sidecar_graph_invalidations`, fresh sidecar cache misses, grouped
+publication, and initialized MoE runtime decode predicates on both CUDA
+participants. Remaining debt: the lane is too slow and still emits compact
+rebalance missing-source diagnostics under the movement-friendly Dynamic policy.
+
 ## Why vLLM Is Fast
 
 The local vLLM source shape to port is:
@@ -1945,6 +1956,18 @@ Status:
   participants as hard failures. Focused gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, and the
   bounded Phase 8 unit cluster.
+- LocalTP greedy grouped publication no longer falls back to row replay while
+  waiting for a single cross-device device mailbox. `RankOrchestrator` now
+  stages verifier device-token rows on every child, runs the verifier forward
+  through a rank-owned child-pointer bundle, reduces sharded all-position
+  logits into the shared compact `SamplingMath` outcome, builds the canonical
+  device-outcome transaction plan, and fans accepted-state publication out
+  through each child's grouped decode-equivalent publisher. The path deliberately
+  does not call child direct device-resident publishers or serial replay. The
+  grouped child publisher now records the resident logical-state mailbox from
+  the accepted step plan, and Rank aggregates those child mailboxes into a
+  domain handle that fans out next-step resident sidecar prelaunch. Focused gate:
+  `V2_Unit_RankOrchestrator|V2_Unit_PrefillDecodeTransition|V2_Unit_MTPVerifierPolicy`.
 - Request-batch admission now has a first-class scheduler contract.
   `MTPSpecRequestBatchScheduler` groups pending requests in stable order,
   admits only matching mode/topology/vocab shapes, preserves variable verifier
@@ -2794,9 +2817,10 @@ Why this phase exists:
 - Phase 9.7 intentionally proved correctness first. It allowed row-serial
   decode-equivalent replay and host bridges while the row contract was still
   being validated.
-- Current MoE publication code still has a decode-equivalent row replay route
-  for multi-row verifier prefill. That is the right fail-closed correctness
-  posture, but it is not an economical production implementation.
+- Current MoE verifier publication no longer accepts row replay as a production
+  route for multi-row verifier prefill. Routed and shared expert verifier rows
+  must execute through decode-equivalent grouped implementations, with row-copy
+  helpers reserved for diagnostics/oracles only.
 - GPU verifier/sampling work has already moved toward resident outcomes, but
   the remaining D2H/H2D and stream-sync boundaries still show up in perfstats
   and ROCm stage timing. The hot path needs to decide, publish, and continue
@@ -2874,11 +2898,12 @@ Implementation plan:
      projections, LM-head, MoE routing, routed experts, shared experts,
      sampling, and accepted-state publication. A helper that loops over M
      ordinary one-token stage executions is a correctness oracle only; it must
-     stay labelled `serial_decode_equivalent_fallback` and cannot satisfy
+     stay labelled `serial_decode_equivalent_oracle_only` and cannot satisfy
      Phase 9.8 performance acceptance.
    - MoE: replace promoted uses of `executeDecodeEquivalentVerifierPrefill`
      row replay with grouped decode-equivalent routed+shared prefill for
-     M=2/3/4. Serial replay remains available only as a guarded fallback.
+     M=2/3/4. Serial replay remains available only as an offline diagnostic
+     oracle and must not be called by production verifier execution.
    - CUDA: tune grouped verifier prefill with explicit stream capture, reusable
      descriptor tables/workspace, row-indexed LM-head, and tile/dispatch choices
      trained or measured for the actual Qwen3.5/3.6 verifier buckets.
@@ -2889,11 +2914,11 @@ Implementation plan:
      strict distribution proof and enough instrumentation to identify row
      grouping, LM-head, sampler, and publication cost separately.
    - Trained M=2/3/4 kernels are part of this phase, not a follow-up.  The
-     row-wise M=1 verifier path is the correctness fallback contract; Phase 9.8
-     is not performance-complete until CPU, CUDA, and ROCm have generated or
-     trained dispatch tables for verifier-shaped GEMV/GEMM buckets and the
-     promoted kernels are wired into dense, GDN, LM-head, routed MoE, and shared
-     expert verifier paths where applicable.
+     row-wise M=1 verifier path is a diagnostic correctness oracle only;
+     Phase 9.8 is not performance-complete until CPU, CUDA, and ROCm have
+     generated or trained dispatch tables for verifier-shaped GEMV/GEMM buckets
+     and the promoted kernels are wired into dense, GDN, LM-head, routed MoE,
+     and shared expert verifier paths where applicable.
    - The generated-kernel pipeline must be turnkey: perf sweeps emit CSV for
      verifier aspect/work buckets and codebooks, the trainer emits checked-in
      C++ `.inc` dispatch tables, and backend code consumes those tables without
@@ -2909,7 +2934,7 @@ Implementation plan:
      explicit non-null streams, consume declared workspace, and avoid raw
      cuda/hip allocations.  CPU kernels must follow the existing scalar/AVX2/
      AVX512 runtime-dispatch pattern where vectorized paths are introduced.
-   - Promotion requires a focused perf win over the serial fallback for the same
+   - Promotion requires a focused perf win over the serial oracle for the same
      row count/backend/model/sampling lane and no full-model regression versus
      the current guarded path.
 
@@ -2931,9 +2956,10 @@ Implementation plan:
 
 6. Cleanup and reconciliation
    - Reconcile the Phase 10 documentation/status rows with the code capability
-     flags so "grouped verifier green" cannot mean "serial fallback is correct".
+     flags so "grouped verifier green" cannot mean "serial oracle is a
+     production lane".
    - Rename comments and metrics where needed to separate
-     `serial_decode_equivalent_fallback` from
+     `serial_decode_equivalent_oracle_only` from
      `grouped_decode_equivalent_verifier`.
    - Delete or demote retired experimental all-position verifier paths only
      after the grouped path has passed correctness and perf gates on CPU, CUDA,
@@ -2961,7 +2987,7 @@ Implementation plan:
    - Dedicated LocalTP and GlobalTP integration tests must prove strict
      cosine, relative L2, symmetric KL/KLD, sampled-token, accepted-count, and
      published-continuation equivalence before any sharded verifier lane is
-     promoted out of the serial fallback.
+     promoted out of the unaccepted verifier lane.
 
 Focused correctness gate:
 
@@ -3020,7 +3046,7 @@ Exit criteria:
   excluding explicit final response materialization.
 - LocalTP and GlobalTP/NodeLocalTP have explicit sharded compact verifier
   reducers for greedy and stochastic, or their Phase 9.8 dashboard rows remain
-  unaccepted and fail-closed behind the labelled serial fallback.
+  unaccepted and fail-closed without a production row-replay fallback.
 - CPU uses the same compact verifier metadata contract as GPU and avoids full
   all-position LM-head work for promoted verifier rows.
 - Dense grouped/batched verifier M=2/3/4 passes strict cosine, relative L2, and
@@ -3031,10 +3057,10 @@ Exit criteria:
   supported Q/K/IQ codebooks, pass serial M=1 numerical equivalence in focused
   integration tests, and are wired into production only after dense/MoE grouped
   verifier parity passes strict cosine, relative L2, and symmetric KL/KLD.
-- Grouped paths are faster than serial fallback in focused verifier harnesses
+- Grouped paths are faster than the serial oracle in focused verifier harnesses
   and do not regress same-run full-model MTP benchmark rows. Lanes that fail
-  either condition remain on fail-closed serial fallback and are not eligible
-  for Phase 10 default enablement.
+  either condition remain unaccepted and are not eligible for Phase 10 default
+  enablement.
 - Dashboard rows include same-run baseline, verifier time, condition-token time,
   publication time, sampler/outcome time, graph replay time, grouped-path status,
   and host-bridge status for every backend/model/sampling lane.
@@ -3045,7 +3071,7 @@ Current status:
   Phase 10 speed/default-readiness evidence.
 - [x] Verifier-economy capability contract added in
   `MTPDecodeCatchup`/`IInferenceRunner`, with `DeviceGraphOrchestrator` and
-  `RankOrchestrator` reporting correct serial fallback separately from
+  `RankOrchestrator` reporting diagnostic serial-oracle support separately from
   grouped/promoted verifier support. Focused unit coverage proves
   `RankOrchestrator` clamps to the weakest participant and current
   SingleDevice lanes are not accidentally marked economical.
@@ -3639,16 +3665,23 @@ Current status:
   open until benchmark evidence proves the promoted lane is economical for
   repetition/DRY requests.
 - [ ] Full MTP benchmark matrix refreshed with perfstats and GPU stage timing.
-- [x] Phase 10 status reconciled so correctness-only serial fallback cannot be
+- [x] Phase 10 status reconciled so correctness-only serial oracles cannot be
   mistaken for performant grouped verifier acceptance. `MTPVerifierEconomyLane`
-  keeps serial fallback, grouped outcome, and direct publication as separate
+  keeps serial oracle, grouped outcome, and direct publication as separate
   contracts; DGO and RankOrchestrator tests assert grouped MoE outcome evidence
-  is not economical while publication is pending. CPU MoE replay units now
+  is not economical while publication is pending. CPU MoE grouped units now
   cover M=2/3/4 with cosine, relative L2, symmetric KL, and max-absolute checks
   so this correctness lane is strict but still labelled non-economical.
 - [ ] LocalTP sharded compact verifier reducers implemented and proven for
   greedy/stochastic dense lanes with strict distribution and continuation
-  equivalence.
+  equivalence.  2026-07-07: RankOrchestrator now has a focused host-visible
+  greedy cross-shard compact verifier reducer for LocalTP all-position rows.
+  It reduces child-local argmax rows through the existing explicit-stream
+  `LogitsLocalInfo` path, summarizes accepted prefix/ready-token metadata with
+  shared `SamplingMath`, publishes accepted rows through grouped child
+  publishers, records child resident mailboxes, and has unit coverage for
+  accept, reject, and aggregate-mailbox prelaunch cases. Stochastic
+  probability/top-p reduction is still unimplemented.
 - [ ] GlobalTP/NodeLocalTP sharded compact verifier reducers implemented and
   proven for greedy/stochastic dense lanes with strict distribution and
   continuation equivalence.
@@ -4127,8 +4160,10 @@ Current status:
   `commitMTPShiftedRowFromDeviceResidentLogicalState()`, which validates the
   mailbox owner/epoch, waits on its readiness event on an explicit stream, reads
   `NEXT_CONDITION_TOKENS` on device, and appends the shifted MTP row without
-  using the host-materialized compact token. Multi-participant TP remains a hard
-  fail until a domain-wide logical mailbox exists. Focused gate passed:
+  using the host-materialized compact token. Multi-participant LocalTP greedy
+  now owns a rank aggregate mailbox whose child handles are dispatched back to
+  every participant; stochastic TP mailbox use remains tied to the pending
+  sharded stochastic reducer. Focused gate passed:
   `V2_Unit_PrefillDecodeTransition`,
   `V2_Unit_GpuWorkspaceAllocationPolicy`, exact Qwen3.6 CUDA/ROCm SingleDevice
   stochastic Prefix+MTP parity, and the bounded CUDA/ROCm MoE stochastic sweep

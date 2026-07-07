@@ -365,33 +365,65 @@ namespace llaminar2
         }
 
         /**
-         * @brief Clear live sequence state owned by the inference buffers.
+         * @brief Clear main-model KV plus hybrid GDN/short-conv payloads.
          *
-         * This is the low-level state payload reset used by the public request
-         * boundary.  It clears KV and recurrent payloads plus host-side logical
-         * position/length vectors.  It deliberately does not touch graph
-         * topology, arena bindings, prepared weights, or backend contexts.
+         * The IKVCache owner is the first-class live-sequence state holder for
+         * attention history. Hybrid cache implementations also own GDN and
+         * short-conv GPU state, so clearing the main and PP KV owners is the
+         * correct boundary for recurrent model state as well.
          */
-        void clear()
+        void clearMainKVAndGDNState()
         {
             if (kv_cache)
                 kv_cache->clear();
+            for (auto &[device, cache] : pp_kv_caches)
+            {
+                (void)device;
+                if (cache)
+                    cache->clear();
+            }
+        }
+
+        /**
+         * @brief Clear request-local MTP sidecar KV payloads.
+         *
+         * MTP sidecars are shifted relative to the main cache and are owned by
+         * the active speculative transaction, not by the main decode stream.
+         */
+        void clearMTPSidecarState()
+        {
             for (auto &cache : mtp_kv_caches)
             {
                 if (cache)
                     cache->clear();
             }
-            for (auto &[device, cache] : pp_kv_caches)
-            {
-                if (cache)
-                    cache->clear();
-            }
+        }
+
+        /**
+         * @brief Clear host logical sequence mirrors and terminal-row freshness.
+         *
+         * These mirrors are request-boundary metadata. They must be reset when
+         * KV/GDN/MTP live state is reset, but they are not themselves cache
+         * payloads and should be named separately in boundary code.
+         */
+        void clearLogicalSequenceState()
+        {
             std::fill(positions.begin(), positions.end(), 0);
             std::fill(sequence_lengths.begin(), sequence_lengths.end(), 0);
             last_forward_seq_len = 0;
             last_forward_batch_size = 0;
             last_forward_request_lengths.clear();
             mtp_terminal_hidden_current = false;
+        }
+
+        /**
+         * @brief Compatibility helper for older hard-reset paths.
+         */
+        void clear()
+        {
+            clearMainKVAndGDNState();
+            clearMTPSidecarState();
+            clearLogicalSequenceState();
         }
 
         /**
@@ -788,7 +820,15 @@ namespace llaminar2
          */
         void setFrozenWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set);
 
-        /// Install alternate full dense bindings for replicated-dense decode.
+        /**
+         * @brief Install alternate full dense bindings for phase-split decode.
+         *
+         * In ExpertOverlay phase-split modes, prefill may use tensor-parallel
+         * dense weights while decode uses a replicated dense sidecar to preserve
+         * serial row semantics.  MTP verifier rows are part of that decode
+         * sidecar: if MTP is enabled, this weight set must carry complete MTP
+         * bindings for terminal decode participants.
+         */
         void setDecodeReplicatedDenseWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set);
 
         /**
@@ -1603,6 +1643,7 @@ namespace llaminar2
                 state_.logits_local->gpu_data_ptr(),
                 device_opt,
                 vocab_local,
+                static_cast<size_t>(localLogitsVocabOffset()),
                 state_.logits_local.get(),
                 stream,
                 // Expose this runner's arena-owned argmax scratch so the
@@ -1645,6 +1686,7 @@ namespace llaminar2
                 state_.logits_local->gpu_data_ptr(),
                 device_opt,
                 vocab_local,
+                static_cast<size_t>(localLogitsVocabOffset()),
                 state_.logits_local.get(),
                 stream,
                 argmax_partial_vals_dev_,
@@ -1655,7 +1697,7 @@ namespace llaminar2
 
         bool hasMTPLogitsLocal() const override
         {
-            if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+            if (!mtpSidecarLogitsAreColumnParallel())
                 return false;
             auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
             return it != state_.extension_buffers.end() && it->second != nullptr;
@@ -1680,6 +1722,7 @@ namespace llaminar2
                 mtp_logits->gpu_data_ptr(),
                 device_opt,
                 vocab_local,
+                static_cast<size_t>(localLogitsVocabOffset()),
                 mtp_logits,
                 stream,
                 argmax_partial_vals_dev_,
@@ -1721,6 +1764,7 @@ namespace llaminar2
                 mtp_logits->gpu_data_ptr(),
                 device_opt,
                 vocab_local,
+                static_cast<size_t>(localLogitsVocabOffset()),
                 mtp_logits,
                 stream,
                 argmax_partial_vals_dev_,
@@ -1731,9 +1775,7 @@ namespace llaminar2
 
         bool hasAllPositionLogitsLocal() const override
         {
-            if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
-                return false;
-            return state_.all_position_logits_local != nullptr;
+            return activeAllPositionLogitsAreColumnParallel();
         }
 
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override
@@ -1755,6 +1797,7 @@ namespace llaminar2
                 state_.all_position_logits_local->gpu_data_ptr(),
                 device_opt,
                 vocab_local,
+                static_cast<size_t>(localLogitsVocabOffset()),
                 state_.all_position_logits_local.get(),
                 stream,
                 argmax_partial_vals_dev_,
@@ -1910,6 +1953,21 @@ namespace llaminar2
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
         bool supportsMTPSpecStatePublication() const override;
         bool supportsDeviceResidentMTPSpecStatePublication() const override;
+        /**
+         * @brief Advertise the narrow grouped decode-equivalent publication lane.
+         *
+         * DeviceGraphOrchestrator keeps direct all-position publication disabled
+         * for dense and MoE/GDN models until continuation-equivalence is proven
+         * for that stronger contract.  This method advertises only the weaker,
+         * already-proven row contract: a grouped verifier graph may publish
+         * accepted rows when the caller has converted its outcome into the same
+         * MTPSpecStepPlanBatch that serial replay would have produced.
+         *
+         * @return true when this is a GPU runner and the current MTP config,
+         *         model family, and requested draft depth fit the runner's
+         *         decode-equivalent row capability.
+         */
+        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override;
         bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
         MTPVerifierRowCapability mtpVerifierRowCapability() const override;
         MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
@@ -1917,6 +1975,24 @@ namespace llaminar2
             const MTPSpecStepPlan &plan,
             std::string *error = nullptr) override;
         bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        /**
+         * @brief Publish accepted state for a grouped decode-equivalent outcome.
+         *
+         * This method is intentionally implemented as a scoped entry point over
+         * the existing batch publisher.  The internal scope lets the batch
+         * publisher reuse the same KV/GDN/short-conv/terminal-hidden mutation
+         * code while ordinary direct calls still fail unless
+         * supportsMTPSpecStatePublication() is true.
+         *
+         * @param plans Accepted-row publication plan derived from grouped
+         *        decode-equivalent verifier rows.
+         * @param error Optional destination for the first failure reason.
+         * @return true when the live runner state and host mirrors were advanced
+         *         exactly to the accepted prefix described by @p plans.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
             const MTPSpecStepPlanBatch &plans,
             std::string *error = nullptr) override;
         bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
@@ -1941,6 +2017,12 @@ namespace llaminar2
             int position_offset_override = -1,
             int already_appended_shifted_kv_tokens = -1) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
             int32_t token,
             int already_appended_tokens,
             bool allow_speculative_discard = false,
@@ -2312,6 +2394,15 @@ namespace llaminar2
         std::string prefillGraphDomainId() const override;
         int prefillGraphParticipantId() const override;
 
+        /**
+         * @brief Test hook for graph-stable GPU MoE movement.
+         *
+         * Graph-stable rebalance keeps moePlacementEpoch() pinned so captured
+         * graphs do not recapture on expert movement, but prefix-cache identity
+         * must still observe runtime expert movement.
+         */
+        void markMoERuntimeMovementForTesting() { ++moe_runtime_movement_epoch_; }
+
         // =========================================================================
         // IInferenceRunner Interface Implementation
         // =========================================================================
@@ -2323,6 +2414,8 @@ namespace llaminar2
         {
             return forward(tokens, seq_len, 1) != nullptr;
         }
+
+        bool forwardPrefill(const int *tokens, int seq_len) override;
 
         bool supportsPrefillChunkSchedule(int seq_len) const override;
 
@@ -2405,6 +2498,9 @@ namespace llaminar2
             const int32_t *draft_tokens,
             int draft_token_count,
             int first_draft_slot = 0) override;
+        bool stageStochasticTargetTokenForDeviceSampling(
+            int32_t target_token,
+            int target_sample_slot = 0) override;
         int sampleStochasticDistributionOnDevice(
             DeviceDistributionBuffer buffer,
             int slot,
@@ -2537,8 +2633,46 @@ namespace llaminar2
          * streams before the next launch.  Unproven request-stateful captures,
          * such as monolithic prefill, still recapture.
          */
-        void clear_cache() override
+        void resetInferenceState(const InferenceStateResetRequest &request) override
         {
+            const bool request_boundary =
+                request.boundary == InferenceStateResetRequest::Boundary::Request;
+            const bool prefix_restore_boundary =
+                request.boundary == InferenceStateResetRequest::Boundary::PrefixRestore;
+            if (!request.resetsAllLiveRequestOwners())
+            {
+                throw std::invalid_argument(
+                    "DeviceGraphOrchestrator::resetInferenceState requires KV, GDN, MTP, "
+                    "and logical sequence owners to cross the reset boundary together");
+            }
+            if (request_boundary)
+            {
+                if (!request.reset_model_runtime || !request.preserve_replay_safe_graphs)
+                {
+                    throw std::invalid_argument(
+                        "DeviceGraphOrchestrator::resetInferenceState request boundary must "
+                        "reset model runtime state and preserve replay-safe graph captures");
+                }
+            }
+            else if (prefix_restore_boundary)
+            {
+                if (request.preserve_replay_safe_graphs)
+                {
+                    throw std::invalid_argument(
+                        "DeviceGraphOrchestrator::resetInferenceState prefix restore must "
+                        "discard replay-safe graph captures before importing cached state");
+                }
+            }
+            else
+            {
+                throw std::invalid_argument(
+                    "DeviceGraphOrchestrator::resetInferenceState does not yet implement "
+                    "the requested hard reset boundary");
+            }
+            const char *reset_reason = request.reason ? request.reason : "request-boundary";
+            const bool preserve_replay_safe_graphs = request.preserve_replay_safe_graphs;
+            const bool prefix_restore_resets_model_runtime_owner =
+                prefix_restore_boundary && request.reset_model_runtime;
             for (auto &[dev, ctx] : device_contexts_)
             {
                 if (ctx && dev.is_gpu())
@@ -2566,21 +2700,72 @@ namespace llaminar2
             if (forward_engine_)
             {
                 forward_engine_->resetSessionReplayState(
-                    /*preserve_replay_safe_segmented_captures=*/true);
+                    preserve_replay_safe_graphs);
             }
-            mtp_sidecar_depth0_cache_.resetSessionStatePreservingGraphReplay();
-            mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingGraphReplay();
-            mtp_sidecar_depth0_chained_cache_.resetSessionStatePreservingGraphReplay();
-            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionStatePreservingGraphReplay();
-            mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingGraphReplay();
-            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingGraphReplay();
-            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-                cache.resetSessionStatePreservingGraphReplay();
-            device_moe_rebalance_maintenance_graph_.resetSessionStatePreservingGraphReplay();
-            for (auto &[edge_mask, cache] : device_moe_rebalance_maintenance_payload_graphs_)
+            if (preserve_replay_safe_graphs)
             {
-                (void)edge_mask;
-                cache.resetSessionStatePreservingGraphReplay();
+                mtp_sidecar_depth0_cache_.resetSessionStatePreservingGraphReplay();
+                mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingGraphReplay();
+                mtp_sidecar_depth0_chained_cache_.resetSessionStatePreservingGraphReplay();
+                mtp_sidecar_depth0_chained_device_token_cache_.resetSessionStatePreservingGraphReplay();
+                mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingGraphReplay();
+                mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingGraphReplay();
+            }
+            else if (prefix_restore_resets_model_runtime_owner)
+            {
+                invalidateMTPSidecarDepth0GraphState(reset_reason);
+            }
+            else
+            {
+                mtp_sidecar_depth0_cache_.resetSessionState();
+                mtp_sidecar_depth0_device_token_cache_.resetSessionState();
+                mtp_sidecar_depth0_chained_cache_.resetSessionState();
+                mtp_sidecar_depth0_chained_device_token_cache_.resetSessionState();
+                mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
+                mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionState();
+            }
+            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+            {
+                if (preserve_replay_safe_graphs)
+                    cache.resetSessionStatePreservingGraphReplay();
+                else if (!prefix_restore_resets_model_runtime_owner)
+                    cache.resetSessionState();
+            }
+            if (preserve_replay_safe_graphs)
+                device_moe_rebalance_maintenance_graph_.resetSessionStatePreservingGraphReplay();
+            else if (prefix_restore_boundary)
+            {
+                /*
+                 * Prefix restore imports portable MoE runtime state and then
+                 * rebinds local payload descriptors through the active
+                 * graph-side transfer-slot directory.  The maintenance graph
+                 * caches own stage objects whose parameters include those
+                 * slot-directory/workspace bindings, so a soft session reset
+                 * would recapture kernels around stale request-local pointers.
+                 * Destroy the graph variants at this boundary and force the
+                 * next maintenance wave to rebuild from the freshly restored
+                 * runtime state.
+                 */
+                device_moe_rebalance_maintenance_graph_.invalidate();
+                for (auto &[edge_mask, cache] : device_moe_rebalance_maintenance_payload_graphs_)
+                {
+                    (void)edge_mask;
+                    cache.invalidate();
+                }
+                device_moe_rebalance_maintenance_payload_graphs_.clear();
+            }
+            else
+                device_moe_rebalance_maintenance_graph_.resetSessionState();
+            if (!prefix_restore_boundary)
+            {
+                for (auto &[edge_mask, cache] : device_moe_rebalance_maintenance_payload_graphs_)
+                {
+                    (void)edge_mask;
+                    if (preserve_replay_safe_graphs)
+                        cache.resetSessionStatePreservingGraphReplay();
+                    else
+                        cache.resetSessionState();
+                }
             }
             device_moe_rebalance_decode_tokens_seen_ = 0;
             mtp_terminal_hidden_row_select_cache_.invalidate();
@@ -2588,7 +2773,7 @@ namespace llaminar2
             last_pos_offset_ = -1;
             defer_next_mtp_main_decode_sync_ = false;
             defer_all_position_verifier_sync_ = false;
-            clearAllPendingLogitsStreams("clear_cache");
+            clearAllPendingLogitsStreams(reset_reason);
             std::fill(stochastic_target_distribution_streams_.begin(),
                       stochastic_target_distribution_streams_.end(),
                       nullptr);
@@ -2609,42 +2794,64 @@ namespace llaminar2
                       0);
             clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
             clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
-            pending_mtp_verifier_device_token_plan_.reset();
-            materialized_mtp_verifier_device_token_row_ = {};
+            clearMTPVerifierTransactionStateForBoundary(reset_reason);
             shifted_mtp_kv_ready_.valid = false;
             shifted_mtp_kv_ready_.producer_stream = nullptr;
             clearPendingAllPositionVerifierStateReady();
             clearDeviceResidentLogicalSequenceStateMailbox();
-            request_batched_prefill_logits_row_count_ = 0;
-            request_batched_prefill_logit_rows_.clear();
             cache_stats_ = CacheStats{};
-            state_.clear();
+            if (request.reset_kv || request.reset_gdn)
+                state_.clearMainKVAndGDNState();
+            if (request.reset_mtp)
+                state_.clearMTPSidecarState();
+            if (request.reset_logical_sequence)
+                state_.clearLogicalSequenceState();
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
             // the lifetime of the orchestrator.
-            /*
-             * Do not call resetKernelDynamicState() here.  The request reset
-             * above deliberately preserves replay-safe captured CUDA/HIP graph
-             * executables, and those executable nodes can reference
-             * kernel-owned dynamic pointer tables populated during graph
-             * warmup.  Hard dynamic resets are still used when graph replay is
-             * discarded (invalidateExecutionCaches(), clearInferenceState(),
-             * MoE rebalance, prefix restore), but request-boundary state must be
-             * reset through graph/stage contracts that keep capture-owned
-             * pointer identity stable.
-             */
-            recordKernelDynamicStatePreservedForCapturedReplay("clear_cache");
-            // Reset model-internal state (no-op for models with hybrid cache since
-            // state_.clear() → kv_cache->clear() already handles GDN state reset)
-            if (graph_builder_)
-                graph_builder_->resetState();
+            if (preserve_replay_safe_graphs)
+            {
+                /*
+                 * Do not call resetKernelDynamicState() here.  The request
+                 * reset above deliberately preserves replay-safe captured
+                 * CUDA/HIP graph executables, and those executable nodes can
+                 * reference kernel-owned dynamic pointer tables populated
+                 * during graph warmup.  Prefix restore takes the other branch:
+                 * it discards replay state before importing cached KV/GDN/MTP
+                 * payloads, so dynamic pointer tables can be reset safely.
+                 */
+                recordKernelDynamicStatePreservedForCapturedReplay(reset_reason);
+            }
+            else
+            {
+                resetKernelDynamicState();
+            }
+            // Reset model-internal state only when this boundary owns that
+            // reset. Prefix restore with a model-runtime snapshot restores the
+            // graph builder immediately after this reset instead. Prefix
+            // restore without a snapshot uses a separate hook because an
+            // ordinary request-boundary reset may preserve graph-compatible
+            // runtime baseline state that would be stale for a restored prefix.
+            if (request.reset_model_runtime && graph_builder_)
+            {
+                if (prefix_restore_boundary)
+                    graph_builder_->resetPrefixCacheRuntimeStateWithoutSnapshot();
+                else
+                    graph_builder_->resetState();
+            }
             // Note: host_resident_released_ is NOT reset here —
             // the host data is gone and cannot be re-uploaded.
             device_sampling_counter_ = 0;
             ++session_epoch_;
-            recordLivePrefixSessionReset("clear_cache",
-                                         /*preserve_gpu_replay_state=*/true);
+            recordLivePrefixSessionReset(reset_reason,
+                                         preserve_replay_safe_graphs);
+        }
+
+        void clear_cache() override
+        {
+            resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("clear_cache"));
         }
 
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override
@@ -2920,11 +3127,16 @@ namespace llaminar2
             const int *tokens,
             const void *token_ids_device,
             int seq_len,
-            int batch_size);
+            int batch_size,
+            bool force_prefill_phase = false);
 
         size_t localLogitsVocabColumns(const TensorBase *tensor) const;
         size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
+        int localLogitsVocabOffset() const;
         bool activeMainLogitsAreColumnParallel() const;
+        bool mtpSidecarLogitsAreColumnParallel() const;
+        bool allPositionVerifierGraphWritesLocalLogits(int graph_token_count = -1) const;
+        bool activeAllPositionLogitsAreColumnParallel(int graph_token_count = -1) const;
         bool usesGraphStableGpuMoERebalance() const;
 
         /**
@@ -3076,6 +3288,18 @@ namespace llaminar2
             const ForwardInput &input,
             DeviceId execution_device,
             bool cache_miss) override;
+
+        /** Wait at a LocalTP-aware prefill graph-capture lifecycle boundary. */
+        bool waitAtPrefillGraphCaptureBoundary(
+            const ForwardInput &input,
+            DeviceId execution_device,
+            const std::string &boundary_name) override;
+
+        /** Wait at a LocalTP-aware decode graph-capture lifecycle boundary. */
+        bool waitAtDecodeGraphCaptureBoundary(
+            const ForwardInput &input,
+            DeviceId execution_device,
+            const std::string &boundary_name) override;
 
         /**
          * @brief Materialize pending verifier token IDs on the graph execution stream.
@@ -3236,6 +3460,18 @@ namespace llaminar2
             const char *consumer_name);
 
         /**
+         * @brief Queue an observation-only wait for deferred shifted MTP KV writes.
+         *
+         * Prefix probes and checkpoint exporters must observe any shifted-cache
+         * append before reading live MTP state, but they must not consume the
+         * event that the next verifier, sidecar, restore, or truncate boundary
+         * may still own as a semantic state transition.
+         */
+        bool waitForPendingShiftedMTPKVReadyForObservation(
+            void *consumer_stream,
+            const char *consumer_name) const;
+
+        /**
          * @brief Record that a deferred all-position verifier finished writing rows.
          *
          * The verifier produces two different surfaces on the same replay stream:
@@ -3258,6 +3494,17 @@ namespace llaminar2
         bool waitForPendingAllPositionVerifierStateReady(
             void *consumer_stream,
             const char *consumer_name);
+
+        /**
+         * @brief Queue an observation-only wait for deferred verifier row state.
+         *
+         * Snapshot/probe reads need verifier-produced KV/GDN/short-conv rows to
+         * be visible, but they must not clear the event that publication still
+         * owns for accepted-state restore.
+         */
+        bool waitForPendingAllPositionVerifierStateReadyForObservation(
+            void *consumer_stream,
+            const char *consumer_name) const;
 
         /** Clear stale verifier-state readiness after reset or disabled deferral. */
         void clearPendingAllPositionVerifierStateReady();
@@ -3308,6 +3555,21 @@ namespace llaminar2
             const PrefixStateSnapshot &snapshot,
             void *consumer_stream,
             const char *consumer_name) const;
+
+        /**
+         * @brief Import only a checkpoint's MTP terminal-hidden row.
+         *
+         * The verifier-base shifted-row repair must not restore KV, GDN,
+         * positions, sampler state, or MTP sidecar KV.  It only needs the
+         * terminal hidden row that was current when the checkpoint was captured.
+         * This helper validates the snapshot payload, uploads it to
+         * PREFIX_TERMINAL_HIDDEN on the runner's explicit stream, and marks that
+         * tensor as the current sidecar input.
+         */
+        bool importMTPCheckpointTerminalHidden(
+            const PrefixStateSnapshot &snapshot,
+            void *stream,
+            const char *consumer_name);
 
         /** Consume the pending live-source checkpoint handoff before mutation. */
         bool waitForPendingLivePrefixCheckpointReady(
@@ -3515,6 +3777,11 @@ namespace llaminar2
             const std::map<std::string, std::string> &maintenance_tags,
             DeviceMoERebalanceMaintenanceOutcome *outcome = nullptr);
 
+        /** Drain graph-stable MoE runtime movement before decode graph capture starts. */
+        bool synchronizeGraphStableMoERuntimeBeforeDecodeCapture(
+            DeviceId execution_device,
+            const std::string &boundary_name);
+
         /**
          * @brief Export a completed maintenance wave at request reset.
          *
@@ -3656,6 +3923,18 @@ namespace llaminar2
          * handoff rule easy to audit.
          */
         void resetMTPSidecarDepth0ReplayState();
+        /**
+         * @brief Destroy every cached depth-0 MTP sidecar graph and replay handle.
+         *
+         * Prefix restore can legally import a block that contains KV/GDN/MTP
+         * payloads but no model-runtime placement snapshot.  In that case the
+         * graph builder clears graph-owned MoE runtime tables, so a cached MTP
+         * sidecar graph would keep stage objects that point at metadata that is
+         * intentionally no longer initialized.  Invalidating, rather than only
+         * resetting replay state, makes the next sidecar call rebuild the graph
+         * and republish its depth-scoped runtime placement table.
+         */
+        void invalidateMTPSidecarDepth0GraphState(const char *reason);
         /**
          * @brief Advance the replay epoch after shifted MTP KV changes.
          *
@@ -3944,6 +4223,21 @@ namespace llaminar2
             void *consumer_stream,
             const char *consumer);
 
+        /**
+         * @brief Order an observation stream after a pending logits producer.
+         *
+         * Prefix probes, prefix harvest, and checkpoint capture read the same
+         * live KV/GDN/MTP surfaces as normal forward graphs, but they are not
+         * the semantic owner of deferred logits.  This helper queues the same
+         * GPU stream dependency as waitForPendingLogitsStream() while leaving
+         * the role handoff intact for the sampler, reducer, or later mutation
+         * boundary that owns consumption.
+         */
+        bool waitForPendingLogitsStreamForObservation(
+            PendingLogitsStreamRole role,
+            void *consumer_stream,
+            const char *consumer) const;
+
         /** @brief Clear every pending logits handoff during session teardown. */
         void clearAllPendingLogitsStreams(const char *reason);
 
@@ -3960,6 +4254,34 @@ namespace llaminar2
             const char *mutation_name);
 
         /**
+         * @brief Queue an observation stream after all live graph producers.
+         *
+         * Unlike waitForPendingLiveGraphProducersBeforePrefixMutation(), this
+         * method is non-consuming. It is the read-only side of the live-state
+         * access contract: host-visible KV exports, prefix-cache harvest, and
+         * diagnostic probes must observe graph-produced KV/GDN/MTP writes in
+         * stream order without stealing sampler or mutation ownership.
+         */
+        bool waitForPendingLiveGraphProducersForObservation(
+            void *observation_stream,
+            const char *observation_name) const;
+
+        /**
+         * @brief Queue an observation stream after every live inference-state producer.
+         *
+         * This is the first-class owner boundary for host-visible reads of live
+         * inference state. It covers accepted verifier publication, prefix
+         * restore/truncate mutation events, ordinary graph replay streams,
+         * shifted MTP KV events, all-position verifier row-state events, and
+         * device-resident logical sequence-state publication. Callers that
+         * export KV, GDN, or MTP state must go through this helper instead of
+         * assembling partial waits locally.
+         */
+        bool waitForLiveInferenceStateReadyForObservation(
+            void *observation_stream,
+            const char *observation_name) const;
+
+        /**
          * @brief Drop transient stream/mailbox handoffs after restoring live state.
          *
          * `restoreLivePrefixState()` replaces the request-visible KV/GDN/logits
@@ -3969,6 +4291,18 @@ namespace llaminar2
          * is allowed to consume live state.
          */
         void clearLivePrefixRestoreTransientHandoffs(const char *reason);
+
+        /**
+         * @brief Clear request-scoped MTP verifier transaction state.
+         *
+         * MTP verification spans several owner surfaces: a host verifier row
+         * plan, optional device-resident first-token materialization, compact
+         * all-position logit row mode, and a publication-time base-KV snapshot.
+         * Prefix restore and request reset abandon that transaction as a unit,
+         * so this helper is the single boundary that returns the runner to an
+         * ordinary continuation state.
+         */
+        void clearMTPVerifierTransactionStateForBoundary(const char *reason);
 
         /**
          * @brief Storage for one pending logits stream handoff.
@@ -4756,6 +5090,17 @@ namespace llaminar2
          */
         bool mtp_publication_base_cache_snapshot_ready_ = false;
         int mtp_publication_base_cache_snapshot_request_count_ = 0;
+        /**
+         * @brief Scoped internal permission for grouped decode-equivalent publish.
+         *
+         * The normal batch publisher begins by checking
+         * supportsMTPSpecStatePublication(), because external callers should not
+         * be able to publish direct all-position verifier rows unless that strong
+         * contract is advertised.  publishGroupedDecodeEquivalentMTPSpecStateBatch()
+         * flips this flag only while it is on the stack, after checking the
+         * narrower grouped decode-equivalent capability.
+         */
+        bool grouped_decode_equivalent_spec_publication_scope_ = false;
 
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
@@ -4795,6 +5140,20 @@ namespace llaminar2
         /// Frozen model weight set for audit/validation (Phase 6)
         std::unique_ptr<FrozenModelWeightSet> frozen_weight_set_;
         std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weight_set_;
+
+        /**
+         * @brief Select the weight set that owns graph-native MTP decode work.
+         *
+         * Phase-split replicated decode deliberately has two frozen views: a
+         * primary tensor-parallel prefill view and a replicated dense decode view.
+         * The MTP sidecar verifies decode rows, so it must bind from the decode
+         * view whenever dense_tp_decode_replicated is active.  Non phase-split
+         * paths continue to bind from the primary frozen set.
+         *
+         * @param caller Short method name used in diagnostics.
+         * @return Selected weight set, or nullptr after logging a configuration error.
+         */
+        const FrozenModelWeightSet *selectMTPDecodeWeightSet(const char *caller) const;
 
         /// Build FrozenModelWeightSet from pre-resolved layer weights (Phase 6)
         void buildFrozenWeightSet(
@@ -4915,6 +5274,25 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Upload a host-resolved grouped publication plan into the resident mailbox.
+         *
+         * Grouped decode-equivalent publication already commits KV, recurrent
+         * state, short-conv state, and terminal hidden rows from verifier graph
+         * rows.  The next MTP sidecar step must then consume the same logical
+         * state from device-resident metadata instead of re-reading host mirrors.
+         * This helper stages the per-request logical rows from the accepted
+         * MTPSpecStepPlanBatch into the persistent MTP metadata workspace and
+         * records the normal device-resident logical-state mailbox event on the
+         * verifier stream.
+         */
+        bool recordDeviceResidentLogicalSequenceStateMailboxFromStepPlans(
+            const MTPSpecStepPlanBatch &plans,
+            int max_draft_tokens,
+            const ComputeGraph &verifier_graph,
+            void *producer_stream,
+            std::string *error = nullptr);
+
+        /**
          * @brief Retarget the current resident mailbox after a shifted-MTP KV append.
          *
          * Resident correction commits consume the next-condition token from the
@@ -4934,6 +5312,20 @@ namespace llaminar2
         bool waitForDeviceResidentLogicalSequenceStateMailbox(
             void *consumer_stream,
             const char *consumer_name);
+
+        /**
+         * @brief Queue an observation-only wait for resident logical-state metadata.
+         *
+         * Device-resident MTP publication can leave request positions and
+         * sequence lengths in GPU metadata until a later host-adoption boundary.
+         * Host-visible diagnostics must wait for the producer stream before
+         * reading any paired live KV/GDN/MTP state, but they must not clear or
+         * adopt the mailbox because scheduler and publication code still own
+         * the semantic transition.
+         */
+        bool waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
+            void *consumer_stream,
+            const char *consumer_name) const;
 
         /**
          * @brief Whether DGO can consume device-published logical sequence state.

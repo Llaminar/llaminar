@@ -17,6 +17,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <numeric>
@@ -403,15 +404,21 @@ TEST_F(Test__LocalTPContext, OnStreamGpuCollectivesStayGroupedDuringGraphCapture
            "explicit-stream launcher, not independent per-device captures.";
 }
 
-TEST_F(Test__LocalTPContext, CollectTimeoutPolicyExtendsOnlyColdStart)
+TEST_F(Test__LocalTPContext, CollectTimeoutPolicyUsesConfiguredCollectiveTimeout)
 {
     using collective_timeout_policy::effectiveCollectTimeoutMs;
-    using collective_timeout_policy::kColdStartCollectTimeoutMs;
+    using collective_timeout_policy::effectiveWorkerJoinTimeoutMs;
 
     EXPECT_EQ(effectiveCollectTimeoutMs(0, false), 0);
-    EXPECT_EQ(effectiveCollectTimeoutMs(30000, false), kColdStartCollectTimeoutMs);
+    EXPECT_EQ(effectiveCollectTimeoutMs(30000, false), 30000);
     EXPECT_EQ(effectiveCollectTimeoutMs(450000, false), 450000);
     EXPECT_EQ(effectiveCollectTimeoutMs(30000, true), 30000);
+
+    EXPECT_EQ(effectiveWorkerJoinTimeoutMs(0), 0);
+    EXPECT_EQ(effectiveWorkerJoinTimeoutMs(30000), 0)
+        << "LLAMINAR_TP_COLLECT_TIMEOUT_MS is a per-collective timeout, "
+           "not a whole-forward TP worker wall-clock limit.";
+    EXPECT_EQ(effectiveWorkerJoinTimeoutMs(450000), 0);
 }
 
 TEST_F(Test__LocalTPContext, FP16TransportFailuresFailBeforeFP32GroupedAllreduce)
@@ -561,6 +568,67 @@ TEST_F(Test__LocalTPContext, RCCLCoordinatorKeepsHipDeviceGuardTrackingInSync)
         << "RCCL coordinator runs direct grouped collectives on worker threads; "
            "raw hipSetDevice leaves HipDeviceGuard's thread-local cache stale and "
            "can make the next kernel launch use a stream from the wrong device.";
+}
+
+TEST_F(Test__LocalTPContext, WorkerGpuCheckedEventHelpersBindContextDevice)
+{
+    const std::string cuda_context = readTextFile(LLAMINAR_NVIDIA_DEVICE_CONTEXT_SOURCE);
+    const std::string rocm_context = readTextFile(LLAMINAR_AMD_DEVICE_CONTEXT_SOURCE);
+    ASSERT_FALSE(cuda_context.empty());
+    ASSERT_FALSE(rocm_context.empty());
+
+    auto extractMethod = [](const std::string &source, const char *signature)
+    {
+        const size_t sig_pos = source.find(signature);
+        EXPECT_NE(sig_pos, std::string::npos) << signature;
+        if (sig_pos == std::string::npos)
+            return std::string();
+        const size_t next_method = source.find("\n    bool ", sig_pos + 1);
+        const size_t next_void = source.find("\n    void ", sig_pos + 1);
+        size_t end = std::min(next_method == std::string::npos ? source.size() : next_method,
+                              next_void == std::string::npos ? source.size() : next_void);
+        if (end <= sig_pos)
+            end = source.size();
+        return source.substr(sig_pos, end - sig_pos);
+    };
+
+    const std::string cuda_record =
+        extractMethod(cuda_context, "bool NvidiaDeviceContext::recordEventChecked(");
+    const std::string cuda_wait =
+        extractMethod(cuda_context, "bool NvidiaDeviceContext::waitEventChecked(");
+    const std::string cuda_query =
+        extractMethod(cuda_context, "bool NvidiaDeviceContext::queryEventChecked(");
+    const std::string cuda_sync =
+        extractMethod(cuda_context, "bool NvidiaDeviceContext::synchronizeStreamChecked(");
+    const std::string rocm_record =
+        extractMethod(rocm_context, "bool AMDDeviceContext::recordEventChecked(");
+    const std::string rocm_wait =
+        extractMethod(rocm_context, "bool AMDDeviceContext::waitEventChecked(");
+    const std::string rocm_query =
+        extractMethod(rocm_context, "bool AMDDeviceContext::queryEventChecked(");
+    const std::string rocm_sync =
+        extractMethod(rocm_context, "bool AMDDeviceContext::synchronizeStreamChecked(");
+    ASSERT_FALSE(cuda_record.empty());
+    ASSERT_FALSE(cuda_wait.empty());
+    ASSERT_FALSE(cuda_query.empty());
+    ASSERT_FALSE(cuda_sync.empty());
+    ASSERT_FALSE(rocm_record.empty());
+    ASSERT_FALSE(rocm_wait.empty());
+    ASSERT_FALSE(rocm_query.empty());
+    ASSERT_FALSE(rocm_sync.empty());
+
+    EXPECT_NE(cuda_record.find("cudaSetDevice(device_ordinal_)"), std::string::npos);
+    EXPECT_NE(cuda_wait.find("cudaSetDevice(device_ordinal_)"), std::string::npos);
+    EXPECT_NE(cuda_query.find("cudaSetDevice(device_ordinal_)"), std::string::npos);
+    EXPECT_NE(cuda_sync.find("cudaSetDevice(device_ordinal_)"), std::string::npos);
+    EXPECT_NE(rocm_record.find("setAMDDeviceForResource(device_ordinal_, \"recordEventChecked\")"),
+              std::string::npos);
+    EXPECT_NE(rocm_wait.find("setAMDDeviceForResource(device_ordinal_, \"waitEventChecked\")"),
+              std::string::npos);
+    EXPECT_NE(rocm_query.find("setAMDDeviceForResource(device_ordinal_, \"queryEventChecked\")"),
+              std::string::npos);
+    EXPECT_NE(rocm_sync.find("setAMDDeviceForResource(device_ordinal_, \"synchronizeStreamChecked\")"),
+              std::string::npos);
 }
 
 TEST_F(Test__LocalTPContext, RawAllgatherUsesParticipantProducerStreams)
@@ -1316,7 +1384,7 @@ TEST_F(Test__LocalTPContext, HostBackendAlwaysAvailable)
     EXPECT_EQ(ctx->degree(), 2);
 }
 
-TEST_F(Test__LocalTPContext, RawAllgatherUsesOnStreamPathDuringGraphCapture)
+TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureSupportUsesAllreducePrimitive)
 {
     auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
     auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
@@ -1325,37 +1393,23 @@ TEST_F(Test__LocalTPContext, RawAllgatherUsesOnStreamPathDuringGraphCapture)
     auto backend = std::make_unique<MockCollectiveBackend>();
     auto *backend_raw = backend.get();
     backend_raw->multi_gpu_mode = true;
-    backend_raw->supports_allgather_on_stream = true;
+    backend_raw->supports_allgather_on_stream = false;
+    backend_raw->supports_allreduce_on_stream = true;
     ctx->setBackendForTesting(
         std::move(backend),
         CollectiveBackendType::NCCL,
         /*initialized=*/true);
 
-    EXPECT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+    EXPECT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture())
+        << "NCCL graph-captured raw allgather is implemented through the validated allreduce primitive.";
 
-    int send = 7;
-    int recv[2] = {};
-    void *stream = reinterpret_cast<void *>(0x1234);
-
-    {
-        GraphCaptureGuard guard;
-        EXPECT_TRUE(ctx->allgatherRawOnStream(
-            &send,
-            recv,
-            1,
-            CollectiveDataType::INT32,
-            0,
-            stream,
-            "captured_raw_stage"));
-    }
-
-    EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 1);
+    backend_raw->supports_allreduce_on_stream = false;
+    EXPECT_FALSE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+    EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 0);
     EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0)
-        << "Graph capture must not enter the host-synchronized raw allgather barrier.";
+        << "Support probing must not enter the host-synchronized raw allgather barrier.";
     EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 0)
-        << "Graph capture must stay participant-local instead of using eager grouped launch.";
-    EXPECT_EQ(backend_raw->last_allgather_on_stream_device_idx, 0);
-    EXPECT_EQ(backend_raw->last_allgather_on_stream_stream, stream);
+        << "Support probing must not launch eager grouped allgather.";
 }
 
 TEST_F(Test__LocalTPContext, RCCLRawAllgatherGraphCaptureSupportUsesAllreducePrimitive)
@@ -1381,29 +1435,34 @@ TEST_F(Test__LocalTPContext, RCCLRawAllgatherGraphCaptureSupportUsesAllreducePri
     EXPECT_FALSE(ctx->supportsRawAllgatherOnStreamGraphCapture());
 }
 
-TEST_F(Test__LocalTPContext, RCCLGraphCapturedRawAllgatherUsesAllreduceEmulation)
+TEST_F(Test__LocalTPContext, GraphCapturedRawAllgatherUsesGroupedAllreduceEmulation)
 {
     std::ifstream source("src/v2/collective/LocalTPContext.cpp");
     ASSERT_TRUE(source.is_open());
     const std::string contents((std::istreambuf_iterator<char>(source)),
                                std::istreambuf_iterator<char>());
 
-    const size_t branch = contents.find("backend_ == CollectiveBackendType::RCCL");
-    ASSERT_NE(branch, std::string::npos);
-    const size_t emulation_comment = contents.find(
-        "RCCL allgather can report successful capture",
-        branch);
+    const size_t entry = contents.find("bool LocalTPContext::allgatherRawOnStream(");
+    ASSERT_NE(entry, std::string::npos);
+    const size_t graph_capture_branch = contents.find("if (isGraphCaptureActive())", entry);
+    ASSERT_NE(graph_capture_branch, std::string::npos);
+    const size_t eager_handoff = contents.find("return allgatherRawWithBarrierMultiGpu(", graph_capture_branch);
+    ASSERT_NE(eager_handoff, std::string::npos);
+    const std::string graph_body = contents.substr(graph_capture_branch, eager_handoff - graph_capture_branch);
+
+    const size_t emulation_comment = graph_body.find(
+        "deterministic publish-and-sum transaction");
     ASSERT_NE(emulation_comment, std::string::npos);
-    const size_t allreduce_call = contents.find(
-        "backend_impl_->allreduceSingleDeviceOnStream",
+    const size_t grouped_allreduce_call = graph_body.find(
+        "allreduceGroupedOnExplicitStreams(",
         emulation_comment);
-    ASSERT_NE(allreduce_call, std::string::npos);
-    const size_t native_allgather_call = contents.find(
-        "backend_impl_->allgatherSingleDeviceOnStream",
-        emulation_comment);
-    ASSERT_NE(native_allgather_call, std::string::npos);
-    EXPECT_LT(allreduce_call, native_allgather_call)
-        << "The RCCL graph-captured branch must avoid native allgather capture.";
+    ASSERT_NE(grouped_allreduce_call, std::string::npos);
+    EXPECT_NE(graph_body.find("nccl_backend_detail::cudaMemsetAsyncDevice"), std::string::npos);
+    EXPECT_NE(graph_body.find("nccl_backend_detail::cudaMemcpyAsyncSameDevice"), std::string::npos);
+    EXPECT_NE(graph_body.find("rccl_backend_detail::hipMemsetAsyncDevice"), std::string::npos);
+    EXPECT_NE(graph_body.find("rccl_backend_detail::hipMemcpyAsyncSameDevice"), std::string::npos);
+    EXPECT_EQ(graph_body.find("backend_impl_->allgatherSingleDeviceOnStream"), std::string::npos)
+        << "Graph-captured raw allgather should not depend on backend-native allgather replay.";
 }
 
 TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport)
@@ -1416,6 +1475,7 @@ TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport
     auto *backend_raw = backend.get();
     backend_raw->multi_gpu_mode = true;
     backend_raw->supports_allgather_on_stream = false;
+    backend_raw->supports_allreduce_on_stream = false;
     ctx->setBackendForTesting(
         std::move(backend),
         CollectiveBackendType::NCCL,

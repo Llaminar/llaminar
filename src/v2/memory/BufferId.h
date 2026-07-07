@@ -130,6 +130,8 @@ namespace llaminar2
         MTP_Q_PROJ,
         MTP_K_PROJ,
         MTP_V_PROJ,
+        MTP_K_FULL_PREFILL,
+        MTP_V_FULL_PREFILL,
         MTP_FA_Q_RAW,
         MTP_FA_GATE,
         MTP_Q_ROPE,
@@ -301,6 +303,10 @@ namespace llaminar2
             return "MTP_K_PROJ";
         case BufferId::MTP_V_PROJ:
             return "MTP_V_PROJ";
+        case BufferId::MTP_K_FULL_PREFILL:
+            return "MTP_K_FULL_PREFILL";
+        case BufferId::MTP_V_FULL_PREFILL:
+            return "MTP_V_FULL_PREFILL";
         case BufferId::MTP_FA_Q_RAW:
             return "MTP_FA_Q_RAW";
         case BufferId::MTP_FA_GATE:

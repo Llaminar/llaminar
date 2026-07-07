@@ -59,6 +59,36 @@ protected:
         return false;
     }
 
+    static bool contractHasInput(const StageBufferContract &contract, BufferId id)
+    {
+        for (const auto &binding : contract.inputs)
+        {
+            if (binding.id == id)
+                return true;
+        }
+        return false;
+    }
+
+    static bool contractHasOutput(const StageBufferContract &contract, BufferId id)
+    {
+        for (const auto &binding : contract.outputs)
+        {
+            if (binding.id == id)
+                return true;
+        }
+        return false;
+    }
+
+    static bool contractHasInOut(const StageBufferContract &contract, BufferId id)
+    {
+        for (const auto &binding : contract.inouts)
+        {
+            if (binding.id == id)
+                return true;
+        }
+        return false;
+    }
+
     // Typical model dimensions (Qwen2.5-0.5B-like)
     static constexpr size_t SEQ_LEN = 4;
     static constexpr size_t D_MODEL = 896;
@@ -671,6 +701,32 @@ TEST_F(Test__StageWeightContracts, GatedRMSNormStage_DeclaresGamma)
 
     EXPECT_FALSE(contract.empty());
     EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+}
+
+TEST_F(Test__StageWeightContracts, GatedRMSNormStage_InPlace_HasInOutBinding)
+{
+    auto input = makeFP32(SEQ_LEN, D_MODEL);
+    auto gate = makeFP32(SEQ_LEN, D_MODEL);
+    auto gamma = makeFP32(1, D_MODEL);
+
+    GatedRMSNormStage::Params params{};
+    params.input = input.get();
+    params.gate = gate.get();
+    params.output = input.get();
+    params.gamma = gamma.get();
+    params.eps = 1e-6f;
+    params.input_buffer_id = BufferId::ATTN_OUTPUT;
+    params.gate_buffer_id = BufferId::GDN_Z;
+    params.output_buffer_id = BufferId::ATTN_OUTPUT;
+
+    GatedRMSNormStage stage(params);
+    auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(contractHasInOut(contract, BufferId::ATTN_OUTPUT));
+    EXPECT_TRUE(contractHasInput(contract, BufferId::GDN_Z));
+    EXPECT_FALSE(contractHasInput(contract, BufferId::ATTN_OUTPUT));
+    EXPECT_FALSE(contractHasOutput(contract, BufferId::ATTN_OUTPUT));
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
 }
 

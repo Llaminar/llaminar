@@ -433,7 +433,10 @@ namespace llaminar2
             const size_t rows = params_.seq_len > 0
                                     ? static_cast<size_t>(params_.seq_len)
                                     : out_base->rows();
-            info.addOutput("output", params_.output, rows, out_base->cols());
+            const size_t cols = params_.feature_dim > 0
+                                    ? static_cast<size_t>(params_.feature_dim)
+                                    : out_base->cols();
+            info.addOutput("output", params_.output, rows, cols);
         }
 
         return info;
@@ -446,13 +449,20 @@ namespace llaminar2
 
     StageBufferContract GatedRMSNormStage::bufferContract() const
     {
+        if (!params_.input_buffer_id || !params_.gate_buffer_id || !params_.output_buffer_id)
+            return {};
+
         StageBufferContract contract;
-        if (params_.input_buffer_id)
+        if (*params_.input_buffer_id == *params_.output_buffer_id)
+        {
+            contract.addInOut(*params_.input_buffer_id);
+        }
+        else
+        {
             contract.addInput(*params_.input_buffer_id);
-        if (params_.gate_buffer_id)
-            contract.addInput(*params_.gate_buffer_id);
-        if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        }
+        contract.addInput(*params_.gate_buffer_id);
         // gamma is a model weight, not arena-managed
         if (params_.gamma)
             contract.addWeight(const_cast<ITensor *>(params_.gamma));

@@ -10,6 +10,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -42,6 +44,41 @@ namespace
             throw std::runtime_error(std::string(operation) + " failed: " + cudaGetErrorString(status));
         }
     }
+
+    /**
+     * @brief Owns one CUDA stream for tests that exercise GPU-resident cache state.
+     *
+     * Hybrid prefix import/export requires an explicit stream so that production
+     * code never falls back to implicit default-stream ordering. The tests use
+     * this small RAII wrapper to make that contract visible and leak-free.
+     */
+    struct CudaStream
+    {
+        cudaStream_t stream = nullptr;
+
+        CudaStream()
+        {
+            checkCuda(cudaStreamCreate(&stream), "cudaStreamCreate");
+        }
+
+        ~CudaStream()
+        {
+            if (stream)
+                (void)cudaStreamDestroy(stream);
+        }
+
+        CudaStream(const CudaStream &) = delete;
+        CudaStream &operator=(const CudaStream &) = delete;
+
+        /// @brief Returns the stream as the opaque pointer expected by kernel interfaces.
+        void *opaque() const { return stream; }
+
+        /// @brief Blocks until all work enqueued on the stream has completed.
+        void synchronize(const char *operation) const
+        {
+            checkCuda(cudaStreamSynchronize(stream), operation);
+        }
+    };
 
     /// @brief Returns true when at least one CUDA device is visible to the runtime.
     bool hasCUDA()
@@ -98,18 +135,39 @@ namespace
         llaminar2::IHybridKVCache *hybrid = nullptr;
     };
 
-    /// @brief Builds a tiny Qwen3.5-style layer map with GDN/FA/GDN layers.
+    /// @brief Builds a compact but production-valid Qwen3.5-style GDN/FA/GDN layer map.
     llaminar2::HybridKVCacheConfig makeHybridConfig()
     {
         llaminar2::HybridKVCacheConfig hybrid;
         hybrid.layer_types = {"gdn", "full_attention", "gdn"};
         hybrid.gdn_conv_kernel_size = 3;
-        hybrid.gdn_state_size = 2;
-        hybrid.gdn_inner_size = 2;
+        hybrid.gdn_state_size = 128;
+        hybrid.gdn_inner_size = 128;
         hybrid.gdn_group_count = 1;
         hybrid.gdn_time_step_rank = 1;
         hybrid.n_heads = 1;
         hybrid.local_n_heads = 0;
+        return hybrid;
+    }
+
+    /**
+     * @brief Builds a TP-sharded one-layer GDN map with distinct local/full state sizes.
+     *
+     * The production partial-prefix path restores two GDN banks: a local bank for
+     * suffix prefill and a full bank for decode. This config makes those banks
+     * different sizes so a regression cannot accidentally pass by aliasing them.
+     */
+    llaminar2::HybridKVCacheConfig makeShardedHybridConfig()
+    {
+        llaminar2::HybridKVCacheConfig hybrid;
+        hybrid.layer_types = {"gdn"};
+        hybrid.gdn_conv_kernel_size = 3;
+        hybrid.gdn_state_size = 2;
+        hybrid.gdn_inner_size = 8;
+        hybrid.gdn_group_count = 2;
+        hybrid.gdn_time_step_rank = 4;
+        hybrid.n_heads = 4;
+        hybrid.local_n_heads = 2;
         return hybrid;
     }
 
@@ -122,8 +180,8 @@ namespace
             "full_attention", "full_attention", "full_attention", "full_attention",
             "gdn"};
         hybrid.gdn_conv_kernel_size = 3;
-        hybrid.gdn_state_size = 2;
-        hybrid.gdn_inner_size = 2;
+        hybrid.gdn_state_size = 128;
+        hybrid.gdn_inner_size = 128;
         hybrid.gdn_group_count = 1;
         hybrid.gdn_time_step_rank = 1;
         hybrid.n_heads = 1;
@@ -167,8 +225,62 @@ namespace
         ASSERT_EQ(actual.size(), expected.size()) << label;
         for (size_t i = 0; i < actual.size(); ++i)
         {
+            ASSERT_TRUE(std::isfinite(actual[i])) << label << " actual value is not finite at index " << i;
+            ASSERT_TRUE(std::isfinite(expected[i])) << label << " expected value is not finite at index " << i;
             ASSERT_NEAR(actual[i], expected[i], tol) << label << " at index " << i;
         }
+    }
+
+    /// @brief Generates deterministic FP32 state snapshots with clearly separated ranges.
+    std::vector<float> statePattern(size_t count, float base)
+    {
+        std::vector<float> values(count);
+        for (size_t i = 0; i < count; ++i)
+            values[i] = base + static_cast<float>(i) * 0.125f;
+        return values;
+    }
+
+    /// @brief Host snapshot of the local live GDN bank exported through GPU kernels.
+    struct GDNStateSnapshot
+    {
+        std::vector<float> recurrence;
+        std::vector<float> conv;
+    };
+
+    /**
+     * @brief Exports the local live GDN bank for a layer into host vectors.
+     *
+     * The host-staged prefix payload stores live GPU state in host memory. This
+     * helper gives tests a precise expected value for that boundary without
+     * confusing it with the cache's mutable host mirror vectors.
+     */
+    GDNStateSnapshot exportLocalGDNState(llaminar2::IHybridKVCache *cache, int layer, const CudaStream &stream)
+    {
+        auto *state = cache->getGDNState(layer);
+        if (!state || !state->rec_kernel || !state->conv_kernel)
+            throw std::runtime_error("invalid GDN state while exporting local CUDA test snapshot");
+
+        GDNStateSnapshot snapshot;
+        snapshot.recurrence.resize(state->recurrence_state.size());
+        snapshot.conv.resize(state->conv_state.size());
+        if (!state->rec_kernel->exportStateForSize(
+                static_cast<int>(snapshot.recurrence.size()),
+                snapshot.recurrence.data(),
+                nullptr,
+                stream.opaque()))
+        {
+            throw std::runtime_error("failed to export local CUDA recurrence state snapshot");
+        }
+        if (!state->conv_kernel->exportStateForSize(
+                static_cast<int>(snapshot.conv.size()),
+                snapshot.conv.data(),
+                nullptr,
+                stream.opaque()))
+        {
+            throw std::runtime_error("failed to export local CUDA conv state snapshot");
+        }
+        stream.synchronize("cudaStreamSynchronize after local GDN state snapshot export");
+        return snapshot;
     }
 
     /// @brief Generates small deterministic FP32 inputs that keep recurrence math finite.
@@ -208,7 +320,8 @@ namespace
         CudaFloatBuffer d_weight(weight);
         CudaFloatBuffer d_output(static_cast<size_t>(channels));
 
-        state->conv_kernel->setGPUStream(nullptr);
+        CudaStream stream;
+        state->conv_kernel->setGPUStream(stream.opaque());
         if (!state->conv_kernel->forward(
                 d_input.ptr, d_weight.ptr, nullptr,
                 d_output.ptr, state->conv_state.data(),
@@ -217,7 +330,7 @@ namespace
         {
             throw std::runtime_error("CUDA short-conv recurrent decode failed");
         }
-        checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after short-conv");
+        stream.synchronize("cudaStreamSynchronize after short-conv");
         return d_output.toHost();
     }
 
@@ -237,15 +350,16 @@ namespace
         auto q = pattern(qk_count, seed + 0.10f);
         auto k = pattern(qk_count, seed + 0.20f);
         auto v = pattern(v_count, seed + 0.30f);
-        std::vector<float> alpha(static_cast<size_t>(n_heads), 0.0f);
-        std::vector<float> beta(static_cast<size_t>(n_heads), 0.0f);   // sigmoid(beta) = 0.5
-        std::vector<float> a_log(static_cast<size_t>(n_heads), -2.0f); // mild decay
-        std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.0f);
+        std::vector<float> alpha(static_cast<size_t>(n_heads), 0.1f);
+        std::vector<float> beta(static_cast<size_t>(n_heads), -1.0f);
+        std::vector<float> a_log(static_cast<size_t>(n_heads), -0.25f);
+        std::vector<float> dt_bias(static_cast<size_t>(n_heads), -0.5f);
 
         CudaFloatBuffer d_q(q), d_k_buf(k), d_v_buf(v), d_alpha(alpha), d_beta(beta), d_a_log(a_log), d_dt_bias(dt_bias);
         CudaFloatBuffer d_output(v_count);
 
-        state->rec_kernel->setGPUStream(nullptr);
+        CudaStream stream;
+        state->rec_kernel->setGPUStream(stream.opaque());
         if (!state->rec_kernel->recurrent_step(
                 d_q.ptr, d_k_buf.ptr, d_v_buf.ptr,
                 d_alpha.ptr, d_beta.ptr,
@@ -256,7 +370,7 @@ namespace
         {
             throw std::runtime_error("CUDA GDN recurrent decode failed");
         }
-        checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after GDN recurrence");
+        stream.synchronize("cudaStreamSynchronize after GDN recurrence");
         return d_output.toHost();
     }
 
@@ -440,13 +554,15 @@ TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUS
     ASSERT_GT(metadata.device_bytes, 0u);
     EXPECT_TRUE(metadata.has_device_kernel_state);
 
+    CudaStream stream;
     std::vector<uint8_t> payload(metadata.host_bytes + metadata.device_bytes);
-    auto *host_payload = payload.data();
-    auto *device_payload = payload.data() + metadata.host_bytes;
     llaminar2::HybridPrefixStateDescriptor desc;
     desc.seq_idx = 0;
     desc.logical_token_count = 4;
-    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(desc, host_payload, device_payload));
+    desc.stream = stream.opaque();
+    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
+    const auto expected_state0 = exportLocalGDNState(cache.hybrid, /*layer=*/0, stream);
+    const auto expected_state2 = exportLocalGDNState(cache.hybrid, /*layer=*/2, stream);
 
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
@@ -459,13 +575,17 @@ TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUS
     EXPECT_FLOAT_EQ(state2->recurrence_state[0], 0.0f);
     EXPECT_FLOAT_EQ(state2->conv_state[0], 0.0f);
 
-    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, host_payload, device_payload));
+    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, payload.data(), nullptr));
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->rec_kernel.get(), rec_ptr);
-    EXPECT_FLOAT_EQ(state0->recurrence_state[0], 10.0f);
-    EXPECT_FLOAT_EQ(state0->conv_state[0], 11.0f);
-    EXPECT_FLOAT_EQ(state2->recurrence_state[0], 20.0f);
-    EXPECT_FLOAT_EQ(state2->conv_state[0], 21.0f);
+    expectNearVector(state0->recurrence_state, expected_state0.recurrence, 0.0f,
+                     "host mirror adopts local live recurrence bank for layer 0");
+    expectNearVector(state0->conv_state, expected_state0.conv, 0.0f,
+                     "host mirror adopts local live conv bank for layer 0");
+    expectNearVector(state2->recurrence_state, expected_state2.recurrence, 0.0f,
+                     "host mirror adopts local live recurrence bank for layer 2");
+    expectNearVector(state2->conv_state, expected_state2.conv, 0.0f,
+                     "host mirror adopts local live conv bank for layer 2");
 
     const auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
@@ -498,9 +618,11 @@ TEST(Test__CUDAHybridKVCacheReset, HostStagedHybridPrefixStateKeepsHostAndDevice
     ASSERT_GT(metadata.host_bytes, 0u);
     ASSERT_GT(metadata.device_bytes, 0u);
 
+    CudaStream stream;
     llaminar2::HybridPrefixStateDescriptor host_only_desc;
     host_only_desc.seq_idx = 0;
     host_only_desc.logical_token_count = 4;
+    host_only_desc.stream = stream.opaque();
     host_only_desc.include_host_state = true;
     host_only_desc.include_device_state = false;
     std::vector<uint8_t> expected_host(metadata.host_bytes);
@@ -512,11 +634,14 @@ TEST(Test__CUDAHybridKVCacheReset, HostStagedHybridPrefixStateKeepsHostAndDevice
     llaminar2::HybridPrefixStateDescriptor desc;
     desc.seq_idx = 0;
     desc.logical_token_count = 4;
+    desc.stream = stream.opaque();
     std::vector<uint8_t> staged_payload(metadata.host_bytes + metadata.device_bytes, 0xCD);
     ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
         desc,
         staged_payload.data(),
         nullptr));
+    const auto expected_state0 = exportLocalGDNState(cache.hybrid, /*layer=*/0, stream);
+    const auto expected_state2 = exportLocalGDNState(cache.hybrid, /*layer=*/2, stream);
 
     const std::vector<uint8_t> actual_host(
         staged_payload.begin(),
@@ -529,10 +654,14 @@ TEST(Test__CUDAHybridKVCacheReset, HostStagedHybridPrefixStateKeepsHostAndDevice
         staged_payload.data(),
         nullptr));
 
-    EXPECT_FLOAT_EQ(state0->recurrence_state[0], 41.0f);
-    EXPECT_FLOAT_EQ(state0->conv_state[0], 42.0f);
-    EXPECT_FLOAT_EQ(state2->recurrence_state[0], 43.0f);
-    EXPECT_FLOAT_EQ(state2->conv_state[0], 44.0f);
+    expectNearVector(state0->recurrence_state, expected_state0.recurrence, 0.0f,
+                     "host-staged import adopts local live recurrence bank for layer 0");
+    expectNearVector(state0->conv_state, expected_state0.conv, 0.0f,
+                     "host-staged import adopts local live conv bank for layer 0");
+    expectNearVector(state2->recurrence_state, expected_state2.recurrence, 0.0f,
+                     "host-staged import adopts local live recurrence bank for layer 2");
+    expectNearVector(state2->conv_state, expected_state2.conv, 0.0f,
+                     "host-staged import adopts local live conv bank for layer 2");
 
     std::vector<uint8_t> roundtrip_payload(metadata.host_bytes + metadata.device_bytes, 0);
     ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
@@ -597,6 +726,240 @@ TEST(Test__CUDAHybridKVCacheReset, AsyncDeviceOnlyHybridPrefixStateRoundTripRest
     expectNearVector(actual_rec, expected_rec, 1e-4f, "async recurrence output after hybrid prefix import");
 }
 
+TEST(Test__CUDAHybridKVCacheReset, HostStagedDeviceOnlyHybridPrefixStateRoundTripStartsAtOffsetZero)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto cache = createHybridCache();
+    auto *state0 = cache.hybrid->getGDNState(0);
+    ASSERT_NE(state0, nullptr);
+    ASSERT_NE(state0->conv_kernel, nullptr);
+    ASSERT_NE(state0->rec_kernel, nullptr);
+
+    state0->recurrence_state[0] = 52.0f;
+    state0->conv_state[0] = 53.0f;
+    mutateGDNState(cache.hybrid, /*layer=*/0);
+
+    const auto metadata = cache.hybrid->hybridPrefixStateMetadata();
+    ASSERT_GT(metadata.host_bytes, 0u);
+    ASSERT_GT(metadata.device_bytes, 0u);
+
+    llaminar2::HybridPrefixStateDescriptor desc;
+    desc.seq_idx = 0;
+    desc.logical_token_count = 4;
+    CudaStream stream;
+    desc.stream = stream.opaque();
+    desc.include_host_state = false;
+    desc.include_device_state = true;
+
+    std::vector<uint8_t> payload(metadata.device_bytes + metadata.host_bytes, 0xCD);
+    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
+        desc,
+        payload.data(),
+        nullptr));
+    EXPECT_FALSE(std::all_of(
+        payload.begin(),
+        payload.begin() + static_cast<std::ptrdiff_t>(metadata.device_bytes),
+        [](uint8_t value) { return value == 0xCD; }));
+    EXPECT_TRUE(std::all_of(
+        payload.begin() + static_cast<std::ptrdiff_t>(metadata.device_bytes),
+        payload.end(),
+        [](uint8_t value) { return value == 0xCD; }));
+
+    const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+
+    cache.owner->clear();
+    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
+        desc,
+        payload.data(),
+        nullptr));
+
+    const auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+    expectNearVector(actual_conv, expected_conv, 1e-5f, "host-staged device-only conv import");
+    expectNearVector(actual_rec, expected_rec, 1e-4f, "host-staged device-only recurrence import");
+}
+
+TEST(Test__CUDAHybridKVCacheReset, HostStagedSuffixPrefillImportKeepsLocalAndFullGDNBanksDistinct)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto source = createHybridCache(makeShardedHybridConfig());
+    auto *source_state = source.hybrid->getGDNState(0);
+    ASSERT_NE(source_state, nullptr);
+    ASSERT_NE(source_state->conv_kernel, nullptr);
+    ASSERT_NE(source_state->rec_kernel, nullptr);
+
+    const int local_rec_floats = static_cast<int>(source_state->recurrence_state.size());
+    const int local_conv_floats = static_cast<int>(source_state->conv_state.size());
+    constexpr int full_rec_floats = 16;
+    constexpr int full_conv_floats = 32;
+    ASSERT_GT(local_rec_floats, 0);
+    ASSERT_GT(local_conv_floats, 0);
+    ASSERT_GT(full_rec_floats, local_rec_floats);
+    ASSERT_GT(full_conv_floats, local_conv_floats);
+
+    const auto expected_local_rec = statePattern(static_cast<size_t>(local_rec_floats), 100.0f);
+    const auto expected_local_conv = statePattern(static_cast<size_t>(local_conv_floats), 200.0f);
+    const auto expected_full_rec = statePattern(static_cast<size_t>(full_rec_floats), 300.0f);
+    const auto expected_full_conv = statePattern(static_cast<size_t>(full_conv_floats), 400.0f);
+
+    CudaStream stream;
+    ASSERT_TRUE(source_state->rec_kernel->importStateForSize(
+        local_rec_floats, expected_local_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(source_state->conv_kernel->importStateForSize(
+        local_conv_floats, expected_local_conv.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(source_state->rec_kernel->importStateForSize(
+        full_rec_floats, expected_full_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(source_state->conv_kernel->importStateForSize(
+        full_conv_floats, expected_full_conv.data(), nullptr, stream.opaque()));
+    stream.synchronize("cudaStreamSynchronize after source state seeding");
+
+    const auto metadata = source.hybrid->hybridPrefixStateMetadata();
+    EXPECT_EQ(metadata.host_bytes,
+              static_cast<size_t>(local_rec_floats + local_conv_floats) * sizeof(float));
+    EXPECT_EQ(metadata.device_bytes,
+              static_cast<size_t>(full_conv_floats + full_rec_floats) * sizeof(float));
+    ASSERT_GT(metadata.host_bytes, 0u);
+    ASSERT_GT(metadata.device_bytes, 0u);
+
+    llaminar2::HybridPrefixStateDescriptor export_desc;
+    export_desc.seq_idx = 0;
+    export_desc.logical_token_count = 4;
+    export_desc.stream = stream.opaque();
+    export_desc.include_host_state = true;
+    export_desc.include_device_state = true;
+
+    std::vector<uint8_t> staged_payload(metadata.host_bytes + metadata.device_bytes, 0xCD);
+    ASSERT_TRUE(source.hybrid->exportHybridPrefixState(
+        export_desc,
+        staged_payload.data(),
+        nullptr));
+
+    auto target = createHybridCache(makeShardedHybridConfig());
+    auto *target_state = target.hybrid->getGDNState(0);
+    ASSERT_NE(target_state, nullptr);
+    ASSERT_NE(target_state->conv_kernel, nullptr);
+    ASSERT_NE(target_state->rec_kernel, nullptr);
+
+    llaminar2::HybridPrefixStateDescriptor import_desc;
+    import_desc.seq_idx = 0;
+    import_desc.logical_token_count = 4;
+    import_desc.stream = stream.opaque();
+    import_desc.include_host_state = false;
+    import_desc.include_device_state = true;
+    import_desc.import_host_state_into_device_state = true;
+    ASSERT_TRUE(target.hybrid->importHybridPrefixState(
+        import_desc,
+        staged_payload.data(),
+        nullptr));
+
+    EXPECT_EQ(target_state->rec_kernel->stateBytes(),
+              static_cast<size_t>(local_rec_floats) * sizeof(float))
+        << "partial-hit suffix prefill must resume with the local recurrence bank active";
+    EXPECT_EQ(target_state->conv_kernel->stateBytes(),
+              static_cast<size_t>(local_conv_floats) * sizeof(float))
+        << "partial-hit suffix prefill must resume with the local conv bank active";
+    EXPECT_TRUE(target_state->rec_kernel->isGPUStateReady(local_rec_floats));
+    EXPECT_TRUE(target_state->rec_kernel->isGPUStateReady(full_rec_floats));
+    EXPECT_TRUE(std::all_of(target_state->recurrence_state.begin(),
+                            target_state->recurrence_state.end(),
+                            [](float value) { return value == 0.0f; }))
+        << "include_host_state=false must not mutate the host recurrence mirror";
+    EXPECT_TRUE(std::all_of(target_state->conv_state.begin(),
+                            target_state->conv_state.end(),
+                            [](float value) { return value == 0.0f; }))
+        << "include_host_state=false must not mutate the host conv mirror";
+
+    std::vector<float> actual_local_rec(static_cast<size_t>(local_rec_floats));
+    std::vector<float> actual_local_conv(static_cast<size_t>(local_conv_floats));
+    std::vector<float> actual_full_rec(static_cast<size_t>(full_rec_floats));
+    std::vector<float> actual_full_conv(static_cast<size_t>(full_conv_floats));
+    ASSERT_TRUE(target_state->rec_kernel->exportStateForSize(
+        local_rec_floats, actual_local_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(target_state->conv_kernel->exportStateForSize(
+        local_conv_floats, actual_local_conv.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(target_state->rec_kernel->exportStateForSize(
+        full_rec_floats, actual_full_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(target_state->conv_kernel->exportStateForSize(
+        full_conv_floats, actual_full_conv.data(), nullptr, stream.opaque()));
+    stream.synchronize("cudaStreamSynchronize after target state export");
+
+    expectNearVector(actual_local_rec, expected_local_rec, 0.0f, "local recurrence bank after suffix import");
+    expectNearVector(actual_local_conv, expected_local_conv, 0.0f, "local conv bank after suffix import");
+    expectNearVector(actual_full_rec, expected_full_rec, 0.0f, "full recurrence bank after suffix import");
+    expectNearVector(actual_full_conv, expected_full_conv, 0.0f, "full conv bank after suffix import");
+}
+
+TEST(Test__CUDAHybridKVCacheReset, LogicalPayloadCanHydrateDeviceBankWithoutMutatingHostMirror)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto source = createHybridCache();
+    auto *source_state0 = source.hybrid->getGDNState(0);
+    ASSERT_NE(source_state0, nullptr);
+    ASSERT_NE(source_state0->conv_kernel, nullptr);
+    ASSERT_NE(source_state0->rec_kernel, nullptr);
+    source_state0->recurrence_state[0] = 70.0f;
+    source_state0->conv_state[0] = 71.0f;
+    mutateGDNState(source.hybrid, /*layer=*/0);
+
+    const auto metadata = source.hybrid->hybridPrefixStateMetadata();
+    ASSERT_GT(metadata.host_bytes, 0u);
+    std::vector<uint8_t> logical_payload(metadata.host_bytes);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+    llaminar2::HybridPrefixStateDescriptor export_desc;
+    export_desc.seq_idx = 0;
+    export_desc.logical_token_count = 4;
+    export_desc.stream = stream;
+    export_desc.include_host_state = true;
+    export_desc.include_device_state = false;
+    ASSERT_TRUE(source.hybrid->exportHybridPrefixState(
+        export_desc,
+        logical_payload.data(),
+        nullptr));
+
+    auto target = createHybridCache();
+    auto *target_state0 = target.hybrid->getGDNState(0);
+    ASSERT_NE(target_state0, nullptr);
+    ASSERT_FALSE(target_state0->recurrence_state.empty());
+    ASSERT_FALSE(target_state0->conv_state.empty());
+    target_state0->recurrence_state[0] = -123.0f;
+    target_state0->conv_state[0] = -456.0f;
+    const std::vector<float> host_recurrence_before = target_state0->recurrence_state;
+    const std::vector<float> host_conv_before = target_state0->conv_state;
+
+    llaminar2::HybridPrefixStateDescriptor import_desc;
+    import_desc.seq_idx = 0;
+    import_desc.logical_token_count = 4;
+    import_desc.stream = stream;
+    import_desc.include_host_state = false;
+    import_desc.include_device_state = false;
+    import_desc.import_host_state_into_device_state = true;
+    ASSERT_TRUE(target.hybrid->importHybridPrefixState(
+        import_desc,
+        logical_payload.data(),
+        nullptr));
+
+    EXPECT_EQ(target_state0->recurrence_state, host_recurrence_before);
+    EXPECT_EQ(target_state0->conv_state, host_conv_before);
+
+    std::vector<uint8_t> roundtrip_payload(metadata.host_bytes);
+    ASSERT_TRUE(target.hybrid->exportHybridPrefixState(
+        export_desc,
+        roundtrip_payload.data(),
+        nullptr));
+    EXPECT_EQ(roundtrip_payload, logical_payload);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)
 {
     if (!hasCUDA())
@@ -642,6 +1005,33 @@ TEST(Test__CUDAHybridKVCacheReset, DeviceSequenceMetadataPointersUseCompressedFu
                             "cudaMemcpy unrelated cached-token count"),
               0)
         << "The old un-remapped path would read this parent slot for global layer 3.";
+}
+
+TEST(Test__CUDAHybridKVCacheReset, GetKVUsesCompressedFullAttentionSlot)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto cache = createHybridCache(makeOffsetFullAttentionHybridConfig());
+    appendFullAttentionToken(cache.owner.get(), /*layer=*/3);
+
+    llaminar2::ITensor *k = nullptr;
+    llaminar2::ITensor *v = nullptr;
+    int kv_len = -1;
+    ASSERT_TRUE(cache.owner->get_kv(/*layer=*/3, /*seq_idx=*/0, &k, &v, &kv_len));
+    EXPECT_NE(k, nullptr);
+    EXPECT_NE(v, nullptr);
+    EXPECT_EQ(kv_len, 2)
+        << "get_kv(global FA layer) must remap through the hybrid layer map.";
+
+    const llaminar2::ITensor *ck = nullptr;
+    const llaminar2::ITensor *cv = nullptr;
+    int const_kv_len = -1;
+    const llaminar2::IKVCache *const_cache = cache.owner.get();
+    ASSERT_TRUE(const_cache->get_kv(/*layer=*/3, /*seq_idx=*/0, &ck, &cv, &const_kv_len));
+    EXPECT_NE(ck, nullptr);
+    EXPECT_NE(cv, nullptr);
+    EXPECT_EQ(const_kv_len, 2);
 }
 
 #else

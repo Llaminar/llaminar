@@ -1377,15 +1377,46 @@ extern "C"
         int d_k, int d_v, int global_v_offset,
         int device_idx, void *stream)
     {
-        cudaSetDevice(device_idx);
+        cudaError_t set_device_err = cudaSetDevice(device_idx);
+        if (set_device_err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_deinterleave_qkv] cudaSetDevice(%d) failed: %s "
+                    "merged=%p out_q=%p out_k=%p out_v=%p stream=%p\n",
+                    device_idx, cudaGetErrorString(set_device_err),
+                    (const void *)merged, (void *)out_q, (void *)out_k, (void *)out_v, stream);
+            return false;
+        }
 
         int q_dst_dim = n_v_heads * d_k;
         int k_dst_dim = n_v_heads * d_k;
         int v_dim = n_v_heads * d_v;
         int total = seq_len * (q_dst_dim + k_dst_dim + v_dim);
+        if (seq_len <= 0 || n_k_heads <= 0 || n_v_heads <= 0 ||
+            d_k <= 0 || d_v <= 0 || total <= 0)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_deinterleave_qkv] invalid launch geometry: "
+                    "seq_len=%d n_k_heads=%d n_v_heads=%d d_k=%d d_v=%d "
+                    "global_v_offset=%d total=%d stream=%p\n",
+                    seq_len, n_k_heads, n_v_heads, d_k, d_v,
+                    global_v_offset, total, stream);
+            return false;
+        }
 
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
+        cudaError_t pre_launch_sticky = cudaPeekAtLastError();
+        cudaStreamCaptureStatus pre_capture_status = cudaStreamCaptureStatusNone;
+        cudaError_t pre_capture_query =
+            stream ? cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &pre_capture_status) : cudaSuccess;
+        cudaError_t pre_stream_query = cudaSuccess;
+        if (stream &&
+            pre_capture_query == cudaSuccess &&
+            pre_capture_status == cudaStreamCaptureStatusNone)
+        {
+            pre_stream_query = cudaStreamQuery(static_cast<cudaStream_t>(stream));
+        }
 
         cuda_gdn_deinterleave_qkv_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
             merged, out_q, out_k, out_v,
@@ -1394,7 +1425,31 @@ extern "C"
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "[cudaGDN_deinterleave_qkv] %s\n", cudaGetErrorString(err));
+            int current_device = -1;
+            (void)cudaGetDevice(&current_device);
+            cudaError_t post_stream_query = cudaSuccess;
+            if (stream &&
+                pre_capture_query == cudaSuccess &&
+                pre_capture_status == cudaStreamCaptureStatusNone)
+            {
+                post_stream_query = cudaStreamQuery(static_cast<cudaStream_t>(stream));
+            }
+            fprintf(stderr,
+                    "[cudaGDN_deinterleave_qkv] %s "
+                    "(seq_len=%d n_k_heads=%d n_v_heads=%d d_k=%d d_v=%d "
+                    "global_v_offset=%d total=%d blocks=%d requested_device=%d current_device=%d "
+                    "merged=%p out_q=%p out_k=%p out_v=%p stream=%p "
+                    "pre_sticky=%s pre_stream_query=%s post_stream_query=%s "
+                    "capture_query=%s capture_status=%d)\n",
+                    cudaGetErrorString(err), seq_len, n_k_heads, n_v_heads,
+                    d_k, d_v, global_v_offset, total, blocks,
+                    device_idx, current_device,
+                    (const void *)merged, (void *)out_q, (void *)out_k, (void *)out_v, stream,
+                    cudaGetErrorString(pre_launch_sticky),
+                    cudaGetErrorString(pre_stream_query),
+                    cudaGetErrorString(post_stream_query),
+                    cudaGetErrorString(pre_capture_query),
+                    static_cast<int>(pre_capture_status));
             return false;
         }
         return true;

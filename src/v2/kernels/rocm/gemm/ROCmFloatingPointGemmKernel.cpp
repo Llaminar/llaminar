@@ -55,6 +55,30 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
     int device_id,
     void *stream);
 
+extern "C" bool rocmFp32x16_batched_projection(
+    const float *const *d_A_array,
+    const float *const *d_B_array,
+    float *const *d_C_array,
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    int weight_dtype,
+    int device_id,
+    void *stream);
+
+extern "C" bool rocmFloating_swiglu_down_projection(
+    const float *d_gate,
+    const float *d_up,
+    const void *d_weights,
+    float *d_output,
+    int M,
+    int N,
+    int K,
+    int weight_dtype,
+    int device_id,
+    void *stream);
+
 namespace llaminar2
 {
     namespace rocm
@@ -367,6 +391,80 @@ namespace llaminar2
                     LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Bias tensor must be on GPU");
                     return false;
                 }
+            }
+
+            /*
+             * FP16/BF16 persistent floating weights still consume FP32 hidden
+             * rows and produce FP32 projection outputs in the current graph
+             * pipeline.  Verifier M=1..4 rows must use the same fixed-order
+             * device path as grouped publication; otherwise serial decode and
+             * grouped MTP rows could diverge through different hipBLAS choices.
+             */
+            if (precision_ != Precision::FP32)
+            {
+                DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
+                if (!transpose_B || alpha != 1.0f || beta != 0.0f || d_bias ||
+                    m < 1 || m > 4 || n <= 0 || k <= 0 || !d_weights_ ||
+                    !gpu_stream_ || !effective_workspace)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] FP32x16 verifier projection requires "
+                              << "transpose_B, alpha=1, beta=0, no bias, M=1..4, stream, and workspace"
+                              << " M=" << m << " N=" << n << " K=" << k
+                              << " precision=" << static_cast<int>(precision_)
+                              << " stream=" << gpu_stream_
+                              << " workspace=" << effective_workspace);
+                    return false;
+                }
+
+                std::vector<const float *> a_ptrs{d_A};
+                std::vector<const float *> b_ptrs{reinterpret_cast<const float *>(d_weights_)};
+                std::vector<float *> c_ptrs{d_C};
+                if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                    return false;
+
+                const int weight_dtype = (precision_ == Precision::BF16) ? 1 : 0;
+                bool success = rocmFp32x16_batched_projection(
+                    d_batch_A_ptrs_,
+                    d_batch_B_ptrs_,
+                    d_batch_C_ptrs_,
+                    m,
+                    n,
+                    k,
+                    1,
+                    weight_dtype,
+                    rocm_device_id_,
+                    gpu_stream_);
+                if (success && d_mapped_output)
+                {
+                    const hipError_t copy_status = hipMemcpyAsync(
+                        d_mapped_output,
+                        d_C,
+                        static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
+                        hipMemcpyDeviceToDevice,
+                        static_cast<hipStream_t>(gpu_stream_));
+                    if (copy_status != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] FP32x16 mapped-output copy failed: "
+                                  << hipGetErrorString(copy_status));
+                        return false;
+                    }
+                }
+                if (success && PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "rocm_fp32x16_single_verifier_projection_calls",
+                        1.0,
+                        "gemm",
+                        "rocm:" + std::to_string(rocm_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"dtype", precision_ == Precision::BF16 ? "bf16" : "fp16"},
+                            {"m", std::to_string(m)},
+                            {"n", std::to_string(n)},
+                            {"k", std::to_string(k)},
+                            {"route", "fixed_order_fp32x16_single_projection"}});
+                }
+                return success;
             }
 
             /*
@@ -830,13 +928,381 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1 || m > 4)
             {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] grouped verifier projection requires M=2..4, got M="
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] grouped verifier projection requires M=1..4, got M="
                           << m);
                 return false;
             }
-            return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
+            if (precision_ == Precision::FP32)
+            {
+                return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
+            }
+
+            (void)mpi_ctx;
+            if (!input || input->native_type() != TensorType::FP32 || projections.empty() || k <= 0)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection rejected: input="
+                          << (input != nullptr)
+                          << " input_type=" << (input ? static_cast<int>(input->native_type()) : -1)
+                          << " projections=" << projections.size()
+                          << " k=" << k);
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection requires an explicit ROCm stream");
+                return false;
+            }
+
+            DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
+            if (!validateROCmWorkspaceBinding(
+                    effective_workspace,
+                    rocm_device_id_,
+                    "ROCmFloatingPointGemmKernel::multiply_fused_verifier_rows_decode_equivalent"))
+            {
+                return false;
+            }
+
+            const float *d_input = static_cast<const float *>(input->gpu_data_ptr());
+            if (!d_input)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection input has no ROCm device data");
+                return false;
+            }
+
+            const int weight_dtype = (precision_ == Precision::BF16) ? 1 : 0;
+            const char *dtype_tag = (precision_ == Precision::BF16) ? "bf16" : "fp16";
+            std::vector<bool> completed(projections.size(), false);
+
+            for (size_t seed_index = 0; seed_index < projections.size(); ++seed_index)
+            {
+                if (completed[seed_index])
+                    continue;
+
+                const auto &seed = projections[seed_index];
+                if (!seed.kernel || !seed.output || seed.bias || seed.n <= 0)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection invalid seed at "
+                              << seed_index);
+                    return false;
+                }
+                if (seed.output->native_type() != TensorType::FP32 || seed.output->isMapped())
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection output must be unmapped FP32 at "
+                              << seed_index);
+                    return false;
+                }
+
+                std::vector<size_t> group_indices;
+                group_indices.push_back(seed_index);
+                for (size_t candidate_index = seed_index + 1; candidate_index < projections.size(); ++candidate_index)
+                {
+                    if (completed[candidate_index])
+                        continue;
+                    const auto &candidate = projections[candidate_index];
+                    if (candidate.n == seed.n)
+                        group_indices.push_back(candidate_index);
+                }
+
+                size_t group_offset = 0;
+                while (group_offset < group_indices.size())
+                {
+                    const size_t group_count =
+                        std::min(MAX_FP32_BATCHED_PROJECTIONS, group_indices.size() - group_offset);
+                    std::vector<const float *> a_ptrs(group_count, d_input);
+                    std::vector<const float *> b_ptrs;
+                    std::vector<float *> c_ptrs;
+                    b_ptrs.reserve(group_count);
+                    c_ptrs.reserve(group_count);
+
+                    for (size_t local = 0; local < group_count; ++local)
+                    {
+                        const size_t projection_index = group_indices[group_offset + local];
+                        const auto &projection = projections[projection_index];
+                        auto *projection_kernel = dynamic_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
+                        if (!projection_kernel ||
+                            projection_kernel->precision_ != precision_ ||
+                            projection_kernel->rocm_device_id_ != rocm_device_id_ ||
+                            static_cast<int>(projection_kernel->K_) != k ||
+                            projection_kernel->N_ != static_cast<size_t>(projection.n) ||
+                            !projection_kernel->d_weights_)
+                        {
+                            LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection incompatible kernel at "
+                                      << projection_index);
+                            return false;
+                        }
+
+                        float *d_output = static_cast<float *>(projection.output->gpu_data_ptr());
+                        if (!d_output)
+                        {
+                            LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection output has no ROCm data at "
+                                      << projection_index);
+                            return false;
+                        }
+                        b_ptrs.push_back(reinterpret_cast<const float *>(projection_kernel->d_weights_));
+                        c_ptrs.push_back(d_output);
+                    }
+
+                    if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                        return false;
+
+                    if (!rocmFp32x16_batched_projection(
+                            d_batch_A_ptrs_,
+                            d_batch_B_ptrs_,
+                            d_batch_C_ptrs_,
+                            m,
+                            seed.n,
+                            k,
+                            static_cast<int>(group_count),
+                            weight_dtype,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection kernel failed"
+                                  << " dtype=" << dtype_tag
+                                  << " M=" << m
+                                  << " N=" << seed.n
+                                  << " K=" << k
+                                  << " batch=" << group_count);
+                        return false;
+                    }
+
+                    for (size_t local = 0; local < group_count; ++local)
+                        completed[group_indices[group_offset + local]] = true;
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_fp32x16_grouped_verifier_projection_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"dtype", dtype_tag},
+                                {"m", std::to_string(m)},
+                                {"n", std::to_string(seed.n)},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(group_count)},
+                                {"route", "fixed_order_fp32x16_batched_projection"}});
+                    }
+
+                    group_offset += group_count;
+                }
+            }
+
+            return true;
+        }
+
+        bool ROCmFloatingPointGemmKernel::multiply_tensor_with_fused_swiglu(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha,
+            float beta,
+            DeviceWorkspaceManager *workspace)
+        {
+            return run_fixed_order_swiglu_down(
+                gate,
+                up,
+                output,
+                m,
+                n,
+                k,
+                alpha,
+                beta,
+                workspace,
+                /*verifier_grouped_call=*/false);
+        }
+
+        bool ROCmFloatingPointGemmKernel::multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha,
+            float beta,
+            DeviceWorkspaceManager *workspace)
+        {
+            return run_fixed_order_swiglu_down(
+                gate,
+                up,
+                output,
+                m,
+                n,
+                k,
+                alpha,
+                beta,
+                workspace,
+                /*verifier_grouped_call=*/true);
+        }
+
+        bool ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m,
+            int n,
+            int k,
+            float alpha,
+            float beta,
+            DeviceWorkspaceManager *workspace,
+            bool verifier_grouped_call)
+        {
+            if (!gate || !up || !output || !d_weights_)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] Null tensor or weights"
+                          << " gate=" << (gate != nullptr)
+                          << " up=" << (up != nullptr)
+                          << " output=" << (output != nullptr)
+                          << " weights=" << (d_weights_ != nullptr));
+                return false;
+            }
+            if (m < 1 || m > 4 || n <= 0 || k <= 0 ||
+                static_cast<size_t>(n) != N_ ||
+                static_cast<size_t>(k) != K_)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                          << "requires M=1..4 and dimensions matching the down weights"
+                          << " M=" << m << " N=" << n << " K=" << k
+                          << " weight_N=" << N_ << " weight_K=" << K_);
+                return false;
+            }
+            if (alpha != 1.0f || beta != 0.0f)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                          << "only alpha=1,beta=0 is supported for decode-equivalent verifier rows"
+                          << " alpha=" << alpha << " beta=" << beta);
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                          << "an explicit non-default ROCm stream is required");
+                return false;
+            }
+            if (gate->native_type() != TensorType::FP32 ||
+                up->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                          << "requires FP32 gate/up/output tensors"
+                          << " gate_type=" << static_cast<int>(gate->native_type())
+                          << " up_type=" << static_cast<int>(up->native_type())
+                          << " output_type=" << static_cast<int>(output->native_type()));
+                return false;
+            }
+
+            const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
+            const float *d_up = static_cast<const float *>(up->gpu_data_ptr());
+            float *d_output = static_cast<float *>(output->gpu_data_ptr());
+            if (!d_gate || !d_up || !d_output)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                          << "gate/up/output must be resident on the ROCm device");
+                return false;
+            }
+
+            float *d_mapped_output = nullptr;
+            if (output->isMapped())
+            {
+                const size_t needed_bytes =
+                    static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float);
+                DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
+                if (!validateROCmWorkspaceBinding(
+                        effective_workspace,
+                        rocm_device_id_,
+                        "ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down"))
+                {
+                    return false;
+                }
+                if (!effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT) ||
+                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT) < needed_bytes)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                              << "mapped output requires declared redirect workspace bytes="
+                              << needed_bytes);
+                    return false;
+                }
+                d_mapped_output = d_output;
+                d_output = static_cast<float *>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT));
+                if (!d_output)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                              << "redirect workspace resolved to null");
+                    return false;
+                }
+            }
+
+            int weight_dtype = 0;
+            const char *dtype_tag = "fp32";
+            switch (precision_)
+            {
+            case Precision::FP32:
+                weight_dtype = 0;
+                dtype_tag = "fp32";
+                break;
+            case Precision::FP16:
+                weight_dtype = 1;
+                dtype_tag = "fp16";
+                break;
+            case Precision::BF16:
+                weight_dtype = 2;
+                dtype_tag = "bf16";
+                break;
+            }
+
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_ROCBLAS, static_cast<hipStream_t>(gpu_stream_));
+            bool success = rocmFloating_swiglu_down_projection(
+                d_gate,
+                d_up,
+                d_weights_,
+                d_output,
+                m,
+                n,
+                k,
+                weight_dtype,
+                rocm_device_id_,
+                gpu_stream_);
+
+            if (success && d_mapped_output)
+            {
+                const hipError_t copy_status = hipMemcpyAsync(
+                    d_mapped_output,
+                    d_output,
+                    static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
+                    hipMemcpyDeviceToDevice,
+                    static_cast<hipStream_t>(gpu_stream_));
+                if (copy_status != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
+                              << "mapped-output copy failed: " << hipGetErrorString(copy_status));
+                    return false;
+                }
+            }
+
+            if (success && PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    verifier_grouped_call
+                        ? "rocm_floating_grouped_verifier_swiglu_down_calls"
+                        : "rocm_floating_fused_swiglu_down_calls",
+                    1.0,
+                    "gemm",
+                    "rocm:" + std::to_string(rocm_device_id_),
+                    PerfStatsCollector::Tags{
+                        {"dtype", dtype_tag},
+                        {"m", std::to_string(m)},
+                        {"n", std::to_string(n)},
+                        {"k", std::to_string(k)},
+                        {"route", "fixed_order_floating_swiglu_down"},
+                        {"verifier", verifier_grouped_call ? "1" : "0"}});
+            }
+            return success;
         }
 
         // =====================================================================
@@ -881,10 +1347,6 @@ namespace llaminar2
             [[maybe_unused]] int k) const
         {
             WorkspaceRequirements reqs;
-            if (precision_ != Precision::FP32)
-            {
-                return reqs;
-            }
 
             const size_t pointer_array_bytes = MAX_FP32_BATCHED_PROJECTIONS * sizeof(float *);
             reqs.buffers.push_back({batchAPtrsBufferName(), pointer_array_bytes, 256, true});

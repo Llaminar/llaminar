@@ -11,7 +11,9 @@
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
 #include "app/MPIShutdown.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 // cpp-httplib (header-only)
 #include "httplib.h"
@@ -27,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <thread>
 #ifdef __linux__
 #include <malloc.h>
 #include <fstream>
@@ -295,6 +298,20 @@ namespace llaminar2
             LOG_TRACE("[HTTP] response\n" << formatResponseTrace(res, context));
         }
 
+        void flushPerfStatsFromEnv()
+        {
+            if (!PerfStatsCollector::flushFromEnv())
+            {
+                LOG_WARN("[ServerMode] Failed to flush PerfStats artifact(s)");
+            }
+        }
+
+        bool shutdownEndpointEnabled()
+        {
+            return DebugEnv::isTruthyEnvValue(
+                DebugEnv::envValue("LLAMINAR_ENABLE_SERVER_SHUTDOWN_ENDPOINT"));
+        }
+
         int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
@@ -310,6 +327,7 @@ namespace llaminar2
                     ctx.runner->abortMPIWorkers(detail);
                 ctx.runner->shutdown();
             }
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
@@ -354,6 +372,7 @@ namespace llaminar2
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 0;
         }
@@ -364,6 +383,7 @@ namespace llaminar2
             if (mpi_ctx->world_size() > 1)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
@@ -388,6 +408,12 @@ namespace llaminar2
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
+#ifdef SIGPIPE
+        // HTTP clients can close a connection while the server is still
+        // writing a response. Treat that as an ordinary request failure path
+        // instead of letting the process die from SIGPIPE.
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
 
         svr.set_pre_routing_handler(
             [&request_log_state](const httplib::Request &req, httplib::Response &) {
@@ -420,6 +446,24 @@ namespace llaminar2
                 {
             json response = {{"status", "ok"}};
             res.set_content(response.dump(), "application/json"); });
+
+        if (shutdownEndpointEnabled())
+        {
+            svr.Post("/admin/shutdown",
+                     [](const httplib::Request &, httplib::Response &res)
+                     {
+                         json response = {{"status", "shutting_down"}};
+                         res.status = 202;
+                         res.set_content(response.dump(), "application/json");
+
+                         std::thread([] {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                             g_shutdown_requested.store(true);
+                             if (g_server_ptr)
+                                 g_server_ptr->stop();
+                         }).detach();
+                     });
+        }
 
         // ─── POST /v1/chat/completions ───────────────────────────────
         ChatCompletionHandler handler(*runner, *tokenizer, model_name);
@@ -500,6 +544,7 @@ namespace llaminar2
             if (mpi_ctx->world_size() > 1)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
@@ -531,6 +576,7 @@ namespace llaminar2
                 if (mpi_ctx->world_size() > 1)
                     runner->shutdownMPIWorkers();
                 runner->shutdown();
+                flushPerfStatsFromEnv();
                 mpiShutdown();
                 return 1;
             }
@@ -544,6 +590,7 @@ namespace llaminar2
             runner->shutdownMPIWorkers();
 
         runner->shutdown();
+        flushPerfStatsFromEnv();
         mpiShutdown();
         return 0;
     }

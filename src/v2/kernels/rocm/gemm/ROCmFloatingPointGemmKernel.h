@@ -176,6 +176,37 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
+             * @brief Fixed-order floating SwiGLU/down for decode-sized rows.
+             *
+             * The current ROCm graph pipeline keeps gate/up activations and
+             * down outputs in FP32.  This method provides the missing
+             * FP32/FP16/BF16 floating down path for M=1..4 without routing
+             * through hipBLAS or materializing an intermediate SwiGLU tensor.
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
+             * @brief Grouped verifier SwiGLU/down with serial-decode math order.
+             *
+             * Rows M=1..4 are evaluated by one explicit-stream HIP kernel.  The
+             * grouped verifier call and the one-row decode call therefore share
+             * the same K traversal, 16-bit conversion points, and reduction tree.
+             */
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for FP ROCm kernel)
              *
              * ROCmFloatingPointGemmKernel is for weight projections only.
@@ -269,6 +300,17 @@ namespace llaminar2
                 const std::vector<const float *> &b_ptrs,
                 const std::vector<float *> &c_ptrs,
                 DeviceWorkspaceManager *workspace);
+            bool run_fixed_order_swiglu_down(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m,
+                int n,
+                int k,
+                float alpha,
+                float beta,
+                DeviceWorkspaceManager *workspace,
+                bool verifier_grouped_call);
         };
 
     } // namespace rocm

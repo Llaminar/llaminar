@@ -576,6 +576,8 @@ namespace llaminar2
         // Global stages
         if (stage_name == "embedding")
             return "EMBEDDING";
+        if (stage_name == "embedding_allreduce")
+            return "EMBEDDING_ALLREDUCED";
         if (stage_name == "final_norm")
             return "FINAL_NORM";
         if (stage_name == "lm_head")

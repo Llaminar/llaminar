@@ -24,7 +24,9 @@
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -584,6 +586,480 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlp
     EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
     EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234MatchSerialDecodeRows)
+{
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const size_t N = 48, K = 256;
+    const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+    auto weights_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+    auto weights_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+
+    std::mt19937 rng(177);
+    std::uniform_real_distribution<float> input_dist(-0.75f, 0.75f);
+    std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+    for (size_t i = 0; i < N * K; ++i)
+    {
+        weights_alpha->mutable_data()[i] = weight_dist(rng);
+        weights_beta->mutable_data()[i] = weight_dist(rng);
+    }
+
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+    ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_);
+    ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_);
+    ASSERT_TRUE(alpha_kernel.supports_fused_projection());
+    ASSERT_TRUE(beta_kernel.supports_fused_projection());
+
+    WorkspaceRequirements reqs;
+    reqs.merge(alpha_kernel.getWorkspaceRequirements(4, static_cast<int>(N), static_cast<int>(K)));
+    reqs.merge(beta_kernel.getWorkspaceRequirements(4, static_cast<int>(N), static_cast<int>(K)));
+    DeviceWorkspaceManager workspace(DeviceId::rocm(rocm_device_id_), reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(reqs));
+    alpha_kernel.bindWorkspace(&workspace);
+    beta_kernel.bindWorkspace(&workspace);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    alpha_kernel.setGPUStream(stream);
+    beta_kernel.setGPUStream(stream);
+
+    for (int M : verifier_rows)
+    {
+        SCOPED_TRACE(std::string("ROCm FP32 M=") + std::to_string(M));
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), K});
+        for (size_t i = 0; i < static_cast<size_t>(M) * K; ++i)
+            input->mutable_data()[i] = input_dist(rng);
+
+        auto output_alpha = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), N});
+        auto output_beta = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), N});
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+        ASSERT_TRUE(output_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+        ASSERT_TRUE(output_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+        std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
+            {&alpha_kernel, output_alpha.get(), static_cast<int>(N), nullptr, "alpha_grouped"},
+            {&beta_kernel, output_beta.get(), static_cast<int>(N), nullptr, "beta_grouped"}};
+
+        ASSERT_TRUE(alpha_kernel.multiply_fused_verifier_rows_decode_equivalent(
+            input.get(), grouped_projections, M, static_cast<int>(K), nullptr, &workspace))
+            << "ROCm FP32 grouped verifier projection failed";
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_input = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, K});
+            std::memcpy(
+                row_input->mutable_data(),
+                input->data() + static_cast<size_t>(row) * K,
+                K * sizeof(float));
+            auto alpha_serial = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, N});
+            auto beta_serial = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, N});
+            ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_TRUE(alpha_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_TRUE(beta_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+            std::vector<ITensorGemm::TensorProjectionDesc> serial_projections = {
+                {&alpha_kernel, alpha_serial.get(), static_cast<int>(N), nullptr, "alpha_serial"},
+                {&beta_kernel, beta_serial.get(), static_cast<int>(N), nullptr, "beta_serial"}};
+            ASSERT_TRUE(alpha_kernel.multiply_fused_tensor(
+                row_input.get(), serial_projections, 1, static_cast<int>(K), nullptr, &workspace))
+                << "ROCm FP32 serial decode projection failed for row " << row;
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            alpha_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            beta_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+            EXPECT_EQ(
+                std::memcmp(
+                    output_alpha->data() + static_cast<size_t>(row) * N,
+                    alpha_serial->data(),
+                    N * sizeof(float)),
+                0)
+                << "ROCm FP32 alpha grouped verifier row must be bitwise serial-decode equivalent";
+            EXPECT_EQ(
+                std::memcmp(
+                    output_beta->data() + static_cast<size_t>(row) * N,
+                    beta_serial->data(),
+                    N * sizeof(float)),
+                0)
+                << "ROCm FP32 beta grouped verifier row must be bitwise serial-decode equivalent";
+        }
+    }
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_fp32_small_n_batched_projection_calls"});
+    uint64_t grouped_small_n_calls = 0;
+    for (const auto &record : records)
+    {
+        if (record.kind == PerfStatRecord::Kind::Counter &&
+            record.domain == "kernel" &&
+            record.name == "rocm_fp32_small_n_batched_projection_calls" &&
+            record.tags.at("n") == std::to_string(N) &&
+            record.tags.at("k") == std::to_string(K) &&
+            record.tags.at("batch") == "2")
+        {
+            const std::string &m_tag = record.tags.at("m");
+            if (m_tag == "2" || m_tag == "3" || m_tag == "4")
+                grouped_small_n_calls += record.count;
+        }
+    }
+    EXPECT_EQ(grouped_small_n_calls, verifier_rows.size())
+        << "ROCm FP32 verifier rows must use the small-N grouped batched projection route for M=2/3/4";
+
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDecodeRows)
+{
+    /**
+     * ROCm FP16/BF16 floating weights participate in verifier publication with
+     * FP32 hidden rows and FP32 outputs.  The grouped M=2..4 hook and the normal
+     * M=1 multiply_tensor decode entry point must therefore share the same
+     * fixed-order fp32x16 device kernel.
+     */
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const size_t N = 80, K = 192;
+    const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+    auto run_case = [&](bool bf16)
+    {
+        const char *dtype_tag = bf16 ? "bf16" : "fp16";
+        std::mt19937 rng(bf16 ? 533 : 431);
+        std::uniform_real_distribution<float> input_dist(-0.75f, 0.75f);
+        std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+
+        std::vector<float> weight_alpha_fp32(N * K);
+        std::vector<float> weight_beta_fp32(N * K);
+        for (float &value : weight_alpha_fp32)
+            value = weight_dist(rng);
+        for (float &value : weight_beta_fp32)
+            value = weight_dist(rng);
+
+        std::unique_ptr<TensorBase> weights_alpha;
+        std::unique_ptr<TensorBase> weights_beta;
+        ROCmFloatingPointGemmKernel::Precision precision;
+        if (bf16)
+        {
+            auto alpha = std::make_unique<BF16Tensor>(std::vector<size_t>{N, K});
+            auto beta = std::make_unique<BF16Tensor>(std::vector<size_t>{N, K});
+            alpha->from_fp32(weight_alpha_fp32.data(), weight_alpha_fp32.size());
+            beta->from_fp32(weight_beta_fp32.data(), weight_beta_fp32.size());
+            weights_alpha = std::move(alpha);
+            weights_beta = std::move(beta);
+            precision = ROCmFloatingPointGemmKernel::Precision::BF16;
+        }
+        else
+        {
+            auto alpha = std::make_unique<FP16Tensor>(std::vector<size_t>{N, K});
+            auto beta = std::make_unique<FP16Tensor>(std::vector<size_t>{N, K});
+            alpha->from_fp32(weight_alpha_fp32.data(), weight_alpha_fp32.size());
+            beta->from_fp32(weight_beta_fp32.data(), weight_beta_fp32.size());
+            weights_alpha = std::move(alpha);
+            weights_beta = std::move(beta);
+            precision = ROCmFloatingPointGemmKernel::Precision::FP16;
+        }
+
+        ASSERT_TRUE(weights_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+        ASSERT_TRUE(weights_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+        ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_, precision);
+        ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_, precision);
+        ASSERT_FALSE(alpha_kernel.supports_fused_projection())
+            << "Generic fused FP16/BF16 projection should stay disabled until the large fused path exists";
+
+        WorkspaceRequirements reqs;
+        reqs.merge(alpha_kernel.getWorkspaceRequirements(4, static_cast<int>(N), static_cast<int>(K)));
+        reqs.merge(beta_kernel.getWorkspaceRequirements(4, static_cast<int>(N), static_cast<int>(K)));
+        DeviceWorkspaceManager workspace(DeviceId::rocm(rocm_device_id_), reqs.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(reqs));
+        alpha_kernel.bindWorkspace(&workspace);
+        beta_kernel.bindWorkspace(&workspace);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        alpha_kernel.setGPUStream(stream);
+        beta_kernel.setGPUStream(stream);
+
+        for (int M : verifier_rows)
+        {
+            SCOPED_TRACE(std::string("ROCm ") + dtype_tag + " M=" + std::to_string(M));
+            auto input = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), K});
+            for (size_t i = 0; i < static_cast<size_t>(M) * K; ++i)
+                input->mutable_data()[i] = input_dist(rng);
+
+            auto output_alpha = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), N});
+            auto output_beta = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), N});
+            ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_TRUE(output_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_TRUE(output_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+            std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
+                {&alpha_kernel, output_alpha.get(), static_cast<int>(N), nullptr, "alpha_grouped"},
+                {&beta_kernel, output_beta.get(), static_cast<int>(N), nullptr, "beta_grouped"}};
+
+            ASSERT_TRUE(alpha_kernel.multiply_fused_verifier_rows_decode_equivalent(
+                input.get(), grouped_projections, M, static_cast<int>(K), nullptr, &workspace))
+                << "ROCm " << dtype_tag << " grouped verifier projection failed";
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+            for (int row = 0; row < M; ++row)
+            {
+                auto row_input = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{size_t{1}, K});
+                std::memcpy(
+                    row_input->mutable_data(),
+                    input->data() + static_cast<size_t>(row) * K,
+                    K * sizeof(float));
+                auto alpha_serial = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{size_t{1}, N});
+                auto beta_serial = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{size_t{1}, N});
+                ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+                ASSERT_TRUE(alpha_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+                ASSERT_TRUE(beta_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+                ASSERT_TRUE(alpha_kernel.multiply_tensor(
+                    row_input.get(), alpha_serial.get(), 1, static_cast<int>(N), static_cast<int>(K),
+                    true, 1.0f, 0.0f, nullptr, nullptr, -1, &workspace));
+                ASSERT_TRUE(beta_kernel.multiply_tensor(
+                    row_input.get(), beta_serial.get(), 1, static_cast<int>(N), static_cast<int>(K),
+                    true, 1.0f, 0.0f, nullptr, nullptr, -1, &workspace));
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                alpha_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                beta_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                EXPECT_EQ(
+                    std::memcmp(
+                        output_alpha->data() + static_cast<size_t>(row) * N,
+                        alpha_serial->data(),
+                        N * sizeof(float)),
+                    0)
+                    << "ROCm " << dtype_tag << " alpha grouped verifier row must be bitwise serial-decode equivalent";
+                EXPECT_EQ(
+                    std::memcmp(
+                        output_beta->data() + static_cast<size_t>(row) * N,
+                        beta_serial->data(),
+                        N * sizeof(float)),
+                    0)
+                    << "ROCm " << dtype_tag << " beta grouped verifier row must be bitwise serial-decode equivalent";
+            }
+        }
+
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    };
+
+    run_case(false);
+    run_case(true);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_fp32x16_grouped_verifier_projection_calls"});
+    uint64_t fp16_calls = 0;
+    uint64_t bf16_calls = 0;
+    for (const auto &record : records)
+    {
+        if (record.kind != PerfStatRecord::Kind::Counter ||
+            record.domain != "kernel" ||
+            record.name != "rocm_fp32x16_grouped_verifier_projection_calls" ||
+            record.tags.at("n") != std::to_string(N) ||
+            record.tags.at("k") != std::to_string(K) ||
+            record.tags.at("projections") != "2")
+        {
+            continue;
+        }
+        const std::string &m_tag = record.tags.at("m");
+        if (!(m_tag == "2" || m_tag == "3" || m_tag == "4"))
+            continue;
+        if (record.tags.at("dtype") == "fp16")
+            fp16_calls += record.count;
+        else if (record.tags.at("dtype") == "bf16")
+            bf16_calls += record.count;
+    }
+    EXPECT_EQ(fp16_calls, verifier_rows.size());
+    EXPECT_EQ(bf16_calls, verifier_rows.size());
+
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234MatchSerialDecodeRows)
+{
+    /**
+     * The floating shared-expert verifier path needs a real grouped
+     * SwiGLU/down implementation for every floating down-weight format.  This
+     * test runs FP32, FP16, and BF16 down weights through grouped M=2..4 and
+     * compares each row with the same decode-sized fused entry point at M=1.
+     */
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const size_t N = 80, K = 192;
+    const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+    auto run_case = [&](const char *dtype_tag, ROCmFloatingPointGemmKernel::Precision precision)
+    {
+        std::mt19937 rng(
+            precision == ROCmFloatingPointGemmKernel::Precision::FP32 ? 631 :
+            precision == ROCmFloatingPointGemmKernel::Precision::FP16 ? 733 : 839);
+        std::uniform_real_distribution<float> activation_dist(-0.65f, 0.65f);
+        std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+
+        std::vector<float> weight_fp32(N * K);
+        for (float &value : weight_fp32)
+            value = weight_dist(rng);
+
+        std::unique_ptr<TensorBase> weights_down;
+        if (precision == ROCmFloatingPointGemmKernel::Precision::FP32)
+        {
+            auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+            std::memcpy(tensor->mutable_data(), weight_fp32.data(), weight_fp32.size() * sizeof(float));
+            weights_down = std::move(tensor);
+        }
+        else if (precision == ROCmFloatingPointGemmKernel::Precision::FP16)
+        {
+            auto tensor = std::make_unique<FP16Tensor>(std::vector<size_t>{N, K});
+            tensor->from_fp32(weight_fp32.data(), weight_fp32.size());
+            weights_down = std::move(tensor);
+        }
+        else
+        {
+            auto tensor = std::make_unique<BF16Tensor>(std::vector<size_t>{N, K});
+            tensor->from_fp32(weight_fp32.data(), weight_fp32.size());
+            weights_down = std::move(tensor);
+        }
+
+        ASSERT_TRUE(weights_down->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+        ROCmFloatingPointGemmKernel down_kernel(weights_down.get(), rocm_device_id_, precision);
+
+        WorkspaceRequirements reqs;
+        reqs.merge(down_kernel.getWorkspaceRequirements(4, static_cast<int>(N), static_cast<int>(K)));
+        DeviceWorkspaceManager workspace(DeviceId::rocm(rocm_device_id_), reqs.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(reqs));
+        down_kernel.bindWorkspace(&workspace);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        down_kernel.setGPUStream(stream);
+
+        for (int M : verifier_rows)
+        {
+            SCOPED_TRACE(std::string("ROCm ") + dtype_tag + " SwiGLU/down M=" + std::to_string(M));
+            auto gate = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), K});
+            auto up = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), K});
+            for (size_t i = 0; i < static_cast<size_t>(M) * K; ++i)
+            {
+                gate->mutable_data()[i] = activation_dist(rng);
+                up->mutable_data()[i] = activation_dist(rng);
+            }
+
+            auto grouped_down = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), N});
+            ASSERT_TRUE(gate->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_TRUE(up->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_TRUE(grouped_down->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+            ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                gate.get(), up.get(), grouped_down.get(),
+                M, static_cast<int>(N), static_cast<int>(K),
+                1.0f, 0.0f, &workspace))
+                << "ROCm " << dtype_tag << " grouped floating SwiGLU/down failed";
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            grouped_down->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+            for (int row = 0; row < M; ++row)
+            {
+                auto gate_row = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{size_t{1}, K});
+                auto up_row = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{size_t{1}, K});
+                std::memcpy(
+                    gate_row->mutable_data(),
+                    gate->data() + static_cast<size_t>(row) * K,
+                    K * sizeof(float));
+                std::memcpy(
+                    up_row->mutable_data(),
+                    up->data() + static_cast<size_t>(row) * K,
+                    K * sizeof(float));
+                auto serial_down = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{size_t{1}, N});
+                ASSERT_TRUE(gate_row->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+                ASSERT_TRUE(up_row->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+                ASSERT_TRUE(serial_down->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+                ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu(
+                    gate_row.get(), up_row.get(), serial_down.get(),
+                    1, static_cast<int>(N), static_cast<int>(K),
+                    1.0f, 0.0f, &workspace))
+                    << "ROCm " << dtype_tag << " serial floating SwiGLU/down failed for row " << row;
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                serial_down->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                EXPECT_EQ(
+                    std::memcmp(
+                        grouped_down->data() + static_cast<size_t>(row) * N,
+                        serial_down->data(),
+                        N * sizeof(float)),
+                    0)
+                    << "ROCm " << dtype_tag << " floating SwiGLU/down grouped row must be bitwise serial-decode equivalent";
+            }
+        }
+
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    };
+
+    run_case("fp32", ROCmFloatingPointGemmKernel::Precision::FP32);
+    run_case("fp16", ROCmFloatingPointGemmKernel::Precision::FP16);
+    run_case("bf16", ROCmFloatingPointGemmKernel::Precision::BF16);
+
+    const auto records =
+        PerfStatsCollector::snapshot({"kernel.rocm_floating_grouped_verifier_swiglu_down_calls"});
+    uint64_t fp32_calls = 0;
+    uint64_t fp16_calls = 0;
+    uint64_t bf16_calls = 0;
+    for (const auto &record : records)
+    {
+        if (record.kind != PerfStatRecord::Kind::Counter ||
+            record.domain != "kernel" ||
+            record.name != "rocm_floating_grouped_verifier_swiglu_down_calls" ||
+            record.tags.at("n") != std::to_string(N) ||
+            record.tags.at("k") != std::to_string(K))
+        {
+            continue;
+        }
+        const std::string &m_tag = record.tags.at("m");
+        if (!(m_tag == "2" || m_tag == "3" || m_tag == "4"))
+            continue;
+        if (record.tags.at("dtype") == "fp32")
+            fp32_calls += record.count;
+        else if (record.tags.at("dtype") == "fp16")
+            fp16_calls += record.count;
+        else if (record.tags.at("dtype") == "bf16")
+            bf16_calls += record.count;
+    }
+    EXPECT_EQ(fp32_calls, verifier_rows.size());
+    EXPECT_EQ(fp16_calls, verifier_rows.size());
+    EXPECT_EQ(bf16_calls, verifier_rows.size());
+
+    PerfStatsCollector::reset();
 }
 
 TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedQwen36AlphaBetaM1MatchesReference)

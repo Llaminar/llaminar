@@ -151,6 +151,12 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1);
+        bool commitMTPShiftedRowFromCheckpointTerminalHiddenAll(
+            const PrefixStateSnapshot &checkpoint,
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1);
         bool ensureMTPCheckpointTerminalHiddenAll();
         bool setComputeAllPositionLogitsAll(bool enabled);
         uint64_t moePlacementEpochAll() const;
@@ -289,6 +295,12 @@ namespace llaminar2
             int token_count,
             int already_appended_tokens) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
             int32_t token,
             int already_appended_tokens,
             bool allow_speculative_discard = false,

@@ -149,10 +149,10 @@ namespace llaminar2
      *
      * The dense and MoE fields are intentionally separate because their fast
      * paths advance different mutable state surfaces.  Direct all-position
-     * publication is stronger than decode-equivalent replay; callers should
-     * require the direct field before publishing state from a batched verifier
-     * graph, and fall back to the decode-equivalent field only for the shared
-     * one-row replay contract.
+     * publication is stronger than decode-equivalent grouped verifier rows;
+     * callers should require the direct field before publishing state from a
+     * batched verifier graph.  Decode-equivalent row support proves the grouped
+     * verifier math, not permission to run production row replay.
      */
     struct MTPVerifierRowCapability
     {
@@ -216,14 +216,14 @@ namespace llaminar2
      * MTPVerifierRowCapability answers "is this verifier row numerically
      * decode-equivalent?".  This object answers the separate production
      * question: "is the proven implementation economical enough to promote?".
-     * A serial replay fallback may be correct and still fail this capability.
+     * A serial replay oracle may be correct and still fail this capability.
      * Keeping those states separate prevents dashboards and rollout logic from
-     * treating correctness-only paths as vLLM-style fast paths.
+     * treating diagnostic/oracle-only paths as vLLM-style fast paths.
      */
     struct MTPVerifierEconomyLane
     {
         bool correct = false;
-        bool serial_decode_equivalent_fallback = false;
+        bool serial_decode_equivalent_oracle_only = false;
         bool grouped_decode_equivalent = false;
         bool row_indexed_lm_head = false;
         bool device_resident_input = false;
@@ -236,16 +236,41 @@ namespace llaminar2
         int max_rows = 0;
         std::string perf_gate_status = "unproven";
 
-        static MTPVerifierEconomyLane serialFallbackCorrect(int rows)
+        static MTPVerifierEconomyLane serialOracleOnlyCorrect(int rows)
         {
             MTPVerifierEconomyLane lane;
             lane.correct = rows > 0;
-            lane.serial_decode_equivalent_fallback = lane.correct;
+            lane.serial_decode_equivalent_oracle_only = lane.correct;
             lane.greedy = lane.correct;
             lane.stochastic = lane.correct;
             lane.max_rows = lane.correct ? rows : 0;
             lane.perf_gate_status = lane.correct
-                                        ? "correct_serial_fallback_not_economical"
+                                        ? "correct_serial_oracle_not_economical"
+                                        : "unproven";
+            return lane;
+        }
+
+        /**
+         * @brief Report grouped decode-equivalent verifier math that is proven
+         *        correct but not yet accepted as an economical hot path.
+         *
+         * CPU lanes and early backend ports can reach this state after their
+         * grouped verifier kernels pass row-equivalence tests, while still
+         * lacking the resident publication, graph-capture, or full-transaction
+         * throughput evidence needed for economical promotion.
+         */
+        static MTPVerifierEconomyLane groupedDecodeEquivalentEconomicsPending(
+            int rows)
+        {
+            MTPVerifierEconomyLane lane;
+            lane.correct = rows > 0;
+            lane.grouped_decode_equivalent = lane.correct;
+            lane.row_indexed_lm_head = lane.correct;
+            lane.greedy = lane.correct;
+            lane.stochastic = lane.correct;
+            lane.max_rows = lane.correct ? rows : 0;
+            lane.perf_gate_status = lane.correct
+                                        ? "grouped_decode_equivalent_economics_pending"
                                         : "unproven";
             return lane;
         }
@@ -287,7 +312,6 @@ namespace llaminar2
         {
             MTPVerifierEconomyLane lane;
             lane.correct = rows > 0;
-            lane.serial_decode_equivalent_fallback = lane.correct;
             lane.grouped_decode_equivalent = lane.correct;
             lane.row_indexed_lm_head = lane.correct;
             lane.device_resident_input = lane.correct;
@@ -331,9 +355,9 @@ namespace llaminar2
         {
             correct = correct && other.correct;
             max_rows = correct ? std::min(max_rows, other.max_rows) : 0;
-            serial_decode_equivalent_fallback =
-                serial_decode_equivalent_fallback &&
-                other.serial_decode_equivalent_fallback;
+            serial_decode_equivalent_oracle_only =
+                serial_decode_equivalent_oracle_only &&
+                other.serial_decode_equivalent_oracle_only;
             grouped_decode_equivalent =
                 grouped_decode_equivalent &&
                 other.grouped_decode_equivalent;

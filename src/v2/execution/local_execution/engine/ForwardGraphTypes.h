@@ -574,13 +574,13 @@ namespace llaminar2
          * executables hot is the served-inference path we want: warmup captures
          * once, later requests replay after device-state reset.
          *
-         * Bucketed prefill graph executables also stay hot across request
-         * boundaries. Ready entries replay the same deterministic prompt mutation
-         * over freshly reset live state with token/position metadata refreshed on
-         * the explicit capture stream before launch. Warmup-only entries are
-         * demoted to Initialized: lazy stage/kernel resources may survive, but
-         * request-local capture arming does not. Capturing or otherwise invalid
-         * entries are still dropped rather than silently reused.
+         * Prefill graph executables do not survive request boundaries. They may
+         * capture GDN/MoE request-local metadata even when their buffers are
+         * stable, so Ready entries are demoted to Initialized: lazy stage/kernel
+         * resources and the owned explicit prefill stream may survive, but
+         * request-local capture arming and executable replay do not. Capturing
+         * or otherwise invalid entries are still dropped rather than silently
+         * reused.
          */
         void resetSessionStatePreservingGraphReplay()
         {
@@ -592,15 +592,19 @@ namespace llaminar2
             PrefillGraphRequestResetSummary prefill_reset;
             if (prefill_graph_cache)
                 prefill_reset = prefill_graph_cache->prepareEntriesForRequestReset();
+            const bool prefill_request_state_was_reset =
+                prefill_reset.ready_demoted > 0 ||
+                prefill_reset.initialized > 0 ||
+                prefill_reset.dropped > 0;
             last_prefill_graph_observation = {};
 
             if (graph)
             {
                 const bool captured_replay_preserved =
-                    (segment_cache.initialized && !segment_cache.needs_capture) ||
-                    prefill_reset.ready_preserved > 0;
+                    segment_cache.initialized && !segment_cache.needs_capture;
                 const bool lazy_prefill_only =
-                    !captured_replay_preserved && prefill_reset.initialized > 0;
+                    !captured_replay_preserved &&
+                    (prefill_reset.ready_demoted > 0 || prefill_reset.initialized > 0);
 
                 graph->reset();
                 for (const auto &node_name : graph->getExecutionOrder())
@@ -616,6 +620,7 @@ namespace llaminar2
                 }
             }
 
+            (void)prefill_request_state_was_reset;
             markGPUStreamBindingsDirty();
             gpu_graph_update_failures = 0;
             phase3_active = segment_cache.initialized && !segment_cache.needs_capture;
@@ -630,11 +635,10 @@ namespace llaminar2
          * clears stage/kernels' dynamic metadata and decode replay captures so
          * the next prompt starts from cleared KV/GDN model state.
          *
-         * Callers that need reusable prefill graph-cache state should use
-         * resetSessionStatePreservingGraphReplay().  That path delegates to
-         * PrefillGraphCache::prepareEntriesForRequestReset(), which either keeps
-         * replay-ready executable graphs or demotes warmup-only entries to
-         * Initialized so they can capture against fresh request state.
+         * Hard request resets use this path for cache classes whose replay is
+         * not proven safe. It keeps the cached ComputeGraph, but discards
+         * prefill graph cache executables and the owned prefill capture stream
+         * while preserving workspace bindings and prepared weights.
          */
         void resetSessionState()
         {
@@ -653,6 +657,7 @@ namespace llaminar2
                 }
             }
 
+            prefill_capture_stream.reset();
             gpu_stream_applied = false;
             applied_stream = nullptr;
             gpu_stream = nullptr;
@@ -693,5 +698,33 @@ namespace llaminar2
             pp_needs_copy = false;
         }
     };
+
+    /**
+     * @brief Select the host position rows that should refresh a cached forward replay.
+     *
+     * Cached forward graphs keep `position_ids` as stable graph-build storage, but that
+     * storage is not the owner of replay-time absolute positions.  A replay input can
+     * reuse the same bucket shape for a different chunk of the request, so the current
+     * `ForwardInput` must win whenever it provides fresh host rows.  The cache-owned
+     * rows are only a compatibility fallback for callers that have no explicit replay
+     * rows.  When device-resident rows are present, this helper returns null so callers
+     * keep the device pointer as the single source of truth.
+     *
+     * @param forward_cache Cache entry that owns graph-build fallback rows.
+     * @param input Current replay input for this forward invocation.
+     * @return Host position row pointer for dynamic replay, or null when none applies.
+     */
+    inline const int *selectForwardReplayHostPositionIds(
+        const ForwardGraphCache &forward_cache,
+        const ForwardInput &input)
+    {
+        if (input.position_ids_device)
+            return nullptr;
+        if (input.position_ids)
+            return input.position_ids;
+        if (!forward_cache.position_ids.empty())
+            return forward_cache.position_ids.data();
+        return nullptr;
+    }
 
 } // namespace llaminar2

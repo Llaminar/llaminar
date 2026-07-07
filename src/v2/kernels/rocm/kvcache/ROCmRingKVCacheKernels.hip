@@ -37,6 +37,28 @@ namespace llaminar2
     // =========================================================================
 
     /**
+     * @brief Resolve the real append row count for a captured bucket launch.
+     *
+     * Captured prefill graphs keep bucket-shaped launch geometry so one graph
+     * can serve several shorter prompt suffixes.  The host uploads the real
+     * append count before replay; copy kernels must honor that value so padded
+     * rows never mutate KV cache storage.  Invalid device metadata is treated as
+     * zero rows here because the host-side KV append stage owns validation and
+     * emits the fail-fast diagnostic before launching a graph.
+     */
+    __device__ __forceinline__ int effective_append_tokens(
+        const int *__restrict__ d_append_count,
+        int captured_num_tokens)
+    {
+        if (!d_append_count)
+            return captured_num_tokens;
+        const int real_tokens = *d_append_count;
+        return (real_tokens > 0 && real_tokens <= captured_num_tokens)
+                   ? real_tokens
+                   : 0;
+    }
+
+    /**
      * @brief Append tokens to ring buffer with wrap-around
      *
      * Each thread handles one element of one token.
@@ -89,6 +111,7 @@ namespace llaminar2
         const T *__restrict__ d_K_new, // [num_tokens, kv_dim]
         const T *__restrict__ d_V_new, // [num_tokens, kv_dim]
         const int *__restrict__ d_head, // Head position (read from device memory)
+        const int *__restrict__ d_append_count, // Real rows for padded bucket replay
         int max_seq_len,               // Ring buffer capacity
         int kv_dim,                    // n_kv_heads * head_dim
         int num_tokens)                // Tokens to append
@@ -96,7 +119,8 @@ namespace llaminar2
         const int token_idx = blockIdx.x;
         const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
 
-        if (token_idx >= num_tokens || elem_idx >= kv_dim)
+        const int rows_to_write = effective_append_tokens(d_append_count, num_tokens);
+        if (token_idx >= rows_to_write || elem_idx >= kv_dim)
             return;
 
         const int head = *d_head; // Read from device memory
@@ -409,6 +433,68 @@ namespace llaminar2
         dst[idx] = __float2half(to_float_device(src[idx]));
     }
 
+    template <typename SrcT>
+    __global__ void ring_append_convert_to_fp16_kernel(
+        _Float16 *__restrict__ d_K_cache,
+        _Float16 *__restrict__ d_V_cache,
+        const SrcT *__restrict__ d_K_new,
+        const SrcT *__restrict__ d_V_new,
+        int head,
+        const int *__restrict__ d_head,
+        const int *__restrict__ d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens)
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+        const int rows_to_write = effective_append_tokens(d_append_count, num_tokens);
+        if (token_idx >= rows_to_write || elem_idx >= kv_dim)
+            return;
+
+        const int effective_head = d_head ? *d_head : head;
+        const int dst_pos = (effective_head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_dim + elem_idx;
+        const int src_offset = token_idx * kv_dim + elem_idx;
+
+        d_K_cache[dst_offset] = static_cast<_Float16>(to_float_device(d_K_new[src_offset]));
+        d_V_cache[dst_offset] = static_cast<_Float16>(to_float_device(d_V_new[src_offset]));
+    }
+
+    __global__ void ring_append_q8_1_to_fp16_kernel(
+        _Float16 *__restrict__ d_K_cache,
+        _Float16 *__restrict__ d_V_cache,
+        const Q8_1Block *__restrict__ d_K_new,
+        const Q8_1Block *__restrict__ d_V_new,
+        int head,
+        const int *__restrict__ d_head,
+        const int *__restrict__ d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        int src_blocks_per_row)
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+        const int rows_to_write = effective_append_tokens(d_append_count, num_tokens);
+        if (token_idx >= rows_to_write || elem_idx >= kv_dim)
+            return;
+
+        const int effective_head = d_head ? *d_head : head;
+        const int dst_pos = (effective_head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_dim + elem_idx;
+        const int block_col = elem_idx / Q8_1Block::BLOCK_SIZE;
+        const int lane = elem_idx % Q8_1Block::BLOCK_SIZE;
+        const int src_offset = token_idx * src_blocks_per_row + block_col;
+
+        const Q8_1Block &k_block = d_K_new[src_offset];
+        const Q8_1Block &v_block = d_V_new[src_offset];
+        const float k_scale = __half2float(__ushort_as_half(k_block.d));
+        const float v_scale = __half2float(__ushort_as_half(v_block.d));
+        d_K_cache[dst_offset] = static_cast<_Float16>(k_scale * static_cast<float>(k_block.qs[lane]));
+        d_V_cache[dst_offset] = static_cast<_Float16>(v_scale * static_cast<float>(v_block.qs[lane]));
+    }
+
     // =========================================================================
     // convert_to_q8_1_kernel — wave-shuffle optimized
     //
@@ -689,6 +775,82 @@ namespace llaminar2
         return hipGetLastError() == hipSuccess;
     }
 
+    extern "C" bool hip_ring_append_converted_fp16(
+        _Float16 *d_K_cache, _Float16 *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        int head,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        hipStream_t stream)
+    {
+        if (!d_K_cache || !d_V_cache || !d_K_new || !d_V_new ||
+            max_seq_len <= 0 || kv_dim <= 0 || num_tokens <= 0)
+        {
+            return false;
+        }
+
+        dim3 block(BLOCK_SIZE);
+        dim3 grid(num_tokens, (kv_dim + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        switch (src_type)
+        {
+        case TensorType::FP32:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(ring_append_convert_to_fp16_kernel<float>),
+                               grid, block, 0, stream,
+                               d_K_cache, d_V_cache,
+                               static_cast<const float *>(d_K_new),
+                               static_cast<const float *>(d_V_new),
+                               head, d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
+            break;
+        case TensorType::FP16:
+            if (d_head)
+            {
+                hipLaunchKernelGGL(ring_append_kernel_dynamic<_Float16>,
+                                   grid, block, 0, stream,
+                                   d_K_cache, d_V_cache,
+                                   static_cast<const _Float16 *>(d_K_new),
+                                   static_cast<const _Float16 *>(d_V_new),
+                                   d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
+            }
+            else
+            {
+                hipLaunchKernelGGL(ring_append_kernel<_Float16>,
+                                   grid, block, 0, stream,
+                                   d_K_cache, d_V_cache,
+                                   static_cast<const _Float16 *>(d_K_new),
+                                   static_cast<const _Float16 *>(d_V_new),
+                                   head, max_seq_len, kv_dim, num_tokens);
+            }
+            break;
+        case TensorType::BF16:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(ring_append_convert_to_fp16_kernel<hip_bfloat16>),
+                               grid, block, 0, stream,
+                               d_K_cache, d_V_cache,
+                               static_cast<const hip_bfloat16 *>(d_K_new),
+                               static_cast<const hip_bfloat16 *>(d_V_new),
+                               head, d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
+            break;
+        case TensorType::Q8_1:
+        {
+            const int blocks_per_row = (kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            hipLaunchKernelGGL(ring_append_q8_1_to_fp16_kernel,
+                               grid, block, 0, stream,
+                               d_K_cache, d_V_cache,
+                               static_cast<const Q8_1Block *>(d_K_new),
+                               static_cast<const Q8_1Block *>(d_V_new),
+                               head, d_head, d_append_count, max_seq_len, kv_dim, num_tokens, blocks_per_row);
+            break;
+        }
+        default:
+            return false;
+        }
+
+        return hipGetLastError() == hipSuccess;
+    }
+
     // =========================================================================
     // Kernel Launch Wrappers (extern "C" for linking)
     // =========================================================================
@@ -940,7 +1102,7 @@ namespace llaminar2
     extern "C" void hip_ring_append_dynamic_fp32(
         float *d_K_cache, float *d_V_cache,
         const float *d_K_new, const float *d_V_new,
-        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_dim, int num_tokens,
         hipStream_t stream)
     {
         if (num_tokens <= 0 || kv_dim <= 0)
@@ -953,13 +1115,13 @@ namespace llaminar2
                            grid, block, 0, stream,
                            d_K_cache, d_V_cache,
                            d_K_new, d_V_new,
-                           d_head, max_seq_len, kv_dim, num_tokens);
+                           d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
     }
 
     extern "C" void hip_ring_append_dynamic_fp16(
         _Float16 *d_K_cache, _Float16 *d_V_cache,
         const _Float16 *d_K_new, const _Float16 *d_V_new,
-        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_dim, int num_tokens,
         hipStream_t stream)
     {
         if (num_tokens <= 0 || kv_dim <= 0)
@@ -972,13 +1134,13 @@ namespace llaminar2
                            grid, block, 0, stream,
                            d_K_cache, d_V_cache,
                            d_K_new, d_V_new,
-                           d_head, max_seq_len, kv_dim, num_tokens);
+                           d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
     }
 
     extern "C" void hip_ring_append_dynamic_bf16(
         hip_bfloat16 *d_K_cache, hip_bfloat16 *d_V_cache,
         const hip_bfloat16 *d_K_new, const hip_bfloat16 *d_V_new,
-        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_dim, int num_tokens,
         hipStream_t stream)
     {
         if (num_tokens <= 0 || kv_dim <= 0)
@@ -991,13 +1153,13 @@ namespace llaminar2
                            grid, block, 0, stream,
                            d_K_cache, d_V_cache,
                            d_K_new, d_V_new,
-                           d_head, max_seq_len, kv_dim, num_tokens);
+                           d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
     }
 
     extern "C" void hip_ring_append_dynamic_q8_1(
         Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
         const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
-        const int *d_head, int max_seq_len, int kv_blocks, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_blocks, int num_tokens,
         hipStream_t stream)
     {
         if (num_tokens <= 0 || kv_blocks <= 0)
@@ -1010,7 +1172,7 @@ namespace llaminar2
                            grid, block, 0, stream,
                            d_K_cache, d_V_cache,
                            d_K_new, d_V_new,
-                           d_head, max_seq_len, kv_blocks, num_tokens);
+                           d_head, d_append_count, max_seq_len, kv_blocks, num_tokens);
     }
 
     extern "C" void hip_kv_sequence_state_advance(

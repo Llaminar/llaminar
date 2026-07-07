@@ -381,12 +381,17 @@ namespace llaminar2
          * host-side sequence state after graph replay use this metadata to keep
          * KV heads, recurrent state, and future row-selection logic aligned to
          * the real token count rather than the padded execution length.
+         *
+         * `token_offset` is the absolute logical request offset for the first
+         * real row in this replay.  It must stay synchronized with position-id
+         * generation and restored-prefix suffix prefill so stateful stages do
+         * not accidentally append or interpret rows at prompt offset zero.
          */
         struct PrefillReplayParams
         {
             int real_seq_len = 0;   ///< Real, non-padding token count in this replay.
             int bucket_seq_len = 0; ///< Fixed graph execution length for this replay.
-            int token_offset = 0;   ///< Offset of this chunk within the original prompt.
+            int token_offset = 0;   ///< Absolute offset of the first real replay token.
         };
 
         /**
@@ -792,6 +797,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief True when this stage must publish derived live state after verifier-row restore.
+         *
+         * Not every live-state mutation owns verifier capture slots directly.  A
+         * graph may restore TP-local recurrent state from captured rows and then
+         * run a later handoff stage that derives the mirrored decode state consumed
+         * by the next token.  Such stages return true here so the MTP publisher
+         * invokes publishPostVerifierStateRestore() in graph order instead of
+         * treating the stage as an irrelevant non-capturing node.
+         *
+         * This hook is intentionally separate from hasVerifierStateCapture(): it
+         * represents derived publication from already-restored state, not another
+         * verifier row snapshot owner.
+         */
+        virtual bool requiresPostVerifierStatePublication() const { return false; }
+
+        /**
+         * @brief Publish derived live state after accepted verifier rows are restored.
+         *
+         * The MTP publisher calls this on the same stream used for row restoration
+         * and before the runner records publication readiness.  Implementations
+         * must enqueue only deterministic state handoffs derived from the accepted
+         * restored state; they must not perform host fallback replay or mutate
+         * unrelated graph outputs.
+         *
+         * @param stream Explicit GPU stream for GPU stages, or nullptr for CPU-only stages.
+         * @return true when the derived live state was published successfully.
+         */
+        virtual bool publishPostVerifierStateRestore(void *stream = nullptr)
+        {
+            (void)stream;
+            return true;
+        }
+
+        /**
          * @brief Whether this stage allows all-zero output tensors
          *
          * By default, all-zero outputs are treated as bugs (likely uninitialized
@@ -988,6 +1027,26 @@ namespace llaminar2
         {
             resetSessionState();
         }
+
+        /**
+         * @brief Invalidate handles into backend-owned kernel-dynamic state.
+         *
+         * Kernel-dynamic state is separate from request-scoped model state and
+         * separate from immutable model weights. It includes backend-owned
+         * pointer tables, descriptor table IDs, dynamic argument buffers, and
+         * other launch metadata that kernels populate lazily for eager or graph
+         * replay execution. When the orchestrator calls
+         * KernelFactory::resetAllDynamicState(), cached ComputeGraphs may keep
+         * their stage objects, but any stage-local handles into the reset kernel
+         * metadata must be treated as stale.
+         *
+         * Implementations must not clear KV/GDN/MTP model state, graph topology,
+         * tensor bindings, workspace ownership, or prepared model weights here.
+         * They should only mark kernel-dynamic handles cold so the next eager
+         * warmup can rebuild them, and they should fail hard if asked to rebuild
+         * while GPU graph capture is already active.
+         */
+        virtual void invalidateKernelDynamicState() {}
 
         /**
          * @brief Update prefill replay bookkeeping before a captured graph launch.

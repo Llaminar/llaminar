@@ -1,3 +1,13 @@
+/**
+ * @file Test__PrefixCachePrefillFlow.cpp
+ * @brief Regression coverage for request-boundary prefix-cache prefill semantics.
+ *
+ * These tests exercise the OrchestrationRunner layer with a lightweight
+ * IInferenceRunner mock.  They pin the visible lifetime boundaries for KV,
+ * GDN, MTP, and MoE model-runtime state when prefix-cache hits, misses, and
+ * terminal restores cross a request boundary.
+ */
+
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -23,6 +33,7 @@ namespace
         {
             ++forward_calls;
             last_forward_tokens.assign(tokens, tokens + seq_len);
+            forward_token_batches.emplace_back(tokens, tokens + seq_len);
             position += seq_len;
             if (all_position_logits_enabled)
             {
@@ -289,6 +300,7 @@ namespace
         bool last_commit_allow_speculative_discard = false;
         int last_commit_position_offset_override = -1;
         std::vector<int> last_forward_tokens;
+        std::vector<std::vector<int>> forward_token_batches;
         std::vector<int> last_commit_tokens;
         std::vector<int> chained_mtp_positions;
         std::vector<int> restored_mtp_rows;
@@ -344,7 +356,13 @@ namespace
         int old_pad_token_;
     };
 
-    RankExecutionPlan makePlan(bool mtp_enabled = false, int mtp_draft_tokens = 1)
+    RankExecutionPlan makePlan(
+        bool mtp_enabled = false,
+        int mtp_draft_tokens = 1,
+        MoERebalanceRuntimeMode rebalance_mode = MoERebalanceRuntimeMode::Dynamic,
+        int prefix_block_size = 2,
+        int prefill_window_tokens = 0,
+        bool prefix_cache_enabled = true)
     {
         RankExecutionPlan plan;
         plan.rank = 0;
@@ -356,22 +374,34 @@ namespace
         plan.has_embedding = true;
         plan.has_lm_head = true;
         plan.primary_device = GlobalDeviceAddress::cpu();
-        plan.runtime.prefix_cache.enabled = true;
-        plan.runtime.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
-        plan.runtime.prefix_cache.block_size = 2;
+        plan.runtime.prefix_cache.enabled = prefix_cache_enabled;
+        plan.runtime.prefix_cache.storage_mode =
+            prefix_cache_enabled ? PrefixCacheStorageMode::Ram : PrefixCacheStorageMode::Disabled;
+        plan.runtime.prefix_cache.block_size = prefix_block_size;
+        plan.runtime.moe_rebalance.mode = rebalance_mode;
+        plan.runtime.moe_rebalance.prefill_window_tokens = prefill_window_tokens;
         plan.runtime.mtp.enabled = mtp_enabled;
         plan.runtime.mtp.draft_tokens = mtp_draft_tokens;
         plan.runtime.mtp.verify_mode = MTPVerifyMode::Greedy;
         return plan;
     }
 
-    OrchestrationConfig makeConfig(bool mtp_enabled = false, int mtp_draft_tokens = 1)
+    OrchestrationConfig makeConfig(
+        bool mtp_enabled = false,
+        int mtp_draft_tokens = 1,
+        MoERebalanceRuntimeMode rebalance_mode = MoERebalanceRuntimeMode::Dynamic,
+        int prefix_block_size = 2,
+        int prefill_window_tokens = 0,
+        bool prefix_cache_enabled = true)
     {
         OrchestrationConfig config;
         config.device_for_this_rank = GlobalDeviceAddress::cpu();
-        config.prefix_cache.enabled = true;
-        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
-        config.prefix_cache.block_size = 2;
+        config.prefix_cache.enabled = prefix_cache_enabled;
+        config.prefix_cache.storage_mode =
+            prefix_cache_enabled ? PrefixCacheStorageMode::Ram : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = prefix_block_size;
+        config.moe_rebalance.mode = rebalance_mode;
+        config.moe_rebalance.prefill_window_tokens = prefill_window_tokens;
         config.mtp.enabled = mtp_enabled;
         config.mtp.draft_tokens = mtp_draft_tokens;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
@@ -380,12 +410,26 @@ namespace
 
     std::unique_ptr<OrchestrationRunner> makeRunner(std::unique_ptr<PrefixFlowMockRunner> mock,
                                                     bool mtp_enabled = false,
-                                                    int mtp_draft_tokens = 1)
+                                                    int mtp_draft_tokens = 1,
+                                                    MoERebalanceRuntimeMode rebalance_mode = MoERebalanceRuntimeMode::Dynamic,
+                                                    int prefix_block_size = 2,
+                                                    int prefill_window_tokens = 0,
+                                                    bool prefix_cache_enabled = true)
     {
         mock->mtp_enabled = mtp_enabled;
         auto runner = std::make_unique<OrchestrationRunner>(
-            makeConfig(mtp_enabled, mtp_draft_tokens),
-            makePlan(mtp_enabled, mtp_draft_tokens),
+            makeConfig(mtp_enabled,
+                       mtp_draft_tokens,
+                       rebalance_mode,
+                       prefix_block_size,
+                       prefill_window_tokens,
+                       prefix_cache_enabled),
+            makePlan(mtp_enabled,
+                     mtp_draft_tokens,
+                     rebalance_mode,
+                     prefix_block_size,
+                     prefill_window_tokens,
+                     prefix_cache_enabled),
             std::move(mock));
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -408,7 +452,7 @@ TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
 
     EXPECT_EQ(mock_ptr->lookup_calls, 1);
-    EXPECT_EQ(mock_ptr->clear_calls, 1);
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
     EXPECT_EQ(mock_ptr->populate_calls, 1);
     EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
     EXPECT_EQ(mock_ptr->forward_calls, 1);
@@ -427,6 +471,268 @@ TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
     EXPECT_EQ(probe.prefix_request.matched_blocks, 1);
     EXPECT_FALSE(probe.prefix_request.terminal_logits_restored);
     EXPECT_EQ(probe.prefix_request.storage_tier, "none");
+}
+
+TEST(Test__PrefixCachePrefillFlow, FreshPrefixMissDoesNotManufactureRequestReset)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 0;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(1, 2, 3, 4));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LivePrefixMissResetsBeforeFullPrefill)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 0;
+    mock_ptr->position = 3;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 1);
+    EXPECT_EQ(mock_ptr->populate_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(1, 2, 3, 4));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LLEPPrefixMissWithoutConfiguredWindowUsesSinglePrefill)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 0;
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/false,
+                             /*mtp_draft_tokens=*/1,
+                             MoERebalanceRuntimeMode::LLEP);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->forward_token_batches,
+                ElementsAre(ElementsAre(1, 2, 3, 4, 5)));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LLEPPartialHitUsesStableCacheBlockPrefillBoundaries)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/false,
+                             /*mtp_draft_tokens=*/1,
+                             MoERebalanceRuntimeMode::LLEP);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
+    EXPECT_EQ(mock_ptr->forward_calls, 2);
+    EXPECT_THAT(mock_ptr->forward_token_batches,
+                            ElementsAre(ElementsAre(3, 4),
+                                        ElementsAre(5)));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LLEPFullHitAtUnalignedBoundaryRecomputesRemainder)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 5;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/false,
+                             /*mtp_draft_tokens=*/1,
+                             MoERebalanceRuntimeMode::LLEP);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(4));
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(5));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_FALSE(probe.prefix_request.hit);
+    EXPECT_TRUE(probe.prefix_request.partial_hit);
+    EXPECT_EQ(probe.prefix_request.matched_tokens, 4);
+    EXPECT_EQ(probe.prefix_request.matched_blocks, 2);
+    EXPECT_FALSE(probe.prefix_request.terminal_logits_restored);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestoresUnalignedMTPState)
+{
+    auto make_block = [](int block_index,
+                         int token_start,
+                         int token_count,
+                         bool terminal) {
+        PrefixBlockHandle block;
+        block.key.fingerprint = 0x1234;
+        block.key.block_index = block_index;
+        block.key.token_start = token_start;
+        block.key.token_count = token_count;
+        block.total_bytes = 1;
+        block.layout.block_size = 2;
+        block.layout.includes_mtp_state = true;
+        block.layout.hybrid_state_bytes = 16;
+        block.has_hybrid_state = terminal;
+        block.has_terminal_hidden = terminal;
+        block.has_terminal_logits = terminal;
+        block.has_model_runtime_state = terminal;
+        if (terminal)
+        {
+            block.mtp_storage =
+                std::make_shared<std::vector<uint8_t>>(4, 0x42);
+            block.mtp_payload = block.mtp_storage->data();
+            block.model_runtime_state_storage =
+                std::make_shared<std::vector<uint8_t>>(4, 0x7f);
+        }
+        return block;
+    };
+
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 5;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->lookup_result.blocks = {
+        make_block(0, 0, 2, false),
+        make_block(1, 2, 2, false),
+        make_block(2, 4, 1, true),
+    };
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/true,
+                             /*mtp_draft_tokens=*/1,
+                             MoERebalanceRuntimeMode::LLEP);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(5));
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_request.hit);
+    EXPECT_FALSE(probe.prefix_request.partial_hit);
+    EXPECT_EQ(probe.prefix_request.matched_tokens, 5);
+    EXPECT_EQ(probe.prefix_request.matched_blocks, 3);
+    EXPECT_TRUE(probe.prefix_request.terminal_logits_restored);
+    EXPECT_TRUE(probe.prefix_request.terminal_hidden_restored);
+    EXPECT_TRUE(probe.prefix_request.mtp_state_restored);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LLEPConfiguredPrefillWindowSegmentsUncachedPrefill)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/false,
+                             /*mtp_draft_tokens=*/1,
+                             MoERebalanceRuntimeMode::LLEP,
+                             /*prefix_block_size=*/2,
+                             /*prefill_window_tokens=*/2,
+                             /*prefix_cache_enabled=*/false);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->lookup_calls, 0);
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 3);
+    EXPECT_THAT(mock_ptr->forward_token_batches,
+                ElementsAre(ElementsAre(1, 2),
+                            ElementsAre(3, 4),
+                            ElementsAre(5)));
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LLEPPrefixMissWithoutPrefixBlockSizeUsesSinglePrefill)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 0;
+    mock_ptr->lookup_result.cached_tokens = 0;
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/false,
+                             /*mtp_draft_tokens=*/1,
+                             MoERebalanceRuntimeMode::LLEP,
+                             /*prefix_block_size=*/0);
+    ASSERT_TRUE(runner->prefill({1, 2, 3})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(1, 2, 3));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow, PopulateFailureHardFailsWithoutMissFallback)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+    mock_ptr->populate_ok = false;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
+
+    EXPECT_THAT(runner->lastError(), HasSubstr("Prefix cache populate failed"));
+    EXPECT_THAT(runner->lastError(), HasSubstr("refusing to downgrade the hit to a miss"));
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }
 
 TEST(Test__PrefixCachePrefillFlow, CoordinatedPrefixHitPopulatesOnlyCompleteBlocks)
@@ -485,7 +791,7 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
     EXPECT_EQ(probe.prefill_chunk_failures, 0u);
 }
 
-TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFallsBackWhenChunkScheduleUnsupported)
+TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFailsWhenChunkScheduleUnsupported)
 {
     ScopedPrefillChunkScheduleEnv env;
     auto mock = std::make_unique<PrefixFlowMockRunner>();
@@ -497,16 +803,17 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFallsBackWhenChunkScheduleUns
 
     auto runner = makeRunner(std::move(mock));
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
-    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+    ASSERT_FALSE(runner->prefill(prompt));
+    EXPECT_THAT(runner->lastError(), HasSubstr("runner does not support prefill chunk scheduling"));
 
     EXPECT_EQ(mock_ptr->chunk_schedule_calls, 0);
-    EXPECT_EQ(mock_ptr->forward_calls, 1);
-    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.prefill_chunk_schedules, 0u);
     EXPECT_EQ(probe.prefill_chunks, 0u);
-    EXPECT_EQ(probe.prefill_chunk_failures, 0u);
+    EXPECT_EQ(probe.prefill_chunk_failures, 1u);
 }
 
 TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixReportsChunkScheduleFailure)
@@ -553,7 +860,7 @@ TEST(Test__PrefixCachePrefillFlow, MTPPartialHitWithoutTerminalHiddenRecomputesB
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
 
-    EXPECT_EQ(mock_ptr->clear_calls, 1);
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
     EXPECT_EQ(mock_ptr->populate_calls, 1);
     EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
     EXPECT_EQ(mock_ptr->forward_calls, 1);
@@ -653,9 +960,9 @@ TEST(Test__PrefixCachePrefillFlow, FullMTPHitWithoutTerminalHiddenRecomputesFina
     ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
 
     EXPECT_EQ(mock_ptr->restore_terminal_calls, 0);
-    EXPECT_EQ(mock_ptr->clear_calls, 2);
-    EXPECT_EQ(mock_ptr->populate_calls, 2);
-    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(4, 2));
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
     EXPECT_EQ(mock_ptr->forward_calls, 1);
     EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4));
 }
@@ -831,9 +1138,31 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithoutTerminalLogitsRecomputesFinalBl
     auto runner = makeRunner(std::move(mock));
     ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
 
-    EXPECT_EQ(mock_ptr->clear_calls, 2);
-    EXPECT_EQ(mock_ptr->populate_calls, 2);
-    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(4, 2));
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
     EXPECT_EQ(mock_ptr->forward_calls, 1);
     EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4));
+}
+
+TEST(Test__PrefixCachePrefillFlow, AdvertisedTerminalRestoreFailureHardFails)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->restore_terminal_ok = false;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
+
+    EXPECT_THAT(runner->lastError(), HasSubstr("Prefix cache terminal restore failed"));
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }

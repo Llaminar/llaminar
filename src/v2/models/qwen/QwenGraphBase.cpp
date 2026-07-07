@@ -293,6 +293,19 @@ namespace llaminar2
         return decode_replicated_dense_weight_bindings_.get_layer_weights != nullptr;
     }
 
+    std::string QwenGraphBase::describeDecodeReplicatedDenseBindingState() const
+    {
+        auto state = [](const void *ptr)
+        {
+            return ptr ? "present" : "missing";
+        };
+        return std::string("layers=") +
+               (decode_replicated_dense_weight_bindings_.get_layer_weights ? "present" : "missing") +
+               " embedding=" + state(decode_replicated_dense_weight_bindings_.embedding_table) +
+               " final_norm=" + state(decode_replicated_dense_weight_bindings_.final_norm) +
+               " lm_head=" + state(decode_replicated_dense_weight_bindings_.lm_head);
+    }
+
     bool QwenGraphBase::useDecodeReplicatedDenseWeights() const
     {
         return decode_replicated_dense_graph_active_ &&
@@ -310,10 +323,53 @@ namespace llaminar2
                hasDecodeMirroredEmbeddingWeightSource();
     }
 
+    bool QwenGraphBase::hasMirroredMTPHeadWeightSource() const
+    {
+        return decode_replicated_dense_weight_bindings_.final_norm != nullptr &&
+               decode_replicated_dense_weight_bindings_.lm_head != nullptr;
+    }
+
+    bool QwenGraphBase::localTPMirroredMTPHeadConfigured() const
+    {
+        return config_.mtp.enabled &&
+               config_.mtp.mirror_full_head_for_local_tp &&
+               config_.lm_head_column_parallel &&
+               config_.tp_ctx != nullptr &&
+               config_.tp_ctx->isLocal();
+    }
+
+    bool QwenGraphBase::mirroredMTPHeadActiveForVerifierTokens(int total_tokens) const
+    {
+        const int max_decode_like_rows =
+            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
+        return localTPMirroredMTPHeadConfigured() &&
+               config_.compute_all_position_logits &&
+               total_tokens > 0 &&
+               total_tokens <= max_decode_like_rows;
+    }
+
+    bool QwenGraphBase::useMirroredMTPHeadWeights() const
+    {
+        return mtp_mirrored_lm_head_graph_active_;
+    }
+
     bool QwenGraphBase::useFullVocabEmbeddingForCurrentGraph() const
     {
         return useDecodeReplicatedDenseWeights() ||
                useDecodeMirroredEmbeddingWeights();
+    }
+
+    bool QwenGraphBase::usesVocabParallelEmbeddingForCurrentGraph() const
+    {
+        TensorBase *embedding = modelEmbeddingTable();
+        return embedding && static_cast<int>(embedding->rows()) < config_.vocab_size;
+    }
+
+    int QwenGraphBase::embeddingVocabOffsetForCurrentGraph(DeviceId device) const
+    {
+        return usesVocabParallelEmbeddingForCurrentGraph()
+                   ? embeddingVocabOffsetForDevice(config_, device)
+                   : 0;
     }
 
     bool QwenGraphBase::useReplicatedAttentionStateWeights() const
@@ -327,11 +383,20 @@ namespace llaminar2
         const int max_decode_like_rows = config_.mtp.enabled
             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
             : 1;
-        return config_.dense_tp_enabled &&
-               config_.dense_tp_decode_replicated &&
-               total_tokens > 0 &&
-               total_tokens <= max_decode_like_rows &&
-               hasDecodeReplicatedDenseWeightSource();
+        const bool decode_like =
+            config_.dense_tp_enabled &&
+            config_.dense_tp_decode_replicated &&
+            total_tokens > 0 &&
+            total_tokens <= max_decode_like_rows;
+        if (!decode_like)
+            return false;
+        if (!hasDecodeReplicatedDenseWeightSource())
+        {
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated dense decode is configured but its layer weight bindings are missing: " +
+                describeDecodeReplicatedDenseBindingState());
+        }
+        return true;
     }
 
     bool QwenGraphBase::denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const
@@ -351,11 +416,20 @@ namespace llaminar2
         const int max_decode_like_rows = config_.mtp.enabled
             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
             : 1;
-        return config_.dense_tp_enabled &&
-               config_.dense_tp_decode_replicated &&
-               total_tokens > 0 &&
-               total_tokens <= max_decode_like_rows &&
-               hasDecodeReplicatedDenseWeightSource();
+        const bool decode_like =
+            config_.dense_tp_enabled &&
+            config_.dense_tp_decode_replicated &&
+            total_tokens > 0 &&
+            total_tokens <= max_decode_like_rows;
+        if (!decode_like)
+            return false;
+        if (!hasDecodeReplicatedDenseWeightSource())
+        {
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated attention-state decode is configured but dense decode layer bindings are missing: " +
+                describeDecodeReplicatedDenseBindingState());
+        }
+        return true;
     }
 
     bool QwenGraphBase::denseTPAllreduceEnabledForCurrentGraph() const
@@ -366,6 +440,32 @@ namespace llaminar2
     bool QwenGraphBase::attentionTPAllreduceEnabledForCurrentGraph() const
     {
         return !useReplicatedAttentionStateWeights();
+    }
+
+    bool QwenGraphBase::useColumnParallelLMHeadForGraph(
+        TensorBase *logits_local) const
+    {
+        if (!config_.lm_head_column_parallel || logits_local == nullptr)
+            return false;
+
+        /*
+         * LocalTP MTP can explicitly mirror the terminal LM head on every
+         * participant.  In that mode MTP verifier/sidecar graphs produce the
+         * same full-vocab rows as serial decode, and advertising a local shard
+         * would reintroduce the tiny verifier logits collective this mode is
+         * designed to remove.
+         */
+        if (useMirroredMTPHeadWeights())
+            return false;
+
+        /*
+         * Dense decode-replicated graphs, including compact all-position
+         * verifier rows, must project through the same full-vocab LM head that
+         * ordinary serial decode uses.  Running the verifier through the primary
+         * sharded LM head changes both the WeightBinding and the prepared GEMM
+         * descriptor, so the hidden states can be identical while logits drift.
+         */
+        return denseTPAllreduceEnabledForCurrentGraph();
     }
 
     bool QwenGraphBase::needsPhaseSplitPrefillKVCacheHandoff(
@@ -382,7 +482,8 @@ namespace llaminar2
         {
             return false;
         }
-        if (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights())
+        if (!mtp_kv_cache_only_graph_active_ &&
+            (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights()))
             return false;
         if (total_tokens <= 1)
             return false;
@@ -402,7 +503,8 @@ namespace llaminar2
         : owner_(owner),
           previous_(owner.decode_replicated_dense_graph_active_),
           previous_attention_(owner.replicated_attention_state_graph_active_),
-          previous_embedding_(owner.decode_mirrored_embedding_graph_active_)
+          previous_embedding_(owner.decode_mirrored_embedding_graph_active_),
+          previous_mtp_head_(owner.mtp_mirrored_lm_head_graph_active_)
     {
         owner_.decode_replicated_dense_graph_active_ =
             owner_.denseDecodeReplicatedActiveForTokens(total_tokens);
@@ -410,6 +512,8 @@ namespace llaminar2
             owner_.denseDecodeMirroredEmbeddingActiveForTokens(total_tokens);
         owner_.replicated_attention_state_graph_active_ =
             owner_.replicatedAttentionStateActiveForTokens(total_tokens);
+        owner_.mtp_mirrored_lm_head_graph_active_ =
+            owner_.mirroredMTPHeadActiveForVerifierTokens(total_tokens);
     }
 
     QwenGraphBase::DecodeReplicatedDenseScope::~DecodeReplicatedDenseScope()
@@ -417,6 +521,35 @@ namespace llaminar2
         owner_.decode_replicated_dense_graph_active_ = previous_;
         owner_.replicated_attention_state_graph_active_ = previous_attention_;
         owner_.decode_mirrored_embedding_graph_active_ = previous_embedding_;
+        owner_.mtp_mirrored_lm_head_graph_active_ = previous_mtp_head_;
+    }
+
+    QwenGraphBase::MirroredMTPHeadScope::MirroredMTPHeadScope(
+        QwenGraphBase &owner,
+        bool active)
+        : owner_(owner),
+          previous_(owner.mtp_mirrored_lm_head_graph_active_)
+    {
+        owner_.mtp_mirrored_lm_head_graph_active_ = active;
+    }
+
+    QwenGraphBase::MirroredMTPHeadScope::~MirroredMTPHeadScope()
+    {
+        owner_.mtp_mirrored_lm_head_graph_active_ = previous_;
+    }
+
+    QwenGraphBase::MTPKVCacheOnlyScope::MTPKVCacheOnlyScope(
+        QwenGraphBase &owner,
+        bool active)
+        : owner_(owner),
+          previous_(owner.mtp_kv_cache_only_graph_active_)
+    {
+        owner_.mtp_kv_cache_only_graph_active_ = active;
+    }
+
+    QwenGraphBase::MTPKVCacheOnlyScope::~MTPKVCacheOnlyScope()
+    {
+        owner_.mtp_kv_cache_only_graph_active_ = previous_;
     }
 
     namespace
@@ -480,6 +613,13 @@ namespace llaminar2
             base.up_proj = pick(decode_dense.up_proj, base.up_proj);
             base.down_proj = pick(decode_dense.down_proj, base.down_proj);
             base.moe_gate = pick(decode_dense.moe_gate, base.moe_gate);
+            base.moe_gate_exps = pick(decode_dense.moe_gate_exps, base.moe_gate_exps);
+            base.moe_up_exps = pick(decode_dense.moe_up_exps, base.moe_up_exps);
+            base.moe_down_exps = pick(decode_dense.moe_down_exps, base.moe_down_exps);
+            base.shared_expert_gate = pick(decode_dense.shared_expert_gate, base.shared_expert_gate);
+            base.shared_expert_up = pick(decode_dense.shared_expert_up, base.shared_expert_up);
+            base.shared_expert_down = pick(decode_dense.shared_expert_down, base.shared_expert_down);
+            base.shared_expert_gate_inp = pick(decode_dense.shared_expert_gate_inp, base.shared_expert_gate_inp);
 
             return base;
         }
@@ -526,6 +666,8 @@ namespace llaminar2
             TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.embedding_table);
             if (decode_bound)
                 return decode_bound;
+            throw std::runtime_error(
+                "[QwenGraphBase] Full-vocab decode embedding was requested but no replicated embedding binding is available");
         }
         TensorBase *bound = legacyTensor(weight_bindings_.embedding_table);
         return bound ? bound : weights_.embedding_table;
@@ -539,20 +681,45 @@ namespace llaminar2
 
     TensorBase *QwenGraphBase::modelLMHead() const
     {
-        if (useDecodeReplicatedDenseWeights())
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
         {
+            if (useMirroredMTPHeadWeights() && !hasMirroredMTPHeadWeightSource())
+            {
+                throw std::runtime_error(
+                    "[QwenGraphBase] Mirrored LocalTP MTP head was requested but replicated final_norm/lm_head bindings are missing: " +
+                    describeDecodeReplicatedDenseBindingState());
+            }
             TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.lm_head);
             if (decode_bound)
                 return decode_bound;
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated dense decode was requested but no replicated LM head binding is available");
         }
         TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
         return bound ? bound : weights_.lm_head;
     }
 
+    TensorBase *QwenGraphBase::modelLMHeadForGraph(bool column_parallel) const
+    {
+        if (column_parallel)
+        {
+            TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
+            if (bound)
+                return bound;
+            return weights_.lm_head;
+        }
+        return modelLMHead();
+    }
+
     const WeightBinding *QwenGraphBase::modelEmbeddingBinding() const
     {
-        if (useFullVocabEmbeddingForCurrentGraph() && decode_replicated_dense_weight_bindings_.embedding_table)
+        if (useFullVocabEmbeddingForCurrentGraph())
+        {
+            if (!decode_replicated_dense_weight_bindings_.embedding_table)
+                throw std::runtime_error(
+                    "[QwenGraphBase] Full-vocab decode embedding was requested but no replicated embedding binding is available");
             return decode_replicated_dense_weight_bindings_.embedding_table;
+        }
         return weight_bindings_.embedding_table;
     }
 
@@ -563,9 +730,24 @@ namespace llaminar2
 
     const WeightBinding *QwenGraphBase::modelLMHeadBinding() const
     {
-        if (useDecodeReplicatedDenseWeights() && decode_replicated_dense_weight_bindings_.lm_head)
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            if (!decode_replicated_dense_weight_bindings_.lm_head)
+                throw std::runtime_error(
+                    useMirroredMTPHeadWeights()
+                        ? "[QwenGraphBase] Mirrored LocalTP MTP head was requested but no replicated LM head binding is available"
+                        : "[QwenGraphBase] Replicated dense decode was requested but no replicated LM head binding is available");
             return decode_replicated_dense_weight_bindings_.lm_head;
+        }
         return weight_bindings_.lm_head;
+    }
+
+    const WeightBinding *QwenGraphBase::modelLMHeadBindingForGraph(
+        bool column_parallel) const
+    {
+        if (column_parallel)
+            return weight_bindings_.lm_head;
+        return modelLMHeadBinding();
     }
 
     std::optional<PreparedWeightRef> QwenGraphBase::preparedRefForGraphWeight(
@@ -952,9 +1134,7 @@ namespace llaminar2
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
-        embed_params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
-                                        ? 0
-                                        : embeddingVocabOffsetForDevice(config_, config_.default_device);
+        embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
         embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
@@ -972,10 +1152,9 @@ namespace llaminar2
         // When embedding is column-parallel sharded, each device holds
         // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
         // AllReduce(sum) combines the partial results.
-        const bool embedding_is_sharded =
-            modelEmbeddingTable() &&
-            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
-        if (embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
+        const bool embedding_is_sharded = usesVocabParallelEmbeddingForCurrentGraph();
+        bool embedding_allreduce_added = false;
+        if (embedding_is_sharded && needsTPAllreduce())
         {
             size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
             auto allreduce_stage = createTPAllreduceStage(
@@ -986,13 +1165,14 @@ namespace llaminar2
             {
                 graph.addNode("embedding_allreduce", std::move(allreduce_stage), device);
                 graph.addDependency("embedding_allreduce", "embedding");
+                embedding_allreduce_added = true;
             }
         }
 
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (complete graphs, not placeholders)
         // -------------------------------------------------------------------------
-        std::string prev_node = embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph()
+        std::string prev_node = embedding_allreduce_added
                                     ? "embedding_allreduce"
                                     : "embedding";
 
@@ -1093,9 +1273,7 @@ namespace llaminar2
         // - AllGather collects to buffers_.logits: [seq_len, vocab_size]
         // -------------------------------------------------------------------------
         bool use_column_parallel =
-            config_.lm_head_column_parallel &&
-            denseTPAllreduceEnabledForCurrentGraph() &&
-            buffers_.logits_local != nullptr;
+            useColumnParallelLMHeadForGraph(buffers_.logits_local);
 
         // Determine output buffer and vocab size for LM head stage
         TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
@@ -1112,8 +1290,9 @@ namespace llaminar2
         // verifier rows. The layout helper keeps the row count and BufferId
         // contract synchronized.
         lm_params.hidden_states = lm_head_input;
-        lm_params.lm_head_weight = modelLMHead();
-        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
+        lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+        lm_params.prepared_ref = preparedRefForGraphWeight(
+            modelLMHeadBindingForGraph(use_column_parallel), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = lm_layout.seq_len;
         lm_params.d_model = config_.d_model;
@@ -1253,9 +1432,7 @@ namespace llaminar2
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
-            embed_params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
-                                            ? 0
-                                            : embeddingVocabOffsetForDevice(config_, config_.default_device);
+            embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
             embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
@@ -1272,10 +1449,8 @@ namespace llaminar2
             // When embedding is column-parallel sharded, each device holds
             // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
             // AllReduce(sum) combines the partial results.
-            const bool embedding_is_sharded =
-                modelEmbeddingTable() &&
-                static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
-            if (embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
+            const bool embedding_is_sharded = usesVocabParallelEmbeddingForCurrentGraph();
+            if (embedding_is_sharded && needsTPAllreduce())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
                 auto allreduce_stage = createTPAllreduceStage(
@@ -1454,9 +1629,7 @@ namespace llaminar2
 
             // LM Head (with optional Column-Parallel + AllGather)
             bool use_column_parallel =
-                config_.lm_head_column_parallel &&
-                denseTPAllreduceEnabledForCurrentGraph() &&
-                buffers_.logits_local != nullptr;
+                useColumnParallelLMHeadForGraph(buffers_.logits_local);
 
             TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
             int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
@@ -1469,8 +1642,9 @@ namespace llaminar2
 
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = lm_head_input;
-            lm_params.lm_head_weight = modelLMHead();
-            lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
+            lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+            lm_params.prepared_ref = preparedRefForGraphWeight(
+                modelLMHeadBindingForGraph(use_column_parallel), device);
             lm_params.logits = lm_head_output;
             lm_params.seq_len = lm_layout.seq_len;
             lm_params.d_model = config_.d_model;
@@ -1649,9 +1823,7 @@ namespace llaminar2
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
-                embed_params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
-                                                ? 0
-                                                : embeddingVocabOffsetForDevice(config_, stage_device);
+                embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(stage_device);
                 embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
@@ -1662,6 +1834,25 @@ namespace llaminar2
                               ComputeStageFactory::createEmbedding(embed_params),
                               stage_device);
                 prev_node = "embedding";
+
+                if (usesVocabParallelEmbeddingForCurrentGraph() && needsTPAllreduce())
+                {
+                    const size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
+                    auto allreduce_stage = createTPAllreduceStage(
+                        embed_output,
+                        allreduce_count,
+                        stage_device,
+                        -1,
+                        /*is_attention=*/false,
+                        "embedding_allreduce",
+                        BufferId::HIDDEN_STATE);
+                    if (allreduce_stage)
+                    {
+                        graph.addNode("embedding_allreduce", std::move(allreduce_stage), stage_device);
+                        graph.addDependency("embedding_allreduce", "embedding");
+                        prev_node = "embedding_allreduce";
+                    }
+                }
 
                 LOG_DEBUG("[QwenGraphBase] Added embedding stage on device " << stage_device.to_string());
             }
@@ -1826,7 +2017,7 @@ namespace llaminar2
                     lm_head_dependency);
 
                 // LM Head
-                bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+                bool use_column_parallel = useColumnParallelLMHeadForGraph(buffers_.logits_local);
                 TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
                 int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
 
@@ -1838,8 +2029,9 @@ namespace llaminar2
 
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = lm_head_input;
-                lm_params.lm_head_weight = modelLMHead();
-                lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), stage_device);
+                lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+                lm_params.prepared_ref = preparedRefForGraphWeight(
+                    modelLMHeadBindingForGraph(use_column_parallel), stage_device);
                 lm_params.logits = lm_head_output;
                 lm_params.seq_len = lm_layout.seq_len;
                 lm_params.d_model = config_.d_model;
@@ -1983,9 +2175,7 @@ namespace llaminar2
         params.num_tokens = total_tokens;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
-        params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
-                                  ? 0
-                                  : embeddingVocabOffsetForDevice(config_, config_.default_device);
+        params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
         params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         params.device_id = config_.default_device;
         params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
@@ -1994,6 +2184,24 @@ namespace llaminar2
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(params),
                       config_.default_device);
+
+        if (usesVocabParallelEmbeddingForCurrentGraph() && needsTPAllreduce())
+        {
+            const size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
+            auto allreduce_stage = createTPAllreduceStage(
+                output_hidden,
+                allreduce_count,
+                config_.default_device,
+                -1,
+                /*is_attention=*/false,
+                "embedding_allreduce",
+                BufferId::HIDDEN_STATE);
+            if (allreduce_stage)
+            {
+                graph.addNode("embedding_allreduce", std::move(allreduce_stage), config_.default_device);
+                graph.addDependency("embedding_allreduce", "embedding");
+            }
+        }
 
         return graph;
     }
@@ -2086,9 +2294,7 @@ namespace llaminar2
         // =================================================================
 
         bool use_column_parallel =
-            config_.lm_head_column_parallel &&
-            denseTPAllreduceEnabledForCurrentGraph() &&
-            logits_local != nullptr;
+            useColumnParallelLMHeadForGraph(logits_local);
 
         // Determine output buffer and vocab size for LM head stage
         TensorBase *lm_head_output = use_column_parallel ? logits_local : output_logits;
@@ -2169,8 +2375,9 @@ namespace llaminar2
         // LM Head projection
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = lm_head_input;
-        lm_params.lm_head_weight = modelLMHead();
-        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
+        lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+        lm_params.prepared_ref = preparedRefForGraphWeight(
+            modelLMHeadBindingForGraph(use_column_parallel), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = lm_head_seq_len;
         lm_params.d_model = config_.d_model;
@@ -2672,6 +2879,8 @@ namespace llaminar2
         // TP-adjusted local dimensions
         // Use local head counts when QKV is column-parallel
         const bool reserve_full_dense_decode_buffers = config_.dense_tp_decode_replicated;
+        const bool reserve_full_mtp_head_buffers =
+            localTPMirroredMTPHeadConfigured();
 
         config.local_n_heads = config_.qkv_column_parallel && !reserve_full_dense_decode_buffers
                                    ? config_.local_n_heads
@@ -2702,6 +2911,10 @@ namespace llaminar2
 
         config.custom_formulas["mtp_target_query_rows"] =
             static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
+        config.custom_formulas["mtp_vocab"] =
+            static_cast<size_t>(reserve_full_mtp_head_buffers
+                                    ? config_.vocab_size
+                                    : config.local_vocab);
 
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "
@@ -3094,8 +3307,8 @@ namespace llaminar2
                                   .stage_name = handoff_node,
                                   .local_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                                   .local_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
-                                  .full_k_buffer_id = BufferId::K_FULL_PREFILL,
-                                  .full_v_buffer_id = BufferId::V_FULL_PREFILL,
+                                  .full_k_buffer_id = buffers.idFor(BufferId::K_FULL_PREFILL),
+                                  .full_v_buffer_id = buffers.idFor(BufferId::V_FULL_PREFILL),
                               }),
                               device);
 
@@ -3123,8 +3336,8 @@ namespace llaminar2
 
                 append_K = buffers.K_full_prefill;
                 append_V = buffers.V_full_prefill;
-                append_k_buffer_id = BufferId::K_FULL_PREFILL;
-                append_v_buffer_id = BufferId::V_FULL_PREFILL;
+                append_k_buffer_id = buffers.idFor(BufferId::K_FULL_PREFILL);
+                append_v_buffer_id = buffers.idFor(BufferId::V_FULL_PREFILL);
                 append_dependency = handoff_node;
             }
 

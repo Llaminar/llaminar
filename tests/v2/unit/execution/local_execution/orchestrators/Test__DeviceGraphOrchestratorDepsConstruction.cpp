@@ -297,7 +297,10 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement, 0)
         << "Default Dynamic should use the shared Dynamic admission floor "
            "max(2, window/16), not an extra GPU-only candidate floor.";
-    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 0);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor,
+              static_cast<int>(moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor))
+        << "The relative spread gate is enabled by default to keep transfer-backed GPU "
+           "maintenance economical.";
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 256)
         << "The wave-level value gate should reject low-value hot-cache transfer churn by default.";
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_foreign_rows_per_transfer, 0)

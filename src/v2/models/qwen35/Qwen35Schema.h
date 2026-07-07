@@ -342,12 +342,14 @@ namespace llaminar2
                 {"mtp_q", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
                 {"mtp_k", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
                 {"mtp_v", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
+                {"mtp_k_full_prefill", {"4", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full key rows for phase-split prefill KV handoff"},
+                {"mtp_v_full_prefill", {"4", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full value rows for phase-split prefill KV handoff"},
                 {"mtp_attn_output", {"4", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
                 {"mtp_attn_proj", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
                 {"mtp_gate", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
                 {"mtp_up", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
                 {"mtp_ffn_output", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
-                {"mtp_logits", {"4", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits shard"},
+                {"mtp_logits", {"4", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits rows; local shard normally, full vocab when LocalTP mirrors the MTP head"},
             };
 
             schema.model_buffers = {
@@ -455,13 +457,22 @@ namespace llaminar2
             Qwen2SchemaFactory qwen2;
             auto config = qwen2.getStageShardingConfig();
 
-            // Add GDN-specific stage sharding annotations
+            // Add GDN-specific stage sharding annotations.  These keys are the
+            // semantic snapshot names emitted by SnapshotCapture, not just the
+            // declarative StageType names from the schema template.
             config["GDN_PROJECTION"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GDN_CONV1D"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_CONV1D_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GDN_RECURRENCE"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_DELTA_RULE_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GATED_RMSNORM"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_NORM_GATE_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_Z_PROJECTION"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_ALPHA"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_BETA"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GDN_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["ATTENTION_OUTPUT_GATE"] = SnapshotShardingMode::REPLICATED;
+            config["ATTENTION_CONTEXT_GATED"] = SnapshotShardingMode::COLUMN_PARALLEL;
 
             return config;
         }

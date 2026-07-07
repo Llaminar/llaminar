@@ -770,7 +770,7 @@ TEST(Test__BufferId, CountIsReasonable)
 {
     auto count = static_cast<size_t>(BufferId::_COUNT);
     EXPECT_GT(count, 10u);
-    EXPECT_LT(count, 100u);
+    EXPECT_LT(count, 128u);
 }
 
 // ============================================================================

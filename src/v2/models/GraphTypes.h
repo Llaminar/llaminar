@@ -852,6 +852,8 @@ namespace llaminar2
         TensorBase *q = nullptr;
         TensorBase *k = nullptr;
         TensorBase *v = nullptr;
+        TensorBase *k_full_prefill = nullptr;
+        TensorBase *v_full_prefill = nullptr;
         TensorBase *q_raw = nullptr;
         TensorBase *q_gate = nullptr;
         TensorBase *attn_output = nullptr;

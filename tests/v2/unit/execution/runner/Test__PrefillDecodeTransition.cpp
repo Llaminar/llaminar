@@ -164,6 +164,8 @@ namespace
         bool forward(const int *tokens, int seq_len) override
         {
             forward_call_count_++;
+            execution_events_.push_back(
+                all_position_logits_enabled_ ? "forward_all_position" : "forward");
             last_forward_tokens_.assign(tokens, tokens + seq_len);
             forward_history_.push_back(last_forward_tokens_);
             last_forward_seq_len_ = seq_len;
@@ -517,6 +519,29 @@ namespace
                 position_offset_override);
         }
 
+        bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            execution_events_.push_back("checkpoint_terminal_hidden_shifted_commit");
+            if (!checkpoint.valid)
+                return false;
+            const int checkpoint_position = checkpoint.cached_tokens;
+            if (position_offset_override >= 0 &&
+                position_offset_override != checkpoint_position)
+            {
+                return false;
+            }
+            return commitMTPShiftedRowFromCurrentTerminalHidden(
+                token,
+                already_appended_tokens,
+                allow_speculative_discard,
+                checkpoint_position);
+        }
+
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
@@ -633,6 +658,11 @@ namespace
 
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override
         {
+            if (require_all_position_local_info_while_enabled_ &&
+                !all_position_logits_enabled_)
+            {
+                return {};
+            }
             return makeLocalInfo(all_position_logits_local_.get());
         }
 
@@ -730,6 +760,11 @@ namespace
             return supports_device_resident_mtp_spec_state_publication_;
         }
 
+        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override
+        {
+            return supports_grouped_decode_equivalent_mtp_spec_state_publication_;
+        }
+
         MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override
         {
             return mtp_verifier_economy_capability_;
@@ -740,6 +775,7 @@ namespace
             std::string *error = nullptr) override
         {
             ++publish_mtp_spec_state_count_;
+            execution_events_.push_back("host_plan_publish");
             last_published_mtp_spec_step_ = plan;
             if (!supports_mtp_spec_state_publication_)
             {
@@ -766,6 +802,7 @@ namespace
         {
             ++publish_mtp_spec_state_batch_count_;
             publication_events_.push_back("host_plan_publish");
+            execution_events_.push_back("host_plan_publish");
             last_published_mtp_spec_batch_ = plans;
             if (!supports_mtp_spec_state_publication_)
             {
@@ -805,6 +842,93 @@ namespace
                     }
                 }
             }
+            all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_enabled_ = false;
+            row_indexed_all_position_logits_row_count_ = 0;
+            return true;
+        }
+
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override
+        {
+            /*
+             * This mock method mirrors the production contract: grouped host
+             * publication is allowed without enabling the stronger direct
+             * all-position publisher.  The separate counter and event name let
+             * tests prove that OrchestrationRunner routed through the narrow
+             * API instead of accidentally calling publishAcceptedMTPSpecStateBatch().
+            */
+            ++publish_grouped_decode_equivalent_mtp_spec_state_batch_count_;
+            publication_events_.push_back("grouped_host_plan_publish");
+            execution_events_.push_back("grouped_host_plan_publish");
+            last_published_mtp_spec_batch_ = plans;
+            if (!supports_grouped_decode_equivalent_mtp_spec_state_publication_)
+            {
+                if (error)
+                    *error = "mock grouped decode-equivalent publication is disabled";
+                return false;
+            }
+            if (!publish_mtp_spec_state_ok_)
+            {
+                if (error)
+                    *error = "mock grouped decode-equivalent publication failed";
+                return false;
+            }
+            if (!plans.ok || plans.steps.empty())
+            {
+                if (error)
+                    *error = plans.ok
+                                 ? "mock grouped decode-equivalent batch has no steps"
+                                 : plans.error;
+                return false;
+            }
+            if (plans.request_count <= 0 ||
+                plans.request_count > kMockResidentOutcomeRequestCapacity ||
+                static_cast<int>(plans.steps.size()) != plans.request_count)
+            {
+                if (error)
+                    *error = "mock grouped decode-equivalent batch request count is outside resident mailbox capacity";
+                return false;
+            }
+
+            last_published_mtp_spec_step_ = plans.steps.front();
+            adoptPublishedMainTokens(plans.steps.front().target_cached_tokens);
+            resident_logical_state_valid_ = false;
+            resident_logical_state_request_count_ = 0;
+            for (const MTPSpecStepPlan &step : plans.steps)
+            {
+                if (step.request_index < 0 ||
+                    step.request_index >= plans.request_count)
+                {
+                    if (error)
+                        *error = "mock grouped decode-equivalent batch has an out-of-range request index";
+                    return false;
+                }
+                const size_t idx = static_cast<size_t>(step.request_index);
+                resident_target_positions_[idx] = step.target_cached_tokens;
+                resident_target_sequence_lengths_[idx] = step.target_cached_tokens;
+                resident_accepted_state_counts_[idx] = step.accepted_count;
+                resident_base_cached_tokens_[idx] = step.base_cached_tokens;
+                resident_next_condition_tokens_[idx] = step.next_condition_token;
+                resident_all_drafts_accepted_flags_[idx] =
+                    step.all_drafts_accepted ? 1 : 0;
+                resident_stopped_flags_[idx] = step.stopped ? 1 : 0;
+                resident_publication_ok_flags_[idx] = 1;
+
+                if (step.request_index < static_cast<int>(sequence_lengths_.size()))
+                {
+                    sequence_lengths_[idx] =
+                        step.target_cached_tokens;
+                    if (step.request_index == 0)
+                    {
+                        mtp_shifted_cached_tokens_ =
+                            shiftedTargetForMainTokens(step.target_cached_tokens);
+                    }
+                }
+            }
+            resident_logical_state_request_count_ = plans.request_count;
+            resident_logical_state_valid_ = true;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -3382,6 +3506,20 @@ namespace
             supports_mtp_token_coordination_ = true;
             hide_local_logits_ = hide_local_logits;
         }
+        /**
+         * @brief Require verifier-row local logits to be sampled before
+         *        all-position mode is disabled.
+         *
+         * Production GPU LocalTP sampling consumes a deferred verifier replay
+         * stream through `LogitsLocalInfo`.  This test-only guard models the
+         * ownership rule explicitly: once the runner tears down all-position
+         * mode, the compact verifier-logit view is no longer a valid sampling
+         * source.
+         */
+        void requireAllPositionLocalInfoWhileEnabled()
+        {
+            require_all_position_local_info_while_enabled_ = true;
+        }
         void enableMTPSidecarSampleFusion()
         {
             supports_mtp_sidecar_sample_fusion_ = true;
@@ -3588,6 +3726,10 @@ namespace
             mtp_verifier_economy_capability_.dense = lane;
             mtp_verifier_economy_capability_.moe = lane;
         }
+        void enableGroupedDecodeEquivalentMTPSpecStatePublication()
+        {
+            supports_grouped_decode_equivalent_mtp_spec_state_publication_ = true;
+        }
         void setMTPSpecStatePublicationOk(bool ok)
         {
             publish_mtp_spec_state_ok_ = ok;
@@ -3599,6 +3741,10 @@ namespace
         int publishMTPSpecStateBatchCount() const
         {
             return publish_mtp_spec_state_batch_count_;
+        }
+        int publishGroupedDecodeEquivalentMTPSpecStateBatchCount() const
+        {
+            return publish_grouped_decode_equivalent_mtp_spec_state_batch_count_;
         }
         int publishDeviceResidentMTPSpecStateCount() const
         {
@@ -3629,6 +3775,10 @@ namespace
         const std::vector<std::string> &publicationEvents() const
         {
             return publication_events_;
+        }
+        const std::vector<std::string> &executionEvents() const
+        {
+            return execution_events_;
         }
         int residentSidecarCountAtLastHostBridge() const
         {
@@ -4104,6 +4254,7 @@ namespace
             info.gpu_ptr = nullptr;
             info.device = std::nullopt;
             info.vocab_local = static_cast<size_t>(vocab_local_);
+            info.vocab_offset = static_cast<size_t>(vocab_start_);
             info.tensor = tensor;
             info.stream = nullptr;
             return info;
@@ -4227,10 +4378,12 @@ namespace
         bool supports_mtp_spec_state_publication_{false};
         bool hide_mtp_spec_state_publication_from_policy_{false};
         bool supports_device_resident_mtp_spec_state_publication_{false};
+        bool supports_grouped_decode_equivalent_mtp_spec_state_publication_{false};
         bool publish_mtp_spec_state_ok_{true};
         bool supports_stochastic_device_sampling_{false};
         bool supports_main_logits_batch_rows_on_device_{false};
         bool all_position_verifier_sync_deferral_enabled_{false};
+        bool require_all_position_local_info_while_enabled_{false};
         bool requires_mtp_decode_equivalent_replay_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
@@ -4281,6 +4434,7 @@ namespace
         std::vector<int> last_request_batch_outcome_inverse_sample_first_positions_;
         std::vector<bool> last_request_batch_outcome_derived_thresholds_;
         std::vector<std::string> publication_events_;
+        std::vector<std::string> execution_events_;
         std::vector<std::pair<int, int>> forced_request_batch_rejections_;
         std::vector<int> verifier_accepted_prefix_script_;
         std::vector<int> verifier_reject_token_script_;
@@ -4332,6 +4486,7 @@ namespace
         int forward_batch_call_count_{0};
         int publish_mtp_spec_state_count_{0};
         int publish_mtp_spec_state_batch_count_{0};
+        int publish_grouped_decode_equivalent_mtp_spec_state_batch_count_{0};
         int publish_device_resident_mtp_spec_state_count_{0};
         int adopt_device_resident_host_state_count_{0};
         int position_{0};
@@ -6957,6 +7112,260 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    /**
+     * @brief Verifies the LocalTP-style grouped greedy host-publication lane.
+     *
+     * LocalTP can sample grouped verifier rows across sharded logits, but it
+     * does not yet expose a single compact device-resident state publisher for
+     * every TP participant.  The production path should still avoid the old
+     * row-serial decode-equivalent replay: it runs one grouped verifier forward,
+     * reduces the grouped verifier outcome, builds the normal
+     * MTPSpecStepPlanBatch, and publishes through the narrow grouped host
+     * publisher.  Direct all-position publication and device-resident state
+     * publication remain disabled in this test.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GroupedGreedyHostPublicationAvoidsSerialReplayWithoutPromotingDirectPath)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_greedy_host_publication_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableGroupedDecodeEquivalentMTPSpecStatePublication();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->setVerifierAcceptedPrefixScript({2});
+
+            ASSERT_FALSE(mock->supportsMTPSpecStatePublication())
+                << "This regression must not rely on the direct publisher.";
+            ASSERT_FALSE(mock->supportsDeviceResidentMTPSpecStatePublication())
+                << "This regression covers the host-mediated grouped lane.";
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step = runner->decodeStep();
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(step.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->setMTPSpecVerifierPlanCount(), 1);
+            EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 2);
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+            EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
+            EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3);
+            EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1)
+                << "The mock may use a compact greedy reducer for response "
+                   "summarization, but live state must still publish through "
+                   "the grouped host-plan API below.";
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+            EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
+                << "Direct host-plan publication must stay disabled.";
+            EXPECT_EQ(mock->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
+            EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 0);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "Grouped host publication should run one verifier forward "
+                   "and no row-serial catch-up forwards.";
+            EXPECT_THAT(mock->publicationEvents(),
+                        ElementsAre("host_outcome_bridge",
+                                    "grouped_host_plan_publish"));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "decode_equivalent_sequential_verifier_runs"),
+                      nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Timer,
+                                     "decode_equivalent_catchup_forward_one"),
+                      nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "all_position_state_publication_verifier_runs"),
+                      nullptr)
+                << "Grouped host publication reuses the grouped verifier "
+                   "forward machinery, but it must not advertise the direct "
+                   "all-position state-publication counter.";
+            ASSERT_NE(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "grouped_outcome_host_publication_uses"),
+                      nullptr);
+            ASSERT_NE(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "grouped_outcome_host_state_publications"),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "grouped_decode_equivalent_greedy_verifier_runs",
+                          {{"verifier_forward_tokens", "3"},
+                           {"verifier_rows", "3"},
+                           {"state_publication", "grouped_host"}}),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "acceptance_trace",
+                          {{"verifier_path",
+                            "grouped_decode_equivalent_host_publication"},
+                           {"catchup_implementation",
+                            "grouped_decode_equivalent_host_publication"},
+                           {"policy_path",
+                            "grouped_outcome_host_publication"},
+                           {"decode_equivalent_replay_required", "false"}}),
+                      nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Proves grouped-host publication consumes rejected corrections as pending rows.
+     *
+     * A reject-after-first-draft grouped transaction emits the correction token
+     * to the response stream but publishes live model state only through the
+     * accepted verifier prefix.  The following MTP step must therefore feed the
+     * correction back as verifier row zero before it emits any new token.  This
+     * mirrors the CUDA/ROCm long-context Dynamic+MTP+prefix-cache failure where
+     * grouped-host publication bypassed the pending row and sampled from the
+     * wrong decode boundary after prefix restore.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GroupedGreedyHostPublicationConsumesPendingCorrection)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_greedy_host_pending_condition_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableGroupedDecodeEquivalentMTPSpecStatePublication();
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->setVerifierAcceptedPrefixScript({0, 1});
+
+            ASSERT_FALSE(mock->supportsMTPSpecStatePublication())
+                << "The regression must exercise the grouped-host path, not "
+                   "the direct all-position publisher.";
+            ASSERT_FALSE(mock->supportsDeviceResidentMTPSpecStatePublication())
+                << "Device-resident publication has its own pending-condition "
+                   "mailbox coverage; this test covers the host-plan lane.";
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult rejected = runner->decodeStep();
+            ASSERT_TRUE(rejected.success()) << rejected.error;
+            EXPECT_THAT(rejected.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            EXPECT_EQ(mock->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "The rejecting grouped-host step should run one verifier "
+                   "forward and no row-serial replay.";
+
+            const auto records_after_reject = PerfStatsCollector::snapshot({"mtp"});
+            ASSERT_NE(findPerfRecordWithTags(
+                          records_after_reject,
+                          PerfStatRecord::Kind::Counter,
+                          "transaction_commits",
+                          {{"path", "all_position_state_publication_verifier"},
+                           {"tokens",
+                            std::string("7,") +
+                                std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)},
+                           {"emitted_tokens", "2"},
+                           {"next_pending_condition_token",
+                            std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)}}),
+                      nullptr);
+
+            const int forward_count_after_reject = mock->forwardCallCount();
+            GenerationResult consumed = runner->decodeStep();
+            ASSERT_TRUE(consumed.success()) << consumed.error;
+            EXPECT_THAT(consumed.tokens,
+                        ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::DECODE_ARGMAX_TOKEN))
+                << "The rejected correction was already emitted in the first "
+                   "transaction. Step two must consume it as verifier input "
+                   "before emitting the newly accepted draft and correction row.";
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_reject + 1)
+                << "Grouped-host pending-condition consumption should run one "
+                   "grouped verifier forward and skip the standalone condition "
+                   "forward.";
+
+            const auto records_after_consumption = PerfStatsCollector::snapshot({"mtp"});
+            EXPECT_EQ(findPerfRecord(records_after_consumption,
+                                     PerfStatRecord::Kind::Counter,
+                                     "pending_condition_fast_path_bypasses"),
+                      nullptr)
+                << "Grouped-host publication must not bypass a pending "
+                   "correction row.";
+            ASSERT_NE(findPerfRecord(records_after_consumption,
+                                     PerfStatRecord::Kind::Counter,
+                                     "condition_forward_skipped_pending_condition"),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records_after_consumption,
+                          PerfStatRecord::Kind::Counter,
+                          "first_token_pending_condition_rows",
+                          {{"token",
+                            std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)}}),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records_after_consumption,
+                          PerfStatRecord::Kind::Counter,
+                          "acceptance_trace",
+                          {{"verifier_path",
+                           "grouped_decode_equivalent_host_publication"},
+                           {"pending_condition_input", "true"},
+                           {"output_tokens", "2"},
+                           {"next_pending_condition_token",
+                            std::to_string(MockInferenceRunner::DECODE_ARGMAX_TOKEN)}}),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records_after_consumption,
+                          PerfStatRecord::Kind::Counter,
+                          "transaction_commits",
+                          {{"path", "all_position_state_publication_verifier"},
+                           {"emitted_token_start_index", "1"},
+                           {"emitted_tokens", "2"},
+                           {"next_pending_condition_token",
+                            std::to_string(MockInferenceRunner::DECODE_ARGMAX_TOKEN)}}),
+                      nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, GroupedGreedyStagesHostVisibleVerifierRowForResidentOutcome)
     {
         const std::filesystem::path export_path =
@@ -7249,6 +7658,24 @@ namespace
             EXPECT_TRUE(mock->lastPublishedMTPSpecStep().reuse_initial_mtp_shifted_kv_row)
                 << "The plan flag means the initial shifted row is resident, "
                    "whether it came from a sidecar or verifier-base publication.";
+            const auto &events = mock->executionEvents();
+            const auto verifier_forward =
+                std::find(events.begin(), events.end(), "forward_all_position");
+            const auto checkpoint_repair =
+                std::find(events.begin(), events.end(), "checkpoint_terminal_hidden_shifted_commit");
+            const auto host_publish =
+                std::find(events.begin(), events.end(), "host_plan_publish");
+            ASSERT_NE(verifier_forward, events.end());
+            ASSERT_NE(checkpoint_repair, events.end());
+            ASSERT_NE(host_publish, events.end());
+            EXPECT_LT(std::distance(events.begin(), verifier_forward),
+                      std::distance(events.begin(), checkpoint_repair))
+                << "The initial shifted row is repaired only after verifier rows "
+                   "prove the first token is publishable.";
+            EXPECT_LT(std::distance(events.begin(), checkpoint_repair),
+                      std::distance(events.begin(), host_publish))
+                << "The publication plan may claim row-zero shifted KV is "
+                   "resident only after checkpoint-terminal-hidden repair runs.";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *deferred_initial =
@@ -7268,7 +7695,7 @@ namespace
                     records,
                     PerfStatRecord::Kind::Counter,
                     "all_position_initial_shifted_commits",
-                    {{"source", "verifier_base_terminal_hidden"}});
+                    {{"source", "verifier_base_checkpoint_terminal_hidden"}});
             ASSERT_NE(initial_commit, nullptr);
             EXPECT_DOUBLE_EQ(initial_commit->value, 1.0);
         }
@@ -7324,6 +7751,20 @@ namespace
                 << "Non-reuse shifted commits must be anchored to the verifier "
                    "base cached-token count, not the later sidecar planning position.";
             EXPECT_TRUE(mock->lastPublishedMTPSpecStep().reuse_initial_mtp_shifted_kv_row);
+            const auto &events = mock->executionEvents();
+            const auto verifier_forward =
+                std::find(events.begin(), events.end(), "forward_all_position");
+            const auto checkpoint_repair =
+                std::find(events.begin(), events.end(), "checkpoint_terminal_hidden_shifted_commit");
+            const auto host_publish =
+                std::find(events.begin(), events.end(), "host_plan_publish");
+            ASSERT_NE(verifier_forward, events.end());
+            ASSERT_NE(checkpoint_repair, events.end());
+            ASSERT_NE(host_publish, events.end());
+            EXPECT_LT(std::distance(events.begin(), verifier_forward),
+                      std::distance(events.begin(), checkpoint_repair));
+            EXPECT_LT(std::distance(events.begin(), checkpoint_repair),
+                      std::distance(events.begin(), host_publish));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *deferred_initial =
@@ -7342,7 +7783,7 @@ namespace
                     records,
                     PerfStatRecord::Kind::Counter,
                     "all_position_initial_shifted_commits",
-                    {{"source", "verifier_base_terminal_hidden"}});
+                    {{"source", "verifier_base_checkpoint_terminal_hidden"}});
             ASSERT_NE(initial_commit, nullptr);
             EXPECT_DOUBLE_EQ(initial_commit->value, 1.0);
         }
@@ -10528,12 +10969,127 @@ namespace
     }
 
     /**
-     * @brief LocalTP must replay grouped-greedy verifier rows until a compact
-     *        cross-shard device outcome reducer exists.
+     * @brief LocalTP compact publication samples rejected verifier rows before
+     *        all-position logits are torn down.
+     *
+     * The CUDA/ROCm LocalTP path samples sharded verifier rows at the rank
+     * level by reading each participant's `LogitsLocalInfo`, then publishes the
+     * accepted prefix through every child's grouped decode-equivalent publisher.
+     * A rejected draft is the sharp regression case: if orchestration disables
+     * row-indexed all-position logits before compact outcome sampling, the
+     * local views can be rebound or cleared and the correction token commonly
+     * degenerates to zero.
      */
     TEST_F(Test__PrefillDecodeTransition,
-           LocalTPGroupedGreedyWithoutCompactOutcomeFallsBackToSequentialReplay)
+           LocalTPGroupedCompactPublicationSamplesRejectBeforeLogitTeardown)
     {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_localtp_grouped_host_reject_precleanup_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto harness = createLocalTPRunner(
+                /*mtp_accept=*/false,
+                /*column_parallel_logits=*/true,
+                {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+                /*mtp_draft_tokens=*/1);
+            for (MockInferenceRunner *child : {harness.child0, harness.child1})
+            {
+                child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+                child->enableGroupedDecodeEquivalentMTPSpecStatePublication();
+                child->enableMTPSidecarPreservesMainState();
+                child->enableMTPTokenCoordination(/*hide_local_logits=*/false);
+                child->requireAllPositionLocalInfoWhileEnabled();
+                child->setVerifierAcceptedPrefixScript({0});
+            }
+            SamplingParams penalty_greedy;
+            penalty_greedy.temperature = 0.0f;
+            penalty_greedy.presence_penalty = 1.0f;
+            harness.runner->setSamplingParams(penalty_greedy);
+
+            ASSERT_TRUE(harness.runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step = harness.runner->decodeStep();
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(step.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+            EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+            EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 0)
+                << "Multi-child LocalTP reduces compact outcomes at the rank, "
+                   "not by delegating to one child.";
+            EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 0);
+            EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 0)
+                << "Rank-level sharded sampling consumes LogitsLocalInfo "
+                   "instead of asking one participant to sample all rows.";
+            EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
+            EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
+            EXPECT_EQ(harness.child0->publishMTPSpecStateBatchCount(), 0);
+            EXPECT_EQ(harness.child1->publishMTPSpecStateBatchCount(), 0);
+            EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
+            EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
+            EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 0);
+            EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 0);
+            EXPECT_THAT(harness.child0->publicationEvents(),
+                        ElementsAre("grouped_host_plan_publish"));
+            EXPECT_THAT(harness.child1->publicationEvents(),
+                        ElementsAre("grouped_host_plan_publish"));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *pre_cleanup_sample =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "grouped_outcome_greedy_verifier_rows_sampled_before_all_position_cleanup");
+            ASSERT_NE(pre_cleanup_sample, nullptr);
+            EXPECT_DOUBLE_EQ(pre_cleanup_sample->value, 2.0);
+            const PerfStatRecord *pre_cleanup_penalties =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "grouped_outcome_greedy_penalty_rows_preapplied");
+            ASSERT_NE(pre_cleanup_penalties, nullptr);
+            EXPECT_DOUBLE_EQ(pre_cleanup_penalties->value, 2.0);
+            ASSERT_NE(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "rank_all_position_greedy_resident_compatible_outcomes"),
+                      nullptr);
+            ASSERT_NE(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "grouped_outcome_pending_condition_resident_mailboxes"),
+                      nullptr);
+            ASSERT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "grouped_outcome_pending_condition_host_tokens"),
+                      nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "acceptance_trace",
+                          {{"verifier_path",
+                            "grouped_decode_equivalent_greedy"},
+                           {"catchup_implementation",
+                            "device_batch_outcome_device_resident_publication"},
+                           {"policy_path",
+                            "grouped_outcome_device_resident_publication"},
+                           {"decode_equivalent_replay_required", "false"}}),
+                      nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief LocalTP grouped greedy uses the rank compact outcome publisher.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           LocalTPGroupedGreedyUsesRankCompactOutcomeAndGroupedPublication)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_localtp_rank_compact_publication_unit.json";
+        ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
         PerfStatsCollector::reset();
         auto harness = createLocalTPRunner(
             /*mtp_accept=*/true,
@@ -10543,8 +11099,7 @@ namespace
         for (MockInferenceRunner *child : {harness.child0, harness.child1})
         {
             child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
-            child->enableDeviceResidentMTPSpecStatePublication();
-            child->hideMTPSpecStatePublicationFromPolicy();
+            child->enableGroupedDecodeEquivalentMTPSpecStatePublication();
             child->setVerifierAcceptedPrefixScript({2});
         }
 
@@ -10559,21 +11114,35 @@ namespace
 
         EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 0);
         EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 0)
-            << "Multi-child LocalTP advertises sharded row sampling, not one "
-               "compact device outcome reducer.";
+            << "RankOrchestrator owns the cross-shard compact outcome.";
         EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 0);
         EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 0);
         EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
         EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
-        EXPECT_GT(harness.child0->commitMTPShiftedCount(), 0);
-        EXPECT_GT(harness.child1->commitMTPShiftedCount(), 0);
+        EXPECT_EQ(harness.child0->publishMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(harness.child1->publishMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
+        EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
 
         const auto records = PerfStatsCollector::snapshot({"mtp"});
-        EXPECT_EQ(findPerfRecord(records,
+        EXPECT_NE(findPerfRecord(records,
                                  PerfStatRecord::Kind::Counter,
                                  "grouped_outcome_device_resident_publication_uses"),
                   nullptr);
+        EXPECT_NE(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Counter,
+                                 "rank_all_position_greedy_resident_compatible_outcomes"),
+                  nullptr);
+        EXPECT_NE(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Counter,
+                                 "grouped_outcome_ready_token_resident_mailboxes"),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Counter,
+                                 "grouped_outcome_ready_token_host_cache_entries"),
+                  nullptr);
         PerfStatsCollector::reset();
+        std::filesystem::remove(export_path);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MPIDynamicMTPDepthBroadcastsRankZeroDecision)

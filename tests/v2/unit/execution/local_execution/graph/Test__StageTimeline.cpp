@@ -260,8 +260,9 @@ TEST_F(Test__StageTimeline, RecordAndCollect_BasicFlow)
     // Collect timings
     timeline.collect(gpu_ctx_.get());
 
-    // Should sync once (on last stop event) and query all 3 pairs
-    EXPECT_EQ(gpu_ctx_->events_synchronized_, 1);
+    // Sync each stage stop event so backend failures are attributed to the
+    // earliest stage that observes them.
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 3);
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 3);
 
     // Check total GPU time
@@ -292,10 +293,10 @@ TEST_F(Test__StageTimeline, CollectSynchronizesLastStopEventOnEachStream)
 
     timeline.collect(gpu_ctx_.get());
 
-    EXPECT_EQ(gpu_ctx_->events_synchronized_, 2)
-        << "stage timing must wait for every explicit stream before querying elapsed events";
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 3)
+        << "stage timing must wait for every recorded stage before querying elapsed events";
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 3);
-    ASSERT_EQ(gpu_ctx_->synchronized_events_.size(), 2u);
+    ASSERT_EQ(gpu_ctx_->synchronized_events_.size(), 3u);
     EXPECT_NE(gpu_ctx_->synchronized_events_[0], gpu_ctx_->synchronized_events_[1]);
 }
 
@@ -579,7 +580,7 @@ TEST_F(Test__StageTimeline, StaleEvents_WouldBeCollectedWithoutReset)
     timeline.collect(gpu_ctx_.get());
 
     // Without reset, it DOES try to sync and query all 4 events
-    EXPECT_EQ(gpu_ctx_->events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 4);
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 4);
 }
 

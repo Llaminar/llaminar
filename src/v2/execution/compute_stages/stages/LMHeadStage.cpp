@@ -4,7 +4,6 @@
  */
 
 #include "LMHeadStage.h"
-#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -214,6 +213,15 @@ namespace llaminar2
             return false;
         }
 
+        if (hidden_states->native_type() != TensorType::FP32 ||
+            logits->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier LM-head requires FP32 hidden/logits"
+                      << " hidden=" << hidden_states->dtype_name()
+                      << " logits=" << logits->dtype_name());
+            return false;
+        }
+
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {lm_gemm, logits, params_.vocab_size, params_.bias_tensor, "lm_head"}};
         const bool success = lm_gemm->multiply_fused_verifier_rows_decode_equivalent(
@@ -223,29 +231,29 @@ namespace llaminar2
             params_.d_model,
             params_.mpi_ctx,
             bound_workspace_);
-
-        if (success)
+        if (!success)
         {
-            if (is_gpu)
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    logits, params_.device_id, stream);
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "lm_head_decode_equivalent_verifier_prefill_rows",
-                static_cast<double>(lm_m),
-                {},
-                params_.device_id.to_string(),
-                {{"route", "grouped"}});
-        }
-        else
-        {
-            LOG_ERROR("[LMHeadStage] Grouped decode-equivalent verifier LM-head is unsupported or failed"
+            LOG_ERROR("[LMHeadStage] Grouped decode-equivalent LM-head failed"
                       << " device=" << params_.device_id.to_string()
                       << " m=" << lm_m
                       << " vocab=" << params_.vocab_size
                       << " d_model=" << params_.d_model);
+            return false;
         }
-        return success;
+
+        if (is_gpu)
+            logits->transitionToWithEvent(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                params_.device_id,
+                stream);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "lm_head_grouped_decode_equivalent_verifier_prefill_rows",
+            static_cast<double>(lm_m),
+            {},
+            params_.device_id.to_string(),
+            {{"route", "grouped"}});
+        return true;
     }
 
     size_t LMHeadStage::estimatedFlops() const

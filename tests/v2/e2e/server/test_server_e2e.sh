@@ -89,6 +89,10 @@
 #   LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS Minimum helper prompt tokens (default: 900)
 #   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: 420)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
+#   LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS Seconds to wait for server startup.
+#                       Default: 300.
+#   LLAMINAR_E2E_SHUTDOWN_TIMEOUT Seconds to wait for graceful server shutdown.
+#                       Default: 120 with PerfStats enabled, 15 otherwise.
 #   LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS Seconds to poll for GPU VRAM release
 #                       after server shutdown before declaring a leak (default: 30)
 #   LLAMINAR_E2E_PERF_STATS Enable per-case PerfStats JSON artifacts and graph
@@ -181,7 +185,8 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 #   prefill-graph-probe  Send repeated same-key long-enough prompts to prove capture/replay.
 #   require-prefill-graph-capture  Fail unless perfstats record prefill capture/replay.
 #   prefix-cache-rebalance-clear-probe  Exercise HTTP prefix-cache requests while
-#                       dynamic MoE rebalance leaves a prepared publish for request cleanup.
+#                       dynamic MoE rebalance leaves a prepared publish for request cleanup;
+#                       fail unless PerfStats prove prefix-cache harvest and restore.
 #   moe-rebalance-movement-probe  Fail unless PerfStats prove the MoE rebalance
 #                       path planned and applied or imported at least one expert.
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
@@ -365,6 +370,18 @@ if [ ${#SUITES[@]} -eq 0 ]; then
             SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
             SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
             SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-cuda2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-greedy-d2-rocm2tp|no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
         fi
         if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
@@ -381,12 +398,19 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     fi
 fi
 
-STARTUP_TIMEOUT=300   # seconds to wait for server startup. Most models load in
-                      # <10s; the 4B Qwen3.5 GGUF on CPU needs ~60-120s for
-                      # weight load + GDN init. The smaller suites finish in
-                      # ~5s either way, so this is just an upper bound.
-SHUTDOWN_TIMEOUT=15   # seconds to wait for graceful SIGTERM shutdown
+STARTUP_TIMEOUT="${LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS:-300}"
+                      # Seconds to wait for server startup. Most models load in
+                      # <10s; large local TP MoE release suites can need
+                      # several minutes for per-backend weight materialization,
+                      # especially on ROCm.
 REQUEST_TIMEOUT=180   # seconds per curl request
+if [[ -n "${LLAMINAR_E2E_SHUTDOWN_TIMEOUT:-}" ]]; then
+    SHUTDOWN_TIMEOUT="${LLAMINAR_E2E_SHUTDOWN_TIMEOUT}"
+elif [[ "$PERF_STATS_ENABLED" == "1" ]]; then
+    SHUTDOWN_TIMEOUT=120
+else
+    SHUTDOWN_TIMEOUT=15
+fi
 
 # Optional long-context helper controls. The helper is intentionally gated to
 # 4B+ models by default so small smoke-test suites keep their fast behavior.
@@ -511,6 +535,25 @@ server_client_host() {
 server_base_url() {
     local port="$1"
     echo "http://$(server_client_host):${port}"
+}
+
+port_accepts_connections() {
+    local port="$1"
+    local host
+    host="$(server_client_host)"
+
+    python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=0.25):
+        sys.exit(0)
+except OSError:
+    sys.exit(1)
+PY
 }
 
 resolve_docker_network() {
@@ -780,6 +823,31 @@ if [ "$sent" != 1 ] && [ -n "$fallback_pid" ]; then
 fi
 [ "$sent" = 1 ]
 ' _ "$signal_name" >/dev/null 2>&1
+}
+
+signal_local_llaminar_processes() {
+    local root="$1"
+    local signal_name="${2:-TERM}"
+    local sent=0
+    local fallback_pid=""
+    local pid comm
+
+    for pid in $(collect_process_tree_pids "$root" 2>/dev/null || true); do
+        [[ -r "/proc/${pid}/comm" ]] || continue
+        comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+        [[ "$comm" == "llaminar2" ]] || continue
+
+        [[ -n "$fallback_pid" ]] || fallback_pid="$pid"
+        if tr "\000" "\n" <"/proc/${pid}/environ" 2>/dev/null | grep -qx "OMPI_COMM_WORLD_RANK=0"; then
+            kill "-${signal_name}" "$pid" >/dev/null 2>&1 && sent=1 || true
+        fi
+    done
+
+    if [[ "$sent" != 1 && -n "$fallback_pid" ]]; then
+        kill "-${signal_name}" "$fallback_pid" >/dev/null 2>&1 && sent=1 || true
+    fi
+
+    [[ "$sent" == 1 ]]
 }
 
 server_is_alive() {
@@ -1111,6 +1179,13 @@ cleanup_server() {
     fi
 }
 
+request_server_shutdown() {
+    local port="$1"
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --max-time 10 "$(server_base_url "$port")/admin/shutdown" 2>/dev/null || echo "000")
+    [[ "$code" == "202" ]]
+}
+
 copy_container_artifact() {
     local handle="$1"
     local container_path="$2"
@@ -1131,23 +1206,39 @@ copy_container_artifact() {
 shutdown_and_validate() {
     local tag="$1"
     local handle="$2"
-    local gpu_before_mb="$3"
-    local backend="${4:-}"
-    local extra_flags="${5:-}"
+    local port="$3"
+    local gpu_before_mb="$4"
+    local backend="${5:-}"
+    local extra_flags="${6:-}"
+    local tracked_server_pids=""
+    tracked_server_pids="$(get_server_pids "$handle" 2>/dev/null || true)"
 
     # ─── Check 1: Clean SIGTERM exit ─────────────────────────────────
     local exit_code=0
+    local shutdown_requested=0
     if [[ "$handle" == docker:* ]]; then
         local container log_pid
         container="$(docker_handle_container "$handle")"
         log_pid="$(docker_handle_log_pid "$handle")"
 
         if server_is_alive "$handle"; then
-            signal_container_llaminar_processes "$container" TERM || true
+            shutdown_requested=1
+            local signalled=0
+            if ! request_server_shutdown "$port"; then
+                signal_container_llaminar_processes "$container" TERM || true
+                signalled=1
+            fi
             local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
             while server_is_alive "$handle" && [ $SECONDS -lt $deadline ]; do
                 sleep 0.2
             done
+            if server_is_alive "$handle" && [ "$signalled" -eq 0 ]; then
+                signal_container_llaminar_processes "$container" TERM || true
+                deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+                while server_is_alive "$handle" && [ $SECONDS -lt $deadline ]; do
+                    sleep 0.2
+                done
+            fi
         fi
 
         if server_is_alive "$handle"; then
@@ -1170,19 +1261,33 @@ shutdown_and_validate() {
         local pid
         pid="$(pid_handle_pid "$handle")"
         if kill -0 "$pid" 2>/dev/null; then
-            # Kill the entire process tree (TP/PP spawns child ranks via mpirun)
-            local tree_pids
-            tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
-            kill $tree_pids 2>/dev/null || true
+            shutdown_requested=1
+            # Signal the serving rank first.  Killing the whole mpirun tree at
+            # once can bypass ServerMode's signal handler and skip runner
+            # shutdown hooks such as PerfStats export.
+            local signalled=0
+            if ! request_server_shutdown "$port"; then
+                signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
+                signalled=1
+            fi
 
             # Wait with timeout — poll until root process exits or deadline
             local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
             while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
                 sleep 0.2
             done
+            if kill -0 "$pid" 2>/dev/null && [ "$signalled" -eq 0 ]; then
+                signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
+                deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+                while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
+                    sleep 0.2
+                done
+            fi
 
             if kill -0 "$pid" 2>/dev/null; then
                 # Process didn't exit gracefully — force kill entire tree
+                local tree_pids
+                tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
                 fail "[${tag}] Shutdown: process did not exit within ${SHUTDOWN_TIMEOUT}s after SIGTERM, sending SIGKILL"
                 kill -9 $tree_pids 2>/dev/null || true
                 wait "$pid" 2>/dev/null || true
@@ -1195,6 +1300,11 @@ shutdown_and_validate() {
             # Process already exited — get its status
             wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
         fi
+    fi
+
+    if [ "$shutdown_requested" -ne 1 ]; then
+        fail "[${tag}] Shutdown: server exited before shutdown validation (exit code ${exit_code})"
+        return
     fi
 
     # ─── Check 2: No crash/segfault on exit ──────────────────────────
@@ -1233,7 +1343,7 @@ shutdown_and_validate() {
 
     # Allow small variance (driver overhead, context caching) — 64 MiB tolerance
     local VRAM_LEAK_TOLERANCE_MB=64
-    local gpu_after_mb gpu_leaked_mb release_deadline
+    local gpu_after_mb gpu_leaked_mb release_deadline server_gpu_mb foreign_gpu_mb
 
     # ─── Check 3: GPU VRAM fully released ────────────────────────────
     if is_gpu_backend "$backend" && ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
@@ -1246,9 +1356,15 @@ shutdown_and_validate() {
     # reporting a false leak while the driver is still releasing allocations.
     release_deadline=$((SECONDS + GPU_RELEASE_TIMEOUT_SECONDS))
     while true; do
-        gpu_after_mb=$(get_total_gpu_memory_mb)
+        server_gpu_mb=0
+        if [ -n "$tracked_server_pids" ]; then
+            server_gpu_mb=$(get_process_tree_gpu_memory_mb "$tracked_server_pids")
+        fi
+        foreign_gpu_mb=$(get_foreign_gpu_memory_mb_for_backend "$backend" "$extra_flags" "$tracked_server_pids")
+        gpu_after_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
         gpu_leaked_mb=$((gpu_after_mb - gpu_before_mb))
-        if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
+        if [ "$server_gpu_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ] &&
+           { [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ] || [ "$foreign_gpu_mb" -gt 0 ]; }; then
             break
         fi
         if [ $SECONDS -ge $release_deadline ]; then
@@ -1257,8 +1373,12 @@ shutdown_and_validate() {
         sleep 1
     done
 
-    if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
+    if [ "$server_gpu_mb" -gt "$VRAM_LEAK_TOLERANCE_MB" ]; then
+        fail "[${tag}] Shutdown: server process tree still owns GPU VRAM (server=${server_gpu_mb} MiB, before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB)"
+    elif [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
         pass "[${tag}] Shutdown: GPU VRAM released (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, delta=${gpu_leaked_mb} MiB)"
+    elif [ "$foreign_gpu_mb" -gt 0 ]; then
+        pass "[${tag}] Shutdown: server GPU VRAM released; global backend memory check ignored because foreign GPU users are active (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, foreign=${foreign_gpu_mb} MiB)"
     else
         fail "[${tag}] Shutdown: GPU VRAM leak detected (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, leaked=${gpu_leaked_mb} MiB)"
     fi
@@ -1507,6 +1627,30 @@ get_total_gpu_memory_mb() {
     echo $((nvidia_mb + amd_mb))
 }
 
+get_gpu_memory_mb_for_backend() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    local expects_cuda=0
+    local expects_rocm=0
+    local total_mb=0
+
+    backend_expects_cuda_memory "$backend" "$extra_flags" && expects_cuda=1
+    backend_expects_rocm_memory "$backend" "$extra_flags" && expects_rocm=1
+
+    if [ "$expects_cuda" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_nvidia_total_gpu_mb)))
+    fi
+    if [ "$expects_rocm" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_amd_total_gpu_mb)))
+    fi
+
+    if [ "$expects_cuda" -eq 0 ] && [ "$expects_rocm" -eq 0 ]; then
+        total_mb=$(get_total_gpu_memory_mb)
+    fi
+
+    echo "$total_mb"
+}
+
 get_nvidia_process_gpu_mb() {
     local pids="$1"
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -1523,6 +1667,26 @@ get_nvidia_process_gpu_mb() {
                 gsub(/ /, "", $1)
                 gsub(/[^0-9]/, "", $2)
                 if (($1 in pid) && $2 != "") sum += $2
+            }
+            END {print sum + 0}'
+}
+
+get_nvidia_foreign_process_gpu_mb() {
+    local pids="$1"
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+    { nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true; } |
+        awk -F',' -v owned="$pids" '
+            BEGIN {
+                split(owned, arr, " ")
+                for (i in arr) if (arr[i] != "") pid[arr[i]] = 1
+            }
+            {
+                gsub(/ /, "", $1)
+                gsub(/[^0-9]/, "", $2)
+                if (!($1 in pid) && $1 != "" && $2 != "") sum += $2
             }
             END {print sum + 0}'
 }
@@ -1598,12 +1762,107 @@ print(walk(data))
 PY
 }
 
+get_amd_foreign_process_gpu_mb() {
+    local pids="$1"
+    if ! command -v amd-smi >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+
+    local amd_json
+    amd_json=$(amd-smi process --general --json 2>/dev/null || echo '[]')
+    AMD_SMI_JSON="$amd_json" python3 - "$pids" <<'PY'
+import json
+import os
+import re
+import sys
+
+owned = {int(p) for p in sys.argv[1].split() if p.strip().isdigit()}
+try:
+    data = json.loads(os.environ.get("AMD_SMI_JSON", "[]"))
+except Exception:
+    print(0)
+    sys.exit(0)
+
+def parse_mib(value):
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+    if not match:
+        return 0
+    amount = float(match.group(1))
+    lower = text.lower()
+    if "gib" in lower or "gb" in lower:
+        amount *= 1024
+    elif "kib" in lower or "kb" in lower:
+        amount /= 1024
+    elif "b" in lower and "mb" not in lower and "mib" not in lower:
+        amount /= 1048576
+    return int(amount)
+
+def find_pid(obj):
+    if not isinstance(obj, dict):
+        return None
+    for key, value in obj.items():
+        normalized = key.lower().replace(" ", "_")
+        if normalized in {"pid", "process_id", "processid"}:
+            try:
+                return int(str(value).split()[0])
+            except Exception:
+                return None
+    return None
+
+def walk(obj):
+    total = 0
+    if isinstance(obj, dict):
+        pid = find_pid(obj)
+        if pid is not None and pid not in owned:
+            for key, value in obj.items():
+                lower = key.lower()
+                if ("mem" in lower or "vram" in lower or "gtt" in lower) and "total" not in lower and "free" not in lower:
+                    total += parse_mib(value)
+        for value in obj.values():
+            total += walk(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            total += walk(value)
+    return total
+
+print(walk(data))
+PY
+}
+
 get_process_tree_gpu_memory_mb() {
     local pids="$1"
     local nvidia_mb amd_mb
     nvidia_mb=$(get_nvidia_process_gpu_mb "$pids")
     amd_mb=$(get_amd_process_gpu_mb "$pids")
     echo $((nvidia_mb + amd_mb))
+}
+
+get_foreign_gpu_memory_mb_for_backend() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    local owned_pids="${3:-}"
+    local expects_cuda=0
+    local expects_rocm=0
+    local total_mb=0
+
+    backend_expects_cuda_memory "$backend" "$extra_flags" && expects_cuda=1
+    backend_expects_rocm_memory "$backend" "$extra_flags" && expects_rocm=1
+
+    if [ "$expects_cuda" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_nvidia_foreign_process_gpu_mb "$owned_pids")))
+    fi
+    if [ "$expects_rocm" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_amd_foreign_process_gpu_mb "$owned_pids")))
+    fi
+    if [ "$expects_cuda" -eq 0 ] && [ "$expects_rocm" -eq 0 ]; then
+        total_mb=$(( $(get_nvidia_foreign_process_gpu_mb "$owned_pids") + $(get_amd_foreign_process_gpu_mb "$owned_pids") ))
+    fi
+
+    echo "$total_mb"
 }
 
 scan_server_log() {
@@ -1666,7 +1925,7 @@ check_memory_usage() {
         return
     fi
     gpu_process_mb=$(get_process_tree_gpu_memory_mb "$pids")
-    gpu_after_mb=$(get_total_gpu_memory_mb)
+    gpu_after_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
     gpu_delta_mb=$((gpu_after_mb - gpu_before_mb))
     abs_gpu_delta_mb=${gpu_delta_mb#-}
     model_mb=$(du -m "$model" 2>/dev/null | awk '{print $1}' || echo 0)
@@ -1688,9 +1947,9 @@ check_memory_usage() {
         if ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] GPU memory: host telemetry unavailable for backend ${backend}; relying on GPU PerfStats/server-log validation"
         elif [ "$gpu_process_mb" -ge "$GPU_ACTIVE_MIN_MB" ] || [ "$abs_gpu_delta_mb" -ge "$GPU_ACTIVE_MIN_MB" ]; then
-            pass "[${tag}] GPU memory: process ${gpu_process_mb} MiB, global delta ${gpu_delta_mb} MiB"
+            pass "[${tag}] GPU memory: process ${gpu_process_mb} MiB, backend delta ${gpu_delta_mb} MiB"
         else
-            fail "[${tag}] GPU memory: expected active GPU usage, process ${gpu_process_mb} MiB, global delta ${gpu_delta_mb} MiB"
+            fail "[${tag}] GPU memory: expected active GPU usage, process ${gpu_process_mb} MiB, backend delta ${gpu_delta_mb} MiB"
         fi
     else
         if [ "$gpu_process_mb" -le "$CPU_GPU_DELTA_LIMIT_MB" ] && [ "$abs_gpu_delta_mb" -le "$CPU_GPU_DELTA_LIMIT_MB" ]; then
@@ -1714,8 +1973,11 @@ validate_perf_stats() {
     fi
 
     if [ ! -s "$perf_path" ]; then
-        if is_mtp_case "$extra_flags" && is_gpu_backend "$backend"; then
-            fail "[${tag}] PerfStats: missing artifact for GPU MTP case (${perf_path})"
+        if (is_mtp_case "$extra_flags" && is_gpu_backend "$backend") ||
+           suite_runs_prefill_graph_probe "$suite_options" ||
+           suite_runs_prefix_cache_rebalance_clear_probe "$suite_options" ||
+           suite_runs_moe_rebalance_movement_probe "$suite_options"; then
+            fail "[${tag}] PerfStats: missing required artifact (${perf_path})"
         else
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] PerfStats: no records emitted (${perf_path})"
         fi
@@ -1807,6 +2069,21 @@ def tag_value_sum(keys, names=None, domain=None):
                 total += numeric(value)
     return total
 
+def max_tag_value(key, names=None, domain=None, required_tags=None):
+    wanted_names = set(names or [])
+    required_tags = required_tags or {}
+    maximum = 0.0
+    for record in records:
+        if wanted_names and record.get("name") not in wanted_names:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        record_tags = record.get("tags") or {}
+        if any(record_tags.get(tag_key) != tag_value for tag_key, tag_value in required_tags.items()):
+            continue
+        maximum = max(maximum, numeric(record_tags.get(key)))
+    return maximum
+
 def flag_value(flag):
     try:
         tokens = shlex.split(extra_flags)
@@ -1875,14 +2152,17 @@ if is_gpu and is_mtp:
     ):
         print("FAIL: GPU MTP case emitted no sidecar graph cache/capture counters")
         sys.exit(0)
-    if not has_record(
-        "live_prefix_replay_state_after_mutation",
-        "mtp",
-        {
-            "operation": "clear_cache",
-            "forward_replay_reset_scope": "request_boundary_preserve",
-            "kernel_dynamic_state": "preserved",
-        },
+    if not any(
+        has_record(
+            "live_prefix_replay_state_after_mutation",
+            "mtp",
+            {
+                "operation": operation,
+                "forward_replay_reset_scope": "request_boundary_preserve",
+                "kernel_dynamic_state": "preserved",
+            },
+        )
+        for operation in ("clear_cache", "request-clear-cache")
     ):
         print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
         sys.exit(0)
@@ -1894,17 +2174,108 @@ if require_prefix_rebalance_clear:
     if " --prefix-cache " not in f" {extra_flags} ":
         print("FAIL: prefix-cache rebalance clear probe requires --prefix-cache")
         sys.exit(0)
-    if " --moe-rebalance dynamic " not in f" {extra_flags} ":
-        print("FAIL: prefix-cache rebalance clear probe requires --moe-rebalance dynamic")
+    mode = flag_value("--moe-rebalance")
+    if mode not in {"dynamic", "llep"}:
+        print("FAIL: prefix-cache rebalance clear probe requires --moe-rebalance dynamic or llep")
         sys.exit(0)
-    for name in (
-        "async_delayed_prepares",
-        "clear_cache_pending_publish_drains",
-        "async_delayed_publishes",
+    prefix_lookup_score = record_value_sum(
+        ("lookup_results",),
+        "prefix_cache",
+    )
+    prefix_harvest_score = record_value_sum(
+        ("harvest_inserts",),
+        "prefix_cache",
+    )
+    prefix_restore_score = record_value_sum(
+        (
+            "block_hits",
+            "populate_restores",
+            "model_runtime_state_restores",
+        ),
+        "prefix_cache",
+    )
+    if prefix_lookup_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe emitted no prefix-cache lookup counters")
+        sys.exit(0)
+    if prefix_harvest_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe emitted no prefix-cache harvest counters")
+        sys.exit(0)
+    if prefix_restore_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe emitted no prefix-cache hit/restore counters")
+        sys.exit(0)
+    if is_mtp and not has_record(
+        "populate_restores",
+        "prefix_cache",
+        {"includes_mtp_state": "true"},
     ):
-        if not has_record(name, "moe_rebalance"):
-            print(f"FAIL: prefix-cache rebalance clear probe emitted no {name} counter")
-            sys.exit(0)
+        print("FAIL: prefix-cache+MTP rebalance case did not restore MTP-bearing prefix-cache state")
+        sys.exit(0)
+    movement_score = (
+        record_value_sum(
+            (
+                "device_rebalance_apply_applied_arrivals",
+                "device_rebalance_transfer_current_applied_arrivals",
+                "device_rebalance_transfer_useful_payload_bytes",
+                "device_rebalance_wave_applied_arrivals",
+                "device_rebalance_wave_applied_arrivals_total",
+                "device_rebalance_windows_applied",
+                "device_rebalance_llep_weight_transfer_count",
+                "gpu_direct_transfer_count",
+                "gpu_direct_transfer_bytes",
+                "gpu_direct_transfer_slot_publish_experts",
+                "replica_arrivals",
+                "new_placement_entries",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "applied_arrivals",
+                "copied_arrivals",
+                "windows_applied",
+                "payload_bucket_slots",
+                "llep_weight_transfer_count",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    if movement_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe saw no applied/imported expert movement")
+        sys.exit(0)
+    pending_publish_drains = record_value_sum(
+        ("clear_cache_pending_publish_drains",),
+        "moe_rebalance",
+    )
+    device_request_reset_exports = 0.0
+    for record in records:
+        if record.get("name") != "device_maintenance_graph_request_reset_exports":
+            continue
+        if record.get("domain") != "moe_rebalance":
+            continue
+        record_tags = record.get("tags") or {}
+        if (
+            record_tags.get("reset") == "clear_cache"
+            and record_tags.get("window") == "request_reset"
+        ):
+            device_request_reset_exports += numeric(record.get("value", record.get("count", 0.0)))
+    if mode != "llep" and pending_publish_drains + device_request_reset_exports <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe did not observe clear-cache rebalance drain/export")
+        sys.exit(0)
+    runtime_movement_epoch = max(
+        max_tag_value(
+            "moe_runtime_movement_epoch",
+            names=("live_prefix_replay_state_after_mutation",),
+            required_tags={
+                "operation": operation,
+                "forward_replay_reset_scope": "request_boundary_preserve",
+                "kernel_dynamic_state": "preserved",
+            },
+        )
+        for operation in ("clear_cache", "request-clear-cache")
+    )
+    if runtime_movement_epoch <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe did not observe nonzero moe_runtime_movement_epoch at request-boundary clear_cache")
+        sys.exit(0)
 
 if require_moe_rebalance_movement:
     if not is_gpu:
@@ -2430,9 +2801,13 @@ run_backend_tests() {
     safe_tag=$(sanitize_name "$tag")
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
     perf_path="${log_path%.log}.perfstats.json"
-    gpu_before_mb=$(get_total_gpu_memory_mb)
+    gpu_before_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
         echo -e "  ${BLUE}INFO${NC} [${tag}] PerfStats artifact: ${perf_path}"
+    fi
+    if port_accepts_connections "$port"; then
+        fail "[${tag}] Server port ${port} is already in use; pass --port with a free base port or stop the existing server"
+        return
     fi
 
     local context_args=()
@@ -2443,6 +2818,7 @@ run_backend_tests() {
     local -a server_env=(
         "LLAMINAR_LOG_LEVEL=$LOG_LEVEL"
         "LLAMINAR_TRACE_GENERATED_TOKENS=$TRACE_TOKENS"
+        "LLAMINAR_ENABLE_SERVER_SHUTDOWN_ENDPOINT=1"
     )
     if suite_disables_prefill_graph_buckets "$suite_options"; then
         echo -e "  ${BLUE}INFO${NC} [${tag}] Prefill graph buckets: disabled by suite option for unsupported collective topology"
@@ -2595,7 +2971,7 @@ run_backend_tests() {
 
     # ─── Test 8: Error handling — invalid JSON ────────────────────────
     local error_response error_msg
-    error_response=$(curl -s --max-time 5 -X POST \
+    error_response=$(curl -s --max-time "$REQUEST_TIMEOUT" -X POST \
         -H "Content-Type: application/json" \
         -d 'not valid json' \
         "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{}')
@@ -2613,7 +2989,7 @@ print(d.get('error', {}).get('type', ''))
     fi
 
     # ─── Test 9: Error handling — missing messages ────────────────────
-    error_response=$(curl -s --max-time 5 -X POST \
+    error_response=$(curl -s --max-time "$REQUEST_TIMEOUT" -X POST \
         -H "Content-Type: application/json" \
         -d '{"max_tokens": 10}' \
         "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{}')
@@ -2650,7 +3026,7 @@ print(d.get('error', {}).get('type', ''))
     check_memory_usage "$tag" "$backend" "$model" "$server_handle" "$gpu_before_mb" "$extra_flags"
 
     # ─── Test 11: Graceful shutdown validation ────────────────────────
-    shutdown_and_validate "$tag" "$server_handle" "$gpu_before_mb" "$backend" "$extra_flags"
+    shutdown_and_validate "$tag" "$server_handle" "$port" "$gpu_before_mb" "$backend" "$extra_flags"
     copy_container_artifact "$server_handle" "$perf_path" "$perf_path"
 
     # ─── Test 12: Server log hygiene (after shutdown) ─────────────────

@@ -28,6 +28,19 @@ namespace llaminar2
             return desc.gate.valid() && desc.up.valid() && desc.down.valid();
         }
 
+        uint32_t portableMoEExpertFlags(uint32_t flags) noexcept
+        {
+            return flags & ~toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+        }
+
+        uint32_t clearPayloadBearingMoEExpertFlags(uint32_t flags) noexcept
+        {
+            return flags & ~(toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+                             toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+                             toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute) |
+                             toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot));
+        }
+
         bool descriptorRequiresReadyPayload(const DeviceMoEExpertDescriptor &desc, uint8_t local_compute)
         {
             return local_compute != 0 ||
@@ -227,6 +240,173 @@ namespace llaminar2
             state.router_hot_cache_replicated_selected_expert_slots = 0;
         }
 
+        struct RuntimeScratchBindings
+        {
+            int32_t *route_expert_ids = nullptr;
+            float *route_weights = nullptr;
+            int32_t *route_participant_ids = nullptr;
+            int32_t *expert_counts = nullptr;
+            int32_t *expert_offsets = nullptr;
+            int32_t *grouped_token_ids = nullptr;
+            float *grouped_route_weights = nullptr;
+            float *grouped_gate_scratch = nullptr;
+            float *grouped_up_scratch = nullptr;
+            float *grouped_output_partials = nullptr;
+            void *decode_scratch = nullptr;
+            void *reserved_ptrs[3] = {};
+            uint64_t reserved_u64[2] = {};
+            uint32_t prefill_token_capacity = 0;
+            uint32_t prefill_route_capacity = 0;
+        };
+
+        RuntimeScratchBindings captureRuntimeScratchBindings(const DeviceMoELayerRuntime &state) noexcept
+        {
+            RuntimeScratchBindings scratch;
+            scratch.route_expert_ids = state.route_expert_ids;
+            scratch.route_weights = state.route_weights;
+            scratch.route_participant_ids = state.route_participant_ids;
+            scratch.expert_counts = state.expert_counts;
+            scratch.expert_offsets = state.expert_offsets;
+            scratch.grouped_token_ids = state.grouped_token_ids;
+            scratch.grouped_route_weights = state.grouped_route_weights;
+            scratch.grouped_gate_scratch = state.grouped_gate_scratch;
+            scratch.grouped_up_scratch = state.grouped_up_scratch;
+            scratch.grouped_output_partials = state.grouped_output_partials;
+            scratch.decode_scratch = state.decode_scratch;
+            scratch.reserved_ptrs[0] = state.reserved_ptrs[0];
+            scratch.reserved_ptrs[1] = state.reserved_ptrs[1];
+            scratch.reserved_ptrs[2] = state.reserved_ptrs[2];
+            scratch.reserved_u64[0] = state.reserved_u64[0];
+            scratch.reserved_u64[1] = state.reserved_u64[1];
+            scratch.prefill_token_capacity = state.prefill_token_capacity;
+            scratch.prefill_route_capacity = state.prefill_route_capacity;
+            return scratch;
+        }
+
+        void restoreRuntimeScratchBindings(DeviceMoELayerRuntime &state,
+                                           const RuntimeScratchBindings &scratch) noexcept
+        {
+            state.route_expert_ids = scratch.route_expert_ids;
+            state.route_weights = scratch.route_weights;
+            state.route_participant_ids = scratch.route_participant_ids;
+            state.expert_counts = scratch.expert_counts;
+            state.expert_offsets = scratch.expert_offsets;
+            state.grouped_token_ids = scratch.grouped_token_ids;
+            state.grouped_route_weights = scratch.grouped_route_weights;
+            state.grouped_gate_scratch = scratch.grouped_gate_scratch;
+            state.grouped_up_scratch = scratch.grouped_up_scratch;
+            state.grouped_output_partials = scratch.grouped_output_partials;
+            state.decode_scratch = scratch.decode_scratch;
+            state.reserved_ptrs[0] = scratch.reserved_ptrs[0];
+            state.reserved_ptrs[1] = scratch.reserved_ptrs[1];
+            state.reserved_ptrs[2] = scratch.reserved_ptrs[2];
+            state.reserved_u64[0] = scratch.reserved_u64[0];
+            state.reserved_u64[1] = scratch.reserved_u64[1];
+            state.reserved_u64[2] = 0;
+            state.reserved_u64[3] = 0;
+            state.prefill_token_capacity = scratch.prefill_token_capacity;
+            state.prefill_route_capacity = scratch.prefill_route_capacity;
+        }
+
+        void resetPerRequestRuntimeFields(DeviceMoELayerRuntime &state, int num_experts) noexcept
+        {
+            std::fill(state.decode_histogram, state.decode_histogram + num_experts, 0ULL);
+            std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts, 0ULL);
+            resetRouterHotCacheCounters(state);
+            state.reserved_u64[2] = 0;
+            state.reserved_u64[3] = 0;
+        }
+
+        /**
+         * @brief Find a payload-ready descriptor in one placement bank.
+         *
+         * Portable prefix-cache state records the stable local slot that owned a
+         * local expert at capture time.  When that slot id is known, restore must
+         * not accept another ready descriptor for the same logical expert: doing
+         * so can bind old transfer-slot pointers after the graph has rebuilt its
+         * transfer-slot directory for the restored request.
+         */
+        bool findReadyDescriptorForExpertInBank(const DeviceMoEPlacementBank &bank,
+                                                uint32_t expert,
+                                                int32_t expected_local_slot,
+                                                DeviceMoEExpertDescriptor &out) noexcept
+        {
+            if (expert >= bank.expert_count || expert >= kDeviceMoEMaxExperts)
+                return false;
+            const auto &candidate = bank.experts[expert];
+            if (candidate.logical_expert_id != static_cast<int32_t>(expert) ||
+                (expected_local_slot >= 0 && candidate.local_slot != expected_local_slot) ||
+                !descriptorReady(candidate))
+            {
+                return false;
+            }
+            out = candidate;
+            return true;
+        }
+
+        bool findReadyDescriptorForExpert(const DeviceMoELayerRuntime &state,
+                                          uint32_t expert,
+                                          int32_t expected_local_slot,
+                                          DeviceMoEExpertDescriptor &out) noexcept
+        {
+            if (state.active_bank <= 1u &&
+                findReadyDescriptorForExpertInBank(
+                    state.banks[state.active_bank], expert, expected_local_slot, out))
+            {
+                return true;
+            }
+            for (uint32_t bank_idx = 0; bank_idx < 2u; ++bank_idx)
+            {
+                if (bank_idx == state.active_bank)
+                    continue;
+                if (findReadyDescriptorForExpertInBank(
+                        state.banks[bank_idx], expert, expected_local_slot, out))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * @brief Validate a local payload descriptor returned during portable restore.
+         *
+         * The restore path will add placement flags such as LocalCompute after it
+         * binds the payload descriptor, so this check intentionally focuses on the
+         * pointer-bearing contract: the descriptor must name the requested expert,
+         * have complete gate/up/down payloads, and match the stable local slot
+         * recorded in the portable blob when that slot is known.
+         */
+        bool descriptorMatchesPortableLocalClaim(const DeviceMoEExpertDescriptor &desc,
+                                                 int expert,
+                                                 int32_t expected_local_slot) noexcept
+        {
+            return desc.logical_expert_id == static_cast<int32_t>(expert) &&
+                   (expected_local_slot < 0 || desc.local_slot == expected_local_slot) &&
+                   descriptorReady(desc);
+        }
+
+        /**
+         * @brief Decide whether a portable local expert must be rebound by resolver.
+         *
+         * A local-compute expert whose owner is another participant represents a
+         * graph-owned transfer-slot replica.  Prefix restore must ask the graph
+         * side transfer-slot directory for the current descriptor before looking
+         * at old runtime banks, because the old banks may still contain descriptor
+         * shapes that are "ready" but point into stale device allocations.
+         */
+        bool portableLocalReplicaRequiresResolver(
+            const DeviceMoEPortableLayerRuntimeState &snapshot,
+            const DeviceMoEPortableExpertRuntimeState &saved,
+            const DeviceMoERuntimeTable::LocalPayloadDescriptorResolver &resolver) noexcept
+        {
+            return resolver &&
+                   saved.local_compute != 0u &&
+                   saved.local_slot >= 0 &&
+                   saved.owner_participant >= 0 &&
+                   saved.owner_participant != static_cast<int32_t>(snapshot.participant_id);
+        }
+
     } // namespace
 
     DeviceMoERuntimeTable::DeviceMoERuntimeTable(Config config)
@@ -258,6 +438,8 @@ namespace llaminar2
         host_layers_.resize(static_cast<size_t>(num_layers_));
         for (auto &state : host_layers_)
             resetLayer(state);
+        initial_host_layers_.resize(host_layers_.size());
+        initial_layer_captured_.assign(host_layers_.size(), 0u);
 
         if (mirror_to_device_)
         {
@@ -490,6 +672,130 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceMoERuntimeTable::captureDecodeHistogramCounts(
+        std::vector<uint64_t> &selected_counts,
+        std::vector<uint64_t> &local_counts,
+        void *stream)
+    {
+        const size_t entry_count =
+            static_cast<size_t>(num_layers_) * static_cast<size_t>(num_experts_);
+        selected_counts.assign(entry_count, 0ULL);
+        local_counts.assign(entry_count, 0ULL);
+
+        if (!mirror_to_device_)
+        {
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                auto *selected_dst =
+                    selected_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                auto *local_dst =
+                    local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                std::copy(state.decode_histogram,
+                          state.decode_histogram + num_experts_,
+                          selected_dst);
+                std::copy(state.decode_local_histogram,
+                          state.decode_local_histogram + num_experts_,
+                          local_dst);
+            }
+            return true;
+        }
+
+        if (!stream)
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored decode histogram capture requires an explicit stream");
+
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const auto *selected_src = device_layers_[layer_idx].decode_histogram;
+            auto *selected_dst =
+                selected_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            copyMirrorToHost(device_id_, selected_dst, selected_src,
+                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             stream,
+                             layerPrefix(layer_idx) + "decode histogram capture");
+
+            const auto *local_src = device_layers_[layer_idx].decode_local_histogram;
+            auto *local_dst =
+                local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            copyMirrorToHost(device_id_, local_dst, local_src,
+                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             stream,
+                             layerPrefix(layer_idx) + "decode local histogram capture");
+        }
+        synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram capture sync");
+        return true;
+    }
+
+    bool DeviceMoERuntimeTable::restoreDecodeHistogramCounts(
+        const uint64_t *selected_counts,
+        const uint64_t *local_counts,
+        size_t layer_count,
+        size_t expert_count,
+        void *stream)
+    {
+        if (!selected_counts || !local_counts)
+            return false;
+        if (layer_count != static_cast<size_t>(num_layers_) ||
+            expert_count != static_cast<size_t>(num_experts_))
+        {
+            LOG_ERROR("[MoERuntimeTable] decode histogram restore shape mismatch: table layers="
+                      << num_layers_ << " experts=" << num_experts_
+                      << " blob layers=" << layer_count
+                      << " experts=" << expert_count);
+            return false;
+        }
+
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            const auto *selected_src =
+                selected_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            const auto *local_src =
+                local_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            std::copy(selected_src, selected_src + num_experts_, state.decode_histogram);
+            std::copy(local_src, local_src + num_experts_, state.decode_local_histogram);
+            resetRouterHotCacheCounters(state);
+        }
+
+        if (!mirror_to_device_)
+            return true;
+
+        if (!stream)
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored decode histogram restore requires an explicit stream");
+
+        const size_t counters_offset = offsetof(DeviceMoELayerRuntime, router_hot_cache_eligible_dispatches);
+        const size_t counters_bytes =
+            offsetof(DeviceMoELayerRuntime, route_expert_ids) - counters_offset;
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const auto *selected_src =
+                selected_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            auto *selected_dst = device_layers_[layer_idx].decode_histogram;
+            copyHostToMirror(device_id_, selected_dst, selected_src,
+                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             stream,
+                             layerPrefix(layer_idx) + "decode histogram restore");
+
+            const auto *local_src =
+                local_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            auto *local_dst = device_layers_[layer_idx].decode_local_histogram;
+            copyHostToMirror(device_id_, local_dst, local_src,
+                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             stream,
+                             layerPrefix(layer_idx) + "decode local histogram restore");
+
+            auto *counter_dst =
+                reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
+            memsetMirror(device_id_, counter_dst, 0,
+                         counters_bytes,
+                         stream,
+                         layerPrefix(layer_idx) + "router hot-cache counter restore reset");
+        }
+        return true;
+    }
+
     void DeviceMoERuntimeTable::resetDecodeHistogramCounts(void *stream)
     {
         for (auto &state : host_layers_)
@@ -561,6 +867,444 @@ namespace llaminar2
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             uploadLayerState(layer_idx, stream);
         synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode runtime reset sync");
+    }
+
+    bool DeviceMoERuntimeTable::hasInitialRuntimeState() const noexcept
+    {
+        return std::any_of(initial_layer_captured_.begin(),
+                           initial_layer_captured_.end(),
+                           [](uint8_t captured)
+                           { return captured != 0u; });
+    }
+
+    void DeviceMoERuntimeTable::restoreInitialRuntimeState(void *stream)
+    {
+        void *owned_stream = nullptr;
+        void *active_stream = stream;
+        if (mirror_to_device_ && !active_stream)
+        {
+            owned_stream = createMirrorStream(device_id_,
+                                              "[MoERuntimeTable] initial runtime restore stream");
+            active_stream = owned_stream;
+        }
+
+        try
+        {
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                const auto scratch = captureRuntimeScratchBindings(state);
+
+                if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
+                    state = initial_host_layers_[static_cast<size_t>(layer_idx)];
+                else
+                    resetLayer(state);
+
+                restoreRuntimeScratchBindings(state, scratch);
+                resetPerRequestRuntimeFields(state, num_experts_);
+
+                if (mirror_to_device_)
+                    uploadLayerState(layer_idx, active_stream);
+            }
+
+            if (mirror_to_device_)
+                synchronizeMirror(device_id_, active_stream,
+                                  "[MoERuntimeTable] initial runtime restore sync");
+
+            if (owned_stream)
+            {
+                destroyMirrorStream(device_id_, owned_stream,
+                                    "[MoERuntimeTable] initial runtime restore stream destroy");
+                owned_stream = nullptr;
+            }
+        }
+        catch (...)
+        {
+            if (owned_stream)
+                destroyMirrorStream(device_id_, owned_stream,
+                                    "[MoERuntimeTable] initial runtime restore stream destroy");
+            throw;
+        }
+    }
+
+    void DeviceMoERuntimeTable::syncRuntimeStateToHost(void *stream)
+    {
+        if (!mirror_to_device_)
+            return;
+
+        void *owned_stream = nullptr;
+        void *active_stream = stream;
+        if (!active_stream)
+        {
+            owned_stream = createMirrorStream(device_id_,
+                                              "[MoERuntimeTable] runtime state D2H stream");
+            active_stream = owned_stream;
+        }
+
+        try
+        {
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                copyMirrorToHost(device_id_,
+                                 host_layers_.data() + layer_idx,
+                                 device_layers_ + layer_idx,
+                                 sizeof(DeviceMoELayerRuntime),
+                                 active_stream,
+                                 layerPrefix(layer_idx) + "runtime table D2H");
+            }
+            synchronizeMirror(device_id_, active_stream,
+                              "[MoERuntimeTable] runtime state D2H sync");
+
+            if (owned_stream)
+            {
+                destroyMirrorStream(device_id_, owned_stream,
+                                    "[MoERuntimeTable] runtime state D2H stream destroy");
+                owned_stream = nullptr;
+            }
+        }
+        catch (...)
+        {
+            if (owned_stream)
+                destroyMirrorStream(device_id_, owned_stream,
+                                    "[MoERuntimeTable] runtime state D2H stream destroy");
+            throw;
+        }
+    }
+
+    void DeviceMoERuntimeTable::restoreRuntimeStateSnapshot(
+        const DeviceMoELayerRuntime *layers,
+        size_t layer_count,
+        void *stream)
+    {
+        if (!layers)
+            throw std::invalid_argument("[MoERuntimeTable] runtime snapshot restore requires layer data");
+        if (layer_count != static_cast<size_t>(num_layers_))
+            throw std::invalid_argument("[MoERuntimeTable] runtime snapshot layer count mismatch");
+
+        void *owned_stream = nullptr;
+        void *active_stream = stream;
+        if (mirror_to_device_ && !active_stream)
+        {
+            owned_stream = createMirrorStream(device_id_,
+                                              "[MoERuntimeTable] runtime snapshot restore stream");
+            active_stream = owned_stream;
+        }
+
+        try
+        {
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                const auto scratch = captureRuntimeScratchBindings(state);
+                const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
+                if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
+                    snapshot.top_k != static_cast<uint32_t>(top_k_) ||
+                    snapshot.active_bank > 1u)
+                {
+                    throw std::invalid_argument(
+                        layerPrefix(layer_idx) + "runtime snapshot metadata mismatch");
+                }
+
+                if (snapshot.active_epoch == 0u)
+                {
+                    resetPerRequestRuntimeFields(state, num_experts_);
+                    if (mirror_to_device_)
+                        uploadLayerState(layer_idx, active_stream);
+                    continue;
+                }
+
+                state = snapshot;
+                restoreRuntimeScratchBindings(state, scratch);
+                resetPerRequestRuntimeFields(state, num_experts_);
+                if (mirror_to_device_)
+                    uploadLayerState(layer_idx, active_stream);
+            }
+
+            if (mirror_to_device_)
+                synchronizeMirror(device_id_, active_stream,
+                                  "[MoERuntimeTable] runtime snapshot restore sync");
+
+            if (owned_stream)
+            {
+                destroyMirrorStream(device_id_, owned_stream,
+                                    "[MoERuntimeTable] runtime snapshot restore stream destroy");
+                owned_stream = nullptr;
+            }
+        }
+        catch (...)
+        {
+            if (owned_stream)
+                destroyMirrorStream(device_id_, owned_stream,
+                                    "[MoERuntimeTable] runtime snapshot restore stream destroy");
+            throw;
+        }
+    }
+
+    bool DeviceMoERuntimeTable::capturePortableRuntimeState(
+        std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
+        void *stream)
+    {
+        layers.clear();
+        const DeviceMoELayerRuntime *source_layers = host_layers_.data();
+        std::vector<DeviceMoELayerRuntime> mirrored_layers;
+
+        if (mirror_to_device_)
+        {
+            if (!stream)
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] mirrored portable runtime capture requires an explicit stream");
+            mirrored_layers.resize(static_cast<size_t>(num_layers_));
+            copyMirrorToHost(device_id_,
+                             mirrored_layers.data(),
+                             device_layers_,
+                             sizeof(DeviceMoELayerRuntime) *
+                                 static_cast<size_t>(num_layers_),
+                             stream,
+                             "[MoERuntimeTable] portable runtime state capture");
+            synchronizeMirror(device_id_, stream,
+                              "[MoERuntimeTable] portable runtime state capture sync");
+            source_layers = mirrored_layers.data();
+        }
+
+        layers.reserve(static_cast<size_t>(num_layers_));
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const auto &state = source_layers[static_cast<size_t>(layer_idx)];
+            if (state.expert_count != static_cast<uint32_t>(num_experts_) ||
+                state.top_k != static_cast<uint32_t>(top_k_) ||
+                state.active_bank > 1u)
+            {
+                LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                     << ": cannot capture malformed portable runtime state"
+                                                     << " active_bank=" << state.active_bank
+                                                     << " experts=" << state.expert_count
+                                                     << " top_k=" << state.top_k);
+                layers.clear();
+                return false;
+            }
+
+            const auto &bank = state.banks[state.active_bank];
+            DeviceMoEPortableLayerRuntimeState captured;
+            captured.active_epoch = state.active_epoch;
+            captured.expert_count = state.expert_count;
+            captured.top_k = state.top_k;
+            captured.participant_id = state.participant_id;
+            captured.participant_count = state.participant_count;
+            captured.experts.resize(static_cast<size_t>(num_experts_));
+            captured.selected_histogram.assign(
+                state.decode_histogram,
+                state.decode_histogram + num_experts_);
+            captured.local_histogram.assign(
+                state.decode_local_histogram,
+                state.decode_local_histogram + num_experts_);
+
+            for (int expert = 0; expert < num_experts_; ++expert)
+            {
+                const auto &desc = bank.experts[static_cast<size_t>(expert)];
+                auto &dst = captured.experts[static_cast<size_t>(expert)];
+                dst.logical_expert_id =
+                    desc.logical_expert_id >= 0 ? desc.logical_expert_id : expert;
+                dst.owner_participant = desc.owner_participant;
+                dst.local_slot = desc.local_slot;
+                dst.flags = portableMoEExpertFlags(desc.flags);
+                dst.local_compute = bank.local_compute_mask[static_cast<size_t>(expert)] != 0u ? 1u : 0u;
+                dst.replica_role = bank.replica_role[static_cast<size_t>(expert)];
+                dst.resident_participant_mask =
+                    bank.resident_participant_mask[static_cast<size_t>(expert)];
+            }
+            layers.push_back(std::move(captured));
+        }
+
+        return true;
+    }
+
+    bool DeviceMoERuntimeTable::restorePortableRuntimeState(
+        const std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
+        void *stream,
+        const LocalPayloadDescriptorResolver &local_payload_resolver)
+    {
+        if (layers.size() != static_cast<size_t>(num_layers_))
+        {
+            LOG_ERROR("[MoERuntimeTable] portable runtime restore layer count mismatch: table="
+                      << num_layers_ << " snapshot=" << layers.size());
+            return false;
+        }
+        if (mirror_to_device_ && !stream)
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored portable runtime restore requires an explicit stream");
+
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
+            if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
+                snapshot.top_k != static_cast<uint32_t>(top_k_) ||
+                snapshot.experts.size() != static_cast<size_t>(num_experts_) ||
+                snapshot.selected_histogram.size() != static_cast<size_t>(num_experts_) ||
+                snapshot.local_histogram.size() != static_cast<size_t>(num_experts_))
+            {
+                LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                     << ": portable runtime restore metadata mismatch");
+                return false;
+            }
+
+            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            MoEPlacementUpdate update;
+            update.epoch = std::max<uint32_t>(
+                state.active_epoch + 1u,
+                snapshot.active_epoch == 0u ? 1u : snapshot.active_epoch);
+            if (update.epoch <= state.active_epoch)
+                update.epoch = state.active_epoch + 1u;
+            update.expert_count = static_cast<uint32_t>(num_experts_);
+            update.participant_id = snapshot.participant_id;
+            update.participant_count = snapshot.participant_count;
+            update.experts.resize(static_cast<size_t>(num_experts_));
+            update.local_compute_mask.assign(static_cast<size_t>(num_experts_), 0u);
+            update.replica_role.assign(
+                static_cast<size_t>(num_experts_),
+                static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+            update.resident_participant_mask.assign(static_cast<size_t>(num_experts_), 0u);
+
+            for (int expert = 0; expert < num_experts_; ++expert)
+            {
+                const auto &saved = snapshot.experts[static_cast<size_t>(expert)];
+                if (saved.logical_expert_id != static_cast<int32_t>(expert))
+                {
+                    LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                         << ": portable runtime restore logical expert mismatch"
+                                                         << " slot=" << expert
+                                                         << " logical=" << saved.logical_expert_id);
+                    return false;
+                }
+
+                DeviceMoEExpertDescriptor desc;
+                desc.logical_expert_id = expert;
+                desc.owner_participant = saved.owner_participant;
+                desc.local_slot = saved.local_compute ? saved.local_slot : -1;
+                desc.flags = clearPayloadBearingMoEExpertFlags(
+                    portableMoEExpertFlags(saved.flags));
+
+                if (saved.local_compute != 0u)
+                {
+                    DeviceMoEExpertDescriptor ready_desc;
+                    bool has_ready_descriptor = false;
+                    const bool resolver_is_authoritative =
+                        portableLocalReplicaRequiresResolver(snapshot,
+                                                             saved,
+                                                             local_payload_resolver);
+
+                    if (resolver_is_authoritative)
+                    {
+                        has_ready_descriptor =
+                            local_payload_resolver(layer_idx,
+                                                   expert,
+                                                   saved.local_slot,
+                                                   ready_desc);
+                        if (!has_ready_descriptor)
+                        {
+                            LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                                 << ": portable runtime restore requires graph-owned local payload for remote-owned expert "
+                                                                 << expert
+                                                                 << " slot=" << saved.local_slot
+                                                                 << " but the resolver could not bind it");
+                            return false;
+                        }
+                        if (!descriptorMatchesPortableLocalClaim(ready_desc,
+                                                                 expert,
+                                                                 saved.local_slot))
+                        {
+                            LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                                 << ": portable runtime restore resolver returned an invalid descriptor for expert "
+                                                                 << expert);
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        has_ready_descriptor =
+                            findReadyDescriptorForExpert(state,
+                                                         static_cast<uint32_t>(expert),
+                                                         saved.local_slot,
+                                                         ready_desc);
+                        if (!has_ready_descriptor && local_payload_resolver)
+                        {
+                            has_ready_descriptor =
+                                local_payload_resolver(layer_idx,
+                                                       expert,
+                                                       saved.local_slot,
+                                                       ready_desc);
+                            if (has_ready_descriptor &&
+                                !descriptorMatchesPortableLocalClaim(ready_desc,
+                                                                     expert,
+                                                                     saved.local_slot))
+                            {
+                                LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                                     << ": portable runtime restore resolver returned an invalid descriptor for expert "
+                                                                     << expert);
+                                return false;
+                            }
+                        }
+                    }
+
+                    if (!has_ready_descriptor)
+                    {
+                        LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                             << ": portable runtime restore requires local payload for expert "
+                                                             << expert
+                                                             << " but no live descriptor is resident");
+                        return false;
+                    }
+                    desc = ready_desc;
+                    desc.logical_expert_id = expert;
+                    desc.owner_participant = saved.owner_participant;
+                    if (saved.local_slot >= 0)
+                        desc.local_slot = saved.local_slot;
+                    desc.flags = portableMoEExpertFlags(saved.flags) |
+                                 toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+                                 toMoEExpertFlags(DeviceMoEExpertFlags::Resident) |
+                                 toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
+                    if (hasMoEExpertFlag(ready_desc.flags,
+                                         DeviceMoEExpertFlags::TransferSlot))
+                    {
+                        desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot);
+                    }
+                }
+
+                update.experts[static_cast<size_t>(expert)] = desc;
+                update.local_compute_mask[static_cast<size_t>(expert)] =
+                    saved.local_compute != 0u ? 1u : 0u;
+                update.replica_role[static_cast<size_t>(expert)] = saved.replica_role;
+                update.resident_participant_mask[static_cast<size_t>(expert)] =
+                    saved.resident_participant_mask;
+            }
+
+            try
+            {
+                prepareInactiveBank(layer_idx, update);
+                flipActiveBank(layer_idx, update.epoch, stream);
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                                                     << ": portable runtime restore failed: "
+                                                     << ex.what());
+                return false;
+            }
+
+            auto &restored = host_layers_[static_cast<size_t>(layer_idx)];
+            std::copy(snapshot.selected_histogram.begin(),
+                      snapshot.selected_histogram.end(),
+                      restored.decode_histogram);
+            std::copy(snapshot.local_histogram.begin(),
+                      snapshot.local_histogram.end(),
+                      restored.decode_local_histogram);
+            resetRouterHotCacheCounters(restored);
+            restored.reserved_u64[2] = 0;
+            restored.reserved_u64[3] = 0;
+            if (mirror_to_device_)
+                uploadLayerState(layer_idx, stream);
+        }
+
+        return true;
     }
 
     void DeviceMoERuntimeTable::ensurePrefillRouteScratchCapacity(int token_capacity, void *stream)
@@ -638,6 +1382,7 @@ namespace llaminar2
 
         state.active_bank = inactive_bank;
         state.active_epoch = epoch;
+        captureInitialLayerStateIfNeeded(layer_idx);
 
         if (mirror_to_device_)
             uploadLayerState(layer_idx, stream);
@@ -721,6 +1466,20 @@ namespace llaminar2
         state.participant_count = 1;
         state.banks[0].expert_count = static_cast<uint32_t>(num_experts_);
         state.banks[1].expert_count = static_cast<uint32_t>(num_experts_);
+    }
+
+    void DeviceMoERuntimeTable::captureInitialLayerStateIfNeeded(int layer_idx)
+    {
+        const auto idx = static_cast<size_t>(layer_idx);
+        if (idx >= initial_layer_captured_.size() ||
+            initial_layer_captured_[idx] != 0u)
+        {
+            return;
+        }
+
+        initial_host_layers_[idx] = host_layers_[idx];
+        resetPerRequestRuntimeFields(initial_host_layers_[idx], num_experts_);
+        initial_layer_captured_[idx] = 1u;
     }
 
     bool DeviceMoERuntimeTable::prefillRouteScratchAllocationHasCapacity(

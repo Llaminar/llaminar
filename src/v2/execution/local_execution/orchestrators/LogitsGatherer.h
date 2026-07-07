@@ -71,9 +71,9 @@ namespace llaminar2
         /**
          * @brief Pin the combined logits buffer for DMA transfer.
          *
-         * Page-locks the buffer memory via the GPU backend, enabling zero-copy
-         * DMA without internal staging buffers (~50-100µs savings per D2H).
-         * Call once after construction with a GPU device.
+         * Page-locks the decode-sized prefix of the buffer via the GPU backend,
+         * enabling fast single-row DMA without registering the full max-context
+         * logits arena. Call once after construction with a GPU device.
          *
          * @param device GPU device to pin for
          */
@@ -163,6 +163,7 @@ namespace llaminar2
         IBackend *resolveBackend(DeviceId device) const;
 
         std::unique_ptr<TensorBase> buffer_;
+        size_t vocab_size_ = 0;
         BackendResolver backend_resolver_ = nullptr; ///< Optional test hook for backend selection.
         bool pinned_ = false;
         DeviceType pinned_device_type_ = DeviceType::CPU; ///< Backend type used for pinning (for correct unpin)

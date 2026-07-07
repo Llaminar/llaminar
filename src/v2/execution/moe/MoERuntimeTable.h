@@ -11,6 +11,8 @@
 #include "../../tensors/TensorKernels.h"
 
 #include <cstdint>
+#include <algorithm>
+#include <functional>
 #include <type_traits>
 #include <vector>
 
@@ -31,6 +33,7 @@ namespace llaminar2
         Replicated = 1u << 2,
         PreferredOwner = 1u << 3,
         LocalCompute = 1u << 4,
+        TransferSlot = 1u << 5,
     };
 
     constexpr DeviceMoEExpertFlags operator|(DeviceMoEExpertFlags lhs, DeviceMoEExpertFlags rhs) noexcept
@@ -119,6 +122,10 @@ namespace llaminar2
         int32_t *route_participant_ids = nullptr;
         int32_t *expert_counts = nullptr;
         int32_t *expert_offsets = nullptr;
+        // Runtime grouped prefill stores original route-slot ids here
+        // (`token * top_k + rank`), not bare token ids. This lets LLEP rewrite
+        // route_participant_ids exactly without searching ambiguous top-k rows;
+        // gather/scatter kernels derive the token row with `slot / top_k`.
         int32_t *grouped_token_ids = nullptr;
         float *grouped_route_weights = nullptr;
         float *grouped_gate_scratch = nullptr;
@@ -145,6 +152,31 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoEPlacementBank>);
     static_assert(std::is_trivially_copyable_v<DeviceMoELayerRuntime>);
 
+    inline bool deviceMoELayerUsesTransientLocalPayload(
+        const DeviceMoELayerRuntime &state) noexcept
+    {
+        if (state.active_bank > 1u ||
+            state.active_epoch == 0u ||
+            state.expert_count > kDeviceMoEMaxExperts)
+        {
+            return false;
+        }
+
+        const auto &bank = state.banks[state.active_bank];
+        const uint32_t expert_count =
+            std::min<uint32_t>(state.expert_count, kDeviceMoEMaxExperts);
+        for (uint32_t expert = 0; expert < expert_count; ++expert)
+        {
+            if (bank.local_compute_mask[expert] != 0u &&
+                hasMoEExpertFlag(bank.experts[expert].flags,
+                                 DeviceMoEExpertFlags::TransferSlot))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     struct MoEPlacementUpdate
     {
         uint32_t epoch = 0;
@@ -157,6 +189,29 @@ namespace llaminar2
         /// Optional [expert] bitmask of participants with resident weights.
         /// If omitted, prepareInactiveBank synthesizes owner/local residency.
         std::vector<uint32_t> resident_participant_mask;
+    };
+
+    struct DeviceMoEPortableExpertRuntimeState
+    {
+        int32_t logical_expert_id = -1;
+        int32_t owner_participant = -1;
+        int32_t local_slot = -1;
+        uint32_t flags = 0;
+        uint8_t local_compute = 0;
+        uint8_t replica_role = static_cast<uint8_t>(DeviceMoEReplicaRole::None);
+        uint32_t resident_participant_mask = 0;
+    };
+
+    struct DeviceMoEPortableLayerRuntimeState
+    {
+        uint32_t active_epoch = 0;
+        uint32_t expert_count = 0;
+        uint32_t top_k = 0;
+        uint32_t participant_id = 0;
+        uint32_t participant_count = 1;
+        std::vector<DeviceMoEPortableExpertRuntimeState> experts;
+        std::vector<uint64_t> selected_histogram;
+        std::vector<uint64_t> local_histogram;
     };
 
     class IMoERuntimeTable
@@ -175,6 +230,14 @@ namespace llaminar2
         virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                                void *stream = nullptr,
                                                bool reset_runtime_counts = true) = 0;
+        virtual bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
+                                                  std::vector<uint64_t> &local_counts,
+                                                  void *stream = nullptr) = 0;
+        virtual bool restoreDecodeHistogramCounts(const uint64_t *selected_counts,
+                                                  const uint64_t *local_counts,
+                                                  size_t layer_count,
+                                                  size_t expert_count,
+                                                  void *stream = nullptr) = 0;
         virtual void resetDecodeHistogramCounts(void *stream = nullptr) = 0;
         virtual void resetDecodeRuntimeState(void *stream = nullptr) = 0;
     };
@@ -217,8 +280,49 @@ namespace llaminar2
         bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                        void *stream = nullptr,
                                        bool reset_runtime_counts = true) override;
+        bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
+                                          std::vector<uint64_t> &local_counts,
+                                          void *stream = nullptr) override;
+        bool restoreDecodeHistogramCounts(const uint64_t *selected_counts,
+                                          const uint64_t *local_counts,
+                                          size_t layer_count,
+                                          size_t expert_count,
+                                          void *stream = nullptr) override;
         void resetDecodeHistogramCounts(void *stream = nullptr) override;
         void resetDecodeRuntimeState(void *stream = nullptr) override;
+        bool hasInitialRuntimeState() const noexcept;
+        void restoreInitialRuntimeState(void *stream = nullptr);
+        void syncRuntimeStateToHost(void *stream = nullptr);
+        void restoreRuntimeStateSnapshot(const DeviceMoELayerRuntime *layers,
+                                         size_t layer_count,
+                                         void *stream = nullptr);
+        /**
+         * @brief Resolver used when a portable restore must rebind local expert payloads.
+         *
+         * Portable prefix-cache state stores logical placement, local-compute
+         * intent, and stable local slot ids, but it deliberately does not embed
+         * pointer-bearing DeviceMoELayerRuntime banks.  A graph builder that owns
+         * persistent transfer-slot directories may provide this resolver to turn
+         * the saved `(layer, expert, local_slot)` claim back into a live
+         * DeviceMoEExpertDescriptor.
+         *
+         * Remote-owned local replicas are transfer-slot payloads owned by the
+         * graph-side slot directory, so a provided resolver is authoritative for
+         * those records.  Owned local experts may still bind from an existing
+         * ready runtime-bank descriptor because their payload lifetime is the
+         * model/runtime table itself rather than a transient rebalance slot.
+         */
+        using LocalPayloadDescriptorResolver =
+            std::function<bool(int layer_idx,
+                               int expert,
+                               int local_slot,
+                               DeviceMoEExpertDescriptor &out)>;
+
+        bool capturePortableRuntimeState(std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
+                                         void *stream = nullptr);
+        bool restorePortableRuntimeState(const std::vector<DeviceMoEPortableLayerRuntimeState> &layers,
+                                         void *stream = nullptr,
+                                         const LocalPayloadDescriptorResolver &local_payload_resolver = {});
         void ensurePrefillRouteScratchCapacity(int token_capacity, void *stream = nullptr);
 
         const DeviceId &deviceId() const noexcept { return device_id_; }
@@ -235,6 +339,8 @@ namespace llaminar2
         bool mirror_to_device_ = false;
         int prefill_token_capacity_ = 0;
         std::vector<DeviceMoELayerRuntime> host_layers_;
+        std::vector<DeviceMoELayerRuntime> initial_host_layers_;
+        std::vector<uint8_t> initial_layer_captured_;
         DeviceMoELayerRuntime *device_layers_ = nullptr;
         void *decode_histogram_producer_stream_ = nullptr;
 
@@ -260,6 +366,7 @@ namespace llaminar2
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
         void resetLayer(DeviceMoELayerRuntime &state) const;
+        void captureInitialLayerStateIfNeeded(int layer_idx);
         bool prefillRouteScratchAllocationHasCapacity(const PrefillRouteScratchAllocation &allocation,
                                                       int token_capacity) const;
         void allocateDeviceMirror();

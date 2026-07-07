@@ -168,6 +168,37 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
+             * @brief Fixed-order floating SwiGLU/down for decode-sized rows.
+             *
+             * Floating shared-expert decode uses FP32 gate/up activations even
+             * when the down weights are FP16 or BF16.  This entry point handles
+             * M=1..4 rows with a graph-capturable CUDA kernel whose reduction
+             * order is shared with the verifier grouped hook below.
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
+             * @brief Grouped verifier SwiGLU/down with serial-decode math order.
+             *
+             * The implementation is a real grouped CUDA path: rows are launched
+             * together for M=1..4, but each output dot product walks K and
+             * reduces in the same order as the M=1 decode call.
+             */
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for FP CUDA kernel)
              *
              * CUDAFloatingPointGemmKernel is for weight projections only.
@@ -240,6 +271,18 @@ namespace llaminar2
             void *gpu_stream_ = nullptr;
 
             DeviceWorkspaceManager *bound_workspace_ = nullptr;
+
+            bool run_fixed_order_swiglu_down(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m,
+                int n,
+                int k,
+                float alpha,
+                float beta,
+                DeviceWorkspaceManager *workspace,
+                bool verifier_grouped_call);
 
         };
 

@@ -36,6 +36,11 @@ namespace llaminar2::least_loaded_ep
         uint32_t min_spread_improvement_divisor = 0;
         uint64_t min_spread_improvement_per_transfer = 0;
         uint64_t min_foreign_rows_per_transfer = 0;
+        /// Optional hard cap on missing expert-weight arrivals the assignment
+        /// may request. Zero means use the caller-provided transfer buffer
+        /// capacity. When the cap is exhausted, remaining rows stay on a
+        /// resident participant instead of publishing an impossible plan.
+        uint32_t max_weight_transfers = 0;
         bool enable_balanced_skip = true;
     };
 
@@ -253,6 +258,53 @@ namespace llaminar2::least_loaded_ep
         const uint32_t fallback =
             local_participant < participant_count ? local_participant : 0u;
         return participant_count == 0u ? 0u : (1u << fallback);
+    }
+
+    LLAMINAR_LLEP_HD uint32_t residentParticipantMaskOrOwner(
+        uint32_t resident_mask,
+        uint32_t owner_participant,
+        uint32_t participant_count) noexcept
+    {
+        resident_mask &= participantMaskLimit(participant_count);
+        if (resident_mask != 0u)
+            return resident_mask;
+        if (owner_participant < participant_count && owner_participant < 32u)
+            return 1u << owner_participant;
+        return 0u;
+    }
+
+    LLAMINAR_LLEP_HD uint32_t selectWeightSourceParticipant(
+        uint32_t owner_participant,
+        uint32_t destination_participant,
+        uint32_t resident_participant_mask,
+        uint32_t participant_count) noexcept
+    {
+        const uint32_t resident_mask = residentParticipantMaskOrOwner(
+            resident_participant_mask,
+            owner_participant,
+            participant_count);
+        if (destination_participant < participant_count &&
+            destination_participant < 32u &&
+            (resident_mask & (1u << destination_participant)) != 0u)
+        {
+            return destination_participant;
+        }
+        if (owner_participant < participant_count &&
+            owner_participant < 32u &&
+            (resident_mask & (1u << owner_participant)) != 0u)
+        {
+            return owner_participant;
+        }
+        for (uint32_t participant = 0; participant < participant_count && participant < 32u; ++participant)
+        {
+            if ((resident_mask & (1u << participant)) != 0u)
+                return participant;
+        }
+        if (owner_participant < participant_count)
+            return owner_participant;
+        if (destination_participant < participant_count)
+            return destination_participant;
+        return 0u;
     }
 
     LLAMINAR_LLEP_HD int32_t selectHighestLoadUnassignedExpert(
@@ -482,6 +534,76 @@ namespace llaminar2::least_loaded_ep
         return true;
     }
 
+    LLAMINAR_LLEP_HD bool destinationNeedsForeignWeight(
+        uint32_t owner_participant,
+        uint32_t destination_participant,
+        uint32_t resident_participant_mask,
+        uint32_t participant_count = 32u) noexcept
+    {
+        const uint32_t resident_mask = residentParticipantMaskOrOwner(
+            resident_participant_mask,
+            owner_participant,
+            participant_count);
+        return destination_participant >= 32u ||
+               (resident_mask & (1u << destination_participant)) == 0u;
+    }
+
+    LLAMINAR_LLEP_HD bool hasWeightTransfer(
+        const LeastLoadedExpertWeightTransfer *transfers,
+        const LeastLoadedExpertAssignmentStatus &status,
+        uint32_t expert,
+        uint32_t source_participant,
+        uint32_t destination_participant) noexcept
+    {
+        if (source_participant == destination_participant)
+            return true;
+        if (!transfers)
+            return false;
+        for (uint32_t i = 0; i < status.weight_transfer_count; ++i)
+        {
+            const auto &transfer = transfers[i];
+            if (transfer.expert == expert &&
+                transfer.source_participant == source_participant &&
+                transfer.destination_participant == destination_participant)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    LLAMINAR_LLEP_HD bool canAssignDestinationWithTransferCapacity(
+        const LeastLoadedExpertWeightTransfer *transfers,
+        uint32_t transfer_capacity,
+        const LeastLoadedExpertAssignmentStatus &status,
+        uint32_t expert,
+        uint32_t owner_participant,
+        uint32_t destination_participant,
+        uint32_t resident_participant_mask,
+        uint32_t participant_count = 32u) noexcept
+    {
+        if (!destinationNeedsForeignWeight(
+                owner_participant,
+                destination_participant,
+                resident_participant_mask,
+                participant_count))
+        {
+            return true;
+        }
+        const uint32_t source_participant = selectWeightSourceParticipant(
+            owner_participant,
+            destination_participant,
+            resident_participant_mask,
+            participant_count);
+        return hasWeightTransfer(
+                   transfers,
+                   status,
+                   expert,
+                   source_participant,
+                   destination_participant) ||
+               status.weight_transfer_count < transfer_capacity;
+    }
+
     LLAMINAR_LLEP_HD void countConceptualAssignmentSpan(
         LeastLoadedExpertAssignmentStatus &status) noexcept
     {
@@ -501,7 +623,8 @@ namespace llaminar2::least_loaded_ep
         uint32_t resident_participant_mask,
         uint64_t begin,
         uint64_t end,
-        bool forced) noexcept
+        bool forced,
+        uint32_t participant_count = 32u) noexcept
     {
         if (end <= begin)
             return true;
@@ -511,12 +634,31 @@ namespace llaminar2::least_loaded_ep
             return false;
         }
 
-        uint32_t resident_mask = resident_participant_mask;
-        if (owner_participant < 32u)
-            resident_mask |= (1u << owner_participant);
-        const bool foreign =
-            destination_participant >= 32u ||
-            (resident_mask & (1u << destination_participant)) == 0u;
+        const bool foreign = destinationNeedsForeignWeight(
+            owner_participant,
+            destination_participant,
+            resident_participant_mask,
+            participant_count);
+        const uint64_t rows = end - begin;
+        if (foreign)
+        {
+            const uint32_t source_participant = selectWeightSourceParticipant(
+                owner_participant,
+                destination_participant,
+                resident_participant_mask,
+                participant_count);
+            if (!appendWeightTransferIfMissing(
+                transfers,
+                transfer_capacity,
+                status,
+                expert,
+                source_participant,
+                destination_participant))
+            {
+                return false;
+            }
+        }
+
         spans[status.span_count++] = LeastLoadedExpertAssignmentSpan{
             expert,
             owner_participant,
@@ -527,20 +669,10 @@ namespace llaminar2::least_loaded_ep
             static_cast<uint8_t>(forced ? 1u : 0u),
             0u};
 
-        const uint64_t rows = end - begin;
         if (foreign)
-        {
             status.spilled_rows += rows;
-            return appendWeightTransferIfMissing(
-                transfers,
-                transfer_capacity,
-                status,
-                expert,
-                owner_participant,
-                destination_participant);
-        }
-
-        status.native_rows += rows;
+        else
+            status.native_rows += rows;
         return true;
     }
 
@@ -614,6 +746,23 @@ namespace llaminar2::least_loaded_ep
 
                 if (best == kInvalidParticipant)
                     break;
+                if (!canAssignDestinationWithTransferCapacity(
+                        transfers,
+                        transfer_capacity,
+                        status,
+                        expert,
+                        owner_participant,
+                        best,
+                        resident_participant_mask,
+                        config.participant_count))
+                {
+                    ++skipped_participants;
+                    if (best < 64u)
+                        skipped_mask |= (1ULL << best);
+                    else
+                        break;
+                    continue;
+                }
 
                 const uint64_t available = availableCapacity(
                     status.capacity_per_participant,
@@ -646,7 +795,8 @@ namespace llaminar2::least_loaded_ep
                         resident_participant_mask,
                         route_row_offset,
                         route_row_offset + chunk,
-                        false))
+                        false,
+                        config.participant_count))
                 {
                     return false;
                 }
@@ -659,11 +809,23 @@ namespace llaminar2::least_loaded_ep
 
             if (!assigned)
             {
-                const uint32_t forced_participant = leastLoadedOtherParticipant(
+                uint32_t forced_participant = leastLoadedOtherParticipant(
                     owner_participant,
                     config.participant_count,
                     workspace.pending_load,
                     workspace.assigned_load);
+                if (!canAssignDestinationWithTransferCapacity(
+                        transfers,
+                        transfer_capacity,
+                        status,
+                        expert,
+                        owner_participant,
+                        forced_participant,
+                        resident_participant_mask,
+                        config.participant_count))
+                {
+                    forced_participant = owner_participant;
+                }
                 if (!appendAssignmentSpan(
                         spans,
                         span_capacity,
@@ -676,7 +838,8 @@ namespace llaminar2::least_loaded_ep
                         resident_participant_mask,
                         route_row_offset,
                         route_row_offset + remaining_rows,
-                        true))
+                        true,
+                        config.participant_count))
                 {
                     return false;
                 }
@@ -778,6 +941,12 @@ namespace llaminar2::least_loaded_ep
             static_cast<uint64_t>(config.alpha_denominator);
         status.capacity_per_participant =
             ceilDiv(capacity_numerator, capacity_denominator);
+        const uint32_t effective_transfer_capacity =
+            config.max_weight_transfers == 0u
+                ? transfer_capacity
+                : (config.max_weight_transfers < transfer_capacity
+                       ? config.max_weight_transfers
+                       : transfer_capacity);
 
         sortExpertsByLoadDescending(
             expert_loads,
@@ -792,12 +961,21 @@ namespace llaminar2::least_loaded_ep
                 continue;
 
             const uint32_t owner = expert_owner_participants[expert];
-            uint32_t resident_mask =
+            const uint32_t resident_mask =
                 expert_resident_participant_masks
-                    ? expert_resident_participant_masks[expert]
-                    : 0u;
-            if (owner < 32u)
-                resident_mask |= (1u << owner);
+                    ? (expert_resident_participant_masks[expert] &
+                       participantMaskLimit(config.participant_count))
+                    : residentParticipantMaskOrOwner(
+                          0u,
+                          owner,
+                          config.participant_count);
+            if (expert_resident_participant_masks && resident_mask == 0u)
+            {
+                status.invalid_config = 1u;
+                if (status_out)
+                    *status_out = status;
+                return false;
+            }
             workspace.pending_load[owner] =
                 workspace.pending_load[owner] >= load
                     ? workspace.pending_load[owner] - load
@@ -813,7 +991,7 @@ namespace llaminar2::least_loaded_ep
                         spans,
                         span_capacity,
                         transfers,
-                        transfer_capacity,
+                        effective_transfer_capacity,
                         status,
                         expert,
                         owner,
@@ -821,7 +999,8 @@ namespace llaminar2::least_loaded_ep
                         resident_mask,
                         0ULL,
                         load,
-                        false))
+                        false,
+                        config.participant_count))
                 {
                     if (status_out)
                         *status_out = status;
@@ -839,7 +1018,7 @@ namespace llaminar2::least_loaded_ep
                         spans,
                         span_capacity,
                         transfers,
-                        transfer_capacity,
+                        effective_transfer_capacity,
                         status,
                         expert,
                         owner,
@@ -847,7 +1026,8 @@ namespace llaminar2::least_loaded_ep
                         resident_mask,
                         0ULL,
                         native_available,
-                        false))
+                        false,
+                        config.participant_count))
                 {
                     if (status_out)
                         *status_out = status;
@@ -862,7 +1042,7 @@ namespace llaminar2::least_loaded_ep
                     spans,
                     span_capacity,
                     transfers,
-                    transfer_capacity,
+                    effective_transfer_capacity,
                     status,
                     config,
                     workspace,
@@ -918,7 +1098,8 @@ namespace llaminar2::least_loaded_ep
         const LeastLoadedExpertAssignmentWorkspace &workspace,
         LeastLoadedExpertWeightTransfer *transfers,
         uint32_t transfer_capacity,
-        LeastLoadedExpertAssignmentStatus *status_out) noexcept
+        LeastLoadedExpertAssignmentStatus *status_out,
+        const uint32_t *expert_resident_participant_masks = nullptr) noexcept
     {
         LeastLoadedExpertAssignmentStatus status{};
         if (status_out)
@@ -997,6 +1178,12 @@ namespace llaminar2::least_loaded_ep
             static_cast<uint64_t>(config.alpha_denominator);
         status.capacity_per_participant =
             ceilDiv(capacity_numerator, capacity_denominator);
+        const uint32_t effective_transfer_capacity =
+            config.max_weight_transfers == 0u
+                ? transfer_capacity
+                : (config.max_weight_transfers < transfer_capacity
+                       ? config.max_weight_transfers
+                       : transfer_capacity);
 
         sortExpertsByLoadDescending(
             expert_loads,
@@ -1011,6 +1198,21 @@ namespace llaminar2::least_loaded_ep
                 continue;
 
             const uint32_t owner = expert_owner_participants[expert];
+            const uint32_t resident_mask =
+                expert_resident_participant_masks
+                    ? (expert_resident_participant_masks[expert] &
+                       participantMaskLimit(config.participant_count))
+                    : residentParticipantMaskOrOwner(
+                          0u,
+                          owner,
+                          config.participant_count);
+            if (expert_resident_participant_masks && resident_mask == 0u)
+            {
+                status.invalid_config = 1u;
+                if (status_out)
+                    *status_out = status;
+                return false;
+            }
             workspace.pending_load[owner] =
                 workspace.pending_load[owner] >= load
                     ? workspace.pending_load[owner] - load
@@ -1022,8 +1224,36 @@ namespace llaminar2::least_loaded_ep
                 workspace.pending_load[owner]);
             if (native_available >= load)
             {
+                const bool foreign = destinationNeedsForeignWeight(
+                    owner,
+                    owner,
+                    resident_mask,
+                    config.participant_count);
+                if (foreign)
+                {
+                    if (!appendWeightTransferIfMissing(
+                            transfers,
+                            effective_transfer_capacity,
+                            status,
+                            expert,
+                            selectWeightSourceParticipant(
+                                owner,
+                                owner,
+                                resident_mask,
+                                config.participant_count),
+                            owner))
+                    {
+                        if (status_out)
+                            *status_out = status;
+                        return false;
+                    }
+                    status.spilled_rows += load;
+                }
+                else
+                {
+                    status.native_rows += load;
+                }
                 workspace.assigned_load[owner] += load;
-                status.native_rows += load;
                 countConceptualAssignmentSpan(status);
                 continue;
             }
@@ -1031,8 +1261,36 @@ namespace llaminar2::least_loaded_ep
             uint64_t remaining = load;
             if (native_available > 0ULL)
             {
+                const bool foreign = destinationNeedsForeignWeight(
+                    owner,
+                    owner,
+                    resident_mask,
+                    config.participant_count);
+                if (foreign)
+                {
+                    if (!appendWeightTransferIfMissing(
+                            transfers,
+                            effective_transfer_capacity,
+                            status,
+                            expert,
+                            selectWeightSourceParticipant(
+                                owner,
+                                owner,
+                                resident_mask,
+                                config.participant_count),
+                            owner))
+                    {
+                        if (status_out)
+                            *status_out = status;
+                        return false;
+                    }
+                    status.spilled_rows += native_available;
+                }
+                else
+                {
+                    status.native_rows += native_available;
+                }
                 workspace.assigned_load[owner] += native_available;
-                status.native_rows += native_available;
                 countConceptualAssignmentSpan(status);
                 remaining -= native_available;
             }
@@ -1067,6 +1325,23 @@ namespace llaminar2::least_loaded_ep
 
                     if (best == kInvalidParticipant)
                         break;
+                    if (!canAssignDestinationWithTransferCapacity(
+                            transfers,
+                            effective_transfer_capacity,
+                            status,
+                            expert,
+                            owner,
+                            best,
+                            resident_mask,
+                            config.participant_count))
+                    {
+                        ++skipped_participants;
+                        if (best < 64u)
+                            skipped_mask |= (1ULL << best);
+                        else
+                            break;
+                        continue;
+                    }
 
                     const uint64_t available = availableCapacity(
                         status.capacity_per_participant,
@@ -1089,10 +1364,14 @@ namespace llaminar2::least_loaded_ep
 
                     if (!appendWeightTransferIfMissing(
                             transfers,
-                            transfer_capacity,
+                            effective_transfer_capacity,
                             status,
                             expert,
-                            owner,
+                            selectWeightSourceParticipant(
+                                owner,
+                                best,
+                                resident_mask,
+                                config.participant_count),
                             best))
                     {
                         if (status_out)
@@ -1109,17 +1388,39 @@ namespace llaminar2::least_loaded_ep
 
                 if (!assigned)
                 {
-                    const uint32_t forced_participant = leastLoadedOtherParticipant(
+                    uint32_t forced_participant = leastLoadedOtherParticipant(
                         owner,
                         config.participant_count,
                         workspace.pending_load,
                         workspace.assigned_load);
-                    if (!appendWeightTransferIfMissing(
+                    if (!canAssignDestinationWithTransferCapacity(
                             transfers,
-                            transfer_capacity,
+                            effective_transfer_capacity,
                             status,
                             expert,
                             owner,
+                            forced_participant,
+                            resident_mask,
+                            config.participant_count))
+                    {
+                        forced_participant = owner;
+                    }
+                    const bool forced_foreign = destinationNeedsForeignWeight(
+                        owner,
+                        forced_participant,
+                        resident_mask,
+                        config.participant_count);
+                    if (forced_foreign &&
+                        !appendWeightTransferIfMissing(
+                            transfers,
+                            effective_transfer_capacity,
+                            status,
+                            expert,
+                            selectWeightSourceParticipant(
+                                owner,
+                                forced_participant,
+                                resident_mask,
+                                config.participant_count),
                             forced_participant))
                     {
                         if (status_out)
@@ -1127,7 +1428,10 @@ namespace llaminar2::least_loaded_ep
                         return false;
                     }
                     workspace.assigned_load[forced_participant] += remaining;
-                    status.spilled_rows += remaining;
+                    if (!forced_foreign)
+                        status.native_rows += remaining;
+                    else
+                        status.spilled_rows += remaining;
                     countConceptualAssignmentSpan(status);
                     remaining = 0ULL;
                     ++status.forced_spills;

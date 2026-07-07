@@ -124,9 +124,9 @@ namespace llaminar2
     /// Summary of request-boundary prefill graph-cache cleanup.
     struct PrefillGraphRequestResetSummary
     {
-        size_t ready_preserved = 0; ///< Ready executable entries kept for replay.
-        size_t initialized = 0;     ///< Entries kept as lazy-initialized, without request capture arming.
-        size_t dropped = 0;         ///< Capturing/invalid entries dropped to Cold.
+        size_t ready_demoted = 0; ///< Ready executable entries demoted to lazy-initialized state.
+        size_t initialized = 0;   ///< Warmup/Initialized entries kept without request capture arming.
+        size_t dropped = 0;       ///< Capturing/invalid entries dropped to Cold.
     };
 
     class PrefillGraphCache
@@ -186,11 +186,14 @@ namespace llaminar2
         void invalidateAll(PrefillGraphRejectReason reason = PrefillGraphRejectReason::InvalidatedByPlacement);
 
         /**
-         * @brief Preserve replay-ready entries across a request-boundary reset.
+         * @brief Split durable lazy initialization from request-local graph replay.
          *
-         * `clear_cache()` resets live KV/GDN/short-conv contents, but replay-ready
-         * bucketed prefill graph entries are designed to read refreshed graph-facing
-         * buffers and then replay the same deterministic mutation sequence.
+         * `clear_cache()` resets live KV/GDN/short-conv contents. Prefill graph
+         * executables capture request-local state and are not allowed to survive
+         * that boundary. Ready entries are demoted to Initialized: reusable lazy
+         * setup survives, but the executable graph, request arming, and replay
+         * counters are discarded so the next prompt must pass fresh strict
+         * preflight and capture against current metadata.
          *
          * Warmup entries are intentionally not preserved as Warmup. A warmed
          * entry has observed request-local runtime metadata, but it has also
@@ -203,9 +206,6 @@ namespace llaminar2
          * @return Summary of preserved, initialized, and dropped entries.
          */
         PrefillGraphRequestResetSummary prepareEntriesForRequestReset();
-
-        /// Compatibility wrapper returning only dropped entries.
-        size_t preserveReadyEntriesAcrossRequestReset();
 
         /// Invalidate a specific entry.
         void invalidate(const PrefillGraphCacheKey &key);

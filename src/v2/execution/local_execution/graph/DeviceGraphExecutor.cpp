@@ -36,6 +36,7 @@
 #include "fort.hpp"
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
 #include <typeinfo>
@@ -71,6 +72,16 @@ namespace llaminar2
             }
 
             return nullptr;
+        }
+
+        std::string snapshotOutputName(const StageDumpInfo::OutputBuffer &output)
+        {
+            return output.name ? output.name : "";
+        }
+
+        bool isDeviceTensorSnapshotOutput(const StageDumpInfo::OutputBuffer &output)
+        {
+            return output.tensor != nullptr;
         }
 
         bool validateStagePointerSet(
@@ -771,27 +782,74 @@ namespace llaminar2
         }
 
         StageDumpInfo dump_info = node.stage->refreshDumpInfoSnapshot();
-        if (dump_info.outputs.empty())
+        std::vector<size_t> graph_output_indices;
+        graph_output_indices.reserve(dump_info.outputs.size());
+        for (size_t i = 0; i < dump_info.outputs.size(); ++i)
+        {
+            if (isDeviceTensorSnapshotOutput(dump_info.outputs[i]))
+                graph_output_indices.push_back(i);
+        }
+
+        if (graph_output_indices.empty())
             return true;
 
         auto &stage_copies = graph_snapshot_copies_[node.name];
-        if (stage_copies.outputs.size() != dump_info.outputs.size())
+        if (stage_copies.outputs.size() != graph_output_indices.size())
         {
             if (isGraphCaptureActive())
             {
-                LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
-                                                         << "' changed snapshot output count during graph capture (old="
-                                                         << stage_copies.outputs.size()
-                                                         << " new=" << dump_info.outputs.size() << ")");
-                return false;
+                std::vector<GraphSnapshotOutputCopy> reconciled;
+                reconciled.resize(graph_output_indices.size());
+                std::vector<bool> consumed(stage_copies.outputs.size(), false);
+                bool matched_all = true;
+
+                for (size_t i = 0; i < graph_output_indices.size(); ++i)
+                {
+                    const auto &output = dump_info.outputs[graph_output_indices[i]];
+                    const std::string output_name = snapshotOutputName(output);
+                    size_t match_index = stage_copies.outputs.size();
+                    if (!output_name.empty())
+                    {
+                        for (size_t j = 0; j < stage_copies.outputs.size(); ++j)
+                        {
+                            if (!consumed[j] && stage_copies.outputs[j].name == output_name)
+                            {
+                                consumed[j] = true;
+                                match_index = j;
+                                break;
+                            }
+                        }
+                    }
+                    if (match_index == stage_copies.outputs.size())
+                    {
+                        matched_all = false;
+                        break;
+                    }
+                    reconciled[i] = std::move(stage_copies.outputs[match_index]);
+                }
+
+                if (!matched_all)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                             << "' changed snapshot output count during graph capture (old="
+                                                             << stage_copies.outputs.size()
+                                                             << " new=" << graph_output_indices.size()
+                                                             << ") and the device-backed outputs could not be reconciled by name");
+                    return false;
+                }
+
+                stage_copies.outputs = std::move(reconciled);
             }
-            stage_copies.outputs.clear();
-            stage_copies.outputs.resize(dump_info.outputs.size());
+            else
+            {
+                stage_copies.outputs.clear();
+                stage_copies.outputs.resize(graph_output_indices.size());
+            }
         }
 
-        for (size_t i = 0; i < dump_info.outputs.size(); ++i)
+        for (size_t i = 0; i < graph_output_indices.size(); ++i)
         {
-            const auto &output = dump_info.outputs[i];
+            const auto &output = dump_info.outputs[graph_output_indices[i]];
             auto &copy = stage_copies.outputs[i];
 
             copy.name = output.name ? output.name : "";
@@ -819,11 +877,11 @@ namespace llaminar2
                  (source_device.has_value() && !source_device->is_gpu()) ||
                  !source_ptr))
             {
-                // Host-only diagnostic outputs do not need graph-stable device copies.
-                copy.storage.reset();
-                copy.storage_bytes = 0;
-                copy.device = DeviceId::invalid();
-                continue;
+                LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                         << "' tensor-backed snapshot output '"
+                                                         << (output.name ? output.name : "<unnamed>")
+                                                         << "' has no GPU source for graph snapshot copy");
+                return false;
             }
 
             const DeviceId copy_device =
@@ -904,10 +962,27 @@ namespace llaminar2
                 return false;
             }
 
-            copy.storage->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                copy_device,
-                producer_stream);
+            if (isGraphCaptureActive())
+            {
+                /*
+                 * The D2D copy has been recorded as a graph node, but it has
+                 * not executed yet.  Recording a normal completion event while
+                 * the stream is being captured leaves the tensor with an event
+                 * that host publication cannot legally wait on.  The post-graph
+                 * publisher re-marks this storage with a real completion event
+                 * after the captured graph is launched.
+                 */
+                copy.storage->transitionTo(
+                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                    copy_device);
+            }
+            else
+            {
+                copy.storage->transitionToWithEvent(
+                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                    copy_device,
+                    producer_stream);
+            }
         }
 
         return true;
@@ -923,18 +998,51 @@ namespace llaminar2
             return true;
 
         auto &stage_copies = it->second;
-        if (stage_copies.outputs.size() != dump_info.outputs.size())
+        std::unordered_map<std::string, GraphSnapshotOutputCopy *> copies_by_name;
+        copies_by_name.reserve(stage_copies.outputs.size());
+        for (auto &copy : stage_copies.outputs)
         {
-            LOG_ERROR("[DeviceGraphExecutor] Graph snapshot copy metadata mismatch for stage '"
-                      << stage_name << "': cached_outputs=" << stage_copies.outputs.size()
-                      << " dump_outputs=" << dump_info.outputs.size());
-            return false;
+            if (!copy.name.empty())
+                copies_by_name.emplace(copy.name, &copy);
         }
 
         for (size_t i = 0; i < dump_info.outputs.size(); ++i)
         {
             auto &output = dump_info.outputs[i];
-            auto &copy = stage_copies.outputs[i];
+            GraphSnapshotOutputCopy *copy_ptr = nullptr;
+            const std::string output_name = snapshotOutputName(output);
+            if (!output_name.empty())
+            {
+                auto copy_it = copies_by_name.find(output_name);
+                if (copy_it != copies_by_name.end())
+                    copy_ptr = copy_it->second;
+            }
+
+            if (!copy_ptr)
+            {
+                if (auto *tensor = dynamic_cast<TensorBase *>(output.tensor))
+                {
+                    if (tensor->current_device().has_value() &&
+                        tensor->current_device()->is_gpu() &&
+                        tensor->gpu_data_ptr())
+                    {
+                        LOG_ERROR("[DeviceGraphExecutor] Missing graph-stable snapshot copy for GPU output '"
+                                  << (output.name ? output.name : "<unnamed>")
+                                  << "' in stage '" << stage_name << "'");
+                        return false;
+                    }
+                }
+                else if (output.tensor && output.tensor->gpu_data_ptr())
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Missing graph-stable snapshot copy for GPU view output '"
+                              << (output.name ? output.name : "<unnamed>")
+                              << "' in stage '" << stage_name << "'");
+                    return false;
+                }
+                continue;
+            }
+
+            auto &copy = *copy_ptr;
             if (!copy.storage)
             {
                 if (auto *tensor = dynamic_cast<TensorBase *>(output.tensor))
@@ -1069,6 +1177,90 @@ namespace llaminar2
                 {"context", context ? context : "post_graph"},
                 {"callbacks", std::to_string(callback_count)}});
 
+        return true;
+    }
+
+    bool DeviceGraphExecutor::publishCapturedTerminalStateAfterGraphExecution(
+        ComputeGraph &graph,
+        int terminal_row,
+        void *producer_stream_override,
+        const char *context)
+    {
+        if (terminal_row < 0)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Cannot publish captured terminal state"
+                      << (context ? std::string(" during ") + context : std::string{})
+                      << ": terminal row is negative (" << terminal_row << ")");
+            return false;
+        }
+
+        const auto &order = graph.getExecutionOrder();
+        if (order.empty())
+            return true;
+
+        size_t restored_count = 0;
+        size_t skipped_count = 0;
+        for (const auto &name : order)
+        {
+            ComputeNode *node = graph.getNode(name);
+            if (!node || !node->stage)
+                continue;
+
+            IComputeStage *stage = node->stage.get();
+            if (!stage->hasVerifierStateCapture())
+            {
+                if (stage->requiresVerifierStateCaptureForPublication())
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication"
+                              << (context ? std::string(" during ") + context : std::string{})
+                              << " required verifier-state capture for stage '"
+                              << name << "' but no capture was bound");
+                    return false;
+                }
+                ++skipped_count;
+                continue;
+            }
+
+            void *producer_stream = producer_stream_override
+                                        ? producer_stream_override
+                                        : stage->gpuStream();
+            DeviceId stage_device = stage->device();
+            if (!stage_device.is_valid())
+                stage_device = node->device;
+            if (stage_device.is_gpu() && !producer_stream)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication"
+                          << (context ? std::string(" during ") + context : std::string{})
+                          << " for GPU stage '" << name
+                          << "' requires an explicit non-null stream");
+                return false;
+            }
+
+            if (!stage->restoreVerifierStateCaptureRow(terminal_row, producer_stream))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication"
+                          << (context ? std::string(" during ") + context : std::string{})
+                          << " failed restoring row " << terminal_row
+                          << " for stage '" << name << "'");
+                return false;
+            }
+            ++restored_count;
+        }
+
+        if (restored_count > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "captured_terminal_state_publications",
+                static_cast<double>(restored_count),
+                GraphExecutorStats::currentPhase() == ExecutionPhase::DECODE
+                    ? "decode"
+                    : "prefill",
+                "executor",
+                {{"context", context ? context : "unknown"},
+                 {"terminal_row", std::to_string(terminal_row)},
+                 {"skipped_stages", std::to_string(skipped_count)}});
+        }
         return true;
     }
 
@@ -1416,6 +1608,24 @@ namespace llaminar2
                             ok = false;
                         }
                     }
+                }
+
+                /*
+                 * Fast collective execution is still a stage boundary.  GPU
+                 * graph capture/replay disables host callbacks while the graph
+                 * body is recorded or launched, but the graph-stable D2D
+                 * snapshot copy must be recorded immediately after the
+                 * collective.  Returning before this hook lets post-collective
+                 * diagnostics such as *_ALLREDUCED observe an older copy even
+                 * though the in-graph tensor payload is correct.
+                 */
+                if (ok && config_.snapshot_callback && !policy.snapshot_callback)
+                {
+                    DeviceId snapshot_device = target_device;
+                    if (!snapshot_device.is_valid() && ctx)
+                        snapshot_device = ctx->deviceId();
+                    if (!captureGraphSnapshotCopies(node, snapshot_device, node.stage->gpuStream()))
+                        ok = false;
                 }
 
                 if (profiling_fast)
@@ -1901,9 +2111,40 @@ namespace llaminar2
             // copy of runtime output metadata, and stages should not have to
             // self-invalidate just to make callback snapshots trustworthy.
             StageDumpInfo snapshot_dump_info = node.stage->refreshDumpInfoSnapshot();
-            snapshot_dump_info.ensureOutputsOnHost(node.stage->gpuStream());
-            LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
-            config_.snapshot_callback(node.name, snapshot_dump_info);
+            DeviceId snapshot_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (!snapshot_device.is_valid() && ctx)
+                snapshot_device = ctx->deviceId();
+            /*
+             * GPU graph capture has a two-phase snapshot contract:
+             *
+             * 1. While capture is active, record only device-to-device copies
+             *    from the stage output into graph-stable scratch. Host
+             *    materialization is forbidden here because ROCm invalidates the
+             *    stream capture when a D2H transfer or host synchronization is
+             *    inserted into the captured body.
+             * 2. After capture/replay launches the graph, publishSnapshotsAfterGraphExecution()
+             *    materializes those stable copies and invokes the host callback.
+             *
+             * Eager execution keeps the historical one-phase path: record the
+             * same stable copy and publish it immediately.
+             */
+            const bool graph_capture_active = isGraphCaptureActive();
+            if (graph_capture_active)
+            {
+                if (!captureGraphSnapshotCopies(node, snapshot_device, node.stage->gpuStream()))
+                    success = false;
+            }
+            else if (!captureGraphSnapshotCopies(node, snapshot_device, node.stage->gpuStream()) ||
+                     !materializeGraphSnapshotCopies(node.name, snapshot_dump_info, node.stage->gpuStream()))
+            {
+                success = false;
+            }
+            else if (!graph_capture_active)
+            {
+                snapshot_dump_info.ensureOutputsOnHost(node.stage->gpuStream());
+                LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
+                config_.snapshot_callback(node.name, snapshot_dump_info);
+            }
             if (profiling)
             {
                 phase_end = std::chrono::high_resolution_clock::now();

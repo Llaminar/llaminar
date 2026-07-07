@@ -269,6 +269,7 @@ namespace llaminar2
         InvalidRuntime = 2,
         MissingPlan = 3,
         MissingDirectory = 4,
+        InProgress = 5,
     };
 
     struct DeviceMoERebalanceApplyStatus
@@ -287,7 +288,8 @@ namespace llaminar2
         uint32_t copied_arrivals = 0;
         uint32_t copy_incomplete = 0;
         uint32_t post_apply_multi_resident_experts = 0;
-        uint32_t reserved[2] = {};
+        uint32_t required_local_arrivals = 0;
+        uint32_t ready_local_arrivals = 0;
     };
 
     constexpr DeviceMoERebalanceFlags operator|(DeviceMoERebalanceFlags lhs,
@@ -347,6 +349,27 @@ namespace llaminar2
         uint32_t min_foreign_rows_per_transfer = 0;
         uint32_t min_router_spread_improvement_per_payload_slot = 0;
         uint32_t max_post_wave_load_spread_per_mille = 0;
+        /**
+         * @brief LLEP capacity multiplier used by graph-captured device planners.
+         *
+         * The shared LLEP assignment policy caps native owner work at
+         * ceil(total_rows * alpha_numerator / (participants * alpha_denominator)).
+         * Keeping these fields in the device config makes decode-maintenance
+         * waves and request-local prefill migrations obey the same policy.
+         */
+        uint32_t llep_alpha_numerator = 1;
+        uint32_t llep_alpha_denominator = 1;
+        /**
+         * @brief Balanced-load standard-EP skip threshold for LLEP.
+         *
+         * When `llep_enable_balanced_skip` is non-zero, LLEP may intentionally
+         * publish no transfers if max_expert_load / mean_expert_load is below
+         * lambda_numerator / lambda_denominator.  Explicit migration tests set
+         * the enable flag to zero so the LLEP path must do observable work.
+         */
+        uint32_t llep_lambda_numerator = 13;
+        uint32_t llep_lambda_denominator = 10;
+        uint32_t llep_enable_balanced_skip = 1;
         uint32_t dynamic_imbalance_threshold_per_mille =
             moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;
         uint32_t dynamic_min_improvement_per_mille =
@@ -764,6 +787,10 @@ namespace llaminar2
                config.participant_id < config.participant_count &&
                moe_rebalance_policy::hasValidRootParticipant(config) &&
                config.window_size_tokens > 0 &&
+               config.llep_alpha_numerator > 0 &&
+               config.llep_alpha_denominator > 0 &&
+               config.llep_lambda_numerator > 0 &&
+               config.llep_lambda_denominator > 0 &&
                (config.layer_window_count == 0 ||
                 config.layer_window_start < config.num_layers);
     }
@@ -1338,6 +1365,8 @@ namespace llaminar2
                  ownership_transfer) &&
                 destination_local)
             {
+                if (status)
+                    ++status->required_local_arrivals;
                 if (!gathered_directory || !local_transfer_slots)
                 {
                     if (status)
@@ -1388,6 +1417,8 @@ namespace llaminar2
                         ++status->copy_incomplete;
                     continue;
                 }
+                if (status)
+                    ++status->ready_local_arrivals;
                 if (slot_entry.descriptor.logical_expert_id != static_cast<int32_t>(plan.expert))
                 {
                     if (status)

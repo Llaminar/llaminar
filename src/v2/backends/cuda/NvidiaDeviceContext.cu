@@ -464,6 +464,14 @@ namespace llaminar2
 
     void *NvidiaDeviceContext::createEvent()
     {
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in createEvent: " << cudaGetErrorString(set_err));
+            return nullptr;
+        }
+
         cudaEvent_t event;
         cudaError_t err = cudaEventCreate(&event);
         if (err != cudaSuccess)
@@ -478,6 +486,14 @@ namespace llaminar2
     {
         if (event == nullptr)
         {
+            return;
+        }
+
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in destroyEvent: " << cudaGetErrorString(set_err));
             return;
         }
 
@@ -504,6 +520,14 @@ namespace llaminar2
         if (!event || !stream)
         {
             LOG_ERROR("[NvidiaDeviceContext] recordEventChecked requires non-null event and stream");
+            return false;
+        }
+
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in recordEventChecked: " << cudaGetErrorString(set_err));
             return false;
         }
 
@@ -542,6 +566,14 @@ namespace llaminar2
             return false;
         }
 
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in waitEventChecked: " << cudaGetErrorString(set_err));
+            return false;
+        }
+
         cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         cudaError_t err = cudaStreamWaitEvent(cuda_stream, cuda_event, 0);
@@ -560,6 +592,14 @@ namespace llaminar2
         if (!event)
         {
             LOG_ERROR("[NvidiaDeviceContext] queryEventChecked requires non-null event");
+            return false;
+        }
+
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in queryEventChecked: " << cudaGetErrorString(set_err));
             return false;
         }
 
@@ -582,14 +622,35 @@ namespace llaminar2
 
     void NvidiaDeviceContext::synchronizeEvent(void *event)
     {
+        (void)synchronizeEventChecked(event);
+    }
+
+    bool NvidiaDeviceContext::synchronizeEventChecked(void *event)
+    {
         if (event == nullptr)
         {
-            LOG_WARN("[NvidiaDeviceContext] synchronizeEvent called with null event");
-            return;
+            LOG_ERROR("[NvidiaDeviceContext] synchronizeEventChecked called with null event");
+            return false;
+        }
+
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in synchronizeEventChecked: "
+                                                             << cudaGetErrorString(set_err));
+            return false;
         }
 
         cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
-        CUDA_CHECK_VOID(cudaEventSynchronize(cuda_event));
+        cudaError_t err = cudaEventSynchronize(cuda_event);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaEventSynchronize failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
     float NvidiaDeviceContext::eventElapsedTime(void *start, void *stop)
@@ -647,13 +708,28 @@ namespace llaminar2
 
     void NvidiaDeviceContext::synchronize()
     {
-        submitAndWait([this]()
+        (void)synchronizeChecked();
+    }
+
+    bool NvidiaDeviceContext::synchronizeChecked()
+    {
+        bool ok = true;
+        submitAndWait([this, &ok]()
                       {
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess) {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                      << ") failed in synchronize: " << cudaGetErrorString(set_err));
+            ok = false;
+            return;
+        }
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
             LOG_ERROR("[NvidiaDeviceContext] cudaDeviceSynchronize failed: " 
                       << cudaGetErrorString(err));
+            ok = false;
         } });
+        return ok;
     }
 
     void NvidiaDeviceContext::synchronizeStream(void *stream)
@@ -666,6 +742,13 @@ namespace llaminar2
         // Synchronize a specific stream. nullptr = legacy default stream (stream 0).
         // This is ~10× cheaper than cudaDeviceSynchronize() since it only waits
         // for one stream's work, not all streams on the device.
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in synchronizeStreamChecked: " << cudaGetErrorString(set_err));
+            return false;
+        }
         cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : cudaStream_t(0);
         cudaError_t err = cudaStreamSynchronize(cuda_stream);
         if (err != cudaSuccess)

@@ -345,6 +345,10 @@ namespace llaminar2
             return BufferId::MTP_K_PROJ;
         if (name == "mtp_v")
             return BufferId::MTP_V_PROJ;
+        if (name == "mtp_k_full_prefill")
+            return BufferId::MTP_K_FULL_PREFILL;
+        if (name == "mtp_v_full_prefill")
+            return BufferId::MTP_V_FULL_PREFILL;
         if (name == "mtp_q_raw")
             return BufferId::MTP_FA_Q_RAW;
         if (name == "mtp_q_gate")

@@ -3740,7 +3740,9 @@ namespace llaminar2
         /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS, default: 8192)
         size_t localtp_small_gpu_allreduce_max_elements = 8192;
 
-        /// Timeout in ms for tensor-parallel coordination waits and blocking MPI collectives
+        /// Timeout in ms for tensor-parallel collective/rendezvous waits and
+        /// blocking MPI collectives. This is not a wall-clock limit for an
+        /// entire per-device forward worker operation.
         /// (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS).
         /// Debug/Integration builds default to a 30s safety net to avoid deadlocked tests;
         /// Release builds default to 0 (wait forever) for production runs.

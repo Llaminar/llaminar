@@ -27,6 +27,7 @@
 
 #include "CPURingKVCache.h"
 
+#include "../kvcache/KVCacheLogicalBlockCodec.h"
 #include "turboquant/TurboQuantDequantizeTQ4.h"
 #include "turboquant/TurboQuantDequantizeSplitTQ.h"
 #include "../../tensors/SIMDHelpers.h"
@@ -1717,6 +1718,24 @@ namespace llaminar2
         const size_t v_rb = VTrait::row_bytes(entry.V.get(), kv_dim_, head_dim_);
         const size_t k_hb = KTrait::head_bytes(entry.K.get(), kv_dim_, head_dim_);
         const size_t v_hb = VTrait::head_bytes(entry.V.get(), kv_dim_, head_dim_);
+        const size_t k_payload_bytes = (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+                                           ? static_cast<size_t>(local_n_kv_heads_) *
+                                                 static_cast<size_t>(desc.token_count) * k_hb
+                                           : static_cast<size_t>(desc.token_count) * k_rb;
+        const size_t v_payload_bytes = (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+                                           ? static_cast<size_t>(local_n_kv_heads_) *
+                                                 static_cast<size_t>(desc.token_count) * v_hb
+                                           : static_cast<size_t>(desc.token_count) * v_rb;
+        auto canonicalize_export = [&]() -> bool
+        {
+            if (!kv_cache_codec::canonicalizeFloatingZeros(dst_k, k_payload_bytes, KPrecision) ||
+                !kv_cache_codec::canonicalizeFloatingZeros(dst_v, v_payload_bytes, VPrecision))
+            {
+                LOG_ERROR("[CPURingKVCache::exportLogicalBlock] logical payload canonicalization failed");
+                return false;
+            }
+            return true;
+        };
 
         if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
         {
@@ -1733,7 +1752,7 @@ namespace llaminar2
                     std::memcpy(out_v + dst_row * v_hb, src_v + src_v_row * v_hb, v_hb);
                 }
             }
-            return true;
+            return canonicalize_export();
         }
 
         for (int i = 0; i < desc.token_count; ++i)
@@ -1748,7 +1767,7 @@ namespace llaminar2
                         v_rb);
         }
 
-        return true;
+        return canonicalize_export();
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>

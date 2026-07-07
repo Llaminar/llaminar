@@ -38,6 +38,8 @@ namespace llaminar2
         bool requires_terminal_logits = true;
         bool has_terminal_hidden = false;
         bool has_terminal_logits = false;
+        bool restore_model_runtime_state = true;
+        bool restore_hybrid_state_for_suffix_prefill = false;
         std::string bypass_reason;
         std::vector<PrefixBlockHandle> blocks;
 

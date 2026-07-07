@@ -341,6 +341,36 @@ namespace llaminar2
         virtual bool supportsRawAllgatherOnStreamGraphCapture() const { return false; }
 
         /**
+         * @brief Rendezvous all LocalTP participants at a GPU graph-capture boundary.
+         *
+         * LocalTP GPU graph capture is a domain-level lifecycle, not an
+         * independent per-device detail. A participant must not start recording a
+         * graph while a sibling is still draining the previous eager prefill
+         * chunk, and no participant should launch an immediately captured graph
+         * before every sibling has exited capture. Implementations that own a
+         * multi-device LocalTP domain should use this hook as a reusable cyclic
+         * barrier keyed by @p boundary_name.
+         *
+         * @param boundary_name Human-readable boundary identifier used for
+         *        contract checks and diagnostics.
+         * @param device_index Participant index in devices().
+         * @param timeout_ms Maximum wait time; non-positive means wait without a
+         *        timeout.
+         * @return true when all participants reached the same boundary, false on
+         *         timeout, mismatch, duplicate arrival, or backend abort.
+         */
+        virtual bool graphCaptureBoundaryRendezvous(
+            const std::string &boundary_name,
+            int device_index,
+            int timeout_ms)
+        {
+            (void)boundary_name;
+            (void)device_index;
+            (void)timeout_ms;
+            return true;
+        }
+
+        /**
          * @brief Gather shards from multiple devices into a single output tensor
          *
          * This is the orchestrator-friendly variant of allgather. Instead of requiring

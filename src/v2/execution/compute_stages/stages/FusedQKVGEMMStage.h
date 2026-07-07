@@ -137,6 +137,9 @@ namespace llaminar2
          * @brief Unbind workspace from all three kernels
          */
         void unbindWorkspace() override;
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
 
     private:
         Params params_;
@@ -156,14 +159,8 @@ namespace llaminar2
             ITensorGemm *gemm_q,
             ITensorGemm *gemm_k,
             ITensorGemm *gemm_v);
+        void clearCachedGemmStreams();
 
-        // Reused tiny row tensors for device-side verifier publication.  They are
-        // deliberately owned by the stage so repeated decode steps do not allocate
-        // a fresh scratch tensor for every verifier row.
-        std::shared_ptr<FP32Tensor> verifier_input_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_q_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_k_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_v_row_;
     };
 
 } // namespace llaminar2

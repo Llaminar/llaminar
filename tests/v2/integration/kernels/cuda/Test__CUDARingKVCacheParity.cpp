@@ -975,6 +975,195 @@ TEST(Test__CUDARingKVCache, AppendWithStream_FP32_to_FP16_Conversion)
     LOG_INFO("[AppendWithStream_FP32_to_FP16] PASSED");
 }
 
+/**
+ * @brief Proves grouped verifier KV publication is byte-identical to serial decode appends.
+ *
+ * The MTP verifier path appends multiple newly verified K/V rows at once.  Serial
+ * decode appends those same rows one at a time through appendConvertedWithStream(),
+ * so grouped publication is only decode-equivalent if the final FP16 cache bytes
+ * match exactly.  This regression keeps both source layouts used by the graph:
+ * position-major `[row][kv_dim]` and verifier head-major `[head][row][dim]`.
+ */
+TEST(Test__CUDARingKVCache, VerifierRowsFP32ToFP16AppendMatchesSerialDecodeForPositionAndHeadMajor)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr int n_layers = 1;
+    constexpr int batch_size = 1;
+    constexpr int max_seq_len = 32;
+    constexpr int n_kv_heads = 3;
+    constexpr int head_dim = 32;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int history_tokens = 5;
+    constexpr int verifier_rows = 3;
+    constexpr int total_tokens = history_tokens + verifier_rows;
+
+    ScopedCudaStream stream;
+
+    auto history_k = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(history_tokens), static_cast<size_t>(kv_dim)});
+    auto history_v = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(history_tokens), static_cast<size_t>(kv_dim)});
+    auto verifier_k_position = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(verifier_rows), static_cast<size_t>(kv_dim)});
+    auto verifier_v_position = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(verifier_rows), static_cast<size_t>(kv_dim)});
+    auto verifier_k_head = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n_kv_heads * verifier_rows), static_cast<size_t>(head_dim)});
+    auto verifier_v_head = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n_kv_heads * verifier_rows), static_cast<size_t>(head_dim)});
+
+    for (size_t i = 0; i < static_cast<size_t>(history_tokens) * kv_dim; ++i)
+    {
+        history_k->mutable_data()[i] = 0.00390625f * static_cast<float>(static_cast<int>(i % 97) - 48);
+        history_v->mutable_data()[i] = -0.0029296875f * static_cast<float>(static_cast<int>(i % 89) - 44);
+    }
+
+    for (int row = 0; row < verifier_rows; ++row)
+    {
+        for (int elem = 0; elem < kv_dim; ++elem)
+        {
+            const int head = elem / head_dim;
+            const int lane = elem - head * head_dim;
+            const size_t position_idx = static_cast<size_t>(row) * kv_dim + elem;
+            const size_t head_idx = (static_cast<size_t>(head) * verifier_rows + row) * head_dim + lane;
+
+            // Use non-trivial, exactly reproducible FP32 values.  The values are
+            // intentionally not all FP16-exact so both serial and grouped paths
+            // must perform the same round-to-nearest-even conversion.
+            const float k_value =
+                0.00137f * static_cast<float>((row + 1) * 101 + head * 17 + lane - 80);
+            const float v_value =
+                -0.00191f * static_cast<float>((row + 1) * 73 + head * 19 + lane - 64);
+
+            verifier_k_position->mutable_data()[position_idx] = k_value;
+            verifier_v_position->mutable_data()[position_idx] = v_value;
+            verifier_k_head->mutable_data()[head_idx] = k_value;
+            verifier_v_head->mutable_data()[head_idx] = v_value;
+        }
+    }
+
+    ASSERT_TRUE(history_k->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(history_v->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(verifier_k_position->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(verifier_v_position->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(verifier_k_head->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(verifier_v_head->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    stream.synchronize();
+
+    auto make_cache = [&]()
+    {
+        auto cache = createCUDARingKVCache(
+            ActivationPrecision::FP16,
+            n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+        EXPECT_NE(cache, nullptr);
+        return cache;
+    };
+
+    auto append_history = [&](ICUDARingKVCache *cache)
+    {
+        ASSERT_NE(cache, nullptr);
+        ASSERT_TRUE(cache->appendConvertedWithStream(
+            0, 0,
+            history_k->gpu_data_ptr(),
+            history_v->gpu_data_ptr(),
+            TensorType::FP32,
+            history_tokens,
+            stream.stream()));
+        stream.synchronize();
+        ASSERT_EQ(cache->get_cached_tokens(0, 0), history_tokens);
+    };
+
+    auto read_cache = [&](ICUDARingKVCache *cache,
+                          std::vector<uint16_t> *out_k,
+                          std::vector<uint16_t> *out_v)
+    {
+        ASSERT_NE(cache, nullptr);
+        const void *d_k_out = nullptr;
+        const void *d_v_out = nullptr;
+        int kv_len = 0;
+        ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_k_out, &d_v_out, &kv_len, stream.stream()));
+        ASSERT_EQ(kv_len, total_tokens);
+        ASSERT_NE(d_k_out, nullptr);
+        ASSERT_NE(d_v_out, nullptr);
+
+        out_k->assign(static_cast<size_t>(total_tokens) * kv_dim, uint16_t{0});
+        out_v->assign(static_cast<size_t>(total_tokens) * kv_dim, uint16_t{0});
+        ASSERT_EQ(cudaMemcpyAsync(out_k->data(), d_k_out,
+                                  out_k->size() * sizeof(uint16_t),
+                                  cudaMemcpyDeviceToHost, stream.stream()),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(out_v->data(), d_v_out,
+                                  out_v->size() * sizeof(uint16_t),
+                                  cudaMemcpyDeviceToHost, stream.stream()),
+                  cudaSuccess);
+        stream.synchronize();
+    };
+
+    auto run_case = [&](const char *case_name,
+                        FP32Tensor *grouped_k,
+                        FP32Tensor *grouped_v)
+    {
+        auto serial = make_cache();
+        auto grouped = make_cache();
+        ASSERT_NE(serial, nullptr);
+        ASSERT_NE(grouped, nullptr);
+
+        append_history(serial.get());
+        append_history(grouped.get());
+
+        const auto *serial_k_base = static_cast<const float *>(verifier_k_position->gpu_data_ptr());
+        const auto *serial_v_base = static_cast<const float *>(verifier_v_position->gpu_data_ptr());
+        ASSERT_NE(serial_k_base, nullptr);
+        ASSERT_NE(serial_v_base, nullptr);
+        for (int row = 0; row < verifier_rows; ++row)
+        {
+            ASSERT_TRUE(serial->appendConvertedWithStream(
+                0, 0,
+                serial_k_base + static_cast<size_t>(row) * kv_dim,
+                serial_v_base + static_cast<size_t>(row) * kv_dim,
+                TensorType::FP32,
+                1,
+                stream.stream()))
+                << case_name << " serial row=" << row;
+            stream.synchronize();
+            ASSERT_EQ(serial->get_cached_tokens(0, 0), history_tokens + row + 1);
+        }
+
+        ASSERT_TRUE(grouped->appendVerifierRowsDecodeEquivalent(
+            0, 0,
+            static_cast<const ITensor *>(grouped_k),
+            static_cast<const ITensor *>(grouped_v),
+            verifier_rows,
+            stream.opaque()))
+            << case_name << " grouped verifier append failed";
+        stream.synchronize();
+        ASSERT_EQ(grouped->get_cached_tokens(0, 0), total_tokens);
+
+        std::vector<uint16_t> serial_k;
+        std::vector<uint16_t> serial_v;
+        std::vector<uint16_t> grouped_k_bytes;
+        std::vector<uint16_t> grouped_v_bytes;
+        read_cache(serial.get(), &serial_k, &serial_v);
+        read_cache(grouped.get(), &grouped_k_bytes, &grouped_v_bytes);
+
+        ASSERT_EQ(grouped_k_bytes.size(), serial_k.size());
+        ASSERT_EQ(grouped_v_bytes.size(), serial_v.size());
+        EXPECT_EQ(grouped_k_bytes, serial_k)
+            << case_name << " grouped K cache bytes diverged from serial decode";
+        EXPECT_EQ(grouped_v_bytes, serial_v)
+            << case_name << " grouped V cache bytes diverged from serial decode";
+    };
+
+    run_case("position-major", verifier_k_position.get(), verifier_v_position.get());
+    run_case("head-major", verifier_k_head.get(), verifier_v_head.get());
+}
+
 // =============================================================================
 // REGRESSION TEST: FP32 ITensor → FP16 cache via append (non-stream)
 //

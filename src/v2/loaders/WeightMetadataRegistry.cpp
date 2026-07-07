@@ -1,3 +1,8 @@
+/**
+ * @file WeightMetadataRegistry.cpp
+ * @brief Implements tensor-pointer metadata tracking for graph weight bindings.
+ */
+
 #include "WeightMetadataRegistry.h"
 
 #include "../tensors/Tensors.h"
@@ -23,9 +28,19 @@ namespace llaminar2
         WeightResidency residency;
         residency.home_device = home_device;
         residency.resident_device = home_device.is_valid() ? std::optional<DeviceId>(home_device) : std::nullopt;
-        return metadata_.emplace(
-            tensor,
-            WeightMetadata{makeSourceWeightIdentity(canonical_name, {}, nextInstanceIdLocked()), {}, residency}).second;
+
+        auto it = metadata_.find(tensor);
+        if (it != metadata_.end() &&
+            it->second.identity.derivation == WeightDerivationKind::Source &&
+            it->second.identity.canonical_name == canonical_name)
+        {
+            it->second.residency = residency;
+            return false;
+        }
+
+        metadata_[tensor] =
+            WeightMetadata{makeSourceWeightIdentity(canonical_name, {}, nextInstanceIdLocked()), {}, residency};
+        return true;
     }
 
     bool WeightMetadataRegistry::registerWeight(

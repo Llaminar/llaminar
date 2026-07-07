@@ -403,15 +403,37 @@ namespace llaminar2
             return graph;
         }
 
+        /*
+         * MTP sidecars verify decode rows.  When LocalTP uses a replicated
+         * dense-decode view, every reused attention/FFN sub-builder must resolve
+         * prepared refs from that same view; otherwise a stage can pair a
+         * replicated tensor pointer with a TP-local prepared GEMM engine.  The
+         * selected MTPDepthWeights already come from selectMTPDecodeWeightSet();
+         * this scope keeps the binding/ref lookups aligned with those tensors.
+         */
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         const bool kv_cache_only = input.kv_cache_only;
+        MTPKVCacheOnlyScope kv_cache_only_scope(*this, kv_cache_only);
+        const bool phase_split_mtp_kv_handoff =
+            kv_cache_only && needsPhaseSplitPrefillKVCacheHandoff(total_tokens, input.kv_cache, device);
         const bool mtp_moe =
             weights.fa_block.moe_gate ||
             weights.fa_block.moe_gate_exps ||
             weights.fa_block.moe_up_exps ||
             weights.fa_block.moe_down_exps;
+        const bool mirror_mtp_lm_head =
+            !kv_cache_only &&
+            localTPMirroredMTPHeadConfigured();
+        MirroredMTPHeadScope mirrored_head_scope(*this, mirror_mtp_lm_head);
+        const bool mtp_lm_head_column_parallel =
+            config_.lm_head_column_parallel &&
+            config_.vocab_local > 0 &&
+            !mirror_mtp_lm_head;
 
         if (missing("embedding table", modelEmbeddingTable()) ||
-            (!kv_cache_only && missing("lm head", modelLMHead())) ||
+            (!kv_cache_only &&
+             missing("lm head", modelLMHeadForGraph(mtp_lm_head_column_parallel))) ||
             (!input.draft_token_ids && !input.draft_token_ids_device &&
              missing("draft_token_ids", input.draft_token_ids)) ||
             missing("terminal_hidden", input.terminal_hidden) ||
@@ -430,6 +452,8 @@ namespace llaminar2
             missing("output.q", output.q) ||
             missing("output.k", output.k) ||
             missing("output.v", output.v) ||
+            (phase_split_mtp_kv_handoff && missing("output.k_full_prefill", output.k_full_prefill)) ||
+            (phase_split_mtp_kv_handoff && missing("output.v_full_prefill", output.v_full_prefill)) ||
             missing("output.q_raw", output.q_raw) ||
             missing("output.q_gate", output.q_gate) ||
             (!kv_cache_only && missing("output.attn_output", output.attn_output)) ||
@@ -468,20 +492,16 @@ namespace llaminar2
                           .num_tokens = total_tokens,
                           .d_model = config_.d_model,
                           .vocab_size = config_.vocab_size,
-                          .vocab_offset = useFullVocabEmbeddingForCurrentGraph()
-                                              ? 0
-                                              : embeddingVocabOffsetForDevice(config_, device),
+                          .vocab_offset = embeddingVocabOffsetForCurrentGraph(device),
                           .local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0,
                           .output_buffer_id = BufferId::MTP_EMBEDDING,
                           .prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
-        const bool embedding_is_sharded =
-            modelEmbeddingTable() &&
-            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
+        const bool embedding_is_sharded = usesVocabParallelEmbeddingForCurrentGraph();
         std::string embedding_terminal = prefix + "embedding";
-        if (embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
+        if (embedding_is_sharded && needsTPAllreduce())
         {
             auto allreduce_stage = createTPAllreduceStage(
                 output.embedding,
@@ -571,6 +591,8 @@ namespace llaminar2
         mtp_buffers.Q = output.q;
         mtp_buffers.K = output.k;
         mtp_buffers.V = output.v;
+        mtp_buffers.K_full_prefill = output.k_full_prefill;
+        mtp_buffers.V_full_prefill = output.v_full_prefill;
         mtp_buffers.attn_output = output.attn_output;
         mtp_buffers.attn_proj = output.attn_proj;
         mtp_buffers.gate = output.gate;
@@ -584,6 +606,8 @@ namespace llaminar2
             {BufferId::Q_PROJ, BufferId::MTP_Q_PROJ},
             {BufferId::K_PROJ, BufferId::MTP_K_PROJ},
             {BufferId::V_PROJ, BufferId::MTP_V_PROJ},
+            {BufferId::K_FULL_PREFILL, BufferId::MTP_K_FULL_PREFILL},
+            {BufferId::V_FULL_PREFILL, BufferId::MTP_V_FULL_PREFILL},
             {BufferId::FA_Q_RAW, BufferId::MTP_FA_Q_RAW},
             {BufferId::FA_GATE, BufferId::MTP_FA_GATE},
             {BufferId::ATTN_OUTPUT, BufferId::MTP_ATTN_OUTPUT},
@@ -684,15 +708,13 @@ namespace llaminar2
         graph.addDependency(prefix + "final_norm", ffn_terminal);
 
         const int mtp_lm_head_vocab_size =
-            (config_.lm_head_column_parallel && config_.vocab_local > 0)
-                ? config_.vocab_local
-                : config_.vocab_size;
+            mtp_lm_head_column_parallel ? config_.vocab_local : config_.vocab_size;
 
         graph.addNode(prefix + "lm_head",
                       ComputeStageFactory::createLMHead({
                           .device_id = device,
                           .hidden_states = output.hidden,
-                          .lm_head_weight = modelLMHead(),
+                          .lm_head_weight = modelLMHeadForGraph(mtp_lm_head_column_parallel),
                           .logits = output.logits,
                           .seq_len = total_tokens,
                           .d_model = config_.d_model,
@@ -701,7 +723,9 @@ namespace llaminar2
                           .compute_all_positions = true,
                           .input_buffer_id = BufferId::MTP_HIDDEN,
                           .output_buffer_id = BufferId::MTP_LOGITS,
-                          .prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device),
+                          .prepared_ref = preparedRefForGraphWeight(
+                              modelLMHeadBindingForGraph(mtp_lm_head_column_parallel),
+                              device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
@@ -765,12 +789,27 @@ namespace llaminar2
         int total_tokens = batch_size * seq_len;
         const bool live_state_allgather_available =
             gdnLiveStateAllGatherAvailable(total_tokens, device);
+        const bool verifier_state_capture_supported =
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm());
+        /*
+         * LocalTP dense decode normally runs from replicated GDN weights and a
+         * full mirrored GDN live-state bank after the prefill handoff.  The MTP
+         * all-position verifier must project exactly the same rows as ordinary
+         * serial decode, so keep the replicated decode view for ordinary decode
+         * whenever the live handoff is available.  MTP all-position verifier
+         * rows are different: accepted-row publication scans the verifier graph
+         * for the explicit GDN handoff stage after restoring speculative state,
+         * so verifier capture keeps the TP-local state path even when ordinary
+         * decode would already have a full mirrored bank.
+         */
         const bool keep_gdn_state_tp_local =
             useDecodeReplicatedDenseWeights() &&
             config_.dense_tp_decode_replicated &&
             config_.qkv_column_parallel &&
             weight_bindings_.get_layer_weights != nullptr &&
-            !live_state_allgather_available;
+            (!live_state_allgather_available || verifier_state_capture_supported);
 
         LayerWeightBindings layer_bindings = keep_gdn_state_tp_local
                                                  ? weight_bindings_.get_layer_weights(layer_idx)
@@ -844,10 +883,6 @@ namespace llaminar2
                                                                     << " n_v_heads=" << n_v_heads << " (full=" << n_v_heads_full << ")"
                                                                     << " d_k=" << d_k << " d_v=" << d_v
                                                                     << " qkv_dim=" << qkv_dim << " value_dim=" << value_dim);
-        const bool verifier_state_capture_supported =
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled &&
-            (device.is_cpu() || device.is_cuda() || device.is_rocm());
         const int per_request_verifier_state_capture_rows =
             verifier_state_capture_supported ? resolveMTPMaxTargetQueryRows(config_.mtp) : 0;
         const int verifier_state_capture_rows =
@@ -1048,11 +1083,32 @@ namespace llaminar2
                 n_v_heads_full * d_k * d_v;
             state_gather_params.stage_name = prefix + "gdn_live_state_allgather";
 
-            graph.addNode(prefix + "gdn_live_state_allgather",
-                          ComputeStageFactory::createGDNLiveStateAllGather(state_gather_params),
-                          device);
-            graph.addDependency(prefix + "gdn_live_state_allgather", prefix + "gdn_recurrence");
-            gdn_state_ready_node = prefix + "gdn_live_state_allgather";
+            const bool gdn_state_already_full =
+                state_gather_params.local_conv_state_floats ==
+                    state_gather_params.full_conv_state_floats &&
+                state_gather_params.local_recurrence_state_floats ==
+                    state_gather_params.full_recurrence_state_floats;
+            if (!gdn_state_already_full)
+            {
+                graph.addNode(prefix + "gdn_live_state_allgather",
+                              ComputeStageFactory::createGDNLiveStateAllGather(state_gather_params),
+                              device);
+                graph.addDependency(prefix + "gdn_live_state_allgather", prefix + "gdn_recurrence");
+                gdn_state_ready_node = prefix + "gdn_live_state_allgather";
+            }
+            else
+            {
+                /*
+                 * Dynamic ExpertOverlay can install replicated dense/GDN weights
+                 * before the long-context prefill begins.  In that case the
+                 * recurrence and short-conv kernels already own full mirrored
+                 * state, so an allgather would be both unnecessary and
+                 * dimensionally invalid (`full == local`, not `local * degree`).
+                 */
+                LOG_DEBUG("[Qwen35Graph] Skipping GDN live-state allgather for layer "
+                          << layer_idx
+                          << " because prefill state is already full-sized");
+            }
         }
 
         // =====================================================================

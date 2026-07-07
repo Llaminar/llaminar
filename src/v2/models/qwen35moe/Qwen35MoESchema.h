@@ -102,23 +102,23 @@ namespace llaminar2
             // Add MoE-specific activation buffers
             // Routing outputs: expert indices and weights for top-k selection
             schema.layer_buffers.push_back(
-                {"moe_expert_indices", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch, "moe_scratch", 10, "MoE top-k expert indices per token (as float)"});
+                {"moe_expert_indices", {"moe_activation_rows", "moe_top_k"}, "fp32", BufferSemantic::Scratch, "moe_scratch", 10, "MoE top-k expert indices per token (as float)"});
             schema.layer_buffers.push_back(
-                {"moe_expert_weights", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch, "moe_scratch", 9, "MoE top-k routing weights per token"});
+                {"moe_expert_weights", {"moe_activation_rows", "moe_top_k"}, "fp32", BufferSemantic::Scratch, "moe_scratch", 9, "MoE top-k routing weights per token"});
 
             // Expert compute output: combined weighted expert output
             schema.layer_buffers.push_back(
-                {"moe_combined_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 10, "Combined routed expert FFN output"});
+                {"moe_combined_output", {"moe_activation_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 10, "Combined routed expert FFN output"});
 
             // Shared expert output
             schema.layer_buffers.push_back(
-                {"moe_shared_expert_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 5, "Shared expert FFN output"});
+                {"moe_shared_expert_output", {"moe_activation_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 5, "Shared expert FFN output"});
 
             // Expert GEMM scratch buffers (for gate/up projections)
             schema.layer_buffers.push_back(
-                {"moe_gate_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 10, "Expert gate projection scratch"});
+                {"moe_gate_scratch", {"moe_activation_rows", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 10, "Expert gate projection scratch"});
             schema.layer_buffers.push_back(
-                {"moe_up_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 5, "Expert up projection scratch"});
+                {"moe_up_scratch", {"moe_activation_rows", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 5, "Expert up projection scratch"});
 
             return schema;
         }
@@ -191,6 +191,9 @@ namespace llaminar2
             config["MOE_SHARED_EXPERT_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["MOE_SHARED_GATE_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["MOE_COMBINED_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
+            config["MOE_EXPERT_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
+            config["MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
+            config["MOE_COMBINED_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
 
             return config;
         }

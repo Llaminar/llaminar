@@ -173,6 +173,29 @@ namespace llaminar2
     {
     }
 
+    void GEMMStage::clearCachedGemmStream()
+    {
+        if (cached_gemm_)
+            cached_gemm_->setGPUStream(nullptr);
+    }
+
+    void GEMMStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        clearCachedGemmStream();
+    }
+
+    void GEMMStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionStatePreservingCapturedReplay();
+        clearCachedGemmStream();
+    }
+
+    void GEMMStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
+    }
+
     bool GEMMStage::validatePreparedWeights(std::string *error) const
     {
         if (!params_.B)
@@ -444,13 +467,6 @@ namespace llaminar2
         if (params_.gate_input && !gate_base)
             return false;
 
-        /*
-         * Phase 9.8 verifier GEMM is a real grouped contract.  The previous
-         * implementation copied one row into scratch and replayed M=1 GEMV in
-         * a loop.  That is a useful diagnostic oracle, but it cannot be the
-         * production verifier path because it serializes exactly the work MTP
-         * is supposed to amortize.
-         */
         bool success = false;
         if (params_.gate_input)
         {
@@ -467,11 +483,8 @@ namespace llaminar2
         }
         else
         {
-            const TensorBase *bias_tensor = nullptr;
-            if (params_.bias_tensor)
-                bias_tensor = dynamic_cast<const TensorBase *>(params_.bias_tensor);
             std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gemm, C_base, effective_n, bias_tensor, "GEMM"}};
+                {gemm, C_base, effective_n, nullptr, "gemm"}};
             success = gemm->multiply_fused_verifier_rows_decode_equivalent(
                 A_base,
                 projections,
@@ -483,12 +496,12 @@ namespace llaminar2
 
         if (!success)
         {
-            LOG_ERROR("[GEMMStage] Grouped decode-equivalent verifier GEMM is unsupported or failed"
+            LOG_ERROR("[GEMMStage] Grouped decode-equivalent verifier GEMM failed"
                       << " device=" << params_.device_id.to_string()
+                      << " swiglu=" << (params_.gate_input ? "1" : "0")
                       << " m=" << params_.m
                       << " n=" << effective_n
-                      << " k=" << params_.k
-                      << " swiglu=" << (params_.gate_input != nullptr));
+                      << " k=" << params_.k);
             return false;
         }
 
@@ -501,7 +514,8 @@ namespace llaminar2
             {},
             params_.device_id.to_string(),
             {{"stage", "GEMM"},
-             {"swiglu", params_.gate_input ? "1" : "0"}});
+             {"swiglu", params_.gate_input ? "1" : "0"},
+             {"route", "grouped"}});
         traceOutput("C", params_.C);
         return true;
     }

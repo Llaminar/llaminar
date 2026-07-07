@@ -25,12 +25,58 @@
 #include "models/GraphTypes.h"
 #include "mocks/MockModelContext.h"
 
+#include <fstream>
+#include <sstream>
+#include <string>
+
 using namespace llaminar2;
 using namespace llaminar2::test;
 using namespace testing;
 
 namespace
 {
+    /**
+     * @brief Read a repository source file for a factory source-contract test.
+     *
+     * Some runner-factory ownership bugs only appear when a real GGUF model,
+     * nested TP-in-PP stage config, and decode-replicated dense sidecar are all
+     * present. The source-contract tests below guard the precise factory wiring
+     * rule without forcing every unit-test run to materialize that full stack.
+     *
+     * @param path Repository-relative path to read from the CTest working tree.
+     * @return File contents, or an empty string when the file cannot be read.
+     */
+    std::string readFactorySourceFile(const std::string &path)
+    {
+        std::ifstream input(path);
+        if (!input.good())
+            return {};
+
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
+
+    /**
+     * @brief Count non-overlapping string occurrences in source text.
+     *
+     * @param haystack Source text to inspect.
+     * @param needle Text to count.
+     * @return Number of non-overlapping matches.
+     */
+    size_t countFactorySourceOccurrences(
+        const std::string &haystack,
+        const std::string &needle)
+    {
+        size_t count = 0;
+        size_t pos = 0;
+        while ((pos = haystack.find(needle, pos)) != std::string::npos)
+        {
+            ++count;
+            pos += needle.size();
+        }
+        return count;
+    }
 
     // =============================================================================
     // Mock LocalTPContext for factory tests
@@ -420,6 +466,86 @@ namespace
         auto result = createTestableRankOrchestrator(
             model_ctx_, std::move(empty_runners), nullptr, config);
         EXPECT_EQ(result, nullptr);
+    }
+
+    /**
+     * @brief Replicated dense decode sidecar plans must preserve PP ownership.
+     *
+     * A nested TP-in-PP runner has two dense weight views: the primary frozen
+     * stage weights and the decode-replicated dense sidecar. Both views must be
+     * filtered by the same FactoryPPStageConfig. Otherwise a terminal stage that
+     * does not own embeddings can reject its decode sidecar for missing
+     * token_embd.weight, while a non-terminal stage can accidentally materialize
+     * LM-head bindings it should never own.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         DecodeReplicatedDensePlansUsePPStageFilter)
+    {
+        const std::string source =
+            readFactorySourceFile("src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        EXPECT_NE(source.find("[InferenceRunner] PP stage decode replicated dense"),
+                  std::string::npos)
+            << "explicit PP materialization must build a decode-replicated dense sidecar";
+        EXPECT_NE(source.find("graph_config.tp_config.get(),\n"
+                              "                    &pp_cfg,\n"
+                              "                    SingleDeviceWeightPlanOptions"),
+                  std::string::npos)
+            << "explicit PP sidecar plans must use the stage's FactoryPPStageConfig";
+        EXPECT_GE(countFactorySourceOccurrences(
+                      source,
+                      "const FactoryPPStageConfig *decode_pp_config ="),
+                  2u)
+            << "generic decode sidecar plan sites must derive their PP filter from runner config";
+        EXPECT_GE(countFactorySourceOccurrences(
+                      source,
+                      "requiresTerminalMTPSidecarEmbedding(graph_config,"),
+                  3u)
+            << "decode-replicated dense sidecar plans must carry terminal MTP embedding ownership "
+               "instead of treating token_embd.weight as a full-stage embedding fallback.";
+        EXPECT_NE(source.find("graph_config.tp_config.get(),\n"
+                              "                decode_pp_config,\n"
+                              "                SingleDeviceWeightPlanOptions"),
+                  std::string::npos)
+            << "concrete runner sidecar plans must pass the runner's optional PP filter";
+        EXPECT_NE(source.find("graph_config.tp_config.get(),\n"
+                              "                            decode_pp_config,\n"
+                              "                            SingleDeviceWeightPlanOptions"),
+                  std::string::npos)
+            << "testable LocalTP sidecar plans must pass the runner's optional PP filter";
+    }
+
+    /**
+     * @brief Replicated dense decode plans must keep MTP verifier sidecar weights.
+     *
+     * Base-layer routed experts are excluded from the dense decode subset because
+     * ExpertOverlay owns their residency separately. Qwen3.6 MTP is different:
+     * its trailing nextn block is the verifier path itself, so even nextn tensors
+     * with ffn_*_exps names must remain in the replicated decode weight plan.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         DecodeReplicatedDensePlansRetainNextNMTPSidecarWeights)
+    {
+        const std::string source =
+            readFactorySourceFile("src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        EXPECT_NE(source.find("weight_name.find(\".nextn.\")"),
+                  std::string::npos)
+            << "phase-split dense decode must keep Qwen3.6 nextn verifier weights";
+        EXPECT_NE(source.find("weight_name.rfind(\"mtp.\", 0)"),
+                  std::string::npos)
+            << "generic mtp.layers verifier weights must also remain in the dense decode plan";
+        EXPECT_NE(source.find("discoverDenseDecodeMTPSourceLayers"),
+                  std::string::npos)
+            << "Qwen3.6 nextn source-layer discovery must keep normal-named sidecar attention/expert weights";
+        EXPECT_NE(source.find("inferWeightLayer(weight_name)"),
+                  std::string::npos)
+            << "dense decode filtering must recognize the full trailing nextn layer, not only names containing nextn";
+        EXPECT_NE(source.find("grouped MTP rows remain mathematically identical to serial decode"),
+                  std::string::npos)
+            << "the source contract should document the parity reason for keeping MTP sidecar weights";
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlansMissingPlacementsFromModelMetadata)

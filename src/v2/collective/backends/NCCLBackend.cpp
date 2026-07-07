@@ -109,6 +109,7 @@ namespace llaminar2
         bool cudaMemcpySameDevice(void *dst, const void *src, size_t bytes, int device_ordinal);
         bool cudaMemcpyPeerDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes);
         bool cudaMemcpyAsyncSameDevice(void *dst, const void *src, size_t bytes, int device_ordinal, void *stream);
+        bool cudaMemsetAsyncDevice(void *dst, int value, size_t bytes, int device_ordinal, void *stream);
         bool cudaMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream);
         bool cudaCanAccessPeerDevice(int dst_device, int src_device);
         bool cudaEnablePeerAccessDevice(int peer_device);

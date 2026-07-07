@@ -139,12 +139,21 @@ namespace llaminar2
 
         /// Target device for coherence management
 
-        /// Update position offset for cached graph reuse.
-        /// Also pre-uploads kernel device params so the next graph replay sees
-        /// the new kv_len and position_offset without captured H2D nodes.
-        /// Note: updateDynamicParams is called BEFORE KVCacheAppend runs for
-        /// this step, so get_cached_tokens() returns previous step's count.
-        /// We add seq_len to get the count after appending.
+        /**
+         * @brief Update request-local attention sequence metadata.
+         *
+         * The forward DAG runs KVCacheAppendStage immediately before this stage.
+         * updateDynamicParams() is called before that append, so the KV cache's
+         * host count is the pre-append history length.  This method records that
+         * count as request-local stage state and uploads any host-owned dynamic
+         * attention parameters needed by the next eager execution or graph replay.
+         *
+         * GPU graph-capturable KV caches expose a device-owned cached-token count.
+         * For those caches, attention records a tiny in-graph derivation kernel
+         * instead of relying on a host scalar.  That keeps one reusable prefill
+         * graph valid whether it is captured for the first prompt chunk or later
+         * replayed as a suffix after a prefix-cache restore.
+         */
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override;
         void updateDynamicParams(int pos_offset, int seq_len) override;
@@ -158,6 +167,9 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
+            dynamic_pre_append_cached_tokens_ = -1;
+            dynamic_logical_seq_len_ = 0;
+            dynamic_post_append_kv_len_ = 0;
             debug_effective_k_tensor_ = nullptr;
             debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;
@@ -186,6 +198,9 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
+            dynamic_pre_append_cached_tokens_ = -1;
+            dynamic_logical_seq_len_ = 0;
+            dynamic_post_append_kv_len_ = 0;
             debug_effective_k_tensor_ = nullptr;
             debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;
@@ -243,6 +258,21 @@ namespace llaminar2
         bool prefill_replay_params_set_ = false;
         int prefill_effective_seq_len_ = 0;
         int prefill_bucket_seq_len_ = 0;
+
+        /**
+         * @brief Pre-append KV history observed for the current dynamic stage pass.
+         *
+         * A GPU graph capture records KV append kernels before attention kernels,
+         * but host cache metadata may be advanced eagerly for bookkeeping while
+         * the device metadata is advanced inside the captured graph.  These
+         * request-local mirrors preserve the boundary that matters to attention:
+         * how many real cached tokens existed before this stage's append, how
+         * many real query rows belong to the current prompt chunk, and therefore
+         * what post-append KV span the attention stage must represent.
+         */
+        int dynamic_pre_append_cached_tokens_ = -1;
+        int dynamic_logical_seq_len_ = 0;
+        int dynamic_post_append_kv_len_ = 0;
 
         /**
          * @brief Get or create the attention kernel

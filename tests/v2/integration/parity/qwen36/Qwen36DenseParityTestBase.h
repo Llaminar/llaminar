@@ -176,6 +176,58 @@ namespace llaminar2::test::parity::qwen36
         return false;
     }
 
+    /**
+     * @brief Return whether dense greedy MTP should publish through grouped host plans.
+     *
+     * Local tensor parallel runners reduce verifier logits across device-local
+     * LM-head shards, so they cannot use a single child runner's compact
+     * device-resident publication mailbox.  They can still avoid row-serial
+     * catch-up replay: the parent RankOrchestrator builds one
+     * decode-equivalent MTPSpecStepPlanBatch from grouped verifier rows, then
+     * fan-outs that same host plan to every TP participant.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @return true when the fixture is a GPU LocalTP case that should exercise
+     *         grouped host-plan MTP publication.
+     */
+    inline bool denseCaseExpectsGroupedHostMTPPublication(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        if (test_case.topology != DensePrefixParityTopology::LocalTP ||
+            test_case.devices.empty())
+        {
+            return false;
+        }
+
+        return std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isGPU();
+            });
+    }
+
+    /**
+     * @brief Return whether dense greedy MTP should use device-resident publication.
+     *
+     * Single-device GPU runners own every speculative slot and live-state cache
+     * locally, so they should use the compact grouped outcome reducer plus the
+     * device-resident publication mailbox.  CPU runners and distributed runners
+     * without that mailbox remain on explicit replay or grouped host plans.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @return true when the fixture should exercise device-resident MTP state
+     *         publication.
+     */
+    inline bool denseCaseExpectsGroupedDevicePublication(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        return test_case.topology == DensePrefixParityTopology::SingleDevice &&
+               !test_case.devices.empty() &&
+               test_case.devices.front().isGPU();
+    }
+
     inline bool denseHasMTPPerfCounter(
         const std::vector<PerfStatRecord> &records,
         const char *name)
@@ -207,6 +259,98 @@ namespace llaminar2::test::parity::qwen36
                 const auto it = record.tags.find(tag_key);
                 return it != record.tags.end() && it->second == tag_value;
             });
+    }
+
+    /**
+     * @brief Assert that a dense greedy MTP request used the expected verifier lane.
+     *
+     * Token equality proves the visible response, but not the performance path.
+     * This guard makes the parity matrix fail if a GPU LocalTP or single-device
+     * request silently falls back to row-serial decode-equivalent replay after
+     * grouped verifier rows have already been proven correct.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @param records Perfstats snapshot captured immediately after the request.
+     * @param context Human-readable request label for assertion failures.
+     */
+    inline void expectDenseGreedyMTPPublicationPath(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        const bool used_serial_replay =
+            denseHasMTPPerfCounter(
+                records,
+                "decode_equivalent_sequential_verifier_runs");
+        const bool used_grouped_host_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_publication_uses") &&
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_state_publications");
+        const bool used_grouped_device_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_device_resident_publication_uses") &&
+            denseHasMTPPerfCounter(records, "spec_state_publications");
+        const bool used_direct_all_position_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "all_position_state_publication_verifier_runs");
+        const bool used_grouped_verifier =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_decode_equivalent_greedy_verifier_runs");
+
+        if (denseCaseExpectsGroupedHostMTPPublication(test_case))
+        {
+            EXPECT_TRUE(used_grouped_host_publication)
+                << context << " should publish grouped verifier rows through "
+                   "the LocalTP host-plan lane.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(used_grouped_verifier)
+                << context << " should run the grouped greedy verifier rows.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_serial_replay)
+                << context << " must not fall back to row-serial verifier "
+                   "replay once grouped host publication is available.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_direct_all_position_publication)
+                << context << " must not promote dense direct all-position "
+                   "publication without a continuation proof.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            return;
+        }
+
+        if (denseCaseExpectsGroupedDevicePublication(test_case))
+        {
+            EXPECT_TRUE(used_grouped_device_publication)
+                << context << " should publish grouped verifier rows through "
+                   "the device-resident mailbox.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(used_grouped_verifier)
+                << context << " should run the grouped greedy verifier rows.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_serial_replay)
+                << context << " must not use row-serial verifier replay when "
+                   "device-resident publication is available.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_direct_all_position_publication)
+                << context << " must not promote dense direct all-position "
+                   "publication without a continuation proof.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            return;
+        }
+
+        EXPECT_TRUE(used_serial_replay || used_grouped_host_publication)
+            << context << " should exercise an explicit decode-equivalent "
+               "MTP verifier path.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(used_direct_all_position_publication)
+            << context << " must not use unproven dense direct all-position "
+               "publication.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
     }
 
     inline void expectPhase138TransactionUsed(
@@ -1767,6 +1911,57 @@ namespace llaminar2::test::parity::qwen36
         return stages;
     }
 
+    /**
+     * @brief Select the collective backend for a homogeneous dense LocalTP case.
+     *
+     * The dense LocalTP parity helper used to assume ROCm because the original
+     * generic suite only targeted ROCm devices.  Explicit CUDA and ROCm suites
+     * make that assumption dangerous: the test name can say CUDA while the
+     * config still asks LocalTPContext to create RCCL.  Keep backend selection
+     * beside the topology translation so every explicit backend suite builds a
+     * self-consistent TP domain.
+     *
+     * @param devices Devices participating in the LocalTP domain.
+     * @return NCCL for homogeneous CUDA, RCCL for homogeneous ROCm, AUTO
+     *         otherwise so production validation can reject unsupported mixes.
+     */
+    inline CollectiveBackendType denseLocalTPBackendForDevices(
+        const std::vector<GlobalDeviceAddress> &devices)
+    {
+        if (devices.empty())
+        {
+            return CollectiveBackendType::AUTO;
+        }
+
+        const bool all_cuda =
+            std::all_of(
+                devices.begin(),
+                devices.end(),
+                [](const GlobalDeviceAddress &device)
+                {
+                    return device.isCUDA();
+                });
+        if (all_cuda)
+        {
+            return CollectiveBackendType::NCCL;
+        }
+
+        const bool all_rocm =
+            std::all_of(
+                devices.begin(),
+                devices.end(),
+                [](const GlobalDeviceAddress &device)
+                {
+                    return device.isROCm();
+                });
+        if (all_rocm)
+        {
+            return CollectiveBackendType::RCCL;
+        }
+
+        return CollectiveBackendType::AUTO;
+    }
+
     inline OrchestrationConfig makeDensePrefixRestoreConfig(
         const DensePrefixRestoreParityCase &test_case,
         const std::string &model_path,
@@ -1808,7 +2003,7 @@ namespace llaminar2::test::parity::qwen36
             config.tp_scope = TPScope::LOCAL;
             config.tp_devices = test_case.devices;
             config.pp_degree = 1;
-            config.default_backend = CollectiveBackendType::RCCL;
+            config.default_backend = denseLocalTPBackendForDevices(test_case.devices);
             break;
 
         case DensePrefixParityTopology::LocalPP:
@@ -2189,6 +2384,9 @@ namespace llaminar2::test::parity::qwen36
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
+        ScopedEnvironmentValues perf_stats_enabled({
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
 
@@ -2216,8 +2414,10 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
+        PerfStatsCollector::reset();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_first = mtp->prefixStateProbe();
+        const auto first_records = PerfStatsCollector::snapshot({"mtp"});
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), expected_tokens.size());
         EXPECT_EQ(first.tokens, expected_tokens);
@@ -2234,10 +2434,15 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             after_first,
             test_case.name + " first request");
+        expectDenseGreedyMTPPublicationPath(
+            test_case,
+            first_records,
+            test_case.name + " first request");
 
         if (!enable_prefix_cache)
         {
             mtp->shutdown();
+            PerfStatsCollector::reset();
             return;
         }
 
@@ -2245,8 +2450,10 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GE(after_first.prefix_cache_inserts, 1u);
         EXPECT_GT(after_first.prefix_cache_mtp_state_bytes, 0u);
 
+        PerfStatsCollector::reset();
         auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_second = mtp->prefixStateProbe();
+        const auto second_records = PerfStatsCollector::snapshot({"mtp"});
         mtp->shutdown();
 
         ASSERT_TRUE(second.error.empty()) << second.error;
@@ -2273,6 +2480,11 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             after_second,
             test_case.name + " restored request");
+        expectDenseGreedyMTPPublicationPath(
+            test_case,
+            second_records,
+            test_case.name + " restored request");
+        PerfStatsCollector::reset();
     }
 
     /**

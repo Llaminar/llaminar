@@ -97,6 +97,11 @@ struct MoEWeightContext {
     // fresh VRAM allocation for every rebalanced expert.
     std::shared_ptr<GpuExpertSlotPool>* gpu_direct_slot_pool = nullptr;
 
+    // CPU NUMA node for strict packed-weight placement. A negative value means
+    // the CPU domain spans the process's allowed sockets, so expert packing must
+    // not bind all grouped CPU verifier weights to an incidental current CPU.
+    int cpu_numa_node = -1;
+
 };
 
 /// One projection of a GPU-direct expert arrival that has been copied into

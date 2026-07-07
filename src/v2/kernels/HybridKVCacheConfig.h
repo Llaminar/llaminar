@@ -51,6 +51,27 @@ namespace llaminar2
         int d_v = 0;       ///< Value dimension per head
         int conv_kernel_size = 0;
 
+        /**
+         * @brief Full decode-bank recurrence size in FP32 elements.
+         *
+         * Tensor-parallel GDN execution can keep two GPU-resident state banks:
+         * the local bank used by suffix prefill and the full bank used by
+         * decode. The host recurrence_state vector deliberately stores the
+         * local logical state, so the full size must be tracked separately
+         * instead of inferred from whichever GPU bank is currently active.
+         */
+        int full_recurrence_state_size = 0;
+
+        /**
+         * @brief Full decode-bank short-conv size in FP32 elements.
+         *
+         * This is the qkv_dim_full * (kernel_size - 1) shape captured in
+         * prefix payload device sections. Keeping it explicit lets restore
+         * paths allocate and import the full bank even when the target cache is
+         * fresh and only has the local bank resident.
+         */
+        int full_conv_state_size = 0;
+
         /// Recurrence state S: [n_v_heads, d_k, d_v] (FP32)
         std::vector<float> recurrence_state;
 

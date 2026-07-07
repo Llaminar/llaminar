@@ -540,6 +540,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!setAMDDeviceForResource(device_ordinal_, "recordEventChecked"))
+            return false;
+
         hipEvent_t hip_event = static_cast<hipEvent_t>(event);
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
         hipError_t err = hipEventRecord(hip_event, hip_stream);
@@ -574,6 +577,9 @@ namespace llaminar2
             LOG_ERROR("[AMDDeviceContext] waitEventChecked requires non-null event and stream");
             return false;
         }
+
+        if (!setAMDDeviceForResource(device_ordinal_, "waitEventChecked"))
+            return false;
 
         hipEvent_t hip_event = static_cast<hipEvent_t>(event);
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
@@ -619,14 +625,31 @@ namespace llaminar2
 
     void AMDDeviceContext::synchronizeEvent(void *event)
     {
+        (void)synchronizeEventChecked(event);
+    }
+
+    bool AMDDeviceContext::synchronizeEventChecked(void *event)
+    {
         if (event == nullptr)
         {
-            LOG_WARN("[AMDDeviceContext] synchronizeEvent called with null event");
-            return;
+            LOG_ERROR("[AMDDeviceContext] synchronizeEventChecked called with null event");
+            return false;
+        }
+
+        if (!setAMDDeviceForResource(device_ordinal_, "synchronizeEventChecked"))
+        {
+            return false;
         }
 
         hipEvent_t hip_event = static_cast<hipEvent_t>(event);
-        HIP_CHECK_VOID(hipEventSynchronize(hip_event));
+        hipError_t err = hipEventSynchronize(hip_event);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipEventSynchronize failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
     float AMDDeviceContext::eventElapsedTime(void *start, void *stop)
@@ -684,21 +707,33 @@ namespace llaminar2
 
     void AMDDeviceContext::synchronize()
     {
+        (void)synchronizeChecked();
+    }
+
+    bool AMDDeviceContext::synchronizeChecked()
+    {
         // During graph capture, hipDeviceSynchronize() is illegal — it poisons
         // the capture state. Skip the sync entirely since no real GPU work is
         // happening during capture recording (kernels are just being recorded).
         if (capture_active_.load(std::memory_order_acquire))
         {
-            return;
+            return true;
         }
 
-        submitAndWait([this]()
+        bool ok = true;
+        submitAndWait([this, &ok]()
                       {
         // Re-check capture_active_ inside worker — another thread's capture
         // controller may have started capture between our outer check and
         // this worker dispatch (race in multi-device TP graph capture).
         if (capture_active_.load(std::memory_order_acquire))
             return;
+
+        if (!setAMDDeviceForResource(device_ordinal_, "synchronize"))
+        {
+            ok = false;
+            return;
+        }
 
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
@@ -713,7 +748,9 @@ namespace llaminar2
             }
             LOG_ERROR("[AMDDeviceContext] hipDeviceSynchronize failed: " 
                       << hipGetErrorString(err));
+            ok = false;
         } });
+        return ok;
     }
 
     void AMDDeviceContext::synchronizeStream(void *stream)
@@ -729,18 +766,20 @@ namespace llaminar2
             return true;
         }
 
+        if (!setAMDDeviceForResource(device_ordinal_, "synchronizeStreamChecked"))
+            return false;
+
         hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : hipStream_t(0);
         hipError_t err = hipStreamSynchronize(hip_stream);
         if (err != hipSuccess)
         {
-            // Benign race: another thread started capture after our check.
             if (err == hipErrorStreamCaptureUnsupported ||
                 err == hipErrorStreamCaptureImplicit)
             {
-                LOG_DEBUG("[AMDDeviceContext] Skipping hipStreamSynchronize during "
-                          "concurrent graph capture (ordinal="
-                          << device_ordinal_ << ")");
-                return true;
+                LOG_ERROR("[AMDDeviceContext] hipStreamSynchronize would violate an active graph capture "
+                          "(ordinal=" << device_ordinal_
+                          << "): " << hipGetErrorString(err));
+                return false;
             }
             LOG_ERROR("[AMDDeviceContext] hipStreamSynchronize failed: "
                       << hipGetErrorString(err));

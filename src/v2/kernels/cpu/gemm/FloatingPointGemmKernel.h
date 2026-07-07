@@ -31,6 +31,8 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/FP16Utils.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
@@ -227,6 +229,221 @@ namespace llaminar2
         }
 
         /**
+         * @brief Execute a decode-equivalent small-M GEMM for 16-bit float storage.
+         *
+         * MTP verifier publication compares grouped candidate rows against the
+         * exact M=1 decode path.  Library BF16/FP16 GEMMs are allowed to choose
+         * different vector widths or reduction trees when M changes, so verifier
+         * rows use this deliberately simple primitive.  It converts each 16-bit
+         * activation/weight element to FP32 at the same point in the K loop and
+         * accumulates in scalar FP32, matching the serial decode dot-product
+         * order while still grouping rows and columns inside one OpenMP region.
+         */
+        template <typename DecodeFn>
+        inline bool run_16bit_skinny_matmul(const uint16_t *A,
+                                            const uint16_t *B,
+                                            float *C,
+                                            int M,
+                                            int N,
+                                            int K,
+                                            bool transpose_B,
+                                            DecodeFn decode,
+                                            float alpha = 1.0f,
+                                            float beta = 0.0f)
+        {
+            if (!A || !B || !C || M < 0 || N < 0 || K < 0)
+            {
+                LOG_ERROR("[FloatingPointGemmKernel] Invalid skinny 16-bit matmul pointers/dims: "
+                          << "A=" << static_cast<const void *>(A)
+                          << " B=" << static_cast<const void *>(B)
+                          << " C=" << static_cast<void *>(C)
+                          << " M=" << M << " N=" << N << " K=" << K);
+                return false;
+            }
+
+            auto work = [&]()
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        float acc = 0.0f;
+                        const uint16_t *a_row = A + static_cast<size_t>(row) * K;
+                        if (transpose_B)
+                        {
+                            const uint16_t *b_row = B + static_cast<size_t>(col) * K;
+                            for (int kk = 0; kk < K; ++kk)
+                            {
+                                acc += decode(a_row[kk]) * decode(b_row[kk]);
+                            }
+                        }
+                        else
+                        {
+                            for (int kk = 0; kk < K; ++kk)
+                            {
+                                acc += decode(a_row[kk]) *
+                                       decode(B[static_cast<size_t>(kk) * N + col]);
+                            }
+                        }
+
+                        float value = alpha * acc;
+                        if (beta != 0.0f)
+                        {
+                            value += beta * C[static_cast<size_t>(row) * N + col];
+                        }
+                        C[static_cast<size_t>(row) * N + col] = value;
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(work);
+            return true;
+        }
+
+        inline bool run_fp16_skinny_matmul(const uint16_t *A,
+                                           const uint16_t *B,
+                                           float *C,
+                                           int M,
+                                           int N,
+                                           int K,
+                                           bool transpose_B,
+                                           float alpha = 1.0f,
+                                           float beta = 0.0f)
+        {
+            return run_16bit_skinny_matmul(
+                A, B, C, M, N, K, transpose_B,
+                [](uint16_t value)
+                {
+                    return fp16_to_fp32(value);
+                },
+                alpha,
+                beta);
+        }
+
+        inline bool run_bf16_skinny_matmul(const uint16_t *A,
+                                           const uint16_t *B,
+                                           float *C,
+                                           int M,
+                                           int N,
+                                           int K,
+                                           bool transpose_B,
+                                           float alpha = 1.0f,
+                                           float beta = 0.0f)
+        {
+            return run_16bit_skinny_matmul(
+                A, B, C, M, N, K, transpose_B,
+                [](uint16_t value)
+                {
+                    return simd::bf16_to_fp32(value);
+                },
+                alpha,
+                beta);
+        }
+
+        /**
+         * @brief Decode-equivalent small-M GEMM for FP32 activations and 16-bit weights.
+         *
+         * Floating FP16/BF16 model weights still commonly feed FP32 hidden rows
+         * in verifier publication code.  This helper is the CPU counterpart to
+         * the GPU fp32x16 verifier kernels: it keeps A in FP32, converts each
+         * 16-bit weight element inside the scalar K loop, and therefore gives
+         * M=1 and grouped M=2..4 rows one shared reduction contract.
+         */
+        template <typename DecodeFn>
+        inline bool run_fp32x16_skinny_matmul(const float *A,
+                                              const uint16_t *B,
+                                              float *C,
+                                              int M,
+                                              int N,
+                                              int K,
+                                              bool transpose_B,
+                                              DecodeFn decode,
+                                              float alpha = 1.0f,
+                                              float beta = 0.0f)
+        {
+            if (!A || !B || !C || M < 0 || N < 0 || K < 0)
+            {
+                LOG_ERROR("[FloatingPointGemmKernel] Invalid skinny FP32x16 matmul pointers/dims: "
+                          << "A=" << static_cast<const void *>(A)
+                          << " B=" << static_cast<const void *>(B)
+                          << " C=" << static_cast<void *>(C)
+                          << " M=" << M << " N=" << N << " K=" << K);
+                return false;
+            }
+
+            auto work = [&]()
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        float acc = 0.0f;
+                        const float *a_row = A + static_cast<size_t>(row) * K;
+                        if (transpose_B)
+                        {
+                            const uint16_t *b_row = B + static_cast<size_t>(col) * K;
+                            for (int kk = 0; kk < K; ++kk)
+                                acc += a_row[kk] * decode(b_row[kk]);
+                        }
+                        else
+                        {
+                            for (int kk = 0; kk < K; ++kk)
+                                acc += a_row[kk] * decode(B[static_cast<size_t>(kk) * N + col]);
+                        }
+
+                        float value = alpha * acc;
+                        if (beta != 0.0f)
+                            value += beta * C[static_cast<size_t>(row) * N + col];
+                        C[static_cast<size_t>(row) * N + col] = value;
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(work);
+            return true;
+        }
+
+        inline bool run_fp32xfp16_skinny_matmul(const float *A,
+                                                const uint16_t *B,
+                                                float *C,
+                                                int M,
+                                                int N,
+                                                int K,
+                                                bool transpose_B,
+                                                float alpha = 1.0f,
+                                                float beta = 0.0f)
+        {
+            return run_fp32x16_skinny_matmul(
+                A, B, C, M, N, K, transpose_B,
+                [](uint16_t value)
+                {
+                    return fp16_to_fp32(value);
+                },
+                alpha,
+                beta);
+        }
+
+        inline bool run_fp32xbf16_skinny_matmul(const float *A,
+                                                const uint16_t *B,
+                                                float *C,
+                                                int M,
+                                                int N,
+                                                int K,
+                                                bool transpose_B,
+                                                float alpha = 1.0f,
+                                                float beta = 0.0f)
+        {
+            return run_fp32x16_skinny_matmul(
+                A, B, C, M, N, K, transpose_B,
+                [](uint16_t value)
+                {
+                    return simd::bf16_to_fp32(value);
+                },
+                alpha,
+                beta);
+        }
+
+        /**
          * @brief Execute FP32 matrix multiplication using OneDNN with optional fused bias
          *
          * @param A Input matrix A [M, K] (FP32, row-major)
@@ -263,6 +480,20 @@ namespace llaminar2
                           << " C=" << static_cast<void *>(C)
                           << " M=" << M << " N=" << N << " K=" << K);
                 return false;
+            }
+
+            /*
+             * MTP verifier publication compares grouped M=2..4 rows against
+             * the same backend's M=1 decode row.  oneDNN is free to choose a
+             * different reduction tree for M=1 and M>1, so verifier-sized
+             * transposed weight projections use the local skinny primitive for
+             * both serial decode and grouped rows.  The primitive still
+             * parallelizes across output columns, but every dot product walks K
+             * in the same order.
+             */
+            if (B && transpose_B && M >= 1 && M <= 4)
+            {
+                return run_fp32_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta, bias);
             }
 
             if (B && M <= 64 && N <= 64)
@@ -371,6 +602,11 @@ namespace llaminar2
             const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
             KERNEL_PROFILE_SCOPE(profile_type);
 
+            if (B && transpose_B && M >= 1 && M <= 4)
+            {
+                return run_bf16_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta);
+            }
+
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
 
@@ -447,6 +683,11 @@ namespace llaminar2
         {
             const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
             KERNEL_PROFILE_SCOPE(profile_type);
+
+            if (B && transpose_B && M >= 1 && M <= 4)
+            {
+                return run_fp16_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta);
+            }
 
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
@@ -1311,7 +1552,7 @@ namespace llaminar2
             {
                 (void)workspace;
                 if (!weight_tensor_ || !gate || !up || !output ||
-                    m <= 1 || m > 4 || n <= 0 || k <= 0)
+                    m < 1 || m > 4 || n <= 0 || k <= 0)
                 {
                     LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU rejected: weight="
                               << (weight_tensor_ != nullptr)
@@ -1327,19 +1568,22 @@ namespace llaminar2
                               << alpha << " beta=" << beta);
                     return false;
                 }
-                if (weight_type_ != TensorType::FP32 ||
-                    gate->native_type() != TensorType::FP32 ||
+                if (gate->native_type() != TensorType::FP32 ||
                     up->native_type() != TensorType::FP32)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU currently supports FP32 tensors only");
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU requires FP32 gate/up tensors");
+                    return false;
+                }
+                if (output->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU output must be FP32");
                     return false;
                 }
 
                 const float *gate_data = gate->data();
                 const float *up_data = up->data();
-                const float *weights = weight_tensor_->data();
                 float *out_data = output->mutable_data();
-                if (!gate_data || !up_data || !weights || !out_data)
+                if (!gate_data || !up_data || !out_data)
                 {
                     LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU requires host-visible FP32 tensors");
                     return false;
@@ -1368,9 +1612,13 @@ namespace llaminar2
 
                 perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                           : PerfStatsCollector::Clock::time_point{};
-                if (!run_fp32_skinny_matmul(
+                bool down_ok = false;
+                const char *dtype_tag = "fp32";
+                if (weight_type_ == TensorType::FP32)
+                {
+                    down_ok = run_fp32_skinny_matmul(
                         swiglu_scratch_tls.data(),
-                        weights,
+                        weight_tensor_->data(),
                         out_data,
                         m,
                         n,
@@ -1378,9 +1626,43 @@ namespace llaminar2
                         /*transpose_B=*/true,
                         alpha,
                         beta,
-                        nullptr))
+                        nullptr);
+                }
+                else if (weight_type_ == TensorType::FP16)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU down projection failed");
+                    const auto *weights_fp16 = dynamic_cast<const FP16Tensor *>(weight_tensor_);
+                    dtype_tag = "fp16";
+                    down_ok = weights_fp16 && run_fp32xfp16_skinny_matmul(
+                                                 swiglu_scratch_tls.data(),
+                                                 weights_fp16->typed_data(),
+                                                 out_data,
+                                                 m,
+                                                 n,
+                                                 k,
+                                                 /*transpose_B=*/true,
+                                                 alpha,
+                                                 beta);
+                }
+                else if (weight_type_ == TensorType::BF16)
+                {
+                    const auto *weights_bf16 = dynamic_cast<const BF16Tensor *>(weight_tensor_);
+                    dtype_tag = "bf16";
+                    down_ok = weights_bf16 && run_fp32xbf16_skinny_matmul(
+                                                 swiglu_scratch_tls.data(),
+                                                 weights_bf16->typed_data(),
+                                                 out_data,
+                                                 m,
+                                                 n,
+                                                 k,
+                                                 /*transpose_B=*/true,
+                                                 alpha,
+                                                 beta);
+                }
+
+                if (!down_ok)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU down projection failed dtype="
+                              << dtype_tag);
                     return false;
                 }
                 recordVerifierTiming(
@@ -1395,14 +1677,28 @@ namespace llaminar2
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
-                        "cpu_fp32_grouped_verifier_swiglu_down_calls",
+                        "cpu_floating_grouped_verifier_swiglu_down_calls",
                         1.0,
                         "gemm",
                         "cpu",
                         PerfStatsCollector::Tags{
+                            {"dtype", dtype_tag},
                             {"m", std::to_string(m)},
                             {"n", std::to_string(n)},
                             {"k", std::to_string(k)}});
+                    if (weight_type_ == TensorType::FP32)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "cpu_fp32_grouped_verifier_swiglu_down_calls",
+                            1.0,
+                            "gemm",
+                            "cpu",
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"n", std::to_string(n)},
+                                {"k", std::to_string(k)}});
+                    }
                 }
                 return true;
             }
@@ -1412,8 +1708,8 @@ namespace llaminar2
              *
              * Phase 9.8 verifier graphs evaluate M=2..4 candidate rows together,
              * but publication-capable recurrent state must match the row-by-row
-             * decode contract.  For FP32 weights this uses the skinny matmul
-             * primitive: it parallelizes over rows and output columns in one
+             * decode contract.  FP32, FP16, and BF16 weights use skinny
+             * primitives that parallelize over rows and output columns in one
              * OpenMP region, while every dot product still walks K in the same
              * order as the M=1 decode GEMV.  This is intentionally not a hidden
              * serial row loop.
@@ -1445,17 +1741,53 @@ namespace llaminar2
                     return false;
                 }
 
-                if (weight_type_ != TensorType::FP32)
-                {
-                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection currently supports FP32 weights only; got "
-                              << static_cast<int>(weight_type_));
-                    return false;
-                }
+                const float *input_fp32 = nullptr;
+                const uint16_t *input_fp16 = nullptr;
+                const uint16_t *input_bf16 = nullptr;
+                const char *dtype_tag = "unknown";
+                const char *timing_name = "cpu_floating_verifier_projection_matmul";
 
-                const float *input_data = input->data();
-                if (!input_data)
+                switch (weight_type_)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                case TensorType::FP32:
+                    input_fp32 = input->data();
+                    dtype_tag = "fp32";
+                    timing_name = "cpu_fp32_verifier_projection_matmul";
+                    if (!input_fp32)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                        return false;
+                    }
+                    break;
+                case TensorType::FP16:
+                {
+                    const auto *typed = dynamic_cast<const FP16Tensor *>(input);
+                    input_fp16 = typed ? typed->typed_data() : nullptr;
+                    dtype_tag = "fp16";
+                    timing_name = "cpu_fp16_verifier_projection_matmul";
+                    if (!input_fp16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP16 data");
+                        return false;
+                    }
+                    break;
+                }
+                case TensorType::BF16:
+                {
+                    const auto *typed = dynamic_cast<const BF16Tensor *>(input);
+                    input_bf16 = typed ? typed->typed_data() : nullptr;
+                    dtype_tag = "bf16";
+                    timing_name = "cpu_bf16_verifier_projection_matmul";
+                    if (!input_bf16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host BF16 data");
+                        return false;
+                    }
+                    break;
+                }
+                default:
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection unsupported weight type "
+                              << static_cast<int>(weight_type_));
                     return false;
                 }
 
@@ -1474,6 +1806,13 @@ namespace llaminar2
                                   << " n=" << proj.n);
                         return false;
                     }
+                    if (proj.output->native_type() != TensorType::FP32)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected at projection "
+                                  << i << ": output must be FP32, got "
+                                  << static_cast<int>(proj.output->native_type()));
+                        return false;
+                    }
 
                     float *out_data = proj.output->mutable_data();
                     if (!out_data)
@@ -1490,12 +1829,20 @@ namespace llaminar2
                                   << i << ": bias has no host FP32 data");
                         return false;
                     }
+                    if (proj.bias && weight_type_ != TensorType::FP32)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier FP16/BF16 projection does not support bias yet");
+                        return false;
+                    }
 
                     const bool perf_enabled = PerfStatsCollector::isEnabled();
                     const auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                                          : PerfStatsCollector::Clock::time_point{};
-                    if (!run_fp32_skinny_matmul(
-                            input_data,
+                    bool projection_ok = false;
+                    if (weight_type_ == TensorType::FP32)
+                    {
+                        projection_ok = run_fp32_skinny_matmul(
+                            input_fp32,
                             fp->weight_tensor_->data(),
                             out_data,
                             m,
@@ -1504,14 +1851,42 @@ namespace llaminar2
                             /*transpose_B=*/true,
                             /*alpha=*/1.0f,
                             /*beta=*/0.0f,
-                            bias_ptr))
+                            bias_ptr);
+                    }
+                    else if (weight_type_ == TensorType::FP16)
+                    {
+                        const auto *weight_fp16 = dynamic_cast<const FP16Tensor *>(fp->weight_tensor_);
+                        projection_ok = weight_fp16 && run_fp16_skinny_matmul(
+                                                          input_fp16,
+                                                          weight_fp16->typed_data(),
+                                                          out_data,
+                                                          m,
+                                                          proj.n,
+                                                          k,
+                                                          /*transpose_B=*/true);
+                    }
+                    else if (weight_type_ == TensorType::BF16)
+                    {
+                        const auto *weight_bf16 = dynamic_cast<const BF16Tensor *>(fp->weight_tensor_);
+                        projection_ok = weight_bf16 && run_bf16_skinny_matmul(
+                                                          input_bf16,
+                                                          weight_bf16->typed_data(),
+                                                          out_data,
+                                                          m,
+                                                          proj.n,
+                                                          k,
+                                                          /*transpose_B=*/true);
+                    }
+
+                    if (!projection_ok)
                     {
                         LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection failed at projection "
-                                  << i << " n=" << proj.n);
+                                  << i << " n=" << proj.n
+                                  << " dtype=" << dtype_tag);
                         return false;
                     }
                     recordVerifierTiming(
-                        "cpu_fp32_verifier_projection_matmul",
+                        timing_name,
                         perf_start,
                         m,
                         proj.n,
@@ -1521,6 +1896,23 @@ namespace llaminar2
 
                 if (PerfStatsCollector::isEnabled())
                 {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cpu_floating_grouped_verifier_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cpu",
+                        PerfStatsCollector::Tags{
+                            {"dtype", dtype_tag},
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(projections.size())}});
+
+                    if (weight_type_ != TensorType::FP32)
+                    {
+                        return true;
+                    }
+
                     PerfStatsCollector::addCounter(
                         "kernel",
                         "cpu_fp32_grouped_verifier_projection_calls",

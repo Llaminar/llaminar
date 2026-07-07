@@ -926,12 +926,19 @@ namespace llaminar2
                           << context << " transfer-stream completion event");
                 return false;
             }
-            if (isGraphCaptureActive() &&
-                params_.join_transfer_stream_after_copy &&
+            /*
+             * `join_transfer_stream_after_copy` means the public stage stream is
+             * the completion contract for this stage.  Captured graphs need the
+             * event wait recorded into the graph, while stream-only maintenance
+             * replays need the same wait enqueued immediately so the
+             * orchestrator's completion event cannot race auxiliary-stream
+             * RCCL/P2P payload work.
+             */
+            if (params_.join_transfer_stream_after_copy &&
                 !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join "
-                          << context << " transfer stream back to capture stream");
+                          << context << " transfer stream back to the stage stream");
                 return false;
             }
             moe_kernel->setGPUStream(stream);
@@ -1386,11 +1393,10 @@ namespace llaminar2
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to record sideband transfer completion event");
                 return false;
             }
-            if (isGraphCaptureActive() &&
-                params_.join_transfer_stream_after_copy &&
+            if (params_.join_transfer_stream_after_copy &&
                 !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
             {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join sideband transfer stream back to capture stream");
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join sideband transfer stream back to the stage stream");
                 return false;
             }
             moe_kernel->setGPUStream(stream);
@@ -1692,7 +1698,62 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
-        return !usesTransferSlotApply() || ensureAsyncTransferState();
+        if (!usesTransferSlotApply())
+            return true;
+        if (!ensureAsyncTransferState())
+            return false;
+        auto *transfer_state = transferState();
+
+        /*
+         * Transfer-slot rebalance captures a multi-stream transaction: the
+         * public graph stream publishes command readiness, an auxiliary stream
+         * runs command metadata collectives and payload copies, then the public
+         * stream waits on the transfer completion event.  HIP/CUDA stream
+         * capture must start from a clean auxiliary stream; otherwise a stale
+         * collective or payload kernel from an earlier request can become an
+         * implicit predecessor of the newly captured graph without being
+         * represented in the graph topology.  This is a short correctness fence
+         * at graph-capture setup time, not a production collective timeout.
+         */
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(params_.device_id);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Failed to resolve GPU context for pre-capture transfer-stream fence"
+                      << " stage=" << suffixFor(params_.stage_name)
+                      << " device=" << params_.device_id.to_string()
+                      << ": " << e.what());
+            return false;
+        }
+        if (!gpu_ctx || !transfer_state || !transfer_state->transferStream())
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream fence requires transfer stream state"
+                      << " stage=" << suffixFor(params_.stage_name)
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+        if (!gpu_ctx->synchronizeStreamChecked(transfer_state->transferStream()))
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Pre-capture transfer-stream fence failed"
+                      << " stage=" << suffixFor(params_.stage_name)
+                      << " phase=" << phaseName(params_.phase)
+                      << " device=" << params_.device_id.to_string()
+                      << " participant=" << params_.tp_device_idx);
+            return false;
+        }
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "device_rebalance_precapture_transfer_stream_fence",
+            1.0,
+            "decode",
+            params_.device_id.to_string(),
+            {{"stage", suffixFor(params_.stage_name)},
+             {"phase", phaseName(params_.phase)},
+             {"participant", std::to_string(params_.tp_device_idx)}});
+        return true;
     }
 
     StageDumpInfo MoEDeviceRebalanceStage::buildDumpInfoImpl() const

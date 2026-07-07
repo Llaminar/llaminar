@@ -974,8 +974,9 @@ namespace llaminar2
          * producer kernels -> allgather -> consumers on the same stream.
          *
          * This is the eager LocalTP path for raw graph-visible handoffs. GPU
-         * graph capture still uses allgatherSingleDeviceOnStream() because
-         * each participant records its own graph work independently.
+         * graph capture uses LocalTPContext's explicit publish-and-sum
+         * allgather transaction so both NCCL and RCCL record the same validated
+         * graph-safe allreduce primitive.
          */
         virtual bool allgatherMultiOnStreams(
             const std::vector<const void *> &send_bufs,

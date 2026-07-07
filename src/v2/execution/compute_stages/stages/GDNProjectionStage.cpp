@@ -87,6 +87,50 @@ namespace llaminar2
             return true;
         }
 
+        bool validateProjectionTensorCapacity(
+            const TensorBase *tensor,
+            const char *name,
+            int rows_required,
+            int cols_required,
+            const DeviceId &device_id)
+        {
+            if (!tensor)
+            {
+                LOG_ERROR("[GDNProjectionStage] Missing tensor for " << name
+                                                                     << " on " << device_id.toString());
+                return false;
+            }
+            if (rows_required <= 0 || cols_required <= 0)
+            {
+                LOG_ERROR("[GDNProjectionStage] Invalid projection extent for " << name
+                                                                                << " on " << device_id.toString()
+                                                                                << ": rows=" << rows_required
+                                                                                << " cols=" << cols_required);
+                return false;
+            }
+
+            const size_t required_rows = static_cast<size_t>(rows_required);
+            const size_t required_cols = static_cast<size_t>(cols_required);
+            const size_t required_elements = required_rows * required_cols;
+            const bool shape_ok = tensor->rows() >= required_rows && tensor->cols() >= required_cols;
+            const bool numel_ok = tensor->numel() >= required_elements;
+            if (shape_ok && numel_ok)
+                return true;
+
+            LOG_ERROR("[GDNProjectionStage] Tensor capacity is too small for " << name
+                                                                               << " on " << device_id.toString()
+                                                                               << ": shape=" << tensor->rows()
+                                                                               << "x" << tensor->cols()
+                                                                               << " numel=" << tensor->numel()
+                                                                               << " bytes=" << tensor->size_bytes()
+                                                                               << " dtype=" << tensor->dtype_name()
+                                                                               << " gpu_ptr=" << tensor->gpu_data_ptr()
+                                                                               << " required_shape=" << required_rows
+                                                                               << "x" << required_cols
+                                                                               << " required_elements=" << required_elements);
+            return false;
+        }
+
         std::vector<ITensorGemm::TensorProjectionDesc> selectProjections(
             const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
             const std::vector<size_t> &indices)
@@ -150,6 +194,35 @@ namespace llaminar2
     GDNProjectionStage::GDNProjectionStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    void GDNProjectionStage::clearCachedGemmStreams()
+    {
+        if (params_.gemm_qkv)
+            params_.gemm_qkv->setGPUStream(nullptr);
+        if (params_.gemm_z)
+            params_.gemm_z->setGPUStream(nullptr);
+        if (params_.gemm_a)
+            params_.gemm_a->setGPUStream(nullptr);
+        if (params_.gemm_b)
+            params_.gemm_b->setGPUStream(nullptr);
+    }
+
+    void GDNProjectionStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        clearCachedGemmStreams();
+    }
+
+    void GDNProjectionStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionStatePreservingCapturedReplay();
+        clearCachedGemmStreams();
+    }
+
+    void GDNProjectionStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
     }
 
     bool GDNProjectionStage::validatePreparedWeights(std::string *error) const
@@ -275,6 +348,15 @@ namespace llaminar2
         auto *C_b = asTensorBase(params_.output_b, "output_b");
         if (!C_qkv || !C_z || !C_a || !C_b)
             return false;
+
+        if (!validateProjectionTensorCapacity(A_base, "input", M, K, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_qkv, "output_qkv", M, params_.n_qkv, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_z, "output_z", M, params_.n_z, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_a, "output_a", M, params_.n_a, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_b, "output_b", M, params_.n_b, params_.device_id))
+        {
+            return false;
+        }
 
         // Set GPU stream on all engines (no-op for CPU)
         gemm_qkv->setGPUStream(gpuStream());

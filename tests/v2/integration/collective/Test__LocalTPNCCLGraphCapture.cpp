@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <mutex>
@@ -132,6 +133,24 @@ namespace
             return;
         EXPECT_EQ(cudaSetDevice(device), cudaSuccess);
         EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    }
+
+    template <typename T>
+    void downloadDeviceVector(int device, const T *device_ptr, std::vector<T> *host_values)
+    {
+        ASSERT_NE(device_ptr, nullptr);
+        ASSERT_NE(host_values, nullptr);
+        ASSERT_EQ(cudaSetDevice(device), cudaSuccess);
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(host_values->data(),
+                                  device_ptr,
+                                  host_values->size() * sizeof(T),
+                                  cudaMemcpyDeviceToHost,
+                                  stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     }
 
     void destroyCaptureResult(CaptureResult &result)
@@ -499,6 +518,281 @@ TEST(Test__LocalTPNCCLGraphCapture, NCCLGroupedP2PMaintenanceGraph_AuxiliaryStre
     freeDevicePtr(1, send1);
     freeDevicePtr(0, recv0);
     freeDevicePtr(1, recv1);
+}
+
+TEST(Test__LocalTPNCCLGraphCapture, NCCLRawAllgather_OnStreamGraphCapture_ReplaysCorrectly)
+{
+    auto *cuda_backend = getCUDABackend();
+    ASSERT_NE(cuda_backend, nullptr);
+    if (cuda_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_backend->deviceCount();
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    constexpr size_t int32_count = 128;
+    constexpr size_t fp32_count = 257;
+    constexpr size_t histogram_u64_count = 4096;
+    static_assert(sizeof(uint64_t) == 2 * sizeof(int32_t));
+    auto make_histogram_payload = [](uint64_t base)
+    {
+        std::vector<uint64_t> values(histogram_u64_count);
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            values[i] = base + static_cast<uint64_t>(i);
+        }
+        return values;
+    };
+    const std::vector<uint64_t> send_hist_host0 =
+        make_histogram_payload(0x100000000ULL + 17ULL);
+    const std::vector<uint64_t> send_hist_host1 =
+        make_histogram_payload(0x200000000ULL + 29ULL);
+    int32_t *send_i32_0 = nullptr;
+    int32_t *send_i32_1 = nullptr;
+    int32_t *recv_i32_0 = nullptr;
+    int32_t *recv_i32_1 = nullptr;
+    float *send_fp32_0 = nullptr;
+    float *send_fp32_1 = nullptr;
+    float *recv_fp32_0 = nullptr;
+    float *recv_fp32_1 = nullptr;
+    uint64_t *send_hist_0 = nullptr;
+    uint64_t *send_hist_1 = nullptr;
+    uint64_t *recv_hist_0 = nullptr;
+    uint64_t *recv_hist_1 = nullptr;
+
+    allocateAndUpload<int32_t>(0, std::vector<int32_t>(int32_count, 11), &send_i32_0);
+    allocateAndUpload<int32_t>(1, std::vector<int32_t>(int32_count, 22), &send_i32_1);
+    allocateAndUpload<int32_t>(0, std::vector<int32_t>(int32_count * 2, -1), &recv_i32_0);
+    allocateAndUpload<int32_t>(1, std::vector<int32_t>(int32_count * 2, -1), &recv_i32_1);
+    allocateAndUpload<float>(0, std::vector<float>(fp32_count, 1.25f), &send_fp32_0);
+    allocateAndUpload<float>(1, std::vector<float>(fp32_count, 2.5f), &send_fp32_1);
+    allocateAndUpload<float>(0, std::vector<float>(fp32_count * 2, -1.0f), &recv_fp32_0);
+    allocateAndUpload<float>(1, std::vector<float>(fp32_count * 2, -1.0f), &recv_fp32_1);
+    allocateAndUpload<uint64_t>(0, send_hist_host0, &send_hist_0);
+    allocateAndUpload<uint64_t>(1, send_hist_host1, &send_hist_1);
+    allocateAndUpload<uint64_t>(
+        0,
+        std::vector<uint64_t>(histogram_u64_count * 2, 0xffffffffffffffffULL),
+        &recv_hist_0);
+    allocateAndUpload<uint64_t>(
+        1,
+        std::vector<uint64_t>(histogram_u64_count * 2, 0xffffffffffffffffULL),
+        &recv_hist_1);
+
+    cudaStream_t stream0 = nullptr;
+    cudaStream_t stream1 = nullptr;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream0, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking), cudaSuccess);
+
+    Barrier ready_to_capture(2);
+    Barrier captured_collective(2);
+    Barrier ready_to_launch(2);
+    CaptureResult result0;
+    CaptureResult result1;
+
+    auto capture_worker = [&](int device,
+                              const int32_t *send_i32,
+                              int32_t *recv_i32,
+                              const float *send_fp32,
+                              float *recv_fp32,
+                              const uint64_t *send_hist,
+                              uint64_t *recv_hist,
+                              cudaStream_t stream,
+                              CaptureResult *result)
+    {
+        result->begin_status = cudaSetDevice(device);
+        if (result->begin_status == cudaSuccess)
+        {
+            result->begin_status = cudaStreamBeginCapture(
+                stream,
+                cudaStreamCaptureModeRelaxed);
+        }
+
+        ready_to_capture.arriveAndWait();
+
+        if (result->begin_status == cudaSuccess)
+        {
+            GraphCaptureGuard guard;
+            const bool i32_ok = ctx->allgatherRawOnStream(
+                send_i32,
+                recv_i32,
+                int32_count,
+                CollectiveDataType::INT32,
+                device,
+                stream,
+                "nccl_raw_allgather_graph_capture_i32");
+            const bool fp32_ok = ctx->allgatherRawOnStream(
+                send_fp32,
+                recv_fp32,
+                fp32_count,
+                CollectiveDataType::FLOAT32,
+                device,
+                stream,
+                "nccl_raw_allgather_graph_capture_fp32");
+            const bool hist_ok = ctx->allgatherRawOnStream(
+                send_hist,
+                recv_hist,
+                histogram_u64_count * 2u,
+                CollectiveDataType::INT32,
+                device,
+                stream,
+                "nccl_raw_allgather_graph_capture_histogram_u64_as_i32");
+            result->collective_ok = i32_ok && fp32_ok && hist_ok;
+        }
+
+        captured_collective.arriveAndWait();
+
+        if (result->begin_status == cudaSuccess &&
+            result->collective_ok)
+        {
+            result->end_status = cudaSetDevice(device);
+            if (result->end_status == cudaSuccess)
+            {
+                result->end_status = cudaStreamEndCapture(
+                    stream,
+                    &result->graph);
+            }
+        }
+
+        if (result->end_status == cudaSuccess && result->graph)
+        {
+            result->instantiate_status = cudaSetDevice(device);
+            if (result->instantiate_status == cudaSuccess)
+            {
+                result->instantiate_status = cudaGraphInstantiate(
+                    &result->exec,
+                    result->graph,
+                    nullptr,
+                    nullptr,
+                    0);
+            }
+        }
+
+        for (int replay = 0; replay < 2; ++replay)
+        {
+            ready_to_launch.arriveAndWait();
+            if (result->instantiate_status == cudaSuccess && result->exec)
+            {
+                result->launch_status = cudaSetDevice(device);
+                if (result->launch_status == cudaSuccess)
+                    result->launch_status = cudaGraphLaunch(result->exec, stream);
+                if (result->launch_status == cudaSuccess)
+                    result->launch_status = cudaStreamSynchronize(stream);
+            }
+        }
+    };
+
+    std::thread t0(capture_worker,
+                   0,
+                   send_i32_0,
+                   recv_i32_0,
+                   send_fp32_0,
+                   recv_fp32_0,
+                   send_hist_0,
+                   recv_hist_0,
+                   stream0,
+                   &result0);
+    std::thread t1(capture_worker,
+                   1,
+                   send_i32_1,
+                   recv_i32_1,
+                   send_fp32_1,
+                   recv_fp32_1,
+                   send_hist_1,
+                   recv_hist_1,
+                   stream1,
+                   &result1);
+    t0.join();
+    t1.join();
+
+    expectCapturedGraphReady(result0, "nccl_raw_allgather_graph0");
+    expectCapturedGraphReady(result1, "nccl_raw_allgather_graph1");
+    EXPECT_EQ(result0.launch_status, cudaSuccess);
+    EXPECT_EQ(result1.launch_status, cudaSuccess);
+
+    std::vector<int32_t> recv_i32_host0(int32_count * 2);
+    std::vector<int32_t> recv_i32_host1(int32_count * 2);
+    std::vector<float> recv_fp32_host0(fp32_count * 2);
+    std::vector<float> recv_fp32_host1(fp32_count * 2);
+    std::vector<uint64_t> recv_hist_host0(histogram_u64_count * 2);
+    std::vector<uint64_t> recv_hist_host1(histogram_u64_count * 2);
+    downloadDeviceVector(0, recv_i32_0, &recv_i32_host0);
+    downloadDeviceVector(1, recv_i32_1, &recv_i32_host1);
+    downloadDeviceVector(0, recv_fp32_0, &recv_fp32_host0);
+    downloadDeviceVector(1, recv_fp32_1, &recv_fp32_host1);
+    downloadDeviceVector(0, recv_hist_0, &recv_hist_host0);
+    downloadDeviceVector(1, recv_hist_1, &recv_hist_host1);
+
+    auto expect_i32_allgather = [&](const std::vector<int32_t> &values, const char *name)
+    {
+        ASSERT_EQ(values.size(), int32_count * 2) << name;
+        EXPECT_TRUE(std::all_of(values.begin(),
+                                values.begin() + static_cast<std::ptrdiff_t>(int32_count),
+                                [](int32_t v) { return v == 11; }))
+            << name;
+        EXPECT_TRUE(std::all_of(values.begin() + static_cast<std::ptrdiff_t>(int32_count),
+                                values.end(),
+                                [](int32_t v) { return v == 22; }))
+            << name;
+    };
+    auto expect_fp32_allgather = [&](const std::vector<float> &values, const char *name)
+    {
+        ASSERT_EQ(values.size(), fp32_count * 2) << name;
+        EXPECT_TRUE(std::all_of(values.begin(),
+                                values.begin() + static_cast<std::ptrdiff_t>(fp32_count),
+                                [](float v) { return v == 1.25f; }))
+            << name;
+        EXPECT_TRUE(std::all_of(values.begin() + static_cast<std::ptrdiff_t>(fp32_count),
+                                values.end(),
+                                [](float v) { return v == 2.5f; }))
+            << name;
+    };
+    expect_i32_allgather(recv_i32_host0, "device0_i32");
+    expect_i32_allgather(recv_i32_host1, "device1_i32");
+    expect_fp32_allgather(recv_fp32_host0, "device0_fp32");
+    expect_fp32_allgather(recv_fp32_host1, "device1_fp32");
+    auto expect_histogram_allgather = [&](const std::vector<uint64_t> &values, const char *name)
+    {
+        ASSERT_EQ(values.size(), histogram_u64_count * 2) << name;
+        EXPECT_TRUE(std::equal(send_hist_host0.begin(),
+                               send_hist_host0.end(),
+                               values.begin()))
+            << name;
+        EXPECT_TRUE(std::equal(send_hist_host1.begin(),
+                               send_hist_host1.end(),
+                               values.begin() + static_cast<std::ptrdiff_t>(histogram_u64_count)))
+            << name;
+    };
+    expect_histogram_allgather(recv_hist_host0, "device0_histogram");
+    expect_histogram_allgather(recv_hist_host1, "device1_histogram");
+
+    destroyCaptureResult(result0);
+    destroyCaptureResult(result1);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream1), cudaSuccess);
+    freeDevicePtr(0, send_i32_0);
+    freeDevicePtr(1, send_i32_1);
+    freeDevicePtr(0, recv_i32_0);
+    freeDevicePtr(1, recv_i32_1);
+    freeDevicePtr(0, send_fp32_0);
+    freeDevicePtr(1, send_fp32_1);
+    freeDevicePtr(0, recv_fp32_0);
+    freeDevicePtr(1, recv_fp32_1);
+    freeDevicePtr(0, send_hist_0);
+    freeDevicePtr(1, send_hist_1);
+    freeDevicePtr(0, recv_hist_0);
+    freeDevicePtr(1, recv_hist_1);
 }
 
 #endif // HAVE_CUDA

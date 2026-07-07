@@ -263,7 +263,8 @@ namespace llaminar2
     void GlobalOrchestratorRunner::clearCache()
     {
         if (global_orch_)
-            global_orch_->clear_cache();
+            global_orch_->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("global-orchestrator-runner"));
         prefill_logits_ready_ = false;
         last_token_ = 0;
         sampler_ = Sampler();

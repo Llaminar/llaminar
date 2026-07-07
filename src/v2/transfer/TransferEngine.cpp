@@ -970,8 +970,23 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "Host data pointer is null");
             }
 
-            // Fine-grained sync: wait for this tensor's completion event
-            if (tensor->device_completion_event_)
+            /*
+             * Explicit-stream host publication is already an ordering contract:
+             * the caller passes the stream that produced the device bytes, and
+             * IBackend::deviceToHost() enqueues the D2H copy on that stream and
+             * synchronizes it before returning.  Waiting a tensor completion
+             * event first is redundant, and on HIP it can be illegal when the
+             * event came from graph-capture bookkeeping for a replay stream.
+             *
+             * Keep the hard-error event path for ordinary host publication with
+             * no producer stream; those callers do not have a stream dependency
+             * that can safely replace the completion event.
+             */
+            if (stream)
+            {
+                LOG_TRACE("[TransferEngine::downloadFull] Explicit producer stream supplied; D2H copy will synchronize that stream");
+            }
+            else if (tensor->device_completion_event_)
             {
                 LOG_TRACE("[TransferEngine::downloadFull] Using event-based sync (waiting for specific kernel)");
                 if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, *tensor->gpu_device_))

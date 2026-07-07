@@ -232,7 +232,7 @@ namespace llaminar2::test
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> makeLocalTPApportionedHotPlan()
+        std::shared_ptr<MoEExpertParallelPlan> makeLocalTPApportionedHotPlan(int layer_count = 1)
         {
             auto plan = std::make_shared<MoEExpertParallelPlan>();
             plan->enabled = true;
@@ -251,13 +251,16 @@ namespace llaminar2::test
             plan->routed_tiers = {
                 tier("hot", "hot_domain", 0),
             };
-            plan->placements.push_back(ExpertLayerPlacement{
-                .layer = 0,
-                .routed_expert_tier = {0, 0, 0, 0, 0, 0},
-            });
+            for (int layer = 0; layer < layer_count; ++layer)
+            {
+                plan->placements.push_back(ExpertLayerPlacement{
+                    .layer = layer,
+                    .routed_expert_tier = {0, 0, 0, 0, 0, 0},
+                });
+            }
             validateMoEExpertParallelPlanOrThrow(
                 *plan,
-                {.layer_count = 1, .routed_expert_count = kNumExperts});
+                {.layer_count = layer_count, .routed_expert_count = kNumExperts});
             return plan;
         }
 
@@ -357,19 +360,22 @@ namespace llaminar2::test
             }
         }
 
-        std::shared_ptr<ModelContext> makeTestingModelContextWithHotDomainExperts()
+        std::shared_ptr<ModelContext> makeTestingModelContextWithHotDomainExperts(int layer_count = 1)
         {
             auto model_ctx = ModelContext::createForTesting(
                 "test.gguf",
                 nullptr,
-                1,
+                static_cast<uint32_t>(std::max(1, layer_count)),
                 /*with_weight_manager=*/true);
             if (!model_ctx || !model_ctx->concreteWeightManager())
                 throw std::runtime_error("ModelContext test WeightManager was not created");
 
             auto &registry = model_ctx->concreteWeightManager()->expertGemmRegistry();
-            registerCompleteDomainExpertLayer(registry, "hot_domain", DeviceId::rocm(0), 0);
-            registerCompleteDomainExpertLayer(registry, "hot_domain", DeviceId::rocm(1), 0);
+            for (int layer = 0; layer < std::max(1, layer_count); ++layer)
+            {
+                registerCompleteDomainExpertLayer(registry, "hot_domain", DeviceId::rocm(0), layer);
+                registerCompleteDomainExpertLayer(registry, "hot_domain", DeviceId::rocm(1), layer);
+            }
             return model_ctx;
         }
 
@@ -668,6 +674,60 @@ namespace llaminar2::test
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPApportionedLeastLoadedPrefillTransferWorkspacesUseRollingLanes)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        });
+        constexpr int kLayerCount = 2;
+        auto plan = makeLocalTPApportionedHotPlan(kLayerCount);
+        ASSERT_FALSE(plan->domains.empty());
+        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        GraphConfig config = makeConfig(plan);
+        config.default_device = DeviceId::rocm(0);
+        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+        config.tp_ctx = &tp_ctx;
+        config.tp_device_idx = 0;
+
+        TensorArena weight_arena;
+        auto layer_weights = makeLayerWeights(weight_arena);
+        TensorArena activation_arena0;
+        auto buffers0 = makeActivationBuffers(activation_arena0);
+        TensorArena activation_arena1;
+        auto buffers1 = makeActivationBuffers(activation_arena1);
+
+        auto model_ctx = makeTestingModelContextWithHotDomainExperts(kLayerCount);
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ComputeGraph graph0 = graph_builder.buildFFNGraph(
+            layer_weights, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+        ComputeGraph graph1 = graph_builder.buildFFNGraph(
+            layer_weights, buffers1, 1, kSeqLen, kBatchSize, DeviceId::rocm(0));
+
+        const auto *stage0 = expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
+        const auto *stage1 = expertComputeStage(graph1, "layer1_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(stage0, nullptr);
+        ASSERT_NE(stage1, nullptr);
+        ASSERT_TRUE(stage0->hasTransferBackedPrefillLLEPForTesting());
+        ASSERT_TRUE(stage1->hasTransferBackedPrefillLLEPForTesting());
+
+        const std::string workspace0 = stage0->prefillLLEPWorkspaceNameForTesting();
+        const std::string workspace1 = stage1->prefillLLEPWorkspaceNameForTesting();
+        EXPECT_NE(workspace0, workspace1)
+            << "Transfer-backed prefill LLEP stages run compute and transfer streams "
+               "concurrently; adjacent layers must not share plan/status/payload "
+               "workspace while an earlier layer's transfer can still be in flight.";
+        EXPECT_NE(workspace0.find("prefill_lane=0"), std::string::npos);
+        EXPECT_NE(workspace1.find("prefill_lane=1"), std::string::npos);
+    }
+
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          LocalTPApportionedLeastLoadedSingleTokenDecodeIsSupported)
     {
         auto plan = makeLocalTPApportionedHotPlan();
@@ -705,15 +765,9 @@ namespace llaminar2::test
         EXPECT_TRUE(expert_stage->hasMoERuntimeTableForTesting())
             << "LeastLoadedEP decode must be given the runtime placement table; without it "
                "production decode fails closed before the device-routed path can run.";
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-        EXPECT_FALSE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting())
-            << "Snapshot-enabled Integration builds intentionally disable runtime-table "
-               "decode capture; production builds cover the supported device-routed path.";
-#else
         EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting())
             << "LeastLoadedEP decode must be allowed to enter the existing device-routed "
                "runtime table path instead of failing before executeSingleToken().";
-#endif
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

@@ -4,7 +4,6 @@
  */
 
 #include "FusedGateUpGEMMStage.h"
-#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
@@ -18,6 +17,15 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
+        {
+            if (!output || !device.is_gpu())
+                return;
+            output->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+        }
+    }
 
     // =============================================================================
     // FusedGateUpGEMMStage Implementation
@@ -26,6 +34,29 @@ namespace llaminar2
     FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    void FusedGateUpGEMMStage::clearCachedKernelStream()
+    {
+        if (cached_kernel_)
+            cached_kernel_->setGPUStream(nullptr);
+    }
+
+    void FusedGateUpGEMMStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        clearCachedKernelStream();
+    }
+
+    void FusedGateUpGEMMStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionStatePreservingCapturedReplay();
+        clearCachedKernelStream();
+    }
+
+    void FusedGateUpGEMMStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
     }
 
     bool FusedGateUpGEMMStage::validatePreparedWeights(std::string *error) const
@@ -277,10 +308,8 @@ namespace llaminar2
         {
             if (is_gpu)
             {
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    output_gate, params_.device_id, stream);
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    output_up, params_.device_id, stream);
+                markGpuTensorWritten(output_gate, params_.device_id, stream);
+                markGpuTensorWritten(output_up, params_.device_id, stream);
             }
             PerfStatsCollector::addCounter(
                 "mtp",

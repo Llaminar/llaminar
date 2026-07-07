@@ -112,7 +112,8 @@ namespace llaminar2
         for (auto &participant_runner : config_.local_participant_runners)
         {
             if (participant_runner)
-                participant_runner->clear_cache();
+                participant_runner->resetInferenceState(
+                    InferenceStateResetRequest::requestBoundary("moe-role-runner"));
         }
     }
 

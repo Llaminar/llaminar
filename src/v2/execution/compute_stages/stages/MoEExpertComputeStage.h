@@ -161,9 +161,9 @@ namespace llaminar2
             /**
              * @brief Require GPU decode to consume routing tensors on device.
              *
-             * Decode-equivalent verifier row replay gathers one row from the
-             * all-position routing tensors.  For GPU backends those row tensors
-             * are DEVICE_AUTHORITATIVE, so the scoped one-token expert replay
+             * Some verifier and overlay M=1 lanes bind routing tensors directly
+             * instead of consuming DeviceMoELayerRuntime state.  For GPU
+             * backends those tensors can be DEVICE_AUTHORITATIVE, so decode
              * must use grouped `FromRouting` kernels instead of falling back to
              * `data()` on a stale host mirror.  When this flag is true, failure
              * to use the device route tensors is a correctness error.
@@ -176,7 +176,7 @@ namespace llaminar2
              * The promoted verifier fast path is a safe composite, not the old
              * single-table routed+shared shortcut.  It runs the routed experts
              * through the proven grouped verifier-prefill path, runs the shared
-             * expert through decode-equivalent M=2..4 GEMV hooks, then applies
+             * expert through decode-equivalent M=1..4 GEMV hooks, then applies
              * the normal shared sigmoid gate plus routed residual add.  The graph
              * must not add separate shared-expert FFN/gate nodes for the same
              * layer when this is enabled.
@@ -238,6 +238,15 @@ namespace llaminar2
              */
             bool runtime_decode_uses_mutable_descriptors = false;
 
+            /*
+             * True when graph construction has published an explicit
+             * multi-participant owner/residency bank for masked decode.  This is
+             * independent of descriptor mutability: resident-only/static decode
+             * can still use immutable descriptor tables while relying on the
+             * runtime bank for correct apportioned-expert ownership metadata.
+             */
+            bool runtime_decode_has_explicit_owner_metadata = false;
+
             // Phase C: Cached slab refs for store-based resolution and rebalance
             std::optional<ExpertSlabRef> gate_slab_ref;
             std::optional<ExpertSlabRef> up_slab_ref;
@@ -292,6 +301,10 @@ namespace llaminar2
         bool hasMoERuntimeTableForTesting() const { return params_.moe_runtime_table != nullptr; }
         bool hasPrefillLLEPTPContextForTesting() const { return params_.prefill_llep_tp_ctx != nullptr; }
         bool hasTransferBackedPrefillLLEPForTesting() const { return hasTransferBackedPrefillLLEP(); }
+        const std::string &prefillLLEPWorkspaceNameForTesting() const
+        {
+            return params_.prefill_llep_workspace_name;
+        }
 
         /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
         /// when no selected experts fall in its local range. The downstream
@@ -407,6 +420,32 @@ namespace llaminar2
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
+            runtime_grouped_decode_warmed_ = false;
+        }
+
+        /**
+         * @brief Invalidate MoE descriptor-table handles owned by kernel dynamic state.
+         *
+         * Grouped routed-expert prefill and decode stages cache integer table
+         * IDs returned by the CUDA/HIP MoE backend. Those IDs are handles into
+         * backend-owned dynamic descriptor tables, not model-weight ownership
+         * and not request KV/GDN/MTP state. A hard kernel-dynamic reset clears
+         * the backend tables while cached ComputeGraphs may retain this stage,
+         * so the stage must forget the table IDs and require an eager rebuild
+         * before any later capture or replay.
+         */
+        void invalidateKernelDynamicState() override
+        {
+            grouped_gateup_desc_table_id_ = -1;
+            grouped_gateup_desc_table_num_experts_ = 0;
+            grouped_gateup_desc_table_d_model_ = 0;
+            grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_gateup_desc_table_dirty_ = false;
+            grouped_down_desc_table_id_ = -1;
+            grouped_down_desc_table_num_experts_ = 0;
+            grouped_down_desc_table_d_model_ = 0;
+            grouped_down_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_dirty_ = false;
             runtime_grouped_decode_warmed_ = false;
         }
 
@@ -534,25 +573,6 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
         mutable std::shared_ptr<FP32Tensor> scratch_up_;
         mutable std::shared_ptr<FP32Tensor> scratch_out_;
-        /**
-         * @brief Output scratch for verifier rows replayed through decode.
-         *
-         * executeSingleToken() uses scratch_out_ as an internal SwiGLU/down
-         * temporary.  The per-row verifier output must not alias that scratch,
-         * otherwise the helper can accumulate into its own intermediate buffer.
-         */
-        mutable std::shared_ptr<FP32Tensor> verifier_output_row_;
-        /**
-         * @brief Device-owned routing row scratch for verifier replay.
-         *
-         * MoERoutingStage writes all-position verifier routing tensors on the
-         * GPU.  The expert stage must gather the selected row from those
-         * device-owned tensors instead of reading stale host mirrors; otherwise
-         * CUDA/ROCm can replay a different expert set than the routing stage
-         * actually produced.
-         */
-        mutable std::shared_ptr<FP32Tensor> verifier_routing_indices_row_;
-        mutable std::shared_ptr<FP32Tensor> verifier_routing_weights_row_;
         mutable int scratch_capacity_ = 0;
 
         /// Batched gate+up scratch buffers for M=1 decode (one per top-k expert).
@@ -592,16 +612,29 @@ namespace llaminar2
         bool executeSingleToken(IDeviceContext *ctx);
 
         /**
-         * @brief Execute verifier-sized batches as a series of decode rows.
+         * @brief Execute verifier-sized batches with grouped serial-row math.
          *
          * MTP state publication restores live KV/GDN/conv state from a selected
-         * verifier row.  That only remains sound when the verifier row was
-         * produced by the same math as ordinary one-token decode.  This helper
-         * enforces that contract for CPU, CUDA, and ROCm by running M=1 expert
-         * projections per row, while still using backend tensor kernels for the
-         * heavy GPU work.
+         * verifier row.  That remains sound only when each grouped row is
+         * numerically equivalent to ordinary one-token decode.  M=1 therefore
+         * enters the normal decode route, while M=2..4 must use grouped
+         * verifier implementations that preserve per-row projection math and
+         * top-k accumulation order.  This function refuses unsupported GPU
+         * requests rather than hiding them behind row replay.
          */
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
+
+        /**
+         * @brief CPU grouped verifier executor for routed MoE experts.
+         *
+         * The CPU route keeps sparse MoE economics by batching route slots by
+         * expert, using the CPU NativeVNNI/floating grouped verifier GEMV hooks
+         * for gate/up and SwiGLU/down work.  It stores every route-slot result
+         * separately and performs the final row accumulation in original top-k
+         * order so the output is serial-decode equivalent without calling the
+         * single-row stage in a loop.
+         */
+        bool executeCPUGroupedDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
 
         void ensureGemmEnginesCached();
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
@@ -610,6 +643,21 @@ namespace llaminar2
         void addPendingGpuDirectTransfersFromStore(const std::vector<int> &expert_ids);
         bool waitForPendingGpuDirectTransfers();
         bool refreshGraphStablePlacement(bool preserve_capture_ready);
+        /**
+         * @brief Revalidates the graph-owned one-token MoE runtime placement.
+         *
+         * Dynamic ExpertParallel and overlay decode stages may receive a
+         * graph-initialized runtime table from Qwen35MoEGraph instead of
+         * synthesizing a full-owner table inside the stage.  This refresh keeps
+         * descriptor-table readiness, the active placement bank, and the
+         * stage-local initialized flag in lockstep so a later warmup/replay does
+         * not re-enter the forbidden synthesis path for explicit owner metadata.
+         *
+         * @param preserve_capture_ready Preserve an already-warmed capture-ready
+         * state only when all refreshed resources still match.
+         * @return true when the active runtime bank is usable or this stage does
+         * not participate in graph-stable runtime decode placement.
+         */
         bool refreshRuntimeGroupedDecodePlacement(bool preserve_capture_ready);
         bool refreshFixedTopologyGroupedPrefillPlacement();
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
@@ -639,7 +687,8 @@ namespace llaminar2
         bool hasTransferBackedPrefillLLEP() const;
         bool executeTransferBackedPrefillLLEPMovement(
             IMoEKernel *kernel,
-            DeviceMoERebalanceStatus **transfer_status_out) const;
+            DeviceMoERebalanceStatus **transfer_status_out,
+            DeviceMoERebalanceApplyStatus **apply_status_out) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;
@@ -762,6 +811,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Invalidate shared-expert descriptor-table handles after kernel reset.
+         *
+         * The shared-expert grouped decode route uses the same backend table
+         * lifetime as routed MoE: descriptor table IDs belong to kernel-dynamic
+         * state, while this stage object and its prepared GEMM engines can
+         * survive graph-cache reuse. Forgetting the handles here forces the
+         * next eager execution to upload fresh tables before capture.
+         */
+        void invalidateKernelDynamicState() override
+        {
+            shared_grouped_gateup_desc_table_id_ = -1;
+            shared_grouped_gateup_desc_table_d_model_ = 0;
+            shared_grouped_gateup_desc_table_intermediate_ = 0;
+            shared_grouped_down_desc_table_id_ = -1;
+            shared_grouped_down_desc_table_d_model_ = 0;
+            shared_grouped_down_desc_table_intermediate_ = 0;
+            grouped_decode_warmed_ = false;
+        }
+
+        /**
          * @brief Preserve grouped shared-expert pointer tables for graph replay.
          *
          * Normal request reset marks grouped decode cold so a following capture
@@ -811,8 +880,6 @@ namespace llaminar2
 
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
         mutable std::shared_ptr<FP32Tensor> scratch_up_;
-        mutable std::shared_ptr<FP32Tensor> scratch_input_row_;
-        mutable std::shared_ptr<FP32Tensor> scratch_output_row_;
         mutable int scratch_seq_len_ = 0;
         /**
          * @brief True once normal single-token grouped decode has populated
@@ -835,12 +902,13 @@ namespace llaminar2
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
 
         /**
-         * @brief Execute shared expert verifier rows through the decode path.
+         * @brief Execute shared expert verifier rows with grouped decode math.
          *
          * The shared expert has no routing state, but its quantized GEMM kernels
-         * can still choose different M=2..4 math than M=1 decode.  State
-         * publication needs the canonical M=1 GEMM/SwiGLU/down path so the next
-         * accepted token continues exactly like serial decode.
+         * can still choose verifier-row math that differs from ordinary decode.
+         * M=1 uses the normal decode path.  M=2..4 use backend grouped verifier
+         * projection and SwiGLU/down hooks, or the GPU grouped table-prefill
+         * route, so production never loops over row replay.
          */
         bool executeDecodeEquivalentVerifierPrefill(
             IDeviceContext *ctx, IMoEKernel *kernel,

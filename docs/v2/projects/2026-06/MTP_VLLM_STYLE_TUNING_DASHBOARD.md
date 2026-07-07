@@ -13,20 +13,21 @@ Fresh E2E: Qwen3.6 dense baseline/RAM-prefix/MTP d2 passed `261/261` on
 CPU/CUDA/ROCm; CPU MoE MTP d2 passed `27/27`; CUDA Qwen3.5 MoE bucket E2E
 passed `28/28`.
 
-Request-boundary `clear_cache()` separates lazy init from request state.
-Replay-safe forward, sidecar, initialized prefill entries, and ready graphs
-survive reset; stage hooks clear request mirrors. CUDA Qwen3.6 MoE E2E passed
-`20/20`; perfstats show bucket `1536` capture from
-`lazy_initialized_after_request_reset` plus ready replay every run.
-Graph-on/off benchmark gauge, Qwen3.6 MoE CUDA, `595` prefill tokens:
-prefill `192.4 ms / 3092 tok/s` on vs `226.0 ms / 2632 tok/s` off
-(`-14.9%` latency, `+17.5%` throughput). Decode also improved in that benchmark
-slice, but needs an isolation pass for attribution.
+Request-boundary `clear_cache()` now separates lazy init from request state;
+CUDA Qwen3.6 MoE E2E passed `20/20` with ready graph replay every run.
 
 CUDA attention dynamic params no longer use ad hoc `cudaMallocHost`; decode
 partials/params use fixed staging plus declared workspace buffers.
 
 CUDA dense greedy d2/d3 acceptance recovered after verifier-row ownership fix.
+
+2026-07-06 CUDA2 ExpertOverlay Dynamic + prefix-cache + MTP long-context parity
+passed after no-snapshot prefix restore now invalidates depth-0 MTP sidecar
+graphs. Evidence: `PrefixCacheMTPRestore_CUDA2TPDynamicPhaseSplit` passed in
+`288.7s`; perfstats show `prefix_cache.block_hits`, `includes_mtp_state=true`,
+`model_runtime_state=false`, `mtp.sidecar_graph_invalidations`, fresh sidecar
+misses, grouped publication, and MoE runtime predicates initialized on both CUDA
+participants. Still slow and prints compact-rebalance missing-source diagnostics.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
@@ -45,7 +46,7 @@ combined routed+shared without strict L2/KLD/cosine/max_abs/token proof.
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
 | LocalPP | ROCm stages | R | R | R | R | Prior dense run speed-negative |
 | NodeLocalTP | CPU sockets | A | A | R | R | Dense E2E green; perf pending |
-| ExpertOverlay | GPU hot + CPU cold | A | R | A | R | Skipped in latest refresh per CPU pause |
+| ExpertOverlay | GPU hot + CPU cold | A | R | A | R | CUDA2 Dynamic prefix+MTP green; broader refresh pending |
 
 ## SingleDevice Speeds
 
@@ -65,12 +66,8 @@ MoE depth sweep:
 | CUDA | `74.02` (`0.54x`) | `77.96` (`0.56x`) | `99.93` (`0.72x`) | `88.74` (`0.64x`) |
 | ROCm | `61.78` (`0.73x`) | `61.98` (`0.74x`) | `80.19` (`0.95x`) | `61.67` (`0.73x`) |
 
-Latest MoE stage blockers:
-
-| Device | Main verifier | Stage body | Largest buckets |
-|---|---:|---:|---|
-| CUDA | `386.4 ms` | `23.7 ms` | graph replay `320.5`, sidecar `40.3`, dist build `19.7` |
-| ROCm | `422.9 ms` | `26.9 ms` | graph replay `349.0`, sidecar `60.9`, dist build `58.0` |
+Latest MoE blockers remain verifier graph replay, sidecar, and distribution
+build time on both CUDA and ROCm.
 
 ## Focused Proofs
 
@@ -91,7 +88,15 @@ Latest MoE stage blockers:
   stochastic reset parity.
 - CUDA Qwen3.6 MoE bucketed-prefill E2E passed `20/20`; capture launch `691 us`,
   replay `288 us`.
+- CUDA2 ExpertOverlay Dynamic long-context prefix+MTP passed with explicit
+  sidecar graph invalidation.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
+- LocalTP greedy now has a rank-owned compact outcome path: sharded verifier
+  rows reduce through child `LogitsLocalInfo`, grouped child publishers mutate
+  accepted state without row replay, and Rank exposes an aggregate resident
+  mailbox for next-step prelaunch. Focused gate:
+  `V2_Unit_RankOrchestrator|V2_Unit_PrefillDecodeTransition|V2_Unit_MTPVerifierPolicy`.
+  Remaining debt: stochastic LocalTP reducer.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,
   CPU MTP thinking `27/27`, dense Qwen3.6 E2E `261/261`.
 - Model-load/MTP lifecycle guards pass: `V2_Unit_NodeLeaderPageCache` and

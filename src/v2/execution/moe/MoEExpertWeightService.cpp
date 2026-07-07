@@ -46,7 +46,6 @@
 #include <sys/syscall.h>
 #include <numa.h>
 #include <numaif.h>
-#include <sched.h>
 #endif
 
 #include <algorithm>
@@ -57,6 +56,7 @@
 #include <cstring>
 #include <iomanip>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -86,19 +86,6 @@ namespace llaminar2
 #endif
             (void)ptr;
             return -1;
-        }
-
-        /// Get NUMA node of the CPU this thread is currently running on.
-        static int currentCPUNode()
-        {
-#ifdef __linux__
-            int cpu = sched_getcpu();
-            if (cpu < 0)
-                return -1;
-            return numa_node_of_cpu(cpu);
-#else
-            return -1;
-#endif
         }
 
         static std::shared_ptr<void> reusableGpuDirectTransferStreamFor(
@@ -226,12 +213,12 @@ namespace llaminar2
 
             if (rc != 0)
             {
-                LOG_ERROR("[MoEWeightService][NUMA] mbind migration failed for " << label
-                                                                                 << " (" << page_bytes
-                                                                                 << " page-rounded bytes, node="
-                                                                                 << target_node << "): errno="
-                                                                                 << bind_errno << " ("
-                                                                                 << std::strerror(bind_errno) << ")");
+                LOG_WARN("[MoEWeightService][NUMA] mbind migration failed for " << label
+                                                                                << " (" << page_bytes
+                                                                                << " page-rounded bytes, node="
+                                                                                << target_node << "): errno="
+                                                                                << bind_errno << " ("
+                                                                                << std::strerror(bind_errno) << ")");
                 return false;
             }
 
@@ -243,6 +230,191 @@ namespace llaminar2
             (void)label;
             return false;
 #endif
+        }
+
+        /**
+         * @brief Bind a fresh page-aligned allocation to a NUMA node before
+         *        first touch.
+         *
+         * Strict migration is still the preferred fast path for already-packed
+         * NativeVNNI buffers, because it preserves the single packed allocation.
+         * When Linux refuses that post-hoc migration, the fix-forward path is
+         * to allocate a replacement buffer, install the target-node memory
+         * policy with no migration flags, and then copy the bytes into the
+         * policy-bound pages.  This preserves the optimized grouped CPU
+         * implementation and still refuses to run if target placement cannot be
+         * proven.
+         */
+        static bool bindFreshRangePolicyToNUMANode(void *ptr,
+                                                   size_t bytes,
+                                                   int target_node,
+                                                   const char *label)
+        {
+#ifdef __linux__
+            if (!ptr || bytes == 0)
+                return true;
+            if (target_node < 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Cannot bind fresh range for " << label
+                                                                                  << ": target NUMA node is unknown");
+                return false;
+            }
+            if (numa_available() < 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Cannot bind fresh range for " << label
+                                                                                  << ": libnuma policy APIs are unavailable");
+                return false;
+            }
+            if (target_node > numa_max_node())
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Cannot bind fresh range for " << label
+                                                                                  << ": target NUMA node " << target_node
+                                                                                  << " exceeds max node " << numa_max_node());
+                return false;
+            }
+
+            const size_t page_size = systemPageSize();
+            const uintptr_t raw_start = reinterpret_cast<uintptr_t>(ptr);
+            if ((raw_start % page_size) != 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Fresh range for " << label
+                                                                      << " is not page-aligned; strict NUMA placement would "
+                                                                         "need to include neighboring heap pages");
+                return false;
+            }
+            const size_t page_bytes = (bytes + page_size - 1) & ~(page_size - 1);
+
+            struct bitmask *nodemask = numa_allocate_nodemask();
+            if (!nodemask)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Failed to allocate nodemask for fresh range " << label);
+                return false;
+            }
+
+            numa_bitmask_clearall(nodemask);
+            numa_bitmask_setbit(nodemask, target_node);
+            errno = 0;
+            const int rc = mbind(ptr,
+                                 page_bytes,
+                                 MPOL_BIND,
+                                 nodemask->maskp,
+                                 nodemask->size,
+                                 0);
+            const int bind_errno = errno;
+            numa_free_nodemask(nodemask);
+
+            if (rc != 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] mbind fresh-range policy failed for "
+                          << label << " (" << page_bytes << " page-rounded bytes, node="
+                          << target_node << "): errno=" << bind_errno << " ("
+                          << std::strerror(bind_errno) << ")");
+                return false;
+            }
+
+            return true;
+#else
+            (void)ptr;
+            (void)bytes;
+            (void)target_node;
+            (void)label;
+            return false;
+#endif
+        }
+
+        /**
+         * @brief Verify every page of a repaired packed-weight buffer.
+         *
+         * Normal NUMA audits sample a few pages to avoid adding many syscalls
+         * to common expert preparation.  The relocation path only runs after
+         * strict migration has failed, so it pays the extra move_pages(2) calls
+         * to prove the replacement buffer is completely resident on the target
+         * node before grouped CPU decode can consume it.
+         */
+        static bool verifyEveryPageNUMANode(const void *ptr,
+                                            size_t bytes,
+                                            int expected_node,
+                                            const char *label)
+        {
+            if (!ptr || bytes == 0)
+                return true;
+
+            const size_t page_size = systemPageSize();
+            const uintptr_t raw_start = reinterpret_cast<uintptr_t>(ptr);
+            const uintptr_t raw_end = raw_start + bytes;
+            const uintptr_t page_start = raw_start & ~(static_cast<uintptr_t>(page_size) - 1);
+            const uintptr_t page_end = (raw_end + page_size - 1) & ~(static_cast<uintptr_t>(page_size) - 1);
+
+            for (uintptr_t page = page_start; page < page_end; page += page_size)
+            {
+                const int node = queryNUMANode(reinterpret_cast<const void *>(page));
+                if (node < 0)
+                {
+                    LOG_ERROR("[MoEWeightService][NUMA] Cannot verify relocated NUMA page for "
+                              << label << " at " << reinterpret_cast<const void *>(page));
+                    return false;
+                }
+                if (node != expected_node)
+                {
+                    LOG_ERROR("[MoEWeightService][NUMA] Relocated NUMA verification failed for "
+                              << label << ": expected node " << expected_node
+                              << ", found node " << node
+                              << " at " << reinterpret_cast<const void *>(page));
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /**
+         * @brief Replace a packed NativeVNNI buffer with a target-node-local
+         *        copy when Linux refuses strict post-pack migration.
+         */
+        static bool relocatePackedInterleavedToNUMANode(
+            cpu::native_vnni::CPUNativeVNNIPackedWeights &packed,
+            int target_node,
+            const std::string &label)
+        {
+            const size_t bytes = packed.native_interleaved.size();
+            if (bytes == 0)
+                return true;
+
+            AlignedVector<uint8_t> relocated;
+            try
+            {
+                relocated.resize_uninitialized(bytes);
+            }
+            catch (const std::bad_alloc &)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Failed to allocate relocation buffer for "
+                          << label << " (" << bytes << " bytes)");
+                return false;
+            }
+
+            const std::string relocation_label = label + " relocated_native_interleaved";
+            if (!bindFreshRangePolicyToNUMANode(
+                    relocated.data(),
+                    relocated.size(),
+                    target_node,
+                    relocation_label.c_str()))
+            {
+                return false;
+            }
+
+            std::memcpy(relocated.data(), packed.native_interleaved.data(), bytes);
+            if (!verifyEveryPageNUMANode(
+                    relocated.data(),
+                    relocated.size(),
+                    target_node,
+                    relocation_label.c_str()))
+            {
+                return false;
+            }
+
+            packed.native_interleaved.swap(relocated);
+            packed.clearWorkspace();
+            return true;
         }
 
         static bool enforceExpertKernelNUMA(ITensorGemm *kernel,
@@ -266,7 +438,10 @@ namespace llaminar2
                                         target_node,
                                         interleaved_label.str().c_str()))
             {
-                return false;
+                return relocatePackedInterleavedToNUMANode(
+                    packed,
+                    target_node,
+                    interleaved_label.str());
             }
 
             return true;
@@ -648,6 +823,8 @@ namespace llaminar2
         // of truth for physical bounds, so they must never attempt to view
         // global expert ids outside [local_start, local_end).
         const bool extract_all = !ctx.expert_mask.empty();
+        const size_t active_mask_count =
+            static_cast<size_t>(std::count(ctx.expert_mask.begin(), ctx.expert_mask.end(), true));
         const int local_start = ctx.local_expert_start;
         const int local_count = (ctx.local_expert_count < 0)
                                     ? num_experts
@@ -667,8 +844,9 @@ namespace llaminar2
         // In that case, global expert index `e` maps to local tensor index
         // `e - local_start`. When the tensor has all experts (shape[2] == num_experts),
         // the offset uses the global index directly.
-        auto extract_views = [local_start, local_end, extract_all](
+        auto extract_views = [local_start, local_count, local_end, extract_all, active_mask_count, &ctx](
                                  TensorBase *tensor_3d, int n_experts,
+                                 const char *role_name,
                                  std::vector<std::shared_ptr<TensorBase>> &views) -> bool
         {
             const auto &shape = tensor_3d->shape();
@@ -704,7 +882,33 @@ namespace llaminar2
                 size_t element_offset = tensor_idx * elements_per_expert;
 
                 std::vector<size_t> view_shape = {rows, cols};
-                auto view = tensor_3d->create_view(view_shape, element_offset);
+                std::shared_ptr<TensorBase> view;
+                try
+                {
+                    view = tensor_3d->create_view(view_shape, element_offset);
+                }
+                catch (const std::exception &ex)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoEWeightService] create_view failed"
+                        << " layer=" << ctx.layer_idx
+                        << " role=" << role_name
+                        << " expert=" << e
+                        << " tensor_idx=" << tensor_idx
+                        << " tensor_shape=[" << shape[0] << "," << shape[1] << "," << shape[2] << "]"
+                        << " view_shape=[" << rows << "," << cols << "]"
+                        << " offset_elements=" << element_offset
+                        << " num_experts=" << n_experts
+                        << " tensor_expert_count=" << tensor_expert_count
+                        << " is_presliced=" << (is_presliced ? "true" : "false")
+                        << " local_start=" << local_start
+                        << " local_count=" << local_count
+                        << " local_end=" << local_end
+                        << " mask_size=" << ctx.expert_mask.size()
+                        << " active_mask_count=" << active_mask_count
+                        << ": " << ex.what();
+                    throw std::runtime_error(oss.str());
+                }
                 if (!view)
                 {
                     LOG_ERROR("[MoE] Failed to create view for expert " << e
@@ -716,11 +920,11 @@ namespace llaminar2
             return true;
         };
 
-        if (!extract_views(ctx.gate_exps, num_experts, ctx.expert_gate_views))
+        if (!extract_views(ctx.gate_exps, num_experts, "gate", ctx.expert_gate_views))
             return false;
-        if (!extract_views(ctx.up_exps, num_experts, ctx.expert_up_views))
+        if (!extract_views(ctx.up_exps, num_experts, "up", ctx.expert_up_views))
             return false;
-        if (!extract_views(ctx.down_exps, num_experts, ctx.expert_down_views))
+        if (!extract_views(ctx.down_exps, num_experts, "down", ctx.expert_down_views))
             return false;
 
         LOG_DEBUG("[MoEWeightService] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
@@ -913,11 +1117,19 @@ namespace llaminar2
         // Each expert has unique tensors (unique raw_data() keys), so no cache
         // key collisions.  The heavy VNNI interleave runs lock-free.
         // Phase D: prepareExpertGemmLocal returns shared_ptr without global registry.
-        const int target_numa_node = currentCPUNode();
-        if (target_numa_node < 0)
+        const int target_numa_node = ctx.cpu_numa_node;
+        const bool enforce_numa_placement = target_numa_node >= 0;
+        if (enforce_numa_placement && numa_available() < 0)
         {
-            LOG_ERROR("[MoEWeightService][NUMA] Cannot determine target NUMA node for CPU expert packing");
+            LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert packing on NUMA node "
+                      << target_numa_node << ": libnuma policy APIs are unavailable");
             return false;
+        }
+        if (!enforce_numa_placement)
+        {
+            LOG_DEBUG("[MoEWeightService][NUMA] CPU expert packing uses aggregate CPU domain; "
+                      "strict single-node placement is disabled for layer "
+                      << ctx.layer_idx);
         }
         std::atomic<bool> error_flag{false};
 
@@ -953,9 +1165,10 @@ namespace llaminar2
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
             }
-            if (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
-                !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
-                !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down"))
+            if (enforce_numa_placement &&
+                (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
+                 !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
+                 !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down")))
             {
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
@@ -1071,9 +1284,13 @@ namespace llaminar2
             }
         }
 
-        // NUMA audit: verify packed weights landed on the correct NUMA node.
-        auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
-                        "initial_pack", ctx.layer_idx, target_numa_node);
+        // NUMA audit: verify packed weights landed on the requested NUMA node.
+        // Aggregate CPU domains intentionally skip this single-node check.
+        if (enforce_numa_placement)
+        {
+            auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
+                            "initial_pack", ctx.layer_idx, target_numa_node);
+        }
 
         // Mark experts as prepared in the payload provider (enables host data release)
         if (ctx.payload_provider)
@@ -1369,11 +1586,19 @@ namespace llaminar2
         int transferred_count = 0;
         std::atomic<bool> error_flag{false};
         const int count = static_cast<int>(new_experts.size());
-        const int target_numa_node = currentCPUNode();
-        if (target_numa_node < 0)
+        const int target_numa_node = ctx.cpu_numa_node;
+        const bool enforce_numa_placement = target_numa_node >= 0;
+        if (enforce_numa_placement && numa_available() < 0)
         {
-            LOG_ERROR("[MoEWeightService][NUMA] Cannot determine target NUMA node for CPU expert arrivals");
+            LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert arrivals on NUMA node "
+                      << target_numa_node << ": libnuma policy APIs are unavailable");
             return false;
+        }
+        if (!enforce_numa_placement)
+        {
+            LOG_DEBUG("[MoEWeightService][NUMA] CPU expert arrivals use aggregate CPU domain; "
+                      "strict single-node placement is disabled for layer "
+                      << ctx.layer_idx);
         }
 
         auto cached_engine_for = [&](const std::optional<ExpertSlabRef> &slab_ref, int expert_id) -> ITensorGemm *
@@ -1436,9 +1661,10 @@ namespace llaminar2
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
             }
-            if (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
-                !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
-                !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down"))
+            if (enforce_numa_placement &&
+                (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
+                 !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
+                 !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down")))
             {
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
@@ -1469,9 +1695,12 @@ namespace llaminar2
                                                         << " experts (" << transferred_count << " transferred): "
                                                         << std::fixed << std::setprecision(1) << prep_ms << " ms");
 
-        auditExpertNUMA(new_experts, ctx.prepared_gate_gemm,
-                        (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
-                        ctx.layer_idx, target_numa_node);
+        if (enforce_numa_placement)
+        {
+            auditExpertNUMA(new_experts, ctx.prepared_gate_gemm,
+                            (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
+                            ctx.layer_idx, target_numa_node);
+        }
 
         // Phase C: Register new arrivals in PreparedWeightStore using cached slab refs
         if (ctx.prepared_store && !new_experts.empty())

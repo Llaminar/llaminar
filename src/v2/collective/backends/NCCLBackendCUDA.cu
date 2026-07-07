@@ -689,6 +689,15 @@ namespace llaminar2
             return (err == cudaSuccess);
         }
 
+        bool cudaMemsetAsyncDevice(void *dst, int value, size_t bytes, int device_ordinal, void *stream)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinal);
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMemsetAsync(dst, value, bytes, static_cast<cudaStream_t>(stream));
+            return (err == cudaSuccess);
+        }
+
         bool cudaMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream)
         {
             cudaError_t err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, static_cast<cudaStream_t>(stream));

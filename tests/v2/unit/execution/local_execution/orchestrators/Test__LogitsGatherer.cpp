@@ -218,7 +218,7 @@ TEST_F(Test__LogitsGatherer, DestructorUnpinsWithPinnedDeviceBackend)
     PinTrackingResolverScope resolver_scope(cuda_backend, rocm_backend);
 
     const void *buffer_ptr = nullptr;
-    const size_t expected_bytes = static_cast<size_t>(VOCAB) * MAX_TOKENS * sizeof(float);
+    const size_t expected_bytes = static_cast<size_t>(VOCAB) * sizeof(float);
 
     {
         auto g = std::make_unique<LogitsGatherer>(VOCAB, MAX_TOKENS, resolvePinTrackingBackend);

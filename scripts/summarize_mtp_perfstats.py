@@ -262,7 +262,7 @@ def _verifier_economy_lane_status(
             (
                 f"status={tags.get('perf_gate_status', 'unknown')}",
                 f"rows={rows}",
-                f"serial={tags.get('serial_decode_equivalent_fallback', 'false')}",
+                f"oracle={tags.get('serial_decode_equivalent_oracle_only', 'false')}",
                 f"grouped={tags.get('grouped_decode_equivalent', 'false')}",
                 f"row_lm={tags.get('row_indexed_lm_head', 'false')}",
                 "resident="

@@ -1600,7 +1600,7 @@ namespace llaminar2
          * This is a performance contract, not merely a correctness contract.
          * Implementations must not hide M ordinary one-token `compute_tensor()`
          * calls behind this method. Unsupported backends should return false so
-         * stages can fail closed instead of silently taking a serial fallback.
+         * stages can fail closed instead of silently taking a serial oracle path.
          */
         virtual bool compute_verifier_rows_decode_equivalent(
             const ITensor *Q,
@@ -3213,6 +3213,9 @@ namespace llaminar2
         /// Size of implementation-owned recurrent state, if exportable.
         virtual size_t stateBytes() const { return 0; }
 
+        /// Largest resident conv-state bank, if multiple live banks are held.
+        virtual size_t largestStateBytes() const { return stateBytes(); }
+
         /// Export implementation-owned state. When stream is non-null, GPU
         /// implementations may enqueue async copies; callers must synchronize
         /// the stream before consuming the exported payload.
@@ -3224,6 +3227,15 @@ namespace llaminar2
             return stateBytes() == 0;
         }
 
+        virtual bool exportStateForSize(int state_size, void *dst_host, void *dst_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return exportState(dst_host, dst_device, stream);
+        }
+
         /// Import implementation-owned state. When stream is non-null, GPU
         /// implementations may enqueue async copies; callers must synchronize
         /// the stream before using the imported state.
@@ -3233,6 +3245,16 @@ namespace llaminar2
             (void)src_device;
             (void)stream;
             return stateBytes() == 0;
+        }
+
+        virtual bool importStateForSize(int state_size, const void *src_host, const void *src_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            allocateGPUState(state_size);
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return importState(src_host, src_device, stream);
         }
 
         /**
@@ -3403,6 +3425,9 @@ namespace llaminar2
         /// Size of implementation-owned recurrent state, if exportable.
         virtual size_t stateBytes() const { return 0; }
 
+        /// Largest resident recurrence-state bank, if multiple live banks are held.
+        virtual size_t largestStateBytes() const { return stateBytes(); }
+
         /// Export implementation-owned state. When stream is non-null, GPU
         /// implementations may enqueue async copies; callers must synchronize
         /// the stream before consuming the exported payload.
@@ -3414,6 +3439,15 @@ namespace llaminar2
             return stateBytes() == 0;
         }
 
+        virtual bool exportStateForSize(int state_size, void *dst_host, void *dst_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return exportState(dst_host, dst_device, stream);
+        }
+
         /// Import implementation-owned state. When stream is non-null, GPU
         /// implementations may enqueue async copies; callers must synchronize
         /// the stream before using the imported state.
@@ -3423,6 +3457,16 @@ namespace llaminar2
             (void)src_device;
             (void)stream;
             return stateBytes() == 0;
+        }
+
+        virtual bool importStateForSize(int state_size, const void *src_host, const void *src_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            allocateGPUState(state_size);
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return importState(src_host, src_device, stream);
         }
 
         /// Check if GPU state is allocated with the required size.

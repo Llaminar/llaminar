@@ -123,6 +123,9 @@ namespace llaminar2
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
 
         // GDN projection uses standard GEMM path — graph-capturable
         bool isGraphCapturable() const override { return true; }
@@ -132,6 +135,7 @@ namespace llaminar2
         /// Caches the result in @p cached for subsequent calls (like GEMMStage).
         ITensorGemm *resolveGemm(
             const ITensor *weight, ITensorGemm *&cached, const char *name);
+        void clearCachedGemmStreams();
 
         Params params_;
     };

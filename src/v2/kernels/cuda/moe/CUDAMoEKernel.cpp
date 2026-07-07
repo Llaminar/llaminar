@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -182,6 +183,50 @@ namespace
         return false;
     }
 
+    /**
+     * @brief True when MoE prefill grouping wrapper tracing is requested.
+     *
+     * This intentionally uses the same environment flag as the stage-level
+     * trace.  The wrapper log is a lower observation point for captured prefill
+     * graphs where the ordinary stage body may not be visible during replay.
+     */
+    bool traceMoEPrefillGroupingWrapperEnabled()
+    {
+        const bool assignment_trace =
+            !llaminar2::DebugEnv::isFalseyEnv("LLAMINAR_MOE_PREFILL_ASSIGNMENT_TRACE");
+        return assignment_trace || llaminar2::debugEnv().execution.prefill_graph_trace;
+    }
+
+    /**
+     * @brief Add bytes to a deterministic FNV-1a diagnostic hash.
+     */
+    uint64_t updateMoETraceHash(uint64_t hash, const void *data, size_t bytes)
+    {
+        constexpr uint64_t kFnvPrime = 1099511628211ULL;
+        const auto *raw = static_cast<const uint8_t *>(data);
+        for (size_t i = 0; i < bytes; ++i)
+        {
+            hash ^= static_cast<uint64_t>(raw[i]);
+            hash *= kFnvPrime;
+        }
+        return hash;
+    }
+
+    /**
+     * @brief Hash a contiguous vector for compact prefill grouping diagnostics.
+     */
+    template <typename T>
+    uint64_t hashMoETraceVector(const std::vector<T> &values)
+    {
+        constexpr uint64_t kFnvOffset = 1469598103934665603ULL;
+        if (values.empty())
+            return kFnvOffset;
+        return updateMoETraceHash(
+            kFnvOffset,
+            values.data(),
+            values.size() * sizeof(T));
+    }
+
     bool requireTensorElements(const llaminar2::ITensor *tensor, size_t required,
                                const char *name, const char *context)
     {
@@ -283,8 +328,8 @@ namespace
             break;
         }
 
-        // MTP verifier prefill runs with M=2..4 rows and must be cheap enough
-        // to beat serial verifier replay.  The compact TM=2 template wins on
+        // MTP verifier prefill runs with M=1..4 rows and must be cheap enough
+        // to be the production grouped path.  The compact TM=2 template wins on
         // CUDA for these tiny active groups because it avoids over-wide blocks
         // while still covering the full row set through grid.y.
         if (max_tokens_per_expert <= 4)
@@ -524,6 +569,22 @@ extern "C"
         int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_route_logits_decode_equivalent_rows(
+        const float *hidden, const float *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_route_logits_bf16_decode_equivalent_rows(
+        const float *hidden, const void *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_softmax_topk(
         float *logits, int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
@@ -612,6 +673,20 @@ extern "C"
         uint32_t command_buffer_count,
         const void *gathered_wave_states,
         void *local_wave_states,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_project_prefill_llep_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        uint32_t *local_plan_count,
+        void *local_command_header,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
         int device_idx,
         void *stream);
 
@@ -832,6 +907,7 @@ extern "C"
         int *expert_counts,
         int *grouped_token_indices,
         int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
         int seq_len,
@@ -882,6 +958,7 @@ extern "C"
         uint32_t min_spread_improvement_divisor,
         uint64_t min_spread_improvement_per_transfer,
         uint64_t min_foreign_rows_per_transfer,
+        uint32_t max_weight_transfers,
         int enable_balanced_skip,
         int device_idx,
         void *stream);
@@ -902,6 +979,7 @@ extern "C"
         int num_experts,
         int top_k,
         const void *transfer_status,
+        const void *apply_status,
         int device_idx,
         void *stream);
 
@@ -911,6 +989,24 @@ extern "C"
         llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
         llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_build_active_expert_list_runtime(
+        const void *runtime,
+        int *active_expert_ids,
+        int num_experts,
+        int max_active_experts,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_build_runtime_original_to_grouped(
+        const void *runtime,
+        int *original_to_grouped,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
         int device_idx,
         void *stream);
 
@@ -1104,6 +1200,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
+        const int *d_original_expert_ids,
         const int *d_active_expert_ids,
         const float *d_group_weights,
         int8_t *d_scratch_A_int8,
@@ -1114,6 +1211,7 @@ extern "C"
         float *d_up_partials,
         int8_t *d_scratch_swiglu_int8,
         float *d_scratch_swiglu_scales,
+        float *d_down_partials,
         float *d_scratch_down_out,
         float *d_output,
         int num_experts,
@@ -1123,11 +1221,13 @@ extern "C"
         int total_slots,
         int top_k,
         int active_expert_slots,
+        int grouped_indices_are_route_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
         int gateup_k_partitions,
+        int down_k_partitions,
         int device_idx,
         void *stream);
 
@@ -1439,22 +1539,24 @@ namespace llaminar2
 
     void CUDAMoEKernel::resetDynamicState()
     {
+        /*
+         * This hook is reached only on hard kernel-dynamic reset boundaries.
+         * Replay-preserving request reset deliberately avoids
+         * KernelFactory::resetAllDynamicState(), because captured CUDA graphs
+         * may still reference workspace-backed pointer tables.  Once the hard
+         * reset path is chosen, grouped prefill/decode scratch, mask upload
+         * hashes, router caches, and descriptor-table handles must all be
+         * treated as invalid so cached stages rebuild them before the next
+         * eager warmup or capture.
+         */
+        clearWorkspaceScratchBindings();
+        grouped_down_desc_tables_.clear();
+        grouped_gateup_desc_tables_.clear();
         host_expert_counts_.clear();
         host_expert_offsets_.clear();
         host_grouped_indices_.clear();
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
-        group_active_expert_slots_ = 0;
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
-        /*
-         * Runtime pointer slots are staged during graph warmup.  A dynamic
-         * reset means the next captured graph must restage its deterministic
-         * scoped table slots instead of inheriting bindings from a discarded
-         * graph.
-         */
-        gateup_pointer_slot_ready_.fill(false);
-        down_pointer_slot_ready_.fill(false);
     }
 
     void CUDAMoEKernel::releaseDeviceBuffers() noexcept
@@ -1756,9 +1858,13 @@ namespace llaminar2
         void *decode_hidden_scales = nullptr;
         const bool ok =
             bindWorkspaceBuffer(&decode_hidden_int8, MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,
-                                static_cast<size_t>(d_model) * sizeof(int8_t), "decode hidden int8") &&
+                                static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                    static_cast<size_t>(d_model) * sizeof(int8_t),
+                                "decode hidden int8") &&
             bindWorkspaceBuffer(&decode_hidden_scales, MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
-                                static_cast<size_t>(blocks_per_row) * sizeof(float), "decode hidden scales");
+                                static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                    static_cast<size_t>(blocks_per_row) * sizeof(float),
+                                "decode hidden scales");
         if (!ok)
         {
             d_decode_hidden_int8_ = nullptr;
@@ -2043,14 +2149,18 @@ namespace llaminar2
               k_partitions == 16))
             return false;
 
-        // The down split-K kernel accumulates all routed experts inside each K-part
-        // and writes a single [k_partitions][d_model] partial buffer.
+        // Decode uses one logical output row, while grouped verifier prefill
+        // needs one partial row per compact verifier route/token owner.  The
+        // caller still passes slots=1 for ordinary decode, so this remains
+        // backward compatible with the existing single-row scratch contract.
         if (d_grouped_down_partials_ &&
             grouped_down_kpart_partitions_cap_ >= k_partitions &&
-            grouped_down_kpart_d_model_cap_ >= d_model)
+            grouped_down_kpart_d_model_cap_ >= d_model &&
+            grouped_down_kpart_slots_cap_ >= slots)
             return true;
 
         const size_t partial_count =
+            static_cast<size_t>(slots) *
             static_cast<size_t>(k_partitions) *
             static_cast<size_t>(d_model);
         void *down_partials = nullptr;
@@ -2067,7 +2177,7 @@ namespace llaminar2
         d_grouped_down_partials_ = static_cast<float *>(down_partials);
         grouped_down_kpart_partitions_cap_ = k_partitions;
         grouped_down_kpart_d_model_cap_ = d_model;
-        grouped_down_kpart_slots_cap_ = 1;
+        grouped_down_kpart_slots_cap_ = slots;
         return true;
     }
 
@@ -2517,42 +2627,16 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * MTP verifier batches are only M=2..4 rows, and later publication is
-         * judged against ordinary one-row decode.  cuBLAS is a fine router for
-         * prompt prefill, but its reduction order is different enough from the
-         * decode GEMV path to move top-k weights on near-tie MoE routes.  Keep
-         * tiny verifier-sized routing on the same row-independent kernel family
-         * that decode uses so expert outputs and downstream KV/GDN state are
-         * numerically decode-equivalent while still staying device-resident and
-         * graph-capturable.
-         */
-        const bool use_decode_equivalent_small_m =
-            gate_is_fp32 && seq_len >= 2 && seq_len <= 4;
-        const bool route_ok = use_decode_equivalent_small_m
-                                  ? cudaMoE_route_logits(hidden,
-                                                         static_cast<const float *>(gate_weights),
-                                                         d_route_logits_,
+        const bool route_ok = gate_is_fp32
+                                  ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
                                                          seq_len, d_model, num_experts,
                                                          device_ordinal_, stream)
-                                  : (gate_is_fp32
-                                         ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
-                                                                seq_len, d_model, num_experts,
-                                                                device_ordinal_, stream)
-                                         : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
-                                                                     seq_len, d_model, num_experts,
-                                                                     device_ordinal_, stream));
+                                  : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
+                                                              seq_len, d_model, num_experts,
+                                                              device_ordinal_, stream);
         if (!route_ok)
             return false;
-        if (use_decode_equivalent_small_m)
-        {
-            PerfStatsCollector::addCounter(
-                "kernel", "cuda_moe_router_decode_equivalent_small_m_calls", 1.0, {}, {},
-                {{"seq_len", std::to_string(seq_len)},
-                 {"d_model", std::to_string(d_model)},
-                 {"num_experts", std::to_string(num_experts)}});
-        }
-        if (gate_is_fp32 && seq_len >= 16)
+        if (gate_is_fp32 && seq_len > 1)
         {
             PerfStatsCollector::addCounter(
                 "kernel", "cuda_moe_router_tiled_prefill_calls", 1.0, {}, {},
@@ -2848,6 +2932,238 @@ namespace llaminar2
                                     host_result,
                                     device_effective_seq_len,
                                     "CUDAMoEKernel::routeWithTensorsEffectiveSeqLen");
+    }
+
+    bool CUDAMoEKernel::routeVerifierRowsDecodeEquivalent(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights)
+    {
+        constexpr const char *kContext = "CUDAMoEKernel::routeVerifierRowsDecodeEquivalent";
+        void *stream = requireStream(kContext);
+        const DeviceId device = deviceId();
+        if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
+            !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights") ||
+            !ensureOutputOnDevice(output_indices, device, stream, "output_indices") ||
+            !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
+        {
+            return false;
+        }
+
+        if (seq_len < 1 || seq_len > 4 || d_model <= 0 ||
+            num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[" << kContext << "] invalid verifier routing shape seq_len="
+                          << seq_len << " d_model=" << d_model
+                          << " num_experts=" << num_experts
+                          << " top_k=" << top_k);
+            return false;
+        }
+
+        auto *hidden_base = asTensorBase(hidden, "verifier route hidden");
+        auto *gate_base = asTensorBase(gate_weights, "verifier route gate_weights");
+        auto *indices_base = asTensorBase(output_indices, "verifier route output_indices");
+        auto *weights_base = asTensorBase(output_weights, "verifier route output_weights");
+        if (!hidden_base || !gate_base || !indices_base || !weights_base)
+            return false;
+
+        if (!requireTensorType(hidden_base, TensorType::FP32, "hidden", kContext) ||
+            !requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", kContext) ||
+            !requireTensorType(indices_base, TensorType::FP32, "output_indices", kContext) ||
+            !requireTensorType(weights_base, TensorType::FP32, "output_weights", kContext))
+        {
+            return false;
+        }
+
+        const size_t required_hidden =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_gate =
+            static_cast<size_t>(num_experts) * static_cast<size_t>(d_model);
+        const size_t required_topk =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (!requireMatrixCapacity(hidden, seq_len, d_model, "hidden", kContext) ||
+            !requireMatrixCapacity(gate_weights, num_experts, d_model, "gate_weights", kContext) ||
+            !requireTensorElements(hidden, required_hidden, "hidden", kContext) ||
+            !requireTensorElements(gate_weights, required_gate, "gate_weights", kContext) ||
+            !requireTensorElements(output_indices, required_topk, "output_indices", kContext) ||
+            !requireTensorElements(output_weights, required_topk, "output_weights", kContext))
+        {
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
+        float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
+        float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
+        if (!d_hidden || !d_gate || !d_idx || !d_wt)
+        {
+            LOG_ERROR("[" << kContext << "] null device pointer hidden="
+                          << static_cast<const void *>(d_hidden)
+                          << " gate=" << d_gate
+                          << " indices=" << static_cast<void *>(d_idx)
+                          << " weights=" << static_cast<void *>(d_wt));
+            return false;
+        }
+
+        const bool gate_is_fp32 = (gate_base->native_type() == TensorType::FP32);
+        const bool q8_router_requested = gate_is_fp32 && debugEnv().gemm.cuda_moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[" << kContext << "] Q8 verifier router requires d_model to be a multiple of 32, got "
+                          << d_model);
+            return false;
+        }
+
+        const size_t logits_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(num_experts);
+        const size_t topk_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        {
+            LOG_ERROR("[" << kContext << "] route scratch allocation failed");
+            return false;
+        }
+
+        /*
+         * Route all verifier rows as one grouped transaction while preserving
+         * serial decode math inside each row.  The Q8, FP32, and BF16 kernels
+         * all use expert-owned grouped blocks that share gate loads across
+         * verifier rows while preserving each row's serial K/reduction order.
+         */
+        if (q8_router_requested)
+        {
+            if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
+            {
+                LOG_ERROR("[" << kContext << "] Q8 router hidden scratch unavailable");
+                return false;
+            }
+            const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                gate_weights, static_cast<const float *>(d_gate), d_model, num_experts);
+            if (!q8_gate)
+            {
+                LOG_ERROR("[" << kContext << "] Q8 router gate cache unavailable");
+                return false;
+            }
+            if (!cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
+                    d_hidden,
+                    d_decode_hidden_int8_,
+                    d_decode_hidden_scales_,
+                    q8_gate->d_gate_weights_q8,
+                    q8_gate->d_gate_scales,
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[" << kContext << "] grouped Q8 decode-equivalent logits failed");
+                return false;
+            }
+
+            /*
+             * Single-row verifier buckets are ordinary decode and may reuse the
+             * router Q8 hidden scratch in the following gate/up decode.  For
+             * M>1 the scratch is laid out as [M,d_model], so a one-row gate/up
+             * reuse marker would be ambiguous; keep it invalid until the expert
+             * grouped path has an explicit row-slice reuse contract.
+             */
+            if (seq_len == 1 && !isCudaMoEDecodeCaptureActive(stream))
+            {
+                router_q8_hidden_source_ = d_hidden;
+                router_q8_hidden_valid_ = true;
+            }
+            else
+            {
+                router_q8_hidden_source_ = nullptr;
+                router_q8_hidden_valid_ = false;
+            }
+        }
+        else if (gate_is_fp32)
+        {
+            if (!cudaMoE_route_logits_decode_equivalent_rows(
+                    d_hidden,
+                    static_cast<const float *>(d_gate),
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[" << kContext << "] grouped FP32 decode-equivalent logits failed");
+                return false;
+            }
+        }
+        else if (!cudaMoE_route_logits_bf16_decode_equivalent_rows(
+                     d_hidden,
+                     d_gate,
+                     d_route_logits_,
+                     seq_len,
+                     d_model,
+                     num_experts,
+                     device_ordinal_,
+                     stream))
+        {
+            LOG_ERROR("[" << kContext << "] grouped BF16 decode-equivalent logits failed");
+            return false;
+        }
+
+        if (!cudaMoE_softmax_topk(
+                d_route_logits_,
+                d_route_indices_,
+                d_route_weights_,
+                seq_len,
+                num_experts,
+                top_k,
+                normalize_weights,
+                device_ordinal_,
+                stream,
+                nullptr))
+        {
+            LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
+            return false;
+        }
+
+        if (!cudaMoE_int_to_float(d_route_indices_,
+                                  d_idx,
+                                  static_cast<int>(topk_count),
+                                  device_ordinal_,
+                                  stream))
+        {
+            LOG_ERROR("[" << kContext << "] grouped int-to-float index conversion failed");
+            return false;
+        }
+
+        const cudaError_t copy_status = cudaMemcpyAsync(
+            d_wt,
+            d_route_weights_,
+            topk_count * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            static_cast<cudaStream_t>(stream));
+        if (copy_status != cudaSuccess)
+        {
+            LOG_ERROR("[" << kContext << "] grouped D2D weight copy failed: "
+                          << cudaGetErrorString(copy_status));
+            return false;
+        }
+
+        markDeviceWritten(output_indices, device, stream);
+        markDeviceWritten(output_weights, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_router_decode_equivalent_small_m_calls",
+            1.0,
+            {},
+            {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"d_model", std::to_string(d_model)},
+             {"num_experts", std::to_string(num_experts)},
+             {"top_k", std::to_string(top_k)},
+             {"route", q8_router_requested ? "grouped_decode_equivalent_q8"
+                                            : "grouped_decode_equivalent"}});
+        return true;
     }
 
     bool CUDAMoEKernel::decodeRouteSelect(DeviceMoELayerRuntime *runtime_layer,
@@ -3297,6 +3613,49 @@ namespace llaminar2
             command_buffer_count,
             gathered_wave_states,
             local_wave_states,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands(
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntry *local_plan_entries,
+        uint32_t *local_plan_count,
+        DeviceMoERebalanceCommandBufferHeader *local_command_header,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceStatus *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_plan_entries || !local_plan_count || !local_command_header ||
+            !status || plan_capacity == 0 || payload_slot_capacity == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands] gathered commands, local command output, status, and payload capacity are required");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands");
+        if (!setMoEDevice(device_ordinal_, "projectPrefillLeastLoadedDomainCommands"))
+            return false;
+
+        return cudaMoE_project_prefill_llep_domain_commands(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_plan_entries,
+            local_plan_count,
+            local_command_header,
+            &config,
+            status,
+            payload_slot_capacity,
+            command_buffer_count,
             device_ordinal_,
             stream);
     }
@@ -3970,6 +4329,21 @@ namespace llaminar2
                               static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
             return false;
+        /*
+         * Masked/padded routing can compact fewer rows than total_slots.  The
+         * grouped prefill gather still launches over total_slots, so stale token
+         * ids from a previous larger request must not survive in unused rows.
+         */
+        err = cudaMemsetAsync(d_grouped_token_indices, 0,
+                              static_cast<size_t>(total_slots) * sizeof(int),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
+        err = cudaMemsetAsync(d_grouped_weights, 0,
+                              static_cast<size_t>(total_slots) * sizeof(float),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
         return cudaMoE_count_per_expert(d_routing_indices, d_expert_counts, total_slots,
                                         num_experts, device_ordinal_, stream) &&
                cudaMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
@@ -4026,6 +4400,20 @@ namespace llaminar2
         {
             LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] routing tensors have no device pointers");
             return false;
+        }
+
+        if (traceMoEPrefillGroupingWrapperEnabled())
+        {
+            LOG_INFO("[CUDAMoEKernel] prefill grouping wrapper trace"
+                     << " tag=groupPrefillRoutes"
+                     << " device=" << device.to_string()
+                     << " current_tokens=" << current_tokens
+                     << " max_tokens=" << max_tokens
+                     << " num_experts=" << num_experts
+                     << " top_k=" << top_k
+                     << " runtime_layer=" << static_cast<void *>(runtime_layer)
+                     << " routing_indices=" << static_cast<const void *>(d_indices)
+                     << " routing_weights=" << static_cast<const void *>(d_weights));
         }
 
         return cudaMoE_group_prefill_routes_runtime(
@@ -4150,6 +4538,7 @@ namespace llaminar2
             config.min_spread_improvement_divisor,
             config.min_spread_improvement_per_transfer,
             config.min_foreign_rows_per_transfer,
+            config.max_weight_transfers,
             config.enable_balanced_skip ? 1 : 0,
             device_ordinal_,
             stream);
@@ -4194,16 +4583,17 @@ namespace llaminar2
         int max_tokens,
         int num_experts,
         int top_k,
-        const DeviceMoERebalanceStatus *transfer_status)
+        const DeviceMoERebalanceStatus *transfer_status,
+        const DeviceMoERebalanceApplyStatus *apply_status)
     {
         if (!runtime_layer)
         {
             LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
             return false;
         }
-        if (!transfer_status)
+        if (!transfer_status || !apply_status)
         {
-            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] transfer status is required");
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] transfer and apply status are required");
             return false;
         }
         if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
@@ -4217,6 +4607,27 @@ namespace llaminar2
 
         void *stream = requireStream(
             "CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers");
+        if (!requireCudaDevicePointer(
+                runtime_layer,
+                device_ordinal_,
+                "runtime_layer",
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+                stream) ||
+            !requireCudaDevicePointer(
+                transfer_status,
+                device_ordinal_,
+                "transfer_status",
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+                stream) ||
+            !requireCudaDevicePointer(
+                apply_status,
+                device_ordinal_,
+                "apply_status",
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+                stream))
+        {
+            return false;
+        }
         return cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
             static_cast<void *>(runtime_layer),
             current_tokens * top_k,
@@ -4224,6 +4635,7 @@ namespace llaminar2
             num_experts,
             top_k,
             transfer_status,
+            apply_status,
             device_ordinal_,
             stream);
     }
@@ -4372,6 +4784,32 @@ namespace llaminar2
             return false;
 
         prepared_num_experts_ = num_experts;
+        if (traceMoEPrefillGroupingWrapperEnabled())
+        {
+            uint64_t total_routes = 0;
+            int max_count = 0;
+            int nonzero_experts = 0;
+            for (int count : host_expert_counts_)
+            {
+                if (count > 0)
+                {
+                    total_routes += static_cast<uint64_t>(count);
+                    max_count = std::max(max_count, count);
+                    ++nonzero_experts;
+                }
+            }
+            LOG_INFO("[CUDAMoEKernel] prefill grouping wrapper trace"
+                     << " tag=prepareExpertGroups"
+                     << " device=" << device.to_string()
+                     << " seq_len=" << seq_len
+                     << " num_experts=" << num_experts
+                     << " top_k=" << top_k
+                     << " total_routes=" << total_routes
+                     << " nonzero_experts=" << nonzero_experts
+                     << " max_count=" << max_count
+                     << " counts_hash=" << hashMoETraceVector(host_expert_counts_)
+                     << " offsets_hash=" << hashMoETraceVector(host_expert_offsets_));
+        }
         return true;
     }
 
@@ -5051,6 +5489,7 @@ namespace llaminar2
                 d_group_counts_,
                 d_group_token_indices_,
                 d_group_original_to_grouped_,
+                d_group_original_expert_ids_,
                 d_group_weights_,
                 d_group_active_expert_ids_,
                 seq_len,
@@ -5111,11 +5550,33 @@ namespace llaminar2
         const bool use_gateup_kpart =
             active_expert_slots > 0 &&
             max_tokens_per_expert <= 4 &&
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-            ensureGroupedGateUpKPartScratchCapacity(
+            debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        if (use_gateup_kpart &&
+            !ensureGroupedGateUpKPartScratchCapacity(
                 total_slots,
                 debugEnv().gemm.cuda_moe_gateup_kparts,
-                intermediate);
+                intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "verifier grouped gate/up split-K scratch allocation failed");
+            return false;
+        }
+        const bool use_down_ordered_kpart =
+            active_expert_slots > 0 &&
+            max_tokens_per_expert <= 4 &&
+            d_group_original_to_grouped_ != nullptr &&
+            d_group_original_expert_ids_ != nullptr &&
+            debugEnv().gemm.cuda_moe_down_kpart_decode;
+        if (use_down_ordered_kpart &&
+            !ensureGroupedDownKPartScratchCapacity(
+                debugEnv().gemm.cuda_moe_down_kparts,
+                d_model,
+                seq_len))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "verifier grouped down split-K scratch allocation failed");
+            return false;
+        }
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureOutputOnDevice(output, device, stream, "output"))
@@ -5130,11 +5591,16 @@ namespace llaminar2
         /*
          * Ordered scatter overwrites every output element, including the shared
          * expert identity-map case.  Only the atomic scatter fallback needs a
-         * zeroed destination before accumulation.
+         * zeroed destination before accumulation.  CUDA currently uses ordered
+         * scatter for this graph-native prefill path whenever the grouping map
+         * is present, so the explicit alias keeps the pre-zero contract aligned
+         * with ROCm and protects future atomic variants from silently skipping
+         * the clear.
          */
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
-        if (!ordered_scatter_overwrites_output)
+        const bool scatter_overwrites_output = ordered_scatter_overwrites_output;
+        if (!scatter_overwrites_output)
         {
             cudaError_t err = cudaMemsetAsync(d_output, 0,
                                               static_cast<size_t>(seq_len) * d_model * sizeof(float),
@@ -5156,6 +5622,7 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
+            use_down_ordered_kpart ? d_group_original_expert_ids_ : nullptr,
             d_active_expert_ids,
             d_group_weights_,
             d_prefill_A_int8_,
@@ -5166,6 +5633,7 @@ namespace llaminar2
             use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
+            use_down_ordered_kpart ? d_grouped_down_partials_ : nullptr,
             d_prefill_gate_,
             d_output,
             num_experts,
@@ -5175,11 +5643,13 @@ namespace llaminar2
             total_slots,
             top_k,
             active_expert_slots,
+            0,
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
             use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
+            use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
             device_ordinal_,
             stream);
         if (!ok)
@@ -5265,7 +5735,30 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
-        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
+        const bool use_down_ordered_kpart =
+            debugEnv().gemm.cuda_moe_down_kpart_decode &&
+            max_tokens_per_expert <= 4 &&
+            num_experts > 1 &&
+            top_k > 1;
+        if (use_down_ordered_kpart &&
+            !runtime_host_layer.route_expert_ids)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+                      "verifier grouped down split-K requires runtime route expert ids");
+            return false;
+        }
+        if (use_down_ordered_kpart &&
+            !ensureGroupedDownKPartScratchCapacity(
+                debugEnv().gemm.cuda_moe_down_kparts,
+                d_model,
+                seq_len))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+                      "verifier grouped down split-K scratch allocation failed");
+            return false;
+        }
+        if (!ensureGroupingBufferCapacity(total_slots, num_experts) ||
+            !ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             !ensureRuntimePrefillDescriptorCapacity(num_experts) ||
             !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureOutputOnDevice(output, device, stream, "output"))
@@ -5291,16 +5784,39 @@ namespace llaminar2
         if (!d_hidden || !d_output)
             return false;
 
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        cudaError_t err = cudaMemsetAsync(
-            d_output,
-            0,
-            static_cast<size_t>(seq_len) * d_model * sizeof(float),
-            cuda_stream);
-        if (err != cudaSuccess)
+        const int active_expert_slots = std::min(total_slots, num_experts);
+        if (!cudaMoE_build_active_expert_list_runtime(
+                device_runtime_layer,
+                d_group_active_expert_ids_,
+                num_experts,
+                active_expert_slots,
+                device_ordinal_,
+                stream))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] output memset failed: "
-                      << cudaGetErrorString(err));
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build active expert list");
+            return false;
+        }
+        group_active_expert_slots_ = active_expert_slots;
+
+        /*
+         * Runtime grouped prefill stores route slots in grouped_token_ids because
+         * LLEP first balances individual top-k router choices and then regroups
+         * only choices local to this participant.  Rebuilding the ordered scatter
+         * map from the runtime scratch gives LLEP the same deterministic top-k
+         * accumulation order as ordinary grouped prefill and avoids prefix-cache
+         * drift from atomicAdd ordering.
+         */
+        if (!cudaMoE_build_runtime_original_to_grouped(
+                device_runtime_layer,
+                d_group_original_to_grouped_,
+                total_slots,
+                total_slots,
+                num_experts,
+                top_k,
+                device_ordinal_,
+                stream))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build runtime ordered-scatter map");
             return false;
         }
 
@@ -5312,8 +5828,9 @@ namespace llaminar2
             runtime_host_layer.expert_counts,
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
-            nullptr,
-            nullptr,
+            d_group_original_to_grouped_,
+            use_down_ordered_kpart ? runtime_host_layer.route_expert_ids : nullptr,
+            d_group_active_expert_ids_,
             runtime_host_layer.grouped_route_weights,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
@@ -5323,6 +5840,7 @@ namespace llaminar2
             nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
+            use_down_ordered_kpart ? d_grouped_down_partials_ : nullptr,
             d_prefill_gate_,
             d_output,
             num_experts,
@@ -5331,12 +5849,14 @@ namespace llaminar2
             max_tokens_per_expert,
             total_slots,
             top_k,
-            0,
+            active_expert_slots,
+            1,
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
             0,
+            use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
             device_ordinal_,
             stream);
         if (!ok)
@@ -5350,11 +5870,11 @@ namespace llaminar2
             seq_len,
             top_k,
             num_experts,
-            0,
+            active_expert_slots,
             selectGroupedPrefillTileM(debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert),
-            128,
+            (active_expert_slots > 0 && max_tokens_per_expert <= 4) ? 64 : 128,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
-            false);
+            true);
         return true;
     }
 
@@ -5663,7 +6183,8 @@ namespace llaminar2
         ITensor *const *gate_outputs,
         ITensor *const *up_outputs,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const uint8_t *expert_mask)
     {
         if (!input || !routing_indices || table_id < 0 || top_k <= 0 ||
             !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
@@ -5735,12 +6256,36 @@ namespace llaminar2
             return false;
         }
 
-        if (!cudaMoE_float_to_int(
-                d_routing_indices,
-                d_routing_decode_expert_ids_,
-                top_k,
-                device_ordinal_,
-                stream))
+        /*
+         * Dynamic/LLEP verifier rows still consume the device-owned routing
+         * tensor, but each LocalTP participant must contribute only the experts
+         * it owns.  The masked conversion preserves the original routing tensor
+         * for histograms/runtime publication and marks nonlocal top-k slots as
+         * inactive in backend-owned scratch.  The grouped kernels already treat
+         * expert id -1 as a no-op slot.
+         */
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(expert_mask, table.num_experts))
+                return false;
+            if (!cudaMoE_float_to_masked_int(
+                    d_routing_indices,
+                    d_routing_decode_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!cudaMoE_float_to_int(
+                     d_routing_indices,
+                     d_routing_decode_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
         {
             return false;
         }
@@ -5843,7 +6388,8 @@ namespace llaminar2
         int top_k,
         ITensor *output,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const uint8_t *expert_mask)
     {
         if (!gate_tensors || !up_tensors || !routing_indices || !routing_weights ||
             table_id < 0 || top_k <= 0 || !output ||
@@ -5900,12 +6446,28 @@ namespace llaminar2
             return false;
         }
 
-        if (!cudaMoE_float_to_int(
-                d_routing_indices,
-                d_routing_decode_expert_ids_,
-                top_k,
-                device_ordinal_,
-                stream))
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(expert_mask, table.num_experts))
+                return false;
+            if (!cudaMoE_float_to_masked_int(
+                    d_routing_indices,
+                    d_routing_decode_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!cudaMoE_float_to_int(
+                     d_routing_indices,
+                     d_routing_decode_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
         {
             return false;
         }

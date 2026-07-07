@@ -1026,6 +1026,65 @@ TEST_F(MoEExpertPrefillGraphCapture, MutableDecodePreservesApportionedRuntimeOwn
 #endif
 }
 
+TEST_F(MoEExpertPrefillGraphCapture, StaticDescriptorMaskedDecodeAcceptsExplicitRuntimeOwners)
+{
+    auto expect_backend = [&](DeviceId device, bool backend_supported)
+    {
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(
+            0,
+            apportionedRuntimeUpdate(
+                1,
+                NUM_EXPERTS,
+                D_MODEL,
+                /*local_participant=*/0,
+                /*participant_count=*/2,
+                {0, 0, 1, 1},
+                {true, true, false, false})));
+        ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.seq_len = 1;
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+        params.my_socket_id = 0;
+        params.participant_count = 2;
+        params.expert_mask = {true, true, false, false};
+        params.runtime_decode_uses_mutable_descriptors = false;
+        params.runtime_decode_has_explicit_owner_metadata = true;
+
+        MoEExpertComputeStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+        stage.setRuntimeGroupedDecodeWarmedForTesting(true);
+
+        const auto &state = runtime_table.hostLayerState(0);
+        const auto &bank = state.banks[state.active_bank];
+        EXPECT_EQ(stage.runtimeDecodeDescriptorSourceForTesting(),
+                  MoEDecodeDescriptorSource::StaticDescriptorTable)
+            << "Explicit owner metadata must not force transfer-slot mutable descriptors.";
+        EXPECT_EQ(bank.experts[2].owner_participant, 1)
+            << "Masked static-descriptor decode must preserve remote owner metadata.";
+        EXPECT_EQ(bank.resident_participant_mask[2], 2u);
+        EXPECT_EQ(bank.local_compute_mask[2], 0u);
+        EXPECT_EQ(stage.isGraphCapturable(), backend_supported)
+            << "A masked LocalTP decode bank with explicit owners should be graph-capturable "
+               "without mutable transfer-slot descriptors.";
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true);
+#else
+    expect_backend(DeviceId::cuda(0), false);
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true);
+#else
+    expect_backend(DeviceId::rocm(0), false);
+#endif
+}
+
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndFusedDecode)
 {
 #if defined(HAVE_ROCM)
@@ -1584,6 +1643,39 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGr
     EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_GATEUP_UP_PTRS), nullptr);
     EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_DOWN_GATE_PTRS), nullptr);
     EXPECT_NE(reqs.find(MoEWorkspaceBuffers::CUDA_DECODE_DOWN_UP_PTRS), nullptr);
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, CudaMTPVerifierRowsCanBypassGroupedDecodeShortcut)
+{
+    ScopedMoEGraphCaptureFlags flags(true, true, false);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.intermediate = INTERMEDIATE;
+    params.input = input_.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output_.get();
+    /*
+     * MTP phase-split sidecars verify one row at a time from the replicated
+     * dense-decode weight set.  That row is allowed to publish into live state,
+     * so the graph builder must be able to request the canonical
+     * decode-equivalent verifier route even on CUDA builds where normal decode
+     * uses the grouped shared-expert pointer-table shortcut.
+     */
+    params.disable_grouped_decode_shortcut = true;
+
+    SharedExpertFFNStage stage(params);
+    EXPECT_FALSE(stage.usesGroupedDecodeForTesting())
+        << "MTP verifier rows must be able to bypass the normal CUDA grouped "
+           "shared-expert decode shortcut and run through the serial-decode oracle.";
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayRequiresGroupedPrefillEnabled)

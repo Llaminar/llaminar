@@ -981,12 +981,14 @@ namespace
         moe->setGPUStream(stream);
         auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
         EXPECT_NE(workspace_consumer, nullptr);
+        const int workspace_num_experts = std::max(num_experts, routed_num_experts);
+        const int workspace_top_k = std::max(top_k, routed_top_k);
         auto reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
             /*max_seq_len=*/4,
             d_model,
             intermediate,
-            num_experts,
-            top_k);
+            workspace_num_experts,
+            workspace_top_k);
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             device,
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
@@ -1213,6 +1215,12 @@ namespace
         EXPECT_TRUE(serial_stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
 
         auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
+        reqs.merge(llaminar2::MoEWorkspaceBuffers::cudaMoE(
+            rows,
+            d_model,
+            intermediate,
+            /*num_experts=*/256,
+            /*top_k=*/8));
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             device,
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);

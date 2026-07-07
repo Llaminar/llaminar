@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -24,11 +25,14 @@
 #include <hip/hip_runtime.h>
 
 #include "backends/DeviceId.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/IKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
+#include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #endif
 
@@ -37,12 +41,56 @@ namespace
 #ifdef HAVE_ROCM
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
 
+    /// @brief Throws when a HIP runtime call fails, preserving the failing operation name.
+    void checkHip(hipError_t status, const char *operation)
+    {
+        if (status != hipSuccess)
+        {
+            throw std::runtime_error(std::string(operation) + " failed: " + hipGetErrorString(status));
+        }
+    }
+
     /// @brief Returns true when at least one ROCm device is visible to HIP.
     bool hasROCm()
     {
         int count = 0;
         return hipGetDeviceCount(&count) == hipSuccess && count > 0;
     }
+
+    /**
+     * @brief Owns one HIP stream for tests that exercise GPU-resident cache state.
+     *
+     * Hybrid prefix import/export requires an explicit stream so that production
+     * code never falls back to implicit default-stream ordering. The tests use
+     * this small RAII wrapper to make that contract visible and leak-free.
+     */
+    struct HipStream
+    {
+        hipStream_t stream = nullptr;
+
+        HipStream()
+        {
+            checkHip(hipStreamCreate(&stream), "hipStreamCreate");
+        }
+
+        ~HipStream()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+
+        HipStream(const HipStream &) = delete;
+        HipStream &operator=(const HipStream &) = delete;
+
+        /// @brief Returns the stream as the opaque pointer expected by kernel interfaces.
+        void *opaque() const { return stream; }
+
+        /// @brief Blocks until all work enqueued on the stream has completed.
+        void synchronize(const char *operation) const
+        {
+            checkHip(hipStreamSynchronize(stream), operation);
+        }
+    };
 
     /// @brief RAII wrapper for a device FP32 buffer used by direct ROCm kernel calls.
     struct HipFloatBuffer
@@ -90,18 +138,39 @@ namespace
         llaminar2::IHybridKVCache *hybrid = nullptr;
     };
 
-    /// @brief Builds a tiny Qwen3.5-style layer map with GDN/FA/GDN layers.
+    /// @brief Builds a compact but production-valid Qwen3.5-style GDN/FA/GDN layer map.
     llaminar2::HybridKVCacheConfig makeHybridConfig()
     {
         llaminar2::HybridKVCacheConfig hybrid;
         hybrid.layer_types = {"gdn", "full_attention", "gdn"};
         hybrid.gdn_conv_kernel_size = 3;
-        hybrid.gdn_state_size = 2;
-        hybrid.gdn_inner_size = 2;
+        hybrid.gdn_state_size = 128;
+        hybrid.gdn_inner_size = 128;
         hybrid.gdn_group_count = 1;
         hybrid.gdn_time_step_rank = 1;
         hybrid.n_heads = 1;
         hybrid.local_n_heads = 0;
+        return hybrid;
+    }
+
+    /**
+     * @brief Builds a TP-sharded one-layer GDN map with distinct local/full state sizes.
+     *
+     * The production partial-prefix path restores two GDN banks: a local bank for
+     * suffix prefill and a full bank for decode. This config makes those banks
+     * different sizes so a regression cannot accidentally pass by aliasing them.
+     */
+    llaminar2::HybridKVCacheConfig makeShardedHybridConfig()
+    {
+        llaminar2::HybridKVCacheConfig hybrid;
+        hybrid.layer_types = {"gdn"};
+        hybrid.gdn_conv_kernel_size = 3;
+        hybrid.gdn_state_size = 2;
+        hybrid.gdn_inner_size = 8;
+        hybrid.gdn_group_count = 2;
+        hybrid.gdn_time_step_rank = 4;
+        hybrid.n_heads = 4;
+        hybrid.local_n_heads = 2;
         return hybrid;
     }
 
@@ -114,8 +183,8 @@ namespace
             "full_attention", "full_attention", "full_attention", "full_attention",
             "gdn"};
         hybrid.gdn_conv_kernel_size = 3;
-        hybrid.gdn_state_size = 2;
-        hybrid.gdn_inner_size = 2;
+        hybrid.gdn_state_size = 128;
+        hybrid.gdn_inner_size = 128;
         hybrid.gdn_group_count = 1;
         hybrid.gdn_time_step_rank = 1;
         hybrid.n_heads = 1;
@@ -144,6 +213,139 @@ namespace
         return handle;
     }
 
+    /**
+     * @brief Creates a ROCm hybrid cache with explicit KV storage precision and shape.
+     *
+     * Prefix-cache payload tests need to exercise the same FP16 KV storage and
+     * compressed full-attention map used by production Qwen3.6 partial-prefix
+     * restore.  The smaller reset tests keep using createHybridCache(), while
+     * this helper lets a regression choose a later global FA layer and a wider
+     * row shape without changing those existing fixtures.
+     */
+    HybridCacheHandle createHybridCacheWithShape(
+        const llaminar2::HybridKVCacheConfig &hybrid_config,
+        llaminar2::ActivationPrecision precision,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim)
+    {
+        llaminar::v2::kernels::KVCacheConfig config;
+        config.precision = precision;
+        config.device = llaminar2::DeviceId::rocm(0);
+        config.num_layers = static_cast<int>(hybrid_config.layer_types.size());
+        config.batch_size = 1;
+        config.max_seq_len = max_seq_len;
+        config.n_kv_heads = n_kv_heads;
+        config.head_dim = head_dim;
+        config.hybrid_config = &hybrid_config;
+
+        HybridCacheHandle handle;
+        handle.owner = KernelFactory::createKVCache(config);
+        handle.hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(handle.owner.get());
+        if (!handle.hybrid)
+            throw std::runtime_error("KernelFactory did not create an IHybridKVCache");
+        return handle;
+    }
+
+    /**
+     * @brief Builds a production-shaped hybrid layer map with late FA layers.
+     *
+     * Qwen3.6 MoE stores only full-attention layers in the KV cache.  Layer 31
+     * is late enough in that compressed slab to catch bugs that earlier
+     * first-FA-layer smoke tests miss.
+     */
+    llaminar2::HybridKVCacheConfig makeLateFullAttentionHybridConfig()
+    {
+        llaminar2::HybridKVCacheConfig hybrid;
+        hybrid.layer_types.assign(40, "gdn");
+        const int fa_layers[] = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39};
+        for (int layer : fa_layers)
+            hybrid.layer_types[static_cast<size_t>(layer)] = "full_attention";
+        hybrid.gdn_conv_kernel_size = 3;
+        hybrid.gdn_state_size = 128;
+        hybrid.gdn_inner_size = 128;
+        hybrid.gdn_group_count = 1;
+        hybrid.gdn_time_step_rank = 1;
+        hybrid.n_heads = 4;
+        hybrid.local_n_heads = 0;
+        return hybrid;
+    }
+
+    /// @brief Fills a byte buffer with a deterministic non-zero pattern.
+    std::vector<uint8_t> bytePattern(size_t bytes, uint32_t seed)
+    {
+        std::vector<uint8_t> out(bytes);
+        uint32_t state = seed == 0 ? 0x9e3779b9u : seed;
+        for (uint8_t &value : out)
+        {
+            state = state * 1664525u + 1013904223u;
+            value = static_cast<uint8_t>((state >> 24) ^ (state >> 11));
+        }
+        return out;
+    }
+
+    /// @brief Exports a logical KV block into byte vectors for exact comparison.
+    std::pair<std::vector<uint8_t>, std::vector<uint8_t>> exportLogicalBytes(
+        llaminar2::IKVCache *cache,
+        int layer,
+        int token_count,
+        const HipStream &stream)
+    {
+        const auto layout = cache->logicalBlockLayout(layer, token_count);
+        std::vector<uint8_t> k(layout.k_bytes);
+        std::vector<uint8_t> v(layout.v_bytes);
+        llaminar2::IKVCache::KVCacheLogicalBlockDescriptor desc;
+        desc.layer = layer;
+        desc.seq_idx = 0;
+        desc.logical_token_start = 0;
+        desc.token_count = token_count;
+        desc.stream = stream.opaque();
+        if (!cache->exportLogicalBlock(desc, k.data(), v.data()))
+            throw std::runtime_error("failed to export logical KV block");
+        return {std::move(k), std::move(v)};
+    }
+
+    /**
+     * @brief Creates a host/device FP16 tensor with finite deterministic bit patterns.
+     *
+     * Captured-append tests compare raw cache bytes rather than decoded
+     * floating-point values.  Keeping the payload finite makes the fixture
+     * reusable for later tests that may run numeric kernels before append.
+     */
+    std::unique_ptr<llaminar2::FP16Tensor> createDeviceFP16PatternTensor(
+        int rows,
+        int cols,
+        uint32_t seed,
+        const HipStream &stream)
+    {
+        auto tensor = std::make_unique<llaminar2::FP16Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+        auto *data = static_cast<uint16_t *>(tensor->raw_mutable_data());
+        if (!data)
+            throw std::runtime_error("FP16 tensor host storage is unavailable");
+
+        uint32_t state = seed == 0 ? 0x6d2b79f5u : seed;
+        const size_t count = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        for (size_t i = 0; i < count; ++i)
+        {
+            state = state * 1664525u + 1013904223u;
+            data[i] = static_cast<uint16_t>(0x3000u | ((state >> 16) & 0x0fffu));
+        }
+        tensor->mark_host_dirty();
+        if (!tensor->ensureOnDevice(llaminar2::DeviceId::rocm(0), stream.opaque()))
+            throw std::runtime_error("failed to upload FP16 test tensor");
+        return tensor;
+    }
+
+    /// @brief Returns a byte-exact copy of the tensor's host-owned payload.
+    std::vector<uint8_t> tensorHostBytes(const llaminar2::ITensor &tensor)
+    {
+        const auto *bytes = static_cast<const uint8_t *>(tensor.raw_data());
+        if (!bytes)
+            throw std::runtime_error("tensor host bytes are unavailable");
+        return std::vector<uint8_t>(bytes, bytes + tensor.size_bytes());
+    }
+
     /// @brief Creates the default tiny ROCm hybrid cache used by reset tests.
     HybridCacheHandle createHybridCache()
     {
@@ -159,8 +361,62 @@ namespace
         ASSERT_EQ(actual.size(), expected.size()) << label;
         for (size_t i = 0; i < actual.size(); ++i)
         {
+            ASSERT_TRUE(std::isfinite(actual[i])) << label << " actual value is not finite at index " << i;
+            ASSERT_TRUE(std::isfinite(expected[i])) << label << " expected value is not finite at index " << i;
             ASSERT_NEAR(actual[i], expected[i], tol) << label << " at index " << i;
         }
+    }
+
+    /// @brief Generates deterministic FP32 state snapshots with clearly separated ranges.
+    std::vector<float> statePattern(size_t count, float base)
+    {
+        std::vector<float> values(count);
+        for (size_t i = 0; i < count; ++i)
+            values[i] = base + static_cast<float>(i) * 0.125f;
+        return values;
+    }
+
+    /// @brief Host snapshot of the local live GDN bank exported through GPU kernels.
+    struct GDNStateSnapshot
+    {
+        std::vector<float> recurrence;
+        std::vector<float> conv;
+    };
+
+    /**
+     * @brief Exports the local live GDN bank for a layer into host vectors.
+     *
+     * The host-staged prefix payload stores live GPU state in host memory. This
+     * helper gives tests a precise expected value for that boundary without
+     * confusing it with the cache's mutable host mirror vectors.
+     */
+    GDNStateSnapshot exportLocalGDNState(llaminar2::IHybridKVCache *cache, int layer, const HipStream &stream)
+    {
+        auto *state = cache->getGDNState(layer);
+        if (!state || !state->rec_kernel || !state->conv_kernel)
+            throw std::runtime_error("invalid GDN state while exporting local ROCm test snapshot");
+
+        GDNStateSnapshot snapshot;
+        snapshot.recurrence.resize(state->recurrence_state.size());
+        snapshot.conv.resize(state->conv_state.size());
+        if (!state->rec_kernel->exportStateForSize(
+                static_cast<int>(snapshot.recurrence.size()),
+                snapshot.recurrence.data(),
+                nullptr,
+                stream.opaque()))
+        {
+            throw std::runtime_error("failed to export local ROCm recurrence state snapshot");
+        }
+        if (!state->conv_kernel->exportStateForSize(
+                static_cast<int>(snapshot.conv.size()),
+                snapshot.conv.data(),
+                nullptr,
+                stream.opaque()))
+        {
+            throw std::runtime_error("failed to export local ROCm conv state snapshot");
+        }
+        stream.synchronize("hipStreamSynchronize after local GDN state snapshot export");
+        return snapshot;
     }
 
     /// @brief Generates small deterministic FP32 inputs that keep recurrence math finite.
@@ -200,13 +456,14 @@ namespace
         HipFloatBuffer d_weight(weight);
         HipFloatBuffer d_output(static_cast<size_t>(channels));
 
-        state->conv_kernel->setGPUStream(nullptr);
+        HipStream stream;
+        state->conv_kernel->setGPUStream(stream.opaque());
         EXPECT_TRUE(state->conv_kernel->forward(
             d_input.ptr, d_weight.ptr, nullptr,
             d_output.ptr, state->conv_state.data(),
             /*seq_len=*/1, channels, kernel_size,
             /*apply_silu=*/false));
-        EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+        stream.synchronize("hipStreamSynchronize after short-conv");
         return d_output.toHost();
     }
 
@@ -231,7 +488,8 @@ namespace
         HipFloatBuffer d_input_output(input);
         HipFloatBuffer d_weight(weight);
 
-        state->conv_kernel->setGPUStream(nullptr);
+        HipStream stream;
+        state->conv_kernel->setGPUStream(stream.opaque());
         if (!state->conv_kernel->allocateGPUScratch(channels))
             throw std::runtime_error("failed to allocate in-place short-conv scratch");
         if (!state->conv_kernel->forward(
@@ -240,12 +498,12 @@ namespace
                 /*seq_len=*/1, channels, kernel_size,
                 /*apply_silu=*/false))
             throw std::runtime_error("in-place short-conv decode failed");
-        if (hipDeviceSynchronize() != hipSuccess)
-            throw std::runtime_error("in-place short-conv decode did not synchronize successfully");
+        stream.synchronize("hipStreamSynchronize after in-place short-conv");
 
         std::vector<float> exported_state(state->conv_state.size());
-        if (!state->conv_kernel->exportState(exported_state.data(), nullptr, nullptr))
+        if (!state->conv_kernel->exportState(exported_state.data(), nullptr, stream.opaque()))
             throw std::runtime_error("failed to export in-place short-conv GPU state");
+        stream.synchronize("hipStreamSynchronize after in-place short-conv state export");
         return {d_input_output.toHost(), exported_state};
     }
 
@@ -265,15 +523,16 @@ namespace
         auto q = pattern(qk_count, seed + 0.10f);
         auto k = pattern(qk_count, seed + 0.20f);
         auto v = pattern(v_count, seed + 0.30f);
-        std::vector<float> alpha(static_cast<size_t>(n_heads), 0.0f);
-        std::vector<float> beta(static_cast<size_t>(n_heads), 0.0f);   // sigmoid(beta) = 0.5
-        std::vector<float> a_log(static_cast<size_t>(n_heads), -2.0f); // mild decay
-        std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.0f);
+        std::vector<float> alpha(static_cast<size_t>(n_heads), 0.1f);
+        std::vector<float> beta(static_cast<size_t>(n_heads), -1.0f);
+        std::vector<float> a_log(static_cast<size_t>(n_heads), -0.25f);
+        std::vector<float> dt_bias(static_cast<size_t>(n_heads), -0.5f);
 
         HipFloatBuffer d_q(q), d_k_buf(k), d_v_buf(v), d_alpha(alpha), d_beta(beta), d_a_log(a_log), d_dt_bias(dt_bias);
         HipFloatBuffer d_output(v_count);
 
-        state->rec_kernel->setGPUStream(nullptr);
+        HipStream stream;
+        state->rec_kernel->setGPUStream(stream.opaque());
         EXPECT_TRUE(state->rec_kernel->recurrent_step(
             d_q.ptr, d_k_buf.ptr, d_v_buf.ptr,
             d_alpha.ptr, d_beta.ptr,
@@ -281,7 +540,7 @@ namespace
             d_output.ptr, state->recurrence_state.data(),
             n_heads, d_k, d_v,
             /*use_qk_l2norm=*/true));
-        EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+        stream.synchronize("hipStreamSynchronize after GDN recurrence");
         return d_output.toHost();
     }
 
@@ -501,13 +760,15 @@ TEST(Test__ROCmHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUS
     ASSERT_GT(metadata.device_bytes, 0u);
     EXPECT_TRUE(metadata.has_device_kernel_state);
 
+    HipStream stream;
     std::vector<uint8_t> payload(metadata.host_bytes + metadata.device_bytes);
-    auto *host_payload = payload.data();
-    auto *device_payload = payload.data() + metadata.host_bytes;
     llaminar2::HybridPrefixStateDescriptor desc;
     desc.seq_idx = 0;
     desc.logical_token_count = 4;
-    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(desc, host_payload, device_payload));
+    desc.stream = stream.opaque();
+    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
+    const auto expected_state0 = exportLocalGDNState(cache.hybrid, /*layer=*/0, stream);
+    const auto expected_state2 = exportLocalGDNState(cache.hybrid, /*layer=*/2, stream);
 
     const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
@@ -520,13 +781,17 @@ TEST(Test__ROCmHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUS
     EXPECT_FLOAT_EQ(state2->recurrence_state[0], 0.0f);
     EXPECT_FLOAT_EQ(state2->conv_state[0], 0.0f);
 
-    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, host_payload, device_payload));
+    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, payload.data(), nullptr));
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->rec_kernel.get(), rec_ptr);
-    EXPECT_FLOAT_EQ(state0->recurrence_state[0], 10.0f);
-    EXPECT_FLOAT_EQ(state0->conv_state[0], 11.0f);
-    EXPECT_FLOAT_EQ(state2->recurrence_state[0], 20.0f);
-    EXPECT_FLOAT_EQ(state2->conv_state[0], 21.0f);
+    expectNearVector(state0->recurrence_state, expected_state0.recurrence, 0.0f,
+                     "host mirror adopts local live recurrence bank for layer 0");
+    expectNearVector(state0->conv_state, expected_state0.conv, 0.0f,
+                     "host mirror adopts local live conv bank for layer 0");
+    expectNearVector(state2->recurrence_state, expected_state2.recurrence, 0.0f,
+                     "host mirror adopts local live recurrence bank for layer 2");
+    expectNearVector(state2->conv_state, expected_state2.conv, 0.0f,
+                     "host mirror adopts local live conv bank for layer 2");
 
     const auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
     const auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
@@ -559,9 +824,11 @@ TEST(Test__ROCmHybridKVCacheReset, HostStagedHybridPrefixStateKeepsHostAndDevice
     ASSERT_GT(metadata.host_bytes, 0u);
     ASSERT_GT(metadata.device_bytes, 0u);
 
+    HipStream stream;
     llaminar2::HybridPrefixStateDescriptor host_only_desc;
     host_only_desc.seq_idx = 0;
     host_only_desc.logical_token_count = 4;
+    host_only_desc.stream = stream.opaque();
     host_only_desc.include_host_state = true;
     host_only_desc.include_device_state = false;
     std::vector<uint8_t> expected_host(metadata.host_bytes);
@@ -573,11 +840,14 @@ TEST(Test__ROCmHybridKVCacheReset, HostStagedHybridPrefixStateKeepsHostAndDevice
     llaminar2::HybridPrefixStateDescriptor desc;
     desc.seq_idx = 0;
     desc.logical_token_count = 4;
+    desc.stream = stream.opaque();
     std::vector<uint8_t> staged_payload(metadata.host_bytes + metadata.device_bytes, 0xCD);
     ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
         desc,
         staged_payload.data(),
         nullptr));
+    const auto expected_state0 = exportLocalGDNState(cache.hybrid, /*layer=*/0, stream);
+    const auto expected_state2 = exportLocalGDNState(cache.hybrid, /*layer=*/2, stream);
 
     const std::vector<uint8_t> actual_host(
         staged_payload.begin(),
@@ -590,10 +860,14 @@ TEST(Test__ROCmHybridKVCacheReset, HostStagedHybridPrefixStateKeepsHostAndDevice
         staged_payload.data(),
         nullptr));
 
-    EXPECT_FLOAT_EQ(state0->recurrence_state[0], 41.0f);
-    EXPECT_FLOAT_EQ(state0->conv_state[0], 42.0f);
-    EXPECT_FLOAT_EQ(state2->recurrence_state[0], 43.0f);
-    EXPECT_FLOAT_EQ(state2->conv_state[0], 44.0f);
+    expectNearVector(state0->recurrence_state, expected_state0.recurrence, 0.0f,
+                     "host-staged import adopts local live recurrence bank for layer 0");
+    expectNearVector(state0->conv_state, expected_state0.conv, 0.0f,
+                     "host-staged import adopts local live conv bank for layer 0");
+    expectNearVector(state2->recurrence_state, expected_state2.recurrence, 0.0f,
+                     "host-staged import adopts local live recurrence bank for layer 2");
+    expectNearVector(state2->conv_state, expected_state2.conv, 0.0f,
+                     "host-staged import adopts local live conv bank for layer 2");
 
     std::vector<uint8_t> roundtrip_payload(metadata.host_bytes + metadata.device_bytes, 0);
     ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
@@ -658,6 +932,240 @@ TEST(Test__ROCmHybridKVCacheReset, AsyncDeviceOnlyHybridPrefixStateRoundTripRest
     expectNearVector(actual_rec, expected_rec, 1e-4f, "async recurrence output after hybrid prefix import");
 }
 
+TEST(Test__ROCmHybridKVCacheReset, HostStagedDeviceOnlyHybridPrefixStateRoundTripStartsAtOffsetZero)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto cache = createHybridCache();
+    auto *state0 = cache.hybrid->getGDNState(0);
+    ASSERT_NE(state0, nullptr);
+    ASSERT_NE(state0->conv_kernel, nullptr);
+    ASSERT_NE(state0->rec_kernel, nullptr);
+
+    state0->recurrence_state[0] = 52.0f;
+    state0->conv_state[0] = 53.0f;
+    mutateGDNState(cache.hybrid, /*layer=*/0);
+
+    const auto metadata = cache.hybrid->hybridPrefixStateMetadata();
+    ASSERT_GT(metadata.host_bytes, 0u);
+    ASSERT_GT(metadata.device_bytes, 0u);
+
+    llaminar2::HybridPrefixStateDescriptor desc;
+    desc.seq_idx = 0;
+    desc.logical_token_count = 4;
+    HipStream stream;
+    desc.stream = stream.opaque();
+    desc.include_host_state = false;
+    desc.include_device_state = true;
+
+    std::vector<uint8_t> payload(metadata.device_bytes + metadata.host_bytes, 0xCD);
+    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
+        desc,
+        payload.data(),
+        nullptr));
+    EXPECT_FALSE(std::all_of(
+        payload.begin(),
+        payload.begin() + static_cast<std::ptrdiff_t>(metadata.device_bytes),
+        [](uint8_t value) { return value == 0xCD; }));
+    EXPECT_TRUE(std::all_of(
+        payload.begin() + static_cast<std::ptrdiff_t>(metadata.device_bytes),
+        payload.end(),
+        [](uint8_t value) { return value == 0xCD; }));
+
+    const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+
+    cache.owner->clear();
+    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
+        desc,
+        payload.data(),
+        nullptr));
+
+    const auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+    expectNearVector(actual_conv, expected_conv, 1e-5f, "host-staged device-only conv import");
+    expectNearVector(actual_rec, expected_rec, 1e-4f, "host-staged device-only recurrence import");
+}
+
+TEST(Test__ROCmHybridKVCacheReset, HostStagedSuffixPrefillImportKeepsLocalAndFullGDNBanksDistinct)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto source = createHybridCache(makeShardedHybridConfig());
+    auto *source_state = source.hybrid->getGDNState(0);
+    ASSERT_NE(source_state, nullptr);
+    ASSERT_NE(source_state->conv_kernel, nullptr);
+    ASSERT_NE(source_state->rec_kernel, nullptr);
+
+    const int local_rec_floats = static_cast<int>(source_state->recurrence_state.size());
+    const int local_conv_floats = static_cast<int>(source_state->conv_state.size());
+    constexpr int full_rec_floats = 16;
+    constexpr int full_conv_floats = 32;
+    ASSERT_GT(local_rec_floats, 0);
+    ASSERT_GT(local_conv_floats, 0);
+    ASSERT_GT(full_rec_floats, local_rec_floats);
+    ASSERT_GT(full_conv_floats, local_conv_floats);
+
+    const auto expected_local_rec = statePattern(static_cast<size_t>(local_rec_floats), 100.0f);
+    const auto expected_local_conv = statePattern(static_cast<size_t>(local_conv_floats), 200.0f);
+    const auto expected_full_rec = statePattern(static_cast<size_t>(full_rec_floats), 300.0f);
+    const auto expected_full_conv = statePattern(static_cast<size_t>(full_conv_floats), 400.0f);
+
+    HipStream stream;
+    ASSERT_TRUE(source_state->rec_kernel->importStateForSize(
+        local_rec_floats, expected_local_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(source_state->conv_kernel->importStateForSize(
+        local_conv_floats, expected_local_conv.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(source_state->rec_kernel->importStateForSize(
+        full_rec_floats, expected_full_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(source_state->conv_kernel->importStateForSize(
+        full_conv_floats, expected_full_conv.data(), nullptr, stream.opaque()));
+    stream.synchronize("hipStreamSynchronize after source state seeding");
+
+    const auto metadata = source.hybrid->hybridPrefixStateMetadata();
+    EXPECT_EQ(metadata.host_bytes,
+              static_cast<size_t>(local_rec_floats + local_conv_floats) * sizeof(float));
+    EXPECT_EQ(metadata.device_bytes,
+              static_cast<size_t>(full_conv_floats + full_rec_floats) * sizeof(float));
+    ASSERT_GT(metadata.host_bytes, 0u);
+    ASSERT_GT(metadata.device_bytes, 0u);
+
+    llaminar2::HybridPrefixStateDescriptor export_desc;
+    export_desc.seq_idx = 0;
+    export_desc.logical_token_count = 4;
+    export_desc.stream = stream.opaque();
+    export_desc.include_host_state = true;
+    export_desc.include_device_state = true;
+
+    std::vector<uint8_t> staged_payload(metadata.host_bytes + metadata.device_bytes, 0xCD);
+    ASSERT_TRUE(source.hybrid->exportHybridPrefixState(
+        export_desc,
+        staged_payload.data(),
+        nullptr));
+
+    auto target = createHybridCache(makeShardedHybridConfig());
+    auto *target_state = target.hybrid->getGDNState(0);
+    ASSERT_NE(target_state, nullptr);
+    ASSERT_NE(target_state->conv_kernel, nullptr);
+    ASSERT_NE(target_state->rec_kernel, nullptr);
+
+    llaminar2::HybridPrefixStateDescriptor import_desc;
+    import_desc.seq_idx = 0;
+    import_desc.logical_token_count = 4;
+    import_desc.stream = stream.opaque();
+    import_desc.include_host_state = false;
+    import_desc.include_device_state = true;
+    import_desc.import_host_state_into_device_state = true;
+    ASSERT_TRUE(target.hybrid->importHybridPrefixState(
+        import_desc,
+        staged_payload.data(),
+        nullptr));
+
+    EXPECT_EQ(target_state->rec_kernel->stateBytes(),
+              static_cast<size_t>(local_rec_floats) * sizeof(float))
+        << "partial-hit suffix prefill must resume with the local recurrence bank active";
+    EXPECT_EQ(target_state->conv_kernel->stateBytes(),
+              static_cast<size_t>(local_conv_floats) * sizeof(float))
+        << "partial-hit suffix prefill must resume with the local conv bank active";
+    EXPECT_TRUE(target_state->rec_kernel->isGPUStateReady(local_rec_floats));
+    EXPECT_TRUE(target_state->rec_kernel->isGPUStateReady(full_rec_floats));
+    EXPECT_TRUE(std::all_of(target_state->recurrence_state.begin(),
+                            target_state->recurrence_state.end(),
+                            [](float value) { return value == 0.0f; }))
+        << "include_host_state=false must not mutate the host recurrence mirror";
+    EXPECT_TRUE(std::all_of(target_state->conv_state.begin(),
+                            target_state->conv_state.end(),
+                            [](float value) { return value == 0.0f; }))
+        << "include_host_state=false must not mutate the host conv mirror";
+
+    std::vector<float> actual_local_rec(static_cast<size_t>(local_rec_floats));
+    std::vector<float> actual_local_conv(static_cast<size_t>(local_conv_floats));
+    std::vector<float> actual_full_rec(static_cast<size_t>(full_rec_floats));
+    std::vector<float> actual_full_conv(static_cast<size_t>(full_conv_floats));
+    ASSERT_TRUE(target_state->rec_kernel->exportStateForSize(
+        local_rec_floats, actual_local_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(target_state->conv_kernel->exportStateForSize(
+        local_conv_floats, actual_local_conv.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(target_state->rec_kernel->exportStateForSize(
+        full_rec_floats, actual_full_rec.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(target_state->conv_kernel->exportStateForSize(
+        full_conv_floats, actual_full_conv.data(), nullptr, stream.opaque()));
+    stream.synchronize("hipStreamSynchronize after target state export");
+
+    expectNearVector(actual_local_rec, expected_local_rec, 0.0f, "local recurrence bank after suffix import");
+    expectNearVector(actual_local_conv, expected_local_conv, 0.0f, "local conv bank after suffix import");
+    expectNearVector(actual_full_rec, expected_full_rec, 0.0f, "full recurrence bank after suffix import");
+    expectNearVector(actual_full_conv, expected_full_conv, 0.0f, "full conv bank after suffix import");
+}
+
+TEST(Test__ROCmHybridKVCacheReset, LogicalPayloadCanHydrateDeviceBankWithoutMutatingHostMirror)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto source = createHybridCache();
+    auto *source_state0 = source.hybrid->getGDNState(0);
+    ASSERT_NE(source_state0, nullptr);
+    ASSERT_NE(source_state0->conv_kernel, nullptr);
+    ASSERT_NE(source_state0->rec_kernel, nullptr);
+    source_state0->recurrence_state[0] = 70.0f;
+    source_state0->conv_state[0] = 71.0f;
+    mutateGDNState(source.hybrid, /*layer=*/0);
+
+    const auto metadata = source.hybrid->hybridPrefixStateMetadata();
+    ASSERT_GT(metadata.host_bytes, 0u);
+    std::vector<uint8_t> logical_payload(metadata.host_bytes);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    llaminar2::HybridPrefixStateDescriptor export_desc;
+    export_desc.seq_idx = 0;
+    export_desc.logical_token_count = 4;
+    export_desc.stream = stream;
+    export_desc.include_host_state = true;
+    export_desc.include_device_state = false;
+    ASSERT_TRUE(source.hybrid->exportHybridPrefixState(
+        export_desc,
+        logical_payload.data(),
+        nullptr));
+
+    auto target = createHybridCache();
+    auto *target_state0 = target.hybrid->getGDNState(0);
+    ASSERT_NE(target_state0, nullptr);
+    ASSERT_FALSE(target_state0->recurrence_state.empty());
+    ASSERT_FALSE(target_state0->conv_state.empty());
+    target_state0->recurrence_state[0] = -123.0f;
+    target_state0->conv_state[0] = -456.0f;
+    const std::vector<float> host_recurrence_before = target_state0->recurrence_state;
+    const std::vector<float> host_conv_before = target_state0->conv_state;
+
+    llaminar2::HybridPrefixStateDescriptor import_desc;
+    import_desc.seq_idx = 0;
+    import_desc.logical_token_count = 4;
+    import_desc.stream = stream;
+    import_desc.include_host_state = false;
+    import_desc.include_device_state = false;
+    import_desc.import_host_state_into_device_state = true;
+    ASSERT_TRUE(target.hybrid->importHybridPrefixState(
+        import_desc,
+        logical_payload.data(),
+        nullptr));
+
+    EXPECT_EQ(target_state0->recurrence_state, host_recurrence_before);
+    EXPECT_EQ(target_state0->conv_state, host_conv_before);
+
+    std::vector<uint8_t> roundtrip_payload(metadata.host_bytes);
+    ASSERT_TRUE(target.hybrid->exportHybridPrefixState(
+        export_desc,
+        roundtrip_payload.data(),
+        nullptr));
+    EXPECT_EQ(roundtrip_payload, logical_payload);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
 TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)
 {
     if (!hasROCm())
@@ -703,6 +1211,332 @@ TEST(Test__ROCmHybridKVCacheReset, DeviceSequenceMetadataPointersUseCompressedFu
                             "hipMemcpy unrelated cached-token count"),
               0)
         << "The old un-remapped path would read this parent slot for global layer 3.";
+}
+
+TEST(Test__ROCmHybridKVCacheReset, GetKVUsesCompressedFullAttentionSlot)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto cache = createHybridCache(makeOffsetFullAttentionHybridConfig());
+    appendFullAttentionToken(cache.owner.get(), /*layer=*/3);
+
+    llaminar2::ITensor *k = nullptr;
+    llaminar2::ITensor *v = nullptr;
+    int kv_len = -1;
+    ASSERT_TRUE(cache.owner->get_kv(/*layer=*/3, /*seq_idx=*/0, &k, &v, &kv_len));
+    EXPECT_NE(k, nullptr);
+    EXPECT_NE(v, nullptr);
+    EXPECT_EQ(kv_len, 2)
+        << "get_kv(global FA layer) must remap through the hybrid layer map.";
+
+    const llaminar2::ITensor *ck = nullptr;
+    const llaminar2::ITensor *cv = nullptr;
+    int const_kv_len = -1;
+    const llaminar2::IKVCache *const_cache = cache.owner.get();
+    ASSERT_TRUE(const_cache->get_kv(/*layer=*/3, /*seq_idx=*/0, &ck, &cv, &const_kv_len));
+    EXPECT_NE(ck, nullptr);
+    EXPECT_NE(cv, nullptr);
+    EXPECT_EQ(const_kv_len, 2);
+}
+
+TEST(Test__ROCmHybridKVCacheReset, PrefixPayloadSlabRoundTripPreservesLateFullAttentionKRows)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    const auto hybrid_config = makeLateFullAttentionHybridConfig();
+    auto source = createHybridCacheWithShape(
+        hybrid_config,
+        llaminar2::ActivationPrecision::FP16,
+        /*max_seq_len=*/16,
+        /*n_kv_heads=*/4,
+        /*head_dim=*/8);
+    auto target = createHybridCacheWithShape(
+        hybrid_config,
+        llaminar2::ActivationPrecision::FP16,
+        /*max_seq_len=*/16,
+        /*n_kv_heads=*/4,
+        /*head_dim=*/8);
+
+    constexpr int kTokenCount = 6;
+    const std::vector<int> fa_layers = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39};
+    const auto first_layout = source.owner->logicalBlockLayout(fa_layers.front(), kTokenCount);
+    ASSERT_GT(first_layout.k_bytes, 0u);
+    ASSERT_EQ(first_layout.k_bytes, first_layout.v_bytes);
+
+    HipStream stream;
+    std::vector<uint8_t> prefix_k_slab(
+        static_cast<size_t>(fa_layers.size()) * first_layout.k_bytes);
+    std::vector<uint8_t> prefix_v_slab(
+        static_cast<size_t>(fa_layers.size()) * first_layout.v_bytes);
+
+    for (size_t i = 0; i < fa_layers.size(); ++i)
+    {
+        const int layer = fa_layers[i];
+        const auto layout = source.owner->logicalBlockLayout(layer, kTokenCount);
+        ASSERT_EQ(layout.k_bytes, first_layout.k_bytes);
+        ASSERT_EQ(layout.v_bytes, first_layout.v_bytes);
+
+        const auto expected_k = bytePattern(layout.k_bytes, 0x31000000u + static_cast<uint32_t>(layer));
+        const auto expected_v = bytePattern(layout.v_bytes, 0x71000000u + static_cast<uint32_t>(layer));
+
+        llaminar2::IKVCache::KVCacheLogicalBlockDescriptor desc;
+        desc.layer = layer;
+        desc.seq_idx = 0;
+        desc.logical_token_start = 0;
+        desc.token_count = kTokenCount;
+        desc.stream = stream.opaque();
+        ASSERT_TRUE(source.owner->importLogicalBlock(
+            desc,
+            expected_k.data(),
+            expected_v.data()))
+            << "source import failed for global layer " << layer;
+
+        auto [source_k, source_v] = exportLogicalBytes(
+            source.owner.get(),
+            layer,
+            kTokenCount,
+            stream);
+        ASSERT_EQ(source_k, expected_k)
+            << "source export changed K payload for global layer " << layer;
+        ASSERT_EQ(source_v, expected_v)
+            << "source export changed V payload for global layer " << layer;
+
+        std::memcpy(
+            prefix_k_slab.data() + i * first_layout.k_bytes,
+            source_k.data(),
+            source_k.size());
+        std::memcpy(
+            prefix_v_slab.data() + i * first_layout.v_bytes,
+            source_v.data(),
+            source_v.size());
+    }
+
+    target.owner->clear();
+    for (size_t i = 0; i < fa_layers.size(); ++i)
+    {
+        const int layer = fa_layers[i];
+        llaminar2::IKVCache::KVCacheLogicalBlockDescriptor desc;
+        desc.layer = layer;
+        desc.seq_idx = 0;
+        desc.logical_token_start = 0;
+        desc.token_count = kTokenCount;
+        desc.stream = stream.opaque();
+
+        ASSERT_TRUE(target.owner->importLogicalBlock(
+            desc,
+            prefix_k_slab.data() + i * first_layout.k_bytes,
+            prefix_v_slab.data() + i * first_layout.v_bytes))
+            << "target import failed for global layer " << layer;
+
+        auto [actual_k, actual_v] = exportLogicalBytes(
+            target.owner.get(),
+            layer,
+            kTokenCount,
+            stream);
+        const auto expected_k = bytePattern(first_layout.k_bytes, 0x31000000u + static_cast<uint32_t>(layer));
+        const auto expected_v = bytePattern(first_layout.v_bytes, 0x71000000u + static_cast<uint32_t>(layer));
+        EXPECT_EQ(actual_k, expected_k)
+            << "prefix slab roundtrip changed K payload for global layer " << layer;
+        EXPECT_EQ(actual_v, expected_v)
+            << "prefix slab roundtrip changed V payload for global layer " << layer;
+    }
+}
+
+TEST(Test__ROCmHybridKVCacheReset, CapturedPrefillAppendPreservesLateFullAttentionPrefixPayload)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    const auto hybrid_config = makeLateFullAttentionHybridConfig();
+    constexpr int kMaxSeqLen = 512;
+    constexpr int kTokenCount = 256;
+    constexpr int kKvHeads = 2;
+    constexpr int kHeadDim = 32;
+    const int kv_cols = kKvHeads * kHeadDim;
+    const std::vector<int> fa_layers = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39};
+
+    auto cache = createHybridCacheWithShape(
+        hybrid_config,
+        llaminar2::ActivationPrecision::FP16,
+        kMaxSeqLen,
+        kKvHeads,
+        kHeadDim);
+    HipStream stream;
+
+    struct CapturedLayerAppend
+    {
+        int layer = 0;
+        std::unique_ptr<llaminar2::FP16Tensor> k;
+        std::unique_ptr<llaminar2::FP16Tensor> v;
+        std::unique_ptr<llaminar2::KVCacheAppendStage> stage;
+        std::vector<uint8_t> expected_k;
+        std::vector<uint8_t> expected_v;
+    };
+
+    std::vector<CapturedLayerAppend> appends;
+    appends.reserve(fa_layers.size());
+    for (int layer : fa_layers)
+    {
+        CapturedLayerAppend append;
+        append.layer = layer;
+        append.k = createDeviceFP16PatternTensor(
+            kTokenCount,
+            kv_cols,
+            0x1000u + static_cast<uint32_t>(layer),
+            stream);
+        append.v = createDeviceFP16PatternTensor(
+            kTokenCount,
+            kv_cols,
+            0x8000u + static_cast<uint32_t>(layer),
+            stream);
+        append.expected_k = tensorHostBytes(*append.k);
+        append.expected_v = tensorHostBytes(*append.v);
+
+        llaminar2::KVCacheAppendStage::Params params;
+        params.device_id = llaminar2::DeviceId::rocm(0);
+        params.K = append.k.get();
+        params.V = append.v.get();
+        params.kv_cache = cache.owner.get();
+        params.layer_idx = layer;
+        params.seq_idx = 0;
+        params.num_tokens = kTokenCount;
+        params.batch_size = 1;
+        params.seq_len = kTokenCount;
+        append.stage = std::make_unique<llaminar2::KVCacheAppendStage>(params);
+        append.stage->setGPUStream(stream.opaque());
+        append.stage->updatePrefillReplayParams({kTokenCount, kTokenCount, 0});
+        append.stage->updateDynamicParams(/*pos_offset=*/0, kTokenCount);
+        appends.push_back(std::move(append));
+    }
+    stream.synchronize("hipStreamSynchronize after captured append metadata upload");
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t exec = nullptr;
+    checkHip(hipStreamBeginCapture(stream.stream, hipStreamCaptureModeGlobal),
+             "hipStreamBeginCapture captured prefill append");
+    {
+        llaminar2::GraphCaptureGuard guard(/*host_bookkeeping=*/true);
+        for (auto &append : appends)
+        {
+            ASSERT_TRUE(append.stage->execute(nullptr))
+                << "captured append failed for layer " << append.layer;
+        }
+    }
+    checkHip(hipStreamEndCapture(stream.stream, &graph),
+             "hipStreamEndCapture captured prefill append");
+    ASSERT_NE(graph, nullptr);
+    checkHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+             "hipGraphInstantiate captured prefill append");
+    checkHip(hipGraphLaunch(exec, stream.stream),
+             "hipGraphLaunch captured prefill append");
+    stream.synchronize("hipStreamSynchronize after captured prefill append launch");
+
+    for (const auto &append : appends)
+    {
+        EXPECT_EQ(cache.owner->get_cached_tokens(append.layer, 0), kTokenCount)
+            << "host KV count must advance exactly once for layer " << append.layer;
+    }
+
+    const auto expected31_it = std::find_if(
+        appends.begin(),
+        appends.end(),
+        [](const CapturedLayerAppend &append)
+        {
+            return append.layer == 31;
+        });
+    ASSERT_NE(expected31_it, appends.end());
+    const auto layer31 = exportLogicalBytes(
+        cache.owner.get(),
+        /*layer=*/31,
+        kTokenCount,
+        stream);
+    EXPECT_EQ(layer31.first, expected31_it->expected_k)
+        << "captured prefill append must preserve late FA K payload bytes";
+    EXPECT_EQ(layer31.second, expected31_it->expected_v)
+        << "captured prefill append must preserve late FA V payload bytes";
+
+    if (exec)
+        (void)hipGraphExecDestroy(exec);
+    if (graph)
+        (void)hipGraphDestroy(graph);
+}
+
+TEST(Test__ROCmHybridKVCacheReset, PartialHitHybridStateImportDoesNotOverwriteLateFullAttentionKV)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    const auto hybrid_config = makeLateFullAttentionHybridConfig();
+    constexpr int kTokenCount = 6;
+    auto source = createHybridCacheWithShape(
+        hybrid_config,
+        llaminar2::ActivationPrecision::FP16,
+        /*max_seq_len=*/16,
+        /*n_kv_heads=*/4,
+        /*head_dim=*/8);
+    auto target = createHybridCacheWithShape(
+        hybrid_config,
+        llaminar2::ActivationPrecision::FP16,
+        /*max_seq_len=*/16,
+        /*n_kv_heads=*/4,
+        /*head_dim=*/8);
+    HipStream stream;
+
+    const auto metadata = source.hybrid->hybridPrefixStateMetadata();
+    ASSERT_GT(metadata.host_bytes, 0u);
+    ASSERT_GT(metadata.device_bytes, 0u);
+    std::vector<uint8_t> hybrid_payload(metadata.host_bytes + metadata.device_bytes, 0xCD);
+
+    llaminar2::HybridPrefixStateDescriptor export_desc;
+    export_desc.seq_idx = 0;
+    export_desc.logical_token_count = kTokenCount;
+    export_desc.stream = stream.opaque();
+    export_desc.include_host_state = true;
+    export_desc.include_device_state = true;
+    ASSERT_TRUE(source.hybrid->exportHybridPrefixState(
+        export_desc,
+        hybrid_payload.data(),
+        nullptr));
+
+    const auto layout = target.owner->logicalBlockLayout(/*layer=*/31, kTokenCount);
+    ASSERT_GT(layout.k_bytes, 0u);
+    ASSERT_GT(layout.v_bytes, 0u);
+    const auto expected_k = bytePattern(layout.k_bytes, 0x3100001fu);
+    const auto expected_v = bytePattern(layout.v_bytes, 0x7100001fu);
+    llaminar2::IKVCache::KVCacheLogicalBlockDescriptor kv_desc;
+    kv_desc.layer = 31;
+    kv_desc.seq_idx = 0;
+    kv_desc.logical_token_start = 0;
+    kv_desc.token_count = kTokenCount;
+    kv_desc.stream = stream.opaque();
+    ASSERT_TRUE(target.owner->importLogicalBlock(
+        kv_desc,
+        expected_k.data(),
+        expected_v.data()));
+
+    llaminar2::HybridPrefixStateDescriptor import_desc;
+    import_desc.seq_idx = 0;
+    import_desc.logical_token_count = kTokenCount;
+    import_desc.stream = stream.opaque();
+    import_desc.include_host_state = false;
+    import_desc.include_device_state = true;
+    import_desc.import_host_state_into_device_state = true;
+    ASSERT_TRUE(target.hybrid->importHybridPrefixState(
+        import_desc,
+        hybrid_payload.data(),
+        nullptr));
+
+    const auto actual = exportLogicalBytes(
+        target.owner.get(),
+        /*layer=*/31,
+        kTokenCount,
+        stream);
+    EXPECT_EQ(actual.first, expected_k)
+        << "partial-hit hybrid restore must not modify late FA K payload";
+    EXPECT_EQ(actual.second, expected_v)
+        << "partial-hit hybrid restore must not modify late FA V payload";
 }
 
 #else

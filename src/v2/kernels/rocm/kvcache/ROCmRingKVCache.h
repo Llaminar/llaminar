@@ -498,6 +498,14 @@ namespace llaminar2
         bool get_kv(int layer, int seq_idx,
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  ITensor **out_k, ITensor **out_v,
+                                  int *out_kv_len = nullptr) override;
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  const ITensor **out_k, const ITensor **out_v,
+                                  int *out_kv_len = nullptr) const override;
 
         // get_kv_converted with FP16 shadow buffers + optional RoPE (IKVCache override)
         bool get_kv_converted(int layer, int seq_idx,
@@ -715,6 +723,7 @@ namespace llaminar2
         // Index 0 = K view, Index 1 = V view
         // Mutable because views are lazily created in const methods
         mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> tensor_views_;
+        mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> snapshot_tensor_views_;
 
         // Statistics
         mutable int total_evicted_ = 0;
@@ -772,8 +781,15 @@ namespace llaminar2
         // Kernel launchers
         void launch_append_kernel(EntryT &entry, const DataT *d_k, const DataT *d_v,
                                   int num_tokens, hipStream_t stream);
+        /**
+         * @brief Launch a graph-capturable append kernel with explicit dynamic row ownership.
+         *
+         * @param d_head Device scalar containing the ring head for this replay.
+         * @param d_append_count Device scalar containing the real rows inside a captured bucket.
+         */
         void launch_append_kernel_dynamic(EntryT &entry, const DataT *d_k, const DataT *d_v,
-                                          const int *d_head, int num_tokens, hipStream_t stream);
+                                          const int *d_head, const int *d_append_count,
+                                          int num_tokens, hipStream_t stream);
         void launch_linearize_kernel(const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
                                      hipStream_t stream);
         void launch_gather_kernel(const std::vector<EntryT *> &entries,

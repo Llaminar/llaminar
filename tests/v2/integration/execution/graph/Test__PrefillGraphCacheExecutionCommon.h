@@ -20,6 +20,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
@@ -32,10 +33,12 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -292,6 +295,29 @@ namespace
     };
 
     /**
+     * @brief RoPE probe that keeps production dynamic-position behavior.
+     *
+     * The synthetic prefill graph does not use BufferArena coherence. This
+     * subclass preserves the production RoPEStage metadata path while disabling
+     * arena-managed coherence and accepting CUDA/ROCm backends explicitly for
+     * the small graph-capture fixture.
+     */
+    class GPURoPEProbeStage final : public RoPEStage
+    {
+    public:
+        explicit GPURoPEProbeStage(RoPEStage::Params params)
+            : RoPEStage(std::move(params)) {}
+
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::GPU_CUDA ||
+                   backend == ComputeBackendType::GPU_ROCM;
+        }
+    };
+
+    /**
      * @brief Minimal ForwardExecutionEngine host that builds one GPU graph.
      */
     class PrefillGraphCacheTestHost final : public IForwardExecutionHost
@@ -312,6 +338,7 @@ namespace
             stage_ = nullptr;
             row_select_stage_ = nullptr;
             kv_append_stage_ = nullptr;
+            rope_stage_ = nullptr;
 
             if (input.device != device_ || input.seq_len <= 0)
                 return GraphBuildResult("invalid input for GPU prefill graph cache test");
@@ -450,6 +477,29 @@ namespace
                 output_tensor_ = residual_output_ptr;
             }
 
+            if (use_rope_probe_)
+            {
+                RoPEStage::Params rope_params;
+                rope_params.Q = residual_output_ptr;
+                rope_params.K = nullptr;
+                rope_params.n_heads = 1;
+                rope_params.n_kv_heads = 0;
+                rope_params.head_dim = kHiddenDim;
+                rope_params.pos_offset = input.position_offset;
+                rope_params.theta_base = 10000.0f;
+                rope_params.seq_len = input.seq_len;
+                rope_params.partial_rotary_factor = 1.0f;
+                rope_params.position_ids = input.position_ids;
+                rope_params.position_ids_device = input.position_ids_device;
+                rope_params.device_id = device_;
+
+                auto rope_stage = std::make_unique<GPURoPEProbeStage>(rope_params);
+                rope_stage_ = rope_stage.get();
+                graph.addNode("rope_position_probe", std::move(rope_stage), device_);
+                graph.addDependency("rope_position_probe", "gpu_residual_add_probe");
+                output_tensor_ = residual_output_ptr;
+            }
+
             ForwardOutput output;
             output.logits = output_tensor_;
             output.hidden = output_tensor_;
@@ -560,6 +610,9 @@ namespace
         /// @brief Enable the real GPU KV append replay-param consumer.
         void setUseKVAppendProbe(bool enabled) { use_kv_append_probe_ = enabled; }
 
+        /// @brief Enable the real GPU RoPE dynamic-position consumer.
+        void setUseRoPEProbe(bool enabled) { use_rope_probe_ = enabled; }
+
         /// @brief Make chunk maintenance emulate a placement-changing rebalance.
         void setPlacementChangingMaintenance(
             ForwardExecutionEngine *engine,
@@ -587,6 +640,9 @@ namespace
 
         /// @brief Return the optional KV append stage built for padded bucket tests.
         KVCacheAppendStage *kvAppendStage() const { return kv_append_stage_; }
+
+        /// @brief Return the optional RoPE stage built for dynamic-position tests.
+        RoPEStage *ropeStage() const { return rope_stage_; }
 
         /// @brief Return the logical cached-token count for the probe KV cache.
         int kvCachedTokensForTesting() const
@@ -657,6 +713,7 @@ namespace
         IDeviceContext *ctx_ = nullptr;
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
         bool use_kv_append_probe_ = false;  ///< Whether to append real GPU KVCacheAppendStage after residual add.
+        bool use_rope_probe_ = false;       ///< Whether to append real GPU RoPEStage after residual add.
         bool rebalance_requested_on_boundary_ = false;
         bool bump_epoch_on_maintenance_ = false;
         uint64_t topology_delta_on_maintenance_ = 0;
@@ -669,6 +726,7 @@ namespace
         GPUResidualAddProbeStage *stage_ = nullptr;
         HiddenStateRowSelectStage *row_select_stage_ = nullptr;
         KVCacheAppendStage *kv_append_stage_ = nullptr;
+        RoPEStage *rope_stage_ = nullptr;
     };
 
     ForwardGraphSignature bucketedPrefillSignature(
@@ -763,6 +821,44 @@ namespace
             EXPECT_NEAR(data[col], expectedProbeValueAtIndex(source_offset + col), 1e-5f)
                 << "Mismatch at selected-row column " << col << " for real_seq_len=" << real_seq_len;
         }
+    }
+
+    /**
+     * @brief Capture a stable prefix of the current probe output tensor.
+     *
+     * Prefill graph replay leaves tensors device-authoritative; FP32Tensor::data()
+     * is the fixture boundary that synchronizes the small output back to host so
+     * tests can compare graph launches without adding bespoke backend copies.
+     */
+    std::vector<float> captureProbeOutputPrefix(
+        PrefillGraphCacheTestHost &host,
+        size_t max_elements)
+    {
+        auto *output = host.outputTensor();
+        EXPECT_NE(output, nullptr);
+        if (!output)
+            return {};
+        const float *data = output->data();
+        EXPECT_NE(data, nullptr);
+        if (!data)
+            return {};
+
+        const size_t count = std::min(
+            max_elements,
+            static_cast<size_t>(kExactBucketSeqLen) * static_cast<size_t>(kHiddenDim));
+        return std::vector<float>(data, data + count);
+    }
+
+    /// @brief Return the maximum absolute elementwise difference between two vectors.
+    double maxAbsDiff(const std::vector<float> &lhs, const std::vector<float> &rhs)
+    {
+        const size_t count = std::min(lhs.size(), rhs.size());
+        double max_abs = 0.0;
+        for (size_t i = 0; i < count; ++i)
+            max_abs = std::max(max_abs, std::abs(static_cast<double>(lhs[i]) - static_cast<double>(rhs[i])));
+        if (lhs.size() != rhs.size())
+            max_abs = std::numeric_limits<double>::infinity();
+        return max_abs;
     }
 
     class PrefillGraphCacheExecutionTest : public ::testing::Test
@@ -1445,6 +1541,76 @@ namespace
             {"topology_signature", std::to_string(0x321u)}};
         EXPECT_DOUBLE_EQ(findPrefillGraphLifecycleCounter(records, replay_tags), 1.0);
         PerfStatsCollector::reset();
+    }
+
+    TEST_F(PrefillGraphCacheExecutionTest, RoPEPositionRowsRefreshAcrossPaddedBucketReplay)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        host_->setUseRoPEProbe(true);
+
+        auto tokens61 = makeSequentialInts(kExactBucketSeqLen - 3, 7000);
+        ForwardInput input61;
+        input61.token_ids = tokens61.data();
+        input61.batch_size = 1;
+        input61.seq_len = kExactBucketSeqLen - 3;
+        input61.token_offset = 128;
+        input61.position_offset = 128;
+        input61.device = device_;
+
+        auto tokens63 = makeSequentialInts(kExactBucketSeqLen - 1, 8000);
+        ForwardInput input63;
+        input63.token_ids = tokens63.data();
+        input63.batch_size = 1;
+        input63.seq_len = kExactBucketSeqLen - 1;
+        input63.token_offset = 512;
+        input63.position_offset = 512;
+        input63.device = device_;
+
+        const auto plan61 = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input61,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/true);
+        ASSERT_TRUE(plan61) << plan61.error;
+        ASSERT_TRUE(plan61.padding_required);
+
+        const auto plan63 = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input63,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/true);
+        ASSERT_TRUE(plan63) << plan63.error;
+        ASSERT_TRUE(plan63.padding_required);
+
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_NE(host_->ropeStage(), nullptr);
+        const auto output_pos128_warmup = captureProbeOutputPrefix(*host_, 512);
+        ASSERT_FALSE(output_pos128_warmup.empty());
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        const auto output_pos512_capture = captureProbeOutputPrefix(*host_, 512);
+        ASSERT_FALSE(output_pos512_capture.empty());
+        EXPECT_GT(maxAbsDiff(output_pos128_warmup, output_pos512_capture), 1.0e-3)
+            << "RoPE probe positions 128..191 and 512..575 must produce distinct output, "
+               "otherwise this regression cannot prove metadata freshness.";
+
+        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        const auto output_pos128_replay = captureProbeOutputPrefix(*host_, 512);
+        ASSERT_FALSE(output_pos128_replay.empty());
+        EXPECT_LT(maxAbsDiff(output_pos128_warmup, output_pos128_replay), 1.0e-5)
+            << "Ready replay must refresh RoPE's workspace position rows back to the current "
+               "chunk instead of reusing the rows captured for the previous real length.";
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ServerStyleRawExecuteReusesPaddedBucketAcrossRealLengths)

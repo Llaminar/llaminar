@@ -184,6 +184,30 @@ namespace llaminar2
             return out.str();
         }
 
+        std::string graphCaptureBoundaryName(
+            const char *phase,
+            uint64_t current_step,
+            int segment_index,
+            const DeviceGraphExecutor::GraphSegment &segment,
+            const std::string &perf_context)
+        {
+            const std::string first_stage =
+                segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front();
+            const std::string last_stage =
+                segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.back();
+            std::ostringstream out;
+            out << "before_begin:"
+                << "phase=" << phase
+                << ":step=" << current_step
+                << ":segment=" << segment_index
+                << ":type=" << segmentTypeName(segment)
+                << ":first=" << first_stage
+                << ":last=" << last_stage;
+            if (!perf_context.empty())
+                out << ":context=" << perf_context;
+            return out.str();
+        }
+
         void addContextTag(PerfStatsCollector::Tags &tags, const std::string &perf_context)
         {
             if (!perf_context.empty())
@@ -1228,6 +1252,9 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         void *capture_stream,
         int segment_index,
+        uint64_t current_step,
+        const std::string &perf_context,
+        const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
@@ -1251,9 +1278,33 @@ namespace llaminar2
             }
         }
 
+        if (!prepareGraphLaunchMetadata(graph, segment, ctx, capture_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Re-capture metadata preparation failed, seg "
+                      << segment_index);
+            return false;
+        }
+
         bool exec_ok = true;
         bool end_capture_ok = true;
         {
+            if (before_begin_capture_cb)
+            {
+                const std::string boundary_name =
+                    graphCaptureBoundaryName(
+                        "recapture",
+                        current_step,
+                        segment_index,
+                        segment,
+                        perf_context);
+                if (!before_begin_capture_cb(boundary_name))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Re-capture boundary rendezvous failed, seg "
+                              << segment_index << " boundary=" << boundary_name);
+                    return false;
+                }
+            }
+
             gpu_ctx->setGraphCaptureActive(true);
             GraphCaptureGuard capture_guard(false);
             gpu_ctx->clearLastError();
@@ -1858,8 +1909,10 @@ namespace llaminar2
         bool recapture_mode,
         bool full_graph_replay,
         int segment_index,
+        uint64_t current_step,
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+        const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
@@ -1902,6 +1955,9 @@ namespace llaminar2
                 gpu_ctx,
                 capture_stream,
                 segment_index,
+                current_step,
+                perf_context,
+                before_begin_capture_cb,
                 record_snapshot_copies_cb,
                 post_launch_cb);
             result.success = recapture_ok;
@@ -1954,6 +2010,7 @@ namespace llaminar2
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
@@ -1972,8 +2029,10 @@ namespace llaminar2
                 recapture_mode,
                 full_graph_replay,
                 segment_index,
+                current_step,
                 perf_context,
                 cohere_inputs_cb,
+                before_begin_capture_cb,
                 record_snapshot_copies_cb,
                 post_launch_cb);
             result.success = capturable_result.success;
@@ -2082,8 +2141,9 @@ namespace llaminar2
                 break;
         }
 
-        for (auto &seg : segment_cache.segments)
+        for (size_t segment_index = 0; segment_index < segment_cache.segments.size(); ++segment_index)
         {
+            auto &seg = segment_cache.segments[segment_index];
             if (seg.capturable && !capture_abandoned)
             {
                 // Capturable path: set stream -> begin capture -> execute nodes
@@ -2164,6 +2224,26 @@ namespace llaminar2
                     result.reset_cache = true;
                     result.fallback_to_fast_decode = true;
                     return result;
+                }
+
+                if (hooks.before_begin_capture)
+                {
+                    const std::string boundary_name =
+                        graphCaptureBoundaryName(
+                            "capture",
+                            current_step,
+                            static_cast<int>(segment_index),
+                            seg,
+                            segment_cache.perf_context);
+                    if (!hooks.before_begin_capture(boundary_name))
+                    {
+                        LOG_ERROR("[DeviceGraphCaptureController] Capture boundary rendezvous failed before segment starting at "
+                                  << (seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front())
+                                  << " boundary=" << boundary_name);
+                        result.reset_cache = true;
+                        result.success = false;
+                        return result;
+                    }
                 }
 
                 seg.capture = gpu_ctx->createGraphCapture(capture_stream);
@@ -2531,6 +2611,7 @@ namespace llaminar2
                 segment_cache.perf_context,
                 hooks.cohere_inputs,
                 hooks.execute_node,
+                hooks.before_begin_capture,
                 hooks.record_snapshot_copies,
                 hooks.post_launch);
             if (PerfStatsCollector::isEnabled())

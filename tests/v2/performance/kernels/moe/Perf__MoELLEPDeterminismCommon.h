@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,18 @@ namespace llaminar2::test::moe_llep_perf
         return hash;
     }
 
+    inline uint64_t fnv1a64Bytes(const void *data, size_t byte_count)
+    {
+        const auto *bytes = static_cast<const uint8_t *>(data);
+        uint64_t hash = 1469598103934665603ull;
+        for (size_t i = 0; i < byte_count; ++i)
+        {
+            hash ^= bytes[i];
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
     inline uint32_t participantMask(int participant_count)
     {
         return participant_count >= 32 ? 0xffffffffu : ((1u << participant_count) - 1u);
@@ -75,9 +88,10 @@ namespace llaminar2::test::moe_llep_perf
 
     inline void configureRuntimeLayer(DeviceMoELayerRuntime &runtime,
                                       const Shape &shape,
-                                      bool all_participants_resident)
+                                      bool all_participants_resident,
+                                      int participant_id = 0)
     {
-        runtime.participant_id = 0;
+        runtime.participant_id = static_cast<uint32_t>(participant_id);
         runtime.participant_count = static_cast<uint32_t>(shape.participant_count);
         runtime.expert_count = static_cast<uint32_t>(shape.num_experts);
         runtime.top_k = static_cast<uint32_t>(shape.top_k);
@@ -88,14 +102,180 @@ namespace llaminar2::test::moe_llep_perf
         for (int expert = 0; expert < shape.num_experts; ++expert)
         {
             const int owner = expert % shape.participant_count;
+            bank.experts[expert] = DeviceMoEExpertDescriptor{};
             bank.experts[expert].logical_expert_id = expert;
             bank.experts[expert].owner_participant = owner;
             bank.experts[expert].local_slot = expert;
+            const bool local_resident =
+                all_participants_resident || owner == participant_id;
+            DeviceMoEExpertFlags flags =
+                DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident;
+            if (local_resident)
+                flags |= DeviceMoEExpertFlags::LocalCompute;
             bank.experts[expert].flags =
-                toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
-                                 DeviceMoEExpertFlags::Resident);
+                toMoEExpertFlags(flags);
+            bank.local_compute_mask[expert] = local_resident ? 1u : 0u;
+            bank.replica_role[expert] =
+                local_resident
+                    ? static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)
+                    : static_cast<uint8_t>(DeviceMoEReplicaRole::None);
             bank.resident_participant_mask[expert] =
                 all_participants_resident ? all_mask : (1u << static_cast<uint32_t>(owner));
+        }
+    }
+
+    struct SyntheticPayloadSpec
+    {
+        int n = 128;
+        int k = 1024;
+        uint8_t codebook_id = 5;
+    };
+
+    inline uint64_t alignUp(uint64_t value, uint64_t alignment)
+    {
+        return ((value + alignment - 1u) / alignment) * alignment;
+    }
+
+    inline uint32_t syntheticBlocksPerRow(int k)
+    {
+        return static_cast<uint32_t>((k + 31) / 32);
+    }
+
+    inline uint64_t syntheticMatrixDataBytes(const SyntheticPayloadSpec &spec)
+    {
+        DeviceNativeVNNIMatrixDesc desc{};
+        desc.n = spec.n;
+        desc.k = spec.k;
+        desc.blocks_per_row = syntheticBlocksPerRow(spec.k);
+        desc.codebook_id = spec.codebook_id;
+        DeviceMoEExpertDirectoryEntry entry{};
+        entry.descriptor.gate = desc;
+        entry.payload_bytes_per_block = 0;
+        entry.is_asymmetric = 0;
+        entry.has_emins = 0;
+        if (!deviceMoEPopulateDirectoryFormat(entry))
+            return 0;
+        return deviceMoEMatrixPayloadBytes(desc, entry) +
+               deviceMoEMatrixScalesBytes(desc) +
+               deviceMoEMatrixMinsBytes(desc, entry) +
+               deviceMoEMatrixEminsBytes(desc, entry);
+    }
+
+    inline uint64_t syntheticExpertDataBytes(const SyntheticPayloadSpec &spec)
+    {
+        return syntheticMatrixDataBytes(spec) * 3u;
+    }
+
+    inline uint64_t syntheticPayloadSlotBytes(const SyntheticPayloadSpec &spec)
+    {
+        return alignUp(sizeof(DeviceMoEExpertDirectoryEntry) +
+                           syntheticExpertDataBytes(spec),
+                       256u);
+    }
+
+    inline DeviceNativeVNNIMatrixDesc makeSyntheticMatrixDesc(uint8_t *base,
+                                                             uint64_t &offset,
+                                                             const SyntheticPayloadSpec &spec)
+    {
+        DeviceNativeVNNIMatrixDesc desc{};
+        desc.n = spec.n;
+        desc.k = spec.k;
+        desc.blocks_per_row = syntheticBlocksPerRow(spec.k);
+        desc.codebook_id = spec.codebook_id;
+
+        DeviceMoEExpertDirectoryEntry entry{};
+        entry.descriptor.gate = desc;
+        const bool format_ok = deviceMoEPopulateDirectoryFormat(entry);
+        (void)format_ok;
+
+        const uint64_t blocks =
+            static_cast<uint64_t>(desc.blocks_per_row) *
+            static_cast<uint64_t>(desc.n);
+        const uint64_t payload_bytes =
+            blocks * static_cast<uint64_t>(entry.payload_bytes_per_block);
+        const uint64_t scales_bytes = blocks * sizeof(uint16_t);
+        const uint64_t mins_bytes = entry.is_asymmetric != 0u ? scales_bytes : 0u;
+        const uint64_t emins_bytes = entry.has_emins != 0u
+                                         ? blocks * sizeof(uint32_t)
+                                         : 0u;
+
+        desc.payload = base + offset;
+        offset += payload_bytes;
+        desc.scales = base + offset;
+        offset += scales_bytes;
+        desc.mins = mins_bytes > 0u ? base + offset : nullptr;
+        offset += mins_bytes;
+        desc.emins = emins_bytes > 0u ? base + offset : nullptr;
+        offset += emins_bytes;
+        return desc;
+    }
+
+    inline DeviceMoEExpertDescriptor makeSyntheticExpertDescriptor(uint8_t *base,
+                                                                  const SyntheticPayloadSpec &spec,
+                                                                  int expert,
+                                                                  int owner,
+                                                                  int local_slot)
+    {
+        uint64_t offset = 0;
+        DeviceMoEExpertDescriptor desc{};
+        desc.gate = makeSyntheticMatrixDesc(base, offset, spec);
+        desc.up = makeSyntheticMatrixDesc(base, offset, spec);
+        desc.down = makeSyntheticMatrixDesc(base, offset, spec);
+        desc.logical_expert_id = expert;
+        desc.owner_participant = owner;
+        desc.local_slot = local_slot;
+        desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                      DeviceMoEExpertFlags::Resident |
+                                      DeviceMoEExpertFlags::LocalCompute);
+        return desc;
+    }
+
+    inline DeviceMoEExpertDirectoryEntry makeSyntheticTransferSlot(uint8_t *base,
+                                                                   const SyntheticPayloadSpec &spec,
+                                                                   uint32_t participant,
+                                                                   uint32_t slot)
+    {
+        DeviceMoEExpertDirectoryEntry entry{};
+        entry.descriptor = makeSyntheticExpertDescriptor(
+            base, spec, -1, static_cast<int>(participant), static_cast<int>(slot));
+        entry.layer = kDeviceMoEInvalidSlot;
+        entry.expert = kDeviceMoEInvalidSlot;
+        entry.participant = participant;
+        entry.slot_index = slot;
+        entry.flags = static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
+                      static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
+        (void)deviceMoEPopulateDirectoryFormat(entry);
+        return entry;
+    }
+
+    inline int sourceOrdinalForExpert(int expert, int participant_count)
+    {
+        return expert / participant_count;
+    }
+
+    inline void installSyntheticLocalExpertDescriptors(DeviceMoELayerRuntime &runtime,
+                                                       const Shape &shape,
+                                                       const SyntheticPayloadSpec &spec,
+                                                       int participant_id,
+                                                       uint8_t *source_slab,
+                                                       uint64_t bytes_per_expert)
+    {
+        auto &bank = runtime.banks[runtime.active_bank];
+        for (int expert = 0; expert < shape.num_experts; ++expert)
+        {
+            const int owner = expert % shape.participant_count;
+            if (owner != participant_id)
+                continue;
+
+            const int ordinal = sourceOrdinalForExpert(expert, shape.participant_count);
+            auto *base = source_slab + static_cast<uint64_t>(ordinal) * bytes_per_expert;
+            bank.experts[expert] = makeSyntheticExpertDescriptor(
+                base, spec, expert, owner, ordinal);
+            bank.local_compute_mask[expert] = 1u;
+            bank.replica_role[expert] =
+                static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+            bank.resident_participant_mask[expert] =
+                1u << static_cast<uint32_t>(participant_id);
         }
     }
 
@@ -160,6 +340,47 @@ namespace llaminar2::test::moe_llep_perf
         config.root_participant = 0;
         config.window_size_tokens = 256;
         return config;
+    }
+
+    inline DeviceMoERebalanceConfig dynamicMaintenanceConfig(const Shape &shape)
+    {
+        auto config = rebalanceConfig(shape);
+        config.flags =
+            static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals) |
+            static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply) |
+            static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        config.max_hot_replicas_per_participant = 0;
+        config.layer_window_start = 0;
+        config.layer_window_count = 1;
+        config.layer_wave_count = 1;
+        config.routed_assignment_policy = kDeviceMoERebalanceAssignmentStaticOwner;
+        return config;
+    }
+
+    inline void installSkewedDynamicHistogram(DeviceMoELayerRuntime &runtime,
+                                              const Shape &shape)
+    {
+        for (int expert = 0; expert < kDeviceMoEMaxExperts; ++expert)
+        {
+            runtime.decode_histogram[expert] = 0;
+            runtime.decode_local_histogram[expert] = 0;
+        }
+
+        for (int expert = 0; expert < shape.num_experts; ++expert)
+        {
+            const int owner = expert % shape.participant_count;
+            uint64_t count = 8;
+            if (owner == 0)
+                count = 64;
+            else if (owner == 1)
+                count = 1;
+            else
+                count = 16;
+            runtime.decode_histogram[expert] = count;
+            runtime.decode_local_histogram[expert] = count;
+        }
+        runtime.decode_histogram[0] = 4096;
+        runtime.decode_local_histogram[0] = 4096;
     }
 
     inline void printTiming(const char *backend,

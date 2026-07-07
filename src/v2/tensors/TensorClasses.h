@@ -1088,6 +1088,13 @@ namespace llaminar2
             setCoherenceState_(new_state);
             if (new_state == TensorCoherenceState::DEVICE_AUTHORITATIVE)
             {
+                /*
+                 * A plain DEVICE_AUTHORITATIVE transition means the caller did
+                 * not record a completion event for this write.  Any existing
+                 * event describes an older producer and must not be used by a
+                 * later D2H read.
+                 */
+                clearCompletionEvent();
                 authoritative_device_ = authoritative_dev.value_or(gpu_device_.value_or(DeviceId::cpu()));
             }
             else if (new_state == TensorCoherenceState::HOST_ONLY ||

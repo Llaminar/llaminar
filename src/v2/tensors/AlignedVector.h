@@ -18,12 +18,15 @@
 #pragma once
 
 #include <cstdlib> // aligned_alloc, free
+#include <cstdint> // uintptr_t
 #include <cstring> // memcpy
 #include <stdexcept>
 #include <algorithm>
 #include <initializer_list>
+#include <memory> // uninitialized_copy, uninitialized_fill
 #ifdef __linux__
 #include <sys/mman.h> // madvise, MADV_HUGEPAGE
+#include <unistd.h>   // sysconf
 #endif
 
 namespace llaminar2
@@ -361,11 +364,27 @@ namespace llaminar2
             if (n == 0)
                 return nullptr;
 
-            // Calculate allocation size (must be multiple of ALIGNMENT)
+            // Calculate allocation size.  Small SIMD scratch buffers only need
+            // cache-line alignment, but large weight buffers participate in
+            // strict NUMA placement.  Linux NUMA APIs bind and migrate whole
+            // pages, so a large allocation that starts at only a 64-byte
+            // boundary can cause callers to round the range outward and touch
+            // neighboring heap bytes.  Page-aligning large allocations keeps
+            // strict mbind()/move_pages() checks scoped to this vector.
             size_t alloc_bytes = n * sizeof(T);
-            size_t aligned_bytes = (alloc_bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+            size_t allocation_alignment = ALIGNMENT;
+#ifdef __linux__
+            const long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size > static_cast<long>(ALIGNMENT) &&
+                alloc_bytes >= static_cast<size_t>(page_size))
+            {
+                allocation_alignment = static_cast<size_t>(page_size);
+            }
+#endif
+            size_t aligned_bytes = (alloc_bytes + allocation_alignment - 1) &
+                                   ~(allocation_alignment - 1);
 
-            void *ptr = std::aligned_alloc(ALIGNMENT, aligned_bytes);
+            void *ptr = std::aligned_alloc(allocation_alignment, aligned_bytes);
             if (!ptr)
             {
                 throw std::bad_alloc();

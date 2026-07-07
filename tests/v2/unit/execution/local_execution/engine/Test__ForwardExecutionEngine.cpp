@@ -10,9 +10,11 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -31,6 +33,15 @@ using namespace llaminar2;
 
 namespace
 {
+    std::string readTextFile(const char *path)
+    {
+        std::ifstream input(path);
+        if (!input)
+            return {};
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
 
     /**
      * @brief Scoped environment override that refreshes debugEnv() for each unit test.
@@ -324,6 +335,7 @@ namespace
         int updates = 0;
         std::vector<int> real_seq_lens;
         std::vector<int> bucket_seq_lens;
+        std::vector<int> token_offsets;
         std::vector<bool> saw_stream;
     };
 
@@ -354,6 +366,7 @@ namespace
             ++probe_->updates;
             probe_->real_seq_lens.push_back(params.real_seq_len);
             probe_->bucket_seq_lens.push_back(params.bucket_seq_len);
+            probe_->token_offsets.push_back(params.token_offset);
             probe_->saw_stream.push_back(gpuStream() != nullptr);
         }
 
@@ -416,6 +429,53 @@ namespace
 
 } // namespace
 
+TEST(ForwardExecutionEngineSourceScan, DecodeCapturePolicyInstallsBoundaryHookBeforeExecutorCall)
+{
+    const std::string source = readTextFile(LLAMINAR_FORWARD_EXECUTION_ENGINE_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t policy_build = source.find("capture_policy = host.buildDecodeCapturePolicy(");
+    ASSERT_NE(policy_build, std::string::npos);
+    const size_t hook_assignment = source.find("capture_policy.before_begin_capture", policy_build);
+    ASSERT_NE(hook_assignment, std::string::npos);
+    const size_t boundary_call = source.find("host.waitAtDecodeGraphCaptureBoundary(", hook_assignment);
+    ASSERT_NE(boundary_call, std::string::npos);
+    const size_t execute_call = source.find("executor_.executeDecodeWithCapturePolicy(", hook_assignment);
+    ASSERT_NE(execute_call, std::string::npos);
+
+    EXPECT_LT(hook_assignment, execute_call)
+        << "Decode graph capture must install the LocalTP boundary hook before entering executor capture/replay.";
+    EXPECT_LT(boundary_call, execute_call)
+        << "The hook must route through the host so LocalTP can fence before beginCapture.";
+}
+
+TEST(ForwardExecutionEngineSourceScan, DecodeSegmentCaptureFencesAfterStreamSyncBeforeBeginCapture)
+{
+    const std::string source = readTextFile(LLAMINAR_DEVICE_GRAPH_CAPTURE_CONTROLLER_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t stream_sync = source.find("Capture warmup stream sync failed before segment");
+    ASSERT_NE(stream_sync, std::string::npos);
+    const size_t boundary_hook = source.find("hooks.before_begin_capture", stream_sync);
+    ASSERT_NE(boundary_hook, std::string::npos);
+    const size_t create_capture = source.find("createGraphCapture(capture_stream)", boundary_hook);
+    ASSERT_NE(create_capture, std::string::npos);
+    const size_t begin_capture = source.find("seg.capture->beginCapture()", create_capture);
+    ASSERT_NE(begin_capture, std::string::npos);
+
+    EXPECT_LT(stream_sync, boundary_hook)
+        << "Participants should drain local warmup work before entering the domain-level capture fence.";
+    EXPECT_LT(boundary_hook, begin_capture)
+        << "LocalTP participants must rendezvous before any device starts HIP/CUDA stream capture.";
+
+    const size_t recapture_boundary = source.find("graphCaptureBoundaryName(\n                        \"recapture\"");
+    ASSERT_NE(recapture_boundary, std::string::npos);
+    const size_t recapture_begin = source.find("segment.capture->beginCapture()", recapture_boundary);
+    ASSERT_NE(recapture_begin, std::string::npos);
+    EXPECT_LT(recapture_boundary, recapture_begin)
+        << "Forced recapture must use the same pre-beginCapture domain fence.";
+}
+
 // =========================================================================
 // Test Fixture
 // =========================================================================
@@ -476,6 +536,26 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_ExactBucketSucceeds
     EXPECT_EQ(plan.chunk.bucket_seq_len, 4);
     EXPECT_EQ(plan.chunk.token_ids, tokens);
     EXPECT_EQ(plan.chunk.position_ids, (std::vector<int>{32, 33, 34, 35}));
+}
+
+TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_UsesPositionOffsetWhenTokenOffsetIsAbsent)
+{
+    const std::vector<int> tokens = {21, 22, 23, 24};
+    auto input = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), nullptr);
+    input.position_offset = 256;
+
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        input,
+        std::vector<int>{4, 8},
+        /*pad_token_id=*/99,
+        /*allow_padded_execution=*/false);
+
+    ASSERT_TRUE(plan) << plan.error;
+    EXPECT_EQ(plan.chunk.token_offset, 256)
+        << "Restored-prefix suffix prefill may arrive as a raw ForwardInput "
+           "with only position_offset populated; bucket planning must keep "
+           "position IDs and replay metadata on that absolute request range.";
+    EXPECT_EQ(plan.chunk.position_ids, (std::vector<int>{256, 257, 258, 259}));
 }
 
 TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_RequiresTokenIds)
@@ -1095,6 +1175,47 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedReplayParamsRefreshAf
         EXPECT_EQ(real_seq_len, 3);
     for (int bucket_seq_len : probe.bucket_seq_lens)
         EXPECT_EQ(bucket_seq_len, 4);
+    for (int token_offset : probe.token_offsets)
+        EXPECT_EQ(token_offset, 0);
+}
+
+TEST_F(Test__ForwardExecutionEngine, Execute_CachedPrefillReplayParamsUsePositionOffsetWhenTokenOffsetIsAbsent)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    PrefillReplayParamProbe probe;
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_factories.push_back(
+        [&probe](const std::string &name, DeviceId device) -> std::unique_ptr<IComputeStage>
+        {
+            return std::make_unique<PrefillReplayParamProbeStage>(name, device, &probe);
+        });
+
+    const std::vector<int> tokens = {70, 71, 72, 73, 74};
+    const std::vector<int> positions = {256, 257, 258, 259, 260};
+    auto input = makeTestInput(5, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+    input.position_offset = 256;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.execute(input, output, host));
+    EXPECT_TRUE(engine.execute(input, output, host));
+
+    ASSERT_GE(probe.updates, 2)
+        << "The cached prefill graph must refresh stateful stage replay metadata "
+           "on both capture/build and replay.";
+    for (int token_offset : probe.token_offsets)
+        EXPECT_EQ(token_offset, 256)
+            << "A restored-prefix suffix must not replay stateful prefill stages "
+               "as though the suffix began at prompt offset zero.";
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedGDNOrShortConvRejectedBeforeExecution)

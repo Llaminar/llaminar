@@ -19,6 +19,7 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../kvcache/KVCacheDeviceParams.h"
+#include "../../kvcache/KVCacheLogicalBlockCodec.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -34,6 +35,27 @@ namespace llaminar2
     // =========================================================================
     // CUDA Kernels
     // =========================================================================
+
+    /**
+     * @brief Resolve the real append row count for captured bucket execution.
+     *
+     * CUDA graph replay uses fixed bucket launch geometry, while the request
+     * may contain fewer real tokens.  The host uploads the real append count
+     * before replay; copy kernels use this guard so padded rows never mutate
+     * KV cache storage.  Invalid device metadata produces a zero-row copy here
+     * because host stage validation is responsible for failing with context.
+     */
+    __device__ __forceinline__ int effective_append_tokens(
+        const int *__restrict__ d_append_count,
+        int captured_num_tokens)
+    {
+        if (!d_append_count)
+            return captured_num_tokens;
+        const int real_tokens = *d_append_count;
+        return (real_tokens > 0 && real_tokens <= captured_num_tokens)
+                   ? real_tokens
+                   : 0;
+    }
 
     /**
      * @brief Append tokens to ring buffer with wrap-around
@@ -87,6 +109,7 @@ namespace llaminar2
         const T *__restrict__ d_K_new,  // [num_tokens, kv_dim]
         const T *__restrict__ d_V_new,  // [num_tokens, kv_dim]
         const int *__restrict__ d_head, // Head position (read from device memory)
+        const int *__restrict__ d_append_count, // Real rows for padded bucket replay
         int max_seq_len,                // Ring buffer capacity
         int kv_dim,                     // n_kv_heads * head_dim
         int num_tokens)                 // Tokens to append
@@ -94,7 +117,8 @@ namespace llaminar2
         int token_idx = blockIdx.x;
         int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
 
-        if (token_idx >= num_tokens || elem_idx >= kv_dim)
+        const int rows_to_write = effective_append_tokens(d_append_count, num_tokens);
+        if (token_idx >= rows_to_write || elem_idx >= kv_dim)
             return;
 
         int head = *d_head; // Read from device memory
@@ -402,6 +426,68 @@ namespace llaminar2
     }
 
     template <typename SrcT>
+    __global__ void ring_append_convert_to_fp16_kernel(
+        __half *__restrict__ d_K_cache,
+        __half *__restrict__ d_V_cache,
+        const SrcT *__restrict__ d_K_new,
+        const SrcT *__restrict__ d_V_new,
+        int head,
+        const int *__restrict__ d_head,
+        const int *__restrict__ d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens)
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+        const int rows_to_write = effective_append_tokens(d_append_count, num_tokens);
+        if (token_idx >= rows_to_write || elem_idx >= kv_dim)
+            return;
+
+        const int effective_head = d_head ? *d_head : head;
+        const int dst_pos = (effective_head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_dim + elem_idx;
+        const int src_offset = token_idx * kv_dim + elem_idx;
+
+        d_K_cache[dst_offset] = __float2half_rn(to_float_device(d_K_new[src_offset]));
+        d_V_cache[dst_offset] = __float2half_rn(to_float_device(d_V_new[src_offset]));
+    }
+
+    __global__ void ring_append_q8_1_to_fp16_kernel(
+        __half *__restrict__ d_K_cache,
+        __half *__restrict__ d_V_cache,
+        const Q8_1Block *__restrict__ d_K_new,
+        const Q8_1Block *__restrict__ d_V_new,
+        int head,
+        const int *__restrict__ d_head,
+        const int *__restrict__ d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        int src_blocks_per_row)
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+        const int rows_to_write = effective_append_tokens(d_append_count, num_tokens);
+        if (token_idx >= rows_to_write || elem_idx >= kv_dim)
+            return;
+
+        const int effective_head = d_head ? *d_head : head;
+        const int dst_pos = (effective_head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_dim + elem_idx;
+        const int block_col = elem_idx / Q8_1Block::BLOCK_SIZE;
+        const int lane = elem_idx % Q8_1Block::BLOCK_SIZE;
+        const int src_offset = token_idx * src_blocks_per_row + block_col;
+
+        const Q8_1Block &k_block = d_K_new[src_offset];
+        const Q8_1Block &v_block = d_V_new[src_offset];
+        const float k_scale = __half2float(__ushort_as_half(k_block.d));
+        const float v_scale = __half2float(__ushort_as_half(v_block.d));
+        d_K_cache[dst_offset] = __float2half_rn(k_scale * static_cast<float>(k_block.qs[lane]));
+        d_V_cache[dst_offset] = __float2half_rn(v_scale * static_cast<float>(v_block.qs[lane]));
+    }
+
+    template <typename SrcT>
     __global__ void convert_to_q8_1_kernel(
         const SrcT *__restrict__ src,
         Q8_1Block *__restrict__ dst,
@@ -592,6 +678,77 @@ namespace llaminar2
         return cudaGetLastError() == cudaSuccess;
     }
 
+    extern "C" bool cuda_ring_append_converted_fp16(
+        __half *d_K_cache, __half *d_V_cache,
+        const void *d_K_new, const void *d_V_new,
+        TensorType src_type,
+        int head,
+        const int *d_head,
+        const int *d_append_count,
+        int max_seq_len,
+        int kv_dim,
+        int num_tokens,
+        cudaStream_t stream)
+    {
+        if (!d_K_cache || !d_V_cache || !d_K_new || !d_V_new ||
+            max_seq_len <= 0 || kv_dim <= 0 || num_tokens <= 0)
+        {
+            return false;
+        }
+
+        const dim3 block(256);
+        const dim3 grid(num_tokens, (kv_dim + static_cast<int>(block.x) - 1) / static_cast<int>(block.x));
+        switch (src_type)
+        {
+        case TensorType::FP32:
+            ring_append_convert_to_fp16_kernel<float><<<grid, block, 0, stream>>>(
+                d_K_cache, d_V_cache,
+                               static_cast<const float *>(d_K_new),
+                               static_cast<const float *>(d_V_new),
+                               head, d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
+            break;
+        case TensorType::FP16:
+            if (d_head)
+            {
+                ring_append_kernel_dynamic<__half><<<grid, block, 0, stream>>>(
+                    d_K_cache, d_V_cache,
+                                   static_cast<const __half *>(d_K_new),
+                                   static_cast<const __half *>(d_V_new),
+                                   d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
+            }
+            else
+            {
+                ring_append_kernel<__half><<<grid, block, 0, stream>>>(
+                    d_K_cache, d_V_cache,
+                    static_cast<const __half *>(d_K_new),
+                    static_cast<const __half *>(d_V_new),
+                    head, max_seq_len, kv_dim, num_tokens);
+            }
+            break;
+        case TensorType::BF16:
+            ring_append_convert_to_fp16_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+                d_K_cache, d_V_cache,
+                               static_cast<const __nv_bfloat16 *>(d_K_new),
+                               static_cast<const __nv_bfloat16 *>(d_V_new),
+                               head, d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
+            break;
+        case TensorType::Q8_1:
+        {
+            const int blocks_per_row = (kv_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            ring_append_q8_1_to_fp16_kernel<<<grid, block, 0, stream>>>(
+                d_K_cache, d_V_cache,
+                               static_cast<const Q8_1Block *>(d_K_new),
+                               static_cast<const Q8_1Block *>(d_V_new),
+                               head, d_head, d_append_count, max_seq_len, kv_dim, num_tokens, blocks_per_row);
+            break;
+        }
+        default:
+            return false;
+        }
+
+        return cudaGetLastError() == cudaSuccess;
+    }
+
     // =========================================================================
     // Kernel Launch Helpers (extern "C" wrappers)
     // =========================================================================
@@ -743,7 +900,7 @@ namespace llaminar2
     extern "C" void cuda_ring_append_dynamic_fp32(
         float *d_K_cache, float *d_V_cache,
         const float *d_K_new, const float *d_V_new,
-        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_dim, int num_tokens,
         cudaStream_t stream)
     {
         if (num_tokens == 0)
@@ -753,13 +910,13 @@ namespace llaminar2
         dim3 grid(num_tokens, (kv_dim + 255) / 256);
         ring_append_kernel_dynamic<float><<<grid, block, 0, stream>>>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_dim, num_tokens);
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
     }
 
     extern "C" void cuda_ring_append_dynamic_fp16(
         __half *d_K_cache, __half *d_V_cache,
         const __half *d_K_new, const __half *d_V_new,
-        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_dim, int num_tokens,
         cudaStream_t stream)
     {
         if (num_tokens == 0)
@@ -769,13 +926,13 @@ namespace llaminar2
         dim3 grid(num_tokens, (kv_dim + 255) / 256);
         ring_append_kernel_dynamic<__half><<<grid, block, 0, stream>>>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_dim, num_tokens);
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
     }
 
     extern "C" void cuda_ring_append_dynamic_bf16(
         __nv_bfloat16 *d_K_cache, __nv_bfloat16 *d_V_cache,
         const __nv_bfloat16 *d_K_new, const __nv_bfloat16 *d_V_new,
-        const int *d_head, int max_seq_len, int kv_dim, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_dim, int num_tokens,
         cudaStream_t stream)
     {
         if (num_tokens == 0)
@@ -785,13 +942,13 @@ namespace llaminar2
         dim3 grid(num_tokens, (kv_dim + 255) / 256);
         ring_append_kernel_dynamic<__nv_bfloat16><<<grid, block, 0, stream>>>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_dim, num_tokens);
+            d_head, d_append_count, max_seq_len, kv_dim, num_tokens);
     }
 
     extern "C" void cuda_ring_append_dynamic_q8_1(
         Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
         const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
-        const int *d_head, int max_seq_len, int kv_blocks, int num_tokens,
+        const int *d_head, const int *d_append_count, int max_seq_len, int kv_blocks, int num_tokens,
         cudaStream_t stream)
     {
         if (num_tokens == 0)
@@ -801,7 +958,7 @@ namespace llaminar2
         dim3 grid(num_tokens, (kv_blocks + 255) / 256);
         ring_append_kernel_dynamic<Q8_1Block><<<grid, block, 0, stream>>>(
             d_K_cache, d_V_cache, d_K_new, d_V_new,
-            d_head, max_seq_len, kv_blocks, num_tokens);
+            d_head, d_append_count, max_seq_len, kv_blocks, num_tokens);
     }
 
     template <typename T>
@@ -1341,49 +1498,52 @@ namespace llaminar2
     // Forward declarations for dynamic wrappers
     extern "C" void cuda_ring_append_dynamic_fp32(
         float *, float *, const float *, const float *,
-        const int *, int, int, int, cudaStream_t);
+        const int *, const int *, int, int, int, cudaStream_t);
     extern "C" void cuda_ring_append_dynamic_fp16(
         __half *, __half *, const __half *, const __half *,
-        const int *, int, int, int, cudaStream_t);
+        const int *, const int *, int, int, int, cudaStream_t);
     extern "C" void cuda_ring_append_dynamic_bf16(
         __nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
-        const int *, int, int, int, cudaStream_t);
+        const int *, const int *, int, int, int, cudaStream_t);
     extern "C" void cuda_ring_append_dynamic_q8_1(
         Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
-        const int *, int, int, int, cudaStream_t);
+        const int *, const int *, int, int, int, cudaStream_t);
     extern "C" void cuda_kv_sequence_state_advance(
         int *, int *, int, int, cudaStream_t);
     extern "C" void cuda_kv_sequence_state_advance_dynamic(
         int *, int *, const int *, int, int, cudaStream_t);
+    extern "C" bool cuda_ring_append_converted_fp16(
+        __half *, __half *, const void *, const void *, TensorType,
+        int, const int *, const int *, int, int, int, cudaStream_t);
 
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::launch_append_kernel_dynamic(
         EntryT &entry, const DataT *d_k, const DataT *d_v,
-        const int *d_head, int num_tokens, cudaStream_t stream)
+        const int *d_head, const int *d_append_count, int num_tokens, cudaStream_t stream)
     {
         if constexpr (Precision == ActivationPrecision::FP32)
         {
             cuda_ring_append_dynamic_fp32(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+                d_head, d_append_count, max_seq_len_, kv_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
             cuda_ring_append_dynamic_fp16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_dim_, num_tokens, stream);
+                d_head, d_append_count, max_seq_len_, kv_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
             cuda_ring_append_dynamic_bf16(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
+                d_head, d_append_count, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
             cuda_ring_append_dynamic_q8_1(
                 entry.d_K, entry.d_V, d_k, d_v,
-                d_head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
+                d_head, d_append_count, max_seq_len_, kv_storage_dim_, num_tokens, stream);
         }
     }
 
@@ -1456,12 +1616,20 @@ namespace llaminar2
         if (capture_active && d_head_params_ && h_head_params_)
         {
             int idx = layer * batch_size_ + seq_idx;
-            launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, effective_stream);
+            const int *d_append_count = deviceDynamicAppendCountPtr(layer, seq_idx);
+            if (!d_append_count)
+            {
+                LOG_ERROR("[CUDARingKVCache::append] Dynamic append count is required during CUDA graph capture");
+                return false;
+            }
+            launch_append_kernel_dynamic(entry, d_k, d_v,
+                                         &d_head_params_[idx], d_append_count,
+                                         num_tokens, effective_stream);
             if (d_count_params_)
             {
                 cuda_kv_sequence_state_advance_dynamic(
                     &d_head_params_[idx], &d_count_params_[idx],
-                    deviceDynamicAppendCountPtr(layer, seq_idx),
+                    d_append_count,
                     num_tokens, max_seq_len_, effective_stream);
             }
         }
@@ -1751,6 +1919,113 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::appendConvertedWithStream(
+        int layer, int seq_idx,
+        const void *d_k_src, const void *d_v_src,
+        TensorType src_type,
+        int num_tokens, cudaStream_t stream)
+    {
+        if constexpr (Precision != ActivationPrecision::FP16)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)d_k_src;
+            (void)d_v_src;
+            (void)src_type;
+            (void)num_tokens;
+            (void)stream;
+            LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Converted append is only implemented for FP16 cache storage");
+            return false;
+        }
+        else
+        {
+            if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            {
+                LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Invalid layer=" << layer
+                                                                                         << " or seq_idx=" << seq_idx);
+                return false;
+            }
+            if (!d_k_src || !d_v_src || num_tokens < 0)
+            {
+                LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Invalid source pointers or token count");
+                return false;
+            }
+            if (!stream)
+            {
+                LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Explicit CUDA stream is required");
+                return false;
+            }
+            if (num_tokens == 0)
+                return true;
+
+            EntryT &entry = entries_[layer][seq_idx];
+            const bool capture_active = isGraphCaptureActive();
+            if (!capture_active && entry.count + num_tokens > max_seq_len_)
+            {
+                const int to_evict = entry.count + num_tokens - max_seq_len_;
+                entry.count -= to_evict;
+                total_evicted_ += to_evict;
+                if (!wrap_warned_)
+                {
+                    LOG_WARN("Context window full (" << max_seq_len_
+                                                     << " tokens). Sliding window is now overwriting oldest tokens. "
+                                                     << "Use -c <size> to increase context length.");
+                    wrap_warned_ = true;
+                }
+                LOG_DEBUG("[CUDARingKVCache::appendConvertedWithStream] Auto-evicted " << to_evict << " tokens");
+            }
+
+            const int idx = layer * batch_size_ + seq_idx;
+            const int *d_head = nullptr;
+            const int *d_append_count = nullptr;
+            if (capture_active)
+            {
+                if (!d_head_params_ || !h_head_params_)
+                {
+                    LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Dynamic head params are required during graph capture");
+                    return false;
+                }
+                d_head = &d_head_params_[idx];
+                d_append_count = deviceDynamicAppendCountPtr(layer, seq_idx);
+                if (!d_append_count)
+                {
+                    LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Dynamic append count is required during CUDA graph capture");
+                    return false;
+                }
+            }
+
+            if (!cuda_ring_append_converted_fp16(
+                    entry.d_K, entry.d_V,
+                    d_k_src, d_v_src, src_type,
+                    entry.head, d_head, d_append_count,
+                    max_seq_len_, kv_dim_, num_tokens, stream))
+            {
+                LOG_ERROR("[CUDARingKVCache::appendConvertedWithStream] Fused converted append launch failed");
+                return false;
+            }
+
+            if (capture_active && d_count_params_)
+            {
+                cuda_kv_sequence_state_advance_dynamic(
+                    &d_head_params_[idx], &d_count_params_[idx],
+                    d_append_count,
+                    num_tokens, max_seq_len_, stream);
+            }
+
+            if (!capture_active)
+            {
+                entry.head = (entry.head + num_tokens) % max_seq_len_;
+                entry.count += num_tokens;
+                entry.scratch_valid = false;
+                if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    template <ActivationPrecision Precision>
     bool CUDARingKVCache<Precision>::get_kv_for_attention(
         int layer, int seq_idx,
         const void **d_k_out, const void **d_v_out,
@@ -1944,10 +2219,14 @@ namespace llaminar2
         {
             return false;
         }
+        if (!desc.stream)
+        {
+            LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] non-empty GPU logical export requires an explicit stream");
+            return false;
+        }
 
         cudaSetDevice(device_id_);
-        cudaStream_t stream = desc.stream ? static_cast<cudaStream_t>(desc.stream)
-                                          : getEffectiveStream(nullptr);
+        cudaStream_t stream = static_cast<cudaStream_t>(desc.stream);
         const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         const int tail = entry.tail(max_seq_len_);
         auto *out_k = static_cast<uint8_t *>(dst_k);
@@ -1991,6 +2270,13 @@ namespace llaminar2
                       << cudaGetErrorString(sync_err));
             return false;
         }
+        const size_t payload_bytes = static_cast<size_t>(desc.token_count) * row_bytes;
+        if (!kv_cache_codec::canonicalizeFloatingZeros(dst_k, payload_bytes, Precision) ||
+            !kv_cache_codec::canonicalizeFloatingZeros(dst_v, payload_bytes, Precision))
+        {
+            LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] logical payload canonicalization failed");
+            return false;
+        }
         return true;
     }
 
@@ -2009,8 +2295,12 @@ namespace llaminar2
         }
 
         auto &entry = entries_[local_layer][desc.seq_idx];
-        cudaStream_t stream = desc.stream ? static_cast<cudaStream_t>(desc.stream)
-                                          : getEffectiveStream(nullptr);
+        if (!desc.stream)
+        {
+            LOG_ERROR("[CUDARingKVCache::importLogicalBlock] GPU logical import requires an explicit stream");
+            return false;
+        }
+        cudaStream_t stream = static_cast<cudaStream_t>(desc.stream);
         if (desc.token_count == 0)
         {
             if (desc.logical_token_start == 0)

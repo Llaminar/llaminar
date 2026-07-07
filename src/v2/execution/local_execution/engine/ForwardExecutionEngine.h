@@ -189,6 +189,52 @@ namespace llaminar2
         /** Check if the host execution mode should run prefill eagerly instead of graph-capturing it. */
         virtual bool prefillGraphCaptureDisabledByHost() const { return false; }
 
+        /**
+         * @brief Wait at a named prefill GPU graph-capture lifecycle boundary.
+         *
+         * Multi-device LocalTP capture must be coordinated at request/chunk
+         * boundaries: one participant starting capture while another is still
+         * draining the previous eager chunk can poison HIP/CUDA capture state and
+         * make the next grouped collective fail. Hosts that own a LocalTP domain
+         * should route this hook to that domain's capture-boundary rendezvous.
+         * Single-device hosts can keep the default no-op implementation.
+         *
+         * @param input Forward input for the prefill chunk being captured.
+         * @param execution_device Device entering the boundary.
+         * @param boundary_name Stable boundary identifier for diagnostics.
+         * @return true when the boundary is safe to cross.
+         */
+        virtual bool waitAtPrefillGraphCaptureBoundary(
+            const ForwardInput &input,
+            DeviceId execution_device,
+            const std::string &boundary_name)
+        {
+            (void)input;
+            (void)execution_device;
+            (void)boundary_name;
+            return true;
+        }
+
+        /**
+         * @brief Wait at a named decode GPU graph-capture lifecycle boundary.
+         *
+         * Segmented decode capture has the same multi-device lifecycle hazard as
+         * prefill capture: no participant may enter HIP/CUDA beginCapture()
+         * while a sibling is still preparing or draining its capture stream.
+         * Hosts that own a LocalTP domain should route this to that domain's
+         * graph-capture boundary rendezvous.
+         */
+        virtual bool waitAtDecodeGraphCaptureBoundary(
+            const ForwardInput &input,
+            DeviceId execution_device,
+            const std::string &boundary_name)
+        {
+            (void)input;
+            (void)execution_device;
+            (void)boundary_name;
+            return true;
+        }
+
         /** Whether the current forward graph must materialize logits for every input row. */
         virtual bool computeAllPositionLogitsEnabled() const { return false; }
 
@@ -704,10 +750,10 @@ namespace llaminar2
          * re-coherence.  When @p preserve_replay_safe_segmented_captures is true,
          * single-token decode and all-position verifier segment captures survive
          * the request reset because their device inputs are rebound/refreshed
-         * before every launch. Exact and bucketed prefill graph-cache state also
-         * uses the preserving reset path: ready entries may replay from refreshed
-         * graph-facing buffers, while warmup-only entries are demoted to
-         * lazy-initialized state and must capture on a later request. Multi-token
+         * before every launch. Exact and bucketed prefill cache state also uses
+         * the preserving reset path so parity and serving can keep the captured
+         * prefill fast path warm; request-local monolithic prefill graph-cache
+         * executables are demoted separately by PrefillGraphCache. Multi-token
          * ordinary decode replay state is still discarded.
          */
         ReplayStateResetSummary resetSessionReplayState(
@@ -723,6 +769,19 @@ namespace llaminar2
          */
         void forEachCachedStage(ComputeStageType type,
                                 const std::function<void(IComputeStage *)> &visitor) const;
+
+        /**
+         * @brief Visit every stage across all valid cached forward graphs.
+         *
+         * This is used for lifecycle boundaries that apply to stage-owned
+         * metadata regardless of stage type, such as invalidating handles into
+         * backend kernel-dynamic state after KernelFactory resets its dynamic
+         * tables. The cached ComputeGraphs remain valid; only the visited
+         * stage's own dynamic handles are expected to change.
+         *
+         * @param visitor Callback receiving each cached IComputeStage pointer.
+         */
+        void forEachCachedStage(const std::function<void(IComputeStage *)> &visitor) const;
 
         /**
          * @brief Return diagnostic prefill graph cache state for a cached forward signature.

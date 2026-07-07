@@ -888,12 +888,14 @@ namespace
         moe->setGPUStream(stream);
         auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
         EXPECT_NE(workspace_consumer, nullptr);
+        const int workspace_num_experts = std::max(num_experts, routed_num_experts);
+        const int workspace_top_k = std::max(top_k, routed_top_k);
         auto reqs = llaminar2::MoEWorkspaceBuffers::rocmMoE(
             /*max_seq_len=*/4,
             d_model,
             intermediate,
-            num_experts,
-            top_k);
+            workspace_num_experts,
+            workspace_top_k);
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             device,
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
@@ -1090,6 +1092,12 @@ namespace
         EXPECT_TRUE(serial_stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
 
         auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
+        reqs.merge(llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            rows,
+            d_model,
+            intermediate,
+            /*num_experts=*/256,
+            /*top_k=*/8));
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             device,
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
@@ -1231,6 +1239,12 @@ namespace
         EXPECT_TRUE(serial_stage_b.usesCPUDecodeEquivalentVerifierPrefillForTesting());
 
         auto reqs = serial_stage_a.getWorkspaceRequirements(rows, d_model, intermediate);
+        reqs.merge(llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            rows,
+            d_model,
+            intermediate,
+            /*num_experts=*/256,
+            /*top_k=*/8));
         auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
             device,
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
@@ -1282,6 +1296,266 @@ namespace
             0.0,
             0.0,
             serial_ms,
+            metrics};
+    }
+
+    /**
+     * @brief Exercise the non-grouped M=1 shared-FFN verifier fallback.
+     *
+     * Phase-split MTP verifier graphs set
+     * `SharedExpertFFNStage::Params::disable_grouped_decode_shortcut` so that
+     * the sidecar does not reuse the normal one-token grouped shared-expert
+     * shortcut as its verifier oracle.  This focused case keeps the fixture
+     * small while proving that the plain one-row prepared-GEMM path remains
+     * finite and decode-equivalent for sidecar-style inputs.
+     */
+    BenchResult runROCmSharedExpertStageM1DisabledShortcutCase(
+        const QuantFormatCase &format)
+    {
+        constexpr int rows = 1;
+        constexpr int d_model = 2048;
+        constexpr int intermediate = 512;
+        const auto device = llaminar2::DeviceId::rocm(0);
+
+        EXPECT_EQ(hipSetDevice(0), hipSuccess);
+        hipStream_t stream = nullptr;
+        EXPECT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+        auto gate_w = format.create(
+            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 8101);
+        auto up_w = format.create(
+            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 8102);
+        auto down_w = format.create(
+            {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 8103);
+        auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
+            gate_w.get(),
+            up_w.get(),
+            down_w.get(),
+            device,
+            std::string("perf.moe_verifier.rocm.shared_stage.m1_disabled.") + format.name,
+            llaminar2::ModelContextId{392000});
+
+        const auto hidden_values = makeHiddenValues(rows, d_model);
+        auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
+        auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        auto disabled_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
+        EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(disabled_output->ensureOnDevice(device, stream));
+
+        auto make_params = [&](llaminar2::TensorBase *output,
+                               bool disable_grouped_decode_shortcut)
+        {
+            llaminar2::SharedExpertFFNStage::Params params;
+            params.device_id = device;
+            params.input = hidden.get();
+            params.gate_w = gate_w.get();
+            params.up_w = up_w.get();
+            params.down_w = down_w.get();
+            params.output = output;
+            params.seq_len = rows;
+            params.d_model = d_model;
+            params.intermediate = intermediate;
+            params.prepared_ref_gate = prepared.gate_ref;
+            params.prepared_ref_up = prepared.up_ref;
+            params.prepared_ref_down = prepared.down_ref;
+            params.prepared_store = prepared.store.get();
+            params.disable_grouped_decode_shortcut =
+                disable_grouped_decode_shortcut;
+            return params;
+        };
+
+        llaminar2::SharedExpertFFNStage grouped_stage(
+            make_params(grouped_output.get(), false));
+        llaminar2::SharedExpertFFNStage disabled_stage(
+            make_params(disabled_output.get(), true));
+        grouped_stage.setGPUStream(stream);
+        disabled_stage.setGPUStream(stream);
+        EXPECT_FALSE(disabled_stage.usesGroupedDecodeForTesting());
+
+        auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
+        reqs.merge(disabled_stage.getWorkspaceRequirements(rows, d_model, intermediate));
+        reqs.merge(llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            rows,
+            d_model,
+            intermediate,
+            /*num_experts=*/256,
+            /*top_k=*/8));
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        grouped_stage.bindWorkspace(workspace.get());
+        disabled_stage.bindWorkspace(workspace.get());
+
+        llaminar2::testing::MockDeviceContext ctx(
+            device, llaminar2::ComputeBackendType::GPU_ROCM);
+        EXPECT_TRUE(grouped_stage.execute(&ctx));
+        EXPECT_TRUE(disabled_stage.execute(&ctx));
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        grouped_output->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        disabled_output->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        std::vector<float> grouped(
+            grouped_output->data(),
+            grouped_output->data() + grouped_output->numel());
+        std::vector<float> disabled(
+            disabled_output->data(),
+            disabled_output->data() + disabled_output->numel());
+        CloseMetrics metrics =
+            compareVectors(disabled, grouped, static_cast<size_t>(d_model));
+
+        grouped_stage.unbindWorkspace();
+        disabled_stage.unbindWorkspace();
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+        return BenchResult{
+            "rocm",
+            std::string("shared_stage_ffn_m1_disabled_shortcut_") + format.name,
+            rows,
+            1,
+            1,
+            d_model,
+            intermediate,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            metrics};
+    }
+
+    /**
+     * @brief Exercise production's M=1 grouped-verifier shared-FFN route.
+     *
+     * The Qwen3.6 MoE MTP sidecar sets both verifier-facing knobs on
+     * `SharedExpertFFNStage`: it disables the ordinary grouped decode shortcut
+     * and asks for grouped verifier prefill when the backend advertises that
+     * capability.  The older stage tests covered M=2..4, but the prefix-cache
+     * restore path starts with a single sidecar row.  This regression keeps
+     * that exact row count and verifies that the stage refuses to route M=1
+     * into the grouped verifier kernel, whose contract starts at M=2.
+     */
+    BenchResult runROCmSharedExpertStageM1GroupedVerifierCase(
+        const QuantFormatCase &format)
+    {
+        constexpr int rows = 1;
+        constexpr int d_model = 2048;
+        constexpr int intermediate = 512;
+        const auto device = llaminar2::DeviceId::rocm(0);
+
+        EXPECT_EQ(hipSetDevice(0), hipSuccess);
+        hipStream_t stream = nullptr;
+        EXPECT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+        auto gate_w = format.create(
+            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 8201);
+        auto up_w = format.create(
+            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 8202);
+        auto down_w = format.create(
+            {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 8203);
+        auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
+            gate_w.get(),
+            up_w.get(),
+            down_w.get(),
+            device,
+            std::string("perf.moe_verifier.rocm.shared_stage.m1_grouped_verifier.") + format.name,
+            llaminar2::ModelContextId{393000});
+
+        const auto hidden_values = makeHiddenValues(rows, d_model);
+        auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
+        auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        auto reference_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
+        EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(reference_output->ensureOnDevice(device, stream));
+
+        auto make_params = [&](llaminar2::TensorBase *output,
+                               bool grouped_verifier)
+        {
+            llaminar2::SharedExpertFFNStage::Params params;
+            params.device_id = device;
+            params.input = hidden.get();
+            params.gate_w = gate_w.get();
+            params.up_w = up_w.get();
+            params.down_w = down_w.get();
+            params.output = output;
+            params.seq_len = rows;
+            params.d_model = d_model;
+            params.intermediate = intermediate;
+            params.prepared_ref_gate = prepared.gate_ref;
+            params.prepared_ref_up = prepared.up_ref;
+            params.prepared_ref_down = prepared.down_ref;
+            params.prepared_store = prepared.store.get();
+            params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
+            params.disable_grouped_decode_shortcut = true;
+            return params;
+        };
+
+        llaminar2::SharedExpertFFNStage grouped_stage(
+            make_params(grouped_output.get(), true));
+        llaminar2::SharedExpertFFNStage reference_stage(
+            make_params(reference_output.get(), false));
+        grouped_stage.setGPUStream(stream);
+        reference_stage.setGPUStream(stream);
+        EXPECT_FALSE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
+        EXPECT_FALSE(grouped_stage.usesGroupedDecodeForTesting());
+        EXPECT_FALSE(reference_stage.usesGroupedVerifierPrefillRouteForTesting());
+        EXPECT_FALSE(reference_stage.usesGroupedDecodeForTesting());
+
+        auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
+        reqs.merge(reference_stage.getWorkspaceRequirements(rows, d_model, intermediate));
+        reqs.merge(llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            rows,
+            d_model,
+            intermediate,
+            /*num_experts=*/256,
+            /*top_k=*/8));
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        grouped_stage.bindWorkspace(workspace.get());
+        reference_stage.bindWorkspace(workspace.get());
+
+        llaminar2::testing::MockDeviceContext ctx(
+            device, llaminar2::ComputeBackendType::GPU_ROCM);
+        EXPECT_TRUE(grouped_stage.execute(&ctx));
+        EXPECT_TRUE(reference_stage.execute(&ctx));
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        grouped_output->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        reference_output->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        std::vector<float> grouped(
+            grouped_output->data(),
+            grouped_output->data() + grouped_output->numel());
+        std::vector<float> reference(
+            reference_output->data(),
+            reference_output->data() + reference_output->numel());
+        CloseMetrics metrics =
+            compareVectors(grouped, reference, static_cast<size_t>(d_model));
+
+        grouped_stage.unbindWorkspace();
+        reference_stage.unbindWorkspace();
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+        return BenchResult{
+            "rocm",
+            std::string("shared_stage_ffn_m1_grouped_verifier_") + format.name,
+            rows,
+            1,
+            1,
+            d_model,
+            intermediate,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             metrics};
     }
 }
@@ -1397,6 +1671,38 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M234_SharedExpertFFNStageSerialOnlyAllCodebo
             printResult(serial);
         }
     }
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M1_SharedExpertFFNStageDisabledGroupedDecodeFinite)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    const QuantFormatCase &format = sharedExpertPreparedFormatCase("IQ3_S");
+    auto shared = runROCmSharedExpertStageM1DisabledShortcutCase(format);
+    expectClose(shared.metrics);
+    printResult(shared);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M1_SharedExpertFFNStageGroupedVerifierDecodeEquivalent)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    const QuantFormatCase &format = sharedExpertPreparedFormatCase("IQ3_S");
+    auto shared = runROCmSharedExpertStageM1GroupedVerifierCase(format);
+    expectClose(shared.metrics);
+    printResult(shared);
 #endif
 }
 

@@ -799,7 +799,7 @@ public:
         restore_dst_state = dst_state;
         restore_row = row;
         restore_stream = stream;
-        return capture_workspace != nullptr && dst_state != nullptr;
+        return capture_workspace != nullptr && (dst_state != nullptr || stream != nullptr);
     }
 
     bool restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -885,7 +885,7 @@ public:
         restore_dst_state = dst_state;
         restore_row = row;
         restore_stream = stream;
-        return capture_workspace != nullptr && dst_state != nullptr;
+        return capture_workspace != nullptr && (dst_state != nullptr || stream != nullptr);
     }
 
     bool restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -1169,6 +1169,57 @@ TEST(Test__GDNKernels, ShortConvPublicationRestoreUsesStageOwnedCPUCaptureAfterS
     EXPECT_EQ(kernel.restore_stream, fake_stream);
 }
 
+TEST(Test__GDNKernels, ShortConvGpuScalarPublicationDoesNotPassHostMirrorToBackend)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingShortConvolution kernel;
+    std::vector<float> conv_state(48, 0.0f);
+
+    ShortConv1dStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cuda(0);
+    verifier_p.seq_len = 2;
+    verifier_p.channels = 16;
+    verifier_p.kernel_size = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.conv_state = conv_state.data();
+    verifier_p.kernel = &kernel;
+
+    ShortConv1dStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+
+    /*
+     * The fake kernel records pointer handoff only; using a CPU workspace keeps
+     * the unit test free of CUDA allocation while still exercising the GPU
+     * branch selected by verifier_p.device_id.
+     */
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+
+    ShortConv1dStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    ShortConv1dStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    void *fake_stream = verifier_capture;
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, fake_stream));
+    EXPECT_EQ(kernel.restore_row_calls, 1);
+    EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
+        << "GPU publication must rebind this verifier graph's capture slots.";
+    EXPECT_EQ(kernel.restore_dst_state, nullptr)
+        << "GPU scalar publication must not ask the backend to refresh a host "
+           "GDN mirror from a LocalTP worker thread.";
+    EXPECT_EQ(kernel.restore_row, 1);
+    EXPECT_EQ(kernel.restore_stream, fake_stream);
+}
+
 TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
 {
     ensureCPUBackendForWorkspace();
@@ -1276,6 +1327,59 @@ TEST(Test__GDNKernels, RecurrencePublicationRestoreUsesStageOwnedCPUCaptureAfter
         << "Device-indexed publication restores backend-owned live state only; "
            "host mirror refresh must stay out of the hot path.";
     EXPECT_EQ(kernel.restore_device_index, &device_row_index);
+    EXPECT_EQ(kernel.restore_stream, fake_stream);
+}
+
+TEST(Test__GDNKernels, RecurrenceGpuScalarPublicationDoesNotPassHostMirrorToBackend)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+    std::vector<float> recurrence_state(32, 0.0f);
+
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cuda(0);
+    verifier_p.seq_len = 2;
+    verifier_p.n_heads = 2;
+    verifier_p.n_k_heads = 2;
+    verifier_p.d_k = 4;
+    verifier_p.d_v = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.recurrence_state = recurrence_state.data();
+    verifier_p.kernel = &kernel;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+
+    /*
+     * This is a contract test for the stage-to-kernel call shape, not a CUDA
+     * memory test. A CPU workspace provides stable fake capture slots while the
+     * CUDA DeviceId forces the GPU scalar publication branch.
+     */
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+
+    GDNRecurrenceStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    void *fake_stream = verifier_capture;
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, fake_stream));
+    EXPECT_EQ(kernel.restore_row_calls, 1);
+    EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
+        << "GPU publication must rebind this verifier graph's capture slots.";
+    EXPECT_EQ(kernel.restore_dst_state, nullptr)
+        << "GPU scalar publication must not ask the backend to refresh a host "
+           "GDN mirror from a LocalTP worker thread.";
+    EXPECT_EQ(kernel.restore_row, 1);
     EXPECT_EQ(kernel.restore_stream, fake_stream);
 }
 

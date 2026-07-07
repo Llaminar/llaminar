@@ -176,6 +176,16 @@ namespace llaminar2
             return static_cast<uint32_t>(parsed);
         }
 
+        uint32_t parsePositiveUint32Value(const std::string &value, const std::string &option_name)
+        {
+            const uint32_t parsed = parseNonNegativeUint32Value(value, option_name);
+            if (parsed == 0u)
+            {
+                throw std::invalid_argument(option_name + " must be greater than zero");
+            }
+            return parsed;
+        }
+
         size_t parseMegabytesToBytes(const std::string &value, const std::string &option_name)
         {
             constexpr size_t MiB = 1024ull * 1024ull;
@@ -303,6 +313,15 @@ namespace llaminar2
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
             }
+            else if (normalized_key == "rebalance_prefill_window_tokens" ||
+                     normalized_key == "rebalance_prefill_window")
+            {
+                config.moe_rebalance.prefill_window_tokens = std::stoi(value);
+                if (config.moe_rebalance.prefill_window_tokens < 0)
+                {
+                    throw std::invalid_argument("moe.rebalance_prefill_window_tokens must be >= 0");
+                }
+            }
             else if (normalized_key == "dynamic_imbalance_threshold_permille")
             {
                 config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
@@ -363,6 +382,30 @@ namespace llaminar2
             {
                 config.moe_rebalance.device_max_post_wave_load_spread_per_mille =
                     parseNonNegativeUint32Value(value, "moe.device_max_post_wave_load_spread_permille");
+            }
+            else if (normalized_key == "device_llep_alpha_numerator")
+            {
+                config.moe_rebalance.device_llep_alpha_numerator =
+                    parsePositiveUint32Value(value, "moe.device_llep_alpha_numerator");
+            }
+            else if (normalized_key == "device_llep_alpha_denominator")
+            {
+                config.moe_rebalance.device_llep_alpha_denominator =
+                    parsePositiveUint32Value(value, "moe.device_llep_alpha_denominator");
+            }
+            else if (normalized_key == "device_llep_lambda_numerator")
+            {
+                config.moe_rebalance.device_llep_lambda_numerator =
+                    parsePositiveUint32Value(value, "moe.device_llep_lambda_numerator");
+            }
+            else if (normalized_key == "device_llep_lambda_denominator")
+            {
+                config.moe_rebalance.device_llep_lambda_denominator =
+                    parsePositiveUint32Value(value, "moe.device_llep_lambda_denominator");
+            }
+            else if (normalized_key == "device_llep_enable_balanced_skip")
+            {
+                config.moe_rebalance.device_llep_enable_balanced_skip = parseBoolValue(value);
             }
             else if (normalized_key == "release_raw_expert_weights")
             {
@@ -449,6 +492,10 @@ namespace llaminar2
                 if (!parsed)
                     throw std::invalid_argument("Invalid mtp verify_mode: '" + value + "'");
                 config.mtp.verify_mode = *parsed;
+            }
+            else if (key == "mirror_full_head_for_local_tp")
+            {
+                config.mtp.mirror_full_head_for_local_tp = parseBoolValue(value);
             }
             else if (key == "require_terminal_hidden_for_full_hit")
             {
@@ -1550,6 +1597,22 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--moe-rebalance-prefill-window",
+            .aliases = {"--moe-llep-prefill-window"},
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Fixed request-local LLEP prefill assignment window; 0 keeps the historical single prefill transaction unless prefix cache supplies a block boundary",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.prefill_window_tokens = std::stoi(v);
+                    if (c.moe_rebalance.prefill_window_tokens < 0)
+                    {
+                        throw std::invalid_argument("--moe-rebalance-prefill-window must be >= 0");
+                    }
+                }),
+        });
+        spec.add({
             .long_name = "--moe-dynamic-imbalance-threshold-permille",
             .category = "MoE Configuration",
             .value_label = "<n>",
@@ -1689,6 +1752,64 @@ namespace llaminar2
                         parseNonNegativeUint32Value(
                             v,
                             "--moe-device-rebalance-max-post-wave-load-spread-permille");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-llep-alpha-numerator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Least-loaded EP device capacity alpha numerator (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_llep_alpha_numerator =
+                        parsePositiveUint32Value(v, "--moe-device-llep-alpha-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-llep-alpha-denominator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Least-loaded EP device capacity alpha denominator (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_llep_alpha_denominator =
+                        parsePositiveUint32Value(v, "--moe-device-llep-alpha-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-llep-lambda-numerator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Least-loaded EP balanced-skip lambda numerator (default: 13)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_llep_lambda_numerator =
+                        parsePositiveUint32Value(v, "--moe-device-llep-lambda-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-llep-lambda-denominator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Least-loaded EP balanced-skip lambda denominator (default: 10)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_llep_lambda_denominator =
+                        parsePositiveUint32Value(v, "--moe-device-llep-lambda-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-llep-disable-balanced-skip",
+            .category = "MoE Configuration",
+            .description = "Require LLEP assignment planning even when standard EP is load-balanced",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.moe_rebalance.device_llep_enable_balanced_skip = false;
                 }),
         });
         spec.add({
@@ -2075,6 +2196,16 @@ namespace llaminar2
                             "' (valid: greedy, speculative-sampling)");
                     }
                     c.mtp.verify_mode = *parsed;
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-mirror-full-head-local-tp",
+            .category = "MTP",
+            .description = "Mirror the full MTP verifier LM head on each LocalTP device instead of sampling a vocab shard collective",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.mtp.mirror_full_head_for_local_tp = true;
                 }),
         });
         spec.add({
@@ -2851,6 +2982,15 @@ namespace llaminar2
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
             }
+            else if (normalized_key == "moe_rebalance_prefill_window" ||
+                     normalized_key == "moe_rebalance_prefill_window_tokens")
+            {
+                config.moe_rebalance.prefill_window_tokens = std::stoi(value);
+                if (config.moe_rebalance.prefill_window_tokens < 0)
+                {
+                    throw std::invalid_argument("moe_rebalance_prefill_window_tokens must be >= 0");
+                }
+            }
             else if (normalized_key == "moe_dynamic_imbalance_threshold_permille")
             {
                 config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
@@ -2915,6 +3055,30 @@ namespace llaminar2
                     parseNonNegativeUint32Value(
                         value,
                         "moe_device_rebalance_max_post_wave_load_spread_permille");
+            }
+            else if (normalized_key == "moe_device_llep_alpha_numerator")
+            {
+                config.moe_rebalance.device_llep_alpha_numerator =
+                    parsePositiveUint32Value(value, "moe_device_llep_alpha_numerator");
+            }
+            else if (normalized_key == "moe_device_llep_alpha_denominator")
+            {
+                config.moe_rebalance.device_llep_alpha_denominator =
+                    parsePositiveUint32Value(value, "moe_device_llep_alpha_denominator");
+            }
+            else if (normalized_key == "moe_device_llep_lambda_numerator")
+            {
+                config.moe_rebalance.device_llep_lambda_numerator =
+                    parsePositiveUint32Value(value, "moe_device_llep_lambda_numerator");
+            }
+            else if (normalized_key == "moe_device_llep_lambda_denominator")
+            {
+                config.moe_rebalance.device_llep_lambda_denominator =
+                    parsePositiveUint32Value(value, "moe_device_llep_lambda_denominator");
+            }
+            else if (normalized_key == "moe_device_llep_enable_balanced_skip")
+            {
+                config.moe_rebalance.device_llep_enable_balanced_skip = parseBoolValue(value);
             }
             else if (normalized_key == "moe_release_raw_expert_weights")
             {

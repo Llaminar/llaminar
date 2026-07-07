@@ -1204,7 +1204,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
     config.domain_definitions.push_back(DomainDefinition::parse(
         "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
     config.domain_definitions.push_back(DomainDefinition::parse(
-        "cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;owner=0"));
+        "cpu_cold=0:cpu:0,2:cpu:0;scope=local;backend=upi;owner=0"));
 
     EXPECT_THROW(
         (void)builder->buildAllPlans(config, model, cluster),
@@ -1212,6 +1212,32 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
         << "Explicit domains must fail at planning time when a participant "
            "is absent from the cluster inventory; otherwise execution can "
            "build null collective participants and crash later.";
+}
+
+/**
+ * @brief Single-rank local execution owns every detected CPU NUMA participant.
+ *
+ * Explicit one-process expert-overlay tests use CPU LocalTP to model a cold
+ * same-host tier.  In that topology, cpu:0 and cpu:1 are two local NUMA
+ * participants served by rank 0, not missing remote ranks.  This regression
+ * keeps the inventory resolver from rejecting the second socket before the
+ * runtime can build the intended local CPU TP domain.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainSingleRankCpuLocalTPResolvesLocalNuma)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_cold=0:cpu:0,1:cpu:0;scope=local;backend=upi;owner=0"));
+
+    std::vector<RankExecutionPlan> plans;
+    ASSERT_NO_THROW(plans = builder->buildAllPlans(config, model, cluster));
+    ASSERT_EQ(plans.size(), 1u);
 }
 
 TEST_F(Test__ExecutionPlanBuilder, BuildPlan_EmptyInventory_FallsBackToCPU)

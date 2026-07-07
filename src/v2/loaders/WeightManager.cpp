@@ -42,6 +42,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <regex>
+#include <sstream>
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -524,8 +525,7 @@ namespace llaminar2
         if (!tensor || !weight_metadata_)
             return;
 
-        if (!weight_metadata_->has(tensor.get()))
-            weight_metadata_->registerSource(tensor.get(), name, device);
+        weight_metadata_->registerSource(tensor.get(), name, device);
 
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::SourceLoad,
@@ -1761,19 +1761,24 @@ namespace llaminar2
             {
                 if (auto metadata = weight_metadata_->metadata(tensor.get()))
                 {
+                    /*
+                     * Tensor metadata owns physical facts such as slice and
+                     * residency.  The WeightPlan owns graph binding identity:
+                     * canonical name, role, layer, expert, and TP/PP ownership.
+                     * Keeping that boundary strict prevents stale pointer-keyed
+                     * metadata from reclassifying a freshly materialized global
+                     * binding after a previous runner has been destroyed.
+                     */
                     binding.identity = metadata->identity;
                     binding.identity.canonical_name = requirement.canonical_name;
                     binding.identity.model_id = plan.strategy().model_id;
+                    binding.identity.logical_id = stableWeightLogicalId(requirement.canonical_name);
                     binding.identity.role = requirement.role == WeightRole::Other
-                                                ? metadata->identity.role
+                                                ? inferWeightRole(requirement.canonical_name)
                                                 : requirement.role;
                     binding.identity.derivation = requirement.derivation;
-                    binding.identity.layer = requirement.layer >= 0
-                                                 ? requirement.layer
-                                                 : metadata->identity.layer;
-                    binding.identity.expert = requirement.expert >= 0
-                                                  ? requirement.expert
-                                                  : metadata->identity.expert;
+                    binding.identity.layer = requirement.layer;
+                    binding.identity.expert = requirement.expert;
                     binding.identity.pp_stage = requirement.pp_stage;
                     binding.identity.tp_domain = requirement.tp_domain;
                     binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
@@ -4324,6 +4329,7 @@ namespace llaminar2
                 size_t tensor_expert_start = 0;
                 size_t global_expert_start = 0;
                 size_t expert_count = 0;
+                bool inner_is_presliced = false;
             };
             struct MoELayerTensors
             {
@@ -4355,6 +4361,7 @@ namespace llaminar2
                 source.owner = std::move(owner);
                 source.tensor = tensor;
                 source.name = name;
+                source.inner_is_presliced = slice.inner_is_presliced;
 
                 /**
                  * Expert-parallel LocalTP freezes a tensor that already contains
@@ -4542,7 +4549,36 @@ namespace llaminar2
                         const size_t tensor_expert_idx = rt.source->tensor_expert_start + local_idx;
                         const size_t element_offset = tensor_expert_idx * role_elements_per_expert;
                         std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
-                        auto view = rt.source->tensor->create_view(view_shape, element_offset);
+                        std::shared_ptr<TensorBase> view;
+                        try
+                        {
+                            view = rt.source->tensor->create_view(view_shape, element_offset);
+                        }
+                        catch (const std::exception &e)
+                        {
+                            std::ostringstream oss;
+                            oss << "[WeightManager] GPU pipeline: failed to create expert view for layer "
+                                << layer_idx << " " << rt.tag
+                                << " global_expert=" << global_expert
+                                << " tensor_expert_idx=" << tensor_expert_idx
+                                << " tensor_expert_start=" << rt.source->tensor_expert_start
+                                << " global_expert_start=" << rt.source->global_expert_start
+                                << " local_idx=" << local_idx
+                                << " expert_count=" << rt.source->expert_count
+                                << " tensor_shape=[";
+                            for (size_t i = 0; i < role_shape.size(); ++i)
+                            {
+                                if (i != 0)
+                                    oss << ",";
+                                oss << role_shape[i];
+                            }
+                            oss << "] view_shape=[" << role_rows_per_expert << "," << role_cols
+                                << "] offset_elements=" << element_offset
+                                << " slice_inner_is_presliced="
+                                << (rt.source->inner_is_presliced ? "true" : "false")
+                                << ": " << e.what();
+                            throw std::runtime_error(oss.str());
+                        }
                         if (!view)
                         {
                             throw std::runtime_error(

@@ -14,13 +14,12 @@
  *   Fix: Changed collective stages to CoherencePolicy::OUTPUT.
  *
  * **Bug 2 — Stale completion event after flags-only dirty marking**:
- *   For intermediate pipeline stages, DeviceGraphExecutor uses
- *   markOutputsDirtyFlagsOnly() which does NOT update device_completion_event_.
- *   If a preceding stage recorded an event, that stale event persisted.
- *   When ensureOnHost() was called, it waited on the stale event (from the
- *   WRONG operation) and proceeded with D2H transfer before the allreduce
- *   had actually completed. Fix: TPAllreduceStage::execute() now calls
- *   transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stage_stream) after the collective operation.
+ *   For intermediate pipeline stages and graph replay, flags-only dirty marking
+ *   intentionally avoids recording a new device completion event. If a preceding
+ *   stage recorded an event, that old event must be invalidated; otherwise
+ *   ensureOnHost() can wait on the wrong producer and race the actual write.
+ *   Fix: flags-only DEVICE_AUTHORITATIVE transitions clear the old completion
+ *   event so readback falls back to full device synchronization.
  *
  * **Test Strategy**:
  *   Unit tests use MockCoherenceTensor (exposing protected coherence state)
@@ -234,19 +233,13 @@ TEST_F(Test__StreamCoherence, GEMMStage_CoherencePolicy_IsFull)
 // Test Suite: DirtyMarkingBehavior
 // =============================================================================
 //
-// Tests for Bug 2: transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) does NOT update the
-// completion event, while mark_device_dirty_with_event() DOES.
-// This distinction is critical for correct GPU→CPU synchronization.
+// Tests for Bug 2: transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE)
+// represents a flags-only GPU write. It must not record a new completion event,
+// and it must invalidate any stale event from a previous producer.
 // =============================================================================
 
-TEST_F(Test__StreamCoherence, FlagsOnly_PreservesStaleCompletionEvent)
+TEST_F(Test__StreamCoherence, FlagsOnly_ClearsStaleCompletionEvent)
 {
-    // CRITICAL: transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) must NOT clear
-    // device_completion_event_. If it did, subsequent ensureOnHost()
-    // would fall back to full device sync (slow but correct).
-    // The real bug is that it PRESERVES a stale event from a PREVIOUS
-    // operation, causing ensureOnHost() to wait on the wrong point.
-
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 64}, DeviceId::cpu());
 
@@ -257,9 +250,8 @@ TEST_F(Test__StreamCoherence, FlagsOnly_PreservesStaleCompletionEvent)
     // Call flags-only dirty marking (what the executor does for intermediate stages)
     tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
-    // The stale event MUST still be there — this is the root cause of Bug 2
-    EXPECT_EQ(tensor->getCompletionEvent(), stale_event)
-        << "transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) must not modify device_completion_event_";
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr)
+        << "Flags-only DEVICE_AUTHORITATIVE must clear stale completion events";
 
     // Verify the dirty flags were set correctly
     EXPECT_TRUE(tensor->getDeviceValid());
@@ -393,15 +385,13 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirty_MultipleOutputs)
     EXPECT_EQ(tensor2->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 }
 
-TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_PreservesExistingEvent)
+TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_ClearsExistingEvent)
 {
     // Regression test for the exact Bug 2 scenario:
     // 1. Tensor has a stale event from a previous operation
     // 2. markOutputsDirtyFlagsOnly() is called (intermediate stage)
-    // 3. The stale event MUST persist (it's NOT cleared by flags-only)
-    //
-    // Without the fix in TPAllreduceStage (calling mark_device_dirty_with_event
-    // explicitly), ensureOnHost() would wait on this stale event.
+    // 3. The stale event must be cleared so host readback does not wait on the
+    //    wrong producer.
 
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 64}, DeviceId::cpu());
@@ -415,8 +405,8 @@ TEST_F(Test__StreamCoherence, MarkOutputsDirtyFlagsOnly_PreservesExistingEvent)
 
     markOutputsDirtyFlagsOnly(outputs);
 
-    // Stale event persists — this is the behavior that caused Bug 2
-    EXPECT_EQ(tensor->getCompletionEvent(), stale_event);
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr)
+        << "Flags-only output marking must invalidate older completion events";
 
     // Virtual method must NOT have been called
 }
@@ -586,16 +576,15 @@ TEST_F(Test__StreamCoherence, Bug2Scenario_StaleEventLifecycle)
 {
     // This test simulates the exact sequence of operations that caused Bug 2:
     //
-    // 1. Stage A (GEMM) runs, executor marks output with flags-only (intermediate)
-    //    → No event recorded, but if tensor had a prior event, it persists
+    // 1. Stage A (GEMM) runs, executor marks output with flags-only
+    //    → No event recorded, and any prior event is cleared
     //
-    // 2. Stage B (TPAllreduce) runs, executor marks output with flags-only (OUTPUT policy)
-    //    → Bug: stale event from step 0 persists
-    //    → Fix: TPAllreduceStage::execute() calls mark_device_dirty_with_event()
+    // 2. Stage B (TPAllreduce) records its own event when it owns a host-visible
+    //    completion boundary
     //
     // 3. Host reads data via data() → calls ensureOnHost()
-    //    → Bug: waits on stale event (too early), gets pre-allreduce data
-    //    → Fix: waits on allreduce's event, gets post-allreduce data
+    //    → Reads after flags-only writes full-sync; reads after event-backed
+    //      writes wait on the new event.
 
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 896}, DeviceId::cpu());
@@ -609,9 +598,8 @@ TEST_F(Test__StreamCoherence, Bug2Scenario_StaleEventLifecycle)
     gemm_outputs.push_back(makeBuffer(tensor.get(), "gemm_output"));
     markOutputsDirtyFlagsOnly(gemm_outputs);
 
-    // Verify: stale event persists (this is expected, and the source of the bug)
-    EXPECT_EQ(tensor->getCompletionEvent(), prior_event)
-        << "After flags-only marking, stale event should persist";
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr)
+        << "After flags-only marking, stale event must be cleared";
 
     // Step 2: TPAllreduce stage — the FIX is that the stage itself calls
     // transitionToWithEvent() after the allreduce completes
@@ -628,11 +616,10 @@ TEST_F(Test__StreamCoherence, Bug2Scenario_StaleEventLifecycle)
     // call chain is correct.
 }
 
-TEST_F(Test__StreamCoherence, Bug2Scenario_WithoutFix_StaleEventPersists)
+TEST_F(Test__StreamCoherence, Bug2Scenario_RepeatedFlagsOnlyClearsStaleEvent)
 {
-    // This test shows what WOULD happen without the fix:
-    // markOutputsDirtyFlagsOnly is called twice (GEMM + allreduce),
-    // and the stale event is never replaced.
+    // Repeated flags-only writes should remain eventless. A host readback after
+    // this sequence must full-sync instead of waiting on an old producer event.
 
     auto tensor = std::make_unique<MockCoherenceTensor>(
         std::vector<size_t>{4, 896}, DeviceId::cpu());
@@ -640,17 +627,14 @@ TEST_F(Test__StreamCoherence, Bug2Scenario_WithoutFix_StaleEventPersists)
     void *stale_event = reinterpret_cast<void *>(0x57A1E001);
     tensor->injectCompletionEvent(stale_event);
 
-    // Two consecutive flags-only markings (simulating the bug scenario
-    // where both stages use flags-only)
     std::vector<CoherenceBuffer> outputs;
     outputs.push_back(makeBuffer(tensor.get(), "tensor"));
 
-    markOutputsDirtyFlagsOnly(outputs); // GEMM stage
-    markOutputsDirtyFlagsOnly(outputs); // Allreduce stage (BUG: should use event)
+    markOutputsDirtyFlagsOnly(outputs);
+    markOutputsDirtyFlagsOnly(outputs);
 
-    // Stale event STILL there — this is the bug!
-    EXPECT_EQ(tensor->getCompletionEvent(), stale_event)
-        << "Without the fix: flags-only marking never replaces the stale event";
+    EXPECT_EQ(tensor->getCompletionEvent(), nullptr)
+        << "Repeated flags-only marking must not preserve stale events";
 }
 
 // =============================================================================
@@ -751,6 +735,65 @@ TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_NoEvent_UsesFullSync)
     // destructor needs the mock backend to handle any remaining cleanup.
     mock_backend.free(device_ptr, 0);
     tensor->injectGpuDataPtr(nullptr); // Prevent destructor from trying to free
+}
+
+TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_StaleEventClearedByFlagsOnlyWrite_UsesFullSync)
+{
+    // Regression for graph replay / helper-kernel writes that mark tensors dirty
+    // without recording a fresh completion event. If an older event remains on
+    // the tensor, readback can wait on the wrong producer.
+
+    using namespace llaminar2::test;
+
+    constexpr size_t ROWS = 4;
+    constexpr size_t COLS = 64;
+    auto tensor = std::make_unique<MockCoherenceTensor>(
+        std::vector<size_t>{ROWS, COLS}, DeviceId::cpu());
+
+    MockBackend mock_backend;
+    tensor->setBackendForTesting(&mock_backend);
+    tensor->injectGpuDevice(DeviceId::rocm(0));
+
+    size_t bytes = ROWS * COLS * sizeof(float);
+    void *device_ptr = mock_backend.allocate(bytes, 0);
+    ASSERT_NE(device_ptr, nullptr);
+
+    float *device_floats = static_cast<float *>(device_ptr);
+    for (size_t i = 0; i < ROWS * COLS; i++)
+    {
+        device_floats[i] = static_cast<float>(i) * 0.25f;
+    }
+    tensor->injectGpuDataPtr(device_ptr);
+
+    void *stale_event = reinterpret_cast<void *>(0x57A1E002);
+    tensor->injectCompletionEvent(stale_event);
+    ASSERT_EQ(tensor->getCompletionEvent(), stale_event);
+
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_EQ(tensor->getCompletionEvent(), nullptr)
+        << "flags-only writes must invalidate older completion events";
+
+    mock_backend.resetAll();
+
+    bool result = tensor->ensureOnHost();
+    EXPECT_TRUE(result) << "ensureOnHost should succeed after stale event invalidation";
+
+    EXPECT_EQ(mock_backend.getEventWaitCount(), 0u)
+        << "ensureOnHost must not wait on the stale event";
+    EXPECT_GE(mock_backend.getSyncCount(), 1u)
+        << "ensureOnHost must full-sync when a flags-only write has no event";
+    EXPECT_GE(mock_backend.getD2HCount(), 1u)
+        << "ensureOnHost must perform D2H transfer";
+
+    const float *host_data = tensor->typed_data();
+    for (size_t i = 0; i < std::min<size_t>(8, ROWS * COLS); i++)
+    {
+        EXPECT_FLOAT_EQ(host_data[i], static_cast<float>(i) * 0.25f)
+            << "Data mismatch at index " << i;
+    }
+
+    mock_backend.free(device_ptr, 0);
+    tensor->injectGpuDataPtr(nullptr);
 }
 
 TEST_F(Test__StreamCoherence, Bug6_EnsureOnHost_WithEvent_UsesEventSync)

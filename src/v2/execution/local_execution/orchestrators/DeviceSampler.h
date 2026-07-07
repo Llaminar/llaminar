@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -59,6 +60,21 @@ namespace llaminar2
          */
         static int sampleGreedyFromLocalInfos(const std::vector<LogitsLocalInfo> &infos,
                                               int row = 0);
+
+        /**
+         * @brief Greedy argmax for several contiguous rows across TP shards.
+         *
+         * This preserves sampleGreedyFromLocalInfos() semantics exactly: each
+         * row is reduced locally per shard, then the host selects the global
+         * winner with the same lower-token-id tie break used by serial row
+         * sampling. GPU inputs must be row-contiguous because the backend
+         * batched argmax API has no explicit row-stride parameter.
+         */
+        static bool sampleGreedyRowsFromLocalInfos(
+            const std::vector<LogitsLocalInfo> &infos,
+            int start_row,
+            int row_count,
+            int32_t *out_tokens);
 
         /**
          * @brief GPU-side sampling with top-k/top-p support.

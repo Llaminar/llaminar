@@ -140,8 +140,6 @@ namespace llaminar2
     private:
         Params params_;
         ITensorGemm *cached_gemm_ = nullptr;
-        std::shared_ptr<FP32Tensor> verifier_hidden_row_;
-        std::shared_ptr<FP32Tensor> verifier_logits_row_;
 
         ITensorGemm *resolvePreparedKernel(const char *caller);
         bool executeDecodeEquivalentVerifierPrefill(

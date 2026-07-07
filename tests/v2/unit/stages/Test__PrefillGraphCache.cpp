@@ -1699,7 +1699,7 @@ TEST_F(PrefillGraphCacheGPUTest, InvalidateAll_ResetsReadyEntries)
     EXPECT_EQ(cache.nodeCount(key), 0u);
 }
 
-TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesWarmupToInitializedAndPreservesReadyEntries)
+TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesReadyAndWarmupToInitialized)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -1720,22 +1720,19 @@ TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesWarmupToInitializedAndPreser
     ASSERT_EQ(cache.phase(warmup_key), PrefillGraphPhase::Warmup);
 
     const auto reset = cache.prepareEntriesForRequestReset();
-    EXPECT_EQ(reset.ready_preserved, 1u);
+    EXPECT_EQ(reset.ready_demoted, 1u);
     EXPECT_EQ(reset.initialized, 1u)
         << "Warmup-only entries keep lazy stage/kernel initialization but must lose request-armed capture state.";
     EXPECT_EQ(reset.dropped, 0u);
-    EXPECT_EQ(cache.phase(ready_key), PrefillGraphPhase::Ready);
-    EXPECT_TRUE(cache.hasGraph(ready_key));
-    EXPECT_EQ(cache.replayCount(ready_key), 1);
+    EXPECT_EQ(cache.phase(ready_key), PrefillGraphPhase::Initialized);
+    EXPECT_FALSE(cache.hasGraph(ready_key))
+        << "Request reset must not preserve a launchable prefill executable captured against stale request state.";
+    EXPECT_EQ(cache.replayCount(ready_key), 0);
+    EXPECT_EQ(cache.initializedCount(ready_key), 1u);
     EXPECT_EQ(cache.phase(warmup_key), PrefillGraphPhase::Initialized);
     EXPECT_FALSE(cache.hasGraph(warmup_key));
     EXPECT_EQ(cache.initializedCount(warmup_key), 1u);
     EXPECT_EQ(cache.lastInvalidationReason(), PrefillGraphRejectReason::RequestStateReset);
-
-    gpu_ctx_->submitAndWait([&]
-                            {
-        ASSERT_TRUE(cache.launch(ready_key));
-        EXPECT_EQ(cache.replayCount(ready_key), 2); });
 }
 
 TEST_F(PrefillGraphCacheGPUTest, InitializedEntryCanCaptureAfterStrictReadiness)

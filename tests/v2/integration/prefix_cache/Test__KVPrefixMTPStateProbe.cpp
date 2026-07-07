@@ -9,6 +9,8 @@
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/mtp/MTPStateTransaction.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/PreparedWeightStore.h"
@@ -32,6 +34,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
+#include <iomanip>
 #include <initializer_list>
 #include <iterator>
 #include <memory>
@@ -565,6 +568,515 @@ namespace
             {"LLAMINAR_QWEN36_CUDA_DEVICE", "LLAMINAR_TEST_CUDA_DEVICE"},
             0);
     }
+
+    ExpertComputeDomain qwen36MoELocalTPDomainForProbe(
+        const std::string &name,
+        CollectiveBackendType backend,
+        std::vector<GlobalDeviceAddress> participants)
+    {
+        ExpertComputeDomain domain;
+        domain.name = name;
+        domain.kind = ExpertDomainKind::LocalTP;
+        domain.backend = backend;
+        domain.participants = std::move(participants);
+        domain.owner_rank = 0;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        return domain;
+    }
+
+    ExpertRoutedTier qwen36MoERoutedTierForProbe(
+        const std::string &name,
+        const std::string &domain,
+        int priority,
+        int max_experts_per_layer,
+        size_t memory_budget_bytes)
+    {
+        ExpertRoutedTier tier;
+        tier.name = name;
+        tier.domain = domain;
+        tier.priority = priority;
+        tier.max_experts_per_layer = max_experts_per_layer;
+        tier.memory_budget_bytes = memory_budget_bytes;
+        return tier;
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayRocm2TPHotOnlyForProbe(
+        RoutedExpertAssignmentPolicy assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner)
+    {
+        constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
+
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->continuation_domain = kRocmHotDomain;
+        plan->shared_expert_domain = kRocmHotDomain;
+        plan->domains = {
+            qwen36MoELocalTPDomainForProbe(
+                kRocmHotDomain,
+                CollectiveBackendType::RCCL,
+                {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
+        };
+        plan->domains.front().assignment_policy = assignment_policy;
+        plan->routed_tiers = {
+            qwen36MoERoutedTierForProbe(
+                "hot",
+                kRocmHotDomain,
+                0,
+                256,
+                8ull * 1024ull * 1024ull * 1024ull),
+        };
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+        return plan;
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayCuda2TPHotOnlyForProbe(
+        RoutedExpertAssignmentPolicy assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner)
+    {
+        constexpr const char *kCudaHotDomain = "qwen36_moe_cuda_hot";
+
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->continuation_domain = kCudaHotDomain;
+        plan->shared_expert_domain = kCudaHotDomain;
+        plan->domains = {
+            qwen36MoELocalTPDomainForProbe(
+                kCudaHotDomain,
+                CollectiveBackendType::NCCL,
+                {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
+        };
+        plan->domains.front().assignment_policy = assignment_policy;
+        plan->routed_tiers = {
+            qwen36MoERoutedTierForProbe(
+                "hot",
+                kCudaHotDomain,
+                0,
+                256,
+                8ull * 1024ull * 1024ull * 1024ull),
+        };
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+        return plan;
+    }
+
+    std::string summarizeStateContinuityProbe(
+        const PrefixRuntimeStateSnapshot &probe,
+        size_t layer_limit = 4)
+    {
+        std::ostringstream oss;
+        oss << "pos=" << probe.current_position
+            << " seqs=";
+        for (size_t i = 0; i < probe.sequence_lengths.size(); ++i)
+        {
+            if (i > 0)
+                oss << ",";
+            oss << probe.sequence_lengths[i];
+        }
+        oss << " kv_tokens=" << probe.totalCachedTokens()
+            << " gdn_layers=" << probe.gdn_layers.size()
+            << " prefix_hits=" << probe.prefix_cache_hits
+            << " prefix_partial_hits=" << probe.prefix_cache_partial_hits
+            << " matched_tokens=" << probe.prefix_cache_matched_tokens
+            << " moe_epoch=" << probe.moe_runtime_movement_epoch
+            << " live_epoch=" << probe.live_state_epoch
+            << " live_mutations=" << probe.live_state_mutations;
+
+        size_t emitted = 0;
+        for (const auto &cache : probe.kv_caches)
+        {
+            for (const auto &layer : cache.layers)
+            {
+                if (emitted++ >= layer_limit)
+                    break;
+                oss << " KV" << layer.global_layer
+                    << "/n=" << layer.cached_tokens
+                    << "/k=" << layer.k_payload_hash
+                    << "/v=" << layer.v_payload_hash;
+                for (const auto &segment : layer.segments)
+                {
+                    oss << "/" << segment.name
+                        << "=" << (segment.hash_available ? "h" : "na")
+                        << ":" << segment.k_payload_hash
+                        << ":" << segment.v_payload_hash;
+                }
+            }
+            if (emitted >= layer_limit)
+                break;
+        }
+        return oss.str();
+    }
+
+    GenerationResult decodeGreedyTokens(
+        IOrchestrationRunner &runner,
+        int max_tokens,
+        const char *label)
+    {
+        GenerationResult result;
+        int remaining = max_tokens;
+        while (remaining > 0)
+        {
+            runner.setDecodeStepTokenBudget(remaining);
+            GenerationResult step = runner.decodeStep();
+            runner.setDecodeStepTokenBudget(0);
+            if (!step.error.empty())
+            {
+                result.error = std::string(label) + ": " + step.error;
+                return result;
+            }
+            if (step.tokens.empty())
+            {
+                result.error = std::string(label) + ": decodeStep produced no tokens";
+                return result;
+            }
+            if (static_cast<int>(step.tokens.size()) > remaining)
+            {
+                result.error = std::string(label) + ": decodeStep exceeded token budget";
+                return result;
+            }
+            result.tokens.insert(result.tokens.end(), step.tokens.begin(), step.tokens.end());
+            remaining -= static_cast<int>(step.tokens.size());
+            if (step.is_complete)
+                break;
+        }
+        return result;
+    }
+
+    std::string compactPreview(const std::string &text, size_t limit = 220)
+    {
+        std::ostringstream compact;
+        bool previous_space = false;
+        for (char ch : text)
+        {
+            if (std::isspace(static_cast<unsigned char>(ch)) != 0)
+            {
+                if (!previous_space)
+                    compact << ' ';
+                previous_space = true;
+            }
+            else
+            {
+                compact << ch;
+                previous_space = false;
+            }
+        }
+        std::string value = compact.str();
+        if (value.size() <= limit)
+            return value;
+        if (limit <= 3)
+            return value.substr(0, limit);
+        return value.substr(0, limit - 3) + "...";
+    }
+
+    const std::vector<std::string> &longContextCodeWordsA()
+    {
+        static const std::vector<std::string> words = {
+            "amber", "basil", "cedar", "delta", "ember", "fable",
+            "garnet", "harbor", "iris", "juniper", "kelp", "laurel"};
+        return words;
+    }
+
+    const std::vector<std::string> &longContextCodeWordsB()
+    {
+        static const std::vector<std::string> words = {
+            "atlas", "beacon", "cobalt", "dawn", "elm", "fjord",
+            "grove", "haven", "ion", "jasmine", "keystone", "lagoon"};
+        return words;
+    }
+
+    const std::vector<std::string> &longContextCodeWordsC()
+    {
+        static const std::vector<std::string> words = {
+            "north", "south", "east", "west", "upper", "lower",
+            "inner", "outer", "prime", "quiet", "rapid", "steady"};
+        return words;
+    }
+
+    std::string deterministicLongContextCode(
+        const std::string &name_space,
+        int index)
+    {
+        int seed = 0;
+        for (char ch : name_space)
+            seed += static_cast<unsigned char>(ch);
+
+        const auto &a = longContextCodeWordsA();
+        const auto &b = longContextCodeWordsB();
+        const auto &c = longContextCodeWordsC();
+        return a[(index + seed) % static_cast<int>(a.size())] + " " +
+               b[((index / static_cast<int>(a.size())) + seed) %
+                 static_cast<int>(b.size())] +
+               " " +
+               c[((index / static_cast<int>(a.size() * b.size())) + seed) %
+                 static_cast<int>(c.size())];
+    }
+
+    int longContextRecallRecordCount(
+        int min_prompt_tokens,
+        int context_length,
+        int max_tokens,
+        const std::string &tier)
+    {
+        constexpr int kMinRecallRecords = 32;
+        constexpr int kEstimatedTokensPerRecallRecord = 42;
+        const int safety_margin = std::max(512, context_length / 8);
+        const int prompt_budget =
+            std::max(0, context_length - max_tokens - safety_margin);
+        const int tier_extra_tokens = tier == "full" ? 900 : 360;
+        const double context_bonus_rate = tier == "full" ? 0.18 : 0.10;
+        const int context_bonus_tokens = static_cast<int>(
+            std::min(std::max(0, context_length - 4096), 2048) *
+            context_bonus_rate);
+        const int target_prompt_tokens = std::min(
+            prompt_budget,
+            min_prompt_tokens + tier_extra_tokens + context_bonus_tokens);
+        const int by_prompt_target =
+            target_prompt_tokens / kEstimatedTokensPerRecallRecord;
+        const int by_context_cap =
+            prompt_budget / kEstimatedTokensPerRecallRecord;
+        if (by_context_cap < kMinRecallRecords)
+            return kMinRecallRecords;
+        return std::max(
+            kMinRecallRecords,
+            std::min(by_prompt_target, by_context_cap));
+    }
+
+    std::string longContextAuditRecord(
+        int index,
+        const std::string &code,
+        const std::string &name_space)
+    {
+        const int checksum =
+            1000 + ((index * 37 + static_cast<int>(name_space.size()) * 97) % 9000);
+        const char lane = static_cast<char>('A' + (index % 6));
+        std::ostringstream oss;
+        oss << "Ledger filler " << std::setw(4) << std::setfill('0') << index
+            << ": distractor audit value \"" << code << "\". "
+            << "Lane " << lane << "; checksum " << checksum
+            << "; status normal; this is not the requested value.";
+        return oss.str();
+    }
+
+    struct NeedlePromptForProbe
+    {
+        std::vector<ChatMessage> messages;
+        std::string target_code;
+        std::vector<std::string> distractors;
+        int record_count = 0;
+    };
+
+    NeedlePromptForProbe buildNeedlePromptForProbe(
+        const std::string &placement,
+        int min_prompt_tokens,
+        int context_length,
+        int max_tokens,
+        const std::string &tier)
+    {
+        const int count = longContextRecallRecordCount(
+            min_prompt_tokens,
+            context_length,
+            max_tokens,
+            tier);
+        int target_index = 0;
+        std::string target_key;
+        std::string target_value;
+        if (placement == "beginning")
+        {
+            target_index = std::min(3, count - 1);
+            target_key = "alpha";
+            target_value = "TUNDRA-84QX";
+        }
+        else if (placement == "middle")
+        {
+            target_index = count / 2;
+            target_key = "middle";
+            target_value = "COBALT-27LM";
+        }
+        else
+        {
+            target_index = std::max(0, count - 5);
+            target_key = "omega";
+            target_value = "RIVER-93RN";
+        }
+
+        std::string namespace_suffix = placement.substr(0, 3);
+        std::transform(
+            namespace_suffix.begin(),
+            namespace_suffix.end(),
+            namespace_suffix.begin(),
+            [](unsigned char ch)
+            { return static_cast<char>(std::toupper(ch)); });
+        const std::string name_space = "LCN-" + namespace_suffix;
+
+        std::vector<std::string> records;
+        std::vector<std::string> codes;
+        records.reserve(static_cast<size_t>(count));
+        codes.reserve(static_cast<size_t>(count));
+        for (int index = 0; index < count; ++index)
+        {
+            const std::string code =
+                index == target_index
+                    ? target_value
+                    : deterministicLongContextCode(name_space, index);
+            codes.push_back(code);
+            std::ostringstream row;
+            if (index == target_index)
+            {
+                row << "Ledger item " << std::setw(4) << std::setfill('0') << index
+                    << ": REQUIRED_JSON_FIELD " << target_key
+                    << " has exact value " << code
+                    << ". This is the only requested field.";
+                records.push_back(row.str());
+            }
+            else
+            {
+                records.push_back(longContextAuditRecord(index, code, name_space));
+            }
+        }
+
+        std::vector<std::string> distractors;
+        for (int neighbor : {target_index - 2, target_index - 1,
+                             target_index + 1, target_index + 2})
+        {
+            if (neighbor >= 0 && neighbor < count)
+                distractors.push_back(codes[static_cast<size_t>(neighbor)]);
+        }
+
+        std::ostringstream user_prompt;
+        user_prompt
+            << "Task: read the ledger and return one minified JSON object.\n"
+            << "The only allowed key is answer.\n"
+            << "Only the REQUIRED_JSON_FIELD named " << target_key
+            << " matters for the final answer.\n";
+        for (const auto &record : records)
+            user_prompt << record << "\n";
+        user_prompt
+            << "Return exactly one minified JSON object and no prose.\n"
+            << "The object shape is {\"answer\":\"VALUE_FROM_LEDGER\"}.\n"
+            << "Use the exact REQUIRED_JSON_FIELD value for " << target_key
+            << " from the ledger.\n"
+            << "Copy every letter, digit, and hyphen in the value; never shorten a value to a suffix.";
+
+        NeedlePromptForProbe prompt;
+        prompt.messages = {
+            ChatMessage{
+                "system",
+                "<|think_off|>\nYou are a strict JSON renderer. Output JSON only."},
+            ChatMessage{"user", user_prompt.str()},
+        };
+        prompt.target_code = codes[static_cast<size_t>(target_index)];
+        prompt.distractors = std::move(distractors);
+        prompt.record_count = count;
+        return prompt;
+    }
+
+    struct NeedleRecallRunResult
+    {
+        std::string placement;
+        std::string target_code;
+        std::string content;
+        std::string error;
+        int prompt_tokens = 0;
+        int generated_tokens = 0;
+
+        bool containsTarget() const
+        {
+            return error.empty() &&
+                   content.find(target_code) != std::string::npos;
+        }
+    };
+
+    NeedleRecallRunResult runNeedleRecallPrompt(
+        IOrchestrationRunner &runner,
+        const std::string &placement,
+        int context_length,
+        int max_tokens)
+    {
+        NeedleRecallRunResult result;
+        result.placement = placement;
+        auto tokenizer = runner.tokenizer();
+        if (!tokenizer)
+        {
+            result.error = "runner has no tokenizer";
+            return result;
+        }
+
+        const NeedlePromptForProbe prompt =
+            buildNeedlePromptForProbe(
+                placement,
+                900,
+                context_length,
+                max_tokens,
+                "full");
+        result.target_code = prompt.target_code;
+        const std::vector<int> encoded =
+            tokenizer->encodeChat(
+                prompt.messages,
+                /*add_generation_prompt=*/true,
+                /*tools_json=*/"",
+                /*enable_thinking=*/false);
+        result.prompt_tokens = static_cast<int>(encoded.size());
+        std::vector<int32_t> prompt_tokens(encoded.begin(), encoded.end());
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        GenerationResult generated;
+        try
+        {
+            runner.clearCache();
+            generated = runner.generate(prompt_tokens, max_tokens, greedy);
+        }
+        catch (const std::exception &e)
+        {
+            result.error = std::string("exception: ") + e.what();
+            return result;
+        }
+        catch (...)
+        {
+            result.error = "unknown exception";
+            return result;
+        }
+        if (!generated.error.empty())
+        {
+            result.error = generated.error;
+            return result;
+        }
+        result.generated_tokens = static_cast<int>(generated.tokens.size());
+        std::vector<int> output_tokens(
+            generated.tokens.begin(),
+            generated.tokens.end());
+        result.content = tokenizer->decode(output_tokens, /*remove_special=*/true);
+        return result;
+    }
+
+    std::string summarizeNeedleRecallResult(const NeedleRecallRunResult &result)
+    {
+        std::ostringstream oss;
+        oss << result.placement
+            << " target=" << result.target_code
+            << " prompt_tokens=" << result.prompt_tokens
+            << " generated_tokens=" << result.generated_tokens;
+        if (!result.error.empty())
+            oss << " error=" << result.error;
+        else
+            oss << " content=" << compactPreview(result.content, 220);
+        return oss.str();
+    }
+
+    struct OverlayRecallProbeConfig
+    {
+        const char *label = "overlay";
+        MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::LLEP;
+        RoutedExpertAssignmentPolicy assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        bool prefix_cache = true;
+        int prefill_window_tokens = 0;
+        bool require_transfer_backing = true;
+    };
 
     std::string formatTokenWindow(
         const std::vector<int32_t> &tokens,
@@ -3209,6 +3721,879 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
     // MTP counters are request-local after each prefill/generate request.
     EXPECT_GE(after_second.mtp_draft_steps, 1u);
     EXPECT_GE(after_second.mtp_verifier_runs, 1u);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextStateContinuity)
+{
+    const int block_size = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_STATE_PROBE_BLOCK_TOKENS"},
+        256);
+    const int requested_prompt_tokens = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_STATE_PROBE_PROMPT_TOKENS"},
+        1024);
+    ASSERT_GT(block_size, 0);
+    ASSERT_GT(requested_prompt_tokens, block_size);
+
+    const int decode_steps = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_STATE_PROBE_DECODE_TOKENS"},
+        2);
+    ASSERT_GT(decode_steps, 0);
+
+    const int boundary_start = std::max(0, block_size - 8);
+    const int boundary_tokens = std::max(
+        1,
+        std::min(16, requested_prompt_tokens - boundary_start));
+    const int tail_start = std::max(block_size, requested_prompt_tokens - 64);
+    const int tail_tokens = requested_prompt_tokens - tail_start;
+    std::ostringstream kv_segments;
+    kv_segments << "prefix=0:" << block_size
+                << ";boundary=" << boundary_start
+                << ":" << boundary_tokens
+                << ";tail=" << tail_start << ":" << tail_tokens;
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_LOG_LEVEL", "WARN"},
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+        {"LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", std::to_string(block_size).c_str()},
+        {"LLAMINAR_PREFIX_PROBE_KV_SEGMENTS", kv_segments.str().c_str()},
+    });
+
+    if (mpiWorldSize() != 1)
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE ExpertOverlay state-continuity probe must run with one MPI rank";
+    }
+
+    const std::string model_path = firstEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_MODEL", "LLAMINAR_PARITY_MOE_MODEL"},
+        "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 MoE ExpertOverlay state-continuity probe";
+    }
+
+    const int max_seq_len = std::max(
+        requested_prompt_tokens + decode_steps + 64,
+        block_size * 2 + decode_steps + 64);
+    auto make_config = [&](bool enable_prefix_cache)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = max_seq_len;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        config.tp_allreduce_precision_override = "schema";
+        config.prefix_cache.enabled = enable_prefix_cache;
+        config.prefix_cache.storage_mode = enable_prefix_cache
+                                               ? PrefixCacheStorageMode::Ram
+                                               : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = block_size;
+        config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+        config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
+        config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
+        config.moe_expert_parallel_plan = qwen36MoEOverlayRocm2TPHotOnlyForProbe();
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::LLEP;
+        config.moe_rebalance.window_size = 4;
+        config.moe_rebalance.max_window_size = 4;
+        config.moe_rebalance.window_growth_factor = 1.0f;
+        config.moe_rebalance.prefill_window_tokens = block_size;
+        config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
+        config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
+        config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
+        config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
+        config.moe_rebalance.dynamic_min_window_activations = 0;
+        config.moe_rebalance.device_min_load_spread_improvement = 0;
+        config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
+        config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
+        config.moe_rebalance.release_raw_expert_weights = true;
+        return config;
+    };
+
+    auto factory = createOrchestrationRunnerFactory();
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+
+    PrefixRuntimeStateSnapshot full_prefill_probe;
+    PrefixRuntimeStateSnapshot split_prefill_probe;
+    PrefixRuntimeStateSnapshot restored_prefill_probe;
+    GenerationResult full_decode;
+    GenerationResult split_decode;
+    GenerationResult restored_decode;
+    std::vector<int32_t> prompt;
+    std::vector<int32_t> seed_prompt;
+    std::vector<int32_t> suffix_prompt;
+
+    {
+        auto baseline = factory->createFromOrchestrationConfig(make_config(false));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto tokenizer = baseline->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        prompt = buildDeterministicPromptTokens(
+            *tokenizer,
+            static_cast<size_t>(requested_prompt_tokens));
+        ASSERT_EQ(prompt.size(), static_cast<size_t>(requested_prompt_tokens));
+        seed_prompt.assign(
+            prompt.begin(),
+            prompt.begin() + static_cast<std::ptrdiff_t>(block_size));
+        suffix_prompt.assign(
+            prompt.begin() + static_cast<std::ptrdiff_t>(block_size),
+            prompt.end());
+        baseline->setSamplingParams(greedy);
+
+        ASSERT_TRUE(baseline->prefill(prompt))
+            << baseline->lastError();
+        full_prefill_probe = baseline->prefixStateProbe();
+        full_decode = decodeGreedyTokens(
+            *baseline,
+            decode_steps,
+            "full-prefill baseline decode");
+        ASSERT_TRUE(full_decode.error.empty()) << full_decode.error;
+        ASSERT_EQ(full_decode.tokens.size(), static_cast<size_t>(decode_steps));
+
+        baseline->clearCache();
+        ASSERT_TRUE(baseline->prefill(seed_prompt))
+            << baseline->lastError();
+        ASSERT_TRUE(baseline->prefill(suffix_prompt))
+            << baseline->lastError();
+        split_prefill_probe = baseline->prefixStateProbe();
+        split_decode = decodeGreedyTokens(
+            *baseline,
+            decode_steps,
+            "split-prefill baseline decode");
+        ASSERT_TRUE(split_decode.error.empty()) << split_decode.error;
+        ASSERT_EQ(split_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        baseline->shutdown();
+    }
+
+    {
+        auto cached = factory->createFromOrchestrationConfig(make_config(true));
+        ASSERT_NE(cached, nullptr);
+        ASSERT_TRUE(cached->initialize()) << cached->lastError();
+        cached->setSamplingParams(greedy);
+
+        ASSERT_TRUE(cached->prefill(seed_prompt))
+            << cached->lastError();
+        const auto seed_probe = cached->prefixStateProbe();
+        ASSERT_TRUE(seed_probe.prefix_cache_ready);
+        EXPECT_GE(seed_probe.prefix_cache_inserts, 1u);
+
+        cached->clearCache();
+        ASSERT_TRUE(cached->prefill(prompt))
+            << cached->lastError();
+        restored_prefill_probe = cached->prefixStateProbe();
+        restored_decode = decodeGreedyTokens(
+            *cached,
+            decode_steps,
+            "prefix-restored decode");
+        ASSERT_TRUE(restored_decode.error.empty()) << restored_decode.error;
+        ASSERT_EQ(restored_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        cached->shutdown();
+    }
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    EXPECT_TRUE(restored_prefill_probe.prefix_cache_ready);
+    EXPECT_GE(restored_prefill_probe.prefix_cache_hits +
+                  restored_prefill_probe.prefix_cache_partial_hits,
+              1u);
+    EXPECT_GE(restored_prefill_probe.prefix_cache_matched_tokens,
+              static_cast<uint64_t>(block_size));
+
+    MTPRuntimeSnapshotComparisonOptions compare_options;
+    compare_options.compare_main_kv_payload_hashes = true;
+    compare_options.compare_shifted_mtp_kv = false;
+    compare_options.compare_gdn_hashes = true;
+
+    const MTPStateValidationResult full_vs_split =
+        compareMTPRuntimeStateSnapshots(
+            full_prefill_probe,
+            split_prefill_probe,
+            compare_options);
+    ASSERT_TRUE(full_vs_split)
+        << "Qwen3.6 MoE ExpertOverlay LLEP split-prefill state drifted from "
+        << "single-request full prefill: " << full_vs_split.reason
+        << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
+        << "\nsplit: " << summarizeStateContinuityProbe(split_prefill_probe);
+
+    const MTPStateValidationResult full_vs_restored =
+        compareMTPRuntimeStateSnapshots(
+            full_prefill_probe,
+            restored_prefill_probe,
+            compare_options);
+    ASSERT_TRUE(full_vs_restored)
+        << "Qwen3.6 MoE ExpertOverlay LLEP prefix-restored state drifted from "
+        << "single-request full prefill: " << full_vs_restored.reason
+        << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
+        << "\nrestored: " << summarizeStateContinuityProbe(restored_prefill_probe);
+
+    EXPECT_EQ(split_decode.tokens, full_decode.tokens)
+        << "split prefill continuation must match full prefill continuation";
+    EXPECT_EQ(restored_decode.tokens, full_decode.tokens)
+        << "prefix-restored continuation must match full prefill continuation";
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextStateContinuity)
+{
+    const int block_size = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_STATE_PROBE_BLOCK_TOKENS"},
+        256);
+    const int requested_prompt_tokens = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_STATE_PROBE_PROMPT_TOKENS"},
+        1024);
+    ASSERT_GT(block_size, 0);
+    ASSERT_GT(requested_prompt_tokens, block_size);
+
+    const int decode_steps = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_STATE_PROBE_DECODE_TOKENS"},
+        2);
+    ASSERT_GT(decode_steps, 0);
+
+    const int boundary_start = std::max(0, block_size - 8);
+    const int boundary_tokens = std::max(
+        1,
+        std::min(16, requested_prompt_tokens - boundary_start));
+    const int tail_start = std::max(block_size, requested_prompt_tokens - 64);
+    const int tail_tokens = requested_prompt_tokens - tail_start;
+    std::ostringstream kv_segments;
+    kv_segments << "prefix=0:" << block_size
+                << ";boundary=" << boundary_start
+                << ":" << boundary_tokens
+                << ";tail=" << tail_start << ":" << tail_tokens;
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_LOG_LEVEL", "WARN"},
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+        {"LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", std::to_string(block_size).c_str()},
+        {"LLAMINAR_PREFIX_PROBE_KV_SEGMENTS", kv_segments.str().c_str()},
+    });
+
+    if (mpiWorldSize() != 1)
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE ExpertOverlay state-continuity probe must run with one MPI rank";
+    }
+
+    const std::string model_path = firstEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_MODEL", "LLAMINAR_PARITY_MOE_MODEL"},
+        "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two CUDA devices for Qwen3.6 MoE ExpertOverlay state-continuity probe";
+    }
+
+    const int max_seq_len = std::max(
+        requested_prompt_tokens + decode_steps + 64,
+        block_size * 2 + decode_steps + 64);
+    auto make_config = [&](bool enable_prefix_cache)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = max_seq_len;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        config.tp_allreduce_precision_override = "schema";
+        config.prefix_cache.enabled = enable_prefix_cache;
+        config.prefix_cache.storage_mode = enable_prefix_cache
+                                               ? PrefixCacheStorageMode::Ram
+                                               : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = block_size;
+        config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+        config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
+        config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
+        config.moe_expert_parallel_plan = qwen36MoEOverlayCuda2TPHotOnlyForProbe();
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::LLEP;
+        config.moe_rebalance.window_size = 4;
+        config.moe_rebalance.max_window_size = 4;
+        config.moe_rebalance.window_growth_factor = 1.0f;
+        config.moe_rebalance.prefill_window_tokens = block_size;
+        config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
+        config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
+        config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
+        config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
+        config.moe_rebalance.dynamic_min_window_activations = 0;
+        config.moe_rebalance.device_min_load_spread_improvement = 0;
+        config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
+        config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
+        config.moe_rebalance.release_raw_expert_weights = true;
+        return config;
+    };
+
+    auto factory = createOrchestrationRunnerFactory();
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+
+    PrefixRuntimeStateSnapshot full_prefill_probe;
+    PrefixRuntimeStateSnapshot split_prefill_probe;
+    PrefixRuntimeStateSnapshot restored_prefill_probe;
+    GenerationResult full_decode;
+    GenerationResult split_decode;
+    GenerationResult restored_decode;
+    std::vector<int32_t> prompt;
+    std::vector<int32_t> seed_prompt;
+    std::vector<int32_t> suffix_prompt;
+
+    {
+        auto baseline = factory->createFromOrchestrationConfig(make_config(false));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto tokenizer = baseline->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        prompt = buildDeterministicPromptTokens(
+            *tokenizer,
+            static_cast<size_t>(requested_prompt_tokens));
+        ASSERT_EQ(prompt.size(), static_cast<size_t>(requested_prompt_tokens));
+        seed_prompt.assign(
+            prompt.begin(),
+            prompt.begin() + static_cast<std::ptrdiff_t>(block_size));
+        suffix_prompt.assign(
+            prompt.begin() + static_cast<std::ptrdiff_t>(block_size),
+            prompt.end());
+        baseline->setSamplingParams(greedy);
+
+        ASSERT_TRUE(baseline->prefill(prompt))
+            << baseline->lastError();
+        full_prefill_probe = baseline->prefixStateProbe();
+        full_decode = decodeGreedyTokens(
+            *baseline,
+            decode_steps,
+            "full-prefill baseline decode");
+        ASSERT_TRUE(full_decode.error.empty()) << full_decode.error;
+        ASSERT_EQ(full_decode.tokens.size(), static_cast<size_t>(decode_steps));
+
+        baseline->clearCache();
+        ASSERT_TRUE(baseline->prefill(seed_prompt))
+            << baseline->lastError();
+        ASSERT_TRUE(baseline->prefill(suffix_prompt))
+            << baseline->lastError();
+        split_prefill_probe = baseline->prefixStateProbe();
+        split_decode = decodeGreedyTokens(
+            *baseline,
+            decode_steps,
+            "split-prefill baseline decode");
+        ASSERT_TRUE(split_decode.error.empty()) << split_decode.error;
+        ASSERT_EQ(split_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        baseline->shutdown();
+    }
+
+    {
+        auto cached = factory->createFromOrchestrationConfig(make_config(true));
+        ASSERT_NE(cached, nullptr);
+        ASSERT_TRUE(cached->initialize()) << cached->lastError();
+        cached->setSamplingParams(greedy);
+
+        ASSERT_TRUE(cached->prefill(seed_prompt))
+            << cached->lastError();
+        const auto seed_probe = cached->prefixStateProbe();
+        ASSERT_TRUE(seed_probe.prefix_cache_ready);
+        EXPECT_GE(seed_probe.prefix_cache_inserts, 1u);
+
+        cached->clearCache();
+        ASSERT_TRUE(cached->prefill(prompt))
+            << cached->lastError();
+        restored_prefill_probe = cached->prefixStateProbe();
+        restored_decode = decodeGreedyTokens(
+            *cached,
+            decode_steps,
+            "prefix-restored decode");
+        ASSERT_TRUE(restored_decode.error.empty()) << restored_decode.error;
+        ASSERT_EQ(restored_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        cached->shutdown();
+    }
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    EXPECT_TRUE(restored_prefill_probe.prefix_cache_ready);
+    EXPECT_GE(restored_prefill_probe.prefix_cache_hits +
+                  restored_prefill_probe.prefix_cache_partial_hits,
+              1u);
+    EXPECT_GE(restored_prefill_probe.prefix_cache_matched_tokens,
+              static_cast<uint64_t>(block_size));
+
+    MTPRuntimeSnapshotComparisonOptions compare_options;
+    compare_options.compare_main_kv_payload_hashes = true;
+    compare_options.compare_shifted_mtp_kv = false;
+    compare_options.compare_gdn_hashes = true;
+
+    const MTPStateValidationResult full_vs_split =
+        compareMTPRuntimeStateSnapshots(
+            full_prefill_probe,
+            split_prefill_probe,
+            compare_options);
+    ASSERT_TRUE(full_vs_split)
+        << "Qwen3.6 MoE ExpertOverlay CUDA LLEP split-prefill state drifted from "
+        << "single-request full prefill: " << full_vs_split.reason
+        << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
+        << "\nsplit: " << summarizeStateContinuityProbe(split_prefill_probe);
+
+    const MTPStateValidationResult full_vs_restored =
+        compareMTPRuntimeStateSnapshots(
+            full_prefill_probe,
+            restored_prefill_probe,
+            compare_options);
+    ASSERT_TRUE(full_vs_restored)
+        << "Qwen3.6 MoE ExpertOverlay CUDA LLEP prefix-restored state drifted from "
+        << "single-request full prefill: " << full_vs_restored.reason
+        << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
+        << "\nrestored: " << summarizeStateContinuityProbe(restored_prefill_probe);
+
+    EXPECT_EQ(split_decode.tokens, full_decode.tokens)
+        << "split prefill continuation must match full prefill continuation";
+    EXPECT_EQ(restored_decode.tokens, full_decode.tokens)
+        << "prefix-restored continuation must match full prefill continuation";
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallMatchesROCm2TP)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+    });
+
+    if (mpiWorldSize() != 1)
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE needle recall probe must run with one MPI rank";
+    }
+
+    const std::string model_path = firstEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_MODEL", "LLAMINAR_PARITY_MOE_MODEL"},
+        "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 MoE needle recall probe";
+    }
+
+    const int context_length = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_CONTEXT_TOKENS"},
+        2048);
+    const int max_tokens = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_MAX_TOKENS"},
+        64);
+    ASSERT_GT(context_length, max_tokens + 512);
+    ASSERT_GT(max_tokens, 0);
+
+    auto configure_prefix_cache =
+        [](OrchestrationConfig &config, bool enabled)
+    {
+        config.prefix_cache.enabled = enabled;
+        config.prefix_cache.storage_mode = enabled
+                                               ? PrefixCacheStorageMode::Ram
+                                               : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = 64;
+        config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+        config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
+        config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
+    };
+
+    auto make_rocm2_tp_config = [&]()
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = context_length;
+        config.batch_size = 1;
+        config.tp_degree = 2;
+        config.tp_scope = TPScope::LOCAL;
+        config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+        config.pp_degree = 1;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        configure_prefix_cache(config, true);
+        return config;
+    };
+
+    auto factory = createOrchestrationRunnerFactory();
+
+    auto make_overlay_config = [&](const OverlayRecallProbeConfig &probe)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = context_length;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        config.tp_allreduce_precision_override = "schema";
+        configure_prefix_cache(config, probe.prefix_cache);
+        config.moe_expert_parallel_plan =
+            qwen36MoEOverlayRocm2TPHotOnlyForProbe(probe.assignment_policy);
+        config.moe_rebalance.mode = probe.mode;
+        config.moe_rebalance.window_size = 4;
+        config.moe_rebalance.max_window_size = 4;
+        config.moe_rebalance.window_growth_factor = 1.0f;
+        config.moe_rebalance.prefill_window_tokens =
+            firstIntEnvOrDefault(
+                {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_PREFILL_WINDOW_TOKENS"},
+                probe.prefill_window_tokens);
+        config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
+        config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
+        config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
+        config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
+        config.moe_rebalance.dynamic_min_window_activations = 0;
+        config.moe_rebalance.device_min_load_spread_improvement = 0;
+        config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
+        config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
+        config.moe_rebalance.release_raw_expert_weights = true;
+        return config;
+    };
+
+    auto run_overlay_probe = [&](const OverlayRecallProbeConfig &probe)
+    {
+        auto runner = factory->createFromOrchestrationConfig(make_overlay_config(probe));
+        EXPECT_NE(runner, nullptr);
+        if (!runner)
+        {
+            NeedleRecallRunResult result;
+            result.placement = probe.label;
+            result.error = "failed to create runner";
+            return result;
+        }
+        NeedleRecallRunResult result;
+        if (runner->initialize())
+        {
+            result = runNeedleRecallPrompt(
+                *runner,
+                "beginning",
+                context_length,
+                max_tokens);
+            result.placement = probe.label;
+        }
+        else
+        {
+            result.placement = probe.label;
+            result.error = runner->lastError();
+        }
+        runner->shutdown();
+        return result;
+    };
+
+    OverlayRecallProbeConfig static_probe;
+    static_probe.label = "static-overlay";
+    static_probe.mode = MoERebalanceRuntimeMode::Off;
+    static_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.prefix_cache = true;
+    static_probe.prefill_window_tokens = 0;
+    static_probe.require_transfer_backing = false;
+
+    OverlayRecallProbeConfig llep_probe;
+    llep_probe.label = "llep-overlay-prefix-window";
+    llep_probe.mode = MoERebalanceRuntimeMode::LLEP;
+    llep_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.prefix_cache = true;
+    llep_probe.prefill_window_tokens = 0;
+    llep_probe.require_transfer_backing = true;
+
+    NeedleRecallRunResult rocm2_result;
+    {
+        auto runner = factory->createFromOrchestrationConfig(make_rocm2_tp_config());
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        rocm2_result = runNeedleRecallPrompt(
+            *runner,
+            "beginning",
+            context_length,
+            max_tokens);
+        runner->shutdown();
+    }
+    if (!rocm2_result.error.empty())
+    {
+        FAIL()
+            << "Ordinary ROCm2 TP failed before the overlay comparison. "
+            << summarizeNeedleRecallResult(rocm2_result);
+    }
+    if (!rocm2_result.containsTarget())
+    {
+        GTEST_SKIP()
+            << "Ordinary ROCm2 TP did not satisfy the guarded needle prompt; "
+            << "not treating it as an overlay-specific regression. "
+            << summarizeNeedleRecallResult(rocm2_result);
+    }
+
+    const NeedleRecallRunResult static_overlay_result =
+        run_overlay_probe(static_probe);
+    ASSERT_TRUE(static_overlay_result.containsTarget())
+        << "Qwen3.6 MoE ExpertOverlay ROCm2TP static-owner guard failed; "
+        << "the regression is not isolated to LLEP.\nstandard: "
+        << summarizeNeedleRecallResult(rocm2_result)
+        << "\nstatic-overlay: "
+        << summarizeNeedleRecallResult(static_overlay_result);
+
+    const NeedleRecallRunResult overlay_result =
+        run_overlay_probe(llep_probe);
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    EXPECT_TRUE(overlay_result.containsTarget())
+        << "Qwen3.6 MoE ExpertOverlay ROCm2TP LLEP lost a long-context needle "
+        << "that ordinary ROCm2 TP recalled.\nstandard: "
+        << summarizeNeedleRecallResult(rocm2_result)
+        << "\nstatic-overlay: "
+        << summarizeNeedleRecallResult(static_overlay_result)
+        << "\noverlay: "
+        << summarizeNeedleRecallResult(overlay_result);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallMatchesCUDA2TP)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+    });
+
+    if (mpiWorldSize() != 1)
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE needle recall probe must run with one MPI rank";
+    }
+
+    const std::string model_path = firstEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_MODEL", "LLAMINAR_PARITY_MOE_MODEL"},
+        "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 MoE model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two CUDA devices for Qwen3.6 MoE needle recall probe";
+    }
+
+    const int context_length = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_CONTEXT_TOKENS"},
+        2048);
+    const int max_tokens = firstIntEnvOrDefault(
+        {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_MAX_TOKENS"},
+        64);
+    ASSERT_GT(context_length, max_tokens + 512);
+    ASSERT_GT(max_tokens, 0);
+
+    auto configure_prefix_cache =
+        [](OrchestrationConfig &config, bool enabled)
+    {
+        config.prefix_cache.enabled = enabled;
+        config.prefix_cache.storage_mode = enabled
+                                               ? PrefixCacheStorageMode::Ram
+                                               : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = 64;
+        config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+        config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
+        config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
+    };
+
+    auto make_cuda2_tp_config = [&]()
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = context_length;
+        config.batch_size = 1;
+        config.tp_degree = 2;
+        config.tp_scope = TPScope::LOCAL;
+        config.tp_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+        config.pp_degree = 1;
+        config.default_backend = CollectiveBackendType::NCCL;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        configure_prefix_cache(config, true);
+        return config;
+    };
+
+    auto factory = createOrchestrationRunnerFactory();
+
+    auto make_overlay_config = [&](const OverlayRecallProbeConfig &probe)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = context_length;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = "auto";
+        config.tp_allreduce_precision_override = "schema";
+        configure_prefix_cache(config, probe.prefix_cache);
+        config.moe_expert_parallel_plan =
+            qwen36MoEOverlayCuda2TPHotOnlyForProbe(probe.assignment_policy);
+        config.moe_rebalance.mode = probe.mode;
+        config.moe_rebalance.window_size = 4;
+        config.moe_rebalance.max_window_size = 4;
+        config.moe_rebalance.window_growth_factor = 1.0f;
+        config.moe_rebalance.prefill_window_tokens =
+            firstIntEnvOrDefault(
+                {"LLAMINAR_QWEN36_MOE_OVERLAY_RECALL_PREFILL_WINDOW_TOKENS"},
+                probe.prefill_window_tokens);
+        config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
+        config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
+        config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
+        config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
+        config.moe_rebalance.dynamic_min_window_activations = 0;
+        config.moe_rebalance.device_min_load_spread_improvement = 0;
+        config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
+        config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
+        config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
+        config.moe_rebalance.release_raw_expert_weights = true;
+        return config;
+    };
+
+    auto run_overlay_probe = [&](const OverlayRecallProbeConfig &probe)
+    {
+        auto runner = factory->createFromOrchestrationConfig(make_overlay_config(probe));
+        EXPECT_NE(runner, nullptr);
+        if (!runner)
+        {
+            NeedleRecallRunResult result;
+            result.placement = probe.label;
+            result.error = "failed to create runner";
+            return result;
+        }
+        NeedleRecallRunResult result;
+        if (runner->initialize())
+        {
+            result = runNeedleRecallPrompt(
+                *runner,
+                "beginning",
+                context_length,
+                max_tokens);
+            result.placement = probe.label;
+        }
+        else
+        {
+            result.placement = probe.label;
+            result.error = runner->lastError();
+        }
+        runner->shutdown();
+        return result;
+    };
+
+    OverlayRecallProbeConfig static_probe;
+    static_probe.label = "static-overlay";
+    static_probe.mode = MoERebalanceRuntimeMode::Off;
+    static_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.prefix_cache = true;
+    static_probe.prefill_window_tokens = 0;
+    static_probe.require_transfer_backing = false;
+
+    OverlayRecallProbeConfig llep_probe;
+    llep_probe.label = "llep-overlay-prefix-window";
+    llep_probe.mode = MoERebalanceRuntimeMode::LLEP;
+    llep_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.prefix_cache = true;
+    llep_probe.prefill_window_tokens = 0;
+    llep_probe.require_transfer_backing = true;
+
+    NeedleRecallRunResult cuda2_result;
+    {
+        auto runner = factory->createFromOrchestrationConfig(make_cuda2_tp_config());
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        cuda2_result = runNeedleRecallPrompt(
+            *runner,
+            "beginning",
+            context_length,
+            max_tokens);
+        runner->shutdown();
+    }
+    if (!cuda2_result.error.empty())
+    {
+        FAIL()
+            << "Ordinary CUDA2 TP failed before the overlay comparison. "
+            << summarizeNeedleRecallResult(cuda2_result);
+    }
+    if (!cuda2_result.containsTarget())
+    {
+        GTEST_SKIP()
+            << "Ordinary CUDA2 TP did not satisfy the guarded needle prompt; "
+            << "not treating it as an overlay-specific regression. "
+            << summarizeNeedleRecallResult(cuda2_result);
+    }
+
+    const NeedleRecallRunResult static_overlay_result =
+        run_overlay_probe(static_probe);
+    ASSERT_TRUE(static_overlay_result.containsTarget())
+        << "Qwen3.6 MoE ExpertOverlay CUDA2TP static-owner guard failed; "
+        << "the regression is not isolated to LLEP.\nstandard: "
+        << summarizeNeedleRecallResult(cuda2_result)
+        << "\nstatic-overlay: "
+        << summarizeNeedleRecallResult(static_overlay_result);
+
+    const NeedleRecallRunResult overlay_result =
+        run_overlay_probe(llep_probe);
+    llaminar::v2::kernels::KernelFactory::clearCache();
+
+    EXPECT_TRUE(overlay_result.containsTarget())
+        << "Qwen3.6 MoE ExpertOverlay CUDA2TP LLEP lost a long-context needle "
+        << "that ordinary CUDA2 TP recalled.\nstandard: "
+        << summarizeNeedleRecallResult(cuda2_result)
+        << "\nstatic-overlay: "
+        << summarizeNeedleRecallResult(static_overlay_result)
+        << "\noverlay: "
+        << summarizeNeedleRecallResult(overlay_result);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)

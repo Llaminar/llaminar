@@ -496,8 +496,17 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        /*
+         * Keep GPU scalar publication aligned with the device-indexed hot path:
+         * restore the implementation-owned recurrent state on the verifier
+         * stream and leave host-mirror refresh to explicit adoption/export
+         * code.  LocalTP grouped publication calls this from worker threads on
+         * multiple devices; doing a D2H mirror refresh here can synchronize the
+         * hot path and, in replicated device-state lanes, hand CUDA/HIP a
+         * destination pointer that is not a valid host mirror for that worker.
+         */
         return params_.kernel->restoreVerifierStateCaptureRow(
-            params_.recurrence_state,
+            nullptr,
             row,
             stream ? stream : gpuStream());
     }

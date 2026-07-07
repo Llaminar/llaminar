@@ -28,8 +28,10 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -124,6 +126,16 @@ extern "C" bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
     int device_idx,
     void *stream);
 
+extern "C" bool cudaMoE_build_runtime_original_to_grouped(
+    const void *runtime,
+    int *original_to_grouped,
+    int current_slots,
+    int max_slots,
+    int num_experts,
+    int top_k,
+    int device_idx,
+    void *stream);
+
 #endif
 
 /**
@@ -194,6 +206,52 @@ namespace
         desc.blocks_per_row = static_cast<uint32_t>(cols / 32);
         desc.codebook_id = codebook_id;
         return desc;
+    }
+
+    void seedRuntimeBankExpert(
+        llaminar2::DeviceMoEPlacementBank &bank,
+        int expert,
+        int owner_participant,
+        bool local_ready)
+    {
+        auto &desc = bank.experts[expert];
+        const uintptr_t base = 0x39000000u + static_cast<uintptr_t>(expert) * 0x4000u;
+        desc.logical_expert_id = expert;
+        desc.owner_participant = owner_participant;
+        desc.local_slot = local_ready ? expert : -1;
+        desc.flags = llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
+                                                 llaminar2::DeviceMoEExpertFlags::Resident);
+        bank.local_compute_mask[expert] = local_ready ? 1u : 0u;
+        bank.replica_role[expert] =
+            local_ready
+                ? static_cast<uint8_t>(llaminar2::DeviceMoEReplicaRole::Primary)
+                : static_cast<uint8_t>(llaminar2::DeviceMoEReplicaRole::None);
+        if (local_ready)
+        {
+            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
+            desc.up = fakeNativeVNNIDesc(base + 0x20u);
+            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.flags |= llaminar2::toMoEExpertFlags(
+                llaminar2::DeviceMoEExpertFlags::LocalCompute);
+        }
+    }
+
+    /**
+     * @brief Construct the clean copy/apply status header expected by rebalance kernels.
+     *
+     * Production transfer waves initialize this status in the payload pack
+     * kernel and then let unpack accumulate destination-side counters into the
+     * same record. Focused tests that invoke unpack directly use this helper to
+     * seed the header without depending on a preceding pack.
+     */
+    llaminar2::DeviceMoERebalanceApplyStatus makeCleanRebalanceApplyStatus()
+    {
+        llaminar2::DeviceMoERebalanceApplyStatus status{};
+        status.magic = llaminar2::kDeviceMoERebalanceMagic;
+        status.version = llaminar2::kDeviceMoERebalanceVersion;
+        status.status_code =
+            static_cast<uint32_t>(llaminar2::DeviceMoERebalanceApplyStatusCode::Ok);
+        return status;
     }
 
     void expectSameNativeVNNIDesc(
@@ -335,6 +393,32 @@ namespace
             ASSERT_NEAR(actual[i], expected[i], tolerance) << "at element " << i;
     }
 
+#ifdef HAVE_CUDA
+    /**
+     * @brief Copy a CUDA-resident FP32 tensor into host memory for strict parity checks.
+     *
+     * The MTP verifier bugs chased by these tests often involve tensor residency
+     * and publication state.  Reading through the tensor's CPU mirror can hide
+     * exactly that class of issue, so focused CUDA proofs fetch the bytes that
+     * the next GPU stage would consume.
+     */
+    std::vector<float> copyCudaFP32TensorToHost(
+        const std::shared_ptr<llaminar2::FP32Tensor> &tensor,
+        cudaStream_t stream)
+    {
+        std::vector<float> host(tensor->numel());
+        EXPECT_NE(tensor->gpu_data_ptr(), nullptr);
+        EXPECT_EQ(cudaMemcpyAsync(host.data(),
+                                  tensor->gpu_data_ptr(),
+                                  host.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost,
+                                  stream),
+                  cudaSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        return host;
+    }
+#endif
+
     double cosineSimilarity(const float *a, const float *b, size_t count)
     {
         double dot = 0.0;
@@ -366,6 +450,22 @@ namespace
         if (ref_sq < 1.0e-30)
             return err_sq < 1.0e-30 ? 0.0 : std::numeric_limits<double>::infinity();
         return std::sqrt(err_sq / ref_sq);
+    }
+
+    /**
+     * @brief Euclidean norm for host-side verifier row witnesses.
+     *
+     * Grouped-vs-serial comparisons are only meaningful when the serial path did
+     * real work.  The all-format MoE sweeps therefore assert nonzero serial and
+     * grouped rows before accepting cosine/L2 agreement; this catches shared
+     * descriptor or decode bugs where both paths accidentally publish zeroes.
+     */
+    double l2Norm(const float *values, size_t count)
+    {
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < count; ++i)
+            sum_sq += static_cast<double>(values[i]) * static_cast<double>(values[i]);
+        return std::sqrt(sum_sq);
     }
 
     double klDivergence(const float *actual, const float *reference, size_t count)
@@ -883,6 +983,168 @@ namespace
     }
 #endif
 
+    using CUDAMoEWeightCreator = std::function<std::unique_ptr<llaminar2::TensorBase>(
+        const std::vector<size_t> &shape,
+        uint32_t seed)>;
+
+    /**
+     * @brief One tensor-format entry for CUDA grouped MoE verifier coverage.
+     *
+     * The grouped CUDA MoE kernels dispatch by native-VNNI codebook id, but the
+     * descriptor metadata still differs across source tensor formats that share a
+     * codebook.  This table is intentionally format-complete for the NativeVNNI
+     * tensors that can reach grouped verifier prefill.
+     */
+    struct CUDAMoEFormatCase
+    {
+        const char *label;
+        uint8_t codebook_id;
+        CUDAMoEWeightCreator create;
+    };
+
+    /**
+     * @brief Create bounded IQ4_XS weights for MoE grouped verifier tests.
+     *
+     * IQ4_XS encodes sub-block scale as `d * (ls - 32)`.  Keeping `ls` close to 32
+     * gives stable, nonzero verifier rows while still exercising codebook 4 and
+     * the IQ4_XS descriptor layout.
+     */
+    std::unique_ptr<llaminar2::TensorBase> createBoundedCudaMoEIQ4XS(
+        const std::vector<size_t> &shape,
+        uint32_t seed)
+    {
+        constexpr size_t block_size = llaminar2::IQ4_XSBlock::BLOCK_SIZE;
+        const size_t rows = shape.at(0);
+        const size_t cols = shape.at(1);
+        const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+        const size_t total_blocks = rows * blocks_per_row;
+
+        std::vector<uint8_t> raw_data(total_blocks * sizeof(llaminar2::IQ4_XSBlock));
+        auto *blocks = reinterpret_cast<llaminar2::IQ4_XSBlock *>(raw_data.data());
+        for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+        {
+            auto &block = blocks[block_idx];
+            block.d = 0x2400; // FP16 0.015625.
+            block.scales_h = 0;
+            std::memset(block.scales_l, 0, sizeof(block.scales_l));
+
+            for (int sub = 0; sub < 8; ++sub)
+            {
+                const uint16_t ls = static_cast<uint16_t>(
+                    33u + ((seed + block_idx + static_cast<size_t>(sub)) & 0x3u));
+                block.scales_l[sub / 2] |= static_cast<uint8_t>(
+                    (ls & 0x0fu) << (4 * (sub & 1)));
+                block.scales_h |= static_cast<uint16_t>(
+                    ((ls >> 4) & 0x3u) << (2 * sub));
+            }
+
+            for (size_t j = 0; j < std::size(block.qs); ++j)
+            {
+                const uint8_t lo = static_cast<uint8_t>(
+                    (seed + block_idx * 19u + j * 5u) & 0x0fu);
+                const uint8_t hi = static_cast<uint8_t>(
+                    ((seed >> 4) + block_idx * 23u + j * 7u) & 0x0fu);
+                block.qs[j] = static_cast<uint8_t>(lo | (hi << 4));
+            }
+        }
+
+        return std::make_unique<llaminar2::IQ4_XSTensor>(shape, raw_data);
+    }
+
+    /**
+     * @brief Create deterministic IQ3_S weights with nonzero signs/high bits.
+     *
+     * The generic IQ3_S random factory is adequate for many smoke tests, but the
+     * all-format grouped MoE sweep needs a stronger witness so serial and grouped
+     * paths cannot both pass by producing zero rows.
+     */
+    std::unique_ptr<llaminar2::TensorBase> createNonzeroCudaMoEIQ3S(
+        const std::vector<size_t> &shape,
+        uint32_t seed)
+    {
+        constexpr size_t block_size = llaminar2::IQ3_SBlock::BLOCK_SIZE;
+        const size_t rows = shape.at(0);
+        const size_t cols = shape.at(1);
+        const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+        const size_t total_blocks = rows * blocks_per_row;
+
+        std::vector<uint8_t> raw_data(total_blocks * sizeof(llaminar2::IQ3_SBlock));
+        auto *blocks = reinterpret_cast<llaminar2::IQ3_SBlock *>(raw_data.data());
+        for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+        {
+            auto &block = blocks[block_idx];
+            block.d = 0x3000; // FP16 0.125.
+
+            for (size_t j = 0; j < std::size(block.qs); ++j)
+            {
+                block.qs[j] = static_cast<uint8_t>(
+                    (seed + block_idx * 37u + j * 13u) & 0xffu);
+            }
+            for (size_t j = 0; j < std::size(block.qh); ++j)
+            {
+                block.qh[j] = static_cast<uint8_t>(
+                    ((seed >> 3) + block_idx * 11u + j * 29u) & 0xffu);
+            }
+            for (size_t j = 0; j < std::size(block.signs); ++j)
+            {
+                block.signs[j] = static_cast<uint8_t>(
+                    (0x5au ^ seed ^ (block_idx * 17u + j * 7u)) & 0xffu);
+            }
+            for (size_t j = 0; j < std::size(block.scales); ++j)
+            {
+                const uint8_t lo = static_cast<uint8_t>((1u + seed + block_idx + j) & 0x3u);
+                const uint8_t hi = static_cast<uint8_t>((2u + (seed >> 2) + block_idx + j) & 0x3u);
+                block.scales[j] = static_cast<uint8_t>(lo | (hi << 4));
+            }
+        }
+
+        return std::make_unique<llaminar2::IQ3_STensor>(shape, raw_data);
+    }
+
+    std::vector<CUDAMoEFormatCase> cudaMoEGroupedNativeFormats()
+    {
+        return {
+            {"Q4_0", 0, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ4_0Random(shape, seed); }},
+            {"IQ4_NL", 4, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
+            {"Q4_1", 5, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ4_1Random(shape, seed); }},
+            {"IQ4_XS", 4, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return createBoundedCudaMoEIQ4XS(shape, seed); }},
+            {"Q5_0", 6, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ5_0Random(shape, seed); }},
+            {"Q5_1", 7, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ5_1Random(shape, seed); }},
+            {"Q4_K", 5, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ4_KRandom(shape, seed); }},
+            {"Q5_K", 7, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ5_KRandom(shape, seed); }},
+            {"Q6_K", 8, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ6_KRandom(shape, seed); }},
+            {"Q3_K", 9, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ3_KRandom(shape, seed); }},
+            {"Q2_K", 10, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ2_KRandom(shape, seed); }},
+            {"IQ3_S", 11, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return createNonzeroCudaMoEIQ3S(shape, seed); }},
+            {"IQ3_XXS", 12, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ3_XXSRandom(shape, seed); }},
+            {"IQ2_S", 13, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ2_SRandom(shape, seed); }},
+            {"IQ2_XS", 14, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ2_XSRandom(shape, seed); }},
+            {"IQ2_XXS", 15, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ2_XXSRandom(shape, seed); }},
+            {"IQ1_S", 16, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ1_SRandom(shape, seed); }},
+            {"IQ1_M", 17, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createIQ1_MRandom(shape, seed); }},
+            {"Q8_0", 19, [](const std::vector<size_t> &shape, uint32_t seed)
+             { return llaminar2::test::TestTensorFactory::createQ8_0Random(shape, seed); }},
+        };
+    }
+
     class Test__CUDAMoEKernel : public ::testing::Test
     {
     protected:
@@ -1125,9 +1387,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticip
     EXPECT_EQ(counts, (std::array<int32_t, num_experts>{1, 1, 1, 1}));
     EXPECT_EQ(offsets, (std::array<int32_t, num_experts>{0, 1, 2, 3}));
     EXPECT_EQ(grouped_tokens[0], 0);
-    EXPECT_EQ(grouped_tokens[1], 1);
-    EXPECT_EQ(grouped_tokens[2], 1);
-    EXPECT_EQ(grouped_tokens[3], 2);
+    EXPECT_EQ(grouped_tokens[1], 2);
+    EXPECT_EQ(grouped_tokens[2], 3);
+    EXPECT_EQ(grouped_tokens[3], 5);
     EXPECT_EQ(grouped_tokens[4], 0);
     EXPECT_EQ(grouped_tokens[5], 0);
     EXPECT_NEAR(grouped_weights[0], 0.50f, 1.0e-6f);
@@ -1136,6 +1398,27 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillRegroupFiltersRoutesByAssignedParticip
     EXPECT_NEAR(grouped_weights[3], 0.80f, 1.0e-6f);
     EXPECT_NEAR(grouped_weights[4], 0.0f, 1.0e-6f);
     EXPECT_NEAR(grouped_weights[5], 0.0f, 1.0e-6f);
+
+    CudaAllocation original_to_grouped(sizeof(int) * total_slots);
+    auto *d_original_to_grouped = static_cast<int *>(original_to_grouped.get());
+    ASSERT_TRUE(cudaMoE_build_runtime_original_to_grouped(
+        runtime_table.deviceLayerState(0),
+        d_original_to_grouped,
+        total_slots,
+        total_slots,
+        num_experts,
+        top_k,
+        0,
+        stream_));
+    std::array<int32_t, total_slots> ordered_map{};
+    ASSERT_EQ(cudaMemcpyAsync(ordered_map.data(),
+                              d_original_to_grouped,
+                              sizeof(ordered_map),
+                              cudaMemcpyDeviceToHost,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(ordered_map, (std::array<int32_t, total_slots>{0, -1, 1, 2, -1, 3}));
 #endif
 }
 
@@ -1320,12 +1603,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterial
     bank.expert_count = num_experts;
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        bank.experts[expert].logical_expert_id = expert;
-        bank.experts[expert].owner_participant = expert < 2 ? 0 : 1;
-        bank.experts[expert].flags =
-            llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
-                                        llaminar2::DeviceMoEExpertFlags::Resident);
-        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(bank.experts[expert].owner_participant);
+        const int owner = expert < 2 ? 0 : 1;
+        seedRuntimeBankExpert(bank, expert, owner, owner == static_cast<int>(runtime_state.participant_id));
+        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(owner);
     }
     ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
                               &runtime_state,
@@ -1430,12 +1710,15 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterial
     uint32_t *d_plan_count = nullptr;
     llaminar2::DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
     llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
+    llaminar2::DeviceMoERebalanceApplyStatus *d_apply_status = nullptr;
     ASSERT_EQ(cudaMalloc(&d_plan, 4 * sizeof(llaminar2::DeviceMoERebalancePlanEntry)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_plan_count, sizeof(uint32_t)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_header, sizeof(llaminar2::DeviceMoERebalanceCommandBufferHeader)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_status, sizeof(llaminar2::DeviceMoERebalanceStatus)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_apply_status, sizeof(llaminar2::DeviceMoERebalanceApplyStatus)),
               cudaSuccess);
     ASSERT_TRUE(cuda_kernel_->materializePrefillLeastLoadedTransferCommands(
         runtime_table.deviceLayerState(0),
@@ -1492,6 +1775,13 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterial
                   0u, 1u, llaminar2::kDeviceMoEMaxParticipants));
     EXPECT_EQ(materialized_status.llep_assignment_span_count, 4u);
     EXPECT_EQ(materialized_status.llep_weight_transfer_count, 1u);
+    llaminar2::DeviceMoERebalanceApplyStatus apply_status;
+    apply_status.plan_entries_seen = materialized_status.planned_arrivals;
+    apply_status.applied_arrivals = 0u;
+    apply_status.changed_layers = materialized_status.planned_arrivals > 0u ? 1u : 0u;
+    ASSERT_EQ(cudaMemcpy(d_apply_status, &apply_status, sizeof(apply_status),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
 
     ASSERT_TRUE(cuda_kernel_->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
         runtime_table.deviceLayerState(0),
@@ -1506,13 +1796,29 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterial
     EXPECT_TRUE(std::all_of(route_participants.begin(), route_participants.end(),
                             [](int32_t participant) { return participant == 0; }))
         << "guarded current-batch LLEP apply must not rewrite assignments while weight transfers are pending";
+
+    ASSERT_EQ(cudaMemcpy(&device_runtime_state,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(device_runtime_state),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    device_runtime_state
+        .banks[device_runtime_state.active_bank]
+        .resident_participant_mask[0] |= 0b10u;
+    ASSERT_EQ(cudaMemcpy(runtime_table.deviceLayerState(0),
+                         &device_runtime_state,
+                         sizeof(device_runtime_state),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+
     ASSERT_TRUE(cuda_kernel_->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
         runtime_table.deviceLayerState(0),
         seq_len,
         seq_len,
         num_experts,
         top_k,
-        d_status));
+        d_status,
+        d_apply_status));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(route_participants.data(), runtime_state.route_participant_ids,
                          sizeof(route_participants), cudaMemcpyDeviceToHost),
@@ -1525,10 +1831,307 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlannerMaterial
     EXPECT_EQ(route_participants[5], 1);
     EXPECT_EQ(route_participants[6], 0);
     EXPECT_EQ(route_participants[7], 1);
+    ASSERT_EQ(cudaFree(d_apply_status), cudaSuccess);
     ASSERT_EQ(cudaFree(d_status), cudaSuccess);
     ASSERT_EQ(cudaFree(d_header), cudaSuccess);
     ASSERT_EQ(cudaFree(d_plan_count), cudaSuccess);
     ASSERT_EQ(cudaFree(d_plan), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedLongContextMaterializeStaysStreamHealthy)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    const auto device = llaminar2::DeviceId::cuda(0);
+    constexpr int seq_len = 1801;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    constexpr int total_slots = seq_len * top_k;
+
+    llaminar2::DeviceMoERuntimeTable::Config runtime_config;
+    runtime_config.device_id = device;
+    runtime_config.num_layers = 1;
+    runtime_config.num_experts = num_experts;
+    runtime_config.top_k = top_k;
+    runtime_config.mirror_to_device = true;
+    runtime_config.prefill_token_capacity = seq_len;
+    llaminar2::MoERuntimeTable runtime_table(runtime_config);
+
+    auto runtime_state = runtime_table.hostLayerState(0);
+    runtime_state.participant_id = 0;
+    runtime_state.participant_count = 2;
+    auto &bank = runtime_state.banks[runtime_state.active_bank];
+    bank.expert_count = num_experts;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const int owner = expert < num_experts / 2 ? 0 : 1;
+        seedRuntimeBankExpert(bank, expert, owner, owner == static_cast<int>(runtime_state.participant_id));
+        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(owner);
+    }
+    ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
+                              &runtime_state,
+                              sizeof(runtime_state),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+
+    auto routing_indices = llaminar2::test::TestTensorFactory::createFP32(
+        {static_cast<size_t>(total_slots), 1});
+    auto routing_weights = llaminar2::test::TestTensorFactory::createFP32(
+        {static_cast<size_t>(total_slots), 1});
+    for (int slot = 0; slot < total_slots; ++slot)
+    {
+        const int row = slot / top_k;
+        const int kth = slot % top_k;
+        const int expert =
+            (kth == 0 && (row % 3) == 0)
+                ? 128
+                : (slot * 37 + row * 11 + kth * 7) % num_experts;
+        routing_indices->mutable_data()[slot] = static_cast<float>(expert);
+        routing_weights->mutable_data()[slot] = 1.0f / static_cast<float>(kth + 1);
+    }
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+
+    ASSERT_TRUE(cuda_kernel_->groupPrefillRoutes(
+        runtime_table.deviceLayerState(0),
+        routing_indices.get(),
+        routing_weights.get(),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k));
+
+    llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentConfig llep_config;
+    llep_config.expert_count = num_experts;
+    llep_config.participant_count = 2;
+    llep_config.enable_balanced_skip = false;
+    llep_config.max_weight_transfers = 1;
+    ASSERT_TRUE(cuda_kernel_->planPrefillRoutesLeastLoadedCurrentBatch(
+        runtime_table.deviceLayerState(0),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k,
+        llep_config));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::DeviceMoELayerRuntime planned_runtime{};
+    ASSERT_EQ(cudaMemcpy(&planned_runtime,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(planned_runtime),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_GT(planned_runtime.reserved_u64[2], 0u);
+    ASSERT_EQ(planned_runtime.reserved_u64[3], 1u);
+
+    constexpr uint32_t plan_capacity = 32;
+    constexpr uint32_t payload_slot_capacity = 1;
+    llaminar2::DeviceMoERebalanceConfig rebalance_config;
+    rebalance_config.num_layers = 1;
+    rebalance_config.num_experts = num_experts;
+    rebalance_config.top_k = top_k;
+    rebalance_config.participant_id = 0;
+    rebalance_config.participant_count = 2;
+    rebalance_config.root_participant = 0;
+    rebalance_config.window_size_tokens = 256;
+
+    llaminar2::DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
+    llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_plan, plan_capacity * sizeof(llaminar2::DeviceMoERebalancePlanEntry)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_plan_count, sizeof(uint32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_header, sizeof(llaminar2::DeviceMoERebalanceCommandBufferHeader)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_status, sizeof(llaminar2::DeviceMoERebalanceStatus)),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->materializePrefillLeastLoadedTransferCommands(
+        runtime_table.deviceLayerState(0),
+        d_plan,
+        d_plan_count,
+        plan_capacity,
+        d_header,
+        d_status,
+        rebalance_config,
+        payload_slot_capacity,
+        0));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    uint32_t materialized_plan_count = 0;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader materialized_header{};
+    llaminar2::DeviceMoERebalanceStatus materialized_status{};
+    ASSERT_EQ(cudaMemcpy(&materialized_plan_count, d_plan_count, sizeof(uint32_t),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&materialized_header, d_header, sizeof(materialized_header),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&materialized_status, d_status, sizeof(materialized_status),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(materialized_plan_count, 1u);
+    EXPECT_EQ(materialized_header.command_count, 1u);
+    EXPECT_EQ(materialized_status.status_code,
+              static_cast<uint32_t>(llaminar2::DeviceMoERebalanceStatusCode::Ok));
+    EXPECT_EQ(materialized_status.planned_arrivals, 1u);
+    EXPECT_EQ(materialized_status.llep_weight_transfer_count, 1u);
+    EXPECT_EQ(materialized_status.llep_assignment_span_count,
+              static_cast<uint32_t>(planned_runtime.reserved_u64[2]));
+
+    ASSERT_EQ(cudaFree(d_status), cudaSuccess);
+    ASSERT_EQ(cudaFree(d_header), cudaSuccess);
+    ASSERT_EQ(cudaFree(d_plan_count), cudaSuccess);
+    ASSERT_EQ(cudaFree(d_plan), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchPlanUsesSymmetricResidency)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    const auto device = llaminar2::DeviceId::cuda(0);
+    constexpr int seq_len = 12;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 1;
+    constexpr int total_slots = seq_len * top_k;
+    constexpr size_t max_spans = 8;
+    constexpr size_t max_transfers = 4;
+
+    struct PlanSnapshot
+    {
+        uint64_t span_count = 0;
+        uint64_t transfer_count = 0;
+        std::array<llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan, max_spans> spans{};
+        std::array<llaminar2::least_loaded_ep::LeastLoadedExpertWeightTransfer, max_transfers> transfers{};
+    };
+
+    const std::array<float, total_slots> routing_indices_data = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 2.0f, 2.0f, 3.0f};
+    const std::array<float, total_slots> routing_weights_data = {
+        1.0f, 0.9f, 0.8f, 0.7f,
+        0.6f, 0.5f, 0.4f, 0.3f,
+        0.2f, 0.2f, 0.1f, 0.1f};
+
+    auto run_plan = [&](uint32_t participant_id) -> PlanSnapshot
+    {
+        llaminar2::DeviceMoERuntimeTable::Config runtime_config;
+        runtime_config.device_id = device;
+        runtime_config.num_layers = 1;
+        runtime_config.num_experts = num_experts;
+        runtime_config.top_k = top_k;
+        runtime_config.mirror_to_device = true;
+        runtime_config.prefill_token_capacity = seq_len;
+        llaminar2::MoERuntimeTable runtime_table(runtime_config);
+
+        auto runtime_state = runtime_table.hostLayerState(0);
+        runtime_state.participant_id = participant_id;
+        runtime_state.participant_count = 2;
+        auto &bank = runtime_state.banks[runtime_state.active_bank];
+        bank.expert_count = num_experts;
+        const int owners[num_experts] = {0, 0, 1, 1};
+        const uint32_t resident_masks[num_experts] = {0b11u, 0b01u, 0b10u, 0b11u};
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const bool locally_resident =
+                (resident_masks[expert] & (1u << participant_id)) != 0u;
+            const bool local_ready =
+                locally_resident && !(participant_id == 0u && expert == 0);
+            seedRuntimeBankExpert(bank, expert, owners[expert], local_ready);
+            bank.local_compute_mask[expert] = local_ready ? 1u : 0u;
+            bank.replica_role[expert] =
+                local_ready
+                    ? static_cast<uint8_t>(
+                          owners[expert] == static_cast<int>(participant_id)
+                              ? llaminar2::DeviceMoEReplicaRole::Primary
+                              : llaminar2::DeviceMoEReplicaRole::Replica)
+                    : static_cast<uint8_t>(llaminar2::DeviceMoEReplicaRole::None);
+            bank.resident_participant_mask[expert] = resident_masks[expert];
+        }
+        EXPECT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
+                                  &runtime_state,
+                                  sizeof(runtime_state),
+                                  cudaMemcpyHostToDevice,
+                                  stream_),
+                  cudaSuccess);
+
+        auto routing_indices = llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(total_slots), 1});
+        auto routing_weights = llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(total_slots), 1});
+        std::copy(routing_indices_data.begin(), routing_indices_data.end(), routing_indices->mutable_data());
+        std::copy(routing_weights_data.begin(), routing_weights_data.end(), routing_weights->mutable_data());
+        EXPECT_TRUE(routing_indices->ensureOnDevice(device));
+        EXPECT_TRUE(routing_weights->ensureOnDevice(device));
+
+        EXPECT_TRUE(cuda_kernel_->groupPrefillRoutes(
+            runtime_table.deviceLayerState(0),
+            routing_indices.get(),
+            routing_weights.get(),
+            seq_len,
+            seq_len,
+            num_experts,
+            top_k));
+
+        llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentConfig config;
+        config.expert_count = num_experts;
+        config.participant_count = 2;
+        config.enable_balanced_skip = false;
+        EXPECT_TRUE(cuda_kernel_->planPrefillRoutesLeastLoadedCurrentBatch(
+            runtime_table.deviceLayerState(0),
+            seq_len,
+            seq_len,
+            num_experts,
+            top_k,
+            config));
+        EXPECT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        llaminar2::DeviceMoELayerRuntime device_runtime_state{};
+        EXPECT_EQ(cudaMemcpy(&device_runtime_state,
+                             runtime_table.deviceLayerState(0),
+                             sizeof(device_runtime_state),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        PlanSnapshot snapshot;
+        snapshot.span_count = device_runtime_state.reserved_u64[2];
+        snapshot.transfer_count = device_runtime_state.reserved_u64[3];
+        EXPECT_LE(snapshot.span_count, max_spans);
+        EXPECT_LE(snapshot.transfer_count, max_transfers);
+        EXPECT_EQ(cudaMemcpy(snapshot.spans.data(), runtime_state.reserved_ptrs[1],
+                             sizeof(snapshot.spans), cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(cudaMemcpy(snapshot.transfers.data(), runtime_state.reserved_ptrs[2],
+                             sizeof(snapshot.transfers), cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        return snapshot;
+    };
+
+    const PlanSnapshot participant0 = run_plan(0);
+    const PlanSnapshot participant1 = run_plan(1);
+    ASSERT_GT(participant0.span_count, 0u);
+    EXPECT_EQ(participant0.span_count, participant1.span_count);
+    EXPECT_EQ(participant0.transfer_count, 0u);
+    EXPECT_EQ(participant1.transfer_count, 0u);
+    for (uint64_t i = 0; i < participant0.span_count; ++i)
+    {
+        EXPECT_EQ(participant0.spans[i].expert, participant1.spans[i].expert) << "span " << i;
+        EXPECT_EQ(participant0.spans[i].owner_participant, participant1.spans[i].owner_participant) << "span " << i;
+        EXPECT_EQ(participant0.spans[i].destination_participant, participant1.spans[i].destination_participant) << "span " << i;
+        EXPECT_EQ(participant0.spans[i].route_row_begin, participant1.spans[i].route_row_begin) << "span " << i;
+        EXPECT_EQ(participant0.spans[i].route_row_end, participant1.spans[i].route_row_end) << "span " << i;
+        EXPECT_EQ(participant0.spans[i].needs_foreign_weight, participant1.spans[i].needs_foreign_weight) << "span " << i;
+        EXPECT_EQ(participant0.spans[i].forced, participant1.spans[i].forced) << "span " << i;
+    }
 #endif
 }
 
@@ -1604,22 +2207,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedTransferCommandsPreserveTra
     config.expert_count = num_experts;
     config.participant_count = 3;
     config.enable_balanced_skip = false;
-    ASSERT_TRUE(cuda_kernel_->planPrefillRoutesLeastLoadedCurrentBatch(
-        runtime_table.deviceLayerState(0),
-        seq_len,
-        seq_len,
-        num_experts,
-        top_k,
-        config));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-
-    ASSERT_EQ(cudaMemcpy(&runtime_state,
-                         runtime_table.deviceLayerState(0),
-                         sizeof(runtime_state),
-                         cudaMemcpyDeviceToHost),
-              cudaSuccess);
-    EXPECT_EQ(runtime_state.reserved_u64[2], 4u);
-    EXPECT_EQ(runtime_state.reserved_u64[3], 3u);
 
     llaminar2::DeviceMoERebalanceConfig rebalance_config;
     rebalance_config.num_layers = 1;
@@ -1641,6 +2228,73 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedTransferCommandsPreserveTra
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_status, sizeof(llaminar2::DeviceMoERebalanceStatus)),
               cudaSuccess);
+
+    config.max_weight_transfers = 1;
+    ASSERT_TRUE(cuda_kernel_->planPrefillRoutesLeastLoadedCurrentBatch(
+        runtime_table.deviceLayerState(0),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k,
+        config));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpy(&runtime_state,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(runtime_state),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(runtime_state.reserved_u64[3], 1u)
+        << "planner must honor max_weight_transfers before compact payload materialization";
+
+    ASSERT_TRUE(cuda_kernel_->materializePrefillLeastLoadedTransferCommands(
+        runtime_table.deviceLayerState(0),
+        d_plan,
+        d_plan_count,
+        4,
+        d_header,
+        d_status,
+        rebalance_config,
+        1,
+        0));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    uint32_t materialized_plan_count = 0;
+    std::array<llaminar2::DeviceMoERebalancePlanEntry, 4> materialized_plan{};
+    llaminar2::DeviceMoERebalanceStatus materialized_status{};
+    ASSERT_EQ(cudaMemcpy(&materialized_plan_count, d_plan_count, sizeof(uint32_t),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(materialized_plan.data(), d_plan,
+                         sizeof(materialized_plan), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&materialized_status, d_status, sizeof(materialized_status),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(materialized_plan_count, 1u);
+    EXPECT_EQ(materialized_status.planned_arrivals, 1u);
+    EXPECT_EQ(materialized_status.plan_overflow, 0u);
+    EXPECT_EQ(materialized_status.payload_bucket_requested_slots, 1u);
+    EXPECT_EQ(materialized_status.payload_bucket_overflow, 0u);
+    EXPECT_EQ(materialized_status.llep_weight_transfer_count, 1u);
+
+    config.max_weight_transfers = 0;
+    ASSERT_TRUE(cuda_kernel_->planPrefillRoutesLeastLoadedCurrentBatch(
+        runtime_table.deviceLayerState(0),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k,
+        config));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpy(&runtime_state,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(runtime_state),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(runtime_state.reserved_u64[2], 4u);
+    EXPECT_EQ(runtime_state.reserved_u64[3], 3u);
     ASSERT_TRUE(cuda_kernel_->materializePrefillLeastLoadedTransferCommands(
         runtime_table.deviceLayerState(0),
         d_plan,
@@ -1653,9 +2307,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedTransferCommandsPreserveTra
         0));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    uint32_t materialized_plan_count = 0;
-    std::array<llaminar2::DeviceMoERebalancePlanEntry, 4> materialized_plan{};
-    llaminar2::DeviceMoERebalanceStatus materialized_status{};
     ASSERT_EQ(cudaMemcpy(&materialized_plan_count, d_plan_count, sizeof(uint32_t),
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
@@ -1725,12 +2376,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedStandardPlanAssignsOwnerRou
     bank.expert_count = num_experts;
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        bank.experts[expert].logical_expert_id = expert;
-        bank.experts[expert].owner_participant = expert;
-        bank.experts[expert].flags =
-            llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
-                                        llaminar2::DeviceMoEExpertFlags::Resident);
-        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(expert);
+        const int owner = expert;
+        seedRuntimeBankExpert(bank, expert, owner, owner == static_cast<int>(runtime_state.participant_id));
+        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(owner);
     }
     ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
                               &runtime_state,
@@ -1823,6 +2471,119 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedStandardPlanAssignsOwnerRou
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedUncoveredSpanRowsFallBackToOwner)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    const auto device = llaminar2::DeviceId::cuda(0);
+    constexpr int seq_len = 4;
+    constexpr int num_experts = 2;
+    constexpr int top_k = 1;
+    constexpr int total_slots = seq_len * top_k;
+
+    llaminar2::DeviceMoERuntimeTable::Config runtime_config;
+    runtime_config.device_id = device;
+    runtime_config.num_layers = 1;
+    runtime_config.num_experts = num_experts;
+    runtime_config.top_k = top_k;
+    runtime_config.mirror_to_device = true;
+    runtime_config.prefill_token_capacity = seq_len;
+    llaminar2::MoERuntimeTable runtime_table(runtime_config);
+
+    auto runtime_state = runtime_table.hostLayerState(0);
+    runtime_state.participant_id = 0;
+    runtime_state.participant_count = 2;
+    auto &bank = runtime_state.banks[runtime_state.active_bank];
+    bank.expert_count = num_experts;
+    seedRuntimeBankExpert(bank, 0, 0, true);
+    seedRuntimeBankExpert(bank, 1, 1, false);
+    bank.resident_participant_mask[0] = 0b01u;
+    bank.resident_participant_mask[1] = 0b10u;
+    ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
+                              &runtime_state,
+                              sizeof(runtime_state),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+
+    const float routing_indices_data[total_slots] = {0.0f, 1.0f, 0.0f, 1.0f};
+    const float routing_weights_data[total_slots] = {1.0f, 0.9f, 0.8f, 0.7f};
+    auto routing_indices = llaminar2::test::TestTensorFactory::createFP32(
+        {static_cast<size_t>(total_slots), 1});
+    auto routing_weights = llaminar2::test::TestTensorFactory::createFP32(
+        {static_cast<size_t>(total_slots), 1});
+    std::copy(routing_indices_data, routing_indices_data + total_slots,
+              routing_indices->mutable_data());
+    std::copy(routing_weights_data, routing_weights_data + total_slots,
+              routing_weights->mutable_data());
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+
+    ASSERT_TRUE(cuda_kernel_->groupPrefillRoutes(
+        runtime_table.deviceLayerState(0),
+        routing_indices.get(),
+        routing_weights.get(),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::array<llaminar2::least_loaded_ep::LeastLoadedExpertAssignmentSpan, 1> spans{};
+    spans[0].expert = 0u;
+    spans[0].owner_participant = 0u;
+    spans[0].destination_participant = 0u;
+    spans[0].route_row_begin = 0u;
+    spans[0].route_row_end = 2u;
+    spans[0].needs_foreign_weight = 0u;
+    const std::array<int32_t, num_experts * 2> span_bounds = {0, 1, -1, -1};
+
+    ASSERT_EQ(cudaMemcpy(runtime_state.reserved_ptrs[1],
+                         spans.data(),
+                         sizeof(spans),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(runtime_state.reserved_ptrs[0],
+                         span_bounds.data(),
+                         sizeof(span_bounds),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    llaminar2::DeviceMoELayerRuntime device_runtime_state{};
+    ASSERT_EQ(cudaMemcpy(&device_runtime_state,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(device_runtime_state),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    device_runtime_state.reserved_u64[2] = spans.size();
+    device_runtime_state.reserved_u64[3] = 0u;
+    ASSERT_EQ(cudaMemcpy(runtime_table.deviceLayerState(0),
+                         &device_runtime_state,
+                         sizeof(device_runtime_state),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        runtime_table.deviceLayerState(0),
+        seq_len,
+        seq_len,
+        num_experts,
+        top_k));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::array<int32_t, total_slots> route_participants{};
+    ASSERT_EQ(cudaMemcpy(route_participants.data(),
+                         runtime_state.route_participant_ids,
+                         sizeof(route_participants),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(route_participants[0], 0);
+    EXPECT_EQ(route_participants[1], 1);
+    EXPECT_EQ(route_participants[2], 0);
+    EXPECT_EQ(route_participants[3], 1);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchNoTransferPlanAssignsRoutes)
 {
 #ifndef HAVE_CUDA
@@ -1851,11 +2612,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchNoTransferPlanA
     for (int expert = 0; expert < num_experts; ++expert)
     {
         const int owner = expert == 1 ? 1 : 0;
-        bank.experts[expert].logical_expert_id = expert;
-        bank.experts[expert].owner_participant = owner;
-        bank.experts[expert].flags =
-            llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
-                                        llaminar2::DeviceMoEExpertFlags::Resident);
+        seedRuntimeBankExpert(bank, expert, owner, owner == static_cast<int>(runtime_state.participant_id));
         bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(owner);
     }
     ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
@@ -1953,12 +2710,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillLeastLoadedCurrentBatchResidentReplica
     bank.expert_count = num_experts;
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        bank.experts[expert].logical_expert_id = expert;
-        bank.experts[expert].owner_participant = expert < 2 ? 0 : 1;
-        bank.experts[expert].flags =
-            llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
-                                        llaminar2::DeviceMoEExpertFlags::Resident);
-        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(bank.experts[expert].owner_participant);
+        const int owner = expert < 2 ? 0 : 1;
+        seedRuntimeBankExpert(bank, expert, owner, owner == static_cast<int>(runtime_state.participant_id));
+        bank.resident_participant_mask[expert] = 1u << static_cast<uint32_t>(owner);
     }
     bank.resident_participant_mask[0] = 0b11u;
     ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
@@ -2237,6 +2991,188 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceDomainProjectionPublishesRootPayloadS
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, DeviceRebalanceDomainProjectionRejectsNonResidentSourceParticipant)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 3;
+    config.root_participant = 0;
+    config.window_size_tokens = 1;
+
+    constexpr uint32_t plan_capacity = 4;
+    constexpr uint32_t command_buffer_count = 2;
+    constexpr uint32_t payload_slot_capacity = 4;
+    std::vector<llaminar2::DeviceMoERebalancePlanEntry> gathered_plan_entries(
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count) *
+        static_cast<size_t>(plan_capacity));
+    std::vector<llaminar2::DeviceMoERebalanceCommandBufferHeader> gathered_headers(
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count));
+    std::vector<llaminar2::DeviceMoERebalanceWaveState> gathered_wave_states(
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count));
+
+    llaminar2::DeviceMoERebalancePlanEntry root_plan;
+    root_plan.op = static_cast<uint32_t>(llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    root_plan.layer = 0;
+    root_plan.expert = 2;
+    root_plan.source_participant = 1;
+    root_plan.destination_participant = 0;
+    root_plan.source_resident_mask = 0b001u;
+    root_plan.destination_slot = 0;
+    root_plan.payload_slot = 0;
+    gathered_plan_entries[0] = root_plan;
+
+    auto &root_header = gathered_headers[0];
+    root_header.epoch = 13;
+    root_header.phase =
+        static_cast<uint32_t>(llaminar2::DeviceMoERebalancePipelinePhase::PlanAssignments);
+    root_header.command_count = 1;
+    root_header.command_capacity = plan_capacity;
+    root_header.participant_id = 0;
+    root_header.participant_count = config.participant_count;
+
+    auto &root_wave = gathered_wave_states[0];
+    root_wave.epoch = root_header.epoch;
+    root_wave.planned_start_layer = 0;
+    root_wave.planned_layer_count = 1;
+    root_wave.command_capacity = plan_capacity;
+    root_wave.participant_id = 0;
+    root_wave.participant_count = config.participant_count;
+    root_wave.requested_payload_slots = 1;
+    root_wave.payload_bucket_slots = 1;
+
+    llaminar2::DeviceMoERebalanceStatus status;
+    std::vector<llaminar2::DeviceMoERebalancePlanEntry> local_plan_entries(
+        static_cast<size_t>(command_buffer_count) * static_cast<size_t>(plan_capacity));
+    std::vector<llaminar2::DeviceMoERebalanceCommandBufferHeader> local_headers(
+        command_buffer_count);
+    std::vector<llaminar2::DeviceMoERebalanceWaveState> local_wave_states(
+        command_buffer_count);
+
+    llaminar2::DeviceMoERebalancePlanEntry *d_gathered_plan = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_gathered_headers = nullptr;
+    llaminar2::DeviceMoERebalanceWaveState *d_gathered_wave_states = nullptr;
+    llaminar2::DeviceMoERebalancePlanEntry *d_local_plan = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_local_headers = nullptr;
+    llaminar2::DeviceMoERebalanceWaveState *d_local_wave_states = nullptr;
+    llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_plan),
+                         gathered_plan_entries.size() * sizeof(gathered_plan_entries[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_headers),
+                         gathered_headers.size() * sizeof(gathered_headers[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_wave_states),
+                         gathered_wave_states.size() * sizeof(gathered_wave_states[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_plan),
+                         local_plan_entries.size() * sizeof(local_plan_entries[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_headers),
+                         local_headers.size() * sizeof(local_headers[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_wave_states),
+                         local_wave_states.size() * sizeof(local_wave_states[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_status), sizeof(status)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered_plan,
+                              gathered_plan_entries.data(),
+                              gathered_plan_entries.size() * sizeof(gathered_plan_entries[0]),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered_headers,
+                              gathered_headers.data(),
+                              gathered_headers.size() * sizeof(gathered_headers[0]),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered_wave_states,
+                              gathered_wave_states.data(),
+                              gathered_wave_states.size() * sizeof(gathered_wave_states[0]),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_plan, 0, local_plan_entries.size() * sizeof(local_plan_entries[0]), stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_headers, 0, local_headers.size() * sizeof(local_headers[0]), stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_wave_states, 0, local_wave_states.size() * sizeof(local_wave_states[0]), stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_status, &status, sizeof(status), cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->projectDeviceRebalanceDomainCommands(
+        d_gathered_plan,
+        d_gathered_headers,
+        plan_capacity,
+        d_local_plan,
+        d_local_headers,
+        config,
+        d_status,
+        payload_slot_capacity,
+        command_buffer_count,
+        d_gathered_wave_states,
+        d_local_wave_states));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpy(local_plan_entries.data(),
+                         d_local_plan,
+                         local_plan_entries.size() * sizeof(local_plan_entries[0]),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(local_headers.data(),
+                         d_local_headers,
+                         local_headers.size() * sizeof(local_headers[0]),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(local_wave_states.data(),
+                         d_local_wave_states,
+                         local_wave_states.size() * sizeof(local_wave_states[0]),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&status, d_status, sizeof(status), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+
+    EXPECT_EQ(local_headers[0].participant_id, config.participant_id);
+    EXPECT_EQ(local_headers[0].participant_count, config.participant_count);
+    EXPECT_EQ(local_headers[0].epoch, root_header.epoch);
+    EXPECT_EQ(local_headers[0].command_count, 0u);
+    EXPECT_EQ(local_plan_entries[0].op, 0u);
+    EXPECT_EQ(local_wave_states[0].requested_payload_slots, 0u);
+    EXPECT_EQ(local_wave_states[0].payload_bucket_slots, 0u);
+    EXPECT_EQ(status.status_code, static_cast<uint32_t>(llaminar2::DeviceMoERebalanceStatusCode::Ok));
+    EXPECT_EQ(status.windows_observed, 1u);
+    EXPECT_EQ(status.windows_applied, 0u);
+    EXPECT_EQ(status.planned_arrivals, 0u);
+    EXPECT_EQ(status.invalid_runtime_layers, 1u);
+    EXPECT_EQ(status.payload_bucket_requested_slots, 0u);
+    EXPECT_EQ(status.payload_bucket_slots, 0u);
+    EXPECT_EQ(status.payload_source_participant_mask, 0u);
+    EXPECT_EQ(status.payload_destination_participant_mask, 0u);
+    EXPECT_EQ(status.payload_edge_mask, 0ULL);
+
+    cudaFree(d_gathered_plan);
+    cudaFree(d_gathered_headers);
+    cudaFree(d_gathered_wave_states);
+    cudaFree(d_local_plan);
+    cudaFree(d_local_headers);
+    cudaFree(d_local_wave_states);
+    cudaFree(d_status);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, DeviceRebalanceDomainProjectionStatusAggregatesRootPayloadAcrossWaves)
 {
 #ifndef HAVE_CUDA
@@ -2360,6 +3296,168 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceDomainProjectionStatusAggregatesRootP
     cudaFree(d_gathered_headers);
     cudaFree(d_local_plan);
     cudaFree(d_local_headers);
+    cudaFree(d_status);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, PrefillLLEPDomainProjectionMergesDestinationLocalRequestsForSourcePacking)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 8;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 3;
+    config.root_participant = 0;
+    config.window_size_tokens = 1;
+
+    constexpr uint32_t plan_capacity = 4;
+    constexpr uint32_t command_buffer_count = 1;
+    constexpr uint32_t payload_slot_capacity = 4;
+    std::vector<llaminar2::DeviceMoERebalancePlanEntry> gathered_plan_entries(
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count) *
+        static_cast<size_t>(plan_capacity));
+    std::vector<llaminar2::DeviceMoERebalanceCommandBufferHeader> gathered_headers(
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count));
+
+    auto make_header = [&](uint32_t participant, uint32_t count)
+    {
+        llaminar2::DeviceMoERebalanceCommandBufferHeader header;
+        header.epoch = 11;
+        header.phase =
+            static_cast<uint32_t>(llaminar2::DeviceMoERebalancePipelinePhase::PlanAssignments);
+        header.command_count = count;
+        header.command_capacity = plan_capacity;
+        header.participant_id = participant;
+        header.participant_count = config.participant_count;
+        return header;
+    };
+    gathered_headers[1] = make_header(1, 1);
+    gathered_headers[2] = make_header(2, 1);
+
+    auto make_plan = [&](uint32_t expert, uint32_t destination)
+    {
+        llaminar2::DeviceMoERebalancePlanEntry plan;
+        plan.op = static_cast<uint32_t>(llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+        plan.layer = 0;
+        plan.expert = expert;
+        plan.source_participant = 0;
+        plan.destination_participant = destination;
+        plan.source_resident_mask = 0b001u;
+        plan.destination_slot = 0;
+        plan.payload_slot = 0;
+        return plan;
+    };
+    gathered_plan_entries[1 * plan_capacity] = make_plan(3, 1);
+    gathered_plan_entries[2 * plan_capacity] = make_plan(5, 2);
+
+    std::vector<llaminar2::DeviceMoERebalancePlanEntry> local_plan_entries(plan_capacity);
+    uint32_t local_plan_count = 0;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader local_header;
+    llaminar2::DeviceMoERebalanceStatus status;
+
+    llaminar2::DeviceMoERebalancePlanEntry *d_gathered_plan = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_gathered_headers = nullptr;
+    llaminar2::DeviceMoERebalancePlanEntry *d_local_plan = nullptr;
+    uint32_t *d_local_plan_count = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_local_header = nullptr;
+    llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_plan),
+                         gathered_plan_entries.size() * sizeof(gathered_plan_entries[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_headers),
+                         gathered_headers.size() * sizeof(gathered_headers[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_plan),
+                         local_plan_entries.size() * sizeof(local_plan_entries[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_plan_count), sizeof(local_plan_count)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_header), sizeof(local_header)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_status), sizeof(status)), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered_plan,
+                              gathered_plan_entries.data(),
+                              gathered_plan_entries.size() * sizeof(gathered_plan_entries[0]),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered_headers,
+                              gathered_headers.data(),
+                              gathered_headers.size() * sizeof(gathered_headers[0]),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_plan, 0, local_plan_entries.size() * sizeof(local_plan_entries[0]), stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_plan_count, 0, sizeof(local_plan_count), stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_header, 0, sizeof(local_header), stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_status, &status, sizeof(status), cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->projectPrefillLeastLoadedDomainCommands(
+        d_gathered_plan,
+        d_gathered_headers,
+        plan_capacity,
+        d_local_plan,
+        d_local_plan_count,
+        d_local_header,
+        config,
+        d_status,
+        payload_slot_capacity,
+        command_buffer_count));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpy(local_plan_entries.data(),
+                         d_local_plan,
+                         local_plan_entries.size() * sizeof(local_plan_entries[0]),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&local_plan_count, d_local_plan_count, sizeof(local_plan_count), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&local_header, d_local_header, sizeof(local_header), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&status, d_status, sizeof(status), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+
+    EXPECT_EQ(local_header.participant_id, config.participant_id);
+    EXPECT_EQ(local_header.participant_count, config.participant_count);
+    EXPECT_EQ(local_header.command_count, 2u);
+    EXPECT_EQ(local_plan_count, 2u);
+    EXPECT_EQ(local_plan_entries[0].source_participant, 0u);
+    EXPECT_EQ(local_plan_entries[0].destination_participant, 1u);
+    EXPECT_EQ(local_plan_entries[0].payload_slot, 0u);
+    EXPECT_EQ(local_plan_entries[0].destination_slot, 0u);
+    EXPECT_EQ(local_plan_entries[1].source_participant, 0u);
+    EXPECT_EQ(local_plan_entries[1].destination_participant, 2u);
+    EXPECT_EQ(local_plan_entries[1].payload_slot, 1u)
+        << "domain projection must remap colliding destination-local slots into source-local compact lanes";
+    EXPECT_EQ(local_plan_entries[1].destination_slot, 0u);
+    EXPECT_EQ(status.status_code, static_cast<uint32_t>(llaminar2::DeviceMoERebalanceStatusCode::Ok));
+    EXPECT_EQ(status.planned_arrivals, 0u)
+        << "projection must preserve local current-batch LLEP completion counters";
+    EXPECT_EQ(status.candidate_arrivals_considered, 2u);
+    EXPECT_EQ(status.payload_bucket_requested_slots, 2u);
+    EXPECT_EQ(status.payload_bucket_slots, 2u);
+    EXPECT_EQ(status.payload_source_participant_mask, 0b001u);
+    EXPECT_EQ(status.payload_destination_participant_mask, 0b110u);
+
+    cudaFree(d_gathered_plan);
+    cudaFree(d_gathered_headers);
+    cudaFree(d_local_plan);
+    cudaFree(d_local_plan_count);
+    cudaFree(d_local_header);
     cudaFree(d_status);
 #endif
 }
@@ -2510,7 +3608,7 @@ TEST_F(Test__CUDAMoEKernel, GroupPrefillRoutesRuntimeState_DeterministicSmall)
     {
         const int expert = routing_indices[static_cast<size_t>(slot)];
         expected_per_expert[static_cast<size_t>(expert)].push_back(
-            {slot / top_k, routing_weights[static_cast<size_t>(slot)]});
+            {slot, routing_weights[static_cast<size_t>(slot)]});
     }
 
     for (int expert = 0; expert < num_experts; ++expert)
@@ -3347,6 +4445,133 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansDynamicOwnershipTransf
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerRejectsOwnershipSwapFromNonResidentSource)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoERuntimeTable;
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = llaminar2::DeviceId::cuda(0);
+    table_config.num_layers = 1;
+    table_config.num_experts = 4;
+    table_config.top_k = 2;
+    table_config.mirror_to_device = true;
+    DeviceMoERuntimeTable runtime_table(table_config);
+
+    auto update = makeDynamicOwnershipTransferUpdate(1, 0);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream_));
+
+    llaminar2::DeviceMoELayerRuntime seeded_runtime{};
+    ASSERT_EQ(cudaMemcpy(&seeded_runtime,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(seeded_runtime),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    seeded_runtime.banks[seeded_runtime.active_bank].resident_participant_mask[2] = 0b01u;
+    ASSERT_EQ(cudaMemcpyAsync(runtime_table.deviceLayerState(0),
+                              &seeded_runtime,
+                              sizeof(seeded_runtime),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.window_size_tokens = 55;
+    config.max_hot_replicas_per_participant = 0;
+    config.dynamic_max_swaps_per_layer = 1;
+    config.dynamic_max_plan_entries_per_wave = 2;
+    config.flags = 0;
+    config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::PlanMissingArrivals);
+    config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::CollectLoadStats);
+    config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::DeferRuntimeApply);
+
+    std::vector<uint64_t> gathered(static_cast<size_t>(config.participant_count) *
+                                       config.num_layers * config.num_experts,
+                                   0);
+    gathered[0] = 70;
+    gathered[1] = 30;
+    gathered[config.num_experts + 2] = 1;
+    gathered[config.num_experts + 3] = 9;
+
+    uint64_t *d_gathered = nullptr;
+    llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
+    llaminar2::DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
+    llaminar2::DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered),
+                         gathered.size() * sizeof(uint64_t)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_status),
+                         sizeof(llaminar2::DeviceMoERebalanceStatus)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_plan),
+                         2 * sizeof(llaminar2::DeviceMoERebalancePlanEntry)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_plan_count),
+                         sizeof(uint32_t)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_command_header),
+                         sizeof(llaminar2::DeviceMoERebalanceCommandBufferHeader)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_wave_state),
+                         sizeof(llaminar2::DeviceMoERebalanceWaveState)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered, gathered.data(),
+                              gathered.size() * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
+        runtime_table.deviceLayerState(0),
+        d_gathered,
+        d_status,
+        config,
+        d_plan,
+        d_plan_count,
+        2,
+        1,
+        d_command_header,
+        d_wave_state));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::DeviceMoERebalanceStatus status;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader command_header;
+    uint32_t plan_count = 99;
+    ASSERT_EQ(cudaMemcpy(&status, d_status, sizeof(status), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&command_header, d_command_header, sizeof(command_header), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&plan_count, d_plan_count, sizeof(plan_count), cudaMemcpyDeviceToHost), cudaSuccess);
+
+    EXPECT_EQ(status.status_code, static_cast<uint32_t>(llaminar2::DeviceMoERebalanceStatusCode::Ok));
+    EXPECT_EQ(status.dynamic_ownership_swap_attempts, 1u);
+    EXPECT_EQ(status.dynamic_ownership_swap_accepts, 0u);
+    EXPECT_EQ(status.dynamic_ownership_swap_rejections, 1u);
+    EXPECT_EQ(status.skipped_no_resident, 1u);
+    EXPECT_EQ(status.planned_arrivals, 0u);
+    EXPECT_EQ(status.accepted_load_spread_improvement_total, 0u);
+    EXPECT_EQ(plan_count, 0u);
+    EXPECT_EQ(command_header.command_count, 0u);
+
+    cudaFree(d_gathered);
+    cudaFree(d_status);
+    cudaFree(d_plan);
+    cudaFree(d_plan_count);
+    cudaFree(d_command_header);
+    cudaFree(d_wave_state);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerNarrowsDeferredApplySpanToCommandLayers)
 {
 #ifndef HAVE_CUDA
@@ -3942,6 +5167,147 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalancePublishRequiresGatheredDestinationCop
     copy_status.copied_arrivals = 0;
     gathered_copy_status[0].copied_arrivals = 0;
     gathered_copy_status[1].copied_arrivals = 0;
+
+    llaminar2::DeviceMoERebalanceGraphControllerState *d_controller_state = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_headers = nullptr;
+    llaminar2::DeviceMoERebalanceWaveState *d_wave_states = nullptr;
+    llaminar2::DeviceMoERebalancePlanEntry *d_plan_entries = nullptr;
+    llaminar2::DeviceMoERebalanceApplyStatus *d_copy_status = nullptr;
+    llaminar2::DeviceMoERebalanceApplyStatus *d_gathered_copy_status = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_controller_state), sizeof(controller_state)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_command_headers),
+                         command_headers.size() * sizeof(command_headers[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_wave_states),
+                         wave_states.size() * sizeof(wave_states[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_plan_entries),
+                         plan_entries.size() * sizeof(plan_entries[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_copy_status), sizeof(copy_status)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_copy_status),
+                         gathered_copy_status.size() * sizeof(gathered_copy_status[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_controller_state, &controller_state, sizeof(controller_state),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_command_headers, command_headers.data(),
+                              command_headers.size() * sizeof(command_headers[0]),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_wave_states, wave_states.data(),
+                              wave_states.size() * sizeof(wave_states[0]),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_plan_entries, plan_entries.data(),
+                              plan_entries.size() * sizeof(plan_entries[0]),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_copy_status, &copy_status, sizeof(copy_status),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered_copy_status, gathered_copy_status.data(),
+                              gathered_copy_status.size() * sizeof(gathered_copy_status[0]),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->publishDeviceRebalanceTransferComplete(
+        d_controller_state,
+        d_command_headers,
+        d_wave_states,
+        d_copy_status,
+        d_plan_entries,
+        plan_capacity,
+        d_gathered_copy_status,
+        config,
+        command_buffer_count));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::DeviceMoERebalanceGraphControllerState result;
+    ASSERT_EQ(cudaMemcpy(&result, d_controller_state, sizeof(result), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(result.last_error_code,
+              static_cast<uint32_t>(llaminar2::DeviceMoERebalanceStatusCode::MissingTransferCompletion));
+    const auto &wave = result.waves[0];
+    EXPECT_EQ(wave.state,
+              static_cast<uint32_t>(llaminar2::DeviceMoERebalanceWaveLifecycle::Error));
+    EXPECT_NE(wave.state,
+              static_cast<uint32_t>(llaminar2::DeviceMoERebalanceWaveLifecycle::ReadyToApply));
+    EXPECT_EQ(wave.error_code,
+              static_cast<uint32_t>(llaminar2::DeviceMoERebalanceStatusCode::MissingTransferCompletion));
+
+    cudaFree(d_controller_state);
+    cudaFree(d_command_headers);
+    cudaFree(d_wave_states);
+    cudaFree(d_plan_entries);
+    cudaFree(d_copy_status);
+    cudaFree(d_gathered_copy_status);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DeviceRebalancePublishRejectsSourceSideCopyErrors)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.window_size_tokens = 1;
+    config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::DeferRuntimeApply);
+
+    constexpr uint32_t command_buffer_count = 2;
+    constexpr uint32_t plan_capacity = 1;
+    llaminar2::DeviceMoERebalanceGraphControllerState controller_state;
+    controller_state.participant_id = config.participant_id;
+    controller_state.participant_count = config.participant_count;
+    controller_state.active_wave = 0;
+    controller_state.wave_count = command_buffer_count;
+
+    std::array<llaminar2::DeviceMoERebalanceCommandBufferHeader, command_buffer_count> command_headers{};
+    std::array<llaminar2::DeviceMoERebalanceWaveState, command_buffer_count> wave_states{};
+    std::array<llaminar2::DeviceMoERebalancePlanEntry, command_buffer_count * plan_capacity> plan_entries{};
+    std::array<llaminar2::DeviceMoERebalanceApplyStatus, 2> gathered_copy_status{};
+    for (uint32_t i = 0; i < command_buffer_count; ++i)
+    {
+        command_headers[i].command_capacity = plan_capacity;
+        command_headers[i].participant_id = config.participant_id;
+        command_headers[i].participant_count = config.participant_count;
+        wave_states[i].command_capacity = plan_capacity;
+        wave_states[i].participant_id = config.participant_id;
+        wave_states[i].participant_count = config.participant_count;
+    }
+    command_headers[0].epoch = 12;
+    command_headers[0].command_count = 1;
+    wave_states[0].epoch = command_headers[0].epoch;
+    wave_states[0].planned_start_layer = 0;
+    wave_states[0].planned_layer_count = 1;
+    wave_states[0].requested_payload_slots = 1;
+    wave_states[0].payload_bucket_slots = 1;
+    plan_entries[0].op = static_cast<uint32_t>(llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    plan_entries[0].layer = 0;
+    plan_entries[0].expert = 1;
+    plan_entries[0].source_participant = 0;
+    plan_entries[0].destination_participant = 1;
+    plan_entries[0].source_resident_mask = 0b01u;
+    plan_entries[0].destination_slot = 0;
+    plan_entries[0].payload_slot = 0;
+
+    /*
+     * Regression for ROCm long-context Dynamic+MTP+prefix cache: the source
+     * participant failed to pack a descriptor, but the destination participant
+     * still reported enough copied arrivals.  Publication must treat the source
+     * error counter as fatal instead of marking the transfer wave ready.
+     */
+    llaminar2::DeviceMoERebalanceApplyStatus copy_status;
+    copy_status.missing_source_descriptors = 1;
+    gathered_copy_status[0].missing_source_descriptors = 1;
+    gathered_copy_status[1].copied_arrivals = 1;
 
     llaminar2::DeviceMoERebalanceGraphControllerState *d_controller_state = nullptr;
     llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_headers = nullptr;
@@ -5336,6 +6702,297 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalancePackDirectoryExportsOnlyLocalResident
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, DeviceRebalanceUnpackPreservesSourceSidePackErrors)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 2;
+    config.window_size_tokens = 1;
+
+    constexpr uint32_t plan_capacity = 1;
+    constexpr uint32_t command_buffer_count = 1;
+    constexpr uint32_t local_payload_slot_count = 1;
+    constexpr uint64_t payload_slot_bytes = 512;
+
+    llaminar2::DeviceMoERebalancePlanEntry plan;
+    plan.op = static_cast<uint32_t>(llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    plan.layer = 0;
+    plan.expert = 0;
+    plan.source_participant = 1;
+    plan.destination_participant = 0;
+    plan.source_resident_mask = 0b10u;
+    plan.destination_slot = 0;
+    plan.payload_slot = 0;
+
+    llaminar2::DeviceMoERebalanceCommandBufferHeader command_header;
+    command_header.epoch = 11;
+    command_header.command_count = 1;
+    command_header.command_capacity = plan_capacity;
+    command_header.participant_id = config.participant_id;
+    command_header.participant_count = config.participant_count;
+
+    const size_t source_descriptor_count =
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count) *
+        static_cast<size_t>(plan_capacity);
+    const size_t local_payload_bytes =
+        static_cast<size_t>(local_payload_slot_count) *
+        static_cast<size_t>(payload_slot_bytes);
+    const size_t gathered_payload_bytes =
+        static_cast<size_t>(config.participant_count) * local_payload_bytes;
+
+    llaminar2::DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
+    llaminar2::DeviceMoEExpertDirectoryEntry *d_local_source_descriptors = nullptr;
+    uint8_t *d_local_payload = nullptr;
+    uint8_t *d_gathered_payload = nullptr;
+    llaminar2::DeviceMoEExpertDirectoryEntry *d_transfer_slots = nullptr;
+    llaminar2::DeviceMoERebalanceApplyStatus *d_copy_status = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_plan), sizeof(plan)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_command_header), sizeof(command_header)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_source_descriptors),
+                         source_descriptor_count * sizeof(llaminar2::DeviceMoEExpertDirectoryEntry)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_payload), local_payload_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered_payload), gathered_payload_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_transfer_slots),
+                         sizeof(llaminar2::DeviceMoEExpertDirectoryEntry)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_copy_status),
+                         sizeof(llaminar2::DeviceMoERebalanceApplyStatus)),
+              cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_plan, &plan, sizeof(plan), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_command_header,
+                              &command_header,
+                              sizeof(command_header),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_source_descriptors,
+                              0,
+                              source_descriptor_count * sizeof(llaminar2::DeviceMoEExpertDirectoryEntry),
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_payload, 0, local_payload_bytes, stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_gathered_payload, 0, gathered_payload_bytes, stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_transfer_slots,
+                              0,
+                              sizeof(llaminar2::DeviceMoEExpertDirectoryEntry),
+                              stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->packDeviceRebalanceCompactPayloads(
+        d_plan,
+        d_command_header,
+        plan_capacity,
+        d_local_source_descriptors,
+        d_local_payload,
+        local_payload_slot_count,
+        payload_slot_bytes,
+        config,
+        d_copy_status,
+        nullptr,
+        command_buffer_count));
+    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+        d_plan,
+        nullptr,
+        plan_capacity,
+        d_command_header,
+        d_gathered_payload,
+        local_payload_slot_count,
+        payload_slot_bytes,
+        d_transfer_slots,
+        1,
+        config,
+        d_copy_status,
+        nullptr,
+        command_buffer_count));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::DeviceMoERebalanceApplyStatus copy_status{};
+    ASSERT_EQ(cudaMemcpy(&copy_status, d_copy_status, sizeof(copy_status), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(copy_status.status_code,
+              static_cast<uint32_t>(llaminar2::DeviceMoERebalanceApplyStatusCode::Ok));
+    EXPECT_EQ(copy_status.missing_source_descriptors, 1u)
+        << "unpack must not clear source-side compact pack failures from the same transfer wave";
+    EXPECT_EQ(copy_status.copied_arrivals, 0u);
+    EXPECT_EQ(copy_status.skipped_wrong_destination, 1u);
+
+    cudaFree(d_plan);
+    cudaFree(d_command_header);
+    cudaFree(d_local_source_descriptors);
+    cudaFree(d_local_payload);
+    cudaFree(d_gathered_payload);
+    cudaFree(d_transfer_slots);
+    cudaFree(d_copy_status);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCompactPayloadRejectsResidentSourceWithoutLocalSlot)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 2;
+    config.window_size_tokens = 1;
+
+    constexpr uint32_t plan_capacity = 1;
+    constexpr uint32_t command_buffer_count = 1;
+    constexpr uint32_t local_payload_slot_count = 1;
+    constexpr uint64_t payload_slot_bytes = 512;
+    constexpr uint32_t n = 2;
+    constexpr uint32_t k = 32;
+    constexpr uint32_t blocks_per_row = 1;
+    constexpr size_t blocks = n * blocks_per_row;
+    constexpr size_t projection_payload_bytes = blocks * 16;
+    constexpr size_t projection_scales_bytes = blocks * sizeof(uint16_t);
+
+    uint8_t *d_src_payload = nullptr;
+    void *d_src_scales = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_src_payload), projection_payload_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_src_scales, projection_scales_bytes), cudaSuccess);
+
+    llaminar2::DeviceNativeVNNIMatrixDesc projection_desc;
+    projection_desc.payload = d_src_payload;
+    projection_desc.scales = d_src_scales;
+    projection_desc.n = n;
+    projection_desc.k = k;
+    projection_desc.blocks_per_row = blocks_per_row;
+    projection_desc.codebook_id = 0;
+
+    llaminar2::DeviceMoEExpertDirectoryEntry source_entry;
+    source_entry.descriptor.gate = projection_desc;
+    source_entry.descriptor.up = projection_desc;
+    source_entry.descriptor.down = projection_desc;
+    source_entry.descriptor.logical_expert_id = 0;
+    source_entry.descriptor.owner_participant = 1;
+    source_entry.descriptor.local_slot = -1;
+    source_entry.descriptor.flags =
+        llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
+                                    llaminar2::DeviceMoEExpertFlags::Resident);
+    source_entry.layer = 0;
+    source_entry.expert = 0;
+    source_entry.participant = 1;
+    source_entry.resident_mask = 0b10u;
+    source_entry.slot_index = llaminar2::kDeviceMoEInvalidSlot;
+    source_entry.flags =
+        static_cast<uint32_t>(llaminar2::DeviceMoERebalanceDirectoryFlags::Valid) |
+        static_cast<uint32_t>(llaminar2::DeviceMoERebalanceDirectoryFlags::Resident);
+    ASSERT_TRUE(llaminar2::deviceMoEPopulateDirectoryFormat(source_entry));
+
+    const size_t source_descriptor_count =
+        static_cast<size_t>(config.participant_count) *
+        static_cast<size_t>(command_buffer_count) *
+        static_cast<size_t>(plan_capacity);
+    std::vector<llaminar2::DeviceMoEExpertDirectoryEntry> local_source_descriptors(
+        source_descriptor_count);
+    local_source_descriptors[0] = source_entry;
+
+    llaminar2::DeviceMoERebalancePlanEntry plan;
+    plan.op = static_cast<uint32_t>(llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    plan.layer = 0;
+    plan.expert = 0;
+    plan.source_participant = 1;
+    plan.destination_participant = 0;
+    plan.source_resident_mask = 0b10u;
+    plan.destination_slot = 0;
+    plan.payload_slot = 0;
+
+    llaminar2::DeviceMoERebalanceCommandBufferHeader command_header;
+    command_header.epoch = 12;
+    command_header.command_count = 1;
+    command_header.command_capacity = plan_capacity;
+    command_header.participant_id = config.participant_id;
+    command_header.participant_count = config.participant_count;
+
+    const size_t local_payload_bytes =
+        static_cast<size_t>(local_payload_slot_count) *
+        static_cast<size_t>(payload_slot_bytes);
+    llaminar2::DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
+    llaminar2::DeviceMoEExpertDirectoryEntry *d_local_source_descriptors = nullptr;
+    uint8_t *d_local_payload = nullptr;
+    llaminar2::DeviceMoERebalanceApplyStatus *d_copy_status = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_plan), sizeof(plan)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_command_header), sizeof(command_header)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_source_descriptors),
+                         local_source_descriptors.size() * sizeof(local_source_descriptors[0])),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_local_payload), local_payload_bytes), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_copy_status),
+                         sizeof(llaminar2::DeviceMoERebalanceApplyStatus)),
+              cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_plan, &plan, sizeof(plan), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_command_header,
+                              &command_header,
+                              sizeof(command_header),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_local_source_descriptors,
+                              local_source_descriptors.data(),
+                              local_source_descriptors.size() * sizeof(local_source_descriptors[0]),
+                              cudaMemcpyHostToDevice,
+                              stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_local_payload, 0, local_payload_bytes, stream_), cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel_->packDeviceRebalanceCompactPayloads(
+        d_plan,
+        d_command_header,
+        plan_capacity,
+        d_local_source_descriptors,
+        d_local_payload,
+        local_payload_slot_count,
+        payload_slot_bytes,
+        config,
+        d_copy_status,
+        nullptr,
+        command_buffer_count));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::DeviceMoERebalanceApplyStatus copy_status{};
+    llaminar2::DeviceMoEExpertDirectoryEntry payload_header{};
+    ASSERT_EQ(cudaMemcpy(&copy_status, d_copy_status, sizeof(copy_status), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&payload_header,
+                         d_local_payload,
+                         sizeof(payload_header),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(copy_status.missing_source_descriptors, 1u)
+        << "a resident mask without a local slot is not a physical source for payload bytes";
+    EXPECT_EQ(copy_status.invalid_plan_entries, 0u);
+    EXPECT_EQ(payload_header.flags, 0u);
+
+    cudaFree(d_plan);
+    cudaFree(d_command_header);
+    cudaFree(d_local_source_descriptors);
+    cudaFree(d_local_payload);
+    cudaFree(d_copy_status);
+    cudaFree(d_src_payload);
+    cudaFree(d_src_scales);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
 {
 #ifndef HAVE_CUDA
@@ -5467,6 +7124,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     source_entry.expert = 0;
     source_entry.participant = 0;
     source_entry.resident_mask = 0b001u;
+    source_entry.slot_index = 0;
     source_entry.flags =
         static_cast<uint32_t>(llaminar2::DeviceMoERebalanceDirectoryFlags::Valid) |
         static_cast<uint32_t>(llaminar2::DeviceMoERebalanceDirectoryFlags::Resident) |
@@ -5804,6 +7462,13 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     ASSERT_EQ(cudaMemsetAsync(d_gathered_payload,
                               0,
                               gathered_payload_bytes,
+                              stream_),
+              cudaSuccess);
+    const auto clean_copy_status = makeCleanRebalanceApplyStatus();
+    ASSERT_EQ(cudaMemcpyAsync(d_copy_status,
+                              &clean_copy_status,
+                              sizeof(clean_copy_status),
+                              cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
     ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
@@ -7444,7 +9109,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDevi
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesDecodeEquivalentKernelAndCaptures)
+TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -7478,26 +9143,22 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesDecodeEquivalentKe
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_JSON", "1");
     llaminar2::PerfStatsCollector::reset();
 
-    llaminar2::MoERoutingResult warmup_host_result;
-    ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
-                                               num_experts, top_k, true,
-                                               cuda_indices.get(), cuda_weights.get(), warmup_host_result));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-
-    llaminar2::MoERoutingResult captured_host_result;
-    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
-    const bool captured_route = cuda_kernel_->routeWithTensors(
+    ASSERT_TRUE(cuda_kernel_->routeVerifierRowsDecodeEquivalent(
         hidden.get(), gate.get(), seq_len, d_model,
         num_experts, top_k, true,
-        cuda_indices.get(), cuda_weights.get(), captured_host_result);
+        cuda_indices.get(), cuda_weights.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    const bool captured_route = cuda_kernel_->routeVerifierRowsDecodeEquivalent(
+        hidden.get(), gate.get(), seq_len, d_model,
+        num_experts, top_k, true,
+        cuda_indices.get(), cuda_weights.get());
     cudaGraph_t graph = nullptr;
     const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
     EXPECT_TRUE(captured_route);
     ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
     ASSERT_NE(graph, nullptr);
-    EXPECT_TRUE(captured_host_result.expert_indices.empty());
-    EXPECT_TRUE(captured_host_result.expert_weights.empty());
-    EXPECT_TRUE(captured_host_result.router_logits.empty());
 
     cudaGraphExec_t executable = nullptr;
     ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
@@ -7536,9 +9197,10 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesDecodeEquivalentKe
                                         return record.name == "cuda_moe_router_decode_equivalent_small_m_calls" &&
                                                tag_equals("seq_len", std::to_string(seq_len)) &&
                                                tag_equals("d_model", std::to_string(d_model)) &&
-                                               tag_equals("num_experts", std::to_string(num_experts));
+                                               tag_equals("num_experts", std::to_string(num_experts)) &&
+                                               tag_equals("route", "grouped_decode_equivalent");
                                     });
-    ASSERT_NE(match, records.end()) << "small-M decode-equivalent router counter missing; test did not exercise the verifier route";
+    ASSERT_NE(match, records.end()) << "grouped decode-equivalent router counter missing; test did not exercise the verifier route";
     EXPECT_GE(match->count, 2u);
     EXPECT_GE(match->value, 2.0);
     llaminar2::PerfStatsCollector::reset();
@@ -7548,7 +9210,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMVerifierUsesDecodeEquivalentKe
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMMatchesSerialDecodeRouterForVerifierRows)
+TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -7557,9 +9219,15 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMMatchesSerialDecodeRouterForVe
         GTEST_SKIP() << "No CUDA device available";
 
     using llaminar2::DeviceMoERuntimeTable;
+    auto &gemm = llaminar2::mutableDebugEnv().gemm;
+    gemm.cuda_moe_router_q8 = true;
+
     constexpr int d_model = 2048;
     constexpr int num_experts = 256;
     constexpr int top_k = 8;
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+    llaminar2::PerfStatsCollector::reset();
 
     DeviceMoERuntimeTable::Config cuda_config;
     cuda_config.device_id = llaminar2::DeviceId::cuda(0);
@@ -7587,7 +9255,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMMatchesSerialDecodeRouterForVe
                          0.0007f * static_cast<float>(static_cast<int>(i % 23) - 11);
     auto gate = makeTensor({num_experts, d_model}, gate_values);
 
-    for (int seq_len : {2, 3, 4})
+    for (int seq_len : {1, 2, 3, 4})
     {
         std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
         for (size_t i = 0; i < hidden_values.size(); ++i)
@@ -7603,11 +9271,10 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMMatchesSerialDecodeRouterForVe
         auto batched_weights = makeZeros(
             {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
 
-        llaminar2::MoERoutingResult batched_result;
-        ASSERT_TRUE(cuda_kernel_->routeWithTensors(
+        ASSERT_TRUE(cuda_kernel_->routeVerifierRowsDecodeEquivalent(
             hidden.get(), gate.get(), seq_len, d_model,
             num_experts, top_k, true,
-            batched_indices.get(), batched_weights.get(), batched_result))
+            batched_indices.get(), batched_weights.get()))
             << "seq_len=" << seq_len;
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
@@ -7670,6 +9337,19 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSmallMMatchesSerialDecodeRouterForVe
             seq_len,
             top_k);
     }
+
+    const auto records =
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_decode_equivalent_small_m_calls"});
+    const auto q8_match = std::find_if(records.begin(), records.end(), [](const llaminar2::PerfStatRecord &record)
+                                       {
+                                           const auto route_it = record.tags.find("route");
+                                           return record.name == "cuda_moe_router_decode_equivalent_small_m_calls" &&
+                                                  route_it != record.tags.end() &&
+                                                  route_it->second == "grouped_decode_equivalent_q8";
+                                       });
+    ASSERT_NE(q8_match, records.end())
+        << "Q8 verifier routing must exercise the economical grouped decode-equivalent router";
+    llaminar2::PerfStatsCollector::reset();
 #endif
 }
 
@@ -7921,6 +9601,367 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
 
     expectNearArray(combined_cuda->data(), combined_cpu->data(), combined_cuda->numel(), 1.0e-5f);
     expectNearArray(shared_cuda->data(), shared_cpu->data(), shared_cuda->numel(), 0.0f);
+}
+
+TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRows)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int d_model = 2048;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    std::vector<float> gate_values(static_cast<size_t>(d_model));
+    for (int i = 0; i < d_model; ++i)
+    {
+        gate_values[static_cast<size_t>(i)] =
+            0.031f * std::sin(0.013f * static_cast<float>(i + 3)) -
+            0.024f * std::cos(0.019f * static_cast<float>(i + 7)) +
+            0.0005f * static_cast<float>((i % 29) - 14);
+    }
+    auto gate = makeTensor({static_cast<size_t>(d_model)}, gate_values);
+    ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
+
+    for (int seq_len : {2, 3, 4})
+    {
+        std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
+        std::vector<float> shared_values(static_cast<size_t>(seq_len) * d_model);
+        std::vector<float> residual_values(static_cast<size_t>(seq_len) * d_model);
+        for (size_t i = 0; i < input_values.size(); ++i)
+        {
+            input_values[i] =
+                0.07f * std::sin(0.0067f * static_cast<float>(i + 11 + seq_len)) -
+                0.041f * std::cos(0.0103f * static_cast<float>(i + 17)) +
+                0.0009f * static_cast<float>(static_cast<int>(i % 23) - 11);
+            shared_values[i] =
+                0.13f * std::sin(0.0051f * static_cast<float>(i + 5)) +
+                0.052f * std::cos(0.0147f * static_cast<float>(i + 13)) -
+                0.0011f * static_cast<float>(static_cast<int>(i % 31) - 15);
+            residual_values[i] =
+                -0.09f * std::sin(0.0079f * static_cast<float>(i + 19)) +
+                0.066f * std::cos(0.0111f * static_cast<float>(i + 29)) +
+                0.0007f * static_cast<float>(static_cast<int>(i % 17) - 8);
+        }
+
+        auto grouped_input = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            input_values);
+        auto grouped_shared_only = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            shared_values);
+        auto grouped_shared_add = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            shared_values);
+        auto grouped_residual = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            residual_values);
+        auto grouped_combined = makeZeros(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+
+        cuda_kernel_->sharedExpertGateFromTensors(
+            grouped_input.get(),
+            gate.get(),
+            grouped_shared_only.get(),
+            seq_len,
+            d_model);
+        cuda_kernel_->sharedExpertGateAddFromTensors(
+            grouped_input.get(),
+            gate.get(),
+            grouped_shared_add.get(),
+            grouped_residual.get(),
+            grouped_combined.get(),
+            seq_len,
+            d_model);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        std::vector<float> serial_shared_only(static_cast<size_t>(seq_len) * d_model);
+        std::vector<float> serial_shared_add(static_cast<size_t>(seq_len) * d_model);
+        std::vector<float> serial_combined(static_cast<size_t>(seq_len) * d_model);
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const auto row_offset = static_cast<size_t>(row) * d_model;
+            std::vector<float> row_input(static_cast<size_t>(d_model));
+            std::vector<float> row_shared(static_cast<size_t>(d_model));
+            std::vector<float> row_residual(static_cast<size_t>(d_model));
+            std::copy_n(input_values.data() + row_offset, d_model, row_input.data());
+            std::copy_n(shared_values.data() + row_offset, d_model, row_shared.data());
+            std::copy_n(residual_values.data() + row_offset, d_model, row_residual.data());
+
+            auto row_input_tensor = makeTensor({1u, static_cast<size_t>(d_model)}, row_input);
+            auto row_shared_only_tensor = makeTensor({1u, static_cast<size_t>(d_model)}, row_shared);
+            auto row_shared_add_tensor = makeTensor({1u, static_cast<size_t>(d_model)}, row_shared);
+            auto row_residual_tensor = makeTensor({1u, static_cast<size_t>(d_model)}, row_residual);
+            auto row_combined_tensor = makeZeros({1u, static_cast<size_t>(d_model)});
+
+            cuda_kernel_->sharedExpertGateFromTensors(
+                row_input_tensor.get(),
+                gate.get(),
+                row_shared_only_tensor.get(),
+                1,
+                d_model);
+            cuda_kernel_->sharedExpertGateAddFromTensors(
+                row_input_tensor.get(),
+                gate.get(),
+                row_shared_add_tensor.get(),
+                row_residual_tensor.get(),
+                row_combined_tensor.get(),
+                1,
+                d_model);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+            const auto row_shared_only_host = copyCudaFP32TensorToHost(row_shared_only_tensor, stream_);
+            const auto row_shared_add_host = copyCudaFP32TensorToHost(row_shared_add_tensor, stream_);
+            const auto row_combined_host = copyCudaFP32TensorToHost(row_combined_tensor, stream_);
+            std::copy_n(row_shared_only_host.data(), d_model, serial_shared_only.data() + row_offset);
+            std::copy_n(row_shared_add_host.data(), d_model, serial_shared_add.data() + row_offset);
+            std::copy_n(row_combined_host.data(), d_model, serial_combined.data() + row_offset);
+        }
+
+        const auto grouped_shared_only_host = copyCudaFP32TensorToHost(grouped_shared_only, stream_);
+        const auto grouped_shared_add_host = copyCudaFP32TensorToHost(grouped_shared_add, stream_);
+        const auto grouped_combined_host = copyCudaFP32TensorToHost(grouped_combined, stream_);
+
+        ASSERT_EQ(grouped_shared_only_host, serial_shared_only) << "seq_len=" << seq_len;
+        ASSERT_EQ(grouped_shared_add_host, serial_shared_add) << "seq_len=" << seq_len;
+        ASSERT_EQ(grouped_combined_host, serial_combined) << "seq_len=" << seq_len;
+    }
+#endif
+}
+
+/**
+ * @brief Prove production shared-expert verifier rows match CUDA serial decode.
+ *
+ * The model-level Qwen3.6 MoE MTP verifier test compares grouped all-position
+ * rows with ordinary one-token serial decode.  The shared expert is a dense
+ * SwiGLU FFN, but CUDA serial decode intentionally reaches it through the MoE
+ * grouped table decode shortcut so graph replay can reuse stable pointer-table
+ * metadata.  This test exercises the exact `SharedExpertFFNStage` routes used
+ * by the graph: M=2/3/4 grouped verifier publication on the left, and M=1
+ * grouped table decode replay on the right.
+ */
+TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36IQ3SMatchSerialGroupedDecode)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int d_model = 2048;
+    constexpr int intermediate = 512;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/16,
+        /*down_kpart=*/true,
+        /*down_kparts=*/16);
+    llaminar2::PerfStatsCollector::reset();
+
+    auto gate_w = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
+        {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6201);
+    auto up_w = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
+        {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6202);
+    auto down_w = llaminar2::test::TestTensorFactory::createIQ3_SRandom(
+        {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 6203);
+    auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
+        gate_w.get(),
+        up_w.get(),
+        down_w.get(),
+        device,
+        "test.cuda_moe.qwen36_shared_stage_verifier",
+        llaminar2::ModelContextId{6200});
+
+    auto make_params = [&](llaminar2::TensorBase *input,
+                           llaminar2::TensorBase *output,
+                           int seq_len,
+                           bool grouped_verifier)
+    {
+        llaminar2::SharedExpertFFNStage::Params params;
+        params.device_id = device;
+        params.input = input;
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = output;
+        params.seq_len = seq_len;
+        params.d_model = d_model;
+        params.intermediate = intermediate;
+        params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
+        params.force_decode_equivalent_verifier_prefill = false;
+        params.disable_grouped_decode_shortcut = false;
+        params.prepared_ref_gate = prepared.gate_ref;
+        params.prepared_ref_up = prepared.up_ref;
+        params.prepared_ref_down = prepared.down_ref;
+        params.prepared_store = prepared.store.get();
+        return params;
+    };
+
+    auto make_stage = [&](llaminar2::SharedExpertFFNStage::Params params)
+    {
+        auto stage = std::make_unique<llaminar2::SharedExpertFFNStage>(params);
+        stage->setGPUStream(stream_);
+        stage->setMoEKernelForTesting(cuda_kernel_);
+        return stage;
+    };
+
+    /*
+     * Allocate the production stage's declared workspace once at the maximum
+     * verifier bucket.  Both sides of the comparison reuse it so differences
+     * cannot be explained by missing scratch, first-use allocation, or an
+     * accidental change to a non-workspace-backed path.
+     */
+    auto planning_input = makeZeros({4u, static_cast<size_t>(d_model)});
+    auto planning_output = makeZeros({4u, static_cast<size_t>(d_model)});
+    auto planning_stage = make_stage(
+        make_params(planning_input.get(), planning_output.get(), 4, true));
+    auto reqs = planning_stage->getWorkspaceRequirements(4, d_model, intermediate);
+    auto stage_workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+        device,
+        reqs.total_bytes_with_alignment() + 4 * 1024 * 1024);
+    ASSERT_TRUE(stage_workspace->allocate(reqs))
+        << "SharedExpertFFNStage Qwen3.6 verifier workspace";
+
+    llaminar2::CUDADeviceContext ctx(device, 0);
+
+    auto expect_bitwise_equal =
+        [](const std::vector<float> &actual,
+           const std::vector<float> &expected,
+           const std::string &label)
+    {
+        ASSERT_EQ(actual.size(), expected.size()) << label;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            if (actual[i] != expected[i])
+            {
+                ADD_FAILURE()
+                    << label
+                    << " first differing element=" << i
+                    << " actual=" << actual[i]
+                    << " expected=" << expected[i]
+                    << " abs_diff=" << std::abs(actual[i] - expected[i]);
+                return;
+            }
+        }
+    };
+
+    for (int seq_len : {2, 3, 4})
+    {
+        std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
+        for (size_t i = 0; i < input_values.size(); ++i)
+        {
+            input_values[i] =
+                0.017f * std::sin(0.0041f * static_cast<float>(i + 13)) -
+                0.011f * std::cos(0.0063f * static_cast<float>(i + 29)) +
+                0.0008f * static_cast<float>(static_cast<int>(i % 31) - 15);
+        }
+
+        auto grouped_input = makeTensor(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            input_values);
+        auto grouped_output = makeZeros(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
+
+        auto grouped_stage = make_stage(
+            make_params(grouped_input.get(), grouped_output.get(), seq_len, true));
+        grouped_stage->bindWorkspace(stage_workspace.get());
+        ASSERT_TRUE(grouped_stage->usesGroupedVerifierPrefillRouteForTesting())
+            << "The left side must exercise the production grouped verifier route";
+        ASSERT_TRUE(grouped_stage->execute(&ctx))
+            << "grouped shared verifier stage failed at seq_len=" << seq_len;
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        const auto grouped_host = copyCudaFP32TensorToHost(grouped_output, stream_);
+
+        std::vector<float> serial_host(static_cast<size_t>(seq_len) * d_model);
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const auto row_offset = static_cast<size_t>(row) * d_model;
+            std::vector<float> row_values(static_cast<size_t>(d_model));
+            std::copy_n(input_values.data() + row_offset, d_model, row_values.data());
+            auto row_input = makeTensor({1u, static_cast<size_t>(d_model)}, row_values);
+            auto row_output = makeZeros({1u, static_cast<size_t>(d_model)});
+            ASSERT_TRUE(row_input->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_output->ensureOnDevice(device, stream_));
+
+            auto row_stage = make_stage(
+                make_params(row_input.get(), row_output.get(), 1, false));
+            row_stage->bindWorkspace(stage_workspace.get());
+            ASSERT_TRUE(row_stage->usesGroupedDecodeForTesting())
+                << "The right side must exercise CUDA's ordinary M=1 grouped table decode route";
+            ASSERT_TRUE(row_stage->execute(&ctx))
+                << "serial grouped shared decode stage failed at seq_len="
+                << seq_len << " row=" << row;
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+            const auto row_host = copyCudaFP32TensorToHost(row_output, stream_);
+            std::copy_n(row_host.data(), d_model, serial_host.data() + row_offset);
+            row_stage->unbindWorkspace();
+        }
+
+        expect_bitwise_equal(
+            grouped_host,
+            serial_host,
+            "SharedExpertFFNStage Qwen3.6 IQ3_S grouped verifier vs serial grouped decode seq_len=" +
+                std::to_string(seq_len));
+        grouped_stage->unbindWorkspace();
+    }
+
+    const auto records =
+        llaminar2::PerfStatsCollector::snapshot({"kernel", "mtp"});
+    auto has_counter = [&](const char *domain,
+                           const char *name,
+                           const char *route,
+                           const char *active_slots) -> bool
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                if (record.domain != domain || record.name != name)
+                    return false;
+                auto tag_equals = [&](const char *key, const char *value)
+                {
+                    const auto it = record.tags.find(key);
+                    return it != record.tags.end() && it->second == value;
+                };
+                return (!route || tag_equals("route", route)) &&
+                       (!active_slots || tag_equals("active_slots", active_slots));
+            });
+    };
+    EXPECT_TRUE(has_counter(
+        "mtp",
+        "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
+        "grouped_table_prefill",
+        nullptr))
+        << "The grouped side must not silently leave the grouped verifier route\n"
+        << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+    EXPECT_TRUE(has_counter(
+        "kernel",
+        "cuda_moe_grouped_decode_gateup_calls",
+        "kpart",
+        "1"))
+        << "The serial side must exercise grouped table gate/up decode\n"
+        << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+    EXPECT_TRUE(has_counter(
+        "kernel",
+        "cuda_moe_grouped_decode_down_calls",
+        "kpart",
+        "1"))
+        << "The serial side must exercise grouped table down decode\n"
+        << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+
+    planning_stage->unbindWorkspace();
+    llaminar2::PerfStatsCollector::reset();
+#endif
 }
 
 TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddEffectiveSeqLenZeroesPaddedRowsAcrossGraphReplay)
@@ -10529,6 +12570,276 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
             /*max_row_relative_l2=*/0.008,
             /*max_row_kl=*/1.0e-4);
     }
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234MatchRowByRowDecode)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    /*
+     * This is the CUDA counterpart to the ROCm all-codegroup MoE sweep.  It runs
+     * every NativeVNNI tensor format that can publish through grouped routed MoE
+     * verifier prefill, including format aliases that share a codebook but carry
+     * different min/scale descriptor metadata.  The reference is the production
+     * row-by-row grouped decode entry point, not a CPU fallback.
+     */
+    constexpr int d_model = 256;
+    constexpr int intermediate = 256;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 4;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/4,
+        /*down_kpart=*/true,
+        /*down_kparts=*/4);
+
+    for (const auto &format : cudaMoEGroupedNativeFormats())
+    {
+        SCOPED_TRACE(format.label);
+
+        std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
+        std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
+        owned_weights.reserve(static_cast<size_t>(num_experts * 3));
+        prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
+
+        auto add_prepared = [&](int rows,
+                                int cols,
+                                uint32_t seed,
+                                const char *role) -> llaminar2::ITensorGemm *
+        {
+            auto weight = format.create(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                seed);
+            auto *weight_ptr = weight.get();
+            owned_weights.push_back(std::move(weight));
+            prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
+                weight_ptr,
+                device,
+                std::string("test.cuda_moe.all_native_formats.") + format.label +
+                    "." + role + "." + std::to_string(seed),
+                llaminar2::ModelContextId{1320000 + static_cast<uint64_t>(seed)}));
+
+            auto *kernel = prepared_weights.back().kernel;
+            if (auto *tensor_kernel = dynamic_cast<llaminar2::ITensorKernel *>(kernel))
+                tensor_kernel->setGPUStream(stream_);
+
+            llaminar2::DeviceNativeVNNIMatrixDesc desc{};
+            const bool exported = kernel->exportNativeVNNIMatrixDesc(desc);
+            EXPECT_TRUE(exported) << format.label << " descriptor export for " << role;
+            if (!exported)
+                return nullptr;
+            EXPECT_EQ(desc.codebook_id, format.codebook_id)
+                << format.label << " must exercise the expected CUDA grouped MoE codebook";
+            EXPECT_EQ(desc.n, rows);
+            EXPECT_EQ(desc.k, cols);
+            if (desc.codebook_id != format.codebook_id)
+                return nullptr;
+            return kernel;
+        };
+
+        struct ExpertTriplet
+        {
+            llaminar2::ITensorGemm *gate = nullptr;
+            llaminar2::ITensorGemm *up = nullptr;
+            llaminar2::ITensorGemm *down = nullptr;
+        };
+
+        std::array<ExpertTriplet, num_experts> experts{};
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            experts[static_cast<size_t>(expert)].gate =
+                add_prepared(intermediate, d_model,
+                             601000u + static_cast<uint32_t>(expert),
+                             "gate");
+            ASSERT_NE(experts[static_cast<size_t>(expert)].gate, nullptr);
+            experts[static_cast<size_t>(expert)].up =
+                add_prepared(intermediate, d_model,
+                             602000u + static_cast<uint32_t>(expert),
+                             "up");
+            ASSERT_NE(experts[static_cast<size_t>(expert)].up, nullptr);
+            experts[static_cast<size_t>(expert)].down =
+                add_prepared(d_model, intermediate,
+                             603000u + static_cast<uint32_t>(expert),
+                             "down");
+            ASSERT_NE(experts[static_cast<size_t>(expert)].down, nullptr);
+        }
+
+        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
+        std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs(num_experts);
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const auto &triplet = experts[static_cast<size_t>(expert)];
+            ASSERT_TRUE(triplet.gate->exportNativeVNNIMatrixDesc(gate_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.up->exportNativeVNNIMatrixDesc(up_descs[static_cast<size_t>(expert)]));
+            ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
+        }
+
+        const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+            gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+        ASSERT_GE(gateup_table, 0) << format.label << " gate/up descriptor table";
+        const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+            down_descs.data(), num_experts, d_model, intermediate);
+        ASSERT_GE(down_table, 0) << format.label << " down descriptor table";
+
+        for (int seq_len : {2, 3, 4})
+        {
+            auto hidden = llaminar2::test::TestTensorFactory::createFP32(
+                {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+            for (size_t i = 0; i < hidden->numel(); ++i)
+            {
+                hidden->mutable_data()[i] =
+                    0.017f * static_cast<float>(static_cast<int>(i % 37) - 18) +
+                    0.003f * static_cast<float>(static_cast<int>((i / 11) % 23) - 11);
+            }
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+
+            auto routing_indices = llaminar2::test::TestTensorFactory::createFP32(
+                {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+            auto routing_weights = llaminar2::test::TestTensorFactory::createFP32(
+                {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+            for (int row = 0; row < seq_len; ++row)
+            {
+                float sum = 0.0f;
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const int slot = row * top_k + route;
+                    routing_indices->mutable_data()[static_cast<size_t>(slot)] =
+                        static_cast<float>((row + route) % num_experts);
+                    routing_weights->mutable_data()[static_cast<size_t>(slot)] =
+                        0.10f + 0.017f *
+                                    static_cast<float>((row * 7 + route * 3) % 9);
+                    sum += routing_weights->mutable_data()[static_cast<size_t>(slot)];
+                }
+                for (int route = 0; route < top_k; ++route)
+                {
+                    routing_weights->mutable_data()[static_cast<size_t>(row * top_k + route)] /=
+                        sum;
+                }
+            }
+            ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream_));
+
+            std::vector<float> rowwise_expected(
+                static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+            for (int row = 0; row < seq_len; ++row)
+            {
+                auto hidden_row = llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(d_model)});
+                std::copy(hidden->data() + static_cast<size_t>(row) * d_model,
+                          hidden->data() + static_cast<size_t>(row + 1) * d_model,
+                          hidden_row->mutable_data());
+                ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream_));
+
+                std::array<int, top_k> expert_ids = {};
+                std::array<float, top_k> expert_weights = {};
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const int slot = row * top_k + route;
+                    expert_ids[static_cast<size_t>(route)] =
+                        static_cast<int>(routing_indices->data()[static_cast<size_t>(slot)]);
+                    expert_weights[static_cast<size_t>(route)] =
+                        routing_weights->data()[static_cast<size_t>(slot)];
+                }
+
+                std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> gate_owned;
+                std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> up_owned;
+                std::array<llaminar2::ITensor *, top_k> gate_outputs = {};
+                std::array<llaminar2::ITensor *, top_k> up_outputs = {};
+                for (int route = 0; route < top_k; ++route)
+                {
+                    gate_owned[static_cast<size_t>(route)] =
+                        llaminar2::test::TestTensorFactory::createFP32(
+                            {1u, static_cast<size_t>(intermediate)});
+                    up_owned[static_cast<size_t>(route)] =
+                        llaminar2::test::TestTensorFactory::createFP32(
+                            {1u, static_cast<size_t>(intermediate)});
+                    ASSERT_TRUE(gate_owned[static_cast<size_t>(route)]->ensureOnDevice(device, stream_));
+                    ASSERT_TRUE(up_owned[static_cast<size_t>(route)]->ensureOnDevice(device, stream_));
+                    gate_outputs[static_cast<size_t>(route)] = gate_owned[static_cast<size_t>(route)].get();
+                    up_outputs[static_cast<size_t>(route)] = up_owned[static_cast<size_t>(route)].get();
+                }
+
+                auto decode_output = llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(d_model)});
+                ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+                    hidden_row.get(), expert_ids.data(), gateup_table, top_k,
+                    gate_outputs.data(), up_outputs.data(), d_model, intermediate))
+                    << format.label << " rowwise gate/up M=" << seq_len << " row=" << row;
+                ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
+                    gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
+                    down_table, top_k, decode_output.get(), d_model, intermediate))
+                    << format.label << " rowwise down M=" << seq_len << " row=" << row;
+                ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+                decode_output->transitionTo(
+                    llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                    device);
+                std::copy(decode_output->data(),
+                          decode_output->data() + d_model,
+                          rowwise_expected.begin() + static_cast<size_t>(row) * d_model);
+            }
+
+            auto grouped_output = llaminar2::test::TestTensorFactory::createFP32(
+                {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
+
+            llaminar2::PerfStatsCollector::reset();
+            ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+                routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k))
+                << format.label << " grouped expert planning M=" << seq_len;
+            ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+                hidden.get(),
+                grouped_output.get(),
+                gateup_table,
+                down_table,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k))
+                << format.label << " grouped verifier prefill M=" << seq_len;
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            grouped_output->transitionTo(
+                llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                device);
+
+            const std::vector<float> grouped_values(
+                grouped_output->data(),
+                grouped_output->data() + grouped_output->numel());
+            ASSERT_GT(l2Norm(rowwise_expected.data(), rowwise_expected.size()), 1.0e-7)
+                << format.label << " produced an all-zero serial decode witness";
+            ASSERT_GT(l2Norm(grouped_values.data(), grouped_values.size()), 1.0e-7)
+                << format.label << " produced an all-zero grouped decode witness";
+            expectVectorsClose(
+                grouped_values,
+                rowwise_expected,
+                0.9999,
+                0.006,
+                /*row_width=*/d_model,
+                /*min_row_cosine=*/0.9998,
+                /*max_row_relative_l2=*/0.008,
+                /*max_row_kl=*/1.0e-4);
+            expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2,
+                                          "kpart_swiglu",
+                                          "kpart_prefill",
+                                          "token_direct",
+                                          /*expected_active_expert_slots=*/num_experts);
+        }
+    }
+
+    llaminar2::PerfStatsCollector::reset();
 #endif
 }
 

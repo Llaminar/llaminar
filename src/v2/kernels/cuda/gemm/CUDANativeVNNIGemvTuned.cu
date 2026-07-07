@@ -31,14 +31,13 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <algorithm>
-#include <atomic>
 #include <mutex>
 
-static std::atomic<int> g_cuda_native_vnni_decode_equivalent_m1_config{0};
+static thread_local int g_cuda_native_vnni_decode_equivalent_m1_config = 0;
 
 static bool decodeEquivalentM1ConfigActive()
 {
-    return g_cuda_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed) != 0;
+    return g_cuda_native_vnni_decode_equivalent_m1_config != 0;
 }
 
 // =====================================================================
@@ -133,6 +132,120 @@ namespace
     };
 
 #include "kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"
+
+    /**
+     * @brief Accumulate one 32-element native-VNNI weight block exactly once.
+     *
+     * MTP verifier publication compares grouped M=2..4 rows against the serial
+     * M=1 decode route bit-for-bit. CUDA may otherwise choose subtly different
+     * multiply/add contraction when the same expression lives in the larger
+     * grouped kernel body. This helper gives both the M=1 KPAR kernel and the
+     * grouped small-M KPAR kernel one shared, explicit round-to-nearest sequence
+     * for the per-block FP32 contribution.
+     */
+    template <uint8_t CB>
+    __device__ __forceinline__ float native_vnni_block_contribution_rn(
+        const int32_t *__restrict__ a_vals,
+        const int32_t *__restrict__ packed_groups,
+        const uint8_t *__restrict__ payload,
+        const uint16_t *__restrict__ d_scales,
+        const uint16_t *__restrict__ d_mins,
+        const uint32_t *__restrict__ d_emins,
+        size_t linear,
+        float scale_a)
+    {
+        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
+        {
+            int dot_lo = 0;
+            int dot_hi = 0;
+            int sum_lo = 0;
+            int sum_hi = 0;
+#pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                dot_lo = __dp4a(a_vals[g], packed_groups[g], dot_lo);
+                dot_hi = __dp4a(a_vals[g + 4], packed_groups[g + 4], dot_hi);
+                sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
+                sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g + 4]);
+            }
+
+            const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
+            const float scale_hi = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
+            const float dot_term = __fadd_rn(
+                __fmul_rn(scale_lo, static_cast<float>(dot_lo)),
+                __fmul_rn(scale_hi, static_cast<float>(dot_hi)));
+            float contribution = __fmul_rn(scale_a, dot_term);
+
+            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
+            {
+                const uint32_t emin = d_emins ? d_emins[linear] : 0u;
+                const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
+                const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
+                const float min_term = __fadd_rn(
+                    __fmul_rn(min_lo, static_cast<float>(sum_lo)),
+                    __fmul_rn(min_hi, static_cast<float>(sum_hi)));
+                contribution = __fadd_rn(contribution, __fmul_rn(scale_a, min_term));
+            }
+
+            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
+            {
+                constexpr float IQ1S_DELTA = 0.125f;
+                const uint8_t qh0 = payload[4];
+                const uint8_t qh1 = payload[5];
+                const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[0]) +
+                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[1]);
+                const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[2]) +
+                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[3]);
+                const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[4]) +
+                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[5]);
+                const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[6]) +
+                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[7]);
+                const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+                const float lo_delta = __fmul_rn(
+                    __fadd_rn(__fmul_rn(d0, static_cast<float>(sg0)),
+                              __fmul_rn(d1, static_cast<float>(sg1))),
+                    scale_lo);
+                const float hi_delta = __fmul_rn(
+                    __fadd_rn(__fmul_rn(d2, static_cast<float>(sg2)),
+                              __fmul_rn(d3, static_cast<float>(sg3))),
+                    scale_hi);
+                contribution = __fadd_rn(
+                    contribution,
+                    __fmul_rn(scale_a, __fadd_rn(lo_delta, hi_delta)));
+            }
+
+            return contribution;
+        }
+        else
+        {
+            int dot = 0;
+            int sum_a = 0;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                dot = __dp4a(a_vals[g], packed_groups[g], dot);
+                sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
+            }
+
+            const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
+            float contribution = __fmul_rn(
+                __fmul_rn(scale_a, scale_b),
+                static_cast<float>(dot));
+
+            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
+            {
+                const float min_b = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
+                contribution = __fadd_rn(
+                    contribution,
+                    __fmul_rn(__fmul_rn(scale_a, min_b), static_cast<float>(sum_a)));
+            }
+
+            return contribution;
+        }
+    }
 
     [[maybe_unused]] static __host__ NativeGemvShape classifyShape(int N, int K)
     {
@@ -383,69 +496,16 @@ namespace
                 int32_t packed_groups[8];
                 llaminar2::cuda_native_vnni::decode_groups<CB>(payload, packed_groups);
 
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
-                {
-                    int dot_lo = 0, dot_hi = 0;
-                    int sum_lo = 0, sum_hi = 0;
-
-#pragma unroll
-                    for (int g = 0; g < 4; ++g)
-                    {
-                        dot_lo = __dp4a(smem_A[g], packed_groups[g], dot_lo);
-                        dot_hi = __dp4a(smem_A[g + 4], packed_groups[g + 4], dot_hi);
-                        sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[g]);
-                        sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[g + 4]);
-                    }
-
-                    const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    const float scale_hi = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                    acc[c] += scale_a * (scale_lo * static_cast<float>(dot_lo) + scale_hi * static_cast<float>(dot_hi));
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
-                    {
-                        const uint32_t emin = d_emins ? d_emins[linear] : 0u;
-                        const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
-                        const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
-                        acc[c] += scale_a * (min_lo * static_cast<float>(sum_lo) + min_hi * static_cast<float>(sum_hi));
-                    }
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
-                    {
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        const uint8_t qh0 = payload[4];
-                        const uint8_t qh1 = payload[5];
-                        const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[0]) + llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[1]);
-                        const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[2]) + llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[3]);
-                        const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[4]) + llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[5]);
-                        const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[6]) + llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[7]);
-                        const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        acc[c] += scale_a * ((d0 * static_cast<float>(sg0) + d1 * static_cast<float>(sg1)) * scale_lo +
-                                             (d2 * static_cast<float>(sg2) + d3 * static_cast<float>(sg3)) * scale_hi);
-                    }
-                }
-                else
-                {
-                    int dot = 0;
-                    int sum_a = 0;
-#pragma unroll
-                    for (int g = 0; g < 8; ++g)
-                    {
-                        dot = __dp4a(smem_A[g], packed_groups[g], dot);
-                        sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(smem_A[g]);
-                    }
-
-                    const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    acc[c] += scale_a * scale_b * static_cast<float>(dot);
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
-                    {
-                        const float min_b = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                        acc[c] += scale_a * min_b * static_cast<float>(sum_a);
-                    }
-                }
+                const float contribution = native_vnni_block_contribution_rn<CB>(
+                    smem_A,
+                    packed_groups,
+                    payload,
+                    d_scales,
+                    d_mins,
+                    d_emins,
+                    linear,
+                    scale_a);
+                acc[c] = __fadd_rn(acc[c], contribution);
             }
 
             __syncthreads(); // Ensure smem_A is not overwritten before all threads finish
@@ -464,6 +524,103 @@ namespace
                 if (d_bias)
                     out += d_bias[n];
                 d_C[n] = out;
+            }
+        }
+    }
+
+    /**
+     * @brief Grouped verifier equivalent of the serial M=1 WIDE/DIRECT kernel.
+     *
+     * The grid's Y dimension is the verifier row.  That keeps all rows inside one
+     * grouped launch while preserving the row-local arithmetic shape of ordinary
+     * serial decode: one CTA tile loads exactly one row's 32-element activation
+     * block into shared memory, decodes the same column-major payload, and writes
+     * to `[row, n]`.
+     */
+    template <int M, int TILE_N, int CPT, uint8_t CB>
+    __global__ void nativeVnniGemv_wide_small_m_serial_rows(
+        const int8_t *__restrict__ d_A_int8,
+        const uint8_t *__restrict__ d_payload,
+        const uint16_t *__restrict__ d_scales,
+        const uint16_t *__restrict__ d_mins,
+        const uint32_t *__restrict__ d_emins,
+        float *__restrict__ d_C,
+        const float *__restrict__ d_scales_A,
+        int N, int K,
+        float alpha, float beta,
+        const float *__restrict__ d_C_existing,
+        const float *__restrict__ d_bias)
+    {
+        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M verifier supports M=2..4");
+        const int row = blockIdx.y;
+        if (row >= M)
+            return;
+
+        const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+        if (n_base >= N)
+            return;
+
+        const int blocks_per_row = K / BLOCK_K;
+        __shared__ int32_t smem_A[8];
+
+        float acc[CPT];
+#pragma unroll
+        for (int c = 0; c < CPT; ++c)
+            acc[c] = 0.0f;
+
+        for (int blk = 0; blk < blocks_per_row; ++blk)
+        {
+            if (threadIdx.x < 8)
+            {
+                smem_A[threadIdx.x] = *reinterpret_cast<const int32_t *>(
+                    d_A_int8 + static_cast<size_t>(row) * K + blk * BLOCK_K + threadIdx.x * 4);
+            }
+            __syncthreads();
+
+            const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
+
+#pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                const int n = n_base + c;
+                if (n >= N)
+                    break;
+
+                const size_t linear = static_cast<size_t>(blk) * N + n;
+                const uint8_t *payload = d_payload + linear *
+                                                         llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CB>();
+
+                int32_t packed_groups[8];
+                llaminar2::cuda_native_vnni::decode_groups<CB>(payload, packed_groups);
+
+                const float contribution = native_vnni_block_contribution_rn<CB>(
+                    smem_A,
+                    packed_groups,
+                    payload,
+                    d_scales,
+                    d_mins,
+                    d_emins,
+                    linear,
+                    scale_a);
+                acc[c] = __fadd_rn(acc[c], contribution);
+            }
+
+            __syncthreads();
+        }
+
+#pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            if (n < N)
+            {
+                const size_t out_idx = static_cast<size_t>(row) * N + n;
+                float out = __fmul_rn(alpha, acc[c]);
+                if (beta != 0.0f && d_C_existing)
+                    out = __fadd_rn(out, __fmul_rn(beta, d_C_existing[out_idx]));
+                if (d_bias)
+                    out = __fadd_rn(out, d_bias[n]);
+                d_C[out_idx] = out;
             }
         }
     }
@@ -555,69 +712,16 @@ namespace
                 // gated on TWO_PHASE but the choice is orthogonal to output path.
                 llaminar2::cuda_native_vnni::decode_groups_vec<CB>(payload, packed_groups);
 
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
-                {
-                    int dot_lo = 0, dot_hi = 0;
-                    int sum_lo = 0, sum_hi = 0;
-
-#pragma unroll
-                    for (int g = 0; g < 4; ++g)
-                    {
-                        dot_lo = __dp4a(a_vals[g], packed_groups[g], dot_lo);
-                        dot_hi = __dp4a(a_vals[g + 4], packed_groups[g + 4], dot_hi);
-                        sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
-                        sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g + 4]);
-                    }
-
-                    const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    const float scale_hi = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                    acc[c] += scale_a * (scale_lo * static_cast<float>(dot_lo) + scale_hi * static_cast<float>(dot_hi));
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
-                    {
-                        const uint32_t emin = d_emins ? d_emins[linear] : 0u;
-                        const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
-                        const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
-                        acc[c] += scale_a * (min_lo * static_cast<float>(sum_lo) + min_hi * static_cast<float>(sum_hi));
-                    }
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
-                    {
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        const uint8_t qh0 = payload[4];
-                        const uint8_t qh1 = payload[5];
-                        const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[0]) + llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[1]);
-                        const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[2]) + llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[3]);
-                        const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[4]) + llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[5]);
-                        const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[6]) + llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[7]);
-                        const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        acc[c] += scale_a * ((d0 * static_cast<float>(sg0) + d1 * static_cast<float>(sg1)) * scale_lo +
-                                             (d2 * static_cast<float>(sg2) + d3 * static_cast<float>(sg3)) * scale_hi);
-                    }
-                }
-                else
-                {
-                    int dot = 0;
-                    int sum_a = 0;
-#pragma unroll
-                    for (int g = 0; g < 8; ++g)
-                    {
-                        dot = __dp4a(a_vals[g], packed_groups[g], dot);
-                        sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
-                    }
-
-                    const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    acc[c] += scale_a * scale_b * static_cast<float>(dot);
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
-                    {
-                        const float min_b = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                        acc[c] += scale_a * min_b * static_cast<float>(sum_a);
-                    }
-                }
+                const float contribution = native_vnni_block_contribution_rn<CB>(
+                    a_vals,
+                    packed_groups,
+                    payload,
+                    d_scales,
+                    d_mins,
+                    d_emins,
+                    linear,
+                    scale_a);
+                acc[c] = __fadd_rn(acc[c], contribution);
             }
         }
 
@@ -1528,87 +1632,20 @@ namespace
                 int32_t packed_groups[8];
                 llaminar2::cuda_native_vnni::decode_groups_vec<CB>(payload, packed_groups);
 
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
+#pragma unroll
+                for (int row = 0; row < M; ++row)
                 {
-                    const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    const float scale_hi = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                    const uint32_t emin = d_emins ? d_emins[linear] : 0u;
-                    const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
-                    const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
-
-#pragma unroll
-                    for (int row = 0; row < M; ++row)
-                    {
-                        int dot_lo = 0;
-                        int dot_hi = 0;
-                        int sum_lo = 0;
-                        int sum_hi = 0;
-#pragma unroll
-                        for (int g = 0; g < 4; ++g)
-                        {
-                            dot_lo = __dp4a(a_vals[row][g], packed_groups[g], dot_lo);
-                            dot_hi = __dp4a(a_vals[row][g + 4], packed_groups[g + 4], dot_hi);
-                            sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][g]);
-                            sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][g + 4]);
-                        }
-
-                        const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
-                        acc[row][c] += scale_a * (scale_lo * static_cast<float>(dot_lo) +
-                                                  scale_hi * static_cast<float>(dot_hi));
-
-                        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
-                        {
-                            acc[row][c] += scale_a * (min_lo * static_cast<float>(sum_lo) +
-                                                      min_hi * static_cast<float>(sum_hi));
-                        }
-
-                        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
-                        {
-                            constexpr float IQ1S_DELTA = 0.125f;
-                            const uint8_t qh0 = payload[4];
-                            const uint8_t qh1 = payload[5];
-                            const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                            const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                            const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                            const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                            const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][0]) +
-                                            llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][1]);
-                            const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][2]) +
-                                            llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][3]);
-                            const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][4]) +
-                                            llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][5]);
-                            const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][6]) +
-                                            llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][7]);
-                            acc[row][c] += scale_a * ((d0 * static_cast<float>(sg0) + d1 * static_cast<float>(sg1)) * scale_lo +
-                                                      (d2 * static_cast<float>(sg2) + d3 * static_cast<float>(sg3)) * scale_hi);
-                        }
-                    }
-                }
-                else
-                {
-                    const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    const float min_b = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-
-#pragma unroll
-                    for (int row = 0; row < M; ++row)
-                    {
-                        int dot = 0;
-                        int sum_a = 0;
-#pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            dot = __dp4a(a_vals[row][g], packed_groups[g], dot);
-                            sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][g]);
-                        }
-
-                        const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
-                        acc[row][c] += scale_a * scale_b * static_cast<float>(dot);
-
-                        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
-                        {
-                            acc[row][c] += scale_a * min_b * static_cast<float>(sum_a);
-                        }
-                    }
+                    const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
+                    const float contribution = native_vnni_block_contribution_rn<CB>(
+                        a_vals[row],
+                        packed_groups,
+                        payload,
+                        d_scales,
+                        d_mins,
+                        d_emins,
+                        linear,
+                        scale_a);
+                    acc[row][c] = __fadd_rn(acc[row][c], contribution);
                 }
             }
         }
@@ -2665,6 +2702,89 @@ namespace
     }
 
     template <int M, uint8_t CB>
+    bool dispatchWideSmallMSerialRowsGenerated(
+        const GeneratedDispatchTuning &tuning,
+        const int8_t *d_A_int8, const uint8_t *d_payload,
+        const uint16_t *d_scales, const uint16_t *d_mins,
+        const uint32_t *d_emins, float *d_C,
+        const float *d_scales_A, int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing, const float *d_bias,
+        cudaStream_t stream)
+    {
+        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M verifier supports M=2..4");
+        switch (tuning.tile_n * 100 + tuning.cpt)
+        {
+        case 32 * 100 + 1:
+        {
+            const int grid_n = (N + 32 - 1) / 32;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 32, 1, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 64 * 100 + 1:
+        {
+            const int grid_n = (N + 64 - 1) / 64;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 64, 1, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 64 * 100 + 2:
+        {
+            const int grid_n = (N + 64 - 1) / 64;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 64, 2, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 128 * 100 + 1:
+        {
+            const int grid_n = (N + 128 - 1) / 128;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 128, 1, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 128 * 100 + 2:
+        {
+            const int grid_n = (N + 128 - 1) / 128;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 128, 2, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 256 * 100 + 2:
+        {
+            const int grid_n = (N + 256 - 1) / 256;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 256, 2, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 256 * 100 + 4:
+        {
+            const int grid_n = (N + 256 - 1) / 256;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 256, 4, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        case 512 * 100 + 4:
+        {
+            const int grid_n = (N + 512 - 1) / 512;
+            nativeVnniGemv_wide_small_m_serial_rows<M, 512, 4, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+            return cudaGetLastError() == cudaSuccess;
+        }
+        default:
+            return false;
+        }
+    }
+
+    template <int M, uint8_t CB>
     bool dispatchKparSmallMGenerated(
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
@@ -2957,24 +3077,34 @@ namespace
         else
         {
             /**
-             * Grouped verifier replay is stricter than raw GEMV parity: every
-             * row may become live state, so M=2..4 rows must use the same
-             * canonical small-M contract as verifier serial replay.  CUDA's
-             * canonical M=1 verifier route pads to M=2, matching global
-             * deterministic mode without forcing that process-wide mode.
+             * Decode-equivalent verifier publication is stricter than ordinary
+             * small-M GEMV parity.  When the scoped M=1 verifier flag is active,
+             * classify by the serial M=1 route and launch a grouped row-dimension
+             * kernel for that family.  This preserves the target architecture
+             * (one grouped production operation) while matching the family that
+             * serial decode uses for each accepted row.
              */
+            const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
             const int dispatch_m =
-                (decodeEquivalentM1ConfigActive() || llaminar2::debugEnv().gemm.deterministic) ? 2 : M;
+                decode_equivalent_m1 ? 1 : (llaminar2::debugEnv().gemm.deterministic ? 2 : M);
             shape = classifyShapeGenerated<CB>(dispatch_m, N, K);
             tuning = selectGeneratedTuning<CB>(dispatch_m, N, K);
         }
 
-        if (shape == NativeGemvShape::WIDE)
-            return false;
+        const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
+        if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
+        {
+            if (!decode_equivalent_m1)
+                return false;
+            return dispatchWideSmallMSerialRowsGenerated<M, CB>(
+                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                stream);
+        }
 
         if constexpr (CB != 19)
         {
-            if (shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
+            if (!decode_equivalent_m1 && shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
             {
                 if (!*rm_slot)
                 {
@@ -3538,10 +3668,10 @@ extern "C"
 
 extern "C" void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled)
 {
-    g_cuda_native_vnni_decode_equivalent_m1_config.store(enabled ? 1 : 0, std::memory_order_relaxed);
+    g_cuda_native_vnni_decode_equivalent_m1_config = enabled ? 1 : 0;
 }
 
 extern "C" int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config()
 {
-    return g_cuda_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed);
+    return g_cuda_native_vnni_decode_equivalent_m1_config;
 }

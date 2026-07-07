@@ -42,6 +42,18 @@ namespace llaminar2
         bool synchronize = true;
         bool include_host_state = true;
         bool include_device_state = true;
+        /*
+         * Partial prefix hits resume with a suffix prefill. TP GDN graphs keep
+         * two resident recurrent-state shapes: a local suffix-prefill bank and
+         * a full decode-ready bank. Portable prefix blocks may contain both
+         * serialized logical/local state and captured full device state. These
+         * flags let GPU caches materialize the local bank from the serialized
+         * host payload while still restoring the captured full bank when
+         * present.  `include_host_state` controls the live host mirror; it is
+         * deliberately independent from using `src_host` as an import source.
+         */
+        bool import_host_state_into_device_state = false;
+        bool import_device_state_from_host_state = false;
     };
 
     /**

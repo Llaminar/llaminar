@@ -94,6 +94,8 @@ namespace llaminar2
             std::function<bool(ComputeNode &, void *)> record_snapshot_copies;
             /// Runs post-launch lifecycle hooks (dirty marking, callbacks, step bookkeeping).
             std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> post_launch;
+            /// Optional domain-level fence immediately before HIP/CUDA beginCapture().
+            DeviceGraphExecutor::GraphCaptureBoundaryHook before_begin_capture;
         };
 
         /**
@@ -257,6 +259,9 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
             int segment_index,
+            uint64_t current_step,
+            const std::string &perf_context,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
@@ -328,8 +333,10 @@ namespace llaminar2
             bool recapture_mode,
             bool full_graph_replay,
             int segment_index,
+            uint64_t current_step,
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
@@ -352,6 +359,7 @@ namespace llaminar2
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &before_begin_capture_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 

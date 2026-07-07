@@ -30,6 +30,9 @@
 #include <vector>
 
 #include "kernels/cpu/rotation/ActivationRotation.h"
+#ifdef HAVE_ONEDNN
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#endif
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
@@ -956,6 +959,9 @@ namespace
         const int N = 4096;
         const std::array<int, 3> verifier_rows = {2, 3, 4};
 
+        setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_native_vnni_grouped_verifier.json", 1);
+        PerfStatsCollector::reset();
+
         for (const auto &fmt : ALL_FORMATS)
         {
             auto weights = createWeightsForFormat(fmt.name, N, K);
@@ -999,12 +1005,464 @@ namespace
                 EXPECT_GE(cos, 0.999999f)
                 << fmt.name << " M=" << M
                 << " grouped verifier hook differs from serial decode rows";
-            EXPECT_LE(max_err, 1e-5f)
-                << fmt.name << " M=" << M
-                << " grouped verifier hook max error differs from serial decode rows";
+                EXPECT_LE(max_err, 1e-5f)
+                    << fmt.name << " M=" << M
+                    << " grouped verifier hook max error differs from serial decode rows";
             }
         }
+
+        const auto records =
+            PerfStatsCollector::snapshot({"kernel.cpu_native_vnni_grouped_verifier_projection_calls"});
+        uint64_t grouped_verifier_calls = 0;
+        for (const auto &record : records)
+        {
+            if (record.domain == "kernel" &&
+                record.name == "cpu_native_vnni_grouped_verifier_projection_calls" &&
+                record.kind == PerfStatRecord::Kind::Counter)
+            {
+                EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+                EXPECT_EQ(record.tags.at("projections"), "1");
+                const std::string &m_tag = record.tags.at("m");
+                EXPECT_TRUE(m_tag == "2" || m_tag == "3" || m_tag == "4");
+                grouped_verifier_calls += record.count;
+            }
+        }
+        EXPECT_EQ(grouped_verifier_calls, ALL_FORMATS.size() * verifier_rows.size())
+            << "Every CPU NativeVNNI tensor format and M=2/3/4 shape must enter the grouped verifier path";
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+
+#ifdef HAVE_ONEDNN
+    TEST_F(CPUNativeVNNIGemvTest, MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters)
+    {
+        const int K = 256;
+        const int N0 = 192;
+        const int N1 = 128;
+        const int NDown = 160;
+        const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+        setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_fp32_grouped_verifier.json", 1);
+        PerfStatsCollector::reset();
+
+        auto weights0 = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(N0), static_cast<size_t>(K)}, -0.2f, 0.2f, 8101);
+        auto weights1 = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(N1), static_cast<size_t>(K)}, -0.2f, 0.2f, 8102);
+        auto weights_down = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(NDown), static_cast<size_t>(K)}, -0.2f, 0.2f, 8103);
+        ASSERT_NE(weights0, nullptr);
+        ASSERT_NE(weights1, nullptr);
+        ASSERT_NE(weights_down, nullptr);
+
+        gemm::FloatingPointGemmKernel kernel0(weights0.get());
+        gemm::FloatingPointGemmKernel kernel1(weights1.get());
+        gemm::FloatingPointGemmKernel down_kernel(weights_down.get());
+
+        for (int M : verifier_rows)
+        {
+            SCOPED_TRACE(std::string("FP32 M=") + std::to_string(M));
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f,
+                static_cast<uint32_t>(8200 + M));
+            ASSERT_NE(input, nullptr);
+
+            FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+            FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+            std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
+                {&kernel0, &grouped0, N0, nullptr, "fp32_proj0"},
+                {&kernel1, &grouped1, N1, nullptr, "fp32_proj1"}};
+            ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
+                input.get(), grouped_projections, M, K))
+                << "CPU FP32 grouped verifier projection failed";
+
+            std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
+            std::vector<float> serial1(static_cast<size_t>(M) * static_cast<size_t>(N1), 0.0f);
+            for (int row = 0; row < M; ++row)
+            {
+                FP32Tensor row_input({size_t{1}, static_cast<size_t>(K)});
+                std::memcpy(
+                    row_input.mutable_data(),
+                    input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    static_cast<size_t>(K) * sizeof(float));
+                FP32Tensor row0({size_t{1}, static_cast<size_t>(N0)});
+                FP32Tensor row1({size_t{1}, static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> row_projections = {
+                    {&kernel0, &row0, N0, nullptr, "fp32_proj0_serial"},
+                    {&kernel1, &row1, N1, nullptr, "fp32_proj1_serial"}};
+
+                ASSERT_TRUE(kernel0.multiply_fused_tensor(&row_input, row_projections, 1, K))
+                    << "CPU FP32 serial decode projection failed for row " << row;
+                std::memcpy(
+                    serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
+                    row0.data(),
+                    static_cast<size_t>(N0) * sizeof(float));
+                std::memcpy(
+                    serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
+                    row1.data(),
+                    static_cast<size_t>(N1) * sizeof(float));
+            }
+
+            EXPECT_EQ(
+                std::memcmp(grouped0.data(), serial0.data(), serial0.size() * sizeof(float)),
+                0)
+                << "CPU FP32 projection 0 grouped verifier rows must be bitwise serial-decode equivalent";
+            EXPECT_EQ(
+                std::memcmp(grouped1.data(), serial1.data(), serial1.size() * sizeof(float)),
+                0)
+                << "CPU FP32 projection 1 grouped verifier rows must be bitwise serial-decode equivalent";
+
+            auto gate = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.6f, 0.6f,
+                static_cast<uint32_t>(8300 + M));
+            auto up = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.6f, 0.6f,
+                static_cast<uint32_t>(8400 + M));
+            ASSERT_NE(gate, nullptr);
+            ASSERT_NE(up, nullptr);
+
+            FP32Tensor grouped_down({static_cast<size_t>(M), static_cast<size_t>(NDown)});
+            ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                gate.get(), up.get(), &grouped_down, M, NDown, K))
+                << "CPU FP32 grouped verifier SwiGLU-down projection failed";
+
+            std::vector<float> serial_down(static_cast<size_t>(M) * static_cast<size_t>(NDown), 0.0f);
+            std::vector<float> swiglu_row(static_cast<size_t>(K), 0.0f);
+            for (int row = 0; row < M; ++row)
+            {
+                primitives::compute_swiglu(
+                    gate->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    up->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    swiglu_row.data(),
+                    K);
+                FP32Tensor row_swiglu({size_t{1}, static_cast<size_t>(K)});
+                std::memcpy(row_swiglu.mutable_data(), swiglu_row.data(), static_cast<size_t>(K) * sizeof(float));
+                FP32Tensor row_down({size_t{1}, static_cast<size_t>(NDown)});
+                ASSERT_TRUE(down_kernel.multiply_tensor(&row_swiglu, &row_down, 1, NDown, K))
+                    << "CPU FP32 serial SwiGLU-down projection failed for row " << row;
+                std::memcpy(
+                    serial_down.data() + static_cast<size_t>(row) * static_cast<size_t>(NDown),
+                    row_down.data(),
+                    static_cast<size_t>(NDown) * sizeof(float));
+            }
+
+            EXPECT_EQ(
+                std::memcmp(grouped_down.data(), serial_down.data(), serial_down.size() * sizeof(float)),
+                0)
+                << "CPU FP32 grouped SwiGLU-down rows must be bitwise serial-decode equivalent";
+        }
+
+        uint64_t projection_calls = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_fp32_grouped_verifier_projection_calls"}))
+        {
+            if (record.domain == "kernel" &&
+                record.name == "cpu_fp32_grouped_verifier_projection_calls" &&
+                record.kind == PerfStatRecord::Kind::Counter)
+            {
+                EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+                EXPECT_EQ(record.tags.at("projections"), "2");
+                projection_calls += record.count;
+            }
+        }
+        EXPECT_EQ(projection_calls, verifier_rows.size())
+            << "CPU FP32 projection verifier must enter the grouped path for M=2/3/4";
+
+        uint64_t swiglu_calls = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_fp32_grouped_verifier_swiglu_down_calls"}))
+        {
+            if (record.domain == "kernel" &&
+                record.name == "cpu_fp32_grouped_verifier_swiglu_down_calls" &&
+                record.kind == PerfStatRecord::Kind::Counter)
+            {
+                EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+                EXPECT_EQ(record.tags.at("n"), std::to_string(NDown));
+                swiglu_calls += record.count;
+            }
+        }
+        EXPECT_EQ(swiglu_calls, verifier_rows.size())
+            << "CPU FP32 SwiGLU-down verifier must enter the grouped path for M=2/3/4";
+
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters)
+    {
+        /**
+         * MTP publication can only trust grouped verifier rows when every row
+         * is bitwise identical to the backend's own one-row decode contract.
+         * This regression sweeps the two 16-bit floating tensor formats through
+         * the CPU floating GEMM grouped verifier hook.  The hook must execute a
+         * real grouped implementation and report its perfstats counter; a
+         * hidden serial replay or unsupported false return would fail here.
+         */
+        const int K = 192;
+        const int N0 = 96;
+        const int N1 = 64;
+        const int NDown = 80;
+        const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+        setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_fp16_bf16_grouped_verifier.json", 1);
+        PerfStatsCollector::reset();
+
+        auto run_fp16_case = [&]()
+        {
+            auto weights0 = TestTensorFactory::createFP16Random(
+                {static_cast<size_t>(N0), static_cast<size_t>(K)}, -0.25f, 0.25f, 9101);
+            auto weights1 = TestTensorFactory::createFP16Random(
+                {static_cast<size_t>(N1), static_cast<size_t>(K)}, -0.25f, 0.25f, 9102);
+            auto weights_down = TestTensorFactory::createFP16Random(
+                {static_cast<size_t>(NDown), static_cast<size_t>(K)}, -0.25f, 0.25f, 9103);
+            ASSERT_NE(weights0, nullptr);
+            ASSERT_NE(weights1, nullptr);
+            ASSERT_NE(weights_down, nullptr);
+
+            gemm::FloatingPointGemmKernel kernel0(weights0.get());
+            gemm::FloatingPointGemmKernel kernel1(weights1.get());
+            gemm::FloatingPointGemmKernel down_kernel(weights_down.get());
+
+            for (int M : verifier_rows)
+            {
+                SCOPED_TRACE(std::string("FP16 M=") + std::to_string(M));
+                auto input = TestTensorFactory::createFP16Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f,
+                    static_cast<uint32_t>(9200 + M));
+                ASSERT_NE(input, nullptr);
+
+                FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
+                    {&kernel0, &grouped0, N0, nullptr, "fp16_proj0"},
+                    {&kernel1, &grouped1, N1, nullptr, "fp16_proj1"}};
+                ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(), grouped_projections, M, K));
+
+                std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
+                std::vector<float> serial1(static_cast<size_t>(M) * static_cast<size_t>(N1), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    std::vector<uint16_t> row_bits(static_cast<size_t>(K));
+                    std::memcpy(
+                        row_bits.data(),
+                        input->typed_data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        static_cast<size_t>(K) * sizeof(uint16_t));
+                    FP16Tensor row_input({size_t{1}, static_cast<size_t>(K)}, row_bits);
+                    FP32Tensor row0({size_t{1}, static_cast<size_t>(N0)});
+                    FP32Tensor row1({size_t{1}, static_cast<size_t>(N1)});
+
+                    ASSERT_TRUE(kernel0.multiply_tensor(&row_input, &row0, 1, N0, K));
+                    ASSERT_TRUE(kernel1.multiply_tensor(&row_input, &row1, 1, N1, K));
+                    std::memcpy(
+                        serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
+                        row0.data(),
+                        static_cast<size_t>(N0) * sizeof(float));
+                    std::memcpy(
+                        serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
+                        row1.data(),
+                        static_cast<size_t>(N1) * sizeof(float));
+                }
+
+                EXPECT_EQ(std::memcmp(grouped0.data(), serial0.data(), serial0.size() * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(grouped1.data(), serial1.data(), serial1.size() * sizeof(float)), 0);
+
+                auto gate = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.6f, 0.6f,
+                    static_cast<uint32_t>(9500 + M));
+                auto up = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.6f, 0.6f,
+                    static_cast<uint32_t>(9600 + M));
+                ASSERT_NE(gate, nullptr);
+                ASSERT_NE(up, nullptr);
+
+                FP32Tensor grouped_down({static_cast<size_t>(M), static_cast<size_t>(NDown)});
+                ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                    gate.get(), up.get(), &grouped_down, M, NDown, K))
+                    << "CPU FP16 grouped verifier SwiGLU/down failed";
+
+                std::vector<float> serial_down(static_cast<size_t>(M) * static_cast<size_t>(NDown), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    FP32Tensor gate_row({size_t{1}, static_cast<size_t>(K)});
+                    FP32Tensor up_row({size_t{1}, static_cast<size_t>(K)});
+                    FP32Tensor down_row({size_t{1}, static_cast<size_t>(NDown)});
+                    std::memcpy(
+                        gate_row.mutable_data(),
+                        gate->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        static_cast<size_t>(K) * sizeof(float));
+                    std::memcpy(
+                        up_row.mutable_data(),
+                        up->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        static_cast<size_t>(K) * sizeof(float));
+                    ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                        &gate_row, &up_row, &down_row, 1, NDown, K))
+                        << "CPU FP16 serial verifier SwiGLU/down failed for row " << row;
+                    std::memcpy(
+                        serial_down.data() + static_cast<size_t>(row) * static_cast<size_t>(NDown),
+                        down_row.data(),
+                        static_cast<size_t>(NDown) * sizeof(float));
+                }
+
+                EXPECT_EQ(
+                    std::memcmp(grouped_down.data(), serial_down.data(), serial_down.size() * sizeof(float)),
+                    0)
+                    << "CPU FP16 grouped SwiGLU/down rows must be bitwise serial-decode equivalent";
+            }
+        };
+
+        auto run_bf16_case = [&]()
+        {
+            auto weights0 = TestTensorFactory::createBF16Random(
+                {static_cast<size_t>(N0), static_cast<size_t>(K)}, -0.25f, 0.25f, 9301);
+            auto weights1 = TestTensorFactory::createBF16Random(
+                {static_cast<size_t>(N1), static_cast<size_t>(K)}, -0.25f, 0.25f, 9302);
+            auto weights_down = TestTensorFactory::createBF16Random(
+                {static_cast<size_t>(NDown), static_cast<size_t>(K)}, -0.25f, 0.25f, 9303);
+            ASSERT_NE(weights0, nullptr);
+            ASSERT_NE(weights1, nullptr);
+            ASSERT_NE(weights_down, nullptr);
+
+            gemm::FloatingPointGemmKernel kernel0(weights0.get());
+            gemm::FloatingPointGemmKernel kernel1(weights1.get());
+            gemm::FloatingPointGemmKernel down_kernel(weights_down.get());
+
+            for (int M : verifier_rows)
+            {
+                SCOPED_TRACE(std::string("BF16 M=") + std::to_string(M));
+                auto input = TestTensorFactory::createBF16Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f,
+                    static_cast<uint32_t>(9400 + M));
+                ASSERT_NE(input, nullptr);
+
+                FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
+                    {&kernel0, &grouped0, N0, nullptr, "bf16_proj0"},
+                    {&kernel1, &grouped1, N1, nullptr, "bf16_proj1"}};
+                ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(), grouped_projections, M, K));
+
+                std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
+                std::vector<float> serial1(static_cast<size_t>(M) * static_cast<size_t>(N1), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    std::vector<uint16_t> row_bits(static_cast<size_t>(K));
+                    std::memcpy(
+                        row_bits.data(),
+                        input->typed_data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        static_cast<size_t>(K) * sizeof(uint16_t));
+                    BF16Tensor row_input({size_t{1}, static_cast<size_t>(K)}, row_bits);
+                    FP32Tensor row0({size_t{1}, static_cast<size_t>(N0)});
+                    FP32Tensor row1({size_t{1}, static_cast<size_t>(N1)});
+
+                    ASSERT_TRUE(kernel0.multiply_tensor(&row_input, &row0, 1, N0, K));
+                    ASSERT_TRUE(kernel1.multiply_tensor(&row_input, &row1, 1, N1, K));
+                    std::memcpy(
+                        serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
+                        row0.data(),
+                        static_cast<size_t>(N0) * sizeof(float));
+                    std::memcpy(
+                        serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
+                        row1.data(),
+                        static_cast<size_t>(N1) * sizeof(float));
+                }
+
+                EXPECT_EQ(std::memcmp(grouped0.data(), serial0.data(), serial0.size() * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(grouped1.data(), serial1.data(), serial1.size() * sizeof(float)), 0);
+
+                auto gate = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.6f, 0.6f,
+                    static_cast<uint32_t>(9700 + M));
+                auto up = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.6f, 0.6f,
+                    static_cast<uint32_t>(9800 + M));
+                ASSERT_NE(gate, nullptr);
+                ASSERT_NE(up, nullptr);
+
+                FP32Tensor grouped_down({static_cast<size_t>(M), static_cast<size_t>(NDown)});
+                ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                    gate.get(), up.get(), &grouped_down, M, NDown, K))
+                    << "CPU BF16 grouped verifier SwiGLU/down failed";
+
+                std::vector<float> serial_down(static_cast<size_t>(M) * static_cast<size_t>(NDown), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    FP32Tensor gate_row({size_t{1}, static_cast<size_t>(K)});
+                    FP32Tensor up_row({size_t{1}, static_cast<size_t>(K)});
+                    FP32Tensor down_row({size_t{1}, static_cast<size_t>(NDown)});
+                    std::memcpy(
+                        gate_row.mutable_data(),
+                        gate->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        static_cast<size_t>(K) * sizeof(float));
+                    std::memcpy(
+                        up_row.mutable_data(),
+                        up->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        static_cast<size_t>(K) * sizeof(float));
+                    ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                        &gate_row, &up_row, &down_row, 1, NDown, K))
+                        << "CPU BF16 serial verifier SwiGLU/down failed for row " << row;
+                    std::memcpy(
+                        serial_down.data() + static_cast<size_t>(row) * static_cast<size_t>(NDown),
+                        down_row.data(),
+                        static_cast<size_t>(NDown) * sizeof(float));
+                }
+
+                EXPECT_EQ(
+                    std::memcmp(grouped_down.data(), serial_down.data(), serial_down.size() * sizeof(float)),
+                    0)
+                    << "CPU BF16 grouped SwiGLU/down rows must be bitwise serial-decode equivalent";
+            }
+        };
+
+        run_fp16_case();
+        run_bf16_case();
+
+        uint64_t fp16_calls = 0;
+        uint64_t bf16_calls = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_floating_grouped_verifier_projection_calls"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_floating_grouped_verifier_projection_calls" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"), "2");
+            if (record.tags.at("dtype") == "fp16")
+                fp16_calls += record.count;
+            else if (record.tags.at("dtype") == "bf16")
+                bf16_calls += record.count;
+        }
+        EXPECT_EQ(fp16_calls, verifier_rows.size());
+        EXPECT_EQ(bf16_calls, verifier_rows.size());
+
+        uint64_t fp16_swiglu_calls = 0;
+        uint64_t bf16_swiglu_calls = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_floating_grouped_verifier_swiglu_down_calls"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_floating_grouped_verifier_swiglu_down_calls" ||
+                record.kind != PerfStatRecord::Kind::Counter ||
+                record.tags.at("n") != std::to_string(NDown) ||
+                record.tags.at("k") != std::to_string(K))
+            {
+                continue;
+            }
+            const std::string &m_tag = record.tags.at("m");
+            if (!(m_tag == "2" || m_tag == "3" || m_tag == "4"))
+                continue;
+            if (record.tags.at("dtype") == "fp16")
+                fp16_swiglu_calls += record.count;
+            else if (record.tags.at("dtype") == "bf16")
+                bf16_swiglu_calls += record.count;
+        }
+        EXPECT_EQ(fp16_swiglu_calls, verifier_rows.size());
+        EXPECT_EQ(bf16_swiglu_calls, verifier_rows.size());
+
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+#endif
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRowsUntrainedShapeUsesPairwiseFloor)
     {

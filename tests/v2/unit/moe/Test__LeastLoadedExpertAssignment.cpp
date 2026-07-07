@@ -117,6 +117,27 @@ namespace
                 static_cast<uint32_t>(transfers.size()),
                 &status);
         }
+
+        bool planTransfersOnlyWithResidency(
+            const std::vector<uint64_t> &loads,
+            const std::vector<uint32_t> &owners,
+            const std::vector<uint32_t> &resident_masks,
+            LeastLoadedExpertAssignmentConfig config)
+        {
+            LeastLoadedExpertAssignmentWorkspace workspace{
+                sorted.data(),
+                pending.data(),
+                assigned.data()};
+            return planLeastLoadedExpertWeightTransfers(
+                loads.data(),
+                owners.data(),
+                config,
+                workspace,
+                transfers.data(),
+                static_cast<uint32_t>(transfers.size()),
+                &status,
+                resident_masks.data());
+        }
     };
 
     LeastLoadedExpertAssignmentConfig configFor(uint32_t expert_count,
@@ -317,6 +338,39 @@ TEST(Test__LeastLoadedExpertAssignment, PartiallyAssignsNativeThenSpillsExcess)
     EXPECT_EQ(fixture.transfers[0].destination_participant, 1u);
 }
 
+TEST(Test__LeastLoadedExpertAssignment, TransferCapKeepsOverflowRowsResident)
+{
+    std::vector<uint64_t> loads{240, 80, 80};
+    std::vector<uint32_t> owners{0, 0, 0};
+    auto config = configFor(3, 3);
+
+    PlannerFixture uncapped(config.expert_count, config.participant_count);
+    ASSERT_TRUE(uncapped.plan(loads, owners, config));
+    ASSERT_GT(uncapped.status.weight_transfer_count, 1u);
+
+    config.max_weight_transfers = 1;
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    ASSERT_TRUE(fixture.plan(loads, owners, config));
+
+    EXPECT_EQ(fixture.status.overflow, 0u);
+    EXPECT_EQ(fixture.status.standard_ep_selected, 0u);
+    EXPECT_EQ(fixture.status.weight_transfer_count, 1u);
+    EXPECT_EQ(fixture.transfers[0].source_participant, 0u);
+    EXPECT_NE(fixture.transfers[0].destination_participant, 0u);
+    EXPECT_LT(fixture.status.spilled_rows, uncapped.status.spilled_rows);
+    EXPECT_EQ(fixture.status.native_rows + fixture.status.spilled_rows, 400u);
+
+    uint32_t foreign_spans = 0;
+    for (uint32_t i = 0; i < fixture.status.span_count; ++i)
+    {
+        if (fixture.spans[i].needs_foreign_weight != 0u)
+            ++foreign_spans;
+    }
+    EXPECT_EQ(foreign_spans, 1u);
+    EXPECT_EQ(fixture.assigned[0] + fixture.assigned[1] + fixture.assigned[2], 400u);
+}
+
 TEST(Test__LeastLoadedExpertAssignment, ResidentReplicaDestinationDoesNotRequireWeightTransfer)
 {
     std::vector<uint64_t> loads{80, 20, 0, 0};
@@ -334,6 +388,56 @@ TEST(Test__LeastLoadedExpertAssignment, ResidentReplicaDestinationDoesNotRequire
     EXPECT_EQ(fixture.spans[1].expert, 0u);
     EXPECT_EQ(fixture.spans[1].destination_participant, 1u);
     EXPECT_EQ(fixture.spans[1].needs_foreign_weight, 0u);
+}
+
+TEST(Test__LeastLoadedExpertAssignment, ForeignTransferSourceComesFromPhysicalResident)
+{
+    std::vector<uint64_t> loads{10};
+    std::vector<uint32_t> owners{1};
+    std::vector<uint32_t> resident_masks{0b01u};
+    auto config = configFor(1, 2);
+    config.enable_balanced_skip = false;
+
+    EXPECT_EQ(residentParticipantMaskOrOwner(resident_masks[0], owners[0], 2), 0b01u);
+    EXPECT_TRUE(destinationNeedsForeignWeight(owners[0], owners[0], resident_masks[0], 2))
+        << "a nonempty physical resident mask must not invent owner residency";
+    EXPECT_EQ(selectWeightSourceParticipant(owners[0], owners[0], resident_masks[0], 2), 0u);
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    ASSERT_TRUE(fixture.planWithResidency(loads, owners, resident_masks, config));
+    ASSERT_EQ(fixture.status.weight_transfer_count, 1u);
+    EXPECT_EQ(fixture.transfers[0].expert, 0u);
+    EXPECT_EQ(fixture.transfers[0].source_participant, 0u);
+    EXPECT_EQ(fixture.transfers[0].destination_participant, 1u);
+
+    PlannerFixture transfers_only(config.expert_count, config.participant_count);
+    ASSERT_TRUE(transfers_only.planTransfersOnlyWithResidency(
+        loads, owners, resident_masks, config));
+    ASSERT_EQ(transfers_only.status.weight_transfer_count, 1u);
+    EXPECT_EQ(transfers_only.transfers[0].expert, 0u);
+    EXPECT_EQ(transfers_only.transfers[0].source_participant, 0u);
+    EXPECT_EQ(transfers_only.transfers[0].destination_participant, 1u);
+}
+
+TEST(Test__LeastLoadedExpertAssignment, ExplicitResidentMaskMustNameAPhysicalSource)
+{
+    std::vector<uint64_t> loads{10};
+    std::vector<uint32_t> owners{0};
+    std::vector<uint32_t> resident_masks{0u};
+    auto config = configFor(1, 2);
+    config.enable_balanced_skip = false;
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    EXPECT_FALSE(fixture.planWithResidency(loads, owners, resident_masks, config));
+    EXPECT_EQ(fixture.status.invalid_config, 1u);
+    EXPECT_EQ(fixture.status.weight_transfer_count, 0u);
+    EXPECT_EQ(fixture.status.span_count, 0u);
+
+    PlannerFixture transfers_only(config.expert_count, config.participant_count);
+    EXPECT_FALSE(transfers_only.planTransfersOnlyWithResidency(
+        loads, owners, resident_masks, config));
+    EXPECT_EQ(transfers_only.status.invalid_config, 1u);
+    EXPECT_EQ(transfers_only.status.weight_transfer_count, 0u);
 }
 
 TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateFallsBackWhenTransferCostDominates)

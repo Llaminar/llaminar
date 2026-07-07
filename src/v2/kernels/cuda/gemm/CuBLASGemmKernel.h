@@ -201,7 +201,8 @@ namespace llaminar2
                 const std::vector<float *> &d_C_matrices,
                 int M, int N, int K,
                 bool transA = false, bool transB = true,
-                float alpha = 1.0f, float beta = 0.0f);
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace_override = nullptr);
 
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 

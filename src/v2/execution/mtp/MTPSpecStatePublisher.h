@@ -19,6 +19,7 @@ namespace llaminar2
         int request_id = -1;
         int accepted_count = 0;
         int restored_stage_count = 0;
+        int post_restore_stage_count = 0;
         int skipped_stage_count = 0;
     };
 

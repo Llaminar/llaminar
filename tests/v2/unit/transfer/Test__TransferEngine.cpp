@@ -897,6 +897,28 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_NoD2HTransf
     EXPECT_EQ(stats.d2h_count, 0u);
 }
 
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_ExplicitStreamBypassesStaleCompletionEvent)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+    mock_->setEventWaitFails(true);
+    mock_->resetTransferStats();
+    mock_->resetEventRecords();
+
+    void *producer_stream = reinterpret_cast<void *>(0x1234);
+    auto result = engine.downloadFull(tensor.get(), producer_stream);
+
+    EXPECT_TRUE(result.success)
+        << "An explicit producer stream should order D2H directly and must not "
+           "host-wait a stale graph-capture completion event";
+    EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
+    EXPECT_EQ(mock_->getEventWaitCount(), 0u)
+        << "Explicit-stream publication must bypass tensor completion events.";
+    auto stats = mock_->getTransferStats();
+    EXPECT_EQ(stats.d2h_count, 1u);
+}
+
 TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitSuccess_TransferSucceeds)
 {
     TransferEngine engine(resolver_);

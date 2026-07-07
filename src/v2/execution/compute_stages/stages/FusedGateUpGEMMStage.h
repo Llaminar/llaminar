@@ -106,12 +106,16 @@ namespace llaminar2
         // =============================================================================
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
 
     private:
         Params params_;
         ITensorFusedGateUpGemm *cached_kernel_ = nullptr; ///< Cached for workspace binding
 
         ITensorFusedGateUpGemm *resolvePreparedKernel(const char *caller);
+        void clearCachedKernelStream();
         bool executeDecodeEquivalentVerifierPrefill(
             IDeviceContext *ctx,
             const TensorBase *input,
@@ -119,9 +123,6 @@ namespace llaminar2
             TensorBase *output_up,
             ITensorFusedGateUpGemm *kernel);
 
-        std::shared_ptr<FP32Tensor> verifier_input_row_;
-        std::shared_ptr<FP32Tensor> verifier_gate_row_;
-        std::shared_ptr<FP32Tensor> verifier_up_row_;
     };
 
 } // namespace llaminar2

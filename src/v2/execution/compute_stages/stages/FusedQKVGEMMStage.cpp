@@ -38,6 +38,33 @@ namespace llaminar2
     {
     }
 
+    void FusedQKVGEMMStage::clearCachedGemmStreams()
+    {
+        if (cached_gemm_q_)
+            cached_gemm_q_->setGPUStream(nullptr);
+        if (cached_gemm_k_)
+            cached_gemm_k_->setGPUStream(nullptr);
+        if (cached_gemm_v_)
+            cached_gemm_v_->setGPUStream(nullptr);
+    }
+
+    void FusedQKVGEMMStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        clearCachedGemmStreams();
+    }
+
+    void FusedQKVGEMMStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionStatePreservingCapturedReplay();
+        clearCachedGemmStreams();
+    }
+
+    void FusedQKVGEMMStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
+    }
+
     bool FusedQKVGEMMStage::validatePreparedWeights(std::string *error) const
     {
         if (!params_.wq && !params_.wk && !params_.wv)
@@ -301,8 +328,8 @@ namespace llaminar2
 
         /*
          * Real verifier fast path: all rows and projections are grouped in the
-         * kernel layer.  The older scratch-row helper remains useful for
-         * diagnostics, but it must not be the production implementation.
+         * kernel layer. Unsupported grouped implementations fail closed here;
+         * production stage execution must never replay verifier rows one at a time.
          */
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},

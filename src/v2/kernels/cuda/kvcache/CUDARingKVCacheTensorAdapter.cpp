@@ -254,52 +254,25 @@ namespace llaminar2
             {
                 return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
             }
-
-            // --- Profiling: ensure scratch buffers ---
-            const auto alloc_start = std::chrono::high_resolution_clock::now();
-
-            const size_t buf_bytes = static_cast<size_t>(elements) * sizeof(uint16_t);
-            if (!ensureConvScratch(buf_bytes))
+            if (K->native_type() != V->native_type())
             {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure FP16 conversion scratch");
-                return false;
-            }
-            auto *d_k_fp16 = static_cast<uint16_t *>(conv_scratch_k_);
-            auto *d_v_fp16 = static_cast<uint16_t *>(conv_scratch_v_);
-
-            const auto alloc_end = std::chrono::high_resolution_clock::now();
-
-            // --- Profiling: FP16 conversion kernels ---
-            const auto conv_start = std::chrono::high_resolution_clock::now();
-
-            const bool k_ok = cuda_convert_tensor_to_fp16(d_k, K->native_type(), d_k_fp16, elements, stream);
-            const bool v_ok = cuda_convert_tensor_to_fp16(d_v, V->native_type(), d_v_fp16, elements, stream);
-
-            if (!k_ok || !v_ok)
-            {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] GPU FP16 conversion failed");
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Asymmetric K/V source types are unsupported for fused FP16 append: K="
+                          << static_cast<int>(K->native_type())
+                          << " V=" << static_cast<int>(V->native_type()));
                 return false;
             }
 
-            const auto conv_end = std::chrono::high_resolution_clock::now();
-
-            // --- Profiling: ring buffer append ---
             const auto append_start = std::chrono::high_resolution_clock::now();
-            const bool ok = append(layer, seq_idx, d_k_fp16, d_v_fp16, num_tokens, stream);
+            const bool ok = appendConvertedWithStream(layer, seq_idx, d_k, d_v,
+                                                      K->native_type(), num_tokens, stream);
             const auto append_end = std::chrono::high_resolution_clock::now();
-
-            // Record profiling breakdown
             {
                 auto to_ns = [](auto d) -> uint64_t
                 {
                     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
                 };
-                const uint64_t alloc_ns = to_ns(alloc_end - alloc_start);
-                const uint64_t conv_ns = to_ns(conv_end - conv_start);
                 const uint64_t append_ns = to_ns(append_end - append_start);
                 const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t) * 2;
-                KVCacheProfiler::record(KVCacheOpType::GPU_ALLOC, alloc_ns);
-                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(num_tokens), bytes);
                 KVCacheProfiler::record(KVCacheOpType::APPEND, append_ns, static_cast<uint64_t>(num_tokens), bytes);
             }
 
@@ -643,6 +616,104 @@ namespace llaminar2
         return ok;
     }
 
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::get_kv_snapshot_view(
+        int layer, int seq_idx,
+        int token_count,
+        ITensor **out_k, ITensor **out_v,
+        int *out_kv_len)
+    {
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
+
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            token_count <= 0 || token_count > max_seq_len_)
+        {
+            return false;
+        }
+
+        const EntryT &entry = entries_[layer][seq_idx];
+        if (!entry.d_K || !entry.d_V || token_count < entry.count)
+            return false;
+
+        if (entry.count > 0 && entry.tail(max_seq_len_) != 0)
+            return false;
+        if (entry.head != entry.count)
+            return false;
+
+        constexpr TensorType tensor_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            else
+                return TensorType::FP32;
+        }();
+
+        if (snapshot_tensor_views_.empty())
+        {
+            snapshot_tensor_views_.resize(n_layers_);
+            for (int l = 0; l < n_layers_; ++l)
+                snapshot_tensor_views_[l].resize(batch_size_);
+        }
+
+        const size_t rows = static_cast<size_t>(token_count);
+        const size_t view_cols = (Precision == ActivationPrecision::Q8_1)
+                                     ? static_cast<size_t>(kv_storage_dim_)
+                                     : static_cast<size_t>(kv_dim_);
+
+        auto &k_view = snapshot_tensor_views_[layer][seq_idx][0];
+        if (!k_view || k_view->gpu_data_ptr() != entry.d_K || k_view->rows() != rows)
+        {
+            k_view = std::make_unique<GpuTensorView>(
+                static_cast<void *>(entry.d_K), rows, view_cols, tensor_type, device_id_);
+        }
+
+        auto &v_view = snapshot_tensor_views_[layer][seq_idx][1];
+        if (!v_view || v_view->gpu_data_ptr() != entry.d_V || v_view->rows() != rows)
+        {
+            v_view = std::make_unique<GpuTensorView>(
+                static_cast<void *>(entry.d_V), rows, view_cols, tensor_type, device_id_);
+        }
+
+        if (out_k)
+            *out_k = k_view.get();
+        if (out_v)
+            *out_v = v_view.get();
+        if (out_kv_len)
+            *out_kv_len = token_count;
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::get_kv_snapshot_view(
+        int layer, int seq_idx,
+        int token_count,
+        const ITensor **out_k, const ITensor **out_v,
+        int *out_kv_len) const
+    {
+        ITensor *k = nullptr;
+        ITensor *v = nullptr;
+        const bool ok = const_cast<CUDARingKVCache<Precision> *>(this)->get_kv_snapshot_view(
+            layer, seq_idx, token_count, &k, &v, out_kv_len);
+        if (ok)
+        {
+            if (out_k)
+                *out_k = k;
+            if (out_v)
+                *out_v = v;
+        }
+        return ok;
+    }
+
     // Explicit template instantiations
     template ITensor *CUDARingKVCache<ActivationPrecision::FP32>::get_k(int, int);
     template const ITensor *CUDARingKVCache<ActivationPrecision::FP32>::get_k(int, int) const;
@@ -672,6 +743,14 @@ namespace llaminar2
     template bool CUDARingKVCache<ActivationPrecision::BF16>::get_kv(int, int, const ITensor **, const ITensor **, int *) const;
     template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv(int, int, ITensor **, ITensor **, int *);
     template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv(int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::FP32>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::FP32>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::FP16>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::FP16>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::BF16>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::BF16>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
 
     // =========================================================================
     // get_kv_converted(): FP16 shadow buffers with optional RoPE

@@ -139,9 +139,12 @@ namespace llaminar2
                 *error = "failed to allocate device-hot handle";
             return false;
         }
+        out.total_bytes = ram_handle.total_bytes;
         out.has_hybrid_state = ram_handle.has_hybrid_state;
         out.has_terminal_hidden = ram_handle.has_terminal_hidden;
         out.has_terminal_logits = ram_handle.has_terminal_logits;
+        out.has_model_runtime_state = ram_handle.has_model_runtime_state;
+        out.model_runtime_state_storage = ram_handle.model_runtime_state_storage;
 
         out.device_kv_storage = uploadBytesToDevice(ram_handle.kv_storage, device_, error);
         if (ram_handle.kv_storage && !ram_handle.kv_storage->empty() && !out.device_kv_storage)
@@ -208,6 +211,7 @@ namespace llaminar2
                 *error = "failed to allocate RAM hydration handle";
             return false;
         }
+        out.total_bytes = handle.total_bytes;
 
         if (!downloadBytesFromDevice(handle.device_kv_storage, out.kv_storage, error) ||
             !downloadBytesFromDevice(handle.device_hybrid_storage, out.hybrid_storage, error) ||
@@ -231,6 +235,8 @@ namespace llaminar2
         out.has_hybrid_state = handle.has_hybrid_state;
         out.has_terminal_hidden = handle.has_terminal_hidden;
         out.has_terminal_logits = handle.has_terminal_logits;
+        out.has_model_runtime_state = handle.has_model_runtime_state;
+        out.model_runtime_state_storage = handle.model_runtime_state_storage;
 
         *ram_handle = std::move(out);
         return true;

@@ -156,6 +156,16 @@ namespace
             return runtime;
         }
 
+        void uploadRuntime(const DeviceMoELayerRuntime &runtime) const
+        {
+            ASSERT_EQ(hipMemcpyAsync(runtime_table_->deviceLayerState(0),
+                                     &runtime,
+                                     sizeof(runtime),
+                                     hipMemcpyHostToDevice,
+                                     stream_),
+                      hipSuccess);
+        }
+
         std::vector<int32_t> copyRouteParticipants(const DeviceMoELayerRuntime &runtime) const
         {
             std::vector<int32_t> participants(static_cast<size_t>(shape_.seq_len * shape_.top_k));
@@ -272,6 +282,76 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CurrentBatchSpanAssignmentDeterministic)
                 route_hash,
                 static_cast<uint32_t>(runtime.reserved_u64[2]),
                 static_cast<uint32_t>(runtime.reserved_u64[3]));
+#endif
+}
+
+TEST(Perf__MoELLEPDeterminism, ROCm_GroupPrefillRoutesDeterministic)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const Shape shape{};
+    const int warmups = envInt("LLAMINAR_MOE_GROUP_ROUTES_WARMUPS", 10);
+    const int iterations = envInt("LLAMINAR_MOE_GROUP_ROUTES_ITERS", 100);
+    ROCmHarness harness(shape);
+    harness.prepare(/*all_participants_resident=*/false,
+                    makeSourceZeroTransferRouteExperts(shape),
+                    makeRouteWeights(shape));
+
+    for (int i = 0; i < warmups; ++i)
+    {
+        ASSERT_TRUE(harness.kernel_->groupPrefillRoutes(
+            harness.runtime_table_->deviceLayerState(0),
+            harness.route_indices_tensor_.get(),
+            harness.route_weights_tensor_.get(),
+            shape.seq_len,
+            shape.seq_len,
+            shape.num_experts,
+            shape.top_k));
+    }
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    HipEvents events;
+    ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
+    for (int i = 0; i < iterations; ++i)
+    {
+        ASSERT_TRUE(harness.kernel_->groupPrefillRoutes(
+            harness.runtime_table_->deviceLayerState(0),
+            harness.route_indices_tensor_.get(),
+            harness.route_weights_tensor_.get(),
+            shape.seq_len,
+            shape.seq_len,
+            shape.num_experts,
+            shape.top_k));
+    }
+    ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
+    ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
+    float elapsed_ms = 0.0f;
+    ASSERT_EQ(hipEventElapsedTime(&elapsed_ms, events.start, events.stop), hipSuccess);
+
+    const auto runtime = harness.copyRuntime();
+    std::vector<int32_t> counts(static_cast<size_t>(shape.num_experts));
+    ASSERT_EQ(hipMemcpyAsync(counts.data(),
+                             runtime.expert_counts,
+                             counts.size() * sizeof(int32_t),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    const int total_routes =
+        std::accumulate(counts.begin(), counts.end(), 0);
+    ASSERT_EQ(total_routes, shape.seq_len * shape.top_k);
+    printTiming("rocm",
+                "group_prefill_routes",
+                shape,
+                iterations,
+                elapsed_ms * 1000.0f / static_cast<float>(iterations),
+                fnv1a64(counts),
+                static_cast<uint32_t>(total_routes),
+                0);
 #endif
 }
 
@@ -408,5 +488,568 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
                 static_cast<uint32_t>(runtime.reserved_u64[2]),
                 count);
     cleanup();
+#endif
+}
+
+TEST(Perf__MoELLEPDeterminism, ROCm_DynamicMaintenancePackAndControllerDeterministic)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const Shape shape{};
+    const DeviceMoERebalanceConfig config = dynamicMaintenanceConfig(shape);
+    const uint32_t wave_layers = std::max(1u, config.layer_wave_count);
+    const uint32_t local_histogram_count = wave_layers * config.num_experts;
+    const uint32_t gathered_histogram_count =
+        config.participant_count * local_histogram_count;
+    const int warmups = envInt("LLAMINAR_MOE_DYNAMIC_MAINT_WARMUPS", 10);
+    const int iterations = envInt("LLAMINAR_MOE_DYNAMIC_MAINT_ITERS", 100);
+
+    ROCmHarness harness(shape);
+    harness.prepare(/*all_participants_resident=*/false,
+                    makeSourceZeroTransferRouteExperts(shape),
+                    makeRouteWeights(shape));
+
+    auto runtime = harness.copyRuntime();
+    configureRuntimeLayer(runtime, shape, /*all_participants_resident=*/false, 0);
+    installSkewedDynamicHistogram(runtime, shape);
+    harness.uploadRuntime(runtime);
+
+    constexpr uint32_t plan_capacity = kDeviceMoEMaxExperts * kDeviceMoEMaxParticipants;
+    uint64_t *d_local_histograms = nullptr;
+    uint64_t *d_gathered_histograms = nullptr;
+    DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    DeviceMoERebalanceStatus *d_status = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
+    DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    ASSERT_EQ(hipMalloc(&d_local_histograms,
+                        static_cast<size_t>(local_histogram_count) * sizeof(uint64_t)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_gathered_histograms,
+                        static_cast<size_t>(gathered_histogram_count) * sizeof(uint64_t)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_plan, plan_capacity * sizeof(DeviceMoERebalancePlanEntry)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_plan_count, sizeof(uint32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_status, sizeof(DeviceMoERebalanceStatus)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_wave_state, sizeof(DeviceMoERebalanceWaveState)), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_gathered_histograms,
+                             0,
+                             static_cast<size_t>(gathered_histogram_count) * sizeof(uint64_t),
+                             harness.stream_),
+              hipSuccess);
+
+    auto run_maintenance = [&]()
+    {
+        ASSERT_TRUE(harness.kernel_->packDeviceRebalanceHistograms(
+            harness.runtime_table_->deviceLayerState(0),
+            d_local_histograms,
+            config));
+        ASSERT_EQ(hipMemcpyAsync(d_gathered_histograms,
+                                 d_local_histograms,
+                                 static_cast<size_t>(local_histogram_count) * sizeof(uint64_t),
+                                 hipMemcpyDeviceToDevice,
+                                 harness.stream_),
+                  hipSuccess);
+        ASSERT_TRUE(harness.kernel_->runDeviceRebalanceController(
+            harness.runtime_table_->deviceLayerState(0),
+            d_gathered_histograms,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            plan_capacity,
+            d_header,
+            d_wave_state));
+    };
+
+    for (int i = 0; i < warmups; ++i)
+        run_maintenance();
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    HipEvents events;
+    ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
+    for (int i = 0; i < iterations; ++i)
+        run_maintenance();
+    ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
+    ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
+    float elapsed_ms = 0.0f;
+    ASSERT_EQ(hipEventElapsedTime(&elapsed_ms, events.start, events.stop), hipSuccess);
+
+    uint32_t plan_count = 0;
+    DeviceMoERebalanceStatus status{};
+    ASSERT_EQ(hipMemcpyAsync(&plan_count,
+                             d_plan_count,
+                             sizeof(plan_count),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(&status,
+                             d_status,
+                             sizeof(status),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    ASSERT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+    ASSERT_GT(plan_count, 0u);
+    ASSERT_EQ(status.plan_overflow, 0u);
+    ASSERT_EQ(status.payload_bucket_overflow, 0u);
+    ASSERT_GT(status.dynamic_ownership_swap_accepts, 0u);
+    ASSERT_GT(status.accepted_load_spread_improvement_total, 0u);
+    ASSERT_GT(status.pre_policy_imbalance_numerator,
+              status.post_policy_imbalance_numerator);
+    ASSERT_GE(status.payload_bucket_slots, status.payload_bucket_requested_slots);
+
+    const auto plan = harness.copyPlan(d_plan, plan_count);
+    const uint64_t plan_hash = fnv1a64Plan(plan.data(), plan.size());
+    printTiming("rocm",
+                "dynamic_maintenance_pack_controller",
+                shape,
+                iterations,
+                elapsed_ms * 1000.0f / static_cast<float>(iterations),
+                plan_hash,
+                status.dynamic_ownership_swap_accepts,
+                plan_count);
+
+    if (d_wave_state)
+        (void)hipFree(d_wave_state);
+    if (d_header)
+        (void)hipFree(d_header);
+    if (d_status)
+        (void)hipFree(d_status);
+    if (d_plan_count)
+        (void)hipFree(d_plan_count);
+    if (d_plan)
+        (void)hipFree(d_plan);
+    if (d_gathered_histograms)
+        (void)hipFree(d_gathered_histograms);
+    if (d_local_histograms)
+        (void)hipFree(d_local_histograms);
+#endif
+}
+
+TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const Shape shape{};
+    const SyntheticPayloadSpec payload_spec{};
+    const uint64_t expert_bytes = syntheticExpertDataBytes(payload_spec);
+    const uint64_t payload_slot_bytes = syntheticPayloadSlotBytes(payload_spec);
+    ASSERT_GT(expert_bytes, 0u);
+    ASSERT_GT(payload_slot_bytes, sizeof(DeviceMoEExpertDirectoryEntry));
+
+    const int warmups = envInt("LLAMINAR_MOE_PAYLOAD_WARMUPS", 5);
+    const int iterations = envInt("LLAMINAR_MOE_PAYLOAD_ITERS", 50);
+    ROCmHarness harness(shape);
+    harness.prepare(/*all_participants_resident=*/false,
+                    makeSourceZeroTransferRouteExperts(shape),
+                    makeRouteWeights(shape));
+
+    constexpr uint32_t plan_capacity = kDeviceMoEMaxExperts * kDeviceMoEMaxParticipants;
+    DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
+    DeviceMoERebalanceStatus *d_plan_status = nullptr;
+    DeviceMoEExpertDirectoryEntry *d_source_descriptors = nullptr;
+    DeviceMoERebalanceApplyStatus *d_pack_status = nullptr;
+    DeviceMoERebalanceApplyStatus *d_unpack_status = nullptr;
+    DeviceMoERebalanceApplyStatus *d_apply_status = nullptr;
+    uint8_t *d_source_slab = nullptr;
+    uint8_t *d_destination_slab = nullptr;
+    uint8_t *d_local_payload = nullptr;
+    uint8_t *d_gathered_payload = nullptr;
+    DeviceMoEExpertDirectoryEntry *d_transfer_slots = nullptr;
+
+    const uint32_t source_experts =
+        static_cast<uint32_t>((shape.num_experts + shape.participant_count - 1) /
+                              shape.participant_count);
+    ASSERT_EQ(hipMalloc(&d_source_slab,
+                        static_cast<size_t>(source_experts) *
+                            static_cast<size_t>(expert_bytes)),
+              hipSuccess);
+    for (uint32_t ordinal = 0; ordinal < source_experts; ++ordinal)
+    {
+        ASSERT_EQ(hipMemsetAsync(d_source_slab + static_cast<uint64_t>(ordinal) * expert_bytes,
+                                 static_cast<int>((ordinal * 37u + 11u) & 0xffu),
+                                 static_cast<size_t>(expert_bytes),
+                                 harness.stream_),
+                  hipSuccess);
+    }
+
+    auto source_runtime = harness.copyRuntime();
+    installSyntheticLocalExpertDescriptors(
+        source_runtime, shape, payload_spec, 0, d_source_slab, expert_bytes);
+    harness.uploadRuntime(source_runtime);
+
+    ASSERT_EQ(hipMalloc(&d_plan, plan_capacity * sizeof(DeviceMoERebalancePlanEntry)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_plan_count, sizeof(uint32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_plan_status, sizeof(DeviceMoERebalanceStatus)), hipSuccess);
+    ASSERT_TRUE(harness.kernel_->materializePrefillLeastLoadedTransferCommands(
+        harness.runtime_table_->deviceLayerState(0),
+        d_plan,
+        d_plan_count,
+        plan_capacity,
+        d_header,
+        d_plan_status,
+        rebalanceConfig(shape),
+        plan_capacity,
+        0));
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    uint32_t plan_count = 0;
+    DeviceMoERebalanceStatus plan_status{};
+    ASSERT_EQ(hipMemcpyAsync(&plan_count,
+                             d_plan_count,
+                             sizeof(plan_count),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(&plan_status,
+                             d_plan_status,
+                             sizeof(plan_status),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    ASSERT_GT(plan_count, 0u);
+    ASSERT_EQ(plan_status.plan_overflow, 0u);
+    ASSERT_EQ(plan_status.payload_bucket_overflow, 0u);
+
+    const auto plan = harness.copyPlan(d_plan, plan_count);
+    uint32_t destination_one_arrivals = 0;
+    for (const auto &entry : plan)
+    {
+        if (entry.destination_participant == 1u)
+            ++destination_one_arrivals;
+    }
+    ASSERT_GT(destination_one_arrivals, 0u);
+    const uint32_t payload_slot_count = plan_status.payload_bucket_slots;
+    ASSERT_GE(payload_slot_count, plan_count);
+
+    ASSERT_EQ(hipMalloc(&d_source_descriptors,
+                        static_cast<size_t>(shape.participant_count) *
+                            plan_capacity * sizeof(DeviceMoEExpertDirectoryEntry)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_pack_status, sizeof(DeviceMoERebalanceApplyStatus)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_unpack_status, sizeof(DeviceMoERebalanceApplyStatus)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_apply_status, sizeof(DeviceMoERebalanceApplyStatus)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_local_payload,
+                        static_cast<size_t>(payload_slot_count) *
+                            static_cast<size_t>(payload_slot_bytes)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_gathered_payload,
+                        static_cast<size_t>(shape.participant_count) *
+                            static_cast<size_t>(payload_slot_count) *
+                            static_cast<size_t>(payload_slot_bytes)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_destination_slab,
+                        static_cast<size_t>(plan_count) *
+                            static_cast<size_t>(expert_bytes)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_transfer_slots,
+                        static_cast<size_t>(plan_count) *
+                            sizeof(DeviceMoEExpertDirectoryEntry)),
+              hipSuccess);
+
+    std::vector<DeviceMoEExpertDirectoryEntry> transfer_slots(plan_count);
+    for (uint32_t slot = 0; slot < plan_count; ++slot)
+    {
+        transfer_slots[slot] = makeSyntheticTransferSlot(
+            d_destination_slab + static_cast<uint64_t>(slot) * expert_bytes,
+            payload_spec,
+            1u,
+            slot);
+    }
+    ASSERT_EQ(hipMemcpyAsync(d_transfer_slots,
+                             transfer_slots.data(),
+                             transfer_slots.size() * sizeof(DeviceMoEExpertDirectoryEntry),
+                             hipMemcpyHostToDevice,
+                             harness.stream_),
+              hipSuccess);
+
+    ASSERT_TRUE(harness.kernel_->packDeviceRebalanceSourceDescriptors(
+        harness.runtime_table_->deviceLayerState(0),
+        d_plan,
+        d_header,
+        plan_capacity,
+        d_source_descriptors,
+        rebalanceConfig(shape),
+        nullptr));
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    auto destination_runtime = harness.copyRuntime();
+    configureRuntimeLayer(destination_runtime, shape, /*all_participants_resident=*/false, 1);
+    harness.uploadRuntime(destination_runtime);
+
+    auto run_payload_wave = [&]()
+    {
+        const DeviceMoERebalanceConfig source_config = rebalanceConfig(shape);
+        DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
+        destination_config.participant_id = 1u;
+
+        auto pack_payloads = [&]()
+        {
+            ASSERT_TRUE(harness.kernel_->packDeviceRebalanceCompactPayloads(
+                d_plan,
+                d_header,
+                plan_capacity,
+                d_source_descriptors,
+                d_local_payload,
+                payload_slot_count,
+                payload_slot_bytes,
+                source_config,
+                d_pack_status));
+        };
+        auto copy_payload_bucket = [&]()
+        {
+            ASSERT_EQ(hipMemcpyAsync(d_gathered_payload,
+                                     d_local_payload,
+                                     static_cast<size_t>(payload_slot_count) *
+                                         static_cast<size_t>(payload_slot_bytes),
+                                     hipMemcpyDeviceToDevice,
+                                     harness.stream_),
+                      hipSuccess);
+        };
+        auto unpack_payloads = [&]()
+        {
+            ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
+                d_plan,
+                d_plan_count,
+                plan_capacity,
+                nullptr,
+                d_gathered_payload,
+                payload_slot_count,
+                payload_slot_bytes,
+                d_transfer_slots,
+                plan_count,
+                destination_config,
+                d_unpack_status));
+        };
+        auto apply_arrivals = [&]()
+        {
+            ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
+                harness.runtime_table_->deviceLayerState(0),
+                d_plan,
+                d_plan_count,
+                plan_capacity,
+                d_transfer_slots,
+                plan_count,
+                destination_config,
+                d_apply_status,
+                nullptr,
+                -1));
+        };
+
+        pack_payloads();
+        copy_payload_bucket();
+        unpack_payloads();
+        apply_arrivals();
+    };
+    auto pack_payloads_once = [&]()
+    {
+        ASSERT_TRUE(harness.kernel_->packDeviceRebalanceCompactPayloads(
+            d_plan,
+            d_header,
+            plan_capacity,
+            d_source_descriptors,
+            d_local_payload,
+            payload_slot_count,
+            payload_slot_bytes,
+            rebalanceConfig(shape),
+            d_pack_status));
+    };
+    auto copy_payload_bucket_once = [&]()
+    {
+        ASSERT_EQ(hipMemcpyAsync(d_gathered_payload,
+                                 d_local_payload,
+                                 static_cast<size_t>(payload_slot_count) *
+                                     static_cast<size_t>(payload_slot_bytes),
+                                 hipMemcpyDeviceToDevice,
+                                 harness.stream_),
+                  hipSuccess);
+    };
+    auto unpack_payloads_once = [&]()
+    {
+        DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
+        destination_config.participant_id = 1u;
+        ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            nullptr,
+            d_gathered_payload,
+            payload_slot_count,
+            payload_slot_bytes,
+            d_transfer_slots,
+            plan_count,
+            destination_config,
+            d_unpack_status));
+    };
+    auto apply_arrivals_once = [&]()
+    {
+        DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
+        destination_config.participant_id = 1u;
+        ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
+            harness.runtime_table_->deviceLayerState(0),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_transfer_slots,
+            plan_count,
+            destination_config,
+            d_apply_status,
+            nullptr,
+            -1));
+    };
+    auto time_component_us = [&](auto &&component)
+    {
+        HipEvents component_events;
+        EXPECT_EQ(hipEventRecord(component_events.start, harness.stream_), hipSuccess);
+        for (int i = 0; i < iterations; ++i)
+            component();
+        EXPECT_EQ(hipEventRecord(component_events.stop, harness.stream_), hipSuccess);
+        EXPECT_EQ(hipEventSynchronize(component_events.stop), hipSuccess);
+        float component_elapsed_ms = 0.0f;
+        EXPECT_EQ(hipEventElapsedTime(&component_elapsed_ms,
+                                      component_events.start,
+                                      component_events.stop),
+                  hipSuccess);
+        return component_elapsed_ms * 1000.0f / static_cast<float>(iterations);
+    };
+
+    for (int i = 0; i < warmups; ++i)
+        run_payload_wave();
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    HipEvents events;
+    ASSERT_EQ(hipEventRecord(events.start, harness.stream_), hipSuccess);
+    for (int i = 0; i < iterations; ++i)
+        run_payload_wave();
+    ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
+    ASSERT_EQ(hipEventSynchronize(events.stop), hipSuccess);
+    float elapsed_ms = 0.0f;
+    ASSERT_EQ(hipEventElapsedTime(&elapsed_ms, events.start, events.stop), hipSuccess);
+    const double pack_us = time_component_us(pack_payloads_once);
+    const double bucket_copy_us = time_component_us(copy_payload_bucket_once);
+    const double unpack_us = time_component_us(unpack_payloads_once);
+    const double apply_us = time_component_us(apply_arrivals_once);
+
+    DeviceMoERebalanceApplyStatus pack_status{};
+    DeviceMoERebalanceApplyStatus unpack_status{};
+    DeviceMoERebalanceApplyStatus apply_status{};
+    ASSERT_EQ(hipMemcpyAsync(&pack_status,
+                             d_pack_status,
+                             sizeof(pack_status),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(&unpack_status,
+                             d_unpack_status,
+                             sizeof(unpack_status),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(&apply_status,
+                             d_apply_status,
+                             sizeof(apply_status),
+                             hipMemcpyDeviceToHost,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    EXPECT_EQ(pack_status.missing_source_descriptors, 0u);
+    EXPECT_EQ(pack_status.descriptor_mismatches, 0u);
+    EXPECT_EQ(unpack_status.copied_arrivals, destination_one_arrivals);
+    EXPECT_EQ(unpack_status.missing_source_descriptors, 0u);
+    EXPECT_EQ(unpack_status.missing_destination_slots, 0u);
+    EXPECT_EQ(unpack_status.descriptor_mismatches, 0u);
+    EXPECT_EQ(apply_status.applied_arrivals, destination_one_arrivals);
+    EXPECT_EQ(apply_status.copy_incomplete, 0u);
+    EXPECT_EQ(apply_status.changed_layers, 1u);
+
+    const auto final_runtime = harness.copyRuntime();
+    const auto &active_bank = final_runtime.banks[final_runtime.active_bank];
+    const uint64_t mask_hash = fnv1a64Bytes(
+        active_bank.resident_participant_mask,
+        static_cast<size_t>(shape.num_experts) * sizeof(uint32_t));
+    printTiming("rocm",
+                "payload_movement_apply",
+                shape,
+                iterations,
+                elapsed_ms * 1000.0f / static_cast<float>(iterations),
+                mask_hash,
+                payload_slot_count,
+                destination_one_arrivals);
+    printTiming("rocm",
+                "payload_pack_compact",
+                shape,
+                iterations,
+                pack_us,
+                mask_hash,
+                payload_slot_count,
+                destination_one_arrivals);
+    printTiming("rocm",
+                "payload_bucket_copy",
+                shape,
+                iterations,
+                bucket_copy_us,
+                mask_hash,
+                payload_slot_count,
+                destination_one_arrivals);
+    printTiming("rocm",
+                "payload_unpack_collective",
+                shape,
+                iterations,
+                unpack_us,
+                mask_hash,
+                payload_slot_count,
+                destination_one_arrivals);
+    printTiming("rocm",
+                "payload_apply_arrivals",
+                shape,
+                iterations,
+                apply_us,
+                mask_hash,
+                payload_slot_count,
+                destination_one_arrivals);
+
+    if (d_transfer_slots)
+        (void)hipFree(d_transfer_slots);
+    if (d_destination_slab)
+        (void)hipFree(d_destination_slab);
+    if (d_gathered_payload)
+        (void)hipFree(d_gathered_payload);
+    if (d_local_payload)
+        (void)hipFree(d_local_payload);
+    if (d_apply_status)
+        (void)hipFree(d_apply_status);
+    if (d_unpack_status)
+        (void)hipFree(d_unpack_status);
+    if (d_pack_status)
+        (void)hipFree(d_pack_status);
+    if (d_source_descriptors)
+        (void)hipFree(d_source_descriptors);
+    if (d_plan_status)
+        (void)hipFree(d_plan_status);
+    if (d_header)
+        (void)hipFree(d_header);
+    if (d_plan_count)
+        (void)hipFree(d_plan_count);
+    if (d_plan)
+        (void)hipFree(d_plan);
+    if (d_source_slab)
+        (void)hipFree(d_source_slab);
 #endif
 }

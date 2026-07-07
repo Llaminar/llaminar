@@ -85,8 +85,27 @@ namespace llaminar2
         /// Reset MoE runtime state between independent inference sessions.
         void resetState() override;
 
+        /**
+         * @brief Restore the pre-decode MoE runtime boundary for a prefix hit without a payload.
+         *
+         * Prefix cache entries may omit the MoE runtime payload when the
+         * harvesting runner's temporary execution domain cannot be replayed by
+         * the restoring domain.  In that case the cached KV/GDN/MTP tensors are
+         * still valid, but any decode-era dynamic placement, transfer slots, or
+         * graph-side rebalance scratch owned by this graph builder must not
+         * survive into suffix prefill.  The implementation resets decode
+         * runtime tables to their empty pre-decode state while preserving their
+         * allocated prefill scratch bindings, then clears transient movement
+         * helpers so suffix prefill observes the same model-runtime baseline as
+         * an uncached split prefill from the same token boundary.
+         */
+        void resetPrefixCacheRuntimeStateWithoutSnapshot() override;
+
         /// Append active MoE runtime placement state to prefix-cache fingerprints.
         void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;
+
+        bool capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream) override;
+        bool restorePrefixCacheRuntimeState(const std::vector<uint8_t> &state, void *stream) override;
 
     private:
         struct ScopedMTPGraphContext
@@ -99,10 +118,28 @@ namespace llaminar2
             int previous_depth_idx = -1;
         };
 
+        /**
+         * @brief Role of a graph-side rebalance binding.
+         *
+         * Decode maintenance bindings are long-lived, domain-wide control lanes
+         * used by the async device-resident rebalance maintenance graph.  Prefill
+         * LLEP transfer bindings are short-lived, layer-local lanes used while a
+         * phase-split prompt is publishing transient expert payloads.  Both can
+         * exist for the same device during prefix-cache+MTP runs, so selection
+         * must be role-based rather than map-order-based.
+         */
+        enum class GraphSideRebalanceBindingRole
+        {
+            DecodeMaintenance,
+            PrefillLLEPTransfer
+        };
+
         struct GraphSideRebalanceBinding
         {
             std::string transfer_key;
             std::string workspace_name;
+            GraphSideRebalanceBindingRole role =
+                GraphSideRebalanceBindingRole::DecodeMaintenance;
             DeviceId device_id = DeviceId::invalid();
             ILocalTPContext *decode_tp_ctx = nullptr;
             ILocalTPContext *maintenance_tp_ctx = nullptr;
@@ -125,9 +162,32 @@ namespace llaminar2
                                                    const std::string &key_suffix = {},
                                                    int num_layers_override = -1,
                                                    bool register_decode_histogram = true);
+        /**
+         * @brief Build a prefix-restore payload resolver for a MoE runtime table.
+         *
+         * The portable prefix blob stores only logical placement and stable
+         * transfer-slot ids.  Qwen35MoEGraph owns the transfer-slot directories
+         * that keep those VRAM payloads alive across a prefix restore with a
+         * model-runtime snapshot, so it supplies the resolver that rehydrates a
+         * local-compute expert descriptor from the graph-owned directory.
+         */
+        MoERuntimeTable::LocalPayloadDescriptorResolver
+        localPayloadDescriptorResolverForRuntimeTable(const MoERuntimeTable *table) const;
         ILocalTPContext *maintenanceTPContextForDomain(
             const std::string &domain_key,
             ILocalTPContext &decode_tp_ctx);
+        /**
+         * @brief Return the device-local decode maintenance binding for async
+         * graph-side rebalance.
+         *
+         * The maintenance graph runs after prefill and during decode, so it must
+         * consume the domain-wide decode workspace.  It must never attach to a
+         * layer-local prefill LLEP workspace, because that workspace may contain
+         * an unrelated in-flight prefill transfer wave and would make decode
+         * maintenance report a permanent busy window.
+         */
+        const GraphSideRebalanceBinding *
+        findDeviceMoERebalanceMaintenanceBinding(DeviceId device) const;
 
     protected:
         void registerRuntimeTableHistogramSyncIfNeeded(

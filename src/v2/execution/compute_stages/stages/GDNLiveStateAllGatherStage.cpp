@@ -9,6 +9,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <utility>
@@ -82,6 +83,45 @@ namespace llaminar2
         if (!ensureContext(ctx, "GDNLiveStateAllGatherStage"))
             return false;
 
+        return runLiveStateAllGather("graph_execution");
+    }
+
+    bool GDNLiveStateAllGatherStage::requiresPostVerifierStatePublication() const
+    {
+        return true;
+    }
+
+    bool GDNLiveStateAllGatherStage::publishPostVerifierStateRestore(void *stream)
+    {
+        if (params_.device_id.is_gpu() && !stream)
+        {
+            LOG_ERROR("[GDNLiveStateAllGatherStage] MTP verifier-state publication requires an explicit stream");
+            return false;
+        }
+
+        void *previous_stream = gpuStream();
+        if (stream)
+            setGPUStream(stream);
+
+        const bool ok = runLiveStateAllGather("mtp_verifier_state_publication");
+        setGPUStream(previous_stream);
+
+        if (ok)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "gdn_live_state_allgather_publications",
+                1.0,
+                "decode",
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"tp_device_idx", std::to_string(params_.tp_device_idx)}});
+        }
+        return ok;
+    }
+
+    bool GDNLiveStateAllGatherStage::runLiveStateAllGather(const char *context)
+    {
         if (!params_.device_id.is_gpu())
         {
             LOG_ERROR("[GDNLiveStateAllGatherStage] GPU device required, got "
@@ -131,6 +171,27 @@ namespace llaminar2
                           << " full=" << params_.full_conv_state_floats
                           << " degree=" << degree);
                 return false;
+            }
+            if (params_.local_conv_state_floats == params_.full_conv_state_floats)
+            {
+                /*
+                 * Some phase-split paths begin prefill with replicated dense/GDN
+                 * weights already installed.  The short-conv kernel is therefore
+                 * already full-sized and there is nothing to gather.  Returning
+                 * here avoids treating an already-mirrored state as a malformed
+                 * TP-local state and, more importantly, avoids allgathering
+                 * degree * local floats into a full buffer that is only local
+                 * floats wide.
+                 */
+                if (params_.conv_kernel->stateBytes() !=
+                    static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
+                {
+                    LOG_ERROR("[GDNLiveStateAllGatherStage] Short-conv kernel is not full-sized for no-op handoff"
+                              << " expected_bytes=" << (static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float))
+                              << " actual_bytes=" << params_.conv_kernel->stateBytes());
+                    return false;
+                }
+                return true;
             }
             if (!params_.modular_conv_state &&
                 params_.full_conv_state_floats != gathered_conv_state_floats)
@@ -293,6 +354,27 @@ namespace llaminar2
                 LOG_ERROR("[GDNLiveStateAllGatherStage] Missing recurrence kernel");
                 return false;
             }
+            if (params_.local_recurrence_state_floats > 0 &&
+                params_.full_recurrence_state_floats > 0 &&
+                params_.local_recurrence_state_floats ==
+                    params_.full_recurrence_state_floats)
+            {
+                /*
+                 * Matching local/full recurrence sizes mean the graph is already
+                 * operating on mirrored dense state.  There is no TP-local
+                 * recurrence bank to gather, so preserve the current kernel
+                 * state and let downstream replicated decode consume it.
+                 */
+                if (params_.recurrence_kernel->stateBytes() !=
+                    static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
+                {
+                    LOG_ERROR("[GDNLiveStateAllGatherStage] Recurrence kernel is not full-sized for no-op handoff"
+                              << " expected_bytes=" << (static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float))
+                              << " actual_bytes=" << params_.recurrence_kernel->stateBytes());
+                    return false;
+                }
+                return true;
+            }
             if (params_.local_recurrence_state_floats <= 0 ||
                 params_.full_recurrence_state_floats <= 0 ||
                 params_.full_recurrence_state_floats !=
@@ -360,7 +442,8 @@ namespace llaminar2
             LOG_DEBUG("[GDNLiveStateAllGatherStage] Gathered full GDN live state"
                       << " layer=" << params_.layer_idx
                       << " device=" << params_.device_id.toString()
-                      << " tp_device_idx=" << params_.tp_device_idx);
+                      << " tp_device_idx=" << params_.tp_device_idx
+                      << " context=" << (context ? context : "unknown"));
         }
         return ok;
     }

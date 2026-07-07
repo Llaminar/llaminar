@@ -10,9 +10,12 @@
 #include "kernels/IKVCache.h"
 #include "../../../memory/BufferId.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/DebugEnv.h"
 
+#include <algorithm>
 #include <optional>
 #include <memory>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -125,10 +128,33 @@ namespace llaminar2
                 {
                     append_tokens = replay_advance_tokens_;
                 }
+                const int bucket_tokens = params_.num_tokens > 0
+                                              ? params_.num_tokens
+                                              : append_tokens;
+                if (append_tokens <= 0 ||
+                    bucket_tokens <= 0 ||
+                    append_tokens > bucket_tokens)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Invalid dynamic KV append token contract"
+                              << " append_tokens=" << append_tokens
+                              << " bucket_tokens=" << bucket_tokens
+                              << " layer=" << params_.layer_idx
+                              << " seq_idx=" << params_.seq_idx);
+                    throw std::runtime_error("invalid dynamic KV append token contract");
+                }
                 if (!params_.kv_cache->setDynamicAppendState(
                         params_.layer_idx, params_.seq_idx, append_tokens, stream))
                 {
                     LOG_ERROR("[KVCacheAppendStage] KV cache refused dynamic append state for graph replay");
+                }
+                if (debugEnv().attention.debug_kv_cache_snapshot &&
+                    debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx))
+                {
+                    const int cached_tokens =
+                        params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
+                    debug_cache_snapshot_rows_ =
+                        static_cast<size_t>(std::max(0, cached_tokens + append_tokens));
+                    invalidateDumpInfoCache();
                 }
             }
         }
@@ -139,6 +165,32 @@ namespace llaminar2
             // later phase. Host cache metadata must advance by the real prompt
             // prefix only so padded rows remain invisible to attention/decode.
             replay_advance_tokens_ = replay.real_seq_len > 0 ? replay.real_seq_len : 0;
+            const int bucket_tokens = params_.num_tokens > 0
+                                          ? params_.num_tokens
+                                          : (replay.bucket_seq_len > 0 ? replay.bucket_seq_len : 0);
+            if (replay_advance_tokens_ > 0 &&
+                bucket_tokens > 0 &&
+                replay_advance_tokens_ > bucket_tokens)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Prefill replay token count exceeds captured bucket"
+                          << " real=" << replay_advance_tokens_
+                          << " bucket=" << bucket_tokens
+                          << " layer=" << params_.layer_idx
+                          << " seq_idx=" << params_.seq_idx);
+                throw std::runtime_error("prefill replay KV append token count exceeds bucket");
+            }
+            if (params_.kv_cache &&
+                debugEnv().attention.debug_kv_cache_snapshot &&
+                debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx))
+            {
+                const int append_tokens =
+                    replay_advance_tokens_ > 0 ? replay_advance_tokens_ : params_.num_tokens;
+                const int cached_tokens =
+                    params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
+                debug_cache_snapshot_rows_ =
+                    static_cast<size_t>(std::max(0, cached_tokens + append_tokens));
+                invalidateDumpInfoCache();
+            }
         }
         void onGraphReplayed() override
         {
@@ -161,6 +213,7 @@ namespace llaminar2
             debug_append_source_k_cols_ = 0;
             debug_append_source_v_rows_ = 0;
             debug_append_source_v_cols_ = 0;
+            debug_cache_snapshot_rows_ = 0;
         }
         /**
          * @brief Clear host-side append bookkeeping for preserved graph replay.
@@ -224,6 +277,7 @@ namespace llaminar2
         size_t debug_append_source_k_cols_ = 0;
         size_t debug_append_source_v_rows_ = 0;
         size_t debug_append_source_v_cols_ = 0;
+        size_t debug_cache_snapshot_rows_ = 0;
 
         /// Real token count to advance after prefill graph replay; 0 falls
         /// back to params_.num_tokens for decode and legacy exact-shape replay.

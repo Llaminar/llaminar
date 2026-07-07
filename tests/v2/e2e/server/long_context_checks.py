@@ -43,6 +43,7 @@ CHAT_PATH = "/v1/chat/completions"
 EXPECTED_JSON_KEYS = {"alpha", "middle", "omega"}
 MIN_RECALL_RECORDS = 32
 ESTIMATED_TOKENS_PER_RECALL_RECORD = 42
+THINK_OFF_MARKER = "<|think_off|>"
 CODE_WORDS_A = (
     "amber",
     "basil",
@@ -240,8 +241,9 @@ def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
 
     # Full-tier structured generation is primarily an anti-degeneration and
     # long-completion check. Some large MoE models spend more tokens per line,
-    # so leave headroom while still requiring sustained numbered output.
-    min_lines = max(40, min(120, long_max_tokens // 18))
+    # so leave enough token-budget headroom while still requiring sustained
+    # numbered output.
+    min_lines = max(40, min(120, long_max_tokens // 20))
     requested_lines = max(140, min(220, long_max_tokens // 6))
     min_completion = max(256, int(long_max_tokens * 0.65))
     return TierSettings(
@@ -287,6 +289,12 @@ def make_chat_payload(messages: list[dict[str, str]], max_tokens: int) -> dict[s
         "temperature": 0.0,
         "enable_thinking": False,
     }
+
+
+def system_message(content: str) -> dict[str, str]:
+    """Build deterministic-check system messages with template-level thinking disabled."""
+
+    return {"role": "system", "content": f"{THINK_OFF_MARKER}\n{content}"}
 
 
 def preview(text: str, limit: int = 160) -> str:
@@ -455,9 +463,9 @@ def build_needle_prompt(
         "end": "omega",
     }
     target_value_by_placement = {
-        "beginning": "LCJSON-ALPHA-314159",
-        "middle": "LCJSON-MIDDLE-271828",
-        "end": "LCJSON-OMEGA-161803",
+        "beginning": "TUNDRA-84QX",
+        "middle": "COBALT-27LM",
+        "end": "RIVER-93RN",
     }
     target_key = target_key_by_placement[placement]
     target_value = target_value_by_placement[placement]
@@ -490,10 +498,11 @@ def build_needle_prompt(
             "Return exactly one minified JSON object and no prose.",
             'The object shape is {"answer":"VALUE_FROM_LEDGER"}.',
             f"Use the exact REQUIRED_JSON_FIELD value for {target_key} from the ledger.",
+            "Copy every letter, digit, and hyphen in the value; never shorten a value to a suffix.",
         ]
     )
     messages = [
-        {"role": "system", "content": "You are a strict JSON renderer. Output JSON only."},
+        system_message("You are a strict JSON renderer. Output JSON only."),
         {"role": "user", "content": user_prompt},
     ]
     return messages, codes[target_index], distractors, count
@@ -552,9 +561,9 @@ def build_multi_needle_prompt(
 ) -> tuple[list[dict[str, str]], dict[str, str], int]:
     count = record_count_for_context(min_prompt_tokens, context_length, max_tokens, tier)
     sentinels = {
-        "alpha": "LCJSON-ALPHA-314159",
-        "middle": "LCJSON-MIDDLE-271828",
-        "omega": "LCJSON-OMEGA-161803",
+        "alpha": "REDWOOD-47QK",
+        "middle": "HARBOR-92MJ",
+        "omega": "JUNIPER-63VX",
     }
     positions = {
         "alpha": min(3, count - 1),
@@ -587,11 +596,12 @@ def build_multi_needle_prompt(
             "Return exactly one minified JSON object and no prose.",
             'The object shape is {"alpha":"VALUE_FROM_LEDGER","middle":"VALUE_FROM_LEDGER","omega":"VALUE_FROM_LEDGER"}.',
             "Use the exact REQUIRED_JSON_FIELD values from the ledger.",
+            "Copy every letter, digit, and hyphen in each value; never shorten a value to a suffix.",
             "Do not omit omega. Do not add keys. Do not use markdown fences.",
         ]
     )
     messages = [
-        {"role": "system", "content": "You are a strict JSON renderer. Output JSON only."},
+        system_message("You are a strict JSON renderer. Output JSON only."),
         {"role": "user", "content": "\n".join(lines)},
     ]
     return messages, sentinels, count
@@ -674,7 +684,7 @@ def structured_prompt(settings: TierSettings) -> tuple[list[dict[str, str]], str
         "If the token limit interrupts the report, stop wherever the limit occurs.",
     ]
     messages = [
-        {"role": "system", "content": "You produce deterministic machine-checkable reports."},
+        system_message("You produce deterministic machine-checkable reports."),
         {"role": "user", "content": "\n".join(lines)},
     ]
     return messages, cache_sentinel
@@ -847,7 +857,7 @@ def run_structured_generation(args: argparse.Namespace, settings: TierSettings) 
 
 def run_cache_reset_probe(args: argparse.Namespace, prior_sentinels: Iterable[str]) -> str:
     messages = [
-        {"role": "system", "content": "You are a calculator. Reply only with the numeric answer."},
+        system_message("You are a calculator. Reply only with the numeric answer."),
         {"role": "user", "content": "What is 6+7? Reply with only 13."},
     ]
     response = post_json(args.base_url, CHAT_PATH, make_chat_payload(messages, 8), args.request_timeout)
@@ -876,7 +886,7 @@ def boundary_messages(word_count: int, answer: str) -> list[dict[str, str]]:
         f"Padding ends. Reply with only {answer}."
     )
     return [
-        {"role": "system", "content": "You answer boundary probes exactly and briefly."},
+        system_message("You answer boundary probes exactly and briefly."),
         {"role": "user", "content": user},
     ]
 
@@ -970,6 +980,14 @@ def expected_sentinels(args: argparse.Namespace, settings: TierSettings) -> list
 def run_self_test() -> int:
     assert strip_optional_code_fence('```json\n{"alpha":"a"}\n```') == '{"alpha":"a"}'
     assert strip_optional_code_fence('{"alpha":"a"}') == '{"alpha":"a"}'
+    assert system_message("json only")["content"].startswith(f"{THINK_OFF_MARKER}\n")
+
+    single_needle_values = [
+        build_needle_prompt(placement, 900, 4096, needle_max_tokens(512), "full")[1]
+        for placement in ("beginning", "middle", "end")
+    ]
+    assert all(not value.startswith("LCJSON-") for value in single_needle_values)
+    assert len({value.split("-", 1)[0] for value in single_needle_values}) == len(single_needle_values)
 
     lite_4k_count = record_count_for_context(900, 4096, 128, "lite")
     full_4k_count = record_count_for_context(900, 4096, 128, "full")

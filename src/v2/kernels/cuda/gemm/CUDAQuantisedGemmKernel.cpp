@@ -287,49 +287,88 @@ namespace llaminar2
         // reuse a slot after that slot's completion event is observed.
         constexpr int kCudaConcurrentDecodeWorkspaceSlots = 8;
 
+        thread_local bool g_cuda_native_vnni_verifier_scope_active = false;
+
         /**
-         * @brief Select serial-decode-shaped CUDA NativeVNNI dispatch inside verifier hooks.
+         * @brief Mark CUDA NativeVNNI calls as publication-sensitive verifier work.
          *
-         * The normal CUDA generated table optimizes M=2..4 grouped GEMV rows
-         * independently from the M=1 decode route.  That is fine for throughput
-         * microbenchmarks, but MTP verifier rows can be published into live KV
-         * and GDN state.  While this scope is active, small-M grouped kernels
-         * keep batching rows but choose the generated M=1 dispatch policy.  The
-         * scope also disables CUDA prefill/concurrent decode paths that would
-         * otherwise need extra verifier-only workspace and reorder reductions.
-         * Together these choices give each codebook the same reduction contract
-         * as serial decode without turning on process-wide deterministic mode.
+         * The important distinction is subtle: this scope is about grouped
+         * M=2..4 verifier entry points.  Plain serial M=1 decode now always uses
+         * the canonical direct GEMV helper, so verifier wrappers use this marker
+         * to force a rowwise outer loop while each row still enters the exact
+         * same M=1 reduction contract as ordinary decode.
          */
         class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
         {
         public:
             ScopedNativeVNNIDecodeEquivalentDispatch()
-                : previous_gemv_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config()),
-                  previous_prefill_(cudaNativeVNNIPrefill_getDeterministicMode())
+                : previous_scope_(g_cuda_native_vnni_verifier_scope_active)
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
-                cudaNativeVNNIPrefill_setDeterministicMode(true);
+                g_cuda_native_vnni_verifier_scope_active = true;
             }
 
             ~ScopedNativeVNNIDecodeEquivalentDispatch()
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_gemv_);
-                cudaNativeVNNIPrefill_setDeterministicMode(previous_prefill_);
+                g_cuda_native_vnni_verifier_scope_active = previous_scope_;
             }
 
             ScopedNativeVNNIDecodeEquivalentDispatch(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
             ScopedNativeVNNIDecodeEquivalentDispatch &operator=(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
 
         private:
-            int previous_gemv_ = 0;
-            bool previous_prefill_ = false;
+            bool previous_scope_ = false;
         };
 
-        bool useCanonicalM1SmallMDecode()
+        bool useCanonicalM1Decode()
         {
-            return debugEnv().gemm.deterministic ||
-                   cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config() != 0;
+            /*
+             * CUDA NativeVNNI M=1 decode is part of the MTP verifier oracle, not
+             * merely a fast approximate GEMV.  The canonical transaction is the
+             * ordinary generated M=1 decode GEMV that serial inference uses after
+             * activation quantization.  Grouped verifier paths may batch their
+             * outer loop, but any row that can be published to live state must
+             * enter this exact M=1 reduction contract.
+             */
+            return true;
         }
+
+        bool explicitSmallMVerifierScopeActive()
+        {
+            return g_cuda_native_vnni_verifier_scope_active;
+        }
+
+        /**
+         * @brief Temporarily force decode-equivalent M=1 GEMV reductions.
+         *
+         * The generated CUDA GEMV table may choose atomic K-parallel reductions
+         * for speed.  Atomic accumulation is not a valid oracle for MTP verifier
+         * publication because first-call and later-call rows can differ by one
+         * ULP.  The low-level switch is thread-local, so this scope affects only
+         * the current LocalTP worker while preserving normal fast policy on
+         * sibling host threads.
+         */
+        class ScopedNativeVNNIGemvDecodeEquivalentM1Config final
+        {
+        public:
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config()
+                : previous_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+            }
+
+            ~ScopedNativeVNNIGemvDecodeEquivalentM1Config()
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_);
+            }
+
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config(
+                const ScopedNativeVNNIGemvDecodeEquivalentM1Config &) = delete;
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config &operator=(
+                const ScopedNativeVNNIGemvDecodeEquivalentM1Config &) = delete;
+
+        private:
+            int previous_ = 0;
+        };
 
         struct CUDAConcurrentPrefillPool
         {
@@ -1914,6 +1953,20 @@ namespace llaminar2
             // Ensure weights are converted
             ensureWeightsConverted();
 
+            /*
+             * Tensor-level calls may need a final device-to-device copy when
+             * logits or other outputs are backed by host-mapped memory.  Keep
+             * that post-GEMM copy on the same explicit stream captured before
+             * any child GEMM can race with request-scoped dynamic-state reset.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] "
+                          "CUDA tensor GEMM requires an explicit CUDA stream");
+                return false;
+            }
+
             // Type dispatch based on A and C types
             TensorType a_type = A->native_type();
             TensorType c_type = C->native_type();
@@ -1975,7 +2028,7 @@ namespace llaminar2
                     success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
-                        cuda_device_id_, gpu_stream_);
+                        cuda_device_id_, execution_stream);
                 }
                 return success;
             }
@@ -2029,7 +2082,7 @@ namespace llaminar2
                     success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
-                        cuda_device_id_, gpu_stream_);
+                        cuda_device_id_, execution_stream);
                 }
                 return success;
             }
@@ -2106,9 +2159,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1 || m > 4)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M=2..4, got M="
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M=1..4, got M="
                           << m);
                 return false;
             }
@@ -2133,8 +2186,23 @@ namespace llaminar2
                 return false;
             }
 
-            if (!gpu_stream_)
-                cudaQuantGemm_setDevice(cuda_device_id_);
+            /*
+             * Capture the caller's stream once for this fused transaction.  The
+             * KernelFactory dynamic-state reset is request-scoped and may run
+             * on a sibling LocalTP worker while this projection group is still
+             * executing.  From this point on, decode-equivalent MTP publication
+             * must use the captured stream value instead of rereading the
+             * mutable gpu_stream_ member that resetDynamicState() clears.
+             */
+            void *execution_stream = gpu_stream_;
+
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                          "Fused CUDA projection launch requires an explicit CUDA stream");
+                return false;
+            }
+            cudaQuantGemm_setDevice(cuda_device_id_);
             DeviceId target_device = DeviceId::cuda(cuda_device_id_);
 
             // Step 1: Ensure input is on the GPU
@@ -2165,12 +2233,14 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && m <= 4)
+            const bool explicit_small_m_verifier =
+                explicitSmallMVerifierScopeActive() && m > 1 && m <= 4;
+            if (explicit_small_m_verifier)
             {
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
                           << m << " projections=" << projections.size());
 
-                if (!gpu_stream_)
+                if (!execution_stream)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path requires an explicit CUDA stream");
                     return false;
@@ -2251,7 +2321,7 @@ namespace llaminar2
                         }
                         else
                         {
-                            if (!fp32_bias->ensureOnDevice(target_device, gpu_stream_))
+                            if (!fp32_bias->ensureOnDevice(target_device, execution_stream))
                             {
                                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
                                           << i << " failed to upload bias to CUDA:" << cuda_device_id_);
@@ -2261,7 +2331,7 @@ namespace llaminar2
                         }
                     }
 
-                    cuda_kernel->setGPUStream(gpu_stream_);
+                    cuda_kernel->setGPUStream(execution_stream);
                     cuda_kernel->validateWorkspace();
                     cuda_kernel->ensureWeightsConverted();
                     if (!canUseNativeVNNIBlockwise(cuda_kernel->impl_.get(), 1, k))
@@ -2284,11 +2354,15 @@ namespace llaminar2
                         proj.name});
                 }
 
-                // All small-M verifier projections share the same activation rows.
-                // Quantize those rows once, then feed the same quantized block into
-                // each decode-equivalent GEMV. This removes repeated hot-path work
-                // while preserving the exact per-projection GEMV kernels and
-                // accumulator order used by the serial verifier path.
+                /*
+                 * The verifier publication path is a true grouped implementation:
+                 * one activation-quantize pass writes an [M,K] Q8_1 activation
+                 * matrix, and each projection consumes all verifier rows through
+                 * the grouped small-M native-VNNI GEMV.  The all-format CUDA
+                 * regression compares every produced row to the public M=1 decode
+                 * entry point, so this route stays in production only while it is
+                 * decode-equivalent rather than merely "close enough".
+                 */
                 validateWorkspace();
                 int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
                 float *d_scales_A_blockwise =
@@ -2306,135 +2380,37 @@ namespace llaminar2
                         m,
                         k,
                         cuda_device_id_,
-                        gpu_stream_))
+                        execution_stream))
                 {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier shared activation quantization failed");
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                              "Small-M verifier grouped activation quantization failed");
                     return false;
                 }
 
-                /*
-                 * Small verifier batches are decode-equivalent because each
-                 * projection still uses the same NativeVNNI small-M GEMV kernel
-                 * and the same serial-M1 dispatch policy selected by
-                 * beginVerifierDecodeEquivalentScope().  The projections are
-                 * independent once the activation rows are quantized, so we can
-                 * overlap them on explicit side streams as long as every stream
-                 * has a distinct declared K-parallel partial arena.
-                 */
-                const bool concurrent_small_m =
-                    bindings.size() >= 2 &&
-                    debugEnv().gemm.cuda_concurrent_decode &&
-                    !debugEnv().gemm.deterministic;
-
-                if (concurrent_small_m)
+                for (int pi = 0; pi < static_cast<int>(bindings.size()); ++pi)
                 {
-                    auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
-                    if (isGraphCaptureActive() && !pool.initialized)
+                    const auto &binding = bindings[static_cast<size_t>(pi)];
+                    void *saved_stream = binding.kernel->getGPUStream();
+                    binding.kernel->setGPUStream(execution_stream);
+                    const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
+                        d_A_int8,
+                        d_scales_A_blockwise,
+                        binding.output,
+                        binding.bias,
+                        m,
+                        binding.n,
+                        k,
+                        1.0f,
+                        0.0f,
+                        true,
+                        execution_stream);
+                    binding.kernel->setGPUStream(saved_stream);
+
+                    if (!projection_ok)
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
-                                  "Small-M verifier concurrent projection path entered graph capture "
-                                  "before its stream pool was initialized. Warmup must initialize "
-                                  "the pool so capture never creates streams or events.");
-                        return false;
-                    }
-                    if (!pool.initialized)
-                        pool.init(cuda_device_id_, static_cast<int>(bindings.size()));
-
-                    const int active_slots =
-                        std::min(static_cast<int>(bindings.size()), kCudaConcurrentDecodeWorkspaceSlots);
-                    cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
-
-                    for (int pi = 0; pi < static_cast<int>(bindings.size()); ++pi)
-                    {
-                        const auto &binding = bindings[static_cast<size_t>(pi)];
-                        const int stream_idx = pi % active_slots;
-
-                        if (pi >= active_slots)
-                            cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
-                        cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready);
-
-                        try
-                        {
-                            binding.kernel->bindConcurrentNativeDecodeScratch(
-                                m,
-                                binding.n,
-                                k,
-                                stream_idx,
-                                active_slots);
-                        }
-                        catch (const std::exception &ex)
-                        {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
-                                      "Small-M verifier concurrent scratch binding failed for projection "
-                                      << pi << " (" << (binding.name ? binding.name : "unnamed")
-                                      << "): " << ex.what());
-                            return false;
-                        }
-
-                        void *saved_stream = binding.kernel->getGPUStream();
-                        binding.kernel->setGPUStream(pool.streams[stream_idx]);
-                        const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
-                            d_A_int8,
-                            d_scales_A_blockwise,
-                            binding.output,
-                            binding.bias,
-                            m,
-                            binding.n,
-                            k,
-                            1.0f,
-                            0.0f);
-                        binding.kernel->setGPUStream(saved_stream);
-
-                        if (!projection_ok)
-                        {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
-                                      "Small-M verifier concurrent GEMV failed for projection "
-                                      << pi << " (" << (binding.name ? binding.name : "unnamed")
-                                      << ") stream_slot=" << stream_idx);
-                            return false;
-                        }
-
-                        cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]);
-                    }
-
-                    for (int si = 0; si < active_slots; ++si)
-                        cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
-
-                    if (PerfStatsCollector::isEnabled())
-                    {
-                        PerfStatsCollector::addCounter(
-                            "kernel",
-                            "cuda_native_vnni_small_m_concurrent_projection_groups",
-                            1.0,
-                            "gemm",
-                            "cuda:" + std::to_string(cuda_device_id_),
-                            PerfStatsCollector::Tags{
-                                {"m", std::to_string(m)},
-                                {"k", std::to_string(k)},
-                                {"projections", std::to_string(bindings.size())},
-                                {"streams", std::to_string(active_slots)}});
-                    }
-
-                    return true;
-                }
-
-                for (size_t i = 0; i < bindings.size(); ++i)
-                {
-                    const auto &binding = bindings[i];
-                    binding.kernel->setGPUStream(gpu_stream_);
-                    if (!binding.kernel->multiply_quantized_small_m_gemv(
-                            d_A_int8,
-                            d_scales_A_blockwise,
-                            binding.output,
-                            binding.bias,
-                            m,
-                            binding.n,
-                            k,
-                            1.0f,
-                            0.0f))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV failed for projection "
-                                  << i << " (" << (binding.name ? binding.name : "unnamed") << ")");
+                                  "Grouped small-M native-VNNI GEMV failed for projection "
+                                  << pi << " (" << (binding.name ? binding.name : "unnamed") << ")");
                         return false;
                     }
                 }
@@ -2451,7 +2427,7 @@ namespace llaminar2
                             {"m", std::to_string(m)},
                             {"k", std::to_string(k)},
                             {"projections", std::to_string(projections.size())},
-                            {"route", "shared_quantized_activation"}});
+                            {"route", "specialized"}});
                 }
 
                 return true;
@@ -2508,10 +2484,10 @@ namespace llaminar2
                 const bool quantized = d_sums_A_blockwise
                                            ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                  d_input, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_)
+                                                 m, k, cuda_device_id_, execution_stream)
                                            : cudaQuantGemm_quantizeActivationsBlockwise(
                                                  d_input, d_A_int8, d_scales_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_);
+                                                 m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
@@ -2527,7 +2503,7 @@ namespace llaminar2
             // concurrent projection dispatch is most useful.
             const bool deterministic_prefill = cudaNativeVNNIPrefill_getDeterministicMode() ||
                                                debugEnv().gemm.deterministic;
-            const bool small_m_stage_stream = (gpu_stream_ != nullptr) && (m <= 16);
+            const bool small_m_stage_stream = (execution_stream != nullptr) && (m <= 16);
 
             // Prefill concurrency: larger prompt M, multi-stream fused projections.
             // The small-M regime (m <= 16) is intentionally excluded here because the
@@ -2548,7 +2524,8 @@ namespace llaminar2
             const bool decode_concurrent_eligible = use_blockwise && m == 1 &&
                                                     projections.size() >= 2 &&
                                                     debugEnv().gemm.cuda_concurrent_decode &&
-                                                    !deterministic_prefill;
+                                                    !deterministic_prefill &&
+                                                    !useCanonicalM1Decode();
 
             const bool concurrent_eligible = prefill_concurrent_eligible || decode_concurrent_eligible;
             const bool concurrent_decode = decode_concurrent_eligible;
@@ -2586,7 +2563,7 @@ namespace llaminar2
                 pool.init(cuda_device_id_, num_proj);
 
                 // Record event after quantization completes on main stream
-                cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
+                cudaQuantGemm_recordEvent(pool.quant_ready, execution_stream);
 
                 for (int pi = 0; pi < num_proj; ++pi)
                 {
@@ -2751,7 +2728,7 @@ namespace llaminar2
                 // All projections dispatched — main stream waits for completion
                 for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                 {
-                    cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
+                    cudaQuantGemm_streamWaitEvent(execution_stream, pool.completion[si]);
                 }
                 LOG_DEBUG("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
                 return true;
@@ -2909,7 +2886,7 @@ namespace llaminar2
                     // Diagnostic: checksum weight data to detect weight corruption
                     if (trace_fused && cuda_kernel->impl_)
                     {
-                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(execution_stream));
                         const void *wt_ptr = cuda_kernel->impl_->d_weights_native_vnni;
                         if (wt_ptr)
                         {
@@ -2927,9 +2904,9 @@ namespace llaminar2
                         }
                     }
 
-                    if (m == 1 && useCanonicalM1SmallMDecode())
+                    if (m == 1 && useCanonicalM1Decode())
                     {
-                        const bool canonical_ok = cuda_kernel->multiply_quantized_m1_via_small_m_gemv(
+                        const bool canonical_ok = cuda_kernel->multiply_quantized_m1_decode_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
                             d_output,
@@ -2937,10 +2914,11 @@ namespace llaminar2
                             n,
                             k,
                             1.0f,
-                            0.0f);
+                            0.0f,
+                            execution_stream);
                         if (!canonical_ok)
                         {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Deterministic canonical M=1 small-M GEMV failed for projection "
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Canonical M=1 decode GEMV failed for projection "
                                       << i << " (" << (proj.name ? proj.name : "unnamed") << ")");
                             all_success = false;
                             break;
@@ -2967,7 +2945,7 @@ namespace llaminar2
                         1.0f, 0.0f,
                         nullptr,
                         d_bias,
-                        cuda_device_id_, gpu_stream_,
+                        cuda_device_id_, execution_stream,
                         nullptr,
                         nativeVNNIUsesAsymmetricCorrection(cuda_kernel->impl_->native_codebook_id)
                             ? d_sums_A_blockwise
@@ -2993,7 +2971,7 @@ namespace llaminar2
                         // LLAMINAR_CUDA_FUSED_GEMM_TRACE must not be running under capture.
                         if (trace_fused)
                         {
-                            cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                            cudaStreamSynchronize(static_cast<cudaStream_t>(execution_stream));
                             const size_t total = static_cast<size_t>(m) * n;
                             std::vector<float> host_all(total);
                             cudaMemcpy(host_all.data(), d_output, total * sizeof(float),
@@ -3081,8 +3059,17 @@ namespace llaminar2
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
 
             ensureWeightsConverted();
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                          "Fused SwiGLU launch requires an explicit CUDA stream");
+                return false;
+            }
+            cudaQuantGemm_setDevice(cuda_device_id_);
 
             const bool verifier_small_m =
+                explicitSmallMVerifierScopeActive() &&
                 (m > 1 && m <= 4) &&
                 (k % 32 == 0) &&
                 canUseNativeVNNIBlockwise(impl_.get(), 1, k);
@@ -3099,22 +3086,39 @@ namespace llaminar2
                         ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
                         : nullptr;
 
-                // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
-                const bool quantized = d_sums_A_blockwise
-                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sums(
-                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_)
-                                           : cudaOps_fused_swiglu_quantize_blockwise(
-                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_);
-                if (!quantized)
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
-                    return false;
-                }
-
                 if (verifier_small_m)
                 {
+                    if (beta != 0.0f)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                                  "Decode-equivalent verifier rows do not support beta accumulation");
+                        return false;
+                    }
+
+                    /*
+                     * Quantized FFN-down uses the same grouped verifier
+                     * contract as projections: compute silu(gate)*up and
+                     * quantize all verifier rows in one kernel, then consume the
+                     * resulting [M,K] activation matrix with the grouped
+                     * small-M native-VNNI GEMV.  The regression suite compares
+                     * every row against M=1 serial decode, so this grouped route
+                     * must be mathematically identical, not just close.
+                     */
+                    if (!cudaOps_fused_swiglu_quantize_blockwise(
+                            d_gate,
+                            d_up,
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            m,
+                            k,
+                            cuda_device_id_,
+                            execution_stream))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                                  "Verifier grouped fused SwiGLU+quantize failed");
+                        return false;
+                    }
+
                     if (!multiply_quantized_small_m_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
@@ -3124,14 +3128,62 @@ namespace llaminar2
                             n,
                             k,
                             alpha,
-                            beta,
-                            true))
+                            0.0f,
+                            true,
+                            execution_stream))
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU small-M NativeVNNI GEMV failed");
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                                  "Verifier grouped small-M down GEMV failed");
                         return false;
                     }
 
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (small-M native GEMV)");
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                              "Complete (grouped small-M decode-equivalent SwiGLU/down)");
+                    return true;
+                }
+
+                // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
+                const bool quantized = d_sums_A_blockwise
+                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
+                                                 m, k, cuda_device_id_, execution_stream)
+                                           : cudaOps_fused_swiglu_quantize_blockwise(
+                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise,
+                                                 m, k, cuda_device_id_, execution_stream);
+                if (!quantized)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
+                    return false;
+                }
+
+                if (m == 1 && useCanonicalM1Decode())
+                {
+                    /*
+                     * Fused SwiGLU/down is the first FFN stage whose output can
+                     * diverge after otherwise bitwise-identical MTP verifier
+                     * rows.  The generic NativeVNNI blockwise route may select a
+                     * fast GEMV dispatch family whose first launch and later
+                     * launch differ by a few ULPs for Qwen3.6-sized FFN-down
+                     * matrices.  Feed the already-quantized SwiGLU activation
+                     * through the same canonical direct M=1 GEMV helper used by
+                     * projection decode so serial replay has a single oracle.
+                     */
+                    if (!multiply_quantized_m1_decode_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            d_C,
+                            nullptr,
+                            n,
+                            k,
+                            alpha,
+                            beta,
+                            execution_stream))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU canonical M=1 NativeVNNI GEMV failed");
+                        return false;
+                    }
+
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (canonical M=1 native GEMV)");
                     return true;
                 }
 
@@ -3142,7 +3194,7 @@ namespace llaminar2
                         impl_.get(),
                         d_A_int8, nullptr, d_C, d_scales_A_blockwise,
                         m, n, k, alpha, beta, d_C_existing, nullptr,
-                        cuda_device_id_, gpu_stream_,
+                        cuda_device_id_, execution_stream,
                         packed_ ? &packed_->rowmajor_ : nullptr,
                         d_sums_A_blockwise))
                 {
@@ -3151,7 +3203,7 @@ namespace llaminar2
                     // Diagnostic: checksum FFN_DOWN output (NativeVNNI path)
                     if (debugEnv().gemm.cuda_fused_gemm_trace)
                     {
-                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(execution_stream));
                         const size_t total = static_cast<size_t>(m) * n;
                         std::vector<float> host_all(total);
                         cudaMemcpy(host_all.data(), d_C, total * sizeof(float),
@@ -3233,9 +3285,9 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1 || m > 4)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M=2..4, got M="
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M=1..4, got M="
                           << m);
                 return false;
             }
@@ -3266,6 +3318,21 @@ namespace llaminar2
             validateWorkspace();
             ensureWeightsConverted();
 
+            /*
+             * Capture the stream once before quantizing rows.  This helper is
+             * used by verifier publication tests and can run while a sibling
+             * LocalTP worker reaches request cleanup, so every launch in the
+             * helper must use the same stream value even if resetDynamicState()
+             * clears gpu_stream_ before the final GEMV dispatch.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] "
+                          "Small-M verifier GEMV requires an explicit CUDA stream");
+                return false;
+            }
+
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
             {
                 return false;
@@ -3282,7 +3349,7 @@ namespace llaminar2
                     m,
                     k,
                     cuda_device_id_,
-                    gpu_stream_))
+                    execution_stream))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Blockwise activation quantization failed");
                 return false;
@@ -3297,7 +3364,9 @@ namespace llaminar2
                 n,
                 k,
                 alpha,
-                beta);
+                beta,
+                true,
+                execution_stream);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv(
@@ -3307,7 +3376,8 @@ namespace llaminar2
             const float *d_bias,
             int m, int n, int k,
             float alpha, float beta,
-            bool use_specialized_small_m_kernel)
+            bool use_specialized_small_m_kernel,
+            void *execution_stream)
         {
             if (!d_A_int8 || !d_scales_A_blockwise || !d_C)
             {
@@ -3318,6 +3388,13 @@ namespace llaminar2
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Invalid dimensions: M="
                           << m << " N=" << n << " K=" << k);
+                return false;
+            }
+            void *stream_handle = execution_stream ? execution_stream : gpu_stream_;
+            if (!stream_handle)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] "
+                          "NativeVNNI small-M GEMV requires an explicit CUDA stream");
                 return false;
             }
 
@@ -3337,7 +3414,6 @@ namespace llaminar2
                 return false;
             }
 
-            const int blocks_per_row = k / 32;
             auto record_small_m_route = [&](const char *route)
             {
                 if (!PerfStatsCollector::isEnabled())
@@ -3372,12 +3448,19 @@ namespace llaminar2
                 }
             };
 
-            if (use_specialized_small_m_kernel)
+            if (!use_specialized_small_m_kernel)
             {
-                if (!impl_->gemv_ctx)
-                    impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] "
+                          "Rowwise small-M replay has been retired; grouped specialized NativeVNNI is required");
+                return false;
+            }
 
-                const bool ok = cudaNativeVNNIGemvTuned_small_m_fp32(
+            if (!impl_->gemv_ctx)
+                impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
+
+            auto launch_small_m = [&]
+            {
+                return cudaNativeVNNIGemvTuned_small_m_fp32(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
@@ -3394,86 +3477,71 @@ namespace llaminar2
                     d_bias,
                     impl_->native_codebook_id,
                     cuda_device_id_,
-                    gpu_stream_,
+                    stream_handle,
                     impl_->gemv_ctx,
                     packed_ ? &packed_->rowmajor_ : nullptr);
-                if (!ok)
-                {
-                    if (cudaNativeVNNIGemvSweep_isActive())
-                    {
-                        return false;
-                    }
+            };
 
-                    cudaError_t le = cudaPeekAtLastError();
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI small-M GEMV failed"
-                              << " M=" << m
-                              << " codebook=" << static_cast<int>(impl_->native_codebook_id)
-                              << " N=" << n << " K=" << k
-                              << " stream=" << gpu_stream_
-                              << " cuda_error=" << cudaGetErrorName(le)
-                              << " (" << cudaGetErrorString(le) << ")"
-                              << " rowmajor_slot=" << (packed_ && packed_->rowmajor_ ? "present" : "absent"));
-                    return false;
-                }
-
-                record_small_m_route("specialized");
-                return true;
-            }
-
-            for (int row = 0; row < m; ++row)
+            /*
+             * The grouped verifier entry point batches rows, but each row must
+             * still obey the same deterministic K-reduction contract as public
+             * M=1 decode.  This scoped flag is thread-local inside the CUDA GEMV
+             * dispatcher, so normal prefill and non-publication small-M tuning
+             * retain their faster generated policy.
+             */
+            bool ok = false;
+            if (explicitSmallMVerifierScopeActive())
             {
-                const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
-                const float *row_scales =
-                    d_scales_A_blockwise + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
-                float *row_C = d_C + static_cast<size_t>(row) * static_cast<size_t>(n);
-                const float *row_existing = (beta != 0.0f) ? row_C : nullptr;
-
-                if (!runNativeVNNIBlockwiseIfSupported(
-                        impl_.get(),
-                        row_A,
-                        nullptr,
-                        row_C,
-                        row_scales,
-                        1,
-                        n,
-                        k,
-                        alpha,
-                        beta,
-                        row_existing,
-                        d_bias,
-                        cuda_device_id_,
-                        gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr))
+                ScopedNativeVNNIGemvDecodeEquivalentM1Config decode_equivalent_m1_scope;
+                ok = launch_small_m();
+            }
+            else
+            {
+                ok = launch_small_m();
+            }
+            if (!ok)
+            {
+                if (cudaNativeVNNIGemvSweep_isActive())
                 {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Row "
-                              << row << " native-VNNI GEMV failed");
                     return false;
                 }
+
+                cudaError_t le = cudaPeekAtLastError();
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI small-M GEMV failed"
+                          << " M=" << m
+                          << " codebook=" << static_cast<int>(impl_->native_codebook_id)
+                          << " N=" << n << " K=" << k
+                          << " stream=" << stream_handle
+                          << " cuda_error=" << cudaGetErrorName(le)
+                          << " (" << cudaGetErrorString(le) << ")"
+                          << " rowmajor_slot=" << (packed_ && packed_->rowmajor_ ? "present" : "absent"));
+                return false;
             }
 
-            record_small_m_route("rowwise");
-
+            record_small_m_route("specialized");
             return true;
         }
 
-        bool CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv(
+        bool CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv(
             const int8_t *d_A_int8,
             const float *d_scales_A_blockwise,
             float *d_C,
             const float *d_bias,
             int n, int k,
-            float alpha, float beta)
+            float alpha, float beta,
+            void *execution_stream)
         {
-            if (!useCanonicalM1SmallMDecode())
+            if (!useCanonicalM1Decode())
                 return false;
             if (!d_A_int8 || !d_scales_A_blockwise || !d_C || n <= 0 || k <= 0 || (k % 32) != 0)
                 return false;
             if (beta != 0.0f)
                 return false;
-            if (!gpu_stream_)
+            void *stream_handle = execution_stream ? execution_stream : gpu_stream_;
+            if (!stream_handle)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] "
-                          "Deterministic canonical M=1 GEMV requires an explicit CUDA stream");
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv] "
+                          "Canonical M=1 decode GEMV requires an explicit CUDA stream");
                 return false;
             }
 
@@ -3482,70 +3550,53 @@ namespace llaminar2
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
                 return false;
 
-            auto *scratch = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
-            const size_t scratch_bytes = workspace_->getBufferSize(tempCFp32BufferName());
-            const size_t required_scratch_bytes = static_cast<size_t>(2) * static_cast<size_t>(n) * sizeof(float);
-            if (!scratch || scratch_bytes < required_scratch_bytes)
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] "
-                          << tempCFp32BufferName() << " workspace is missing or undersized: need "
-                          << required_scratch_bytes << " bytes, have " << scratch_bytes);
-                return false;
-            }
-
-            const int blocks_per_row = k / 32;
-            auto *mutable_A = const_cast<int8_t *>(d_A_int8);
-            auto *mutable_scales = const_cast<float *>(d_scales_A_blockwise);
-            cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
-            cudaError_t err = cudaMemsetAsync(
-                mutable_A + static_cast<size_t>(k),
-                0,
-                static_cast<size_t>(k) * sizeof(int8_t),
-                stream);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to clear padded A row: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-
-            err = cudaMemsetAsync(
-                mutable_scales + static_cast<size_t>(blocks_per_row),
-                0,
-                static_cast<size_t>(blocks_per_row) * sizeof(float),
-                stream);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to clear padded scale row: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-
-            if (!multiply_quantized_small_m_gemv(
-                    d_A_int8,
-                    d_scales_A_blockwise,
-                    scratch,
-                    d_bias,
-                    2,
-                    n,
-                    k,
-                    alpha,
-                    0.0f,
-                    true))
+            if (!ensureNativeVNNIIQGridTablesInitialized(
+                    impl_->native_codebook_id,
+                    cuda_device_id_,
+                    "NativeVNNI canonical M=1 route"))
             {
                 return false;
             }
 
-            err = cudaMemcpyAsync(
+            /*
+             * Serial decode already has the exact numerical contract the MTP
+             * verifier must preserve.  Launching through the raw M=1 generated
+             * route avoids the padded small-M scratch/copy transaction that
+             * produced one-ULP repeat drift in Q4_0 focused tests.
+             *
+             * Pass a null row-major slot for the canonical verifier oracle.  The
+             * optional ROWPAR auxiliary view is materialized lazily, so comparing
+             * a first decode token against a later token can otherwise compare two
+             * different dispatch families.  Once ROWPAR preparation becomes an
+             * explicit graph warmup step, it can earn its way back through the
+             * same first-call repeat tests.
+             */
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config decode_equivalent_m1_scope;
+            const bool ok = cudaNativeVNNIGemvTuned_fp32(
+                d_A_int8,
+                impl_->d_weights_native_vnni,
+                impl_->d_weights_native_scales,
+                impl_->d_weights_native_mins,
+                impl_->d_weights_native_emins,
                 d_C,
-                scratch,
-                static_cast<size_t>(n) * sizeof(float),
-                cudaMemcpyDeviceToDevice,
-                stream);
-            if (err != cudaSuccess)
+                d_scales_A_blockwise,
+                n,
+                k,
+                alpha,
+                beta,
+                nullptr,
+                d_bias,
+                impl_->native_codebook_id,
+                cuda_device_id_,
+                stream_handle,
+                impl_->gemv_ctx,
+                nullptr);
+            if (!ok)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to copy canonical row output: "
-                          << cudaGetErrorString(err));
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv] "
+                          "Canonical M=1 decode GEMV failed"
+                          << " codebook=" << static_cast<int>(impl_->native_codebook_id)
+                          << " N=" << n << " K=" << k);
                 return false;
             }
 
@@ -3553,7 +3604,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
-                    "cuda_native_vnni_m1_canonical_small_m_calls",
+                    "cuda_native_vnni_m1_canonical_decode_calls",
                     1.0,
                     "gemm",
                     "cuda:" + std::to_string(cuda_device_id_),
@@ -3586,6 +3637,22 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
+            /*
+             * All launches in this public GEMM transaction must use the same
+             * stream.  KernelFactory::resetAllDynamicState() is allowed to
+             * clear the member stream at request boundaries, and LocalTP
+             * workers can reach that boundary at slightly different wall-clock
+             * times.  Capturing here prevents a later branch from accidentally
+             * falling onto a null/default stream after earlier work was queued.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] "
+                          "CUDA GEMM requires an explicit CUDA stream");
+                return false;
+            }
+
             // ──── cuBLAS FP16 GEMM path (LLAMINAR_CUBLAS_GEMM=1) ────────────
             // Dequant Q4_0 native VNNI weights → FP16 per-call,
             // convert FP32 activations → FP16,
@@ -3602,7 +3669,7 @@ namespace llaminar2
                                { LOG_DEBUG("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM path active (Q4_0 native dequant)"); });
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM, gpu_stream_);
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM, execution_stream);
                 // Lazy-create per-device cuBLAS context
                 if (!impl_->cublas_ctx)
                     impl_->cublas_ctx = cudaCuBLASContext_create(cuda_device_id_);
@@ -3614,7 +3681,7 @@ namespace llaminar2
                     m, n, k,
                     alpha, beta,
                     d_C_existing,
-                    cuda_device_id_, gpu_stream_,
+                    cuda_device_id_, execution_stream,
                     impl_->cublas_ctx);
                 if (ok)
                 {
@@ -3624,7 +3691,7 @@ namespace llaminar2
                 LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
             }
 
-            if (m > 1 && m <= 4)
+            if (explicitSmallMVerifierScopeActive() && m > 1 && m <= 4)
             {
                 if (multiply_fp32_to_fp32_small_m_gemv(
                         d_A, d_C, nullptr, m, n, k, alpha, beta))
@@ -3661,10 +3728,10 @@ namespace llaminar2
                 const bool quantized = d_sums_A_blockwise
                                            ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                  d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_)
+                                                 m, k, cuda_device_id_, execution_stream)
                                            : cudaQuantGemm_quantizeActivationsBlockwise(
                                                  d_A, d_A_int8, d_scales_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_);
+                                                 m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
@@ -3672,9 +3739,9 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (m == 1 && useCanonicalM1SmallMDecode())
+                if (m == 1 && useCanonicalM1Decode())
                 {
-                    if (multiply_quantized_m1_via_small_m_gemv(
+                    if (multiply_quantized_m1_decode_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
                             d_C,
@@ -3682,13 +3749,14 @@ namespace llaminar2
                             n,
                             k,
                             alpha,
-                            beta))
+                            beta,
+                            execution_stream))
                     {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (deterministic canonical M=1 small-M GEMV)");
+                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (canonical M=1 decode GEMV)");
                         return true;
                     }
 
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Deterministic M=1 native-VNNI canonical small-M GEMV failed");
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Canonical M=1 native-VNNI decode GEMV failed");
                     return false;
                 }
 
@@ -3702,7 +3770,7 @@ namespace llaminar2
                         alpha, beta,
                         d_C_existing,
                         nullptr,
-                        cuda_device_id_, gpu_stream_,
+                        cuda_device_id_, execution_stream,
                         packed_ ? &packed_->rowmajor_ : nullptr,
                         d_sums_A_blockwise))
                 {
@@ -3736,7 +3804,21 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            if (m > 1 && m <= 4 &&
+            /*
+             * Bias and non-bias FP32 paths share the same stream lifetime
+             * contract: snapshot the explicit stage stream once and never
+             * consult the mutable gpu_stream_ member after work begins.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                          "CUDA GEMM with bias requires an explicit CUDA stream");
+                return false;
+            }
+
+            if (explicitSmallMVerifierScopeActive() &&
+                m > 1 && m <= 4 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
@@ -3758,14 +3840,14 @@ namespace llaminar2
 
                 // Step 1: Blockwise quantize activations
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::QUANTIZE_ACTIVATIONS, gpu_stream_);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::QUANTIZE_ACTIVATIONS, execution_stream);
                     const bool quantized = d_sums_A_blockwise
                                                ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                      d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                     m, k, cuda_device_id_, gpu_stream_)
+                                                     m, k, cuda_device_id_, execution_stream)
                                                : cudaQuantGemm_quantizeActivationsBlockwise(
                                                      d_A, d_A_int8, d_scales_A_blockwise,
-                                                     m, k, cuda_device_id_, gpu_stream_);
+                                                     m, k, cuda_device_id_, execution_stream);
                     if (!quantized)
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
@@ -3774,9 +3856,9 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (m == 1 && useCanonicalM1SmallMDecode())
+                if (m == 1 && useCanonicalM1Decode())
                 {
-                    if (multiply_quantized_m1_via_small_m_gemv(
+                    if (multiply_quantized_m1_decode_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
                             d_C,
@@ -3784,13 +3866,14 @@ namespace llaminar2
                             n,
                             k,
                             alpha,
-                            beta))
+                            beta,
+                            execution_stream))
                     {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (deterministic canonical M=1 small-M GEMV)");
+                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (canonical M=1 decode GEMV)");
                         return true;
                     }
 
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Deterministic M=1 native-VNNI canonical small-M GEMV with bias failed");
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Canonical M=1 native-VNNI decode GEMV with bias failed");
                     return false;
                 }
 
@@ -3804,7 +3887,7 @@ namespace llaminar2
                         alpha, beta,
                         d_C_existing,
                         d_bias,
-                        cuda_device_id_, gpu_stream_,
+                        cuda_device_id_, execution_stream,
                         packed_ ? &packed_->rowmajor_ : nullptr,
                         d_sums_A_blockwise))
                 {
@@ -3918,7 +4001,7 @@ namespace llaminar2
             // the same buffers as full tiles. Size by tile-padded M so a short
             // prompt cannot leave the CUDA workspace under-provisioned while
             // keeping active/bucket sizing for the rest of the graph.
-            const bool deterministic_m1 = (m == 1 && useCanonicalM1SmallMDecode());
+            const bool deterministic_m1 = (m == 1 && useCanonicalM1Decode());
             const int workspace_m = deterministic_m1 ? 2 : ((m > 1) ? ((m + 127) & ~127) : m);
 
             // INT8 path needs quantization + accumulator buffers
@@ -4011,7 +4094,7 @@ namespace llaminar2
             // GEMV KPAR partials for decode/verifier reductions. The caller's
             // declared graph shape owns the bound; dynamic-depth graph users
             // must request their max verifier M explicitly.
-            const int gemv_workspace_m = (m == 1 && useCanonicalM1SmallMDecode()) ? 2 : m;
+            const int gemv_workspace_m = m;
             if (gemv_workspace_m > 0 && gemv_workspace_m <= 4)
             {
                 const int k_groups = (k + 31) / 32;

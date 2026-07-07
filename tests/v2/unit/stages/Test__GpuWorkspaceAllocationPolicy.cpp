@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
@@ -760,20 +761,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenRowSelectCachesTrackWo
     EXPECT_GE(countOccurrences(executable_source, "cache.workspace_generation = workspaceGeneration(state_.device_id);"), 3u)
         << "Each terminal-hidden helper execution path must publish the generation that validated its workspace bindings.";
 
-    const auto clear_cache_body = sliceBetween(
+    const auto reset_body = sliceBetween(
         header,
-        "void clear_cache() override",
-        "/**\n         * @brief Get current position");
-    const auto clear_cache_executable =
-        stripCommentsAndStringLiterals(clear_cache_body);
-    EXPECT_NE(clear_cache_executable.find("mtp_terminal_hidden_row_select_cache_.invalidate()"),
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override");
+    const auto reset_executable =
+        stripCommentsAndStringLiterals(reset_body);
+    EXPECT_NE(reset_executable.find("mtp_terminal_hidden_row_select_cache_.invalidate()"),
               std::string::npos);
-    EXPECT_NE(clear_cache_executable.find("mtp_terminal_hidden_rows_select_cache_.invalidate()"),
+    EXPECT_NE(reset_executable.find("mtp_terminal_hidden_rows_select_cache_.invalidate()"),
               std::string::npos);
-    EXPECT_EQ(clear_cache_executable.find("mtp_terminal_hidden_row_select_cache_.resetSessionState()"),
+    EXPECT_EQ(reset_executable.find("mtp_terminal_hidden_row_select_cache_.resetSessionState()"),
               std::string::npos)
         << "clear_cache() must not preserve tiny terminal-hidden helper graphs after request-state teardown.";
-    EXPECT_EQ(clear_cache_executable.find("mtp_terminal_hidden_rows_select_cache_.resetSessionState()"),
+    EXPECT_EQ(reset_executable.find("mtp_terminal_hidden_rows_select_cache_.resetSessionState()"),
               std::string::npos)
         << "clear_cache() must not preserve tiny terminal-hidden helper graphs after request-state teardown.";
 
@@ -916,6 +917,76 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNISmallMDispatchSweepUsesRe
     EXPECT_NE(sweep_source.find("if (m > 1)\n            return candidate.family == SweepFamily::KPar;"),
               std::string::npos)
         << "M=2..4 trainer cases must not label WIDE/DIRECT/ROWPAR rows as specialized small-M timings.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCapturedStream)
+{
+    const auto kernel_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp");
+    const auto header_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.h");
+
+    const auto fused_raw = sliceBetween(
+        kernel_source,
+        "bool CUDAQuantisedGemmKernel::multiply_fused_tensor_impl(",
+        "bool CUDAQuantisedGemmKernel::multiply_q8_to_fp32(");
+    const auto fused_body = stripCommentsAndStringLiterals(fused_raw);
+    const auto fused_compact = removeAsciiWhitespace(fused_body);
+
+    EXPECT_NE(fused_body.find("void *execution_stream = gpu_stream_;"), std::string::npos)
+        << "Fused CUDA projection launches must snapshot the stage stream once.";
+    EXPECT_NE(fused_raw.find("Fused CUDA projection launch requires an explicit CUDA stream"),
+              std::string::npos)
+        << "The fused path must fail hard instead of falling onto the CUDA default stream.";
+    EXPECT_EQ(fused_compact.find("cuda_device_id_,gpu_stream_"), std::string::npos)
+        << "Fused projection work must pass the captured stream, not reread gpu_stream_.";
+    EXPECT_NE(fused_compact.find("multiply_quantized_m1_decode_gemv("
+                                 "d_A_int8,d_scales_A_blockwise,d_output,d_bias,n,k,1.0f,0.0f,execution_stream)"),
+              std::string::npos)
+        << "Canonical M=1 verifier replay must receive the fused transaction stream.";
+    EXPECT_NE(fused_compact.find("binding.kernel->multiply_quantized_small_m_gemv("
+                                 "d_A_int8,d_scales_A_blockwise,binding.output,binding.bias,"
+                                 "m,binding.n,k,1.0f,0.0f,true,execution_stream)"),
+              std::string::npos)
+        << "Grouped verifier fused projections must pass their captured stream.";
+
+    const auto small_m_raw = sliceBetween(
+        kernel_source,
+        "bool CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv(",
+        "bool CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv(");
+    const auto small_m_body = stripCommentsAndStringLiterals(small_m_raw);
+    EXPECT_NE(small_m_body.find("void *stream_handle = execution_stream ? execution_stream : gpu_stream_;"),
+              std::string::npos);
+    EXPECT_NE(small_m_raw.find("NativeVNNI small-M GEMV requires an explicit CUDA stream"),
+              std::string::npos)
+        << "Small-M GEMV helpers must reject null streams instead of using stream 0.";
+
+    const auto m1_raw = sliceBetween(
+        kernel_source,
+        "bool CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv(",
+        "bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32(");
+    const auto m1_body = stripCommentsAndStringLiterals(m1_raw);
+    const auto m1_compact = removeAsciiWhitespace(m1_body);
+    EXPECT_NE(m1_body.find("void *stream_handle = execution_stream ? execution_stream : gpu_stream_;"),
+              std::string::npos);
+    EXPECT_NE(m1_raw.find("Canonical M=1 decode GEMV requires an explicit CUDA stream"),
+              std::string::npos);
+    EXPECT_NE(m1_compact.find("cudaNativeVNNIGemvTuned_fp32("
+                              "d_A_int8,impl_->d_weights_native_vnni,impl_->d_weights_native_scales,"
+                              "impl_->d_weights_native_mins,impl_->d_weights_native_emins,d_C,"
+                              "d_scales_A_blockwise,n,k,alpha,beta,nullptr,d_bias,"
+                              "impl_->native_codebook_id,cuda_device_id_,stream_handle,impl_->gemv_ctx,nullptr)"),
+              std::string::npos)
+        << "The M=1 canonical path must launch the serial decode GEMV on the captured stream without lazy ROWPAR state.";
+    EXPECT_EQ(m1_compact.find("cudaMemsetAsync("), std::string::npos)
+        << "Canonical M=1 decode must not pad into a synthetic small-M transaction.";
+    EXPECT_EQ(m1_compact.find("cudaMemcpyAsync("), std::string::npos)
+        << "Canonical M=1 decode must write directly to the caller's output row.";
+
+    EXPECT_NE(header_source.find("LocalTP workers may reset request-scoped kernel dynamic"),
+              std::string::npos)
+        << "The private helper contract should document why the explicit stream "
+           "parameter exists.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIDispatchSweepUsesFastDeterministicWeights)
@@ -1174,10 +1245,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifie
                   "ready.verifier_consumer_pending=ready.verifier_consumer_pending||verifier_consumer_pending"),
               std::string::npos)
         << "Restamping a ready event must preserve an existing verifier-owner bit.";
-    EXPECT_NE(compact_header.find("pending_mtp_verifier_device_token_plan_.reset()"),
+    EXPECT_NE(compact_source.find("pending_mtp_verifier_device_token_plan_.reset()"),
               std::string::npos)
         << "Request-boundary clear_cache() must drop verifier token-row plans.";
-    EXPECT_NE(compact_header.find("materialized_mtp_verifier_device_token_row_={}"),
+    EXPECT_NE(compact_source.find("materialized_mtp_verifier_device_token_row_={}"),
               std::string::npos)
         << "Request-boundary clear_cache() must drop materialized verifier token rows.";
 }
@@ -1186,10 +1257,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCacheDropsStochasticDistributionSl
 {
     const auto header =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
-    const auto clear_cache_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+    const auto reset_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         header,
-        "void clear_cache() override",
-        "/**\n         * @brief Get current position")));
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override")));
 
     /*
      * Regression guard for seeded stochastic MTP reproducibility after
@@ -1205,17 +1276,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCacheDropsStochasticDistributionSl
     const std::string clear_ready =
         "clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);";
 
-    EXPECT_NE(clear_cache_body.find(clear_target_top_k), std::string::npos)
+    EXPECT_NE(reset_body.find(clear_target_top_k), std::string::npos)
         << "clear_cache() must reset request-local target stochastic top-k metadata.";
-    EXPECT_NE(clear_cache_body.find(clear_draft_top_k), std::string::npos)
+    EXPECT_NE(reset_body.find(clear_draft_top_k), std::string::npos)
         << "clear_cache() must reset request-local draft stochastic top-k metadata.";
     expectNeedleBefore(
-        clear_cache_body,
+        reset_body,
         clear_target_top_k,
         clear_ready,
         "clear_cache() must fully empty stochastic distribution slots before ready-event cleanup.");
     expectNeedleBefore(
-        clear_cache_body,
+        reset_body,
         clear_draft_top_k,
         clear_ready,
         "clear_cache() must fully empty stochastic distribution slots before ready-event cleanup.");
@@ -1225,10 +1296,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCa
 {
     const auto header =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto reset_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        header,
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override")));
     const auto clear_cache_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         header,
         "void clear_cache() override",
         "/**\n         * @brief Get current position")));
+    const auto clear_cache_body_with_strings = removeAsciiWhitespace(sliceBetween(
+        header,
+        "void clear_cache() override",
+        "/**\n         * @brief Get current position"));
 
     /*
      * Request boundaries should clear live KV/GDN/session state without forcing
@@ -1237,45 +1316,43 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCa
      * decode captures; this guard makes sure clear_cache() opts into preserving
      * the replay-safe single-token decode and all-position verifier classes.
      */
-    EXPECT_NE(clear_cache_body.find(
-                  "forward_engine_->resetSessionReplayState(true);"),
+    EXPECT_NE(clear_cache_body_with_strings.find(
+                  "resetInferenceState(InferenceStateResetRequest::requestBoundary(\"clear_cache\"));"),
+              std::string::npos)
+        << "clear_cache() must enter the typed request-boundary reset path.";
+    EXPECT_NE(reset_body.find(
+                  "!request.reset_model_runtime||!request.preserve_replay_safe_graphs"),
+              std::string::npos)
+        << "The request boundary must require replay-safe graph preservation.";
+    EXPECT_NE(reset_body.find(
+                  "forward_engine_->resetSessionReplayState(preserve_replay_safe_graphs);"),
               std::string::npos)
         << "clear_cache() must preserve replay-safe cached forward graph captures.";
-    EXPECT_NE(clear_cache_body.find(
+    EXPECT_NE(reset_body.find(
                   "mtp_sidecar_depth0_cache_.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
         << "The ordinary MTP sidecar cache should stay replay-hot across requests.";
-    EXPECT_NE(clear_cache_body.find(
+    EXPECT_NE(reset_body.find(
                   "mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
         << "Device-token sidecar replay is the served stochastic path and must not recapture every request.";
-    EXPECT_NE(clear_cache_body.find(
+    EXPECT_NE(reset_body.find(
                   "cache.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
         << "Batched KV-only sidecar caches must use the same replay-preserving request reset.";
-    EXPECT_EQ(clear_cache_body.find(
-                  "mtp_sidecar_depth0_cache_.resetSessionState();"),
-              std::string::npos)
-        << "The request boundary must not use the replay-dropping sidecar reset for the hot path.";
-    EXPECT_EQ(clear_cache_body.find("resetKernelDynamicState();"),
-              std::string::npos)
-        << "clear_cache() preserves captured replay-safe GPU graphs, so it must not wipe "
-           "kernel-owned dynamic pointer tables captured by those executables.";
-    EXPECT_NE(clear_cache_body.find(
-                  "recordKernelDynamicStatePreservedForCapturedReplay("),
+    EXPECT_NE(reset_body.find(
+                  "recordKernelDynamicStatePreservedForCapturedReplay(reset_reason);"),
               std::string::npos)
         << "Request-boundary kernel-state preservation must remain visible in perf counters.";
-    const auto clear_cache_body_with_strings = removeAsciiWhitespace(sliceBetween(
+    const auto reset_body_with_strings = removeAsciiWhitespace(sliceBetween(
         header,
-        "void clear_cache() override",
-        "/**\n         * @brief Get current position"));
-    EXPECT_NE(clear_cache_body_with_strings.find(
-                  "recordLivePrefixSessionReset(\"clear_cache\","),
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override"));
+    EXPECT_NE(reset_body_with_strings.find(
+                  "recordLivePrefixSessionReset(reset_reason,preserve_replay_safe_graphs);"),
               std::string::npos)
         << "Live-prefix request-boundary telemetry must report replay/kernel "
            "state as preserved, not as a hard session reset.";
-    EXPECT_NE(clear_cache_body_with_strings.find("/*preserve_gpu_replay_state=*/true"),
-              std::string::npos);
 
     const auto source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
@@ -1301,6 +1378,73 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCa
     EXPECT_NE(clear_inference_body.find("recordLivePrefixSessionReset(\"clearInferenceState\")"),
               std::string::npos)
         << "clearInferenceState() is still a hard state reset.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreWithoutModelRuntimeInvalidatesMTPSidecarGraphs)
+{
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+
+    const auto compact_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto reset_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        header,
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override")));
+    const auto invalidation_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::invalidateMTPSidecarDepth0GraphState(",
+        "void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()")));
+    const auto invalidation_body_with_strings = removeAsciiWhitespace(sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::invalidateMTPSidecarDepth0GraphState(",
+        "void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()"));
+
+    /*
+     * Regression guard for prefix-cache + MTP + MoE LocalTP: a restored prefix
+     * block may contain live KV/GDN/MTP payloads but no graph-owned
+     * model-runtime placement snapshot.  That boundary resets MoE runtime
+     * tables, so cached MTP sidecar graphs must be destroyed and rebuilt rather
+     * than merely resetting replay handles while leaving stale stage metadata.
+     */
+    EXPECT_NE(compact_header.find("voidinvalidateMTPSidecarDepth0GraphState(constchar*reason);"),
+              std::string::npos)
+        << "MTP sidecar graph invalidation must remain a named coherence operation.";
+    EXPECT_NE(reset_body.find(
+                  "constboolprefix_restore_resets_model_runtime_owner=prefix_restore_boundary&&request.reset_model_runtime;"),
+              std::string::npos)
+        << "Prefix restore needs an explicit no-model-runtime-snapshot predicate.";
+    EXPECT_NE(reset_body.find(
+                  "elseif(prefix_restore_resets_model_runtime_owner){invalidateMTPSidecarDepth0GraphState(reset_reason);}"),
+              std::string::npos)
+        << "Prefix restore without model-runtime state must invalidate sidecar graphs.";
+    expectNeedleBefore(
+        reset_body,
+        "invalidateMTPSidecarDepth0GraphState(reset_reason);",
+        "mtp_sidecar_depth0_cache_.resetSessionState();",
+        "The no-snapshot prefix restore branch must bypass stale-graph resetSessionState().");
+    EXPECT_NE(reset_body.find(
+                  "elseif(!prefix_restore_resets_model_runtime_owner)cache.resetSessionState();"),
+              std::string::npos)
+        << "Batched KV-only MTP sidecar caches must not survive the no-snapshot restore branch.";
+
+    EXPECT_NE(invalidation_body.find("mtp_sidecar_depth0_device_token_cache_.invalidate();"),
+              std::string::npos)
+        << "Device-token sidecars were the observed stale cache hit and must be destroyed.";
+    EXPECT_NE(invalidation_body.find("mtp_sidecar_depth0_kv_only_device_token_cache_.invalidate();"),
+              std::string::npos)
+        << "KV-only device-token sidecars follow the same runtime-table lifetime.";
+    EXPECT_NE(invalidation_body.find("cache.invalidate();"), std::string::npos)
+        << "Batched KV-only sidecar caches must be invalidated as a group.";
+    EXPECT_NE(invalidation_body_with_strings.find(
+                  "PerfStatsCollector::addCounter(\"mtp\",\"sidecar_graph_invalidations\""),
+              std::string::npos)
+        << "Perfstats must expose that prefix restore invalidated MTP sidecar graphs.";
+    EXPECT_NE(invalidation_body_with_strings.find("tags[\"reason\"]=reason?reason:\"unknown\";"),
+              std::string::npos)
+        << "The invalidation counter should identify the reset boundary.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, DeviceResidentShiftedMTPHostAdoptionAllowsTruncation)
@@ -1532,6 +1676,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
         source,
         "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const",
         "bool DeviceGraphOrchestrator::restoreLivePrefixState");
+    const auto live_observation_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForLiveInferenceStateReadyForObservation(",
+        "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(");
     const auto observation_wait_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::waitForPendingAcceptedSpecPublicationReadyForObservation(",
@@ -1543,11 +1691,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
         removeAsciiWhitespace(stripCommentsAndStringLiterals(payload_body));
     const auto compact_checkpoint =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(checkpoint_body));
+    const auto compact_live_observation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(live_observation_body));
     const auto compact_observation_wait =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(observation_wait_body));
     const auto compact_header =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
 
+    EXPECT_NE(compact_header.find(
+                  "waitForLiveInferenceStateReadyForObservation("
+                  "void*observation_stream,constchar*observation_name)const"),
+              std::string::npos)
+        << "Host-visible live-state exports must use the shared observation boundary.";
     EXPECT_NE(compact_header.find(
                   "waitForPendingAcceptedSpecPublicationReadyForObservation("
                   "void*consumer_stream,constchar*consumer_name)const"),
@@ -1564,37 +1719,159 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
               std::string::npos)
         << "Diagnostic observation must leave the real forward handoff intact.";
 
-    EXPECT_NE(compact_probe.find(
+    EXPECT_NE(compact_live_observation.find(
                   "waitForPendingAcceptedSpecPublicationReadyForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_live_observation.find(
+                  "waitForPendingLivePrefixMutationReadyForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_live_observation.find(
+                  "waitForPendingLiveGraphProducersForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_live_observation.find(
+                  "waitForDeviceResidentLogicalSequenceStateMailboxForObservation("),
+              std::string::npos);
+
+    EXPECT_NE(compact_probe.find(
+                  "waitForLiveInferenceStateReadyForObservation("),
               std::string::npos);
     EXPECT_NE(probe_body.find("\"prefix_state_probe\""),
               std::string::npos);
     EXPECT_NE(compact_payload.find(
-                  "waitForPendingAcceptedSpecPublicationReadyForObservation("),
+                  "waitForLiveInferenceStateReadyForObservation("),
               std::string::npos);
     EXPECT_NE(payload_body.find("\"capture_live_prefix_state\""),
               std::string::npos);
     EXPECT_NE(compact_checkpoint.find(
-                  "waitForPendingAcceptedSpecPublicationReadyForObservation("),
+                  "waitForLiveInferenceStateReadyForObservation("),
               std::string::npos);
     EXPECT_NE(checkpoint_body.find("\"capture_live_prefix_checkpoint\""),
               std::string::npos);
 
     expectNeedleBefore(
         compact_probe,
-        "waitForPendingAcceptedSpecPublicationReadyForObservation(",
+        "waitForLiveInferenceStateReadyForObservation(",
         "PrefixRuntimeStateSnapshotsnapshot;",
-        "prefixStateProbe must order after accepted-state publication before reading probes.");
+        "prefixStateProbe must order after all live inference-state producers before reading probes.");
     expectNeedleBefore(
         compact_payload,
-        "waitForPendingAcceptedSpecPublicationReadyForObservation(",
+        "waitForLiveInferenceStateReadyForObservation(",
         "snapshot.valid=true;",
-        "captureLivePrefixState must order after accepted-state publication before exporting payloads.");
+        "captureLivePrefixState must order after all live inference-state producers before exporting payloads.");
     expectNeedleBefore(
         compact_checkpoint,
-        "waitForPendingAcceptedSpecPublicationReadyForObservation(",
+        "waitForLiveInferenceStateReadyForObservation(",
         "constintdraft_tokens=",
-        "captureLivePrefixCheckpoint must order after accepted-state publication before reading live metadata.");
+        "captureLivePrefixCheckpoint must order after all live inference-state producers before reading live metadata.");
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, LiveStateObservationsWaitForGraphProducersWithoutConsumingThem)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+
+    const auto logits_observation_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForPendingLogitsStreamForObservation(",
+        "void *DeviceGraphOrchestrator::peekPendingLogitsStream(");
+    const auto graph_observation_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForPendingLiveGraphProducersForObservation(",
+        "void DeviceGraphOrchestrator::clearMTPVerifierTransactionStateForBoundary(");
+    const auto shifted_observation_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForPendingShiftedMTPKVReadyForObservation(",
+        "bool DeviceGraphOrchestrator::recordAllPositionVerifierStateReady(");
+    const auto verifier_observation_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForPendingAllPositionVerifierStateReadyForObservation(",
+        "void DeviceGraphOrchestrator::clearPendingAllPositionVerifierStateReady()");
+    const auto mailbox_observation_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailboxForObservation(",
+        "bool DeviceGraphOrchestrator::retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(");
+    const auto harvest_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::harvestPrefix(",
+        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixState(int seq_idx) const");
+
+    const auto compact_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto compact_logits_observation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(logits_observation_body));
+    const auto compact_graph_observation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(graph_observation_body));
+    const auto compact_shifted_observation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(shifted_observation_body));
+    const auto compact_verifier_observation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(verifier_observation_body));
+    const auto compact_mailbox_observation =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(mailbox_observation_body));
+    const auto compact_harvest =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(harvest_body));
+
+    EXPECT_NE(compact_header.find("waitForPendingLogitsStreamForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_header.find("waitForPendingLiveGraphProducersForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_header.find("waitForPendingShiftedMTPKVReadyForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_header.find("waitForPendingAllPositionVerifierStateReadyForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_header.find("waitForDeviceResidentLogicalSequenceStateMailboxForObservation("),
+              std::string::npos);
+
+    EXPECT_NE(compact_logits_observation.find("peekPendingLogitsStream(role)"),
+              std::string::npos)
+        << "Observation must inspect the logits handoff without taking ownership.";
+    EXPECT_EQ(compact_logits_observation.find("consumePendingLogitsStream("),
+              std::string::npos)
+        << "Observation must not steal sampler/reducer stream ownership.";
+    EXPECT_NE(compact_logits_observation.find("insertStreamDependency("),
+              std::string::npos);
+
+    EXPECT_NE(compact_graph_observation.find("PendingLogitsStreamRole::MTPSidecar"),
+              std::string::npos);
+    EXPECT_NE(compact_graph_observation.find("PendingLogitsStreamRole::MainDecode"),
+              std::string::npos);
+    EXPECT_NE(compact_graph_observation.find("PendingLogitsStreamRole::AllPositionVerifier"),
+              std::string::npos);
+    EXPECT_NE(compact_graph_observation.find("waitForPendingShiftedMTPKVReadyForObservation("),
+              std::string::npos);
+    EXPECT_NE(compact_graph_observation.find("waitForPendingAllPositionVerifierStateReadyForObservation("),
+              std::string::npos);
+    EXPECT_EQ(compact_graph_observation.find("waitForPendingLogitsStream("),
+              std::string::npos)
+        << "Observation helper must use the non-consuming logits wait.";
+    EXPECT_EQ(compact_graph_observation.find("waitForPendingShiftedMTPKVReady("),
+              std::string::npos)
+        << "Observation helper must not consume shifted-MTP-KV ownership.";
+    EXPECT_EQ(compact_graph_observation.find("waitForPendingAllPositionVerifierStateReady("),
+              std::string::npos)
+        << "Observation helper must not consume verifier row-state ownership.";
+
+    EXPECT_NE(compact_shifted_observation.find("streamWaitEvent("),
+              std::string::npos);
+    EXPECT_EQ(compact_shifted_observation.find("ready.valid=false"),
+              std::string::npos);
+    EXPECT_NE(compact_verifier_observation.find("streamWaitEvent("),
+              std::string::npos);
+    EXPECT_EQ(compact_verifier_observation.find("clearPendingAllPositionVerifierStateReady()"),
+              std::string::npos);
+    EXPECT_NE(compact_mailbox_observation.find("streamWaitEvent("),
+              std::string::npos);
+    EXPECT_EQ(compact_mailbox_observation.find("mailbox.clear()"),
+              std::string::npos)
+        << "Diagnostic observation must not adopt or clear device-resident logical state.";
+
+    EXPECT_NE(compact_harvest.find("waitForLiveInferenceStateReadyForObservation("),
+              std::string::npos)
+        << "Prefix-cache harvest is a host-visible export and must use the shared observation boundary.";
+    EXPECT_EQ(compact_harvest.find("waitForPendingLiveGraphProducersBeforePrefixMutation("),
+              std::string::npos)
+        << "Harvest must not consume graph-producer handoffs just to export payloads.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, LiveLogicalCheckpointsUseEventBackedSourceAndSnapshotHandoffs)
@@ -1806,9 +2083,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     EXPECT_NE(compact_prepare.find("live_prefix_mutation_ready_.valid"), std::string::npos);
     EXPECT_NE(compact_prepare.find("waitForPendingLivePrefixMutationReady("), std::string::npos);
     EXPECT_NE(compact_sidecar.find("waitForPendingLivePrefixMutationReady("), std::string::npos);
-    EXPECT_NE(compact_probe.find("waitForPendingLivePrefixMutationReadyForObservation("), std::string::npos);
-    EXPECT_NE(compact_payload.find("waitForPendingLivePrefixMutationReadyForObservation("), std::string::npos);
-    EXPECT_NE(compact_checkpoint.find("waitForPendingLivePrefixMutationReadyForObservation("), std::string::npos);
+    EXPECT_NE(compact_probe.find("waitForLiveInferenceStateReadyForObservation("), std::string::npos);
+    EXPECT_NE(compact_payload.find("waitForLiveInferenceStateReadyForObservation("), std::string::npos);
+    EXPECT_NE(compact_checkpoint.find("waitForLiveInferenceStateReadyForObservation("), std::string::npos);
 
     expectNeedleBefore(
         compact_restore,
@@ -1891,10 +2168,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreClearsDiscardedTimelineTra
 
     const auto compact_header =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto reset_body = sliceBetween(
+        header,
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override");
     const auto helper_body = sliceBetween(
         source,
         "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(",
         "void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(");
+    const auto mtp_transaction_helper_body = sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::clearMTPVerifierTransactionStateForBoundary(",
+        "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(");
     const auto wait_helper_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::waitForPendingLiveGraphProducersBeforePrefixMutation(",
@@ -1905,6 +2190,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreClearsDiscardedTimelineTra
         "PrefixCacheFingerprintResult DeviceGraphOrchestrator::buildCurrentPrefixFingerprint(");
     const auto compact_helper =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(helper_body));
+    const auto compact_mtp_transaction_helper =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(mtp_transaction_helper_body));
+    const auto compact_reset =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(reset_body));
     const auto compact_wait_helper =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(wait_helper_body));
     const auto compact_mutation =
@@ -1922,6 +2211,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreClearsDiscardedTimelineTra
               std::string::npos);
     EXPECT_NE(compact_header.find("clearLivePrefixRestoreTransientHandoffs(constchar*reason)"),
               std::string::npos);
+    EXPECT_NE(compact_header.find("clearMTPVerifierTransactionStateForBoundary(constchar*reason)"),
+              std::string::npos);
+    EXPECT_NE(compact_reset.find("clearMTPVerifierTransactionStateForBoundary(reset_reason)"),
+              std::string::npos)
+        << "Request reset must clear the same MTP verifier transaction owner as prefix restore.";
     EXPECT_NE(compact_helper.find("clearAllPendingLogitsStreams(clear_reason)"),
               std::string::npos)
         << "A restored snapshot must not inherit logits stream ownership from the abandoned timeline.";
@@ -1935,17 +2229,30 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixRestoreClearsDiscardedTimelineTra
               std::string::npos);
     EXPECT_NE(compact_helper.find("shifted_mtp_kv_ready_.event.reset()"),
               std::string::npos);
-    EXPECT_NE(compact_helper.find("pending_mtp_verifier_device_token_plan_.reset()"),
+    EXPECT_NE(compact_helper.find("clearMTPVerifierTransactionStateForBoundary(clear_reason)"),
+              std::string::npos)
+        << "Prefix restore should clear MTP verifier transaction state through its first-class owner.";
+    EXPECT_NE(compact_mtp_transaction_helper.find("pending_mtp_spec_verifier_input_plan_.reset()"),
+              std::string::npos)
+        << "Prefix restore must drop abandoned spec verifier input plans.";
+    EXPECT_NE(compact_mtp_transaction_helper.find("pending_mtp_verifier_device_token_plan_.reset()"),
               std::string::npos);
-    EXPECT_NE(compact_helper.find("request_batched_prefill_logits_row_count_=0"),
+    EXPECT_NE(compact_mtp_transaction_helper.find("materialized_mtp_verifier_device_token_row_={}"),
               std::string::npos);
-    EXPECT_NE(compact_helper.find("setRowIndexedAllPositionLogitRows({})"),
+    EXPECT_NE(compact_mtp_transaction_helper.find("mtp_publication_base_cache_snapshot_ready_=false"),
+              std::string::npos)
+        << "Prefix restore must not retain verifier publication base snapshots from the abandoned timeline.";
+    EXPECT_NE(compact_mtp_transaction_helper.find("mtp_publication_base_cache_snapshot_request_count_=0"),
+              std::string::npos);
+    EXPECT_NE(compact_mtp_transaction_helper.find("request_batched_prefill_logits_row_count_=0"),
+              std::string::npos);
+    EXPECT_NE(compact_mtp_transaction_helper.find("setRowIndexedAllPositionLogitRows({})"),
               std::string::npos)
         << "Prefix restore must drop compact verifier row ownership from the abandoned timeline.";
-    EXPECT_NE(compact_helper.find("setComputeRowIndexedAllPositionLogits(false,0)"),
+    EXPECT_NE(compact_mtp_transaction_helper.find("setComputeRowIndexedAllPositionLogits(false,0)"),
               std::string::npos)
         << "A restored prefix checkpoint must not inherit row-indexed verifier logits mode.";
-    EXPECT_NE(compact_helper.find("setComputeAllPositionLogits(false)"),
+    EXPECT_NE(compact_mtp_transaction_helper.find("setComputeAllPositionLogits(false)"),
               std::string::npos)
         << "A restored prefix checkpoint resumes as ordinary decode, not an all-position verifier.";
     EXPECT_EQ(compact_helper.find("&& !compute_all_position_logits_"), std::string::npos)
@@ -2438,10 +2745,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
             "verifyGreedyAllPositionBatchOutcomeOnDevice(");
     const size_t direct_publish =
         compact_greedy_runner.find(
-            "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
+            "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(",
+            resident_verify);
     const size_t host_materialize =
         compact_greedy_runner.find(
-            "materializeDeviceSpeculativeOutcomesForHostResponse(");
+            "materializeDeviceSpeculativeOutcomesForHostResponse(",
+            direct_publish);
     ASSERT_NE(resident_verify, std::string::npos);
     ASSERT_NE(direct_publish, std::string::npos);
     ASSERT_NE(host_materialize, std::string::npos);
@@ -3357,11 +3666,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxWrapsReside
               std::string::npos)
         << "Metadata adoption must mark the current mailbox epoch as fresh.";
 
-    const auto clear_cache_body = sliceBetween(
+    const auto reset_body = sliceBetween(
         header,
-        "void clear_cache() override",
-        "int get_position() const override");
-    EXPECT_NE(removeAsciiWhitespace(stripCommentsAndStringLiterals(clear_cache_body))
+        "void resetInferenceState(const InferenceStateResetRequest &request) override",
+        "void clear_cache() override");
+    EXPECT_NE(removeAsciiWhitespace(stripCommentsAndStringLiterals(reset_body))
                   .find("clearDeviceResidentLogicalSequenceStateMailbox();"),
               std::string::npos)
         << "Session resets must invalidate mailbox pointers into workspace buffers.";
@@ -3399,6 +3708,67 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxWrapsReside
     EXPECT_EQ(compact_decode_step.find("runner_->get_position()"),
               std::string::npos)
         << "decodeStep must not bypass the host-mirror freshness guard for MTP planning.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPBudgetLimitedDirectEmitUsesCheckpointShiftedSidecarAnchor)
+{
+    const auto orchestration_source =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+    const auto decode_mtp_body = sliceBetween(
+        orchestration_source,
+        "GenerationResult OrchestrationRunner::decodeStepMTP()",
+        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto direct_emit_body = sliceBetween(
+        decode_mtp_body,
+        "if (speculative_draft_count == 0)",
+        "std::optional<PrefixStateSnapshot> verifier_replay_base_checkpoint;");
+    const auto compact_direct_emit =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(direct_emit_body));
+
+    EXPECT_NE(compact_direct_emit.find(
+                  "constintbase_sidecar_position=snapshotShiftedMTPTokens(verifier_base_checkpoint)+1;"),
+              std::string::npos)
+        << "Budget-limited direct emit must anchor shifted-KV repair to the "
+           "verifier-base checkpoint, because prefix-cache restore can leave "
+           "the host runner position staged ahead of the shifted sidecar head.";
+    EXPECT_NE(compact_direct_emit.find(
+                  "commitMTPShiftedRowFromCurrentTerminalHidden(first_token,0,true,base_sidecar_position)"),
+              std::string::npos)
+        << "The direct emit shifted-row commit must consume the checkpoint-derived anchor.";
+    EXPECT_EQ(compact_direct_emit.find("currentMTPBaseSidecarPositionForPlanning("),
+              std::string::npos)
+        << "This direct-emit block must not read host position for the shifted "
+           "sidecar precondition; it already has the authoritative checkpoint.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPConditionForwardPublishesShiftedSidecarBeforeMainForward)
+{
+    const auto orchestration_source =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+    const auto decode_mtp_body = sliceBetween(
+        orchestration_source,
+        "GenerationResult OrchestrationRunner::decodeStepMTP()",
+        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto condition_forward_body = sliceBetween(
+        decode_mtp_body,
+        "else if (!use_ready_logits)",
+        "else if (use_ready_logits)");
+    const auto compact_condition_forward =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(condition_forward_body));
+
+    const size_t commit_pos = compact_condition_forward.find(
+        "commitMTPShiftedRowFromCurrentTerminalHidden(condition_token,0,true,*condition_sidecar_position)");
+    const size_t forward_pos = compact_condition_forward.find(
+        "runner_->forward(&condition_token,1)");
+    ASSERT_NE(commit_pos, std::string::npos)
+        << "Condition-forward MTP decode must publish the shifted sidecar row "
+           "for the condition token before advancing main state.";
+    ASSERT_NE(forward_pos, std::string::npos);
+    EXPECT_LT(commit_pos, forward_pos)
+        << "The shifted sidecar row must be committed before the main condition forward.";
+    EXPECT_NE(condition_forward_body.find("condition_forward_shifted_commits"),
+              std::string::npos)
+        << "The maintenance path should remain visible in perfstats.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, DGOResidentPublicationDoesNotMutateKVBeforeLogicalStateIsResident)
@@ -3479,6 +3849,57 @@ TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheDeviceResidentPublicationContrac
     EXPECT_NE(source.find("Long-context ring caches"), std::string::npos)
         << "The contract should document why target count alone is not enough "
            "to update wrapped ring-cache heads.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVLogicalBlockAccessRequiresExplicitStreams)
+{
+    const auto interface_source =
+        readFile(repoRoot() / "src/v2/kernels/IKVCache.h");
+    const auto cuda_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu");
+    const auto rocm_source =
+        readFile(repoRoot() / "src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp");
+
+    const auto cuda_export = sliceBetween(
+        cuda_source,
+        "bool CUDARingKVCache<Precision>::exportLogicalBlock(",
+        "bool CUDARingKVCache<Precision>::importLogicalBlock(");
+    const auto cuda_import = sliceBetween(
+        cuda_source,
+        "bool CUDARingKVCache<Precision>::importLogicalBlock(",
+        "bool CUDARingKVCache<Precision>::truncateSequence(");
+    const auto rocm_export = sliceBetween(
+        rocm_source,
+        "bool ROCmRingKVCache<Precision>::exportLogicalBlock(",
+        "bool ROCmRingKVCache<Precision>::importLogicalBlock(");
+    const auto rocm_import = sliceBetween(
+        rocm_source,
+        "bool ROCmRingKVCache<Precision>::importLogicalBlock(",
+        "bool ROCmRingKVCache<Precision>::truncateSequence(");
+
+    const auto compact_interface =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(interface_source));
+    const std::vector<std::string> bodies = {
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(cuda_export)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(cuda_import)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(rocm_export)),
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(rocm_import)),
+    };
+
+    EXPECT_NE(interface_source.find("GPU implementations require @ref stream"),
+              std::string::npos)
+        << "The API contract must tell callers that GPU logical KV access is stream-owned.";
+    EXPECT_NE(compact_interface.find("void*stream=nullptr"),
+              std::string::npos)
+        << "CPU callers may still omit streams; GPU implementations enforce when streams are required.";
+
+    for (const auto &body : bodies)
+    {
+        EXPECT_NE(body.find("if(!desc.stream)"), std::string::npos)
+            << "GPU logical KV import/export must fail fast when no explicit stream is supplied.";
+        EXPECT_EQ(body.find("getEffectiveStream(nullptr)"), std::string::npos)
+            << "GPU logical KV import/export must not quietly fall back to a default stream.";
+    }
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheDeviceCountMirrorsAreSymmetricAndGraphAdvanced)
@@ -3619,6 +4040,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AttentionDeviceParamsCanDeriveFromDevic
         removeAsciiWhitespace(stripCommentsAndStringLiterals(interface_source));
     const auto stage_compact =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(stage_source));
+    const auto update_dynamic_body =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            stage_source,
+            "void AttentionComputeStage::updateDynamicParams(",
+            "bool AttentionComputeStage::supportsDeviceResidentDynamicPositionReplay(")));
+    const auto execute_device_params_body =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            stage_source,
+            "if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)",
+            "// Get device index using proper ordinal for GPU devices")));
     const auto cuda_compact =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(cuda_source));
     const auto rocm_compact =
@@ -3633,6 +4064,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AttentionDeviceParamsCanDeriveFromDevic
               std::string::npos);
     EXPECT_NE(stage_compact.find("prepareDynamicAttnParamsFromDeviceSequenceState("),
               std::string::npos);
+    EXPECT_NE(stage_compact.find("dynamic_pre_append_cached_tokens_"),
+              std::string::npos)
+        << "Attention must make the pre-append KV history a request-local stage boundary.";
+    EXPECT_NE(update_dynamic_body.find("dynamic_post_append_kv_len_=pre_append_cached_tokens+logical_seq_len"),
+              std::string::npos);
+    EXPECT_EQ(update_dynamic_body.find("kv_len>logical_seq_len"),
+              std::string::npos)
+        << "Reusable prefill graphs must record device-count derivation even when captured with no prefix history.";
+    EXPECT_NE(execute_device_params_body.find("has_current_dynamic_sequence_state||effective_kv_len>logical_seq_len"),
+              std::string::npos)
+        << "Eager execution may still ignore hostile device counts unless the forward engine established a dynamic boundary.";
     EXPECT_NE(stage_compact.find("!tq_cache"), std::string::npos)
         << "TQ/hybrid metadata must stay on its own guarded contract until it "
            "has the same device-owned append/count semantics.";
@@ -3832,6 +4274,276 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
            "main-state preservation and shifted-row reuse.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimeRefreshPublishesInitializedFlag)
+{
+    const auto stage_source =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
+    const auto header_source =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h");
+
+    const auto refresh_body = sliceBetween(
+        stage_source,
+        "bool MoEExpertComputeStage::refreshRuntimeGroupedDecodePlacement(bool preserve_capture_ready)",
+        "bool MoEExpertComputeStage::refreshFixedTopologyGroupedPrefillPlacement()");
+    const std::string compact_refresh =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(refresh_body));
+
+    EXPECT_NE(compact_refresh.find("moe_runtime_table_initialized_=false;"),
+              std::string::npos)
+        << "Failed graph-stable refreshes must clear the stage-local readiness "
+           "flag before the next warmup/replay observes stale placement state.";
+    EXPECT_NE(compact_refresh.find("moe_runtime_table_initialized_=runtimeTableHasActiveGroupedDecodeBank();"),
+              std::string::npos)
+        << "A successful graph-stable placement refresh must publish the active "
+           "runtime-bank check into the stage-local initialized flag.";
+    EXPECT_NE(compact_refresh.find("&&moe_runtime_table_initialized_;"),
+              std::string::npos)
+        << "Capture-ready preservation must depend on the same initialized flag "
+           "that decode execution will later read.";
+    EXPECT_NE(compact_refresh.find("returnmoe_runtime_table_initialized_;"),
+              std::string::npos)
+        << "Explicit-owner LocalTP runtime tables must fail closed if the active "
+           "bank disappears between graph build and replay.";
+    expectNeedleBefore(
+        compact_refresh,
+        "moe_runtime_table_initialized_=runtimeTableHasActiveGroupedDecodeBank();",
+        "runtime_grouped_decode_warmed_=preserve_capture_ready",
+        "The initialized flag must be refreshed before capture-ready bookkeeping.");
+
+    EXPECT_NE(header_source.find("@brief Revalidates the graph-owned one-token MoE runtime placement."),
+              std::string::npos)
+        << "This private refresh method owns a subtle graph/runtime coherence "
+           "contract and needs durable Doxygen guidance.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MoEVerifierRoutingTensorDecodeDoesNotRequireAllEnabledMask)
+{
+    const auto stage_source =
+        readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
+    const auto imoe_source =
+        readFile(repoRoot() / "src/v2/kernels/IMoEKernel.h");
+    const auto cuda_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+    const auto rocm_source =
+        readFile(repoRoot() / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp");
+
+    const auto verifier_replay_body = sliceBetween(
+        stage_source,
+        "struct ScopedSingleVerifierRow",
+        "return executeSingleToken(ctx);");
+    const auto routing_tensor_predicate = sliceBetween(
+        stage_source,
+        "const bool require_device_routing_tensor_decode =",
+        "if (can_try_device_routing_tensor_decode)");
+    const auto routing_tensor_body = sliceBetween(
+        stage_source,
+        "if (can_try_device_routing_tensor_decode)",
+        "if (is_gpu && isGraphCaptureActive())");
+    const auto compact_verifier_replay =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(verifier_replay_body));
+    const auto compact_predicate =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(routing_tensor_predicate));
+    const auto compact_body =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(routing_tensor_body));
+
+    EXPECT_NE(compact_verifier_replay.find("params_.require_device_routing_tensor_decode=is_gpu;"),
+              std::string::npos)
+        << "GPU decode-equivalent verifier replay must use the explicit routing-tensor path.";
+    EXPECT_NE(compact_predicate.find("hasFullLocalExpertOwnership();"),
+              std::string::npos)
+        << "The routing-tensor path still requires a complete local descriptor table.";
+    EXPECT_EQ(compact_predicate.find("&&expertMaskAllEnabled()"),
+              std::string::npos)
+        << "Dynamic/LLEP masks can be participant scoped; all-enabled masks must "
+           "not gate the decode-equivalent routing tensor path.";
+    EXPECT_NE(compact_predicate.find("device_routing_expert_mask"),
+              std::string::npos)
+        << "Participant masks must be converted to byte masks before the device "
+           "routing tensor path is considered usable.";
+    EXPECT_NE(compact_body.find("required_expert_ids=device_routing_expert_mask_ptr?device_routing_required_expert_ids:all_expert_ids_;"),
+              std::string::npos)
+        << "Masked verifier routing must prepare only mask-active local experts "
+           "instead of demanding a full replicated descriptor table.";
+    EXPECT_NE(compact_body.find("ensureGemmEnginesForExperts(required_expert_ids)"),
+              std::string::npos);
+    EXPECT_NE(routing_tensor_body.find("device_routing_expert_mask_ptr"),
+              std::string::npos)
+        << "The device route calls must receive the participant mask so masked-off "
+           "top-k slots become inactive on device.";
+    EXPECT_NE(routing_tensor_predicate.find(
+                  "masked-off top-k slots to -1"),
+              std::string::npos)
+        << "The non-obvious mask/ownership split needs inline guidance.";
+    EXPECT_NE(imoe_source.find("const uint8_t *expert_mask = nullptr"),
+              std::string::npos)
+        << "The backend interface must expose an explicit optional local-compute "
+           "mask for routing-tensor decode.";
+    EXPECT_NE(cuda_source.find("cudaMoE_float_to_masked_int("),
+              std::string::npos)
+        << "CUDA routing-tensor decode must keep masked slots on device instead "
+           "of round-tripping routing ids through the host.";
+    EXPECT_NE(rocm_source.find("hipMoE_float_to_masked_int("),
+              std::string::npos)
+        << "ROCm routing-tensor decode must use the same masked device conversion.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, GpuMoERebalanceProjectionRequiresPhysicalSourceResidency)
+{
+    const auto shared_policy_source =
+        readFile(repoRoot() / "src/v2/execution/moe/DeviceMoERebalancePolicyShared.h");
+    const auto domain_policy = sliceBetween(
+        shared_policy_source,
+        "LLAMINAR_MOE_REBALANCE_HD bool candidateCanAffectDomainCompute(",
+        "} // namespace llaminar2::moe_rebalance_policy");
+    const auto compact_domain_policy =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(domain_policy));
+
+    EXPECT_EQ(compact_domain_policy.find("resident_mask|=participantBit"),
+              std::string::npos)
+        << "Domain-root planning must not promote descriptor ownership into "
+           "physical source residency.";
+    EXPECT_NE(compact_domain_policy.find(
+                  "firstResidentParticipant(resident_mask,config.participant_count,desc.owner_participant,-1)"),
+              std::string::npos)
+        << "The owner may remain a source preference, but firstResidentParticipant "
+           "must still require the bit in the physical resident mask.";
+
+    const std::vector<std::pair<std::string, std::filesystem::path>> kernels = {
+        {"CUDA", "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu"},
+        {"ROCm", "src/v2/kernels/rocm/moe/ROCmMoEKernels.hip"},
+    };
+
+    for (const auto &[backend, relative_path] : kernels)
+    {
+        const auto source = readFile(repoRoot() / relative_path);
+        const auto compact =
+            removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+        const auto root_projection = sliceBetween(
+            source,
+            "__global__ void project_rebalance_domain_commands_kernel(",
+            "__global__ void project_prefill_llep_domain_commands_kernel(");
+        const auto compact_root_projection =
+            removeAsciiWhitespace(stripCommentsAndStringLiterals(root_projection));
+        const auto prefill_projection = sliceBetween(
+            source,
+            "__global__ void project_prefill_llep_domain_commands_kernel(",
+            "__global__ void materialize_prefill_llep_transfer_commands_kernel(");
+        const auto compact_prefill_projection =
+            removeAsciiWhitespace(stripCommentsAndStringLiterals(prefill_projection));
+        const auto materialize_transfers = sliceBetween(
+            source,
+            "__global__ void materialize_prefill_llep_transfer_commands_kernel(",
+            "__global__ void pack_rebalance_source_descriptors_kernel(");
+        const auto compact_materialize =
+            removeAsciiWhitespace(stripCommentsAndStringLiterals(materialize_transfers));
+        const auto source_entry_ready = sliceBetween(
+            source,
+            "__device__ __forceinline__ bool rebalance_source_entry_ready(",
+            "__device__ __forceinline__ bool rebalance_transfer_slot_ready(");
+        const auto compact_source_entry_ready =
+            removeAsciiWhitespace(stripCommentsAndStringLiterals(source_entry_ready));
+        const auto copy_status = sliceBetween(
+            source,
+            "__device__ __forceinline__ bool rebalance_copy_status_ok(",
+            "__device__ __forceinline__ uint32_t rebalance_expected_payload_arrivals(");
+        const auto compact_copy_status =
+            removeAsciiWhitespace(stripCommentsAndStringLiterals(copy_status));
+
+        EXPECT_EQ(compact.find("runtime_participant_bit(candidate_desc.owner_participant)"),
+                  std::string::npos)
+            << backend << " dynamic planning must not treat ownership as physical source residency.";
+        EXPECT_EQ(compact.find("candidate_resident_mask|="),
+                  std::string::npos)
+            << backend << " dynamic planning must not inflate candidate residency masks.";
+        EXPECT_EQ(compact.find("projected.source_resident_mask|="),
+                  std::string::npos)
+            << backend << " domain projection must not launder invalid root-plan source masks.";
+        EXPECT_EQ(compact.find("shared_post_policy_resident_mask[transfer.expert]|source_bit"),
+                  std::string::npos)
+            << backend << " LLEP decode planning must not manufacture transfer-source residency.";
+        EXPECT_NE(compact.find("shared_physical_source_resident_mask"),
+                  std::string::npos)
+            << backend << " must keep wave-start physical source residency separate "
+               "from optimistic post-policy residency.";
+        EXPECT_NE(compact.find("candidate_physical_source_mask"),
+                  std::string::npos)
+            << backend << " dynamic missing-resident scoring must pick copy sources "
+               "from the wave-start physical mask.";
+        EXPECT_NE(compact.find("heavy_physical_source_mask"),
+                  std::string::npos)
+            << backend << " ownership swaps must validate the heavy source against "
+               "wave-start physical residency.";
+        EXPECT_NE(compact.find("light_physical_source_mask"),
+                  std::string::npos)
+            << backend << " ownership swaps must validate the light source against "
+               "wave-start physical residency.";
+        EXPECT_EQ(compact.find("static_cast<int>(destination_choice.source_participant)"),
+                  std::string::npos)
+            << backend << " must not copy from a source participant chosen from "
+               "the optimistic post-policy resident mask.";
+        EXPECT_NE(compact.find("source_delta.meets_floor"),
+                  std::string::npos)
+            << backend << " dynamic candidate scoring must recompute economics for "
+               "the physical source participant it will actually copy from.";
+        EXPECT_GE(countOccurrences(compact, "source_is_physically_resident"),
+                  2u)
+            << backend << " dynamic root planning must check the selected copy source "
+               "during both candidate selection and final command publication.";
+        EXPECT_GE(countOccurrences(compact, "heavy_physical_source_mask"),
+                  2u)
+            << backend << " dynamic ownership swaps must validate the heavy expert's "
+               "physical source residency in both controller paths.";
+        EXPECT_GE(countOccurrences(compact, "light_physical_source_mask"),
+                  2u)
+            << backend << " dynamic ownership swaps must validate the light expert's "
+               "physical source residency in both controller paths.";
+        EXPECT_EQ(compact.find("source_resident_mask=runtime_participant_bit(static_cast<int>(heavy_source))"),
+                  std::string::npos)
+            << backend << " ownership-transfer commands must publish the actual "
+               "resident mask, not a manufactured source bit.";
+        EXPECT_EQ(compact.find("source_resident_mask=runtime_participant_bit(static_cast<int>(light_source))"),
+                  std::string::npos)
+            << backend << " ownership-transfer commands must publish the actual "
+               "resident mask, not a manufactured source bit.";
+
+        EXPECT_NE(compact_root_projection.find("(plan.source_resident_mask&source_participant_bit)!=0u"),
+                  std::string::npos)
+            << backend << " root-domain projection must reject source participants "
+               "that are absent from the resident mask.";
+        EXPECT_NE(root_projection.find("Compact root-domain transfer commands after checking physical source residency"),
+                  std::string::npos)
+            << backend << " needs an inline note for the source-residency projection contract.";
+        EXPECT_NE(compact_root_projection.find("local_plan_entries[local_plan_index]=plan;"),
+                  std::string::npos)
+            << backend << " should compact only already-validated root commands.";
+        EXPECT_EQ(compact_root_projection.find("entry=gathered_plan_entries"),
+                  std::string::npos)
+            << backend << " must not copy root commands verbatim before source-residency validation.";
+
+        EXPECT_NE(compact_prefill_projection.find("(plan.source_resident_mask&source_participant_bit)!=0u"),
+                  std::string::npos)
+            << backend << " prefill-LLEP domain projection must reject non-resident sources.";
+        EXPECT_NE(compact_materialize.find("(resident_mask&transfer_source_bit)!=0u"),
+                  std::string::npos)
+            << backend << " materialized prefill-LLEP transfers must require the "
+               "selected source to be physically resident.";
+        EXPECT_NE(compact_source_entry_ready.find("entry.slot_index!=kDeviceMoEInvalidSlot"),
+                  std::string::npos)
+            << backend << " source descriptors must require a participant-local "
+               "slot before any payload bytes can be copied.";
+        EXPECT_NE(compact_source_entry_ready.find("entry.descriptor.local_slot>=0"),
+                  std::string::npos)
+            << backend << " source descriptors must reject resident masks backed "
+               "only by non-local descriptor metadata.";
+        EXPECT_EQ(compact_materialize.find("resident_mask|=llaminar2::moe_rebalance_policy::participantBit(transfer_source)"),
+                  std::string::npos)
+            << backend << " materialization must not manufacture source residency.";
+        EXPECT_NE(compact_copy_status.find("status.missing_source_descriptors==0u"),
+                  std::string::npos)
+            << backend << " transfer publication must reject source-side pack failures.";
+    }
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableGuardsOwnershipShape)
 {
     const auto graph_source =
@@ -3913,8 +4625,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ProductionGpuMoERoutingRejectsHostTopKF
               std::string::npos)
         << "Production GPU decode must fail closed if runtime-table routing is "
            "unavailable, instead of silently materializing top-k rows on host.";
-    EXPECT_NE(executable_source.find("!defined(ENABLE_PIPELINE_SNAPSHOTS)"),
-              std::string::npos);
+    EXPECT_NE(source.find("#ifdef ENABLE_PIPELINE_SNAPSHOTS"),
+              std::string::npos)
+        << "Host routing mirrors must remain snapshot-only diagnostics.";
     EXPECT_NE(executable_source.find(
                   "params_.device_id.is_gpu()&&params_.seq_len==1&&!isDeviceRoutedDecodeGraphCapturable()"),
               std::string::npos)
@@ -4590,12 +5303,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CachedForwardReplayRefreshesResidentPos
     EXPECT_NE(compact_forward_engine.find("input.position_ids_device!=nullptr"),
               std::string::npos)
         << "The cache signature should record resident-position mode.";
+    EXPECT_NE(compact_forward_types.find("selectForwardReplayHostPositionIds"),
+              std::string::npos)
+        << "Cache-hit replay must use the current invocation's position rows before cache storage.";
     EXPECT_NE(compact_forward_engine.find("stage->updateDynamicDevicePositionIds(input.position_ids_device,input.seq_len)"),
               std::string::npos)
         << "Cache-hit replay must refresh the resident RoPE pointer before capture/replay.";
-    EXPECT_NE(compact_forward_engine.find("stage->updateDynamicPositionIds(cached_position_ids,input.seq_len)"),
+    EXPECT_NE(compact_forward_engine.find("stage->updateDynamicPositionIds(replay_position_ids,input.seq_len)"),
               std::string::npos)
         << "Cache-hit replay must keep host explicit position rows fresh too.";
+    EXPECT_NE(compact_forward_engine.find("stage->updateDynamicDevicePositionIds(effective_input.position_ids_device,effective_input.seq_len)"),
+              std::string::npos)
+        << "GPU cache-miss capture must refresh resident RoPE rows after stream binding.";
+    EXPECT_NE(compact_forward_engine.find("stage->updateDynamicPositionIds(effective_input.position_ids,effective_input.seq_len)"),
+              std::string::npos)
+        << "GPU cache-miss capture must refresh host explicit RoPE rows after stream binding.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineDoesNotForceFreshGraphSegment)
@@ -4676,11 +5398,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         << "The decode-equivalent verifier lane must remain available for CPU "
            "and any GPU topology that is not allowed to use the grouped "
            "all-position publication path.";
-    EXPECT_NE(compact.find("total_tokens>1&&total_tokens<=4"),
+    EXPECT_NE(compact.find("total_tokens>=1&&total_tokens<=4"),
               std::string::npos)
-        << "Only multi-row verifier publication should force the "
-           "decode-equivalent path; one-token correction replay can keep the "
-           "grouped verifier route.";
+        << "M=1 verifier publication uses the explicit decode-equivalent path, "
+           "while M=2..4 can use the grouped verifier route.";
 
     const auto combined_shared_section = sliceBetween(
         graph_source,
@@ -4950,4 +5671,47 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveHybridCheckpointStorageUsesReusable
         << "Pool slots must not be reused while a PrefixStateSnapshot still owns device payload storage.";
     EXPECT_NE(acquire_body.find("live_prefix_checkpoint_hybrid_storage_pool_hits"), std::string::npos);
     EXPECT_NE(acquire_body.find("live_prefix_checkpoint_hybrid_storage_pool_misses"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, OrchestrationSnapshotsExposeTensorParallelSemanticViews)
+{
+    const auto header =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.h");
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+
+    EXPECT_NE(header.find("snapshot_combined_cache_"), std::string::npos)
+        << "OrchestrationRunner must own TP-combined snapshot storage so getSnapshot() "
+        << "can return a stable semantic view instead of a child-runner pointer.";
+    EXPECT_NE(header.find("local-TP topology details"), std::string::npos)
+        << "The snapshot cache member should document why topology-specific TP "
+        << "assembly is hidden behind IOrchestrationRunner.";
+
+    const auto get_snapshot_body = sliceBetween(
+        source,
+        "const float *OrchestrationRunner::getSnapshot(",
+        "std::vector<std::string> OrchestrationRunner::getSnapshotKeys()");
+    EXPECT_NE(get_snapshot_body.find("dynamic_cast<const RankOrchestrator *>"), std::string::npos)
+        << "A RankOrchestrator-backed orchestration runner must publish TP-aware snapshots.";
+    EXPECT_NE(get_snapshot_body.find("rank->getTPSnapshot(key)"), std::string::npos)
+        << "Snapshot reads must use RankOrchestrator's sharding metadata instead of "
+        << "returning only the primary participant snapshot.";
+    EXPECT_NE(get_snapshot_body.find("snapshot_combined_cache_[key]"), std::string::npos)
+        << "Combined snapshot data must live beyond the temporary TPSnapshot object.";
+
+    const auto enable_body = sliceBetween(
+        source,
+        "void OrchestrationRunner::enableSnapshotCapture(",
+        "void OrchestrationRunner::setSnapshotCaptureFilter(");
+    const auto disable_body = sliceBetween(
+        source,
+        "void OrchestrationRunner::disableSnapshotCapture(",
+        "void OrchestrationRunner::clearSnapshots()");
+    const auto clear_body = sliceBetween(
+        source,
+        "void OrchestrationRunner::clearSnapshots()",
+        "const float *OrchestrationRunner::getSnapshot(");
+    EXPECT_NE(enable_body.find("snapshot_combined_cache_.clear()"), std::string::npos);
+    EXPECT_NE(disable_body.find("snapshot_combined_cache_.clear()"), std::string::npos);
+    EXPECT_NE(clear_body.find("snapshot_combined_cache_.clear()"), std::string::npos);
 }

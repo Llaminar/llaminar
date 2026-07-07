@@ -402,6 +402,21 @@ extern "C"
         int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_gate_logits_fp32_decode_equivalent_rows(
+        const float *hidden, const float *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
+        const float *hidden, const void *gate_weights_fp16, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
+        const float *hidden, const void *gate_weights_bf16, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool hipMoE_quantize_router_gate_q8(
         const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
         int d_model, int num_experts,
@@ -411,6 +426,12 @@ extern "C"
         const float *hidden, int8_t *hidden_q8, float *hidden_scales,
         const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
         int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
     bool hipMoE_softmax_topk(
@@ -555,6 +576,20 @@ extern "C"
         uint32_t command_buffer_count,
         const void *gathered_wave_states,
         void *local_wave_states,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_project_prefill_llep_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        uint32_t *local_plan_count,
+        void *local_command_header,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
         int device_idx,
         void *stream);
 
@@ -780,6 +815,7 @@ extern "C"
         const float *routing_indices, const float *routing_weights,
         int *expert_counts, int *expert_offsets,
         int *grouped_token_indices, int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
         int total_slots, int num_experts, int top_k,
@@ -861,6 +897,7 @@ extern "C"
         uint32_t min_spread_improvement_divisor,
         uint64_t min_spread_improvement_per_transfer,
         uint64_t min_foreign_rows_per_transfer,
+        uint32_t max_weight_transfers,
         int enable_balanced_skip,
         int device_idx, void *stream);
 
@@ -873,6 +910,7 @@ extern "C"
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
         const void *transfer_status,
+        const void *apply_status,
         int device_idx, void *stream);
 
     bool hipMoE_materialize_runtime_prefill_descriptor_tables(
@@ -881,6 +919,24 @@ extern "C"
         llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
         llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_build_active_expert_list_runtime(
+        const void *runtime,
+        int *active_expert_ids,
+        int num_experts,
+        int max_active_experts,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_build_runtime_original_to_grouped(
+        const void *runtime,
+        int *original_to_grouped,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
         int device_idx,
         void *stream);
 
@@ -1104,6 +1160,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
+        const int *d_original_expert_ids,
         const float *d_group_weights,
         const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
@@ -1123,6 +1180,8 @@ extern "C"
         int total_slots,
         int top_k,
         int active_expert_slots,
+        int grouped_indices_are_route_slots,
+        int original_slot_atomic_scatter,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         uint32_t gateup_codebook_mask,
@@ -1600,31 +1659,22 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "resetDynamicState"))
             return;
 
-        // Histogram counts are session-derived, but the allocation and mask
-        // capacity are weight/model-shaped and may be referenced by captured
-        // prefill graphs, so reset contents without changing device pointers.
-        if (d_histogram_ && max_layers_ > 0 && max_experts_ > 0)
-        {
-            const size_t histogram_bytes = static_cast<size_t>(max_layers_) *
-                                           static_cast<size_t>(max_experts_) *
-                                           sizeof(uint64_t);
-            hipError_t memset_err = hipMemset(d_histogram_, 0, histogram_bytes);
-            if (memset_err != hipSuccess)
-            {
-                LOG_WARN("[ROCmMoEKernel::resetDynamicState] histogram reset failed: "
-                         << hipGetErrorString(memset_err));
-            }
-        }
-
-        // CPU-side grouping metadata mirrors the last request's routing table;
-        // clearing it prevents legacy gather/scatter fallbacks from seeing old
-        // expert counts after a cache clear.
+        /*
+         * This hook is a hard kernel-dynamic reset, not the replay-preserving
+         * request boundary. Captured HIP graph replay keeps kernel-owned
+         * workspace tables alive by avoiding KernelFactory::resetAllDynamicState().
+         * When this hook is invoked, grouped scratch, mask upload hashes,
+         * histogram buffers, pointer-table caches, and descriptor registries
+         * must be rebuilt before the next eager warmup or capture.
+         */
+        clearWorkspaceScratchBindings();
+        grouped_down_desc_tables_.clear();
+        grouped_gateup_desc_tables_.clear();
         host_expert_counts_.clear();
         host_expert_offsets_.clear();
         host_grouped_indices_.clear();
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
-        group_active_expert_slots_ = 0;
     }
 
     void ROCmMoEKernel::syncBlasStream()
@@ -1727,11 +1777,13 @@ namespace llaminar2
 
         if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_router_q8_hidden_),
                                  MoEWorkspaceBuffers::ROCM_ROUTER_Q8_HIDDEN,
-                                 static_cast<size_t>(d_model) * sizeof(int8_t),
+                                 static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                     static_cast<size_t>(d_model) * sizeof(int8_t),
                                  "ensureRouterQ8HiddenScratchCapacity(hidden)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_router_q8_hidden_scales_),
                                  MoEWorkspaceBuffers::ROCM_ROUTER_Q8_SCALES,
-                                 static_cast<size_t>(blocks_per_row) * sizeof(float),
+                                 static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                     static_cast<size_t>(blocks_per_row) * sizeof(float),
                                  "ensureRouterQ8HiddenScratchCapacity(scales)"))
         {
             d_router_q8_hidden_ = nullptr;
@@ -2061,56 +2113,6 @@ namespace llaminar2
             {
                 bufs = {};
                 return false;
-            }
-        }
-        else if (seq_len >= 2 && seq_len <= 4)
-        {
-            /*
-             * All-position MTP verifier routing must be row-for-row equivalent
-             * to ordinary decode.  The optimized small-M router is useful for
-             * throughput sweeps, but it changes the dot-product reduction order
-             * versus decode and can perturb near-tie top-k weights enough for
-             * downstream MoE/GDN state to diverge.  Use the same single-token
-             * router logits implementation that decode uses, one row at a time,
-             * while leaving softmax/top-k and all outputs device-resident.
-             */
-            void *stream = getStream();
-            bool rows_ready = true;
-            for (int row = 0; row < seq_len; ++row)
-            {
-                const float *row_hidden =
-                    hidden + static_cast<size_t>(row) * static_cast<size_t>(d_model);
-                float *row_logits =
-                    bufs.d_logits + static_cast<size_t>(row) * static_cast<size_t>(num_experts);
-                if (!launchDecodeGateLogitsForGateType(
-                        row_hidden, gate_weights, gate_type, row_logits,
-                        d_model, num_experts,
-                        device_ordinal_, stream,
-                        "ROCmMoEKernel::routeCore.decode_equivalent_small_m"))
-                {
-                    rows_ready = false;
-                    break;
-                }
-            }
-            if (!rows_ready)
-            {
-                bufs = {};
-                return false;
-            }
-
-            if (PerfStatsCollector::isEnabled())
-            {
-                PerfStatsCollector::addCounter(
-                    "kernel",
-                    "rocm_moe_decode_equivalent_small_m_router_calls",
-                    1.0,
-                    "moe",
-                    DeviceId::rocm(device_ordinal_).to_string(),
-                    PerfStatsCollector::Tags{
-                        {"seq_len", std::to_string(seq_len)},
-                        {"num_experts", std::to_string(num_experts)},
-                        {"top_k", std::to_string(top_k)},
-                        {"gate_type", tensorTypeName(gate_type)}});
             }
         }
         else if (gate_type != TensorType::FP32)
@@ -2599,6 +2601,27 @@ namespace llaminar2
                           << hipGetErrorString(err));
                 return false;
             }
+        }
+        /*
+         * Masked/padded routing can leave the compact grouped tail unused.  The
+         * grouped prefill gather is sized by total_slots, so clear stale rows
+         * before scatter publishes the valid compact prefix.
+         */
+        err = hipMemsetAsync(d_grouped_token_indices, 0,
+                             static_cast<size_t>(total_slots) * sizeof(int), stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] hipMemsetAsync grouped_token_indices failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        err = hipMemsetAsync(d_grouped_weights, 0,
+                             static_cast<size_t>(total_slots) * sizeof(float), stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] hipMemsetAsync grouped_weights failed: "
+                      << hipGetErrorString(err));
+            return false;
         }
 
         // Step 2: Count per expert
@@ -3396,6 +3419,312 @@ namespace llaminar2
                                     "ROCmMoEKernel::routeWithTensorsEffectiveSeqLen");
     }
 
+    bool ROCmMoEKernel::routeVerifierRowsDecodeEquivalent(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights)
+    {
+        constexpr const char *kContext = "ROCmMoEKernel::routeVerifierRowsDecodeEquivalent";
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!setMoEDevice(device_ordinal_, kContext))
+            return false;
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[" << kContext << "] explicit HIP stream is required");
+            return false;
+        }
+
+        if (seq_len < 1 || seq_len > 4 || d_model <= 0 ||
+            num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[" << kContext << "] invalid verifier routing shape seq_len="
+                          << seq_len << " d_model=" << d_model
+                          << " num_experts=" << num_experts
+                          << " top_k=" << top_k);
+            return false;
+        }
+
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(hidden, device, stream, "hidden", kContext) ||
+            !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights", kContext) ||
+            !ensureOutputOnDevice(output_indices, device, stream, "output_indices", kContext) ||
+            !ensureOutputOnDevice(output_weights, device, stream, "output_weights", kContext))
+        {
+            return false;
+        }
+
+        auto *hidden_base = dynamic_cast<TensorBase *>(hidden);
+        auto *gate_base = dynamic_cast<TensorBase *>(gate_weights);
+        auto *indices_base = dynamic_cast<TensorBase *>(output_indices);
+        auto *weights_base = dynamic_cast<TensorBase *>(output_weights);
+        if (!hidden_base || !gate_base || !indices_base || !weights_base)
+        {
+            LOG_ERROR("[" << kContext << "] verifier routing requires TensorBase-backed tensors");
+            return false;
+        }
+        if (hidden_base->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[" << kContext << "] hidden tensor must be FP32, got "
+                          << tensorTypeName(hidden_base->native_type()));
+            return false;
+        }
+        if (indices_base->native_type() != TensorType::FP32 ||
+            weights_base->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[" << kContext << "] routing outputs must be FP32 tensors");
+            return false;
+        }
+
+        const size_t required_hidden =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_gate =
+            static_cast<size_t>(num_experts) * static_cast<size_t>(d_model);
+        const size_t required_topk =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (hidden->numel() < required_hidden ||
+            gate_weights->numel() < required_gate ||
+            output_indices->numel() < required_topk ||
+            output_weights->numel() < required_topk)
+        {
+            LOG_ERROR("[" << kContext << "] tensor capacity is too small"
+                          << " hidden=" << hidden->numel() << "/" << required_hidden
+                          << " gate=" << gate_weights->numel() << "/" << required_gate
+                          << " indices=" << output_indices->numel() << "/" << required_topk
+                          << " weights=" << output_weights->numel() << "/" << required_topk);
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
+        float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
+        float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
+        if (!d_hidden || !d_gate || !d_idx || !d_wt)
+        {
+            LOG_ERROR("[" << kContext << "] null device pointer hidden="
+                          << static_cast<const void *>(d_hidden)
+                          << " gate=" << d_gate
+                          << " indices=" << static_cast<void *>(d_idx)
+                          << " weights=" << static_cast<void *>(d_wt));
+            return false;
+        }
+
+        const auto &rocm_env = debugEnv().rocm;
+        const bool gate_is_fp32 = (gate_base->native_type() == TensorType::FP32);
+        const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[" << kContext << "] Q8 verifier router requires d_model to be a multiple of 32, got "
+                          << d_model);
+            return false;
+        }
+        if (rocm_env.moe_router_kpart_decode)
+        {
+            LOG_ERROR("[" << kContext << "] ROCm k-part decode router is enabled, but verifier-row "
+                          "publication does not yet have a k-part row contract");
+            return false;
+        }
+
+        const size_t logits_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(num_experts);
+        const size_t topk_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        {
+            LOG_ERROR("[" << kContext << "] route scratch allocation failed");
+            return false;
+        }
+
+        bool used_q8_grouped_router = false;
+        bool used_fp16_grouped_router = false;
+        if (q8_router_requested)
+        {
+            if (!ensureRouterQ8HiddenScratchCapacity(d_model))
+            {
+                LOG_ERROR("[" << kContext << "] Q8 router hidden scratch unavailable for d_model="
+                              << d_model);
+                return false;
+            }
+            const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                gate_weights, static_cast<const float *>(d_gate), d_model, num_experts);
+            if (!q8_gate)
+            {
+                LOG_ERROR("[" << kContext << "] Q8 router gate cache unavailable");
+                return false;
+            }
+            if (!hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
+                    d_hidden,
+                    d_router_q8_hidden_,
+                    d_router_q8_hidden_scales_,
+                    q8_gate->d_gate_weights_q8,
+                    q8_gate->d_gate_scales,
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    getStream()))
+            {
+                LOG_ERROR("[" << kContext << "] grouped Q8 verifier logits failed");
+                return false;
+            }
+            used_q8_grouped_router = true;
+
+            /*
+             * M=1 remains ordinary decode and can reuse the hidden Q8 scratch
+             * for the following gate/up path.  M>1 lays scratch out as
+             * [rows,d_model], so keep the one-row reuse marker invalid until
+             * grouped expert decode has an explicit row-slice reuse contract.
+             */
+            if (seq_len == 1 && !isDecodeGraphCaptureActive())
+            {
+                router_q8_hidden_source_ = d_hidden;
+                router_q8_hidden_valid_ = true;
+            }
+            else
+            {
+                router_q8_hidden_source_ = nullptr;
+                router_q8_hidden_valid_ = false;
+            }
+        }
+        else if (gate_is_fp32)
+        {
+            const void *g_fp16 = getOrCreateFP16RouterGateCache(
+                gate_weights, static_cast<const float *>(d_gate), d_model, num_experts);
+            if (rocm_env.moe_router_fp16 && !g_fp16)
+            {
+                LOG_ERROR("[" << kContext << "] FP16 router was requested but gate cache is unavailable");
+                return false;
+            }
+            if (g_fp16)
+            {
+                if (!hipMoE_gate_logits_fp16_decode_equivalent_rows(
+                        d_hidden,
+                        g_fp16,
+                        d_route_logits_,
+                        seq_len,
+                        d_model,
+                        num_experts,
+                        device_ordinal_,
+                        getStream()))
+                {
+                    LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
+                    return false;
+                }
+                used_fp16_grouped_router = true;
+            }
+            else if (!hipMoE_gate_logits_fp32_decode_equivalent_rows(
+                         d_hidden,
+                         static_cast<const float *>(d_gate),
+                         d_route_logits_,
+                         seq_len,
+                         d_model,
+                         num_experts,
+                         device_ordinal_,
+                         getStream()))
+            {
+                LOG_ERROR("[" << kContext << "] grouped FP32 verifier logits failed");
+                return false;
+            }
+        }
+        else if (gate_base->native_type() == TensorType::FP16)
+        {
+            if (!hipMoE_gate_logits_fp16_decode_equivalent_rows(
+                    d_hidden,
+                    d_gate,
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    getStream()))
+            {
+                LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
+                return false;
+            }
+            used_fp16_grouped_router = true;
+        }
+        else if (gate_base->native_type() == TensorType::BF16)
+        {
+            if (!hipMoE_gate_logits_bf16_decode_equivalent_rows(
+                    d_hidden,
+                    d_gate,
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    getStream()))
+            {
+                LOG_ERROR("[" << kContext << "] grouped BF16 verifier logits failed");
+                return false;
+            }
+        }
+        else
+        {
+            LOG_ERROR("[" << kContext << "] unsupported router gate dtype "
+                          << tensorTypeName(gate_base->native_type()));
+            return false;
+        }
+
+        if (!hipMoE_softmax_topk(d_route_logits_,
+                                 d_route_indices_,
+                                 d_route_weights_,
+                                 seq_len,
+                                 num_experts,
+                                 top_k,
+                                 normalize_weights,
+                                 device_ordinal_,
+                                 getStream(),
+                                 nullptr))
+        {
+            LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
+            return false;
+        }
+
+        if (!hipMoE_int_to_float(d_route_indices_,
+                                 d_idx,
+                                 static_cast<int>(topk_count),
+                                 device_ordinal_,
+                                 getStream()))
+        {
+            LOG_ERROR("[" << kContext << "] grouped int-to-float index conversion failed");
+            return false;
+        }
+        const hipError_t copy_status = hipMemcpyAsync(
+            d_wt,
+            d_route_weights_,
+            topk_count * sizeof(float),
+            hipMemcpyDeviceToDevice,
+            stream);
+        if (copy_status != hipSuccess)
+        {
+            LOG_ERROR("[" << kContext << "] grouped D2D weight copy failed: "
+                          << hipGetErrorString(copy_status));
+            return false;
+        }
+
+        markDeviceWritten(output_indices, device, getStream());
+        markDeviceWritten(output_weights, device, getStream());
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_moe_decode_equivalent_small_m_router_calls",
+            1.0,
+            {},
+            {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"d_model", std::to_string(d_model)},
+             {"num_experts", std::to_string(num_experts)},
+             {"top_k", std::to_string(top_k)},
+             {"route", used_q8_grouped_router ? "grouped_decode_equivalent_q8"
+                                               : (used_fp16_grouped_router
+                                                      ? "grouped_decode_equivalent_fp16"
+                                                      : "grouped_decode_equivalent")}});
+        return true;
+    }
+
     bool ROCmMoEKernel::decodeRouteSelect(
         DeviceMoELayerRuntime *runtime_layer,
         ITensor *hidden, ITensor *gate_weights,
@@ -4147,6 +4476,51 @@ namespace llaminar2
             command_buffer_count,
             gathered_wave_states,
             local_wave_states,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands(
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntry *local_plan_entries,
+        uint32_t *local_plan_count,
+        DeviceMoERebalanceCommandBufferHeader *local_command_header,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceStatus *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_plan_entries || !local_plan_count || !local_command_header ||
+            !status || plan_capacity == 0 || payload_slot_capacity == 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands] gathered commands, local command output, status, and payload capacity are required");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::projectPrefillLeastLoadedDomainCommands");
+        if (!setMoEDevice(device_ordinal_, "projectPrefillLeastLoadedDomainCommands"))
+            return false;
+
+        return hipMoE_project_prefill_llep_domain_commands(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_plan_entries,
+            local_plan_count,
+            local_command_header,
+            &config,
+            status,
+            payload_slot_capacity,
+            command_buffer_count,
             device_ordinal_,
             stream);
     }
@@ -5438,7 +5812,8 @@ namespace llaminar2
         ITensor *const *gate_outputs,
         ITensor *const *up_outputs,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const uint8_t *expert_mask)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
 
@@ -5523,29 +5898,97 @@ namespace llaminar2
             return false;
         }
 
-        if (!hipMoE_float_to_int(
-                d_routing_indices, d_grouped_gateup_expert_ids_, top_k,
-                device_ordinal_, getStream()))
+        /*
+         * The ROCm MTP verifier deliberately replays decode-equivalent rows from
+         * device routing tensors.  In LocalTP ExpertParallel overlays the route
+         * tensor names global experts, while this participant should compute only
+         * its mask-active shard before the MoE output allreduce.  The masked
+         * conversion writes -1 for nonlocal top-k slots into backend scratch; the
+         * grouped table kernels already skip those inactive slots.
+         */
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(expert_mask, table.num_experts))
+                return false;
+            if (!hipMoE_float_to_masked_int(
+                    d_routing_indices,
+                    d_grouped_gateup_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    table.num_experts,
+                    device_ordinal_,
+                    getStream()))
+            {
+                return false;
+            }
+        }
+        else if (!hipMoE_float_to_int(
+                     d_routing_indices, d_grouped_gateup_expert_ids_, top_k,
+                     device_ordinal_, getStream()))
         {
             return false;
         }
 
-        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
-            d_hidden,
-            table.device_gate_descs,
-            table.device_up_descs,
-            d_grouped_gateup_expert_ids_,
-            d_grouped_gate_output_ptrs_,
-            d_grouped_up_output_ptrs_,
-            d_grouped_hidden_int8_,
-            d_grouped_hidden_scales_,
-            false,
-            top_k,
-            intermediate,
-            d_model,
-            table.codebook_id,
-            device_ordinal_,
-            getStream());
+        const int k_partitions = debugEnv().rocm.moe_gateup_kparts;
+        const bool use_kpart_gateup = debugEnv().rocm.moe_gateup_kpart_decode;
+        if (use_kpart_gateup && !groupedDecodeSupportsCodebook(table.codebook_id))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] "
+                      "K-part gate/up decode was requested but codebook "
+                      << static_cast<int>(table.codebook_id) << " is unsupported");
+            return false;
+        }
+        if (use_kpart_gateup && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
+
+        /*
+         * Serial decode and grouped verifier execution must use the same
+         * gate/up reduction plan.  The verifier owns explicit routing tensors,
+         * so it cannot call the runtime-table entry point directly; instead it
+         * selects the matching table-descriptor kernel variant here.  This keeps
+         * LocalTP MTP verifier rows bitwise aligned with ordinary decode while
+         * remaining device-resident and graph-capturable.
+         */
+        const bool ok = use_kpart_gateup
+                            ? rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                                  d_hidden,
+                                  table.device_gate_descs,
+                                  table.device_up_descs,
+                                  d_grouped_gateup_expert_ids_,
+                                  d_grouped_gate_output_ptrs_,
+                                  d_grouped_up_output_ptrs_,
+                                  d_grouped_hidden_int8_,
+                                  d_grouped_hidden_scales_,
+                                  false,
+                                  d_grouped_gateup_gate_partials_,
+                                  d_grouped_gateup_up_partials_,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  table.codebook_id,
+                                  k_partitions,
+                                  device_ordinal_,
+                                  getStream())
+                            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
+                                  d_hidden,
+                                  table.device_gate_descs,
+                                  table.device_up_descs,
+                                  d_grouped_gateup_expert_ids_,
+                                  d_grouped_gate_output_ptrs_,
+                                  d_grouped_up_output_ptrs_,
+                                  d_grouped_hidden_int8_,
+                                  d_grouped_hidden_scales_,
+                                  false,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  table.codebook_id,
+                                  device_ordinal_,
+                                  getStream());
 
         if (ok)
         {
@@ -6226,7 +6669,8 @@ namespace llaminar2
         int top_k,
         ITensor *output,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const uint8_t *expert_mask)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SWIGLU, static_cast<hipStream_t>(getStream()));
 
@@ -6312,28 +6756,78 @@ namespace llaminar2
             return false;
         }
 
-        if (!hipMoE_float_to_int(
-                d_routing_indices, d_grouped_expert_ids_, top_k,
-                device_ordinal_, getStream()))
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(expert_mask, table.num_experts))
+                return false;
+            if (!hipMoE_float_to_masked_int(
+                    d_routing_indices,
+                    d_grouped_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    table.num_experts,
+                    device_ordinal_,
+                    getStream()))
+            {
+                return false;
+            }
+        }
+        else if (!hipMoE_float_to_int(
+                     d_routing_indices, d_grouped_expert_ids_, top_k,
+                     device_ordinal_, getStream()))
         {
             return false;
         }
 
-        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
-            d_grouped_gate_ptrs_,
-            d_grouped_up_ptrs_,
-            table.device_descs,
-            d_grouped_expert_ids_,
-            d_weights,
-            d_grouped_swiglu_int8_,
-            d_grouped_swiglu_scales_,
-            d_output,
-            top_k,
-            d_model,
-            intermediate,
-            table.codebook_id,
-            device_ordinal_,
-            getStream());
+        const bool use_parallel_down = debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+        if (use_parallel_down && !groupedDecodeSupportsCodebook(table.codebook_id))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] "
+                      "parallel down decode was requested but codebook "
+                      << static_cast<int>(table.codebook_id) << " is unsupported");
+            return false;
+        }
+
+        /*
+         * The verifier path enters with explicit route tensors rather than a
+         * DeviceMoELayerRuntime, but it still has to select the same down-proj
+         * reduction variant as serial decode.  Otherwise LocalTP MTP rows can
+         * be routed to the same experts and still drift after the weighted down
+         * projection because runtime decode used the parallel accumulator while
+         * grouped verifier execution used a different table helper.
+         */
+        const bool ok = use_parallel_down
+                            ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
+                                  d_grouped_gate_ptrs_,
+                                  d_grouped_up_ptrs_,
+                                  table.device_descs,
+                                  d_grouped_expert_ids_,
+                                  d_weights,
+                                  d_grouped_swiglu_int8_,
+                                  d_grouped_swiglu_scales_,
+                                  false,
+                                  d_output,
+                                  top_k,
+                                  d_model,
+                                  intermediate,
+                                  table.codebook_id,
+                                  device_ordinal_,
+                                  getStream())
+                            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+                                  d_grouped_gate_ptrs_,
+                                  d_grouped_up_ptrs_,
+                                  table.device_descs,
+                                  d_grouped_expert_ids_,
+                                  d_weights,
+                                  d_grouped_swiglu_int8_,
+                                  d_grouped_swiglu_scales_,
+                                  d_output,
+                                  top_k,
+                                  d_model,
+                                  intermediate,
+                                  table.codebook_id,
+                                  device_ordinal_,
+                                  getStream());
 
         if (ok)
             markDeviceWritten(output, device, getStream());
@@ -6738,6 +7232,7 @@ namespace llaminar2
             config.min_spread_improvement_divisor,
             config.min_spread_improvement_per_transfer,
             config.min_foreign_rows_per_transfer,
+            config.max_weight_transfers,
             config.enable_balanced_skip ? 1 : 0,
             device_ordinal_,
             getStream());
@@ -6787,16 +7282,17 @@ namespace llaminar2
         int max_tokens,
         int num_experts,
         int top_k,
-        const DeviceMoERebalanceStatus *transfer_status)
+        const DeviceMoERebalanceStatus *transfer_status,
+        const DeviceMoERebalanceApplyStatus *apply_status)
     {
         if (!runtime_layer)
         {
             LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
             return false;
         }
-        if (!transfer_status)
+        if (!transfer_status || !apply_status)
         {
-            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] transfer status is required");
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] transfer and apply status are required");
             return false;
         }
         if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
@@ -6814,6 +7310,24 @@ namespace llaminar2
         }
         if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"))
             return false;
+        if (!validateDevicePointerOrLog(
+                runtime_layer,
+                device_ordinal_,
+                "runtime_layer",
+                "ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers") ||
+            !validateDevicePointerOrLog(
+                transfer_status,
+                device_ordinal_,
+                "transfer_status",
+                "ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers") ||
+            !validateDevicePointerOrLog(
+                apply_status,
+                device_ordinal_,
+                "apply_status",
+                "ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"))
+        {
+            return false;
+        }
 
         return hipMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
             static_cast<void *>(runtime_layer),
@@ -6822,6 +7336,7 @@ namespace llaminar2
             num_experts,
             top_k,
             transfer_status,
+            apply_status,
             device_ordinal_,
             getStream());
     }
@@ -7188,6 +7703,14 @@ namespace llaminar2
         if (use_small_grouping)
         {
             const int active_expert_slots = std::min(total_slots, num_experts);
+            /*
+             * Small verifier batches use a single graph-capturable planner
+             * kernel that publishes every piece of route metadata consumed by
+             * grouped execution.  d_group_int_indices_ is deliberately passed
+             * as original route-slot expert ids; executeGroupedPrefillPipeline
+             * later gives that same buffer to the parallel down publication
+             * kernel when ROCm serial decode is using parallel down.
+             */
             if (!hipMoE_group_tokens_small_float(
                     d_float_indices,
                     d_float_weights,
@@ -7195,6 +7718,7 @@ namespace llaminar2
                     d_group_offsets_,
                     d_group_token_indices_,
                     d_group_original_to_grouped_,
+                    d_group_int_indices_,
                     d_group_weights_,
                     d_group_active_expert_ids_,
                     total_slots,
@@ -7744,15 +8268,20 @@ namespace llaminar2
         }
 
         /*
-         * The ordered scatter kernel writes every output element exactly once.
-         * Only the legacy atomic scatter fallback needs a pre-zeroed output
-         * buffer.  Keeping this branch outside the device pipeline removes one
-         * captured graph node per verifier MoE layer in the normal small-M path.
+         * Ordered scatter writes every output element exactly once and matches
+         * serial non-parallel decode.  When ROCm serial decode uses parallel
+         * down, the verifier must publish with the same route-slot atomic-add
+         * semantics; that mode accumulates into a pre-zeroed output just like
+         * the legacy atomic scatter fallback.
          */
+        const bool original_slot_atomic_scatter =
+            debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
+        const bool scatter_overwrites_output =
+            ordered_scatter_overwrites_output && !original_slot_atomic_scatter;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (!ordered_scatter_overwrites_output)
+        if (!scatter_overwrites_output)
         {
             hipError_t memset_err = hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
             if (memset_err != hipSuccess)
@@ -7773,6 +8302,7 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
+            original_slot_atomic_scatter ? d_group_int_indices_ : nullptr,
             d_group_weights_,
             d_active_expert_ids,
             d_prefill_A_int8_,
@@ -7792,6 +8322,8 @@ namespace llaminar2
             total_slots,
             top_k,
             active_expert_slots,
+            0,
+            original_slot_atomic_scatter ? 1 : 0,
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_table.codebook_mask,
@@ -7926,17 +8458,76 @@ namespace llaminar2
             return false;
         }
 
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        hipError_t memset_err = hipMemsetAsync(
-            d_output,
-            0,
-            static_cast<size_t>(seq_len) * d_model * sizeof(float),
-            stream);
-        if (memset_err != hipSuccess)
+        if (total_slots > group_slots_cap_ ||
+            !d_group_active_expert_ids_ ||
+            !d_group_original_to_grouped_)
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] output zero failed: "
-                      << hipGetErrorString(memset_err));
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "executeGroupedPrefillPipelineFromRuntime(group_active_expert_ids)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
+                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "executeGroupedPrefillPipelineFromRuntime(group_original_to_grouped)"))
+            {
+                d_group_active_expert_ids_ = nullptr;
+                d_group_original_to_grouped_ = nullptr;
+                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] runtime grouping workspace is required");
+                return false;
+            }
+            group_slots_cap_ = total_slots;
+        }
+        const int active_expert_slots = std::min(total_slots, num_experts);
+        if (!hipMoE_build_active_expert_list_runtime(
+                device_runtime_layer,
+                d_group_active_expert_ids_,
+                num_experts,
+                active_expert_slots,
+                device_ordinal_,
+                getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build active expert list");
             return false;
+        }
+        group_active_expert_slots_ = active_expert_slots;
+
+        /*
+         * Runtime LLEP grouped prefill stores route slots in grouped_token_ids.
+         * Rebuilding the inverse map lets the scatter stage publish in original
+         * route-slot order.  Deterministic ordered scatter matches serial
+         * non-parallel decode; original-slot atomic scatter matches ROCm
+         * parallel-down decode.
+         */
+        if (!hipMoE_build_runtime_original_to_grouped(
+                device_runtime_layer,
+                d_group_original_to_grouped_,
+                total_slots,
+                total_slots,
+                num_experts,
+                top_k,
+                device_ordinal_,
+                getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to build runtime ordered-scatter map");
+            return false;
+        }
+
+        const bool original_slot_atomic_scatter =
+            debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+        if (original_slot_atomic_scatter)
+        {
+            hipError_t memset_err = hipMemsetAsync(
+                d_output,
+                0,
+                static_cast<size_t>(seq_len) * static_cast<size_t>(d_model) * sizeof(float),
+                static_cast<hipStream_t>(getStream()));
+            if (memset_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] output zero failed: "
+                          << hipGetErrorString(memset_err));
+                return false;
+            }
         }
 
         const bool ok = rocmMoE_grouped_prefill_pipeline(
@@ -7947,9 +8538,10 @@ namespace llaminar2
             runtime_host_layer.expert_counts,
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
-            nullptr,
+            d_group_original_to_grouped_,
+            original_slot_atomic_scatter ? runtime_host_layer.route_expert_ids : nullptr,
             runtime_host_layer.grouped_route_weights,
-            nullptr,
+            d_group_active_expert_ids_,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
@@ -7966,7 +8558,9 @@ namespace llaminar2
             max_tokens_per_expert,
             total_slots,
             top_k,
-            0,
+            active_expert_slots,
+            1,
+            original_slot_atomic_scatter ? 1 : 0,
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_table.codebook_mask,
