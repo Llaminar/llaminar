@@ -462,13 +462,14 @@ namespace llaminar2
         int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
         int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
         /**
-         * @brief Read the host-visible sidecar base position for MTP planning.
+         * @brief Resolve the scalar sidecar base position for MTP planning.
          *
          * vLLM-style resident publication can advance logical positions on the
-         * device before the compatibility bridge refreshes host mirrors.  This
-         * helper is the only MTP planning path that may read `get_position()`;
-         * it hard-fails when a current resident mailbox exists but host mirrors
-         * have not been adopted yet.
+         * device before backend host mirrors observe the same transaction. This
+         * helper is the only scalar MTP planning path that may read
+         * `get_position()`. When a live resident mailbox exists and the backend
+         * host mirror is stale, it instead returns the runner-owned transaction
+         * shadow maintained from accepted-state publication metadata.
          */
         std::optional<int> currentMTPBaseSidecarPositionForPlanning(
             const char *context,
@@ -688,6 +689,16 @@ namespace llaminar2
         std::optional<SamplingParams>
             prelaunched_mtp_first_sidecar_params_;
         /**
+         * @brief Scalar planning position for device-resident MTP transactions.
+         *
+         * This value is a host-visible scalar, but it is not copied from backend
+         * logical mirrors. It is derived from the same verifier-base and
+         * accepted-state counts that drive device publication, so scalar control
+         * flow can schedule the next graph while KV/GDN/short-conv/logical state
+         * remain resident on the backend runner.
+         */
+        std::optional<int> device_resident_mtp_planning_position_;
+        /**
          * @brief Per-request state initialized by prefillBatch().
          *
          * Phase 8 request batching must never reuse the scalar last-token or
@@ -700,6 +711,7 @@ namespace llaminar2
         struct BatchedDecodeRequestState
         {
             int32_t last_token = 0;
+            int logical_tokens = 0;
             bool prefill_logits_ready = false;
             std::optional<int32_t> ready_sampled_token;
             std::optional<SamplingParams> ready_sampled_params;

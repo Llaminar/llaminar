@@ -13314,7 +13314,7 @@ namespace llaminar2
     void DeviceGraphOrchestrator::clearDeviceResidentLogicalSequenceStateMailbox()
     {
         device_resident_logical_sequence_state_mailbox_.clear();
-        device_resident_logical_sequence_host_adopted_epoch_ = 0;
+        device_resident_logical_sequence_host_mirror_epoch_ = 0;
     }
 
     DeviceResidentLogicalSequenceStateHandle
@@ -13356,7 +13356,7 @@ namespace llaminar2
             return true;
         }
 
-        return device_resident_logical_sequence_host_adopted_epoch_ ==
+        return device_resident_logical_sequence_host_mirror_epoch_ ==
                mailbox.live_state_epoch;
     }
 
@@ -13456,7 +13456,7 @@ namespace llaminar2
         }
 
         device_resident_logical_sequence_state_mailbox_ = mailbox;
-        device_resident_logical_sequence_host_adopted_epoch_ = 0;
+        device_resident_logical_sequence_host_mirror_epoch_ = 0;
         PerfStatsCollector::addCounter(
             "mtp",
             "device_resident_logical_state_mailboxes",
@@ -13679,6 +13679,14 @@ namespace llaminar2
                     : "host-plan resident logical-state mailbox could not record readiness: " +
                           mailbox_error);
         }
+        /*
+         * Host-plan publication has already advanced state_.positions,
+         * state_.sequence_lengths, and the host KV mirrors before this helper
+         * uploads the matching resident mailbox.  Mark this epoch as
+         * host-visible without introducing a separate adoption handoff.
+         */
+        device_resident_logical_sequence_host_mirror_epoch_ =
+            live_replay_state_epoch_;
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -13869,19 +13877,19 @@ namespace llaminar2
             return false;
         }
 
-        const uint64_t old_host_adopted_epoch =
-            device_resident_logical_sequence_host_adopted_epoch_;
+        const uint64_t old_host_mirror_epoch =
+            device_resident_logical_sequence_host_mirror_epoch_;
         mailbox.producer_stream = producer_stream;
         mailbox.ready_event = std::move(ready_event);
         mailbox.live_state_epoch = live_replay_state_epoch_;
-        if (old_host_adopted_epoch == previous_epoch)
+        if (old_host_mirror_epoch == previous_epoch)
         {
             /*
              * The shifted-MTP KV append changes verifier input state only.  The
              * host-visible logical positions/sequence lengths still mirror the
-             * device rows that were adopted immediately after publication.
+             * resident logical rows when they were current before the retarget.
              */
-            device_resident_logical_sequence_host_adopted_epoch_ =
+            device_resident_logical_sequence_host_mirror_epoch_ =
                 live_replay_state_epoch_;
         }
 
@@ -14089,11 +14097,10 @@ namespace llaminar2
         /*
          * This is intentionally split from IKVCache device publication.  A cache
          * can update its device head/count mirrors only when DGO also records a
-         * resident logical-state mailbox and refuses stale host-position reads
-         * until adoption.  Host graph signatures are safe after adoption because
-         * adoptDeviceResidentMTPSpecPublishedHostState() refreshes both DGO
-         * position mirrors and KV cache host head/count mirrors from the same
-         * validated step plan.
+         * resident logical-state mailbox and refuses stale host-position reads.
+         * Host graph signatures are safe only when the transaction that records
+         * the mailbox also advanced DGO position mirrors and KV cache host
+         * head/count mirrors.
          */
         return state_.device_id.is_gpu() &&
                state_.kv_cache != nullptr &&
@@ -14570,530 +14577,6 @@ namespace llaminar2
 	             {"skipped_stages", std::to_string(state_result.skipped_stage_count)}});
         if (forward_engine_)
             forward_engine_->clearLastAllPositionVerifierForwardGraph();
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostState(
-        const MTPSpecStepPlanBatch &plans,
-        std::string *error)
-    {
-        auto fail = [&](std::string reason) -> bool
-        {
-            if (error)
-                *error = reason;
-            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
-            return false;
-        };
-
-        if (!plans.ok)
-        {
-            return fail("device-resident host-state adoption received an invalid plan batch: " +
-                        plans.error);
-        }
-        if (plans.request_count <= 0 ||
-            static_cast<int>(plans.steps.size()) != plans.request_count)
-        {
-            return fail("device-resident host-state adoption received inconsistent request count");
-        }
-
-        const auto &mailbox =
-            device_resident_logical_sequence_state_mailbox_;
-        if (!mailbox.valid() ||
-            mailbox.live_state_epoch != live_replay_state_epoch_)
-        {
-            return fail("device-resident host-state adoption requires the current logical-state mailbox");
-        }
-        if (mailbox.request_count != plans.request_count)
-        {
-            std::ostringstream msg;
-            msg << "device-resident host-state adoption request-count mismatch: mailbox="
-                << mailbox.request_count << " plan=" << plans.request_count;
-            return fail(msg.str());
-        }
-        if (plans.request_count > state_.batch_size)
-        {
-            return fail("device-resident host-state adoption exceeds initialized runner batch size");
-        }
-        if (static_cast<int>(state_.positions.size()) < plans.request_count ||
-            static_cast<int>(state_.sequence_lengths.size()) < plans.request_count)
-        {
-            return fail("device-resident host-state adoption requires per-request host mirrors");
-        }
-
-        std::vector<bool> seen_request(static_cast<size_t>(plans.request_count), false);
-        std::vector<int32_t> target_cached_tokens(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<int32_t> accepted_state_counts(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<int32_t> publication_ok_flags(
-            static_cast<size_t>(plans.request_count),
-            0);
-        for (const MTPSpecStepPlan &step : plans.steps)
-        {
-            if (step.request_index < 0 ||
-                step.request_index >= plans.request_count)
-            {
-                return fail("device-resident host-state adoption received an out-of-range request index");
-            }
-            if (seen_request[static_cast<size_t>(step.request_index)])
-            {
-                return fail("device-resident host-state adoption received a duplicate request index");
-            }
-            seen_request[static_cast<size_t>(step.request_index)] = true;
-            if (step.target_cached_tokens !=
-                step.base_cached_tokens + step.accepted_count)
-            {
-                return fail("device-resident host-state adoption target cache count drifted from base plus accepted");
-            }
-            target_cached_tokens[static_cast<size_t>(step.request_index)] =
-                step.target_cached_tokens;
-            accepted_state_counts[static_cast<size_t>(step.request_index)] =
-                step.accepted_count;
-            publication_ok_flags[static_cast<size_t>(step.request_index)] = 1;
-        }
-
-        for (bool seen : seen_request)
-        {
-            if (!seen)
-                return fail("device-resident host-state adoption plan is missing a request index");
-        }
-
-        if (!state_.kv_cache)
-        {
-            return fail("device-resident host-state adoption requires a live KV cache");
-        }
-        IKVCache::HostSequenceStatePublicationRequest kv_host_request;
-        kv_host_request.request_count = plans.request_count;
-        kv_host_request.first_seq_idx = 0;
-        kv_host_request.target_cached_tokens = target_cached_tokens;
-        kv_host_request.accepted_state_counts = accepted_state_counts;
-        kv_host_request.publication_ok_flags = publication_ok_flags;
-
-        std::string kv_host_error;
-        if (!state_.kv_cache->adoptSequenceStateFromHostMetadata(
-                kv_host_request,
-                &kv_host_error))
-        {
-            return fail(
-                kv_host_error.empty()
-                    ? "device-resident host-state adoption could not update KV host mirrors"
-                    : "device-resident host-state adoption could not update KV host mirrors: " +
-                          kv_host_error);
-        }
-
-        /*
-         * Device publication advanced every shifted MTP KV cache on the
-         * verifier stream.  Refresh the matching host mirrors from the same
-         * step plan before exposing host-visible positions.  Depth d owns the
-         * sequence shifted by d + 1 rows, so its target is
-         * max(0, main_target - d - 1) and its wrapped-head delta is the
-         * difference from the prior shifted length.
-         */
-        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
-        {
-            auto &cache = state_.mtp_kv_caches[depth];
-            if (!cache)
-                return fail("device-resident host-state adoption encountered an uninitialized shifted MTP KV cache");
-
-            std::vector<int32_t> shifted_target_cached_tokens(
-                static_cast<size_t>(plans.request_count),
-                0);
-            std::vector<int32_t> shifted_accepted_state_counts(
-                static_cast<size_t>(plans.request_count),
-                0);
-
-            for (const MTPSpecStepPlan &step : plans.steps)
-            {
-                const int shift = static_cast<int>(depth) + 1;
-                const int base_shifted =
-                    std::max(0, step.base_cached_tokens - shift);
-                const int target_shifted =
-                    computeMTPShiftedKVTargetCachedTokens(
-                        step,
-                        static_cast<int>(depth));
-                const int current_shifted =
-                    cache->get_cached_tokens(
-                        cache->first_layer_index(),
-                        step.request_index);
-                if (current_shifted < 0)
-                    return fail("device-resident host-state adoption read an invalid shifted MTP KV host mirror");
-
-                const size_t idx =
-                    static_cast<size_t>(step.request_index);
-                shifted_target_cached_tokens[idx] = target_shifted;
-                shifted_accepted_state_counts[idx] =
-                    std::max(0, target_shifted - current_shifted);
-                if (target_shifted < current_shifted)
-                {
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "device_resident_shifted_mtp_kv_host_truncations",
-                        1.0,
-                        "decode",
-                        state_.device_id.toString(),
-                        {{"depth", std::to_string(depth)},
-                         {"current", std::to_string(current_shifted)},
-                         {"target", std::to_string(target_shifted)},
-                         {"base_shifted", std::to_string(base_shifted)}});
-                }
-            }
-
-            IKVCache::HostSequenceStatePublicationRequest shifted_host_request;
-            shifted_host_request.request_count = plans.request_count;
-            shifted_host_request.first_seq_idx = 0;
-            shifted_host_request.target_cached_tokens =
-                std::move(shifted_target_cached_tokens);
-            shifted_host_request.accepted_state_counts =
-                std::move(shifted_accepted_state_counts);
-            shifted_host_request.publication_ok_flags = publication_ok_flags;
-
-            std::string shifted_host_error;
-            if (!cache->adoptSequenceStateFromHostMetadata(
-                    shifted_host_request,
-                    &shifted_host_error))
-            {
-                return fail(
-                    shifted_host_error.empty()
-                        ? "device-resident host-state adoption could not update shifted MTP KV host mirrors"
-                        : "device-resident host-state adoption could not update shifted MTP KV host mirrors: " +
-                              shifted_host_error);
-            }
-        }
-
-        for (const MTPSpecStepPlan &step : plans.steps)
-        {
-            state_.positions[static_cast<size_t>(step.request_index)] =
-                step.target_cached_tokens;
-            state_.sequence_lengths[static_cast<size_t>(step.request_index)] =
-                step.target_cached_tokens;
-        }
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "device_resident_host_state_adoptions",
-            1.0,
-            "decode",
-            state_.device_id.toString(),
-            {{"request_count", std::to_string(plans.request_count)}});
-        device_resident_logical_sequence_host_adopted_epoch_ =
-            mailbox.live_state_epoch;
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
-        const DeviceResidentHostStateAdoptionRequest &request,
-        std::string *error)
-    {
-        auto fail = [&](std::string reason) -> bool
-        {
-            if (error)
-                *error = reason;
-            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
-            return false;
-        };
-
-        if (!request.valid())
-        {
-            return fail(
-                "device-resident host-state adoption from metadata received an invalid request");
-        }
-        if (!state_.device_id.is_gpu() ||
-            request.logical_state.device != state_.device_id)
-        {
-            return fail(
-                "device-resident host-state adoption from metadata requires the runner GPU device");
-        }
-
-        const int request_count = request.logical_state.request_count;
-        const auto &mailbox =
-            device_resident_logical_sequence_state_mailbox_;
-        if (!mailbox.ownsHandle(request.logical_state, live_replay_state_epoch_))
-        {
-            return fail(
-                "device-resident host-state adoption from metadata requires the current logical-state mailbox");
-        }
-        if (request_count > state_.batch_size)
-        {
-            return fail(
-                "device-resident host-state adoption from metadata exceeds initialized runner batch size");
-        }
-        if (static_cast<int>(state_.positions.size()) < request_count ||
-            static_cast<int>(state_.sequence_lengths.size()) < request_count)
-        {
-            return fail(
-                "device-resident host-state adoption from metadata requires per-request host mirrors");
-        }
-        if (!state_.kv_cache)
-        {
-            return fail(
-                "device-resident host-state adoption from metadata requires a live KV cache");
-        }
-        if (!stochastic_batch_output_host_scratch_ ||
-            !stochastic_batch_output_host_scratch_->canServe(
-                request_count,
-                /*output_stride=*/0,
-                /*meta_stride=*/3))
-        {
-            return fail(
-                "device-resident host-state adoption from metadata requires pinned host scratch");
-        }
-
-        IBackend *backend = getBackendFor(state_.device_id);
-        if (!backend)
-        {
-            return fail(
-                "device-resident host-state adoption from metadata could not resolve backend");
-        }
-
-        void *copy_stream = stochastic_outcome_response_bridge_stream_.get();
-        if (!copy_stream)
-        {
-            void *raw_copy_stream =
-                backend->createStream(state_.device_id.gpu_ordinal());
-            if (!raw_copy_stream)
-            {
-                return fail(
-                    "device-resident host-state adoption from metadata could not create explicit bridge stream");
-            }
-            const int device_ordinal = state_.device_id.gpu_ordinal();
-            stochastic_outcome_response_bridge_stream_.reset(
-                raw_copy_stream,
-                [backend, device_ordinal](void *stream)
-                {
-                    if (stream)
-                        backend->destroyStream(stream, device_ordinal);
-                });
-            copy_stream = stochastic_outcome_response_bridge_stream_.get();
-        }
-
-        if (!backend->streamWaitEvent(
-                copy_stream,
-                request.logical_state.ready_event,
-                state_.device_id.gpu_ordinal()))
-        {
-            return fail(
-                "device-resident host-state adoption from metadata could not wait for logical-state mailbox");
-        }
-
-        int32_t *scratch =
-            reinterpret_cast<int32_t *>(
-                stochastic_batch_output_host_scratch_->meta);
-        int32_t *target_cached_tokens_scratch = scratch;
-        int32_t *accepted_state_counts_scratch =
-            scratch + static_cast<size_t>(request_count);
-        int32_t *publication_ok_flags_scratch =
-            accepted_state_counts_scratch +
-            static_cast<size_t>(request_count);
-        const size_t bytes =
-            static_cast<size_t>(request_count) * sizeof(int32_t);
-
-        {
-            PerfStatsCollector::ScopedTimer enqueue_timer(
-                "mtp",
-                "device_resident_host_state_metadata_d2h_enqueue",
-                perfPhaseName(),
-                state_.device_id.toString(),
-                {{"requests", std::to_string(request_count)}});
-            if (!backend->deviceToHostOnStream(
-                    target_cached_tokens_scratch,
-                    request.logical_state.target_sequence_lengths_device,
-                    bytes,
-                    state_.device_id.gpu_ordinal(),
-                    copy_stream) ||
-                !backend->deviceToHostOnStream(
-                    accepted_state_counts_scratch,
-                    request.logical_state.accepted_state_counts_device,
-                    bytes,
-                    state_.device_id.gpu_ordinal(),
-                    copy_stream) ||
-                !backend->deviceToHostOnStream(
-                    publication_ok_flags_scratch,
-                    request.logical_state.publication_ok_flags_device,
-                    bytes,
-                    state_.device_id.gpu_ordinal(),
-                    copy_stream))
-            {
-                return fail(
-                    "device-resident host-state adoption from metadata could not enqueue logical-state D2H copies");
-            }
-        }
-        {
-            PerfStatsCollector::ScopedTimer wait_timer(
-                "mtp",
-                "device_resident_host_state_metadata_d2h_wait",
-                perfPhaseName(),
-                state_.device_id.toString(),
-                {{"requests", std::to_string(request_count)}});
-            if (!backend->synchronizeStream(
-                    copy_stream,
-                    state_.device_id.gpu_ordinal()))
-            {
-                return fail(
-                    "device-resident host-state adoption from metadata could not synchronize bridge stream");
-            }
-        }
-
-        std::vector<int32_t> target_cached_tokens(
-            static_cast<size_t>(request_count),
-            0);
-        std::vector<int32_t> accepted_state_counts(
-            static_cast<size_t>(request_count),
-            0);
-        std::vector<int32_t> publication_ok_flags(
-            static_cast<size_t>(request_count),
-            0);
-        for (int i = 0; i < request_count; ++i)
-        {
-            const int32_t base =
-                request.base_cached_tokens[static_cast<size_t>(i)];
-            const int32_t target = target_cached_tokens_scratch[i];
-            const int32_t accepted = accepted_state_counts_scratch[i];
-            const int32_t ok = publication_ok_flags_scratch[i];
-            if (ok == 0)
-            {
-                return fail(
-                    "device-resident host-state adoption from metadata saw an invalid publication row");
-            }
-            if (base < 0 || target < 0 || accepted < 0)
-            {
-                return fail(
-                    "device-resident host-state adoption from metadata saw a negative sequence count");
-            }
-            if (target != base + accepted)
-            {
-                return fail(
-                    "device-resident host-state adoption from metadata target cache count drifted from base plus accepted");
-            }
-            target_cached_tokens[static_cast<size_t>(i)] = target;
-            accepted_state_counts[static_cast<size_t>(i)] = accepted;
-            publication_ok_flags[static_cast<size_t>(i)] = ok;
-        }
-
-        IKVCache::HostSequenceStatePublicationRequest kv_host_request;
-        kv_host_request.request_count = request_count;
-        kv_host_request.first_seq_idx = 0;
-        kv_host_request.target_cached_tokens = target_cached_tokens;
-        kv_host_request.accepted_state_counts = accepted_state_counts;
-        kv_host_request.publication_ok_flags = publication_ok_flags;
-
-        std::string kv_host_error;
-        if (!state_.kv_cache->adoptSequenceStateFromHostMetadata(
-                kv_host_request,
-                &kv_host_error))
-        {
-            return fail(
-                kv_host_error.empty()
-                    ? "device-resident host-state adoption from metadata could not update KV host mirrors"
-                    : "device-resident host-state adoption from metadata could not update KV host mirrors: " +
-                          kv_host_error);
-        }
-
-        if (request.publish_mtp_shifted_kv)
-        {
-            /*
-             * Device publication derives shifted-cache counts as
-             * max(0, main_target - depth - 1).  Mirror that same rule here so
-             * host cache heads match the device-owned KV publication without a
-             * compact outcome plan.
-             */
-            for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
-            {
-                auto &cache = state_.mtp_kv_caches[depth];
-                if (!cache)
-                {
-                    return fail(
-                        "device-resident host-state adoption from metadata encountered an uninitialized shifted MTP KV cache");
-                }
-
-                const int shift = static_cast<int>(depth) + 1;
-                std::vector<int32_t> shifted_target_cached_tokens(
-                    static_cast<size_t>(request_count),
-                    0);
-                std::vector<int32_t> shifted_accepted_state_counts(
-                    static_cast<size_t>(request_count),
-                    0);
-
-                for (int i = 0; i < request_count; ++i)
-                {
-                    const int base =
-                        request.base_cached_tokens[static_cast<size_t>(i)];
-                    const int target =
-                        target_cached_tokens[static_cast<size_t>(i)];
-                    const int base_shifted =
-                        base > shift ? base - shift : 0;
-                    const int target_shifted =
-                        target > shift ? target - shift : 0;
-                    const int current_shifted =
-                        cache->get_cached_tokens(
-                            cache->first_layer_index(),
-                            i);
-                    if (current_shifted < 0)
-                    {
-                        return fail(
-                            "device-resident host-state adoption from metadata read an invalid shifted MTP KV host mirror");
-                    }
-                    shifted_target_cached_tokens[static_cast<size_t>(i)] =
-                        target_shifted;
-                    shifted_accepted_state_counts[static_cast<size_t>(i)] =
-                        std::max(0, target_shifted - current_shifted);
-                    if (target_shifted < current_shifted)
-                    {
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "device_resident_shifted_mtp_kv_host_truncations",
-                            1.0,
-                            "decode",
-                            state_.device_id.toString(),
-                            {{"depth", std::to_string(depth)},
-                             {"current", std::to_string(current_shifted)},
-                             {"target", std::to_string(target_shifted)},
-                             {"base_shifted", std::to_string(base_shifted)}});
-                    }
-                }
-
-                IKVCache::HostSequenceStatePublicationRequest shifted_host_request;
-                shifted_host_request.request_count = request_count;
-                shifted_host_request.first_seq_idx = 0;
-                shifted_host_request.target_cached_tokens =
-                    std::move(shifted_target_cached_tokens);
-                shifted_host_request.accepted_state_counts =
-                    std::move(shifted_accepted_state_counts);
-                shifted_host_request.publication_ok_flags =
-                    publication_ok_flags;
-
-                std::string shifted_host_error;
-                if (!cache->adoptSequenceStateFromHostMetadata(
-                        shifted_host_request,
-                        &shifted_host_error))
-                {
-                    return fail(
-                        shifted_host_error.empty()
-                            ? "device-resident host-state adoption from metadata could not update shifted MTP KV host mirrors"
-                            : "device-resident host-state adoption from metadata could not update shifted MTP KV host mirrors: " +
-                                  shifted_host_error);
-                }
-            }
-        }
-
-        for (int i = 0; i < request_count; ++i)
-        {
-            state_.positions[static_cast<size_t>(i)] =
-                target_cached_tokens[static_cast<size_t>(i)];
-            state_.sequence_lengths[static_cast<size_t>(i)] =
-                target_cached_tokens[static_cast<size_t>(i)];
-        }
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "device_resident_host_state_metadata_adoptions",
-            1.0,
-            "decode",
-            state_.device_id.toString(),
-            {{"request_count", std::to_string(request_count)}});
-        device_resident_logical_sequence_host_adopted_epoch_ =
-            mailbox.live_state_epoch;
         return true;
     }
 

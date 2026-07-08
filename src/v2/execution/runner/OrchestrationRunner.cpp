@@ -1407,6 +1407,7 @@ namespace llaminar2
         pending_mtp_condition_resident_state_.reset();
         prelaunched_mtp_first_sidecar_resident_state_.reset();
         prelaunched_mtp_first_sidecar_params_.reset();
+        device_resident_mtp_planning_position_.reset();
         clearBatchedDecodeState();
         last_token_ = prompt_tokens.back();
 
@@ -1544,6 +1545,7 @@ namespace llaminar2
                 pending_mtp_condition_resident_state_.reset();
                 prelaunched_mtp_first_sidecar_resident_state_.reset();
                 prelaunched_mtp_first_sidecar_params_.reset();
+                device_resident_mtp_planning_position_.reset();
 
                 auto make_common_hit = [&]()
                 {
@@ -1903,6 +1905,7 @@ namespace llaminar2
 
             BatchedDecodeRequestState state;
             state.last_token = tokens.back();
+            state.logical_tokens = static_cast<int>(tokens.size());
             state.prefill_logits_ready = true;
             state.sampler = Sampler(active_sampling_params_.seed);
             next_states.push_back(std::move(state));
@@ -1922,6 +1925,7 @@ namespace llaminar2
         pending_mtp_condition_resident_state_.reset();
         prelaunched_mtp_first_sidecar_resident_state_.reset();
         prelaunched_mtp_first_sidecar_params_.reset();
+        device_resident_mtp_planning_position_.reset();
         last_token_ = next_states.front().last_token;
 
         if (!runner_->forward_batch(converted))
@@ -2068,6 +2072,44 @@ namespace llaminar2
             return batch_result;
         }
 
+        std::vector<int> planning_sequence_lengths(
+            sequence_lengths.begin(),
+            sequence_lengths.begin() + request_batch);
+        const DeviceResidentLogicalSequenceStateHandle resident_batch_state =
+            runner_->deviceResidentLogicalSequenceState();
+        if (resident_batch_state.valid() &&
+            !runner_->hostLogicalStateMirrorsDeviceResidentState())
+        {
+            bool shadows_valid = true;
+            for (int request = 0; request < request_batch; ++request)
+            {
+                const int logical_tokens =
+                    batched_request_states_[static_cast<size_t>(request)]
+                        .logical_tokens;
+                if (logical_tokens < 0)
+                {
+                    shadows_valid = false;
+                    break;
+                }
+                planning_sequence_lengths[static_cast<size_t>(request)] =
+                    logical_tokens;
+            }
+            if (!shadows_valid)
+            {
+                batch_result.error =
+                    "decodeStepBatch() has resident logical state but missing "
+                    "transaction-derived request positions";
+                return batch_result;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "request_batch_planning_resident_shadow_reads",
+                1.0,
+                "decode",
+                {},
+                {{"request_count", std::to_string(request_batch)}});
+        }
+
         batch_result.requests.resize(static_cast<size_t>(request_batch));
 
         bool has_ready_prefill_logits = false;
@@ -2127,7 +2169,7 @@ namespace llaminar2
                         BatchedDecodeRequestState &state =
                             batched_request_states_[static_cast<size_t>(request)];
                         const int logical_position =
-                            sequence_lengths[static_cast<size_t>(request)];
+                            planning_sequence_lengths[static_cast<size_t>(request)];
                         /*
                          * Keep request-batched first-token sampling identical
                          * to scalar stochastic MTP. The draw is keyed by the
@@ -2214,7 +2256,8 @@ namespace llaminar2
                 }
                 else
                 {
-                    const int logical_length = sequence_lengths[static_cast<size_t>(request)];
+                    const int logical_length =
+                        planning_sequence_lengths[static_cast<size_t>(request)];
                     if (logical_length <= 0 || logical_length > padded_seq_len)
                     {
                         batch_result.error =
@@ -2398,7 +2441,8 @@ namespace llaminar2
                 batch_result.requests[static_cast<size_t>(request)].is_complete = true;
                 continue;
             }
-            const int logical_length = sequence_lengths[static_cast<size_t>(request)];
+            const int logical_length =
+                planning_sequence_lengths[static_cast<size_t>(request)];
             if (logical_length <= 0)
             {
                 batch_result.error =
@@ -2422,7 +2466,9 @@ namespace llaminar2
             {
                 condition_tokens[static_cast<size_t>(request)] = 0;
                 position_ids[static_cast<size_t>(request)] =
-                    std::max(0, sequence_lengths[static_cast<size_t>(request)]);
+                    std::max(
+                        0,
+                        planning_sequence_lengths[static_cast<size_t>(request)]);
             }
         }
         {
@@ -2473,7 +2519,7 @@ namespace llaminar2
                 condition_tokens[static_cast<size_t>(request)] =
                     request_drafts[static_cast<size_t>(request)].back();
                 position_ids[static_cast<size_t>(request)] =
-                    sequence_lengths[static_cast<size_t>(request)] +
+                    planning_sequence_lengths[static_cast<size_t>(request)] +
                     draft_index;
                 sidecar_drafts[static_cast<size_t>(request)] =
                     kMTPSpecDecodeInvalidToken;
@@ -2556,7 +2602,8 @@ namespace llaminar2
             pending.compatibility_key = compatibility_key;
             pending.vocab_size = vocab;
             pending.base_cached_tokens =
-                static_cast<int32_t>(sequence_lengths[static_cast<size_t>(request)]);
+                static_cast<int32_t>(
+                    planning_sequence_lengths[static_cast<size_t>(request)]);
             pending.requires_shifted_kv_publication = true;
             pending.greedy_request.draft_tokens.clear();
             pending.greedy_request.draft_tokens.reserve(
@@ -2568,7 +2615,7 @@ namespace llaminar2
                 request_drafts[static_cast<size_t>(request)].end());
             pending.greedy_request.stop_tokens = stop_tokens_;
             pending.greedy_request.base_sidecar_position =
-                sequence_lengths[static_cast<size_t>(request)];
+                planning_sequence_lengths[static_cast<size_t>(request)];
             pending.greedy_request.verifier_path =
                 "request_batched_all_position_state_publication";
             pending.greedy_request.implementation_name =
@@ -2709,6 +2756,7 @@ namespace llaminar2
         };
 
         std::vector<int> scheduled_request_ids;
+        std::vector<int32_t> scheduled_base_cached_tokens;
         std::vector<MTPDecodeCatchupGreedyResult> catchup_results;
 
         if (!stochastic_batch_verify)
@@ -2728,6 +2776,8 @@ namespace llaminar2
             }
 
             scheduled_request_ids = tx.scheduled_batch.request_ids;
+            scheduled_base_cached_tokens =
+                tx.scheduled_batch.base_cached_tokens;
             catchup_results = tx.transaction.catchup.results;
         }
         else
@@ -3138,45 +3188,32 @@ namespace llaminar2
                     return release_and_fail(std::move(message));
                 }
 
-                DeviceResidentHostStateAdoptionRequest adoption_request;
-                adoption_request.logical_state =
+                const DeviceResidentLogicalSequenceStateHandle logical_state =
                     runner_->deviceResidentLogicalSequenceState();
-                adoption_request.base_cached_tokens =
-                    tx.scheduled_batch.base_cached_tokens;
-                adoption_request.publish_mtp_shifted_kv =
-                    tx.scheduled_batch.requires_shifted_kv_publication;
-
-                std::string adoption_error;
+                if (!logical_state.valid() ||
+                    logical_state.request_count <
+                        tx.scheduled_batch.request_count)
                 {
-                    PerfStatsCollector::ScopedTimer adoption_timer(
-                        "mtp",
-                        "request_batch_device_resident_host_metadata_adoption",
-                        "decode",
-                        {},
-                        {{"request_count",
-                          std::to_string(tx.scheduled_batch.request_count)}});
-                    if (!runner_->adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
-                            adoption_request,
-                            &adoption_error))
-                    {
-                        std::string message =
-                            "decodeStepBatch() request-batched stochastic "
-                            "resident host-state metadata adoption failed";
-                        if (!adoption_error.empty())
-                        {
-                            message += ": ";
-                            message += adoption_error;
-                        }
-                        return release_and_fail(std::move(message));
-                    }
+                    return release_and_fail(
+                        "decodeStepBatch() request-batched stochastic resident "
+                        "publication produced no valid logical-state mailbox");
                 }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "request_batch_resident_plan_checks",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"request_count",
+                      std::to_string(tx.scheduled_batch.request_count)},
+                     {"host_mirror_source", "none"}});
 
                 /*
                  * Full compact outcome materialization is deliberately after
-                 * live-state publication and host-mirror adoption.  It now
-                 * exists only so decodeStepBatch() can return response tokens
-                 * and update sampler bookkeeping; state planning and adoption
-                 * above consume the resident logical-state mailbox only.
+                 * live-state publication.  It exists only so decodeStepBatch()
+                 * can return response tokens and update sampler bookkeeping;
+                 * state planning consumes transaction-derived per-request
+                 * shadows plus the resident logical-state mailbox.
                  */
                 tx.device_outcomes.assign(
                     static_cast<size_t>(tx.scheduled_batch.request_count),
@@ -3259,6 +3296,8 @@ namespace llaminar2
             }
 
             scheduled_request_ids = tx.scheduled_batch.request_ids;
+            scheduled_base_cached_tokens =
+                tx.scheduled_batch.base_cached_tokens;
             catchup_results.reserve(tx.device_outcomes.size());
             for (size_t i = 0; i < tx.device_outcomes.size(); ++i)
             {
@@ -3322,6 +3361,24 @@ namespace llaminar2
                     "decodeStepBatch() request-batched verifier produced an "
                     "invalid catch-up result");
             }
+            if (i >= scheduled_base_cached_tokens.size() ||
+                catchup.target_verifier_state_commit_count < 0)
+            {
+                return fail_after_checkpoint(
+                    "decodeStepBatch() request-batched verifier produced "
+                    "invalid accepted-state length metadata");
+            }
+            state.logical_tokens =
+                scheduled_base_cached_tokens[i] +
+                catchup.target_verifier_state_commit_count;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "request_batch_resident_planning_position_commits",
+                1.0,
+                "decode",
+                {},
+                {{"request", std::to_string(request)},
+                 {"position", std::to_string(state.logical_tokens)}});
 
             /*
              * The verifier input prefix includes the already-returned
@@ -3642,8 +3699,23 @@ namespace llaminar2
         if (resident_state.valid() &&
             !runner_->hostLogicalStateMirrorsDeviceResidentState())
         {
+            if (device_resident_mtp_planning_position_.has_value() &&
+                *device_resident_mtp_planning_position_ >= 0)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "sidecar_position_planning_resident_shadow_reads",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"context", context ? context : "unknown"},
+                     {"position",
+                      std::to_string(*device_resident_mtp_planning_position_)}});
+                return *device_resident_mtp_planning_position_;
+            }
+
             std::string message =
-                "MTP sidecar position planning refused stale host logical state";
+                "MTP sidecar position planning has resident logical state but no transaction-derived planning position";
             if (context && context[0] != '\0')
                 message += std::string(" for ") + context;
             if (error)
@@ -4472,6 +4544,30 @@ namespace llaminar2
                 {
                     return validation_error;
                 }
+
+                const int committed_position = base.cached_tokens + advanced_tokens;
+                const DeviceResidentLogicalSequenceStateHandle resident_state =
+                    runner_ ? runner_->deviceResidentLogicalSequenceState()
+                            : DeviceResidentLogicalSequenceStateHandle{};
+                if (resident_state.valid() &&
+                    runner_ &&
+                    !runner_->hostLogicalStateMirrorsDeviceResidentState())
+                {
+                    device_resident_mtp_planning_position_ = committed_position;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "device_resident_planning_position_commits",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"path", path},
+                         {"position", std::to_string(committed_position)},
+                         {"advanced_tokens", std::to_string(advanced_tokens)}});
+                }
+                else
+                {
+                    device_resident_mtp_planning_position_.reset();
+                }
             }
 
             pending_mtp_condition_token_ = next_pending_condition_token;
@@ -4872,6 +4968,18 @@ namespace llaminar2
             }
             if (!ok)
                 return fail_after_checkpoint("Forward pass failed during MTP condition decode");
+            if (device_resident_mtp_planning_position_.has_value())
+            {
+                ++(*device_resident_mtp_planning_position_);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "device_resident_planning_position_condition_advances",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"position",
+                      std::to_string(*device_resident_mtp_planning_position_)}});
+            }
             if (can_synthesize_verifier_base_checkpoint)
             {
                 std::string position_error;
@@ -8675,37 +8783,24 @@ namespace llaminar2
             }
             else
             {
-                std::string host_state_error;
-                bool host_adoption_ok = false;
-                {
-                    PerfStatsCollector::ScopedTimer adoption_timer(
-                        "mtp",
-                        "device_resident_publication_host_adoption",
-                        "decode",
-                        {},
-                        {{"verifier_path",
-                          "all_position_state_publication"}});
-                    host_adoption_ok =
-                        runner_->adoptDeviceResidentMTPSpecPublishedHostState(
-                            step_plans,
-                            &host_state_error);
-                }
-                if (!host_adoption_ok)
+                const DeviceResidentLogicalSequenceStateHandle resident_state =
+                    runner_->deviceResidentLogicalSequenceState();
+                if (!resident_state.valid())
                 {
                     return fail_after_checkpoint(
-                        std::string("All-position MTP verifier device-resident host-state adoption failed: ") +
-                        host_state_error);
+                        "All-position MTP verifier device-resident publication produced no resident logical-state mailbox");
                 }
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "device_resident_state_publication_host_plan_checks",
+                    "device_resident_state_publication_resident_plan_checks",
                     1.0,
                     "decode",
                     {},
                     {{"accepted_state_count",
                       std::to_string(accepted_state_count)},
                      {"requires_correction_replay",
-                      step.requiresCorrectionReplay() ? "true" : "false"}});
+                      step.requiresCorrectionReplay() ? "true" : "false"},
+                     {"host_mirror_source", "none"}});
             }
 
             int correction_forward_count = 0;
@@ -9965,26 +10060,25 @@ namespace llaminar2
                         "Grouped-outcome MTP verifier transaction plan accepted-state count drifted from compact outcome metadata");
                 }
 
-                std::string host_state_error;
-                bool host_adoption_ok = false;
-                {
-                    PerfStatsCollector::ScopedTimer adoption_timer(
-                        "mtp",
-                        "grouped_outcome_device_resident_host_adoption",
-                        "decode",
-                        {},
-                        {{"policy_path", "grouped_outcome_device_resident_publication"}});
-                    host_adoption_ok =
-                        runner_->adoptDeviceResidentMTPSpecPublishedHostState(
-                            step_plans,
-                            &host_state_error);
-                }
-                if (!host_adoption_ok)
+                const DeviceResidentLogicalSequenceStateHandle resident_state =
+                    runner_->deviceResidentLogicalSequenceState();
+                if (!resident_state.valid())
                 {
                     return fail_after_checkpoint(
-                        std::string("Grouped-outcome MTP verifier device-resident host-state adoption failed: ") +
-                        host_state_error);
+                        "Grouped-outcome stochastic MTP device-resident publication produced no resident logical-state mailbox");
                 }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "grouped_outcome_resident_plan_checks",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"policy_path",
+                      "grouped_outcome_device_resident_publication"},
+                     {"sampling", "stochastic"},
+                     {"accepted_state_count",
+                      std::to_string(compact_accepted_state_count)},
+                     {"host_mirror_source", "none"}});
 
                 const std::vector<int32_t> accepted_tokens =
                     catchup.accepted_tokens;
@@ -10150,7 +10244,7 @@ namespace llaminar2
                               "grouped_outcome_device_resident_publication"},
                              {"resident_state_kind", resolved_prelaunch_kind},
                              {"prelaunch_timing",
-                              "post_outcome_fallback"}});
+                              "post_outcome_resolution"}});
                         if (!runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
                                 *resolved_prelaunch_state,
                                 /*request_index=*/0))
@@ -10172,7 +10266,7 @@ namespace llaminar2
                         {{"request_index", "0"},
                          {"path", "grouped_outcome_device_resident_publication"},
                          {"resident_state_kind", resolved_prelaunch_kind},
-                         {"prelaunch_timing", "post_outcome_fallback"},
+                         {"prelaunch_timing", "post_outcome_resolution"},
                          {"stop_tokens",
                           std::to_string(stop_tokens_.size())}});
                 }
@@ -11080,27 +11174,25 @@ namespace llaminar2
                 const int accepted_state_count =
                     std::max(0, step.accepted_count);
 
-                std::string host_state_error;
-                bool host_adoption_ok = false;
-                {
-                    PerfStatsCollector::ScopedTimer adoption_timer(
-                        "mtp",
-                        "grouped_outcome_device_resident_host_adoption",
-                        "decode",
-                        {},
-                        {{"policy_path", "grouped_outcome_device_resident_publication"},
-                         {"sampling", "greedy"}});
-                    host_adoption_ok =
-                        runner_->adoptDeviceResidentMTPSpecPublishedHostState(
-                            step_plans,
-                            &host_state_error);
-                }
-                if (!host_adoption_ok)
+                const DeviceResidentLogicalSequenceStateHandle resident_state =
+                    runner_->deviceResidentLogicalSequenceState();
+                if (!resident_state.valid())
                 {
                     return fail_after_checkpoint(
-                        std::string("Grouped-outcome greedy MTP verifier device-resident host-state adoption failed: ") +
-                        host_state_error);
+                        "Grouped-outcome greedy MTP device-resident publication produced no resident logical-state mailbox");
                 }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "grouped_outcome_resident_plan_checks",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"policy_path",
+                      "grouped_outcome_device_resident_publication"},
+                     {"sampling", "greedy"},
+                     {"accepted_state_count",
+                      std::to_string(accepted_state_count)},
+                     {"host_mirror_source", "none"}});
 
                 const std::vector<int32_t> accepted_tokens =
                     catchup.accepted_tokens;
@@ -12305,6 +12397,7 @@ namespace llaminar2
         pending_mtp_condition_resident_state_.reset();
         prelaunched_mtp_first_sidecar_resident_state_.reset();
         prelaunched_mtp_first_sidecar_params_.reset();
+        device_resident_mtp_planning_position_.reset();
         clearBatchedDecodeState();
         sampler_ = Sampler(active_sampling_params_.seed);
         mtp_bypassed_ = false;

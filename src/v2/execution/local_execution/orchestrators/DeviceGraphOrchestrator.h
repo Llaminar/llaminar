@@ -1999,12 +1999,6 @@ namespace llaminar2
         bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
             const DeviceSpeculativePublicationRequest &request,
             std::string *error = nullptr) override;
-        bool adoptDeviceResidentMTPSpecPublishedHostState(
-            const MTPSpecStepPlanBatch &plans,
-            std::string *error = nullptr) override;
-        bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
-            const DeviceResidentHostStateAdoptionRequest &request,
-            std::string *error = nullptr) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -4916,7 +4910,7 @@ namespace llaminar2
         };
         DeviceResidentLogicalSequenceStateMailbox
             device_resident_logical_sequence_state_mailbox_;
-        uint64_t device_resident_logical_sequence_host_adopted_epoch_ = 0;
+        uint64_t device_resident_logical_sequence_host_mirror_epoch_ = 0;
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;

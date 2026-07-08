@@ -630,17 +630,6 @@ namespace llaminar2
         bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
             const DeviceSpeculativePublicationRequest &request,
             std::string *error = nullptr) override;
-        /**
-         * @brief Refresh rank host mirrors after grouped compact publication.
-         *
-         * The child runners already published live state during
-         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  This method only
-         * adopts the accepted boundary into RankOrchestrator's aggregate
-         * position/sequence mirrors.
-         */
-        bool adoptDeviceResidentMTPSpecPublishedHostState(
-            const MTPSpecStepPlanBatch &plans,
-            std::string *error = nullptr) override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
         bool supportsMTPSidecarLogitsStreamHandoff() const override;

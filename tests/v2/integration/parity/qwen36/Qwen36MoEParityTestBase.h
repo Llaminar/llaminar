@@ -5587,10 +5587,27 @@ namespace llaminar2::test::parity::qwen36
                     publication_request,
                     &publication_error))
                     << publication_error;
-                ASSERT_TRUE(runner->adoptDeviceResidentMTPSpecPublishedHostState(
-                    batch,
-                    &publication_error))
-                    << publication_error;
+                const DeviceResidentLogicalSequenceStateHandle logical_state =
+                    runner->deviceResidentLogicalSequenceState();
+                ASSERT_TRUE(logical_state.valid())
+                    << "device-resident publication must leave a typed logical "
+                       "state mailbox for subsequent planning";
+                ASSERT_EQ(logical_state.request_count, 1);
+                ASSERT_FALSE(runner->hostLogicalStateMirrorsDeviceResidentState())
+                    << "device-resident publication must not repair host mirrors "
+                       "through an adoption bridge";
+                ASSERT_NE(
+                    logical_state.targetSequenceLengthDeviceForRequest(0),
+                    nullptr);
+                ASSERT_NE(
+                    logical_state.acceptedStateCountDeviceForRequest(0),
+                    nullptr);
+                ASSERT_NE(
+                    logical_state.nextConditionTokenDeviceForRequest(0),
+                    nullptr);
+                ASSERT_NE(
+                    logical_state.publicationOkFlagDeviceForRequest(0),
+                    nullptr);
             }
             else
             {

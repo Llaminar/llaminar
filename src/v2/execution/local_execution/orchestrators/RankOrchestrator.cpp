@@ -7949,67 +7949,6 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::adoptDeviceResidentMTPSpecPublishedHostState(
-        const MTPSpecStepPlanBatch &plans,
-        std::string *error)
-    {
-        auto fail = [&](const std::string &reason) -> bool
-        {
-            if (error)
-                *error = reason;
-            LOG_ERROR("[RankOrchestrator] " << reason);
-            return false;
-        };
-
-        if (pp_stage_runners_.empty() &&
-            device_runners_.size() == 1 &&
-            device_runners_[0])
-        {
-            const bool ok =
-                device_runners_[0]->adoptDeviceResidentMTPSpecPublishedHostState(
-                    plans,
-                    error);
-            if (ok)
-                refreshAggregateSequenceStateFromPrimaryRunnerAfterPublication();
-            return ok;
-        }
-
-        if (!plans.ok ||
-            plans.request_count <= 0 ||
-            static_cast<int>(plans.steps.size()) != plans.request_count)
-        {
-            return fail(
-                "rank compact MTP host-state adoption received an invalid step-plan batch");
-        }
-        if (!rank_compact_outcome_published_)
-        {
-            return fail(
-                "rank compact MTP host-state adoption ran before compact grouped publication");
-        }
-
-        /*
-         * Publication already mutated every child through
-         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  Keep this hook
-         * as an explicit mirror-adoption boundary so OrchestrationRunner can use
-         * the same lifecycle as single-device resident publication without
-         * accidentally publishing the same accepted rows twice.
-         */
-        rank_last_device_outcome_step_plans_ = plans;
-        refreshAggregateSequenceStateFromPrimaryRunnerAfterPublication();
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::Stochastic
-                ? "rank_compact_stochastic_host_state_adoptions"
-                : "rank_compact_greedy_host_state_adoptions",
-            1.0,
-            "decode",
-            "rank",
-            {{"request_count", std::to_string(plans.request_count)},
-             {"implementation", "already_device_resident_published"}});
-        return true;
-    }
-
     MTPVerifierRowCapability RankOrchestrator::mtpVerifierRowCapability() const
     {
         const auto &participants =

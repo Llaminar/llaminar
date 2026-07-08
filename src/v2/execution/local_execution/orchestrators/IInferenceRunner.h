@@ -338,31 +338,6 @@ namespace llaminar2
     };
 
     /**
-     * @brief Host-mirror adoption request for a resident speculative publish.
-     *
-     * Device-resident publication makes accelerator metadata authoritative for
-     * the next live logical position and sequence length.  The host still owns
-     * legacy mirrors used by graph signatures and API diagnostics, so it needs
-     * one explicit adoption handoff.  This request carries the resident mailbox
-     * plus the pre-verifier base cache lengths that remain host-known from
-     * scheduling; it does not carry compact verifier outcome rows.
-     */
-    struct DeviceResidentHostStateAdoptionRequest
-    {
-        DeviceResidentLogicalSequenceStateHandle logical_state;
-        std::vector<int32_t> base_cached_tokens;
-        bool publish_mtp_shifted_kv = true;
-
-        bool valid() const
-        {
-            return logical_state.valid() &&
-                   logical_state.request_count > 0 &&
-                   static_cast<int>(base_cached_tokens.size()) ==
-                       logical_state.request_count;
-        }
-    };
-
-    /**
      * @brief One logical request inside a device-side stochastic MTP batch.
      *
      * The descriptor is intentionally value-owned: thresholds and stop tokens
@@ -1030,57 +1005,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Refresh host-visible logical positions after resident publication.
-         *
-         * Device-resident MTP publication mutates live KV/recurrent state from
-         * compact GPU metadata before the compatibility host bridge flushes
-         * output tokens.  Once the bridge has produced the equivalent
-         * MTPSpecStepPlanBatch, callers can use this method to make
-         * get_position() and sequence_lengths() reflect the already-published
-         * device state without invoking publishAcceptedMTPSpecStateBatch() a
-         * second time.
-         *
-         * Implementations must update host mirrors only. They must not append,
-         * truncate, restore, synchronize a GPU stream, or mutate cache/state
-         * that was already published from device metadata.
-         */
-        virtual bool adoptDeviceResidentMTPSpecPublishedHostState(
-            const MTPSpecStepPlanBatch &plans,
-            std::string *error = nullptr)
-        {
-            (void)plans;
-            if (error)
-            {
-                *error =
-                    "runner does not support adopting device-resident MTP host state";
-            }
-            return false;
-        }
-
-        /**
-         * @brief Refresh host mirrors directly from resident device metadata.
-         *
-         * This is the request-batched GPU hot-path counterpart to
-         * adoptDeviceResidentMTPSpecPublishedHostState().  Implementations
-         * should wait on @p request.logical_state.ready_event using an explicit
-         * bridge stream, copy only the small logical-state arrays needed for
-         * host mirrors, and update host-side positions/cache heads without
-         * reconstructing an MTPSpecStepPlanBatch from compact verifier outcomes.
-         */
-        virtual bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
-            const DeviceResidentHostStateAdoptionRequest &request,
-            std::string *error = nullptr)
-        {
-            (void)request;
-            if (error)
-            {
-                *error =
-                    "runner does not support adopting device-resident MTP host state from device metadata";
-            }
-            return false;
-        }
-
-        /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.
          *
          * @param draft_condition_token Token whose shifted MTP KV row is appended.
@@ -1633,8 +1557,8 @@ namespace llaminar2
          * GPU implementations must also treat @p position_offset_override as
          * part of the resident-state handoff.  If it is negative, the method
          * must fail instead of deriving a position from get_position() or
-         * sequence_lengths(), because those host mirrors can legitimately be
-         * stale until adoptDeviceResidentMTPSpecPublishedHostState() runs.
+         * sequence_lengths(), because device-resident MTP publication may leave
+         * host mirrors stale by design.
          */
         virtual bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -2009,10 +1933,11 @@ namespace llaminar2
          * @brief Return whether host logical getters mirror any resident mailbox.
          *
          * A valid deviceResidentLogicalSequenceState() means a runner has
-         * staged logical positions/sequence lengths on device. Until the
-         * compatibility host bridge adopts the equivalent step plan,
+         * staged logical positions/sequence lengths on device.  Host getters are
+         * only planning-safe when the runner can prove they were advanced by the
+         * same transaction that produced the resident mailbox.  Otherwise
          * get_position() and sequence_lengths() may be stale and must not drive
-         * speculative planning. Runners without resident state can keep the
+         * speculative planning.  Runners without resident state can keep the
          * default true result.
          */
         virtual bool hostLogicalStateMirrorsDeviceResidentState() const

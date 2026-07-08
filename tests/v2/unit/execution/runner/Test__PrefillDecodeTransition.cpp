@@ -925,6 +925,7 @@ namespace
             }
             resident_logical_state_request_count_ = plans.request_count;
             resident_logical_state_valid_ = true;
+            resident_logical_state_host_mirror_current_ = true;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -1026,117 +1027,10 @@ namespace
             }
             resident_logical_state_request_count_ = request.request_count;
             resident_logical_state_valid_ = true;
+            resident_logical_state_host_mirror_current_ = false;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
-            return true;
-        }
-
-        bool adoptDeviceResidentMTPSpecPublishedHostState(
-            const MTPSpecStepPlanBatch &plans,
-            std::string *error = nullptr) override
-        {
-            ++adopt_device_resident_host_state_count_;
-            publication_events_.push_back("host_state_adopt");
-            last_adopted_device_resident_host_state_ = plans;
-            if (!supports_device_resident_mtp_spec_state_publication_)
-            {
-                if (error)
-                    *error = "mock device-resident host-state adoption is disabled";
-                return false;
-            }
-            if (!plans.ok || plans.steps.empty())
-            {
-                if (error)
-                    *error = plans.ok
-                                 ? "mock device-resident host-state adoption has no steps"
-                                 : plans.error;
-                return false;
-            }
-            if (sequence_lengths_.size() <
-                static_cast<size_t>(std::max(1, batch_capacity_)))
-            {
-                sequence_lengths_.resize(
-                    static_cast<size_t>(std::max(1, batch_capacity_)),
-                    position_);
-            }
-            for (const MTPSpecStepPlan &step : plans.steps)
-            {
-                if (step.request_index < 0 ||
-                    step.request_index >= static_cast<int>(sequence_lengths_.size()))
-                {
-                    if (error)
-                        *error = "mock device-resident host-state adoption request index is out of range";
-                    return false;
-                }
-                sequence_lengths_[static_cast<size_t>(step.request_index)] =
-                    step.target_cached_tokens;
-                if (step.request_index == 0)
-                    adoptPublishedMainTokens(step.target_cached_tokens);
-            }
-            return true;
-        }
-
-        bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
-            const DeviceResidentHostStateAdoptionRequest &request,
-            std::string *error = nullptr) override
-        {
-            ++adopt_device_resident_host_state_count_;
-            publication_events_.push_back("host_state_adopt");
-            if (!supports_device_resident_mtp_spec_state_publication_)
-            {
-                if (error)
-                    *error = "mock device-resident metadata host-state adoption is disabled";
-                return false;
-            }
-            if (!request.valid() ||
-                !request.logical_state.sameMailboxAs(deviceResidentLogicalSequenceState()))
-            {
-                if (error)
-                    *error = "mock device-resident metadata host-state adoption request is invalid";
-                return false;
-            }
-            if (sequence_lengths_.size() <
-                static_cast<size_t>(std::max(1, batch_capacity_)))
-            {
-                sequence_lengths_.resize(
-                    static_cast<size_t>(std::max(1, batch_capacity_)),
-                    position_);
-            }
-            for (int request_index = 0;
-                 request_index < request.logical_state.request_count;
-                 ++request_index)
-            {
-                const int32_t base =
-                    request.base_cached_tokens[static_cast<size_t>(request_index)];
-                const int32_t target =
-                    request.logical_state
-                        .targetSequenceLengthDeviceForRequest(request_index)[0];
-                const int32_t accepted =
-                    request.logical_state
-                        .acceptedStateCountDeviceForRequest(request_index)[0];
-                const int32_t ok =
-                    request.logical_state
-                        .publicationOkFlagDeviceForRequest(request_index)[0];
-                if (ok == 0 || target != base + accepted)
-                {
-                    if (error)
-                    {
-                        std::ostringstream msg;
-                        msg << "mock device-resident metadata host-state adoption saw invalid counts"
-                            << " request=" << request_index
-                            << " base=" << base
-                            << " accepted=" << accepted
-                            << " target=" << target
-                            << " ok=" << ok;
-                        *error = msg.str();
-                    }
-                    return false;
-                }
-                sequence_lengths_[static_cast<size_t>(request_index)] = target;
-                if (request_index == 0)
-                    adoptPublishedMainTokens(target);
-            }
             return true;
         }
 
@@ -1165,6 +1059,12 @@ namespace
             handle.ready_event = const_cast<int *>(&resident_ready_event_token_);
             handle.live_state_epoch = 1;
             return handle;
+        }
+
+        bool hostLogicalStateMirrorsDeviceResidentState() const override
+        {
+            return !resident_logical_state_valid_ ||
+                   resident_logical_state_host_mirror_current_;
         }
 
         bool commitMTPShiftedRowFromDeviceResidentLogicalState(
@@ -3910,10 +3810,6 @@ namespace
         {
             return stage_device_resident_mtp_spec_outcome_count_;
         }
-        int adoptDeviceResidentHostStateCount() const
-        {
-            return adopt_device_resident_host_state_count_;
-        }
         const MTPSpecStepPlan &lastPublishedMTPSpecStep() const
         {
             return last_published_mtp_spec_step_;
@@ -3926,11 +3822,6 @@ namespace
         lastDeviceResidentPublicationRequest() const
         {
             return last_device_resident_publication_request_;
-        }
-        const MTPSpecStepPlanBatch &
-        lastAdoptedDeviceResidentHostState() const
-        {
-            return last_adopted_device_resident_host_state_;
         }
         const std::vector<std::string> &publicationEvents() const
         {
@@ -4590,7 +4481,6 @@ namespace
         MTPSpecStepPlan last_published_mtp_spec_step_;
         MTPSpecStepPlanBatch last_published_mtp_spec_batch_;
         DeviceSpeculativePublicationRequest last_device_resident_publication_request_;
-        MTPSpecStepPlanBatch last_adopted_device_resident_host_state_;
         MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_plan_;
         std::vector<int> last_forward_tokens_;
         std::vector<std::vector<int>> forward_history_;
@@ -4649,6 +4539,7 @@ namespace
         int resident_outcome_response_ready_event_token_{0};
         int resident_ready_event_token_{0};
         bool resident_logical_state_valid_{false};
+        bool resident_logical_state_host_mirror_current_{true};
         int resident_logical_state_request_count_{0};
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
             resident_target_positions_{};
@@ -4680,7 +4571,6 @@ namespace
         int publish_grouped_decode_equivalent_mtp_spec_state_batch_count_{0};
         int publish_device_resident_mtp_spec_state_count_{0};
         int stage_device_resident_mtp_spec_outcome_count_{0};
-        int adopt_device_resident_host_state_count_{0};
         int position_{0};
         int batch_capacity_{1};
         int padded_seq_len_{0};
@@ -5449,10 +5339,8 @@ namespace
             << "GPU stochastic request batches must not mutate live state "
                "through the host-plan publisher.";
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_state_adopt",
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
@@ -5537,14 +5425,14 @@ namespace
             << "The compatibility host-plan publisher must not run after "
                "resident request-batch publication succeeds.";
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_state_adopt",
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
-        EXPECT_THAT(mock->sequence_lengths(), ElementsAre(6, 5));
+        EXPECT_THAT(mock->sequence_lengths(), ElementsAre(3, 3))
+            << "The backend host mirror intentionally remains at the prefill "
+               "length after resident request-batch publication.";
 
         GenerationBatchResult third = runner->decodeStepBatch(2);
         ASSERT_TRUE(third.error.empty()) << third.error;
@@ -5555,6 +5443,13 @@ namespace
         EXPECT_EQ(mock->forwardBatchCallCount(), 2)
             << "Ready stochastic bonus tokens should be consumed without "
                "another verifier forward";
+
+        GenerationBatchResult fourth = runner->decodeStepBatch(2);
+        ASSERT_TRUE(fourth.error.empty()) << fourth.error;
+        EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
+                    ElementsAre(7, 6))
+            << "The next verifier step should schedule from per-request "
+               "transaction shadows, not stale backend sequence_lengths().";
     }
 
     /**
@@ -5610,12 +5505,10 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
-            << "The hidden direct publisher must not be used as a fallback.";
+            << "The hidden direct publisher must not be used.";
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_state_adopt",
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
@@ -5775,7 +5668,6 @@ namespace
                "should try to avoid.";
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 4);
         PerfStatsCollector::reset();
@@ -7258,11 +7150,9 @@ namespace
             EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
                 << "The host-plan publisher must not mutate live state after "
                    "device-resident greedy publication succeeds.";
-            EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
             EXPECT_THAT(mock->publicationEvents(),
                         ElementsAre("device_outcome_publish",
-                                    "host_outcome_bridge",
-                                    "host_state_adopt"));
+                                    "host_outcome_bridge"));
 
             const auto &device_verifier_tokens =
                 mock->deviceVerifierInputTokens();
@@ -7356,7 +7246,6 @@ namespace
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-            EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
             EXPECT_EQ(mock->restoreCount(), 0)
                 << "grouped greedy resident publication must not restore a "
                    "payload checkpoint on the success path";
@@ -7374,8 +7263,7 @@ namespace
                    "shadow token.";
             EXPECT_THAT(mock->publicationEvents(),
                         ElementsAre("device_outcome_publish",
-                                    "host_outcome_bridge",
-                                    "host_state_adopt"));
+                                    "host_outcome_bridge"));
             EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 0)
                 << "Grouped greedy response materialization should not wait "
                    "behind speculative next-step sidecar prelaunch work.";
@@ -7505,7 +7393,6 @@ namespace
             EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(mock->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
-            EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 0);
             EXPECT_THAT(mock->publicationEvents(), IsEmpty());
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
@@ -7589,7 +7476,6 @@ namespace
                       nullptr);
             EXPECT_EQ(mock->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
-            EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 0);
             EXPECT_THAT(mock->publicationEvents(), IsEmpty());
             EXPECT_EQ(findPerfRecord(records_after_reject,
                                      PerfStatRecord::Kind::Counter,
@@ -8417,7 +8303,6 @@ namespace
         EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
             << "grouped outcomes must publish state from compact device "
                "metadata instead of replaying shifted rows";
@@ -8620,7 +8505,6 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_EQ(mock->restoreCount(), 0)
             << "A grouped vLLM-style verifier with sidecar preservation should "
                "never restore a payload checkpoint on the success path.";
@@ -8702,7 +8586,6 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_EQ(mock->residentAcceptedStateCount(0), 1)
             << "Reject-first grouped publication should publish only the "
                "already-consumed verifier row and leave the correction as "
@@ -8847,9 +8730,6 @@ namespace
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
             << "The compatibility host-plan publisher must not run after "
                "device-resident publication succeeds.";
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1)
-            << "The compatibility host bridge should refresh host-visible "
-               "positions/sequence lengths without re-publishing live state.";
         EXPECT_EQ(mock->captureCheckpointCount(), 0)
             << "the vLLM-style device-resident transaction carries only a "
                "logical base stamp on the success path; rollback checkpoints "
@@ -8860,11 +8740,9 @@ namespace
                "device-resident publication contract.";
         EXPECT_THAT(mock->publicationEvents(),
                     ElementsAre("device_outcome_publish",
-                                "host_outcome_bridge",
-                                "host_state_adopt"))
+                                "host_outcome_bridge"))
             << "Host outcome copying should remain only an output flush after "
-               "live state has already been published; host mirror adoption is "
-               "a separate no-KV-mutation step.";
+               "live state has already been published.";
 
         const DeviceSpeculativePublicationRequest &request =
             mock->lastDeviceResidentPublicationRequest();
@@ -8875,15 +8753,6 @@ namespace
             << "Device-resident publication should use the pre-verifier "
                "device snapshot, not a host base-cache shadow.";
         EXPECT_EQ(request.base_sidecar_position, 5);
-        ASSERT_TRUE(mock->lastAdoptedDeviceResidentHostState().ok);
-        ASSERT_THAT(mock->lastAdoptedDeviceResidentHostState().steps,
-                    SizeIs(1));
-        EXPECT_EQ(
-            mock->lastAdoptedDeviceResidentHostState()
-                .steps.front()
-                .target_cached_tokens,
-            mock->get_position());
-
         const auto records = PerfStatsCollector::snapshot({"mtp"});
         const PerfStatRecord *skipped_checkpoint =
             findPerfRecord(records,
@@ -8940,12 +8809,11 @@ namespace
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
 
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
-        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
         EXPECT_EQ(mock->residentLogicalStateShiftedCommitCount(), 0)
             << "The rejected correction token should remain resident pending "
                "condition state, not a same-step shifted-cache append.";
         EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
-            << "Direct resident publication must not fall back to the host-token "
+            << "Direct resident publication must not use the host-token "
                "shifted-row helper for a rejected correction.";
         EXPECT_EQ(mock->commitMTPShiftedCount(), 0);
         EXPECT_EQ(mock->residentAcceptedStateCount(0), 1)
