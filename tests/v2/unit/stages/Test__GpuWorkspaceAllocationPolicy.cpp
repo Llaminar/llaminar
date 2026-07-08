@@ -580,6 +580,39 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPPendingLogitsStreamsUseOwnershipHelp
         << "Publishing a different stream over an unconsumed logits handoff must hard-fail.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarGraphCaptureInstallsLocalTPBoundaryHook)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+
+    const auto sidecar_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched(",
+        "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
+    const size_t policy_build = sidecar_body.find("auto capture_policy = buildDecodeCapturePolicy(");
+    ASSERT_NE(policy_build, std::string::npos)
+        << "MTP sidecar execution must continue to build a decode capture policy.";
+    const size_t boundary_hook =
+        sidecar_body.find("capture_policy.before_begin_capture", policy_build);
+    ASSERT_NE(boundary_hook, std::string::npos)
+        << "MTP sidecar graph capture must join the same LocalTP capture boundary as main decode.";
+    const size_t boundary_call =
+        sidecar_body.find("waitAtDecodeGraphCaptureBoundary(", boundary_hook);
+    ASSERT_NE(boundary_call, std::string::npos)
+        << "The sidecar boundary hook must route through DeviceGraphOrchestrator so participant indices are validated.";
+    const size_t execute_call =
+        sidecar_body.find("executor_.executeDecodeWithCapturePolicy(", policy_build);
+    ASSERT_NE(execute_call, std::string::npos)
+        << "MTP sidecar execution must still use the centralized capture policy path.";
+
+    EXPECT_LT(policy_build, boundary_hook)
+        << "The sidecar capture policy should be built before installing the boundary hook.";
+    EXPECT_LT(boundary_hook, execute_call)
+        << "LocalTP participants must rendezvous before any sidecar stream begins graph capture.";
+    EXPECT_LT(boundary_call, execute_call)
+        << "The sidecar hook must be installed before entering the executor capture path.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBeforeConsumers)
 {
     const auto source =

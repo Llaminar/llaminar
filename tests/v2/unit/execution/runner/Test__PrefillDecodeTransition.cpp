@@ -516,7 +516,8 @@ namespace
             last_commit_mtp_tokens_.assign(1, token);
             return appendOneShiftedMTPRow(
                 already_appended_tokens,
-                position_offset_override);
+                position_offset_override,
+                allow_speculative_discard);
         }
 
         bool commitMTPShiftedRowFromCheckpointTerminalHidden(
@@ -532,9 +533,7 @@ namespace
             const int checkpoint_position = checkpoint.cached_tokens;
             if (position_offset_override >= 0 &&
                 position_offset_override != checkpoint_position)
-            {
                 return false;
-            }
             return commitMTPShiftedRowFromCurrentTerminalHidden(
                 token,
                 already_appended_tokens,
@@ -1213,7 +1212,8 @@ namespace
             last_resident_logical_state_shifted_commit_token_ = token;
             return appendOneShiftedMTPRow(
                 already_appended_tokens,
-                position_offset_override);
+                position_offset_override,
+                allow_speculative_discard);
         }
 
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override
@@ -4023,8 +4023,21 @@ namespace
                 shiftedTargetForMainTokens(target_cached_tokens);
         }
 
+        /**
+         * @brief Append one shifted MTP cache row using production discard rules.
+         *
+         * Single-row shifted-cache repairs are used for the first accepted MTP
+         * output when the sidecar did not leave a reusable shifted row behind.
+         * Production may discover speculative rows that belong to an abandoned
+         * draft path; when the caller explicitly allows speculative discard,
+         * the cache is truncated back to the serial boundary before the repair
+         * row is appended.  The mock mirrors that behavior so LocalTP grouped
+         * publication tests exercise the real contract instead of a looser
+         * test-only cache model.
+         */
         bool appendOneShiftedMTPRow(int already_appended_tokens,
-                                    int position_offset_override)
+                                    int position_offset_override,
+                                    bool allow_speculative_discard)
         {
             if (already_appended_tokens < 0)
                 return false;
@@ -4035,7 +4048,15 @@ namespace
             const int expected_cached_tokens =
                 std::max(0, position_offset - 1 + already_appended_tokens);
             if (mtp_shifted_cached_tokens_ > expected_cached_tokens)
+            {
+                if (!allow_speculative_discard)
+                    return false;
+                mtp_shifted_cached_tokens_ = expected_cached_tokens;
+            }
+            if (mtp_shifted_cached_tokens_ > expected_cached_tokens)
                 return false;
+            if (mtp_shifted_cached_tokens_ < expected_cached_tokens)
+                mtp_shifted_cached_tokens_ = expected_cached_tokens;
             mtp_shifted_cached_tokens_ = expected_cached_tokens + 1;
             return true;
         }

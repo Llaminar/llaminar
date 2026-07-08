@@ -578,6 +578,47 @@ public:
             position_offset_override);
     }
 
+    /**
+     * @brief Record checkpoint-backed shifted-row repairs for LocalTP fanout tests.
+     *
+     * The production LocalTP path uses this method when grouped verifier
+     * publication needs to append the first shifted MTP row from the verifier
+     * base terminal hidden state.  The mock keeps the checkpoint metadata
+     * visible so tests can prove the rank sends a valid logical checkpoint to
+     * every participant instead of accidentally taking the older partial-forward
+     * row-list path.
+     */
+    bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+        const PrefixStateSnapshot &checkpoint,
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard = false,
+        int position_offset_override = -1) override
+    {
+        ++commit_mtp_checkpoint_terminal_hidden_calls_;
+        last_commit_mtp_already_appended_ = already_appended_tokens;
+        last_commit_mtp_main_forward_token_count_ = 0;
+        last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
+        last_commit_mtp_position_offset_override_ = position_offset_override;
+        last_commit_mtp_tokens_.assign(1, token);
+        last_commit_mtp_checkpoint_valid_ = checkpoint.valid;
+        last_commit_mtp_checkpoint_logical_ = checkpoint.logical_checkpoint;
+        last_commit_mtp_checkpoint_cached_tokens_ = checkpoint.cached_tokens;
+        last_commit_mtp_checkpoint_provenance_ = checkpoint.provenance;
+        if (!commit_mtp_checkpoint_terminal_hidden_ok_ ||
+            !checkpoint.valid ||
+            already_appended_tokens < 0)
+        {
+            return false;
+        }
+        if (position_offset_override >= 0 &&
+            position_offset_override != checkpoint.cached_tokens)
+        {
+            return false;
+        }
+        return true;
+    }
+
     bool ensureMTPCheckpointTerminalHidden() override
     {
         ++ensure_mtp_checkpoint_terminal_hidden_calls_;
@@ -1371,6 +1412,10 @@ public:
     void set_supports_chained_mtp_drafts(bool supported) { supports_chained_mtp_drafts_ = supported; }
     void set_forward_mtp_from_last_draft_ok(bool ok) { forward_mtp_from_last_draft_ok_ = ok; }
     void set_commit_mtp_shifted_rows_ok(bool ok) { commit_mtp_shifted_rows_ok_ = ok; }
+    void set_commit_mtp_checkpoint_terminal_hidden_ok(bool ok)
+    {
+        commit_mtp_checkpoint_terminal_hidden_ok_ = ok;
+    }
     void set_ensure_mtp_checkpoint_terminal_hidden_ok(bool ok)
     {
         ensure_mtp_checkpoint_terminal_hidden_ok_ = ok;
@@ -1443,6 +1488,10 @@ public:
     size_t get_mtp_logits_local_info_call_count() const { return get_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t consume_mtp_logits_local_info_call_count() const { return consume_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t commit_mtp_shifted_rows_call_count() const { return commit_mtp_shifted_rows_calls_; }
+    size_t commit_mtp_checkpoint_terminal_hidden_call_count() const
+    {
+        return commit_mtp_checkpoint_terminal_hidden_calls_;
+    }
     size_t ensure_mtp_checkpoint_terminal_hidden_call_count() const
     {
         return ensure_mtp_checkpoint_terminal_hidden_calls_;
@@ -1467,6 +1516,13 @@ public:
     bool last_commit_mtp_allow_speculative_discard() const { return last_commit_mtp_allow_speculative_discard_; }
     int last_commit_mtp_position_offset_override() const { return last_commit_mtp_position_offset_override_; }
     const std::vector<int32_t> &last_commit_mtp_tokens() const { return last_commit_mtp_tokens_; }
+    bool last_commit_mtp_checkpoint_valid() const { return last_commit_mtp_checkpoint_valid_; }
+    bool last_commit_mtp_checkpoint_logical() const { return last_commit_mtp_checkpoint_logical_; }
+    int last_commit_mtp_checkpoint_cached_tokens() const { return last_commit_mtp_checkpoint_cached_tokens_; }
+    PrefixStateProvenance last_commit_mtp_checkpoint_provenance() const
+    {
+        return last_commit_mtp_checkpoint_provenance_;
+    }
     const MTPSpecStepPlan &last_mtp_spec_state_plan() const { return last_mtp_spec_state_plan_; }
     const MTPSpecStepPlanBatch &last_mtp_spec_state_batch() const { return last_mtp_spec_state_batch_; }
     size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
@@ -1608,6 +1664,7 @@ private:
     bool supports_chained_mtp_drafts_ = false;
     bool forward_mtp_from_last_draft_ok_ = true;
     bool commit_mtp_shifted_rows_ok_ = true;
+    bool commit_mtp_checkpoint_terminal_hidden_ok_ = true;
     bool ensure_mtp_checkpoint_terminal_hidden_ok_ = true;
     bool supports_mtp_spec_state_publication_ = false;
     bool supports_grouped_decode_equivalent_mtp_spec_state_publication_ = false;
@@ -1657,8 +1714,13 @@ private:
     int last_commit_mtp_already_appended_ = 0;
     int last_commit_mtp_main_forward_token_count_ = 0;
     int last_commit_mtp_position_offset_override_ = -1;
+    int last_commit_mtp_checkpoint_cached_tokens_ = -1;
     size_t ensure_mtp_checkpoint_terminal_hidden_calls_ = 0;
     bool last_commit_mtp_allow_speculative_discard_ = false;
+    bool last_commit_mtp_checkpoint_valid_ = false;
+    bool last_commit_mtp_checkpoint_logical_ = false;
+    PrefixStateProvenance last_commit_mtp_checkpoint_provenance_ =
+        PrefixStateProvenance::Unknown;
     MTPSpecStepPlan last_mtp_spec_state_plan_;
     MTPSpecStepPlanBatch last_mtp_spec_state_batch_;
     MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_input_plan_;
@@ -1666,6 +1728,7 @@ private:
     size_t sample_greedy_on_device_calls_ = 0;
     size_t sample_on_device_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
+    size_t commit_mtp_checkpoint_terminal_hidden_calls_ = 0;
     size_t apply_penalties_on_device_calls_ = 0;
     size_t apply_penalties_to_mtp_logits_calls_ = 0;
     size_t apply_penalties_to_all_position_row_calls_ = 0;
@@ -4157,6 +4220,67 @@ TEST_F(Test__RankOrchestrator, LocalPPCheckpointTerminalHiddenDelegatesOnlyToFin
     EXPECT_EQ(stage1_ptr->ensure_mtp_checkpoint_terminal_hidden_call_count(), 1u);
 }
 
+/**
+ * @brief LocalTP fans out logical verifier-base terminal-hidden repairs.
+ *
+ * Grouped LocalTP MTP publication may synthesize a logical verifier-base
+ * checkpoint when every participant advertises that token-count checkpoints
+ * are sufficient.  That shared logical checkpoint still has to reach every TP
+ * participant so each shard appends its own shifted MTP row from the same
+ * serial-decode boundary.  This is the focused regression for a bug where the
+ * rank worker path accepted only aggregate participant snapshots and skipped
+ * valid logical checkpoints before child runners could commit the repair.
+ */
+TEST_F(Test__RankOrchestrator,
+       LocalTPCheckpointTerminalHiddenFansOutSharedLogicalCheckpoint)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixStateSnapshot checkpoint;
+    checkpoint.valid = true;
+    checkpoint.logical_checkpoint = true;
+    checkpoint.provenance = PrefixStateProvenance::LogicalCheckpoint;
+    checkpoint.cached_tokens = 5;
+    checkpoint.mtp_cached_tokens = {4};
+
+    EXPECT_TRUE(orchestrator->commitMTPShiftedRowFromCheckpointTerminalHidden(
+        checkpoint,
+        /*token=*/123,
+        /*already_appended_tokens=*/0,
+        /*allow_speculative_discard=*/true,
+        /*position_offset_override=*/5));
+
+    for (MockDeviceGraphOrchestrator *child : {runner0_ptr, runner1_ptr})
+    {
+        EXPECT_EQ(child->commit_mtp_checkpoint_terminal_hidden_call_count(), 1u);
+        EXPECT_EQ(child->commit_mtp_shifted_rows_call_count(), 0u)
+            << "The checkpoint-terminal-hidden repair is a distinct grouped "
+               "publication operation, not a partial-forward row replay.";
+        EXPECT_TRUE(child->last_commit_mtp_checkpoint_valid());
+        EXPECT_TRUE(child->last_commit_mtp_checkpoint_logical());
+        EXPECT_EQ(child->last_commit_mtp_checkpoint_provenance(),
+                  PrefixStateProvenance::LogicalCheckpoint);
+        EXPECT_EQ(child->last_commit_mtp_checkpoint_cached_tokens(), 5);
+        EXPECT_EQ(child->last_commit_mtp_tokens(),
+                  std::vector<int32_t>({123}));
+        EXPECT_TRUE(child->last_commit_mtp_allow_speculative_discard());
+        EXPECT_EQ(child->last_commit_mtp_position_offset_override(), 5);
+    }
+}
+
 TEST_F(Test__RankOrchestrator, LocalPPAllPositionPublicationRunsOnEveryStage)
 {
     auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
@@ -4885,6 +5009,86 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomePublishesGroup
     EXPECT_EQ(runner1_ptr->forward_mtp_from_resident_logical_state_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->last_resident_logical_state_request_index(), 0);
     EXPECT_EQ(runner1_ptr->last_resident_logical_state_request_index(), 0);
+}
+
+TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferredRankSlots)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
+    runner0_ptr->set_mock_logits_local(
+        /*local_vocab=*/3,
+        {0.0f, 1.0f, 2.0f});
+    runner0_ptr->set_mock_mtp_logits_local(
+        /*local_vocab=*/3,
+        {0.0f, 1.0f, 2.0f});
+    runner0_ptr->set_mock_all_position_logits_local(
+        /*rows=*/2,
+        /*local_vocab=*/3,
+        {
+            0.0f, 1.0f, 2.0f,
+            0.0f, 6.0f, 12.0f,
+        });
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
+    runner1_ptr->set_mock_logits_local(
+        /*local_vocab=*/3,
+        {0.0f, 10.0f, 1.0f});
+    runner1_ptr->set_mock_mtp_logits_local(
+        /*local_vocab=*/3,
+        {0.0f, 10.0f, 1.0f});
+    runner1_ptr->set_mock_all_position_logits_local(
+        /*rows=*/2,
+        /*local_vocab=*/3,
+        {
+            0.0f, 10.0f, 1.0f,
+            5.0f, 4.0f, 3.0f,
+        });
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    ASSERT_TRUE(orchestrator->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+        /*target_sample_slot=*/0,
+        /*out_token=*/nullptr));
+    ASSERT_TRUE(orchestrator->sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+        /*draft_sample_slot=*/0,
+        /*out_token=*/nullptr));
+
+    const std::array<int32_t, 2> deferred_tokens = {-3, -2};
+    DeviceSpeculativeOutcomeHandle handle;
+    ASSERT_TRUE(orchestrator->verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+        deferred_tokens.data(),
+        static_cast<int>(deferred_tokens.size()),
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        &handle));
+    ASSERT_TRUE(handle.valid());
+
+    DeviceSpeculativeVerifyBatchOutcome materialized;
+    ASSERT_TRUE(orchestrator->materializeDeviceSpeculativeOutcomesForHostResponse(
+        handle,
+        &materialized));
+    EXPECT_TRUE(materialized.ok);
+    EXPECT_EQ(materialized.output_token_count, 2);
+    EXPECT_EQ(materialized.output_tokens[0], 4)
+        << "The first-token shadow should resolve from rank target slot zero.";
+    EXPECT_EQ(materialized.output_tokens[1], 4)
+        << "The draft-token shadow should resolve from rank draft slot zero.";
+    EXPECT_EQ(materialized.accepted_speculative_prefix, 1);
+    EXPECT_EQ(materialized.target_verifier_state_commit_count, 2);
+    EXPECT_EQ(materialized.ready_token, 2);
+    EXPECT_EQ(runner0_ptr->consume_all_position_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->consume_all_position_logits_local_info_call_count(), 1u);
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPResidentCompactStochasticOutcomePublishesGroupedRowsWithoutChildVerifierFallback)
@@ -5650,6 +5854,47 @@ TEST_F(Test__RankOrchestrator, MultiChildMainSamplingDelegatesToPrimaryReplicate
     EXPECT_EQ(runner1_ptr->sample_greedy_on_device_call_count(), 0u);
 }
 
+TEST_F(Test__RankOrchestrator, MultiChildGreedyMainTargetSlotStagesCrossShardWinner)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0->set_mock_logits_local(
+        /*local_vocab=*/3,
+        {0.5f, 1.0f, 0.25f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1->set_mock_logits_local(
+        /*local_vocab=*/3,
+        {0.1f, 5.0f, 2.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    int32_t host_token = -1;
+    EXPECT_TRUE(orchestrator->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+        /*target_sample_slot=*/2,
+        &host_token));
+
+    EXPECT_EQ(host_token, 4)
+        << "The rank argmax must add each child's vocab offset before staging.";
+    EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->stage_stochastic_target_token_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->stage_stochastic_target_token_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_staged_target_token(), 4);
+    EXPECT_EQ(runner1_ptr->last_staged_target_token(), 4);
+    EXPECT_EQ(runner0_ptr->last_staged_target_sample_slot(), 2);
+    EXPECT_EQ(runner1_ptr->last_staged_target_sample_slot(), 2);
+}
+
 TEST_F(Test__RankOrchestrator, MultiChildMainStochasticSamplingDelegatesToPrimaryReplicatedLogits)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
@@ -5767,6 +6012,55 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPSamplingUsesColumnParallelShardInfos
     EXPECT_EQ(runner1_ptr->consume_mtp_logits_local_info_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->get_mtp_logits_local_info_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->get_mtp_logits_local_info_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildGreedyMTPDraftSlotStagesCrossShardWinner)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mock_mtp_logits_local(
+        /*local_vocab=*/3,
+        {1.0f, 0.0f, 0.5f});
+    auto *runner0_ptr = runner0.get();
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_mock_mtp_logits_local(
+        /*local_vocab=*/3,
+        {0.25f, 9.0f, 2.0f});
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setVocabSize(6);
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    int32_t host_token = -1;
+    EXPECT_TRUE(orchestrator->sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+        /*draft_sample_slot=*/1,
+        &host_token));
+
+    EXPECT_EQ(host_token, 4)
+        << "The rank argmax must convert the winning local MTP shard index into "
+           "the global token before staging draft verifier slots.";
+    EXPECT_EQ(runner0_ptr->consume_mtp_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->consume_mtp_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->get_mtp_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->get_mtp_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner0_ptr->stage_stochastic_draft_tokens_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->stage_stochastic_draft_tokens_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_staged_first_draft_slot(), 1);
+    EXPECT_EQ(runner1_ptr->last_staged_first_draft_slot(), 1);
+    EXPECT_EQ(runner0_ptr->last_staged_draft_tokens(),
+              std::vector<int32_t>({4}));
+    EXPECT_EQ(runner1_ptr->last_staged_draft_tokens(),
+              std::vector<int32_t>({4}));
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildMTPPenaltyApplicationFansOutToEveryShard)

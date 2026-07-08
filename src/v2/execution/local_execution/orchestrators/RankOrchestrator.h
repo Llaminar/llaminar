@@ -1585,6 +1585,37 @@ namespace llaminar2
             int32_t *out_token);
 
         /**
+         * @brief Resolve a LocalTP greedy MTP-head sample into a child draft slot.
+         *
+         * The MTP sidecar LM head is vocab-sharded under LocalTP, so no child can
+         * independently choose the full-vocab greedy draft token.  The rank
+         * consumes each child's compact local-logits metadata, performs the same
+         * cross-shard argmax used by immediate greedy sampling, and then stages
+         * the single winning global token into every child draft slot.  This is
+         * the grouped verifier production path: it avoids a full-logit host
+         * gather, avoids row replay, and preserves the device-slot contract used
+         * by greedy and stochastic verifier input materialization.
+         */
+        bool sampleRankGreedyMTPLogitsToLocalTPDraftSlot(
+            int draft_sample_slot,
+            int32_t *out_token);
+
+        /**
+         * @brief Resolve a LocalTP greedy main-logits sample into a child target slot.
+         *
+         * Greedy MTP first-token deferral uses the same child-owned target-token
+         * arena as stochastic verification.  In LocalTP no child owns full logits,
+         * so the rank performs the economical cross-shard argmax from each
+         * child's local logits metadata, records the compact winning token, and
+         * fans that one token into every child device target slot.  This keeps the
+         * verifier path grouped and device-slot based without falling back to a
+         * full-logit host gather.
+         */
+        bool sampleRankGreedyMainLogitsToLocalTPTargetSlot(
+            int target_sample_slot,
+            int32_t *out_token);
+
+        /**
          * @brief Install one rank-resolved target token into every child slot.
          *
          * The LocalTP rank reducer owns the compact full-vocab sample decision,
@@ -1637,6 +1668,23 @@ namespace llaminar2
             const int32_t *tokens,
             int total_verifier_input_tokens,
             int draft_token_count);
+
+        /**
+         * @brief Resolve deferred LocalTP greedy outcome tokens from rank slots.
+         *
+         * Device-resident greedy MTP can intentionally pass compact shadow
+         * sentinels through OrchestrationRunner while the actual first token and
+         * draft tokens live in rank-owned target/draft sample slots.  The
+         * rank-level outcome reducer must summarize the real tokens that the
+         * verifier graph consumed, not the negative shadows.  This helper maps a
+         * negative first entry to target slot zero and negative draft entries to
+         * the corresponding draft slots, returning a compact host row suitable
+         * for SamplingMath metadata generation and publication bookkeeping.
+         */
+        bool resolveRankGreedyOutcomeTokensForLocalTP(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            std::vector<int32_t> *out_tokens) const;
 
         /**
          * @brief Return a previously sampled rank draft token slot.

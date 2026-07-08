@@ -4478,6 +4478,8 @@ namespace llaminar2
 
         const bool aggregate_checkpoint =
             !checkpoint.participant_snapshots.empty();
+        const bool shared_logical_checkpoint =
+            !aggregate_checkpoint && checkpoint.logical_checkpoint;
         if (aggregate_checkpoint &&
             checkpoint.participant_snapshots.size() != device_runners_.size())
         {
@@ -4490,7 +4492,9 @@ namespace llaminar2
         {
             if (aggregate_checkpoint)
                 return &checkpoint.participant_snapshots[i];
-            return device_runners_.size() == 1 ? &checkpoint : nullptr;
+            if (device_runners_.size() == 1 || shared_logical_checkpoint)
+                return &checkpoint;
+            return nullptr;
         };
 
         if (device_runners_.size() == 1)
@@ -4532,7 +4536,7 @@ namespace llaminar2
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())}});
             tp_worker_pool_->dispatch(
-                [this, &checkpoint, token, already_appended_tokens,
+                [this, &checkpoint, &child_checkpoint, token, already_appended_tokens,
                  allow_speculative_discard, position_offset_override,
                  kernel_phase, rocm_phase, cuda_phase, kv_phase,
                  executor_phase](size_t i) -> bool
@@ -4544,9 +4548,16 @@ namespace llaminar2
                     GraphExecutorStats::setCurrentPhase(executor_phase);
 
                     if (i >= device_runners_.size() ||
-                        i >= checkpoint.participant_snapshots.size() ||
                         !device_runners_[i])
                     {
+                        return false;
+                    }
+                    const PrefixStateSnapshot *child = child_checkpoint(i);
+                    if (!child)
+                    {
+                        LOG_ERROR("RankOrchestrator::commitMTPShiftedRowFromCheckpointTerminalHidden: Device "
+                                  << i
+                                  << " has no participant checkpoint for non-logical multi-device commit");
                         return false;
                     }
 
@@ -4565,7 +4576,7 @@ namespace llaminar2
 
                     const bool ok =
                         device_runners_[i]->commitMTPShiftedRowFromCheckpointTerminalHidden(
-                            checkpoint.participant_snapshots[i],
+                            *child,
                             token,
                             already_appended_tokens,
                             allow_speculative_discard,
@@ -4855,7 +4866,9 @@ namespace llaminar2
                 draft_sample_slot,
                 out_token);
         }
-        return false;
+        return sampleRankGreedyMTPLogitsToLocalTPDraftSlot(
+            draft_sample_slot,
+            out_token);
     }
 
     bool RankOrchestrator::sampleGreedyFromMainLogitsToDeviceTargetSlot(
@@ -4874,7 +4887,9 @@ namespace llaminar2
                 target_sample_slot,
                 out_token);
         }
-        return false;
+        return sampleRankGreedyMainLogitsToLocalTPTargetSlot(
+            target_sample_slot,
+            out_token);
     }
 
     int RankOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
@@ -5031,6 +5046,60 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::resolveRankGreedyOutcomeTokensForLocalTP(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        std::vector<int32_t> *out_tokens) const
+    {
+        if (!draft_tokens ||
+            draft_token_count <= 0 ||
+            !out_tokens)
+        {
+            return false;
+        }
+
+        out_tokens->clear();
+        out_tokens->reserve(static_cast<size_t>(draft_token_count));
+
+        int resolved_shadow_count = 0;
+        for (int i = 0; i < draft_token_count; ++i)
+        {
+            int32_t token = draft_tokens[i];
+            if (token < 0)
+            {
+                /*
+                 * OrchestrationRunner uses negative shadows only after it has
+                 * staged the corresponding compact token into rank-owned slots.
+                 * Slot zero is the fixed first-token target slot for the current
+                 * single-request transaction; draft entries map one-to-one to
+                 * draft slots starting at zero.
+                 */
+                token = (i == 0)
+                            ? rankStochasticTargetSampleToken(/*slot=*/0)
+                            : rankStochasticDraftSampleToken(/*slot=*/i - 1);
+                ++resolved_shadow_count;
+            }
+            if (token < 0)
+            {
+                out_tokens->clear();
+                return false;
+            }
+            out_tokens->push_back(token);
+        }
+
+        if (resolved_shadow_count > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_greedy_outcome_deferred_token_resolutions",
+                static_cast<double>(resolved_shadow_count),
+                "decode",
+                "rank",
+                {{"tokens", std::to_string(draft_token_count)}});
+        }
+        return true;
+    }
+
     bool RankOrchestrator::verifyGreedyAllPositionBatchOutcomeOnDevice(
         const int32_t *draft_tokens,
         int draft_token_count,
@@ -5076,6 +5145,15 @@ namespace llaminar2
             return false;
         }
 
+        std::vector<int32_t> resolved_draft_tokens;
+        if (!resolveRankGreedyOutcomeTokensForLocalTP(
+                draft_tokens,
+                draft_token_count,
+                &resolved_draft_tokens))
+        {
+            return false;
+        }
+
         /*
          * LocalTP all-position verifier logits are vocab shards.  Reduce the
          * compact verifier row batch across child-local shards, then run the
@@ -5102,7 +5180,7 @@ namespace llaminar2
             verifier_tokens[static_cast<size_t>(row)] =
                 static_cast<int>(verifier_tokens_i32[static_cast<size_t>(row)]);
             packed_draft_tokens[static_cast<size_t>(row)] =
-                static_cast<int>(draft_tokens[row]);
+                static_cast<int>(resolved_draft_tokens[static_cast<size_t>(row)]);
         }
 
         std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens{};
@@ -5115,7 +5193,7 @@ namespace llaminar2
         output_tokens_int.fill(-1);
         meta.fill(0);
         summarize_greedy_speculative_verify_batch(
-            packed_draft_tokens[0],
+            static_cast<int>(resolved_draft_tokens[0]),
             verifier_tokens.data(),
             packed_draft_tokens.data(),
             compare_rows,
@@ -5177,9 +5255,18 @@ namespace llaminar2
         rank_compact_outcome_published_ = false;
         rank_resident_child_logical_state_handles_.clear();
 
+        std::vector<int32_t> resolved_draft_tokens;
+        if (!resolveRankGreedyOutcomeTokensForLocalTP(
+                draft_tokens,
+                draft_token_count,
+                &resolved_draft_tokens))
+        {
+            return false;
+        }
+
         DeviceSpeculativeVerifyBatchOutcome outcome;
         if (!verifyGreedyAllPositionBatchOutcomeOnDevice(
-                draft_tokens,
+                resolved_draft_tokens.data(),
                 draft_token_count,
                 stop_tokens,
                 stop_token_count,
@@ -5220,8 +5307,8 @@ namespace llaminar2
             outcome.sampled_terminal ? 1 : 0;
 
         rank_compact_last_draft_tokens_.assign(
-            draft_tokens,
-            draft_tokens + draft_token_count);
+            resolved_draft_tokens.begin(),
+            resolved_draft_tokens.end());
         rank_compact_last_stop_tokens_.clear();
         if (stop_token_count > 0)
         {
@@ -5766,6 +5853,141 @@ namespace llaminar2
              {"top_k", std::to_string(active_top_k)},
              {"token", std::to_string(token)},
              {"probability", std::to_string(selected_probability)}});
+        return true;
+    }
+
+    bool RankOrchestrator::sampleRankGreedyMTPLogitsToLocalTPDraftSlot(
+        int draft_sample_slot,
+        int32_t *out_token)
+    {
+        if (device_runners_.size() < 2 ||
+            draft_sample_slot < 0 ||
+            draft_sample_slot >= kRankStochasticMaxSlots)
+        {
+            return false;
+        }
+
+        /*
+         * Each child owns only its local MTP-head shard.  The rank samples the
+         * global greedy token by reducing child-local argmax metadata, then
+         * stages that one compact token into every child draft slot.  The
+         * verifier can therefore consume child device slots exactly as it does
+         * for stochastic MTP, without gathering full logits or replaying rows.
+         */
+        std::vector<LogitsLocalInfo> local_infos;
+        local_infos.reserve(device_runners_.size());
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->hasMTPLogitsLocal())
+                return false;
+            LogitsLocalInfo info =
+                runner->consumeMTPLogitsLocalInfoForSampling();
+            if (!info || info.vocab_local == 0)
+                return false;
+            local_infos.push_back(info);
+        }
+
+        const int token =
+            DeviceSampler::sampleGreedyFromLocalInfos(local_infos, /*row=*/0);
+        if (token < 0)
+            return false;
+
+        const int32_t staged_token = static_cast<int32_t>(token);
+        if (!stageStochasticDraftTokensForDeviceVerification(
+                &staged_token,
+                /*draft_token_count=*/1,
+                draft_sample_slot))
+        {
+            return false;
+        }
+        if (out_token)
+            *out_token = staged_token;
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_greedy_mtp_draft_slot_samples",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"slot", std::to_string(draft_sample_slot)},
+             {"token", std::to_string(token)},
+             {"implementation", "cross_shard_argmax_device_partial"}});
+        return true;
+    }
+
+    bool RankOrchestrator::sampleRankGreedyMainLogitsToLocalTPTargetSlot(
+        int target_sample_slot,
+        int32_t *out_token)
+    {
+        if (device_runners_.size() < 2 ||
+            target_sample_slot < 0 ||
+            target_sample_slot >= kRankStochasticMaxSlots)
+        {
+            return false;
+        }
+
+        /*
+         * LocalTP main logits are vocab-sharded: each child owns a compact row
+         * for its LM-head slice.  DeviceSampler performs the economical
+         * per-shard argmax and returns only the winning global token.  That small
+         * rank decision is then staged into every child target slot so downstream
+         * verifier graph input remains device-resident and participant-symmetric.
+         */
+        std::vector<LogitsLocalInfo> local_infos;
+        local_infos.reserve(device_runners_.size());
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->hasLogitsLocal())
+                return false;
+            LogitsLocalInfo info =
+                runner->consumeLogitsLocalInfoForSampling();
+            if (!info || info.vocab_local == 0)
+                return false;
+            local_infos.push_back(info);
+        }
+
+        const int token =
+            DeviceSampler::sampleGreedyFromLocalInfos(local_infos, /*row=*/0);
+        if (token < 0)
+            return false;
+
+        if (!stageRankStochasticTargetTokenForLocalTP(
+                target_sample_slot,
+                static_cast<int32_t>(token)))
+        {
+            return false;
+        }
+
+        const size_t slot_offset =
+            static_cast<size_t>(target_sample_slot) *
+            static_cast<size_t>(sampling_math::kMaxTopK);
+        for (int i = 0; i < sampling_math::kMaxTopK; ++i)
+        {
+            rank_stochastic_target_token_ids_[slot_offset +
+                                              static_cast<size_t>(i)] = -1;
+            rank_stochastic_target_probs_[slot_offset +
+                                          static_cast<size_t>(i)] = 0.0f;
+        }
+        rank_stochastic_target_token_ids_[slot_offset] = token;
+        rank_stochastic_target_probs_[slot_offset] = 1.0f;
+        rank_stochastic_target_top_k_[static_cast<size_t>(target_sample_slot)] = 1;
+        rank_stochastic_target_sample_tokens_[
+            static_cast<size_t>(target_sample_slot)] =
+            static_cast<int32_t>(token);
+        if (out_token)
+            *out_token = static_cast<int32_t>(token);
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_greedy_main_target_slot_samples",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"slot", std::to_string(target_sample_slot)},
+             {"token", std::to_string(token)},
+             {"implementation", "cross_shard_argmax_device_partial"}});
         return true;
     }
 

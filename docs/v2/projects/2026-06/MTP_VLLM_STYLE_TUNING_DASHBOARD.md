@@ -21,13 +21,10 @@ partials/params use fixed staging plus declared workspace buffers.
 
 CUDA dense greedy d2/d3 acceptance recovered after verifier-row ownership fix.
 
-2026-07-06 CUDA2 ExpertOverlay Dynamic + prefix-cache + MTP long-context parity
-passed after no-snapshot prefix restore now invalidates depth-0 MTP sidecar
-graphs. Evidence: `PrefixCacheMTPRestore_CUDA2TPDynamicPhaseSplit` passed in
-`288.7s`; perfstats show `prefix_cache.block_hits`, `includes_mtp_state=true`,
-`model_runtime_state=false`, `mtp.sidecar_graph_invalidations`, fresh sidecar
-misses, grouped publication, and MoE runtime predicates initialized on both CUDA
-participants. Still slow and prints compact-rebalance missing-source diagnostics.
+2026-07-07 LocalTP CUDA/ROCm prefix+MTP correctness is green: Qwen3.6 LocalTP
+parity `13/13`, full unit suite `517/517`. Fixes covered sidecar graph-capture
+boundary fencing, rank greedy compact sampling/publication, and logical
+verifier-base shifted-row fanout to every TP participant.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
@@ -40,8 +37,8 @@ combined routed+shared without strict L2/KLD/cosine/max_abs/token proof.
 | SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused |
 | SingleDevice | CUDA d1 | G | G | R | R | Dense green; MoE below baseline |
 | SingleDevice | ROCm d1 | A | A | A | A | MoE nearly break-even |
-| LocalTP | CUDA deg2 | R | R | R | R | Dense greedy accepts 0; stochastic unsupported |
-| LocalTP | ROCm deg2 | R | R | R | R | Fixed d1 segfaults in LocalTP allreduce |
+| LocalTP | CUDA deg2 | A | A | R | R | Dense correctness green; perf/tuning pending |
+| LocalTP | ROCm deg2 | A | A | R | R | Dense correctness green after topology swap |
 | LocalTP | ROCm deg4 | A | R | R | R | Preset/bench refresh pending |
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
 | LocalPP | ROCm stages | R | R | R | R | Prior dense run speed-negative |
@@ -91,12 +88,12 @@ build time on both CUDA and ROCm.
 - CUDA2 ExpertOverlay Dynamic long-context prefix+MTP passed with explicit
   sidecar graph invalidation.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
-- LocalTP greedy now has a rank-owned compact outcome path: sharded verifier
-  rows reduce through child `LogitsLocalInfo`, grouped child publishers mutate
-  accepted state without row replay, and Rank exposes an aggregate resident
-  mailbox for next-step prelaunch. Focused gate:
-  `V2_Unit_RankOrchestrator|V2_Unit_PrefillDecodeTransition|V2_Unit_MTPVerifierPolicy`.
-  Remaining debt: stochastic LocalTP reducer.
+- LocalTP grouped path: rank-owned compact greedy sampling reduces child
+  `LogitsLocalInfo`, grouped child publishers mutate accepted state without row
+  replay, resident mailboxes prelaunch the next step, and logical checkpoint
+  shifted-row repair fans out to every TP participant. Focused gates:
+  `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, Qwen3.6 LocalTP parity `13/13`.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,
   CPU MTP thinking `27/27`, dense Qwen3.6 E2E `261/261`.
 - Model-load/MTP lifecycle guards pass: `V2_Unit_NodeLeaderPageCache` and

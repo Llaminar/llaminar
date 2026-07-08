@@ -11172,6 +11172,30 @@ namespace llaminar2
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
                 capture_policy.defer_final_sync = can_defer_sidecar_sync;
+                if (capture_policy.allow_cached_graph_replay)
+                {
+                    /*
+                     * MTP sidecar decode graphs use the same LocalTP capture
+                     * lifecycle as the main decode graph.  Without this
+                     * boundary, one TP participant can begin HIP/CUDA stream
+                     * capture for a sidecar collective while a sibling is still
+                     * draining or publishing the previous shifted-KV catch-up.
+                     * ROCm reports that race as a capture-implicit stream
+                     * dependency and poisons the RCCL graph-captured allreduce.
+                     */
+                    ForwardInput capture_boundary_input;
+                    capture_boundary_input.device = state_.device_id;
+                    const DeviceId capture_device = state_.device_id;
+                    capture_policy.before_begin_capture =
+                        [this, capture_boundary_input, capture_device](
+                            const std::string &boundary_name) -> bool
+                    {
+                        return waitAtDecodeGraphCaptureBoundary(
+                            capture_boundary_input,
+                            capture_device,
+                            boundary_name);
+                    };
+                }
                 const char *sidecar_recapture_context_filter =
                     DebugEnv::envValue("LLAMINAR_MTP_FORCE_SIDECAR_GRAPH_RECAPTURE_CONTEXT");
                 const bool force_this_sidecar_context =

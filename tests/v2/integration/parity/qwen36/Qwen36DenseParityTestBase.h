@@ -179,12 +179,10 @@ namespace llaminar2::test::parity::qwen36
     /**
      * @brief Return whether dense greedy MTP should publish through grouped host plans.
      *
-     * Local tensor parallel runners reduce verifier logits across device-local
-     * LM-head shards, so they cannot use a single child runner's compact
-     * device-resident publication mailbox.  They can still avoid row-serial
-     * catch-up replay: the parent RankOrchestrator builds one
-     * decode-equivalent MTPSpecStepPlanBatch from grouped verifier rows, then
-     * fan-outs that same host plan to every TP participant.
+     * This lane is intentionally narrow now that GPU LocalTP owns a rank-level
+     * compact verifier outcome and resident mailbox.  It remains as a guard for
+     * future distributed shapes that can publish grouped verifier rows through
+     * host-visible plans but do not yet have a compact resident outcome.
      *
      * @param test_case Dense parity fixture under test.
      * @return true when the fixture is a GPU LocalTP case that should exercise
@@ -193,28 +191,18 @@ namespace llaminar2::test::parity::qwen36
     inline bool denseCaseExpectsGroupedHostMTPPublication(
         const DensePrefixRestoreParityCase &test_case)
     {
-        if (test_case.topology != DensePrefixParityTopology::LocalTP ||
-            test_case.devices.empty())
-        {
-            return false;
-        }
-
-        return std::all_of(
-            test_case.devices.begin(),
-            test_case.devices.end(),
-            [](const GlobalDeviceAddress &device)
-            {
-                return device.isGPU();
-            });
+        (void)test_case;
+        return false;
     }
 
     /**
-     * @brief Return whether dense greedy MTP should use device-resident publication.
+     * @brief Return whether dense MTP should use device-resident publication.
      *
-     * Single-device GPU runners own every speculative slot and live-state cache
-     * locally, so they should use the compact grouped outcome reducer plus the
-     * device-resident publication mailbox.  CPU runners and distributed runners
-     * without that mailbox remain on explicit replay or grouped host plans.
+     * Single-device GPU runners own every speculative slot locally.  GPU
+     * LocalTP runners now reduce verifier outcomes at RankOrchestrator scope
+     * and then fan the same compact accepted-state transaction to every child.
+     * CPU runners and distributed runners without that mailbox remain on
+     * explicit replay or grouped host plans.
      *
      * @param test_case Dense parity fixture under test.
      * @return true when the fixture should exercise device-resident MTP state
@@ -223,9 +211,20 @@ namespace llaminar2::test::parity::qwen36
     inline bool denseCaseExpectsGroupedDevicePublication(
         const DensePrefixRestoreParityCase &test_case)
     {
-        return test_case.topology == DensePrefixParityTopology::SingleDevice &&
-               !test_case.devices.empty() &&
-               test_case.devices.front().isGPU();
+        if (test_case.devices.empty())
+            return false;
+
+        const bool all_gpu =
+            std::all_of(
+                test_case.devices.begin(),
+                test_case.devices.end(),
+                [](const GlobalDeviceAddress &device)
+                {
+                    return device.isGPU();
+                });
+        return all_gpu &&
+               (test_case.topology == DensePrefixParityTopology::SingleDevice ||
+                test_case.topology == DensePrefixParityTopology::LocalTP);
     }
 
     inline bool denseHasMTPPerfCounter(
@@ -293,7 +292,11 @@ namespace llaminar2::test::parity::qwen36
             denseHasMTPPerfCounter(
                 records,
                 "grouped_outcome_device_resident_publication_uses") &&
-            denseHasMTPPerfCounter(records, "spec_state_publications");
+            (denseHasMTPPerfCounter(records, "spec_state_publications") ||
+             denseHasMTPPerfCounter(records, "spec_state_batch_publications") ||
+             denseHasMTPPerfCounter(
+                 records,
+                 "rank_grouped_decode_equivalent_spec_state_batch_publications"));
         const bool used_direct_all_position_publication =
             denseHasMTPPerfCounter(
                 records,
@@ -4785,9 +4788,10 @@ namespace llaminar2::test::parity::qwen36
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
         ASSERT_TRUE(test_case.topology == DensePrefixParityTopology::SingleDevice ||
-                    test_case.topology == DensePrefixParityTopology::LocalPP)
-            << "Stochastic MTP verifier parity currently requires a full-logit "
-               "SingleDevice or LocalPP final-stage owner";
+                    test_case.topology == DensePrefixParityTopology::LocalPP ||
+                    test_case.topology == DensePrefixParityTopology::LocalTP)
+            << "Stochastic MTP verifier parity requires either a full-logit "
+               "owner or a rank-owned LocalTP compact reducer";
 
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -4884,6 +4888,16 @@ namespace llaminar2::test::parity::qwen36
                 phase138_records,
                 "all_position_state_publication_verifier_runs") &&
             denseHasMTPPerfCounter(phase138_records, "spec_state_publications");
+        const bool used_grouped_device_publication =
+            denseHasMTPPerfCounter(
+                phase138_records,
+                "grouped_decode_equivalent_stochastic_verifier_runs") &&
+            denseHasMTPPerfCounter(
+                phase138_records,
+                "grouped_outcome_device_resident_publication_uses") &&
+            denseHasMTPPerfCounter(
+                phase138_records,
+                "grouped_outcome_device_resident_state_publications");
         if (denseCaseExpectsAllPositionSpecPublication(test_case))
         {
             EXPECT_TRUE(used_all_position_publication)
@@ -4894,6 +4908,23 @@ namespace llaminar2::test::parity::qwen36
                 << "GPU Qwen3.6 stochastic MTP must not fall back to the "
                    "decode-equivalent stochastic verifier once publication is "
                    "available\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
+        else if (denseCaseExpectsGroupedDevicePublication(test_case))
+        {
+            EXPECT_TRUE(used_grouped_device_publication)
+                << "GPU LocalTP Qwen3.6 stochastic MTP must exercise the "
+                   "rank-owned grouped verifier outcome and device-resident "
+                   "publication path\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
+                << "GPU LocalTP Qwen3.6 stochastic MTP must not fall back to "
+                   "row-serial stochastic verifier replay once the rank "
+                   "compact reducer is available\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_all_position_publication)
+                << "GPU LocalTP Qwen3.6 stochastic MTP must not promote to a "
+                   "single-owner all-position publication path\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
         else

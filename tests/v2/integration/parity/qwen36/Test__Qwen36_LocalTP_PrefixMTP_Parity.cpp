@@ -75,6 +75,11 @@ TEST(Qwen36CUDALocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecode
     runDenseDynamicMTPParity(cudaLocalTPCase(), false);
 }
 
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase());
+}
+
 TEST(Qwen36CUDALocalTPPrefixMTPParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(cudaLocalTPCase(), true);
@@ -98,6 +103,11 @@ TEST(Qwen36ROCmLocalTPPrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens
 TEST(Qwen36ROCmLocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
 {
     runDenseDynamicMTPParity(rocmLocalTPCase(), false);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase());
 }
 
 TEST(Qwen36ROCmLocalTPPrefixMTPParity, PrefixCacheMTPRestore)
