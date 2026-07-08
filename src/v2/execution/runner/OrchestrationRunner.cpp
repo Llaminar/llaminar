@@ -1983,9 +1983,20 @@ namespace llaminar2
             !active_sampling_params_.is_greedy() &&
             !active_sampling_params_.has_penalties() &&
             runner_->supportsDeviceStochasticMTPVerification();
-        const bool stochastic_publication_ok =
-            !stochastic_batch_verify ||
-            !runner_->primaryDeviceId().is_gpu() ||
+        /*
+         * Request-batched stochastic GPU decode publishes from the compact
+         * device outcome mailbox, not from the older direct all-position
+         * host-plan publisher.  LocalTP grouped verification deliberately hides
+         * supportsMTPSpecStatePublication() from the policy while still
+         * supporting publishAcceptedMTPSpecStateBatchFromDeviceOutcome(), so
+         * advertise batch continuation when either the direct contract or the
+         * resident compact stochastic contract is available.
+         */
+        const bool direct_publication_ok =
+            runner_->supportsMTPSpecStatePublication();
+        const bool resident_stochastic_publication_ok =
+            stochastic_batch_verify &&
+            runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsDeviceResidentMTPSpecStatePublication();
         const bool chained_ok =
             draft_depth <= 1 || runner_->supportsChainedMTPDrafts();
@@ -1996,8 +2007,8 @@ namespace llaminar2
                draft_depth >= 1 &&
                draft_depth <= 3 &&
                chained_ok &&
-               stochastic_publication_ok &&
-               runner_->supportsMTPSpecStatePublication();
+               (direct_publication_ok ||
+                resident_stochastic_publication_ok);
     }
 
     GenerationBatchResult OrchestrationRunner::decodeStepBatch(int request_batch)
@@ -2314,11 +2325,26 @@ namespace llaminar2
                 "requires batched chained MTP draft support for depth > 1";
             return batch_result;
         }
-        if (!runner_->supportsMTPSpecStatePublication())
+        /*
+         * Non-stochastic request batches still require the direct batch
+         * publisher.  Stochastic GPU request batches can instead use the
+         * compact resident outcome publisher below; requiring the direct
+         * all-position advert here would incorrectly reject grouped LocalTP
+         * lanes before their rank-owned compact reducer can run.
+         */
+        const bool request_batch_direct_publication_ok =
+            runner_->supportsMTPSpecStatePublication();
+        const bool request_batch_resident_publication_ok =
+            stochastic_batch_verify &&
+            runner_->primaryDeviceId().is_gpu() &&
+            runner_->supportsDeviceResidentMTPSpecStatePublication();
+        if (!request_batch_direct_publication_ok &&
+            !request_batch_resident_publication_ok)
         {
             batch_result.error =
                 "decodeStepBatch() request-batched verifier continuation "
-                "requires runner MTP spec-state publication";
+                "requires runner MTP spec-state publication or stochastic "
+                "device-resident compact publication";
             return batch_result;
         }
 

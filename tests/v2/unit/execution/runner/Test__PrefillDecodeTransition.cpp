@@ -5370,6 +5370,70 @@ namespace
     }
 
     /**
+     * @brief Request-batched stochastic MTP accepts compact resident publication.
+     *
+     * Grouped LocalTP owns the verifier outcome at rank scope: it reduces
+     * sharded verifier rows into compact metadata and publishes that device
+     * outcome through every participant.  That lane intentionally does not
+     * advertise the older direct all-position host-plan publisher, so the
+     * request-batch gate must key off the resident compact publication
+     * contract.  This focused regression hides the direct advert while keeping
+     * resident publication enabled; decodeStepBatch() must still execute the
+     * same device-outcome path as the full direct-advert case above.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           RequestBatchedStochasticResidentPublicationDoesNotRequireDirectAdvert)
+    {
+        auto [runner, mock] =
+            createSingleDeviceRequestBatchRunner(
+                /*max_request_batch=*/2,
+                /*mtp_draft_tokens=*/2,
+                MTPVerifyMode::SpeculativeSampling);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMainLogitsBatchRowsOnDevice();
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+
+        SamplingParams sampling;
+        sampling.temperature = 0.1f;
+        sampling.top_k = 5;
+        sampling.top_p = 1.0f;
+        sampling.seed = 1234;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefillBatch({{1, 2, 3}, {4, 5}}))
+            << runner->lastError();
+
+        GenerationBatchResult first = runner->decodeStepBatch(2);
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        EXPECT_TRUE(runner->supportsDecodeStepBatch(2))
+            << "The request batch should remain advertised when compact "
+               "device-resident publication is the only production publisher.";
+
+        GenerationBatchResult second = runner->decodeStepBatch(2);
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_THAT(second.requests, SizeIs(2));
+        EXPECT_THAT(second.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(second.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
+            << "The hidden direct publisher must not be used as a fallback.";
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_EQ(mock->adoptDeviceResidentHostStateCount(), 1);
+        EXPECT_THAT(mock->publicationEvents(),
+                    ElementsAre("device_outcome_publish",
+                                "host_state_adopt",
+                                "host_outcome_bridge"));
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+    }
+
+    /**
      * @brief Pins the scalar-equivalent RNG contract for batched stochastic MTP.
      *
      * Request batching must not key accept, residual, or bonus draws by compact
