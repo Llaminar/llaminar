@@ -10834,19 +10834,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPre
     constexpr int top_k = 2;
     constexpr int total_slots = seq_len * top_k;
 
-    struct ScopedGroupedPrefillFlag
-    {
-        bool old_value;
-        explicit ScopedGroupedPrefillFlag(bool value)
-            : old_value(llaminar2::mutableDebugEnv().gpu_moe.grouped_prefill)
-        {
-            llaminar2::mutableDebugEnv().gpu_moe.grouped_prefill = value;
-        }
-        ~ScopedGroupedPrefillFlag()
-        {
-            llaminar2::mutableDebugEnv().gpu_moe.grouped_prefill = old_value;
-        }
-    } grouped_prefill_flag(true);
     ScopedEnv perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
     llaminar2::PerfStatsCollector::reset();
 
@@ -10963,7 +10950,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPre
         device, 64 * 1024 * 1024);
     llaminar2::CUDADeviceContext ctx(device, 0);
 
-    llaminar2::mutableDebugEnv().gpu_moe.grouped_prefill = false;
     llaminar2::MoEExpertComputeStage reference_stage(make_params(reference_output.get(), nullptr));
     ASSERT_TRUE(stage_workspace->allocate(
         reference_stage.getWorkspaceRequirements(seq_len, d_model, intermediate)));
@@ -10980,7 +10966,6 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPre
     runtime_config.prefill_token_capacity = seq_len;
     llaminar2::MoERuntimeTable runtime_table(runtime_config);
 
-    llaminar2::mutableDebugEnv().gpu_moe.grouped_prefill = true;
     llaminar2::MoEExpertComputeStage runtime_stage(make_params(runtime_output.get(), &runtime_table));
     ASSERT_TRUE(runtime_stage.isGraphCapturable());
     runtime_stage.bindWorkspace(stage_workspace.get());

@@ -46,27 +46,23 @@ namespace
     class ScopedMoEGraphCaptureFlags
     {
     public:
-        ScopedMoEGraphCaptureFlags(bool grouped_decode, bool device_routed_decode, bool grouped_prefill)
+        ScopedMoEGraphCaptureFlags(bool grouped_decode, bool device_routed_decode)
             : old_grouped_(mutableDebugEnv().rocm.moe_grouped_decode),
-              old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode),
-              old_prefill_(mutableDebugEnv().gpu_moe.grouped_prefill)
+              old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode)
         {
             mutableDebugEnv().rocm.moe_grouped_decode = grouped_decode;
             mutableDebugEnv().rocm.moe_device_routed_decode = device_routed_decode;
-            mutableDebugEnv().gpu_moe.grouped_prefill = grouped_prefill;
         }
 
         ~ScopedMoEGraphCaptureFlags()
         {
             mutableDebugEnv().rocm.moe_grouped_decode = old_grouped_;
             mutableDebugEnv().rocm.moe_device_routed_decode = old_device_routed_;
-            mutableDebugEnv().gpu_moe.grouped_prefill = old_prefill_;
         }
 
     private:
         bool old_grouped_;
         bool old_device_routed_;
-        bool old_prefill_;
     };
 
     DeviceNativeVNNIMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
@@ -386,7 +382,7 @@ protected:
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     MoERoutingStage stage(params);
@@ -405,7 +401,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     MoERoutingStage stage(params);
@@ -428,7 +424,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 
 TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplaySeqLenOneUsesPrefillCaptureContract)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto input = TestTensorFactory::createFP32({1, D_MODEL});
     auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
@@ -471,7 +467,7 @@ TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplaySeqLenOneUsesPrefi
 
 TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplayDoesNotFallBackToDecodeCapture)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto input = TestTensorFactory::createFP32({1, D_MODEL});
     auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
@@ -497,15 +493,23 @@ TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplayDoesNotFallBackToD
 
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
+#if defined(HAVE_CUDA)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Forced CUDA verifier replay must keep the grouped-prefill route even "
+           "without any runtime capability-advertisement switch";
+#else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Forced verifier replay must hard-require grouped prefill instead of using decode capture";
+#endif
 }
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsOnCPU)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.device_id = DeviceId::cpu();
@@ -515,22 +519,28 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsOnCPU)
     EXPECT_FALSE(stage.isGraphCapturable());
 }
 
-TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWhenGroupedPrefillDisabled)
+TEST_F(MoERoutingPrefillGraphCapture, PrefillUsesBackendGroupedCapability)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false); // GPU grouped-prefill = false
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Grouped prefill is now a hard GPU capability requirement, not an "
+           "optional runtime advertisement";
+#else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
-    EXPECT_FALSE(stage.isGraphCapturable())
-        << "Prefill routing should not be capturable when gpu_moe_grouped_prefill is disabled";
+    EXPECT_FALSE(stage.isGraphCapturable());
+#endif
 }
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullInput)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.input = nullptr;
@@ -542,7 +552,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullInput)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullGateWeights)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.gate_weights = nullptr;
@@ -554,7 +564,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullGateWeights)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputIndices)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.output_indices = nullptr;
@@ -566,7 +576,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputIndices)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputWeights)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.output_weights = nullptr;
@@ -578,7 +588,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputWeights)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsInvalidTopK)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     // top_k = 0
     {
@@ -601,7 +611,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsInvalidTopK)
 
 TEST_F(MoERoutingPrefillGraphCapture, NeedsOnGraphReplayedForPrefill)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     DecodeExpertHistogramConfig histogram_config;
@@ -696,7 +706,7 @@ protected:
 
 TEST_F(MoEExpertPrefillGraphCapture, FixedTopologyCapturableWhenReady)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     MoEExpertComputeStage stage(params);
@@ -714,7 +724,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FixedTopologyCapturableWhenReady)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     MoEExpertComputeStage stage(params);
@@ -737,7 +747,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsOnCPU)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.device_id = DeviceId::cpu();
@@ -747,20 +757,28 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsOnCPU)
     EXPECT_FALSE(stage.isGraphCapturable());
 }
 
-TEST_F(MoEExpertPrefillGraphCapture, RejectsWhenGroupedPrefillDisabled)
+TEST_F(MoEExpertPrefillGraphCapture, UsesBackendGroupedCapability)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false); // GPU grouped-prefill = false
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Fixed-topology grouped prefill must stay available on compiled GPU "
+           "backends without any runtime capability-advertisement switch";
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable());
+#endif
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.local_expert_count = NUM_EXPERTS - 1; // not full
@@ -773,7 +791,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
 
 TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFullOwnership)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto expect_backend = [&](DeviceId device, bool backend_supported, const char *backend_name)
     {
@@ -813,7 +831,7 @@ TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFull
 
 TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEnginesOnly)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.expert_mask = {true, false, true, false};
@@ -838,7 +856,7 @@ TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEngin
 
 TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyRejectsMissingLocalEngine)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.expert_mask = {true, false, true, false};
@@ -853,7 +871,7 @@ TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyRejectsMissingLocalEngin
 
 TEST_F(MoEExpertPrefillGraphCapture, AllowsFixedTopologyPrefillWithReplicas)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.replica_set.num_replicated = 1;
@@ -870,7 +888,7 @@ TEST_F(MoEExpertPrefillGraphCapture, AllowsFixedTopologyPrefillWithReplicas)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithMissingGemmEngines)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     // One expert has null gate GEMM
@@ -885,7 +903,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithMissingGemmEngines)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsDecodeSeqLen)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto params = makeValidPrefillParams();
     params.seq_len = 1; // decode — should not hit fixed-topology prefill path
@@ -901,7 +919,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsDecodeSeqLen)
 
 TEST_F(MoEExpertPrefillGraphCapture, DeviceRoutedDecodeRequiresFusedRuntimeWarmupBeforeCapture)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
@@ -1088,7 +1106,7 @@ TEST_F(MoEExpertPrefillGraphCapture, StaticDescriptorMaskedDecodeAcceptsExplicit
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndFusedDecode)
 {
 #if defined(HAVE_ROCM)
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
 
@@ -1128,7 +1146,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWithReplicas)
 {
 #if defined(HAVE_ROCM)
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
 
@@ -1203,7 +1221,7 @@ protected:
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequireWarmScratch)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1235,9 +1253,9 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequire
 #endif
 }
 
-TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
+TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightUsesBackendGroupedCapability)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1255,12 +1273,18 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportRejectsDisable
     params.output = output_.get();
 
     SharedExpertFFNStage stage(params);
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Shared-expert grouped prefill is a backend capability, not an "
+           "optional runtime advertisement";
+#else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1284,7 +1308,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsInsufficientScratch)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1304,7 +1328,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsInsufficientScratch)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1323,7 +1347,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsWithoutKernel)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::cpu();
@@ -1342,7 +1366,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, RocmDecodeCapturableAfterWarmupWhenGroupedRouteIsDisabled)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
     const bool old_shared_grouped = mutableDebugEnv().rocm.shared_expert_grouped_decode;
     mutableDebugEnv().rocm.shared_expert_grouped_decode = false;
 
@@ -1371,7 +1395,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, RocmDecodeCapturableAfterWarmupWhenGr
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPrefillRoute)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1415,7 +1439,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPre
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuNormalSmallMPrefillDoesNotForceGroupedVerifierRoute)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto expect_backend = [&](DeviceId device, const char *backend_name)
     {
@@ -1442,7 +1466,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuNormalSmallMPrefillDoesNotForceGro
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPrefillRoute)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1482,7 +1506,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPref
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupedPrefillWarmup)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1531,7 +1555,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupe
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPrefillReadiness)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1594,7 +1618,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPr
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGroupedTableRoute)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1647,7 +1671,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGr
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, CudaMTPVerifierRowsCanBypassGroupedDecodeShortcut)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1678,9 +1702,9 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaMTPVerifierRowsCanBypassGroupedDe
            "shared-expert decode shortcut and run through the serial-decode oracle.";
 }
 
-TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayRequiresGroupedPrefillEnabled)
+TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayUsesBackendGroupedCapability)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1701,9 +1725,25 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayRequiresGroupedP
         params.force_grouped_verifier_prefill_for_decode = true;
 
         SharedExpertFFNStage stage(params);
-        EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
-            << "No " << backend_name
-            << " verifier replay should silently enter grouped prefill when grouped prefill is disabled";
+        const bool backend_compiled =
+            (device.is_cuda()
+#if defined(HAVE_CUDA)
+             && true
+#else
+             && false
+#endif
+            ) ||
+            (device.is_rocm()
+#if defined(HAVE_ROCM)
+             && true
+#else
+             && false
+#endif
+            );
+        EXPECT_EQ(stage.usesGroupedVerifierPrefillRouteForTesting(), backend_compiled)
+            << backend_name
+            << " verifier replay must use grouped prefill whenever the backend is compiled, "
+               "without consulting a runtime capability-advertisement switch";
     };
 
     expect_backend(DeviceId::cuda(0), "CUDA");
@@ -1736,7 +1776,7 @@ protected:
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWithKernel)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1765,7 +1805,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWit
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1794,7 +1834,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
 
 TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWithoutKernel)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1816,9 +1856,9 @@ TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWit
 #endif
 }
 
-TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
+TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightUsesBackendGroupedCapability)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1829,12 +1869,16 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabl
     params.shared_output = shared_output_.get();
 
     SharedExpertGateStage stage(params);
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
 }
 
 TEST_F(SharedExpertGatePrefillGraphCapture, RejectsOnCPU)
 {
-    ScopedMoEGraphCaptureFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::cpu();

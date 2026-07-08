@@ -3104,7 +3104,39 @@ namespace
 
         if constexpr (CB != 19)
         {
-            if (!decode_equivalent_m1 && shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
+            /**
+             * Serial M=1 decode promotes generated KPAR shapes to ROWPAR when
+             * row-major weights are available.  Verifier publication has to
+             * match that true public decode route, not just the raw generated
+             * classifier result, so the grouped M=2..4 path applies the same
+             * promotion while still executing all verifier rows in one launch.
+             */
+            if (decode_equivalent_m1 && shape == NativeGemvShape::KPAR &&
+                isRowParEnabled() && rm_slot)
+            {
+                if (!*rm_slot)
+                {
+                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
+                    *rm_slot = cudaRowMajorWeights_create(
+                        d_payload, d_scales, d_mins, d_emins,
+                        N, K, PB, cuda_device_id, stream);
+                }
+                if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
+                {
+                    const int k_blocks = K / BLOCK_K;
+                    const int nwarps = (k_blocks >= 256) ? 4 : 2;
+                    return launchRowParSmallM<M, CB>(
+                        d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
+                        (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
+                        d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                        nwarps, stream);
+                }
+
+                cudaGetLastError();
+                return false;
+            }
+
+            if (shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
             {
                 if (!*rm_slot)
                 {
@@ -3582,6 +3614,26 @@ extern "C"
         // Transpose payload (PB bytes per block)
         switch (payload_bytes)
         {
+        case 6:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 6>(d_payload_col, N, K_blocks, s));
+            break;
+        case 8:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 8>(d_payload_col, N, K_blocks, s));
+            break;
+        case 9:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 9>(d_payload_col, N, K_blocks, s));
+            break;
+        case 12:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 12>(d_payload_col, N, K_blocks, s));
+            break;
+        case 13:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 13>(d_payload_col, N, K_blocks, s));
+            break;
         case 2:
             rm->d_payload = reinterpret_cast<uint8_t *>(
                 transposeBuffer<uint8_t, 2>(d_payload_col, N, K_blocks, s));
@@ -3593,6 +3645,14 @@ extern "C"
         case 16:
             rm->d_payload = reinterpret_cast<uint8_t *>(
                 transposeBuffer<uint8_t, 16>(d_payload_col, N, K_blocks, s));
+            break;
+        case 20:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 20>(d_payload_col, N, K_blocks, s));
+            break;
+        case 24:
+            rm->d_payload = reinterpret_cast<uint8_t *>(
+                transposeBuffer<uint8_t, 24>(d_payload_col, N, K_blocks, s));
             break;
         case 32:
             rm->d_payload = reinterpret_cast<uint8_t *>(

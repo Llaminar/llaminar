@@ -3021,8 +3021,72 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
         f_acc += (static_cast<float>(acc_lo) * scale_lo +
                   static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-        f_acc += moe_native_vnni_dual_scale_correction<FMT>(
-            a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
+
+        /*
+         * Keep the decode-equivalent small-M path in lockstep with the serial
+         * M=1 GEMV kernel.  The shared MoE correction helper intentionally
+         * returns a float correction because the grouped MoE kernels use that
+         * expression tree as their serial contract.  Plain GEMV serial decode,
+         * however, applies each correction directly to f_acc.  Returning the
+         * IQ1_M delta through a helper is enough for HIP to round one ULP
+         * differently on some rows, so the verifier-row implementation spells
+         * out the same updates as the serial GEMV loop.
+         */
+        if constexpr (Traits::is_dual_scale_asym)
+        {
+            constexpr int32_t ones = 0x01010101;
+            int32_t sum_a_lo = 0;
+            int32_t sum_a_hi = 0;
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+                sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+            #pragma unroll
+            for (int g = 4; g < 8; ++g)
+                sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+
+            float min_lo;
+            float min_hi;
+            if constexpr (Traits::needs_emin_array)
+            {
+                const uint32_t emin_packed = emin_base[linear];
+                const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
+                const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
+                min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
+                min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
+            }
+            else
+            {
+                min_lo = 0.0f;
+                min_hi = 0.0f;
+            }
+            f_acc += (static_cast<float>(sum_a_lo) * min_lo
+                   +  static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
+        }
+
+        if constexpr (FMT == NVNNI_IQ1_M)
+        {
+            constexpr float IQ1S_DELTA = 0.125f;
+            constexpr int32_t ones = 0x01010101;
+            const uint8_t qh0 = payload[4];
+            const uint8_t qh1 = payload[5];
+
+            const int32_t sa_g0 = __builtin_amdgcn_sdot4(
+                a4[1], ones, __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+            const int32_t sa_g1 = __builtin_amdgcn_sdot4(
+                a4[3], ones, __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+            const int32_t sa_g2 = __builtin_amdgcn_sdot4(
+                a4[5], ones, __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+            const int32_t sa_g3 = __builtin_amdgcn_sdot4(
+                a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+            const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            f_acc += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
+                   +  (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi) * scale_ab;
+        }
     }
     else
     {

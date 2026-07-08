@@ -188,6 +188,57 @@ namespace
         return (lhs.size() == rhs.size()) ? lhs.size() : count;
     }
 
+    /**
+     * @brief Assert that grouped ROCm verifier rows exactly match serial decode.
+     *
+     * The grouped verifier path publishes rows into live MTP state, so ordinary
+     * cosine/L2 tolerances are only useful as breadcrumbs after a failure.  The
+     * pass condition is byte-for-byte equality with the backend's own M=1 decode
+     * GEMV for each FP32 output element.
+     */
+    void expectBitwiseEqualFloatRows(
+        const std::string &label,
+        const float *actual,
+        const float *expected,
+        size_t count,
+        size_t row_width)
+    {
+        ASSERT_NE(actual, nullptr) << label << " actual rows are null";
+        ASSERT_NE(expected, nullptr) << label << " expected rows are null";
+        ASSERT_GT(count, 0u) << label << " row buffer is empty";
+
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
+
+        size_t first_mismatch = 0;
+        uint32_t actual_bits = 0;
+        uint32_t expected_bits = 0;
+        for (; first_mismatch < count; ++first_mismatch)
+        {
+            std::memcpy(&actual_bits, actual + first_mismatch, sizeof(actual_bits));
+            std::memcpy(&expected_bits, expected + first_mismatch, sizeof(expected_bits));
+            if (actual_bits != expected_bits)
+                break;
+        }
+
+        const size_t safe_row_width = row_width == 0 ? count : row_width;
+        const size_t mismatch_row = first_mismatch / safe_row_width;
+        const size_t mismatch_col = first_mismatch % safe_row_width;
+        ADD_FAILURE()
+            << label << " is not bitwise serial-decode equivalent"
+            << " first_mismatch=" << first_mismatch
+            << " row=" << mismatch_row
+            << " col=" << mismatch_col
+            << " actual=" << (first_mismatch < count ? actual[first_mismatch] : 0.0f)
+            << " expected=" << (first_mismatch < count ? expected[first_mismatch] : 0.0f)
+            << " actual_bits=0x" << std::hex << actual_bits
+            << " expected_bits=0x" << expected_bits << std::dec
+            << " max_abs=" << maxAbsError(actual, expected, count)
+            << " rel_l2=" << relativeL2Error(actual, expected, count)
+            << " cosine=" << cosineSimilarity(actual, expected, count)
+            << " symmetric_kl=" << symmetricKLDivergenceFromLogits(actual, expected, count);
+    }
+
     /// CPU FP32 reference GEMV: output[j] = sum_k(input[k] * W_dequant[j][k])
     /// W is stored as [N, K] i.e. row j has K elements.
     void cpuFP32Gemv(const float *input_fp32, // [K]
@@ -1342,27 +1393,13 @@ namespace
                 const float *specialized = output_specialized->data();
                 const float *serial = output_serial->data();
                 const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
-                const float rel_l2 = relativeL2Error(specialized, serial, count);
-                const float max_abs = maxAbsError(specialized, serial, count);
-                const float cosine = cosineSimilarity(specialized, serial, count);
-                const float symmetric_kl =
-                    symmetricKLDivergenceFromLogits(specialized, serial, count);
-                EXPECT_LE(rel_l2, 1e-6f)
-                    << fmt.name << " M=" << M << " relative L2 differs from serial GEMVs";
-                EXPECT_LE(max_abs, 2e-6f)
-                    << fmt.name << " M=" << M << " max abs differs from serial GEMVs";
-                EXPECT_GE(cosine, 0.9999999f)
-                    << fmt.name << " M=" << M
-                    << " cosine differs from serial GEMVs"
-                    << " rel_l2=" << rel_l2
-                    << " max_abs=" << max_abs
-                    << " symmetric_kl=" << symmetric_kl;
-                EXPECT_LE(symmetric_kl, 1e-10f)
-                    << fmt.name << " M=" << M
-                    << " symmetric KLD differs from serial GEMVs"
-                    << " cosine=" << cosine
-                    << " rel_l2=" << rel_l2
-                    << " max_abs=" << max_abs;
+                expectBitwiseEqualFloatRows(
+                    fmt.name + " ROCm native-VNNI grouped verifier rows M=" +
+                        std::to_string(M),
+                    specialized,
+                    serial,
+                    count,
+                    static_cast<size_t>(N));
             }
 
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);

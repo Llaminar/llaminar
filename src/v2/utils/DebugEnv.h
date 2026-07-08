@@ -3681,16 +3681,6 @@ namespace llaminar2
             std::string profile_csv_path = "/tmp/llaminar_moe_ep_profile.csv";
         } moe_expert_overlay;
 
-        /// Backend-neutral GPU MoE execution feature gates.
-        struct
-        {
-            /// Enable fixed-topology grouped MoE prefill when CUDA/ROCm support it.
-            /// This path is the graph-capturable prefill dispatch contract for
-            /// homogeneous GPU LocalTP MoE domains. (env:
-            /// LLAMINAR_GPU_MOE_GROUPED_PREFILL)
-            bool grouped_prefill = true;
-        } gpu_moe;
-
         bool tp_timing = false;                    ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false;               ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
         bool tp_collective_contract_trace = false; ///< Trace LocalTP collective context identity and sequence contract (env: LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE)
@@ -3848,13 +3838,6 @@ namespace llaminar2
                 gpu_vram_preflight_min_margin_mib = std::max(0, std::atoi(min_mib));
         }
 
-        void reloadGpuMoEEnv()
-        {
-            gpu_moe.grouped_prefill = true;
-            if (const char *grouped_prefill = std::getenv("LLAMINAR_GPU_MOE_GROUPED_PREFILL"))
-                gpu_moe.grouped_prefill = (std::atoi(grouped_prefill) != 0);
-        }
-
         static int parseLLEPPrefillTransferMode(const char *value)
         {
             std::string normalized = normalizedEnvValue(value);
@@ -3903,7 +3886,6 @@ namespace llaminar2
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
             reloadGpuVramPreflightEnv();
-            reloadGpuMoEEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -4087,7 +4069,6 @@ namespace llaminar2
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
             reloadGpuVramPreflightEnv();
-            reloadGpuMoEEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on

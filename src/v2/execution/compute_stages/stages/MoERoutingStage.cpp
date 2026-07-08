@@ -71,8 +71,6 @@ namespace llaminar2
             (void)device;
             return false;
 #else
-            if (!debugEnv().gpu_moe.grouped_prefill)
-                return false;
 #if defined(HAVE_ROCM)
             if (device.is_rocm())
                 return true;
@@ -794,7 +792,6 @@ namespace llaminar2
             LOG_ERROR("[MoERoutingStage] MTP verifier correction replay requested grouped prefill "
                       "routing for seq_len=1, but the device-routed prefill path is unavailable"
                       << " (device=" << params_.device_id.toString()
-                      << ", gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
                       << ", d_model=" << params_.d_model
                       << ", num_experts=" << params_.num_experts
                       << ", top_k=" << params_.top_k

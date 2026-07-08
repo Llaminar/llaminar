@@ -13635,19 +13635,6 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     constexpr int top_k = 2;
     constexpr int total_slots = seq_len * top_k;
 
-    struct ScopedGroupedPrefillFlag
-    {
-        bool old_value;
-        explicit ScopedGroupedPrefillFlag(bool value)
-            : old_value(mutableDebugEnv().gpu_moe.grouped_prefill)
-        {
-            mutableDebugEnv().gpu_moe.grouped_prefill = value;
-        }
-        ~ScopedGroupedPrefillFlag()
-        {
-            mutableDebugEnv().gpu_moe.grouped_prefill = old_value;
-        }
-    } grouped_prefill_flag(true);
     ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
 
@@ -13779,7 +13766,6 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
 
     ROCmDeviceContext ctx(device, 0);
 
-    mutableDebugEnv().gpu_moe.grouped_prefill = false;
     MoEExpertComputeStage reference_stage(make_params(reference_output.get(), nullptr));
     reference_stage.bindWorkspace(workspace.get());
     ASSERT_TRUE(reference_stage.execute(&ctx));
@@ -13794,7 +13780,6 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     runtime_config.prefill_token_capacity = seq_len;
     MoERuntimeTable runtime_table(runtime_config);
 
-    mutableDebugEnv().gpu_moe.grouped_prefill = true;
     MoEExpertComputeStage fixed_stage(make_params(fixed_output.get(), &runtime_table));
     ASSERT_TRUE(fixed_stage.isGraphCapturable());
     fixed_stage.bindWorkspace(workspace.get());

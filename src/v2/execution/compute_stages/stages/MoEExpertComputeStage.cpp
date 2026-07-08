@@ -846,8 +846,6 @@ namespace llaminar2
             (void)device;
             return false;
 #else
-            if (!debugEnv().gpu_moe.grouped_prefill)
-                return false;
 #if defined(HAVE_ROCM)
             if (device.is_rocm())
                 return true;
@@ -1863,7 +1861,6 @@ namespace llaminar2
                       "prefill for seq_len=1 inside graph capture, but the fixed-topology grouped path "
                       "is unavailable: "
                       "device=" << params_.device_id.to_string()
-                                << ", gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
                                 << ", fullOwnership=" << hasFullLocalExpertOwnership()
                                 << ", allEnabled=" << expertMaskAllEnabled()
                                 << ", replicas=" << params_.replica_set.num_replicated
@@ -1878,8 +1875,7 @@ namespace llaminar2
         {
             LOG_ERROR("[MoEExpertComputeStage] GPU graph-captured prefill (seq_len=" << params_.seq_len
                                                                                      << ") requires fixed-topology grouped prefill but conditions not met: "
-                                                                      << "gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
-                                                                      << ", fullOwnership=" << hasFullLocalExpertOwnership()
+                                                                      << "fullOwnership=" << hasFullLocalExpertOwnership()
                                                                       << ", allEnabled=" << expertMaskAllEnabled()
                                                                       << ", replicas=" << params_.replica_set.num_replicated
                                                                       << ", layer=" << params_.layer_idx);
@@ -2040,7 +2036,6 @@ namespace llaminar2
             LOG_ERROR("[MoEExpertComputeStage] MTP verifier correction replay could not use "
                       "the required device grouped path for seq_len=1: "
                       "device=" << params_.device_id.to_string()
-                                << ", gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
                                 << ", fullOwnership=" << hasFullLocalExpertOwnership()
                                 << ", allEnabled=" << expertMaskAllEnabled()
                                 << ", replicas=" << params_.replica_set.num_replicated

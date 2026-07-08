@@ -85,27 +85,6 @@ private:
 };
 
 /**
- * @brief Temporarily override the GPU MoE grouped-prefill flag for preflight tests.
- */
-class ScopedGpuMoEGroupedPrefillFlag
-{
-public:
-    explicit ScopedGpuMoEGroupedPrefillFlag(bool enabled)
-        : old_prefill_(mutableDebugEnv().gpu_moe.grouped_prefill)
-    {
-        mutableDebugEnv().gpu_moe.grouped_prefill = enabled;
-    }
-
-    ~ScopedGpuMoEGroupedPrefillFlag()
-    {
-        mutableDebugEnv().gpu_moe.grouped_prefill = old_prefill_;
-    }
-
-private:
-    bool old_prefill_;
-};
-
-/**
  * @brief Mock stateful GDN/short-conv stage that implements padded real-length replay.
  */
 class PaddedRealLengthContractMockStage : public MockComputeStage
@@ -985,8 +964,6 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupR
 
 TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKernelWarmup)
 {
-    ScopedGpuMoEGroupedPrefillFlag grouped_prefill(true);
-
     constexpr int seq_len = 608;
     constexpr int real_seq_len = 595;
     constexpr int d_model = 64;
@@ -1036,7 +1013,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKer
 #endif
 }
 
-TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingHonorsGroupedPrefillAndBackend)
+TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingUsesBackendGroupedCapability)
 {
     constexpr int seq_len = 608;
     constexpr int real_seq_len = 595;
@@ -1055,7 +1032,6 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingHonorsGroupedPrefill
     PrefillGraphCache cache(config);
 
     {
-        ScopedGpuMoEGroupedPrefillFlag grouped_prefill(false);
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = DeviceId::rocm(0);
@@ -1068,11 +1044,16 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingHonorsGroupedPrefill
 
         const auto reason = cache.preflight(
             graph, key, nullptr, false, false, real_seq_len, seq_len);
+#if defined(HAVE_ROCM)
+        EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+            << "Cold padded MoE routing should use compiled backend capability, "
+               "not a runtime capability-advertisement switch";
+#else
         EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+#endif
     }
 
     {
-        ScopedGpuMoEGroupedPrefillFlag grouped_prefill(true);
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = DeviceId::cuda(0);

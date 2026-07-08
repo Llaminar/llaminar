@@ -418,6 +418,38 @@ namespace
     }
 
     /**
+     * @brief Scope direct CUDA native-VNNI calls into production verifier mode.
+     *
+     * The production graph reaches this policy through
+     * `ITensorGemm::beginVerifierDecodeEquivalentScope()`.  The all-format test
+     * below intentionally calls the low-level launcher directly, so it needs the
+     * same thread-local switch here to prove the publishable MTP verifier path
+     * rather than a faster small-M tuning policy.
+     */
+    class ScopedCudaNativeVNNIDecodeEquivalentM1Policy
+    {
+    public:
+        ScopedCudaNativeVNNIDecodeEquivalentM1Policy()
+            : previous_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+        {
+            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+        }
+
+        ~ScopedCudaNativeVNNIDecodeEquivalentM1Policy()
+        {
+            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_);
+        }
+
+        ScopedCudaNativeVNNIDecodeEquivalentM1Policy(
+            const ScopedCudaNativeVNNIDecodeEquivalentM1Policy &) = delete;
+        ScopedCudaNativeVNNIDecodeEquivalentM1Policy &operator=(
+            const ScopedCudaNativeVNNIDecodeEquivalentM1Policy &) = delete;
+
+    private:
+        int previous_ = 0;
+    };
+
+    /**
      * @brief Compare two logit rows as probability distributions.
      *
      * Cosine and L2 catch amplitude drift, but speculative decoding is also
@@ -5080,6 +5112,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
     const int K = 512;
     const int N = 384;
     const std::array<int, 3> verifier_rows = {2, 3, 4};
+    ScopedCudaNativeVNNIDecodeEquivalentM1Policy verifier_policy_scope;
 
     ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
         << "CUDA native-VNNI IQ grid tables must be initialized for direct low-level GEMV tests";
@@ -5214,36 +5247,18 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
                 }))
                 << fmt.name << " specialized-vs-serial CUDA native-VNNI GEMV failed at M=" << M;
 
-            const auto result = checkParity(
-                C_specialized->data(),
-                C_serial->data(),
-                static_cast<size_t>(M) * N,
-                0.999999,
-                1e-5);
-            EXPECT_FALSE(result.has_nan_inf)
-                << fmt.name << " M=" << M << " specialized small-M output contains non-finite values";
-            EXPECT_LE(result.relative_l2_error, 1e-5)
-                << fmt.name << " M=" << M << " relative L2 differs from serial GEMVs";
-            /**
-             * The grouped M=2..4 kernels and the serial M=1 oracle can use
-             * different generated KPAR tilings for the same codebook.  That is
-             * still decode-equivalent for the verifier contract when the full
-             * distribution metrics are tight; keep this absolute bound as a
-             * small outlier guard instead of making one reduction-order ULP
-             * spike override cosine/relative-L2.
-             */
-            EXPECT_LE(result.max_abs_error, 3e-4f)
-                << fmt.name << " M=" << M
-                << " max abs differs from serial GEMVs"
-                << " rel_l2=" << result.relative_l2_error
-                << " cosine=" << result.cosine_similarity;
-            if (result.max_abs_error > 0.0f)
+            for (int row = 0; row < M; ++row)
             {
-                EXPECT_GE(result.cosine_similarity, 0.999999)
-                    << fmt.name << " M=" << M
-                    << " specialized CUDA small-M GEMV diverges from serial GEMVs"
-                    << " rel_l2=" << result.relative_l2_error
-                    << " max_abs=" << result.max_abs_error;
+                const std::string label =
+                    std::string(fmt.name) + " CUDA native-VNNI grouped verifier row M=" +
+                    std::to_string(M) + " row=" + std::to_string(row);
+                expectBitwiseEqualFloatRow(
+                    label.c_str(),
+                    C_specialized->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    C_serial->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    static_cast<size_t>(N));
             }
         }
 

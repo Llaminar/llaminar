@@ -105,29 +105,6 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicCudaAndRocmRoutes)
     EXPECT_FALSE(env_snapshot.rocm.moe_gateup_kpart_decode);
 }
 
-TEST(Test__DeterministicMode, GpuMoEGroupedPrefillDefaultsOn)
-{
-    const char *name = "LLAMINAR_GPU_MOE_GROUPED_PREFILL";
-    const char *previous = std::getenv(name);
-    const bool had_previous = previous != nullptr;
-    const std::string previous_value = previous ? previous : "";
-
-    unsetenv(name);
-    mutableDebugEnv().reload();
-    EXPECT_TRUE(debugEnv().gpu_moe.grouped_prefill)
-        << "Fixed-topology grouped GPU MoE prefill is the default graph-capturable path";
-
-    setenv(name, "0", 1);
-    mutableDebugEnv().reload();
-    EXPECT_FALSE(debugEnv().gpu_moe.grouped_prefill)
-        << "The default-on path must still have an explicit diagnostic opt-out";
-
-    if (had_previous)
-        setenv(name, previous_value.c_str(), 1);
-    else
-        unsetenv(name);
-    mutableDebugEnv().reload();
-}
 
 TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsCleared)
 {

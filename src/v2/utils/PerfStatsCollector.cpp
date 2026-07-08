@@ -190,6 +190,22 @@ namespace llaminar2
                    filterRequestsStageGpuTiming();
         }
 
+        /**
+         * @brief Return whether GPU stage timing is requested by the live process environment.
+         *
+         * Several unit-test binaries link `PerfStatsCollector` from `libllaminar2_core.so`
+         * while their small RAII environment guards call the inline `mutableDebugEnv()`
+         * accessor from the executable image.  Reading the live environment here keeps
+         * this diagnostic gate coherent across shared-library and test-executable
+         * boundaries, and it also mirrors how command-line profiling tools toggle the
+         * feature immediately before launching a process.
+         */
+        bool gpuStageTimingEnvRequested()
+        {
+            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_GPU_STAGE_TIMING")) ||
+                   isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_GPU_STAGE_TIMING_DETAIL"));
+        }
+
         bool recordMatchesFilters(const PerfStatRecord &record, const std::vector<std::string> &filters)
         {
             if (filters.empty())
@@ -312,6 +328,7 @@ namespace llaminar2
     {
         return debugEnv().profile.enabled ||
                debugEnv().gpu_stage_timing ||
+               gpuStageTimingEnvRequested() ||
                perfStatsGpuStageTimingRequested() ||
                isSummaryRequested() ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
@@ -322,6 +339,7 @@ namespace llaminar2
     {
         return debugEnv().gpu_stage_timing ||
                debugEnv().profile.enabled ||
+               gpuStageTimingEnvRequested() ||
                perfStatsGpuStageTimingRequested();
     }
 

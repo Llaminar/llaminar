@@ -315,8 +315,7 @@ namespace llaminar2::test::parity::qwen36
             : old_gateup_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_gateup_kpart_decode),
               old_down_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
               old_prefill_fuse_swiglu_(mutableDebugEnv().gemm.cuda_moe_prefill_fuse_swiglu),
-              old_prefill_tile_m_(mutableDebugEnv().gemm.cuda_moe_prefill_tile_m),
-              old_grouped_prefill_(mutableDebugEnv().gpu_moe.grouped_prefill)
+              old_prefill_tile_m_(mutableDebugEnv().gemm.cuda_moe_prefill_tile_m)
         {
             auto &gemm = mutableDebugEnv().gemm;
             const bool allow_split_k_decode = !gemm.deterministic;
@@ -324,7 +323,6 @@ namespace llaminar2::test::parity::qwen36
             gemm.cuda_moe_down_kpart_decode = allow_split_k_decode;
             gemm.cuda_moe_prefill_fuse_swiglu = true;
             gemm.cuda_moe_prefill_tile_m = 0;
-            mutableDebugEnv().gpu_moe.grouped_prefill = true;
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -335,7 +333,6 @@ namespace llaminar2::test::parity::qwen36
             gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
             gemm.cuda_moe_prefill_fuse_swiglu = old_prefill_fuse_swiglu_;
             gemm.cuda_moe_prefill_tile_m = old_prefill_tile_m_;
-            mutableDebugEnv().gpu_moe.grouped_prefill = old_grouped_prefill_;
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -347,7 +344,6 @@ namespace llaminar2::test::parity::qwen36
         bool old_down_kpart_decode_ = false;
         bool old_prefill_fuse_swiglu_ = false;
         int old_prefill_tile_m_ = 0;
-        bool old_grouped_prefill_ = false;
     };
 
     /**

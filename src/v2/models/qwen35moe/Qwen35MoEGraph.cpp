@@ -2627,11 +2627,15 @@ namespace llaminar2
 
         IMoERuntimeTable *moe_runtime_table = nullptr;
         const auto &rocm_env = debugEnv().rocm;
-        const auto &gpu_moe_env = debugEnv().gpu_moe;
+        /*
+         * Grouped MoE verifier rows are now a required production path rather
+         * than an advertised optional capability.  Keep backend/shape preflight
+         * in the stages, but do not let the old grouped-prefill debug kill switch
+         * route publishable verifier rows through a non-grouped substitute.
+         */
         auto forceGroupedSharedMoEVerifierPrefill = [&](DeviceId candidate)
         {
-            return gpu_moe_env.grouped_prefill &&
-                   forceGroupedMoEVerifierPrefill(candidate);
+            return forceGroupedMoEVerifierPrefill(candidate);
         };
         /*
          * MTP sidecars need their own persistent MoE metadata even when their
@@ -2802,15 +2806,14 @@ namespace llaminar2
                 runtime_table_layers,
                 register_runtime_histogram_for_decode);
         }
-        else if (total_tokens > 1 &&
-                 (gpu_moe_env.grouped_prefill ||
-                  forceDecodeEquivalentMoERouting(device)))
+        else if (total_tokens > 1)
         {
             // Fixed-topology grouped prefill consumes routing tensors directly.
             // Decode-equivalent verifier routing instead uses the same
             // runtime-table router as serial decode, so build the table even
-            // when grouped prefill is disabled; otherwise the strict verifier
-            // row proof would fail closed before reaching the rows under test.
+            // if an old environment still tries to disable grouped prefill;
+            // otherwise the strict verifier row proof would fail closed before
+            // reaching the rows under test.
             // This table is prefill-only. It must not register as a decode
             // histogram source, because hot-cache overlay decode may use the
             // legacy host histogram path and never publish a runtime-table

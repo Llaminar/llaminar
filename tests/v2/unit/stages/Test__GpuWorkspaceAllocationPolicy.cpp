@@ -5475,10 +5475,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         removeAsciiWhitespace(stripCommentsAndStringLiterals(shared_policy_section));
     EXPECT_FALSE(compact_shared_policy.empty())
         << "Could not find the shared-expert verifier grouping policy.";
-    EXPECT_NE(compact_shared_policy.find("gpu_moe_env.grouped_prefill&&"),
+    EXPECT_EQ(compact_shared_policy.find("gpu_moe_env.grouped_prefill"),
               std::string::npos)
-        << "If grouped prefill is disabled, the graph must choose the explicit "
-           "decode-equivalent path rather than quietly falling through.";
+        << "Grouped shared-expert verifier rows are a hard GPU requirement now; "
+           "do not route them through the removed grouped-prefill capability gate.";
     EXPECT_NE(compact_shared_policy.find("forceGroupedMoEVerifierPrefill(candidate)"),
               std::string::npos)
         << "The standalone grouped shared-expert verifier path is promoted for "
