@@ -562,22 +562,7 @@ namespace llaminar2
          * own KV/recurrent/terminal-hidden slice from the same speculative step.
          */
         bool supportsMTPSpecStatePublication() const override;
-        /**
-         * @brief True when every active participant supports the grouped
-         *        decode-equivalent publication lane.
-         *
-         * Rank-level publication is a collective live-state mutation.  The rank
-         * can only advertise grouped decode-equivalent publication when each
-         * LocalTP child or PP stage can consume the same clamped
-         * MTPSpecStepPlanBatch through its own narrow grouped-publish entry
-         * point.
-         *
-         * @return true when all active rank participants support the narrow
-         *         grouped decode-equivalent publisher.
-         */
-        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override;
         MTPVerifierRowCapability mtpVerifierRowCapability() const override;
-        MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
 
         /**
          * @brief Publish accepted MTP verifier state on every LocalTP child.

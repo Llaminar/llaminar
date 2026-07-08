@@ -221,19 +221,9 @@ public:
         return supports_mtp_spec_state_publication_;
     }
 
-    bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override
-    {
-        return supports_grouped_decode_equivalent_mtp_spec_state_publication_;
-    }
-
     MTPVerifierRowCapability mtpVerifierRowCapability() const override
     {
         return mtp_verifier_row_capability_;
-    }
-
-    MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override
-    {
-        return mtp_verifier_economy_capability_;
     }
 
     bool publishAcceptedMTPSpecState(
@@ -364,12 +354,6 @@ public:
                     *error = "mock grouped decode-equivalent MTP publication rendezvous timed out";
                 return false;
             }
-        }
-        if (!supports_grouped_decode_equivalent_mtp_spec_state_publication_)
-        {
-            if (error)
-                *error = "mock grouped decode-equivalent MTP publication disabled";
-            return false;
         }
         if (!publish_mtp_spec_state_ok_)
         {
@@ -1421,18 +1405,9 @@ public:
         ensure_mtp_checkpoint_terminal_hidden_ok_ = ok;
     }
     void set_supports_mtp_spec_state_publication(bool supported) { supports_mtp_spec_state_publication_ = supported; }
-    void set_supports_grouped_decode_equivalent_mtp_spec_state_publication(bool supported)
-    {
-        supports_grouped_decode_equivalent_mtp_spec_state_publication_ = supported;
-    }
     void set_mtp_verifier_row_capability(MTPVerifierRowCapability capability)
     {
         mtp_verifier_row_capability_ = capability;
-    }
-
-    void set_mtp_verifier_economy_capability(MTPVerifierEconomyCapability capability)
-    {
-        mtp_verifier_economy_capability_ = capability;
     }
     void set_publish_mtp_spec_state_ok(bool ok) { publish_mtp_spec_state_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
@@ -1667,9 +1642,7 @@ private:
     bool commit_mtp_checkpoint_terminal_hidden_ok_ = true;
     bool ensure_mtp_checkpoint_terminal_hidden_ok_ = true;
     bool supports_mtp_spec_state_publication_ = false;
-    bool supports_grouped_decode_equivalent_mtp_spec_state_publication_ = false;
     MTPVerifierRowCapability mtp_verifier_row_capability_;
-    MTPVerifierEconomyCapability mtp_verifier_economy_capability_;
     bool supports_greedy_all_position_batch_outcome_ = true;
     bool publish_mtp_spec_state_ok_ = true;
     bool set_all_position_logits_ok_ = true;
@@ -4771,9 +4744,7 @@ TEST_F(Test__RankOrchestrator, LocalTPAllPositionRowBatchSamplingConsumesVerifie
 TEST_F(Test__RankOrchestrator, LocalTPAdvertisesResidentCompactGreedyVerifierOutcomeWhenGroupedPublicationIsAvailable)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
-    runner0->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
-    runner1->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
     runners.push_back(std::move(runner0));
@@ -4914,7 +4885,6 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomePublishesGroup
 
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner0_ptr->set_supports_mtp_sidecar_logits_stream_handoff(true);
     runner0_ptr->set_supports_mtp_device_draft_token_input(true);
     runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
@@ -4928,7 +4898,6 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomePublishesGroup
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
-    runner1_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner1_ptr->set_supports_mtp_sidecar_logits_stream_handoff(true);
     runner1_ptr->set_supports_mtp_device_draft_token_input(true);
     runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
@@ -5015,7 +4984,6 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferr
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner0_ptr->set_mock_logits_local(
         /*local_vocab=*/3,
         {0.0f, 1.0f, 2.0f});
@@ -5032,7 +5000,6 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferr
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
-    runner1_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner1_ptr->set_mock_logits_local(
         /*local_vocab=*/3,
         {0.0f, 10.0f, 1.0f});
@@ -5097,7 +5064,6 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactStochasticOutcomePublishesG
 
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner0_ptr->set_supports_mtp_sidecar_logits_stream_handoff(true);
     runner0_ptr->set_supports_mtp_device_draft_token_input(true);
     runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
@@ -5113,7 +5079,6 @@ TEST_F(Test__RankOrchestrator, LocalTPResidentCompactStochasticOutcomePublishesG
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
-    runner1_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner1_ptr->set_supports_mtp_sidecar_logits_stream_handoff(true);
     runner1_ptr->set_supports_mtp_device_draft_token_input(true);
     runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
@@ -5362,50 +5327,6 @@ TEST_F(Test__RankOrchestrator, VerifierRowCapabilityClampsToWeakestParticipant)
         << "Device-resident publication is an all-participant contract.";
 }
 
-TEST_F(Test__RankOrchestrator, VerifierEconomyCapabilityClampsToWeakestParticipant)
-{
-    MTPVerifierEconomyCapability strong;
-    strong.dense = MTPVerifierEconomyLane::groupedPromoted(4);
-    strong.moe = MTPVerifierEconomyLane::groupedPromoted(4);
-
-    MTPVerifierEconomyCapability weak;
-    weak.dense =
-        MTPVerifierEconomyLane::groupedDecodeEquivalentEconomicsPending(4);
-    weak.moe = MTPVerifierEconomyLane::groupedPromoted(2);
-    weak.moe.host_bridge_free_hot_path = false;
-    weak.moe.perf_gate_status = "device_bridge_pending";
-
-    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
-    runner0->set_mtp_verifier_economy_capability(strong);
-
-    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
-    runner1->set_mtp_verifier_economy_capability(weak);
-
-    std::vector<std::unique_ptr<IInferenceRunner>> runners;
-    runners.push_back(std::move(runner0));
-    runners.push_back(std::move(runner1));
-
-    auto orchestrator = RankOrchestrator::createForTest(
-        llaminar2::test::MockModelContext::createMinimal(),
-        std::move(runners),
-        makeTPContextForRunnerCount(2),
-        makeRankConfigForRunnerCount(2));
-
-    const MTPVerifierEconomyCapability capability =
-        orchestrator->mtpVerifierEconomyCapability();
-    EXPECT_TRUE(capability.supportsDenseRows(4, true));
-    EXPECT_FALSE(capability.hasEconomicalDensePath(4, false))
-        << "Grouped verifier correctness alone must not be advertised as an "
-           "economical hot path until publication and perf gates are green.";
-    EXPECT_TRUE(capability.supportsMoERows(2, true));
-    EXPECT_FALSE(capability.supportsMoERows(3, false))
-        << "Rank-level MoE economy must clamp row count to the weakest child.";
-    EXPECT_FALSE(capability.hasEconomicalMoEPath(2, true))
-        << "Every participant must be host-bridge free before the rank path is "
-           "economical.";
-    EXPECT_EQ(capability.moe.perf_gate_status, "mixed_capability");
-}
-
 TEST_F(Test__RankOrchestrator, SpecStatePublicationRunsOnEveryLocalTPChild)
 {
     auto rendezvous = std::make_shared<MTPPublicationRendezvous>(2);
@@ -5587,47 +5508,6 @@ TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationFailureStillAttemptsEver
 }
 
 /**
- * @brief Regression guard for LocalTP grouped-publication capability aggregation.
- *
- * A rank-level grouped decode-equivalent publication mutates every child runner's
- * live KV/recurrent state from the same accepted-count decision.  If one child
- * lacks the grouped publisher, the rank must refuse the operation before any
- * participant mutates state.  This is the grouped analogue of the direct
- * publication support test above, but it intentionally does not require direct
- * all-position publication support.
- */
-TEST_F(Test__RankOrchestrator, GroupedDecodeEquivalentBatchPublicationRequiresEveryLocalTPChildSupport)
-{
-    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
-    auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
-
-    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
-    auto *runner1_ptr = runner1.get();
-
-    std::vector<std::unique_ptr<IInferenceRunner>> runners;
-    runners.push_back(std::move(runner0));
-    runners.push_back(std::move(runner1));
-
-    auto orchestrator = RankOrchestrator::createForTest(
-        llaminar2::test::MockModelContext::createMinimal(),
-        std::move(runners),
-        makeTPContextForRunnerCount(2),
-        makeRankConfigForRunnerCount(2));
-
-    std::string error;
-    EXPECT_FALSE(orchestrator->supportsMTPSpecStatePublication())
-        << "Grouped row publication must not imply direct all-position publication.";
-    EXPECT_FALSE(orchestrator->supportsGroupedDecodeEquivalentMTPSpecStatePublication());
-    EXPECT_FALSE(orchestrator->publishGroupedDecodeEquivalentMTPSpecStateBatch(
-        makeMTPSpecPublicationBatch(),
-        &error));
-    EXPECT_NE(error.find("not advertised"), std::string::npos);
-    EXPECT_EQ(runner0_ptr->publish_grouped_decode_equivalent_mtp_spec_state_batch_call_count(), 0u);
-    EXPECT_EQ(runner1_ptr->publish_grouped_decode_equivalent_mtp_spec_state_batch_call_count(), 0u);
-}
-
-/**
  * @brief Regression guard that grouped LocalTP publication uses grouped child APIs.
  *
  * The key safety property is non-promotion: a LocalTP rank may support grouped
@@ -5642,12 +5522,10 @@ TEST_F(Test__RankOrchestrator, GroupedDecodeEquivalentBatchPublicationRunsOnEver
 
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
-    runner1_ptr->set_supports_grouped_decode_equivalent_mtp_spec_state_publication(true);
     runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
@@ -5664,7 +5542,6 @@ TEST_F(Test__RankOrchestrator, GroupedDecodeEquivalentBatchPublicationRunsOnEver
     std::string error;
     EXPECT_FALSE(orchestrator->supportsMTPSpecStatePublication())
         << "The grouped lane must remain separate from direct all-position publication.";
-    EXPECT_TRUE(orchestrator->supportsGroupedDecodeEquivalentMTPSpecStatePublication());
     EXPECT_TRUE(orchestrator->publishGroupedDecodeEquivalentMTPSpecStateBatch(batch, &error))
         << error;
 

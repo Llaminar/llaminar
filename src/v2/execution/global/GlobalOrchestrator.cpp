@@ -730,27 +730,6 @@ namespace llaminar2
         }
     }
 
-    bool StageRunnerRegistry::supportsGroupedDecodeEquivalentMTPSpecStatePublicationAll() const
-    {
-        bool saw_runner = false;
-        for (const auto &entry : entries_)
-        {
-            saw_runner = true;
-            if (!entry.runner ||
-                !entry.runner->supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-            {
-                return false;
-            }
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            if (!compatibility_runner_->supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-                return false;
-        }
-        return saw_runner;
-    }
-
     bool StageRunnerRegistry::publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
         const MTPSpecStepPlanBatch &plans,
         std::string *error)
@@ -1748,13 +1727,6 @@ namespace llaminar2
             return {};
         const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
         return runner ? runner->getAllPositionLogitsLocalInfo() : LogitsLocalInfo{};
-    }
-
-    bool GlobalOrchestrator::supportsGroupedDecodeEquivalentMTPSpecStatePublication() const
-    {
-        if (!mtpDecodeUnsupportedReason().empty())
-            return false;
-        return stage_runners_.supportsGroupedDecodeEquivalentMTPSpecStatePublicationAll();
     }
 
     bool GlobalOrchestrator::publishGroupedDecodeEquivalentMTPSpecStateBatch(

@@ -458,15 +458,6 @@ namespace llaminar2
         std::string mtpDecodeHardFailureReason() const;
         std::string mtpDecodeBypassReason() const;
         void recordMTPBypass(const std::string &reason);
-        /**
-         * @brief Emit one structured Phase 9.8 verifier-economy snapshot.
-         *
-         * The snapshot is intentionally separate from decode timers. It lets
-         * dashboards distinguish a diagnostic serial oracle from an economical
-         * grouped/resident verifier path without adding per-token hot-path
-         * logging overhead when perfstats are disabled.
-         */
-        void recordMTPVerifierEconomyPerfStatsIfNeeded();
         bool ensureMTPDepthController(const MTPRuntimeConfig &mtp);
         int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
         int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
@@ -730,7 +721,6 @@ namespace llaminar2
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
         std::unique_ptr<MTPDepthController> mtp_depth_controller_;
-        bool mtp_verifier_economy_perfstats_emitted_{false};
         PrefillChunkStats prefill_chunk_stats_;
         PrefixCacheRequestSummary prefix_request_summary_;
         bool mtp_bypassed_{false};

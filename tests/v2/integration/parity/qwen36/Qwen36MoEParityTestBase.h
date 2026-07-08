@@ -5635,10 +5635,6 @@ namespace llaminar2::test::parity::qwen36
                 std::string publication_error;
                 if (verify_grouped_host_publication)
                 {
-                    ASSERT_TRUE(
-                        runner->supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-                        << "grouped-host publication proof must exercise the "
-                           "explicit grouped decode-equivalent publisher";
                     ASSERT_TRUE(runner->publishGroupedDecodeEquivalentMTPSpecStateBatch(
                         batch,
                         &publication_error))

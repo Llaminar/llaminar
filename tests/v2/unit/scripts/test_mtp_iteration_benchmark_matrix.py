@@ -257,7 +257,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             header = lines[0].split("\t")
             row = lines[1].split("\t")
             self.assertEqual(len(header), len(row))
-            self.assertGreaterEqual(len(header), 122)
+            self.assertGreaterEqual(len(header), 120)
             self.assertEqual(len(header), len(set(header)))
             self.assertIn("topology", header)
             self.assertEqual(row[header.index("topology")], "single")
@@ -276,8 +276,6 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 "stochastic_semantic_verify_rows",
                 "stochastic_post_reject_rows",
                 "stochastic_seeded_device_threshold_rows",
-                "verifier_economy_dense",
-                "verifier_economy_moe",
                 "condition_skipped_pending",
                 "pending_condition_rows",
                 "first_token_pending_condition_rows",

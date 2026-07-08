@@ -1953,24 +1953,8 @@ namespace llaminar2
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
         bool supportsMTPSpecStatePublication() const override;
         bool supportsDeviceResidentMTPSpecStatePublication() const override;
-        /**
-         * @brief Advertise the narrow grouped decode-equivalent publication lane.
-         *
-         * DeviceGraphOrchestrator keeps direct all-position publication disabled
-         * for dense and MoE/GDN models until continuation-equivalence is proven
-         * for that stronger contract.  This method advertises only the weaker,
-         * already-proven row contract: a grouped verifier graph may publish
-         * accepted rows when the caller has converted its outcome into the same
-         * MTPSpecStepPlanBatch that serial replay would have produced.
-         *
-         * @return true when this is a GPU runner and the current MTP config,
-         *         model family, and requested draft depth fit the runner's
-         *         decode-equivalent row capability.
-         */
-        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override;
         bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
         MTPVerifierRowCapability mtpVerifierRowCapability() const override;
-        MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
         bool publishAcceptedMTPSpecState(
             const MTPSpecStepPlan &plan,
             std::string *error = nullptr) override;
@@ -5097,8 +5081,8 @@ namespace llaminar2
          * supportsMTPSpecStatePublication(), because external callers should not
          * be able to publish direct all-position verifier rows unless that strong
          * contract is advertised.  publishGroupedDecodeEquivalentMTPSpecStateBatch()
-         * flips this flag only while it is on the stack, after checking the
-         * narrower grouped decode-equivalent capability.
+         * flips this flag only while it is on the stack after validating the
+         * concrete grouped publication preconditions.
          */
         bool grouped_decode_equivalent_spec_publication_scope_ = false;
 

@@ -2264,7 +2264,6 @@ namespace llaminar2
                 "decodeStepBatch() MTP verifier continuation requires MTP";
             return batch_result;
         }
-        recordMTPVerifierEconomyPerfStatsIfNeeded();
         const bool greedy_batch_verify =
             mtp.verify_mode == MTPVerifyMode::Greedy &&
             active_sampling_params_.is_greedy();
@@ -3519,55 +3518,6 @@ namespace llaminar2
         }
     }
 
-    void OrchestrationRunner::recordMTPVerifierEconomyPerfStatsIfNeeded()
-    {
-        if (mtp_verifier_economy_perfstats_emitted_ ||
-            !PerfStatsCollector::isEnabled() ||
-            !runner_)
-        {
-            return;
-        }
-
-        mtp_verifier_economy_perfstats_emitted_ = true;
-        const MTPVerifierEconomyCapability capability =
-            runner_->mtpVerifierEconomyCapability();
-        const std::string device = runner_->primaryDeviceId().is_valid()
-                                       ? runner_->primaryDeviceId().toString()
-                                       : std::string{};
-        const char *active_model_class =
-            mtpDepthPolicyModelClassName(inferMTPDepthPolicyModelClass(model_ctx_));
-
-        auto emit_lane = [&](const char *lane_name, const MTPVerifierEconomyLane &lane)
-        {
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "verifier_economy_capability",
-                static_cast<double>(std::max(0, lane.max_rows)),
-                "decode",
-                device,
-                {{"lane", lane_name},
-                 {"active_model_class", active_model_class},
-                 {"correct", perfBool(lane.correct)},
-                 {"grouped_decode_equivalent", perfBool(lane.grouped_decode_equivalent)},
-                 {"row_indexed_lm_head", perfBool(lane.row_indexed_lm_head)},
-                 {"device_resident_input", perfBool(lane.device_resident_input)},
-                 {"device_resident_outcome", perfBool(lane.device_resident_outcome)},
-                 {"device_resident_publication", perfBool(lane.device_resident_publication)},
-                 {"host_native_input", perfBool(lane.host_native_input)},
-                 {"host_native_outcome", perfBool(lane.host_native_outcome)},
-                 {"host_plan_publication", perfBool(lane.host_plan_publication)},
-                 {"host_bridge_free_hot_path", perfBool(lane.host_bridge_free_hot_path)},
-                 {"graph_capturable", perfBool(lane.graph_capturable)},
-                 {"greedy", perfBool(lane.greedy)},
-                 {"stochastic", perfBool(lane.stochastic)},
-                 {"max_rows", std::to_string(std::max(0, lane.max_rows))},
-                 {"perf_gate_status", lane.perf_gate_status}});
-        };
-
-        emit_lane("dense", capability.dense);
-        emit_lane("moe", capability.moe);
-    }
-
     int OrchestrationRunner::effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const
     {
         if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed)
@@ -3799,7 +3749,6 @@ namespace llaminar2
     {
         PerfStatsCollector::ScopedTimer step_timer("mtp", "decode_step_total", "decode");
         PerfStatsCollector::addCounter("mtp", "decode_step_calls", 1.0, "decode");
-        recordMTPVerifierEconomyPerfStatsIfNeeded();
 
         GenerationResult result;
         const int vocab = vocabSize();
@@ -13645,7 +13594,6 @@ namespace llaminar2
 
     void OrchestrationRunner::resetExecutorStats()
     {
-        mtp_verifier_economy_perfstats_emitted_ = false;
         if (runner_)
         {
             runner_->resetExecutorStats();

@@ -711,8 +711,7 @@ namespace
         bool supportsRowLocalAllPositionPenaltyApplication() const override
         {
             return supports_mtp_token_coordination_ ||
-                   (primary_device_.is_cpu() &&
-                    supports_grouped_decode_equivalent_mtp_spec_state_publication_);
+                   (primary_device_.is_cpu() && mtp_enabled_);
         }
 
         bool supportsMTPSidecarSampleFusion() const override
@@ -759,16 +758,6 @@ namespace
         bool supportsDeviceResidentMTPSpecStatePublication() const override
         {
             return supports_device_resident_mtp_spec_state_publication_;
-        }
-
-        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override
-        {
-            return supports_grouped_decode_equivalent_mtp_spec_state_publication_;
-        }
-
-        MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override
-        {
-            return mtp_verifier_economy_capability_;
         }
 
         bool publishAcceptedMTPSpecState(
@@ -864,12 +853,6 @@ namespace
             publication_events_.push_back("grouped_host_plan_publish");
             execution_events_.push_back("grouped_host_plan_publish");
             last_published_mtp_spec_batch_ = plans;
-            if (!supports_grouped_decode_equivalent_mtp_spec_state_publication_)
-            {
-                if (error)
-                    *error = "mock grouped decode-equivalent publication is disabled";
-                return false;
-            }
             if (!publish_mtp_spec_state_ok_)
             {
                 if (error)
@@ -3500,15 +3483,6 @@ namespace
                 enableGroupedOutcomeHostPublication(/*rows=*/4);
                 return;
             }
-            if (mtp_verifier_economy_capability_.dense.perf_gate_status ==
-                    "grouped_host_outcome_economical" &&
-                mtp_verifier_economy_capability_.moe.perf_gate_status ==
-                    "grouped_host_outcome_economical")
-            {
-                mtp_verifier_economy_capability_ = {};
-                supports_grouped_decode_equivalent_mtp_spec_state_publication_ =
-                    false;
-            }
         }
         void enableColumnParallelShard(int vocab_start, int vocab_local)
         {
@@ -3737,24 +3711,12 @@ namespace
         }
         void enableGroupedOutcomeDeviceResidentPublication(int rows)
         {
-            const MTPVerifierEconomyLane lane =
-                MTPVerifierEconomyLane::groupedOutcomeDevicePublicationEconomicsPending(rows);
-            mtp_verifier_economy_capability_.dense = lane;
-            mtp_verifier_economy_capability_.moe = lane;
+            (void)rows;
             supports_device_resident_mtp_spec_state_publication_ = true;
         }
         void enableGroupedOutcomeHostPublication(int rows)
         {
-            const MTPVerifierEconomyLane lane =
-                MTPVerifierEconomyLane::groupedOutcomeHostPublicationEconomical(rows);
-            mtp_verifier_economy_capability_.dense = lane;
-            mtp_verifier_economy_capability_.moe = lane;
-            supports_grouped_decode_equivalent_mtp_spec_state_publication_ =
-                true;
-        }
-        void enableGroupedDecodeEquivalentMTPSpecStatePublication()
-        {
-            supports_grouped_decode_equivalent_mtp_spec_state_publication_ = true;
+            (void)rows;
         }
         void setMTPSpecStatePublicationOk(bool ok)
         {
@@ -4425,7 +4387,6 @@ namespace
         bool supports_mtp_spec_state_publication_{false};
         bool hide_mtp_spec_state_publication_from_policy_{false};
         bool supports_device_resident_mtp_spec_state_publication_{false};
-        bool supports_grouped_decode_equivalent_mtp_spec_state_publication_{false};
         bool publish_mtp_spec_state_ok_{true};
         bool supports_stochastic_device_sampling_{false};
         bool supports_main_logits_batch_rows_on_device_{false};
@@ -4446,7 +4407,6 @@ namespace
         PrefixStateSnapshot last_restored_snapshot_;
         MTPSpecStepPlan last_published_mtp_spec_step_;
         MTPSpecStepPlanBatch last_published_mtp_spec_batch_;
-        MTPVerifierEconomyCapability mtp_verifier_economy_capability_;
         DeviceSpeculativePublicationRequest last_device_resident_publication_request_;
         MTPSpecStepPlanBatch last_adopted_device_resident_host_state_;
         MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_plan_;
@@ -7170,7 +7130,6 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
-            mock->enableGroupedDecodeEquivalentMTPSpecStatePublication();
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->setVerifierAcceptedPrefixScript({2});
@@ -7293,7 +7252,6 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
-            mock->enableGroupedDecodeEquivalentMTPSpecStatePublication();
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->setVerifierAcceptedPrefixScript({0, 1});
@@ -10959,7 +10917,7 @@ namespace
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, LocalTPGPUAllPositionPublicationUsesShardedRowSampler)
+    TEST_F(Test__PrefillDecodeTransition, LocalTPGPUGroupedPublicationUsesShardedRowSampler)
     {
         auto harness = createLocalTPRunner(
             /*mtp_accept=*/true,
@@ -10991,8 +10949,12 @@ namespace
         EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 0)
             << "Rank-level LocalTP sampling consumes child LogitsLocalInfo "
                "directly instead of asking one child to sample all rows.";
-        EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 1);
-        EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 1);
+        EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0)
+            << "LocalTP grouped verifier publication must not promote the "
+               "direct all-position publication path.";
+        EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
+        EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 1);
         EXPECT_EQ(harness.child0->setAllPositionCount(), 2);
         EXPECT_EQ(harness.child1->setAllPositionCount(), 2);
     }
@@ -11027,7 +10989,6 @@ namespace
             for (MockInferenceRunner *child : {harness.child0, harness.child1})
             {
                 child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
-                child->enableGroupedDecodeEquivalentMTPSpecStatePublication();
                 child->enableMTPSidecarPreservesMainState();
                 child->enableMTPTokenCoordination(/*hide_local_logits=*/false);
                 child->requireAllPositionLocalInfoWhileEnabled();
@@ -11128,7 +11089,6 @@ namespace
         for (MockInferenceRunner *child : {harness.child0, harness.child1})
         {
             child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
-            child->enableGroupedDecodeEquivalentMTPSpecStatePublication();
             child->setVerifierAcceptedPrefixScript({2});
         }
 

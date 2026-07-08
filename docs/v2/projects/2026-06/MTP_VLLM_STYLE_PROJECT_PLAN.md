@@ -3069,17 +3069,11 @@ Current status:
 
 - [x] Phase added to close the gap between Phase 9.7 correctness proofs and
   Phase 10 speed/default-readiness evidence.
-- [x] Verifier-economy capability contract added in
-  `MTPDecodeCatchup`/`IInferenceRunner`, with `DeviceGraphOrchestrator` and
-  `RankOrchestrator` reporting diagnostic serial-oracle support separately from
-  grouped/promoted verifier support. Focused unit coverage proves
-  `RankOrchestrator` clamps to the weakest participant and current
-  SingleDevice lanes are not accidentally marked economical.
-- [x] Verifier-economy capability printed in perfstats/matrix rows. MTP decode
-  emits tagged dense/MoE `verifier_economy_capability` counters, and
-  `summarize_mtp_perfstats.py`/`run_mtp_iteration_benchmark_matrix.sh` expose
-  compact `verifier_economy_dense` and `verifier_economy_moe` columns for
-  dashboard refreshes.
+- [x] Verifier-economy capability advertising retired. Grouped verifier paths
+  are now a hard production contract: they must be serial-row-equivalent and
+  economical rather than reporting an optional capability. Runtime perfstats
+  keep measured timings and counters only; dedicated `Perf__` suites own the
+  economy proof.
 - [x] GPU request-batched stochastic depth-1 sidecar tokens can now publish
   directly into device draft slots. `OrchestrationRunner` skips the legacy
   draft-token H2D staging for this lane, while the compatibility host shadow is
@@ -3666,12 +3660,11 @@ Current status:
   repetition/DRY requests.
 - [ ] Full MTP benchmark matrix refreshed with perfstats and GPU stage timing.
 - [x] Phase 10 status reconciled so correctness-only serial oracles cannot be
-  mistaken for performant grouped verifier acceptance. `MTPVerifierEconomyLane`
-  keeps serial oracle, grouped outcome, and direct publication as separate
-  contracts; DGO and RankOrchestrator tests assert grouped MoE outcome evidence
-  is not economical while publication is pending. CPU MoE grouped units now
-  cover M=2/3/4 with cosine, relative L2, symmetric KL, and max-absolute checks
-  so this correctness lane is strict but still labelled non-economical.
+  mistaken for performant grouped verifier acceptance. Grouped verifier
+  publication is invoked directly and fails on concrete structural/plan errors;
+  row replay remains diagnostic-only. CPU MoE grouped units now cover M=2/3/4
+  with cosine, relative L2, symmetric KL, and max-absolute checks, while the
+  grouped decode-equivalence sweeps enforce bitwise gates.
 - [ ] LocalTP sharded compact verifier reducers implemented and proven for
   greedy/stochastic dense lanes with strict distribution and continuation
   equivalence.  2026-07-07: RankOrchestrator now has a focused host-visible

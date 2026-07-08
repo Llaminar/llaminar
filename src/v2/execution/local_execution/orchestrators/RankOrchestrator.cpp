@@ -7359,35 +7359,6 @@ namespace llaminar2
         return true;
     }
 
-    /**
-     * @brief Check the grouped decode-equivalent publication contract across
-     *        the active rank topology.
-     *
-     * LocalTP and LocalPP publication is only correct when every participant
-     * mutates live state from the same accepted prefix.  Returning false for a
-     * single missing child capability prevents the policy layer from entering a
-     * grouped host-publication path that would update only part of the topology.
-     */
-    bool RankOrchestrator::supportsGroupedDecodeEquivalentMTPSpecStatePublication() const
-    {
-        const auto &participants =
-            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
-        if (participants.empty())
-        {
-            return false;
-        }
-
-        for (const auto &runner : participants)
-        {
-            if (!runner ||
-                !runner->supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
     bool RankOrchestrator::supportsDeviceResidentMTPSpecStatePublication() const
     {
         /*
@@ -7415,7 +7386,13 @@ namespace llaminar2
             return false;
         }
 
-        return supportsGroupedDecodeEquivalentMTPSpecStatePublication();
+        return std::all_of(
+            device_runners_.begin(),
+            device_runners_.end(),
+            [](const std::unique_ptr<IInferenceRunner> &runner)
+            {
+                return runner != nullptr;
+            });
     }
 
     bool RankOrchestrator::copyDeviceSpeculativeOutcomesToHost(
@@ -7714,38 +7691,6 @@ namespace llaminar2
             }
             const MTPVerifierRowCapability child =
                 runner->mtpVerifierRowCapability();
-            if (!initialized)
-            {
-                capability = child;
-                initialized = true;
-            }
-            else
-            {
-                capability.intersectWith(child);
-            }
-        }
-        return capability;
-    }
-
-    MTPVerifierEconomyCapability RankOrchestrator::mtpVerifierEconomyCapability() const
-    {
-        const auto &participants =
-            !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
-        MTPVerifierEconomyCapability capability;
-        if (participants.empty())
-        {
-            return capability;
-        }
-
-        bool initialized = false;
-        for (const auto &runner : participants)
-        {
-            if (!runner)
-            {
-                return {};
-            }
-            const MTPVerifierEconomyCapability child =
-                runner->mtpVerifierEconomyCapability();
             if (!initialized)
             {
                 capability = child;
@@ -8201,9 +8146,8 @@ namespace llaminar2
                     all_success = false;
                     continue;
                 }
-                if (grouped_decode_equivalent_spec_publication_scope_
-                        ? !pp_stage_runners_[i]->supportsGroupedDecodeEquivalentMTPSpecStatePublication()
-                        : !pp_stage_runners_[i]->supportsMTPSpecStatePublication())
+                if (!grouped_decode_equivalent_spec_publication_scope_ &&
+                    !pp_stage_runners_[i]->supportsMTPSpecStatePublication())
                 {
                     child_errors[i] =
                         "stage does not support verifier-state publication";
@@ -8275,9 +8219,8 @@ namespace llaminar2
                     << " is unavailable";
                 return fail(msg.str());
             }
-            if (grouped_decode_equivalent_spec_publication_scope_
-                    ? !device_runners_[i]->supportsGroupedDecodeEquivalentMTPSpecStatePublication()
-                    : !device_runners_[i]->supportsMTPSpecStatePublication())
+            if (!grouped_decode_equivalent_spec_publication_scope_ &&
+                !device_runners_[i]->supportsMTPSpecStatePublication())
             {
                 std::ostringstream msg;
                 msg << "MTP spec-state batch publication participant " << i
@@ -8491,22 +8434,11 @@ namespace llaminar2
         const MTPSpecStepPlanBatch &plans,
         std::string *error)
     {
-        if (!supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-        {
-            if (error)
-            {
-                *error =
-                    "grouped decode-equivalent MTP spec-state publication is not advertised for every rank participant";
-            }
-            return false;
-        }
-
         /*
          * The scoped flag is the only difference from a direct batch
          * publication.  It makes publishAcceptedMTPSpecStateBatch() ask each
-         * participant for grouped decode-equivalent support and call each
-         * participant's grouped publisher, then restores normal direct-publish
-         * behavior before returning to the caller.
+         * participant's grouped publisher directly, then restores normal
+         * direct-publish behavior before returning to the caller.
          */
         struct ScopedGroupedDecodeEquivalentPublication
         {

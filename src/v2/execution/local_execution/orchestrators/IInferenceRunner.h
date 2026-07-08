@@ -877,19 +877,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Phase 9.8 economical verifier capability advertised by runner.
-         *
-         * This is intentionally separate from mtpVerifierRowCapability(). A
-         * runner may be numerically decode-equivalent only because it replays
-         * rows serially; that is correct, but not the grouped, resident,
-         * graph-capturable fast path required before Phase 10 rollout claims.
-         */
-        virtual MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const
-        {
-            return {};
-        }
-
-        /**
          * @brief True when the runner implements vLLM-style accepted-count
          *        publication from the most recent target verifier graph.
          */
@@ -909,40 +896,14 @@ namespace llaminar2
         virtual bool supportsDeviceResidentMTPSpecStatePublication() const { return false; }
 
         /**
-         * @brief True when a grouped decode-equivalent verifier may publish
-         *        accepted state through the host-visible step-plan contract.
-         *
-         * This is narrower than supportsMTPSpecStatePublication().  The older
-         * capability means callers may choose the direct all-position verifier
-         * policy.  This capability is for the middle lane where grouped
-         * verifier rows have already been proven decode-equivalent, the caller
-         * has built the same MTPSpecStepPlanBatch a serial replay would have
-         * produced, and the runner can publish those accepted rows without
-         * advertising the broader direct all-position policy.
-         *
-         * @return true when publishGroupedDecodeEquivalentMTPSpecStateBatch()
-         *         is legal for the most recent grouped verifier graph.
-         *
-         * @note A true return value here must not imply that
-         *       supportsMTPSpecStatePublication() is also true.  Keeping those
-         *       two capabilities separate is what prevents the policy layer
-         *       from silently upgrading a decode-equivalent grouped row proof
-         *       into direct all-position publication.
-         */
-        virtual bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const
-        {
-            return false;
-        }
-
-        /**
          * @brief Publish accepted verifier state for a grouped
          *        decode-equivalent outcome.
          *
-         * Implementations must preserve the same semantics as
-         * publishAcceptedMTPSpecStateBatch() for the provided step plans, but
-         * may be enabled when supportsMTPSpecStatePublication() remains false.
-         * This keeps the grouped-outcome MTP lane from silently promoting the
-         * stronger direct all-position policy.
+         * Grouped verifier rows are a hard MTP requirement, not an advertised
+         * optional capability.  Implementations must preserve the same
+         * semantics as publishAcceptedMTPSpecStateBatch() for the provided step
+         * plans while remaining separate from the stronger direct all-position
+         * publication policy.
          *
          * @param plans Host-visible publication plans derived from a grouped
          *        decode-equivalent verifier outcome.  The accepted counts and

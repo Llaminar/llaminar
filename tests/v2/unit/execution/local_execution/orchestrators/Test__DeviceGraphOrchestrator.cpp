@@ -581,28 +581,9 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     EXPECT_FALSE(moe_orchestrator.supportsMTPSpecStatePublication())
         << "CPU MoE must remain replay-published until it has a resident-state "
            "publication proof of its own.";
-    EXPECT_TRUE(moe_orchestrator.supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-        << "CPU MoE must publish grouped decode-equivalent verifier rows through "
-           "the narrow host-native grouped publication API, not row replay.";
-    const auto cpu_moe_economy =
-        moe_orchestrator.mtpVerifierEconomyCapability();
-    EXPECT_TRUE(cpu_moe_economy.supportsMoERows(4, true));
-    EXPECT_TRUE(cpu_moe_economy.moe.grouped_decode_equivalent)
-        << "CPU MoE now has a grouped decode-equivalent verifier proof, even "
-           "before full hot-path economics are accepted.";
-    EXPECT_TRUE(cpu_moe_economy.moe.row_indexed_lm_head);
-    EXPECT_FALSE(cpu_moe_economy.moe.device_resident_input);
-    EXPECT_FALSE(cpu_moe_economy.moe.device_resident_outcome);
-    EXPECT_FALSE(cpu_moe_economy.moe.device_resident_publication);
-    EXPECT_TRUE(cpu_moe_economy.moe.host_native_input);
-    EXPECT_TRUE(cpu_moe_economy.moe.host_native_outcome);
-    EXPECT_TRUE(cpu_moe_economy.moe.host_plan_publication);
-    EXPECT_TRUE(cpu_moe_economy.moe.host_bridge_free_hot_path);
-    EXPECT_TRUE(cpu_moe_economy.moe.graph_capturable);
-    EXPECT_STREQ(
-        cpu_moe_economy.moe.perf_gate_status.c_str(),
-        "grouped_host_outcome_economical");
-    EXPECT_TRUE(cpu_moe_economy.hasEconomicalMoEPath(4, true));
+    EXPECT_FALSE(moe_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+        << "CPU MoE grouped publication is a required host-native contract; it "
+           "does not advertise a separate economy or device-residency capability.";
 
     DeviceId gpu_device = DeviceId::invalid();
     if (DeviceManager::instance().cuda_device_count() > 0)
@@ -647,24 +628,6 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
             << "Grouped MoE outcomes now have a resident accepted-state "
                "publication handoff even though the stronger all-position "
                "state-publication policy remains disabled.";
-        const auto gpu_moe_economy =
-            gpu_moe_orchestrator.mtpVerifierEconomyCapability();
-        EXPECT_TRUE(gpu_moe_economy.supportsMoERows(4, true));
-        EXPECT_TRUE(gpu_moe_economy.moe.grouped_decode_equivalent)
-            << "GPU MoE exposes the strict grouped verifier outcome proof.";
-        EXPECT_TRUE(gpu_moe_economy.moe.row_indexed_lm_head);
-        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_input);
-        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_outcome);
-        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_publication);
-        EXPECT_FALSE(gpu_moe_economy.moe.host_bridge_free_hot_path);
-        EXPECT_TRUE(gpu_moe_economy.moe.graph_capturable);
-        EXPECT_STREQ(
-            gpu_moe_economy.moe.perf_gate_status.c_str(),
-            "grouped_outcome_economics_pending");
-        EXPECT_FALSE(gpu_moe_economy.hasEconomicalMoEPath(4, true))
-            << "The grouped outcome lane is a middle contract; it cannot be "
-               "counted as economical until the grouped verifier graph and "
-               "host-bridge-free hot path are speed-accepted.";
     }
 
     auto dense_config = config_;
@@ -692,9 +655,9 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         << "CPU dense MTP must stay on the decode-equivalent verifier until "
            "CPU all-position GDN/KV publication has a continuation-equivalence "
            "proof.";
-    EXPECT_TRUE(dense_orchestrator.supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-        << "CPU dense must publish accepted grouped verifier rows through the "
-           "narrow grouped API instead of falling back to serial row replay.";
+    EXPECT_FALSE(dense_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+        << "CPU dense grouped publication is required through the host-native "
+           "path and no longer has a separate economy advertisement.";
     const auto cpu_dense_capability =
         dense_orchestrator.mtpVerifierRowCapability();
     EXPECT_TRUE(cpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true))
@@ -702,23 +665,6 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
            "contract for M=1..4.";
     EXPECT_FALSE(cpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
         << "CPU dense direct publication is intentionally not promoted.";
-    const auto cpu_dense_economy =
-        dense_orchestrator.mtpVerifierEconomyCapability();
-    EXPECT_TRUE(cpu_dense_economy.supportsDenseRows(4, true));
-    EXPECT_TRUE(cpu_dense_economy.dense.grouped_decode_equivalent);
-    EXPECT_TRUE(cpu_dense_economy.dense.row_indexed_lm_head);
-    EXPECT_FALSE(cpu_dense_economy.dense.device_resident_input);
-    EXPECT_FALSE(cpu_dense_economy.dense.device_resident_outcome);
-    EXPECT_FALSE(cpu_dense_economy.dense.device_resident_publication);
-    EXPECT_TRUE(cpu_dense_economy.dense.host_native_input);
-    EXPECT_TRUE(cpu_dense_economy.dense.host_native_outcome);
-    EXPECT_TRUE(cpu_dense_economy.dense.host_plan_publication);
-    EXPECT_TRUE(cpu_dense_economy.dense.host_bridge_free_hot_path);
-    EXPECT_TRUE(cpu_dense_economy.dense.graph_capturable);
-    EXPECT_STREQ(
-        cpu_dense_economy.dense.perf_gate_status.c_str(),
-        "grouped_host_outcome_economical");
-    EXPECT_TRUE(cpu_dense_economy.hasEconomicalDensePath(4, false));
 
     if (gpu_device.is_valid())
     {
@@ -740,26 +686,10 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
                "path; direct publication remains fail-closed.";
         EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(4, true))
             << "Stochastic direct publication also requires its own proof.";
-        const auto gpu_dense_economy =
-            gpu_dense_orchestrator.mtpVerifierEconomyCapability();
-        EXPECT_TRUE(gpu_dense_economy.supportsDenseRows(4, true));
-        EXPECT_TRUE(gpu_dense_economy.dense.grouped_decode_equivalent)
-            << "GPU dense must expose the M=1..4 grouped verifier-row proof "
-               "so SingleDevice stochastic MTP can use the resident outcome path.";
-        EXPECT_TRUE(gpu_dense_economy.dense.row_indexed_lm_head);
-        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_input);
-        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_outcome);
-        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_publication);
-        EXPECT_FALSE(gpu_dense_economy.dense.host_bridge_free_hot_path)
-            << "Grouped dense publication is not fully economical until the "
-               "whole transaction is benchmark-accepted.";
-        EXPECT_TRUE(gpu_dense_economy.dense.graph_capturable);
-        EXPECT_STREQ(
-            gpu_dense_economy.dense.perf_gate_status.c_str(),
-            "grouped_outcome_economics_pending");
-        EXPECT_FALSE(gpu_dense_economy.hasEconomicalDensePath(4, true))
-            << "Grouped/resident verifier promotion is Phase 9.8 work, even "
-               "when Phase 9.7 row correctness is green.";
+        EXPECT_TRUE(gpu_dense_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+            << "GPU dense grouped verifier publication uses the resident "
+               "accepted-state handoff without promoting direct all-position "
+               "publication or a separate economy capability.";
     }
 }
 

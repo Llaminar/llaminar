@@ -13311,82 +13311,6 @@ namespace llaminar2
         return capability;
     }
 
-    MTPVerifierEconomyCapability DeviceGraphOrchestrator::mtpVerifierEconomyCapability() const
-    {
-        MTPVerifierEconomyCapability economy;
-        const MTPVerifierRowCapability correctness = mtpVerifierRowCapability();
-
-        /*
-         * Phase 10 records increasingly strong contracts separately:
-         * diagnostic serial oracles, grouped verifier outcomes, grouped
-         * verifier outcomes with resident device publication, and fully
-         * economical grouped hot paths.  This distinction prevents a
-         * correctness proof from masquerading as a fully performant vLLM-style
-         * transaction, while also keeping row replay out of production
-         * capability reporting.
-         */
-        if (correctness.dense_decode_equivalent.enabled)
-        {
-            if (state_.device_id.is_gpu())
-            {
-                /*
-                 * Dense GPU runners have strict M=1..4 grouped verifier-row
-                 * equivalence and the resident publication mailbox needed by
-                 * the vLLM-style stochastic grouped-outcome path.  This is
-                 * still an economy-pending middle contract: direct
-                 * all-position publication stays disabled until the recurrent
-                 * continuation proof is green, and benchmarks must prove the
-                 * whole transaction before Phase 10 calls the lane economical.
-                 */
-                economy.dense =
-                    MTPVerifierEconomyLane::groupedOutcomeDevicePublicationEconomicsPending(
-                        correctness.dense_decode_equivalent.max_rows);
-            }
-            else
-            {
-                /*
-                 * CPU verifier publication is native host work, not a hidden
-                 * row replay.  The grouped verifier forward produces M rows,
-                 * row-indexed LM head exposes exactly the rows that determine
-                 * the accepted prefix, and the grouped host-plan publisher
-                 * restores accepted KV/GDN/short-conv state from those rows.
-                 */
-                economy.dense =
-                    MTPVerifierEconomyLane::groupedOutcomeHostPublicationEconomical(
-                        correctness.dense_decode_equivalent.max_rows);
-            }
-        }
-        if (correctness.moe_decode_equivalent.enabled)
-        {
-            if (correctness.moe_direct_all_position.enabled &&
-                correctness.device_resident_direct_publication)
-            {
-                economy.moe = MTPVerifierEconomyLane::groupedPromoted(
-                    correctness.moe_direct_all_position.max_rows);
-            }
-            else if (state_.device_id.is_gpu())
-            {
-                economy.moe =
-                    MTPVerifierEconomyLane::groupedOutcomeDevicePublicationEconomicsPending(
-                        correctness.moe_decode_equivalent.max_rows);
-            }
-            else
-            {
-                /*
-                 * CPU MoE follows the same grouped host-publication contract
-                 * as dense CPU: grouped routed/shared expert rows are the
-                 * production verifier result, and the accepted prefix is
-                 * published from verifier graph rows instead of replaying rows
-                 * through the serial decode loop.
-                 */
-                economy.moe =
-                    MTPVerifierEconomyLane::groupedOutcomeHostPublicationEconomical(
-                        correctness.moe_decode_equivalent.max_rows);
-            }
-        }
-        return economy;
-    }
-
     void DeviceGraphOrchestrator::clearDeviceResidentLogicalSequenceStateMailbox()
     {
         device_resident_logical_sequence_state_mailbox_.clear();
@@ -13994,63 +13918,6 @@ namespace llaminar2
         return graph_builder_ &&
                graph_builder_->config().mtp.enabled &&
                supportsDeviceResidentLogicalSequenceStatePublication();
-    }
-
-    /**
-     * @brief Report whether this single-device runner can publish grouped
-     *        decode-equivalent verifier rows without enabling direct publish.
-     *
-     * The important distinction is the source of the proof.  Direct
-     * all-position publication requires proving that any accepted verifier row
-     * can become live state immediately.  Grouped decode-equivalent publication
-     * is narrower: the caller first reduces grouped verifier rows into a
-     * serial-equivalent MTPSpecStepPlanBatch, then asks this runner to publish
-     * those exact accepted rows.
-     */
-    bool DeviceGraphOrchestrator::supportsGroupedDecodeEquivalentMTPSpecStatePublication() const
-    {
-        /*
-         * Publication still needs real live-state storage.  A row-equivalence
-         * proof is not useful if the runner has no main KV cache or no shifted
-         * MTP caches to advance after accepting speculative rows.
-         */
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled ||
-            state_.kv_cache == nullptr || state_.mtp_kv_caches.empty())
-        {
-            return false;
-        }
-        /*
-         * CPU grouped publication is host-native: all verifier rows and step
-         * plans already live in ordinary addressable memory, so requiring the
-         * GPU resident mailbox would falsely disable the real grouped path.
-         * GPU runners still need the resident logical-state handoff here so a
-         * host-plan grouped publisher cannot accidentally bypass stream-ordered
-         * live-state readiness.
-         */
-        if (state_.device_id.is_gpu() &&
-            !supportsDeviceResidentLogicalSequenceStatePublication())
-        {
-            return false;
-        }
-
-        const MTPRuntimeConfig &mtp = graph_builder_->config().mtp;
-        const int requested_rows =
-            std::max(1, mtp.depth_policy.max_depth > 0
-                            ? mtp.depth_policy.max_depth
-                            : mtp.draft_tokens);
-        const bool stochastic =
-            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling;
-        const MTPVerifierRowCapability capability = mtpVerifierRowCapability();
-        const auto &config = graph_builder_->config();
-        if (config.isMoE() || isPrefixCacheMoEModel())
-        {
-            return capability.supportsMoEDecodeEquivalentRows(
-                requested_rows,
-                stochastic);
-        }
-        return capability.supportsDenseDecodeEquivalentRows(
-            requested_rows,
-            stochastic);
     }
 
     bool DeviceGraphOrchestrator::supportsLogicalMTPVerifierBaseCheckpoint() const
@@ -15559,21 +15426,14 @@ namespace llaminar2
         const MTPSpecStepPlanBatch &plans,
         std::string *error)
     {
-        if (!supportsGroupedDecodeEquivalentMTPSpecStatePublication())
-        {
-            if (error)
-            {
-                *error =
-                    "grouped decode-equivalent MTP spec-state publication is not advertised for this runner";
-            }
-            return false;
-        }
-
         /*
          * The scope object is intentionally tiny and local.  It flips one
          * boolean for the duration of this call so the shared batch publisher
-         * can pass its opening capability check, then restores the previous
-         * value even if publication exits through an early failure.
+         * can pass the direct all-position capability check, then restores the
+         * previous value even if publication exits through an early failure.
+         * The shared publisher still validates the real structural contract:
+         * MTP graph, cached verifier graph, KV caches, captured state, streams,
+         * and the exact accepted-row step plan.
          */
         struct ScopedGroupedDecodeEquivalentPublication
         {

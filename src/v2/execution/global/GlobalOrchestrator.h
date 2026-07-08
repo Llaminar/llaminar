@@ -198,10 +198,6 @@ namespace llaminar2
          */
         void clearMTPSpecVerifierInputPlanAll();
         /**
-         * @brief True when all local runners can publish grouped verifier plans.
-         */
-        bool supportsGroupedDecodeEquivalentMTPSpecStatePublicationAll() const;
-        /**
          * @brief Publish the accepted grouped verifier prefix through all local runners.
          *
          * The same MTPSpecStepPlanBatch must reach every GlobalTP participant
@@ -394,10 +390,6 @@ namespace llaminar2
         LogitsLocalInfo getMTPLogitsLocalInfo() const override;
         bool hasAllPositionLogitsLocal() const override;
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
-        /**
-         * @brief True when every local stage can publish grouped verifier rows.
-         */
-        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override;
         /**
          * @brief Publish accepted grouped verifier rows through GlobalTP children.
          */

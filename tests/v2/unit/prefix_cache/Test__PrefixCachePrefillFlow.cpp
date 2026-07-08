@@ -310,11 +310,6 @@ namespace
             return all_position_logits.empty() ? nullptr : all_position_logits.data();
         }
 
-        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override
-        {
-            return mtp_enabled;
-        }
-
         /**
          * @brief Publish a grouped verifier transaction into the mock live state.
          *
