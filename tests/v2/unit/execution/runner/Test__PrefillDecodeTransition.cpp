@@ -1487,7 +1487,8 @@ namespace
         int sampleGreedyFromMTPLogitsOnDevice() override
         {
             ++sample_mtp_logits_count_;
-            if (!supports_mtp_token_coordination_ || mtp_logits_.empty())
+            if (force_mtp_device_greedy_sample_failure_ ||
+                !supports_mtp_token_coordination_ || mtp_logits_.empty())
                 return -1;
             return greedyArgmax(mtp_logits_.data(), VOCAB_SIZE);
         }
@@ -1767,7 +1768,8 @@ namespace
         int sampleGreedyOnDevice() override
         {
             ++sample_main_logits_count_;
-            if (!supports_mtp_token_coordination_)
+            if (force_main_device_greedy_sample_failure_ ||
+                !supports_mtp_token_coordination_)
                 return -1;
             return greedyArgmax(logits_.data(), VOCAB_SIZE);
         }
@@ -3539,6 +3541,28 @@ namespace
             supports_stochastic_device_sampling_ = true;
         }
         /**
+         * @brief Make main-logit greedy device sampling fail while host logits remain visible.
+         *
+         * This lets regressions prove that GPU MTP treats a bad device sampler as
+         * a hard error instead of quietly sampling the same logits through the CPU
+         * mirror.
+         */
+        void forceMainDeviceGreedySamplingFailure()
+        {
+            force_main_device_greedy_sample_failure_ = true;
+        }
+        /**
+         * @brief Make MTP-logit greedy device sampling fail while host logits remain visible.
+         *
+         * Draft-token sampling is a separate MTP hot-path operation from the
+         * first target token.  Tests use this hook to ensure both sites reject
+         * CPU mirror sampling on CUDA/ROCm.
+         */
+        void forceMTPDeviceGreedySamplingFailure()
+        {
+            force_mtp_device_greedy_sample_failure_ = true;
+        }
+        /**
          * @brief Force one request-batched stochastic verifier lane to reject.
          *
          * Production GPU verification can naturally produce a mixed request
@@ -4313,6 +4337,8 @@ namespace
         std::vector<float> last_main_logits_batch_thresholds_;
         int sample_mtp_logits_count_{0};
         int sample_mtp_logits_to_device_draft_slot_count_{0};
+        bool force_main_device_greedy_sample_failure_{false};
+        bool force_mtp_device_greedy_sample_failure_{false};
         int sample_all_position_logits_count_{0};
         int sample_all_position_logits_batched_count_{0};
         int verify_greedy_all_position_batch_outcome_count_{0};
@@ -5751,6 +5777,102 @@ namespace
         EXPECT_THAT(step.error, HasSubstr("CPU logits fallback is disabled"));
         EXPECT_EQ(mock->sampleMainLogitsCount(), 1);
         EXPECT_TRUE(step.tokens.empty());
+    }
+
+    /**
+     * @brief GPU MTP first-token sampling failures are hard errors.
+     *
+     * Host logits are intentionally still visible in this regression.  A broken
+     * GPU sampler used to fall through to the CPU mirror and continue MTP from a
+     * token that was not produced by the device path.  CUDA/ROCm MTP now treats
+     * that as an implementation failure so bitwise grouped verifier publication
+     * cannot be masked by host-side sampling.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GPUMTPFirstTokenSamplingFailureDoesNotFallbackToHostLogits)
+    {
+        PerfStatsCollector::reset();
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0));
+        mock->forceMainDeviceGreedySamplingFailure();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step = runner->decodeStep();
+        EXPECT_FALSE(step.success());
+        EXPECT_THAT(step.error, HasSubstr("MTP first-token GPU sampling failed"));
+        EXPECT_THAT(step.error, HasSubstr("CPU logits fallback is disabled"));
+        EXPECT_TRUE(step.tokens.empty());
+        EXPECT_EQ(mock->sampleMainLogitsCount(), 1);
+        EXPECT_EQ(mock->forwardMTPCount(), 0)
+            << "The failure must happen before any sidecar draft consumes a "
+               "host-sampled first token.";
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Counter,
+                                 "first_token_cpu_host_samples"),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Timer,
+                                 "sample_first_token_host"),
+                  nullptr);
+
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief GPU MTP draft-token sampling failures are hard errors.
+     *
+     * This pins the second GPU sampling site in the MTP transaction: the first
+     * target token is device-sampled successfully, the sidecar runs, and then the
+     * MTP logits sampler fails.  Production must stop there rather than sampling
+     * the sidecar logits through the host mirror.
+     */
+    TEST_F(Test__PrefillDecodeTransition, GPUMTPDraftTokenSamplingFailureDoesNotFallbackToHostLogits)
+    {
+        PerfStatsCollector::reset();
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0));
+        mock->forceMTPDeviceGreedySamplingFailure();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step = runner->decodeStep();
+        EXPECT_FALSE(step.success());
+        EXPECT_THAT(step.error, HasSubstr("MTP draft-token GPU sampling failed"));
+        EXPECT_THAT(step.error, HasSubstr("CPU logits fallback is disabled"));
+        EXPECT_TRUE(step.tokens.empty());
+        EXPECT_EQ(mock->sampleMainLogitsCount(), 1)
+            << "The first token should still come from the device sampler.";
+        EXPECT_EQ(mock->forwardMTPCount(), 1)
+            << "The sidecar should run before the draft sampler failure.";
+        EXPECT_EQ(mock->sampleMTPLogitsCount(), 1);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Counter,
+                                 "mtp_token_cpu_host_samples"),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Timer,
+                                 "sample_mtp_token_host"),
+                  nullptr);
+
+        PerfStatsCollector::reset();
     }
 
     /**

@@ -5112,7 +5112,12 @@ namespace llaminar2
                     {
                         return fail_after_checkpoint("MTP first-token penalized GPU sampling failed");
                     }
-                    PerfStatsCollector::addCounter("mtp", "first_token_host_sampling_fallbacks", 1.0, "decode");
+                    if (runner_->primaryDeviceId().is_gpu())
+                    {
+                        return fail_after_checkpoint(
+                            "MTP first-token GPU sampling failed; CPU logits fallback is disabled");
+                    }
+                    PerfStatsCollector::addCounter("mtp", "first_token_cpu_host_samples", 1.0, "decode");
                     const float *main_logits = runner_->logits();
                     if (!main_logits)
                     {
@@ -5300,6 +5305,7 @@ namespace llaminar2
         std::vector<std::vector<SamplingDistributionEntry>> host_mtp_draft_distributions(
             static_cast<size_t>(std::max(0, speculative_draft_count)));
         constexpr int32_t kDeferredMTPDraftTokenShadow = -2;
+        std::string mtp_token_sampling_error;
         const bool use_greedy_device_draft_slots =
             (use_all_position_state_publication_verifier ||
              use_grouped_outcome_device_resident_publication_verifier) &&
@@ -5310,6 +5316,7 @@ namespace llaminar2
 
         auto sample_mtp_token = [&](int draft_idx, bool defer_host_read) -> int32_t
         {
+            mtp_token_sampling_error.clear();
             int32_t token = -1;
             if (stochastic_verify)
             {
@@ -5463,13 +5470,23 @@ namespace llaminar2
 
             if (use_sampling_penalties)
             {
+                mtp_token_sampling_error =
+                    "MTP draft-token penalized GPU sampling failed";
                 return -1;
             }
 
-            PerfStatsCollector::addCounter("mtp", "mtp_token_host_sampling_fallbacks", 1.0, "decode");
+            if (runner_->primaryDeviceId().is_gpu())
+            {
+                mtp_token_sampling_error =
+                    "MTP draft-token GPU sampling failed; CPU logits fallback is disabled";
+                return -1;
+            }
+
+            PerfStatsCollector::addCounter("mtp", "mtp_token_cpu_host_samples", 1.0, "decode");
             const float *mtp_logits = runner_->mtpLogits();
             if (!mtp_logits)
             {
+                mtp_token_sampling_error = "No MTP logits available";
                 return -1;
             }
             {
@@ -5925,7 +5942,10 @@ namespace llaminar2
             if (mtp_token < 0)
             {
                 if (mtp_token != kDeferredMTPDraftTokenShadow)
-                    return fail_after_checkpoint("No MTP logits available");
+                    return fail_after_checkpoint(
+                        mtp_token_sampling_error.empty()
+                            ? "No MTP logits available"
+                            : mtp_token_sampling_error);
             }
             if (sidecar_sample_already_done)
             {
