@@ -63,7 +63,7 @@ env:
 
 jobs:
   build:
-    name: Build builder image and unit tests
+    name: Build builder image, unit tests, and focused integration tests
     runs-on: [llaminar-bench]
     timeout-minutes: 120
     outputs:
@@ -138,11 +138,34 @@ jobs:
                   --output-on-failure \
                   --parallel
 
+      - name: Run focused integration tests
+        run: |
+          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
+            --probe-image "${BUILDER_IMAGE}" \
+            --required)
+          docker run --rm \
+            "${nvidia_args[@]}" \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit core=-1 \
+            --shm-size=16g \
+            -e MODELS_DIR="${MODELS_DIR}" \
+            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration \
+                  -R '^V2_Integration_GroupedVerifierRows_' \
+                  --output-on-failure \
+                  --parallel
+
       - name: Upload core dumps on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cores-unit-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cores-build-tests-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/cores/
           if-no-files-found: ignore
           retention-days: 7

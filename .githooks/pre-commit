@@ -6,14 +6,15 @@
 #   chmod +x .git/hooks/pre-commit
 #
 # This hook builds and runs tests before allowing a commit.
-# Feature branches run a 6-step suite:
+# Feature branches run a 7-step suite:
 #   1. Integration build
 #   2. Unit tests (parallel)
-#   3. Focused parity baseline (56 tests, all model families, sequential)
-#   4. E2E release build
-#   5. E2E server integration tests
-#   6. Performance regression benchmarks
-# develop/master add full integration as step 3 and shift the later steps to 4-7.
+#   3. Focused integration tests (grouped verifier decode-equivalence)
+#   4. Focused parity baseline (56 tests, all model families, sequential)
+#   5. E2E release build
+#   6. E2E server integration tests
+#   7. Performance regression benchmarks
+# develop/master add broader integration as step 4 and shift the later steps to 5-8.
 # Override with: git commit --no-verify
 
 set -e
@@ -35,11 +36,11 @@ fi
 
 if $FULL_SUITE; then
     echo -e "${BLUE}==============================================================${NC}"
-    echo -e "${BLUE}Pre-commit Hook: Build, Unit, Integration, Parity, E2E & Benchmarks${NC}"
+    echo -e "${BLUE}Pre-commit Hook: Build, Unit, Focused Integration, Integration, Parity, E2E & Benchmarks${NC}"
     echo -e "${BLUE}==============================================================${NC}"
 else
     echo -e "${BLUE}==============================================================${NC}"
-    echo -e "${BLUE}Pre-commit Hook [feature branch: ${CURRENT_BRANCH}]: Build, Unit, Parity, E2E & Benchmarks${NC}"
+    echo -e "${BLUE}Pre-commit Hook [feature branch: ${CURRENT_BRANCH}]: Build, Unit, Focused Integration, Parity, E2E & Benchmarks${NC}"
     echo -e "${BLUE}==============================================================${NC}"
 fi
 echo ""
@@ -53,9 +54,9 @@ E2E_CONTAINER_IMAGE="${LLAMINAR_E2E_CONTAINER_IMAGE:-llaminar:precommit}"
 E2E_CONTAINER_BUILD="${LLAMINAR_PRECOMMIT_E2E_CONTAINER_BUILD:-1}"
 E2E_CONTAINER_CUDA_ARCHS="${LLAMINAR_PRECOMMIT_E2E_CUDA_ARCHS:-${LLAMINAR_CUDA_ARCHS:-86}}"
 if $FULL_SUITE; then
-    TOTAL_STEPS=7
+    TOTAL_STEPS=8
 else
-    TOTAL_STEPS=6
+    TOTAL_STEPS=7
 fi
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
@@ -96,16 +97,46 @@ fi
 echo -e "${GREEN}✓ Unit tests passed${NC}"
 echo ""
 
-# Step 3 (develop/master only): Run Integration Tests
-# Full integration test suite (excludes Parity and RCCL tests).
-# RCCL tests are excluded due to known driver-level flakiness.
+# Step 3: Run Focused Integration Tests
+# This gate is intentionally small and high-signal: grouped verifier rows must
+# be bitwise-equivalent to serial decode across CPU, CUDA, ROCm, and supported
+# tensor formats/codebooks. It runs before the heavier parity/E2E gates so MTP
+# decode-equivalence regressions fail quickly.
+FOCUSED_INTEG_STEP=3
+echo -e "${YELLOW}[${FOCUSED_INTEG_STEP}/${TOTAL_STEPS}] Running focused integration tests (grouped verifier rows)...${NC}"
+echo ""
+
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_GroupedVerifierRows_" --output-on-failure --parallel
+FOCUSED_INTEG_EXIT_CODE=$?
+set -e
+
+if [ $FOCUSED_INTEG_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo -e "${RED}❌ Focused integration tests failed — grouped decode may not be serial-row-equivalent.${NC}"
+    echo ""
+    echo -e "${YELLOW}Re-run standalone for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R \"^V2_Integration_GroupedVerifierRows_\" --output-on-failure --parallel${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Focused integration tests passed${NC}"
+echo ""
+
+# Step 4 (develop/master only): Run Broader Integration Tests
+# The broad integration sweep excludes Parity, RCCL, and GroupedVerifierRows:
+# parity has its own focused baseline, RCCL has known driver-level flakiness,
+# and grouped verifier rows already ran as the dedicated focused gate above.
 if $FULL_SUITE; then
-    INTEG_STEP=3
-    echo -e "${YELLOW}[${INTEG_STEP}/${TOTAL_STEPS}] Running V2 integration tests (excluding Parity & RCCL)...${NC}"
+    INTEG_STEP=4
+    echo -e "${YELLOW}[${INTEG_STEP}/${TOTAL_STEPS}] Running V2 integration tests (excluding Parity, RCCL & GroupedVerifierRows)...${NC}"
     echo ""
 
     set +e
-    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" -E "Parity|RCCL" --output-on-failure
+    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" -E "Parity|RCCL|GroupedVerifierRows" --output-on-failure
     INTEG_EXIT_CODE=$?
     set -e
 
@@ -122,13 +153,13 @@ if $FULL_SUITE; then
     echo ""
 fi
 
-# Step 3/4: Run Focused Parity Baseline (56 tests, all model families, sequential)
+# Step 4/5: Run Focused Parity Baseline (56 tests, all model families, sequential)
 # Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
 # Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
 # HybridPPTP (pipeline+tensor parallel),
 # and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.
-if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
+if $FULL_SUITE; then PARITY_STEP=5; else PARITY_STEP=4; fi
 echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (56 tests, all model families)...${NC}"
 echo ""
 
@@ -152,8 +183,8 @@ fi
 echo -e "${GREEN}✓ Parity baseline passed${NC}"
 echo ""
 
-# Step 4: Build Release (for E2E — no assertions/debug overhead = faster inference)
-if $FULL_SUITE; then E2E_BUILD_STEP=5; else E2E_BUILD_STEP=4; fi
+# Step 5/6: Build Release (for E2E — no assertions/debug overhead = faster inference)
+if $FULL_SUITE; then E2E_BUILD_STEP=6; else E2E_BUILD_STEP=5; fi
 echo -e "${YELLOW}[${E2E_BUILD_STEP}/${TOTAL_STEPS}] Building V2 Release for E2E tests...${NC}"
 if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Release)${NC}"
@@ -184,13 +215,13 @@ if [[ "$E2E_CONTAINER_MODE" == "1" ]]; then
 fi
 echo ""
 
-# Step 5: E2E Server Integration Tests (Release binary — no assertions = faster inference)
+# Step 6/7: E2E Server Integration Tests (Release binary — no assertions = faster inference)
 # Spins up llaminar2 --serve on CPU, CUDA, and ROCm, validates multi-turn
 # inference via the REST API with curl, and runs long-context checks for the
 # default 35B CPU/ROCm suites, plus Qwen3.6 MoE CUDA2/ROCm2
 # Dynamic/LLEP rebalance movement probes. The 30B gate keeps smaller smoke
 # models fast.
-if $FULL_SUITE; then E2E_STEP=6; else E2E_STEP=5; fi
+if $FULL_SUITE; then E2E_STEP=7; else E2E_STEP=6; fi
 echo -e "${YELLOW}[${E2E_STEP}/${TOTAL_STEPS}] Running E2E Server integration tests (cpu, cuda:0, rocm:0 + 35B long-context + MoE rebalance probes)...${NC}"
 echo ""
 
@@ -230,11 +261,11 @@ fi
 echo -e "${GREEN}✓ E2E server tests passed${NC}"
 echo ""
 
-# Step 6: Performance Regression Benchmarks
+# Step 7/8: Performance Regression Benchmarks
 # Runs 'llaminar2 benchmark' for each model × device combination defined in
 # benchmark_baseline.json and compares prefill/decode throughput against
 # canonical baselines. Devices that are unavailable are skipped gracefully.
-if $FULL_SUITE; then BENCH_STEP=7; else BENCH_STEP=6; fi
+if $FULL_SUITE; then BENCH_STEP=8; else BENCH_STEP=7; fi
 echo -e "${YELLOW}[${BENCH_STEP}/${TOTAL_STEPS}] Running performance regression benchmarks...${NC}"
 echo ""
 
@@ -262,6 +293,7 @@ echo "================================================"
 echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
 echo -e "${GREEN}  • Integration build: OK${NC}"
 echo -e "${GREEN}  • Unit tests: OK${NC}"
+echo -e "${GREEN}  • Focused integration tests: OK${NC}"
 if $FULL_SUITE; then
 echo -e "${GREEN}  • Integration tests: OK${NC}"
 fi
