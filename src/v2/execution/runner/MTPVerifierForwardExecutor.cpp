@@ -36,7 +36,9 @@ namespace llaminar2
         }
 
         const bool batched = graph_plan.request_count > 1;
-        if (batched && !options.allow_batched_host_forward)
+        if (batched &&
+            !options.allow_batched_host_forward &&
+            options.device_token_ids == nullptr)
         {
             return verifierForwardFailure(
                 std::move(graph_plan),

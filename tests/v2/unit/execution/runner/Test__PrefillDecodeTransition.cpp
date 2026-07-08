@@ -154,9 +154,16 @@ namespace
         static constexpr int MTP_ARGMAX_TOKEN = 9;
         static constexpr int VERIFY_REJECT_TOKEN = 4;
         static constexpr int DEFERRED_DEVICE_FIRST_TOKEN_SHADOW = -3;
+        static constexpr int kMockResidentOutcomeRequestCapacity = 4;
+        static constexpr int kMockVerifierTokenCapacity =
+            kMockResidentOutcomeRequestCapacity *
+            sampling_math::kSpeculativeBatchMaxOutputTokens;
 
         MockInferenceRunner()
         {
+            device_target_sample_tokens_.fill(-1);
+            device_draft_sample_tokens_.fill(-1);
+            device_verifier_input_tokens_.fill(-1);
             // Set up prefill logits: token 7 has highest value
             setupPrefillLogits();
         }
@@ -242,6 +249,17 @@ namespace
             return token_shadow && token_ids_device && forward(token_shadow, seq_len);
         }
 
+        bool forwardBatchWithDeviceTokenIds(
+            const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len) override
+        {
+            ++forward_with_device_token_ids_count_;
+            last_forward_device_token_ids_ = token_ids_device;
+            last_forward_device_token_seq_len_ = padded_seq_len;
+            return token_ids_device && forward_batch(token_batches);
+        }
+
         const void *prepareMTPVerifierInputTokensOnDevice(
             int32_t first_token,
             int first_draft_slot,
@@ -271,6 +289,83 @@ namespace
                 device_verifier_input_tokens_[static_cast<size_t>(i + 1)] =
                     device_draft_sample_tokens_[static_cast<size_t>(
                         first_draft_slot + i)];
+            }
+            return device_verifier_input_tokens_.data();
+        }
+
+        const void *prepareMTPVerifierInputTokenBatchOnDevice(
+            const DeviceMTPVerifierInputBatchRequest *requests,
+            int request_count,
+            int padded_seq_len) override
+        {
+            ++prepare_mtp_verifier_input_tokens_on_device_count_;
+            last_prepare_mtp_verifier_total_tokens_ = padded_seq_len;
+            if (!supports_mtp_device_draft_token_input_ ||
+                !requests ||
+                request_count <= 0 ||
+                padded_seq_len <= 0 ||
+                request_count * padded_seq_len >
+                    static_cast<int>(device_verifier_input_tokens_.size()))
+            {
+                return nullptr;
+            }
+
+            std::fill(device_verifier_input_tokens_.begin(),
+                      device_verifier_input_tokens_.end(),
+                      -1);
+            last_mtp_verifier_batch_first_tokens_from_device_.clear();
+            for (int request = 0; request < request_count; ++request)
+            {
+                const DeviceMTPVerifierInputBatchRequest &row =
+                    requests[request];
+                if (row.draft_token_count < 0 ||
+                    row.total_verifier_input_tokens !=
+                        row.draft_token_count + 1 ||
+                    row.total_verifier_input_tokens > padded_seq_len ||
+                    row.first_draft_slot < 0 ||
+                    row.first_draft_slot + row.draft_token_count >
+                        static_cast<int>(device_draft_sample_tokens_.size()))
+                {
+                    return nullptr;
+                }
+
+                const size_t row_base =
+                    static_cast<size_t>(request) *
+                    static_cast<size_t>(padded_seq_len);
+                if (row.first_token_from_device)
+                {
+                    if (row.first_token_device)
+                    {
+                        device_verifier_input_tokens_[row_base] =
+                            *row.first_token_device;
+                    }
+                    else if (row.first_target_sample_slot >= 0 &&
+                             row.first_target_sample_slot <
+                                 static_cast<int>(device_target_sample_tokens_.size()))
+                    {
+                        device_verifier_input_tokens_[row_base] =
+                            device_target_sample_tokens_[
+                                static_cast<size_t>(row.first_target_sample_slot)];
+                    }
+                    else
+                    {
+                        return nullptr;
+                    }
+                }
+                else
+                {
+                    device_verifier_input_tokens_[row_base] =
+                        row.first_token;
+                }
+                last_mtp_verifier_batch_first_tokens_from_device_.push_back(
+                    row.first_token_from_device);
+                for (int draft = 0; draft < row.draft_token_count; ++draft)
+                {
+                    device_verifier_input_tokens_[
+                        row_base + static_cast<size_t>(draft + 1)] =
+                        device_draft_sample_tokens_[
+                            static_cast<size_t>(row.first_draft_slot + draft)];
+                }
             }
             return device_verifier_input_tokens_.data();
         }
@@ -1801,6 +1896,172 @@ namespace
             return out_handle->valid();
         }
 
+        bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+            const DeviceGreedyBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override
+        {
+            using namespace sampling_math;
+            ++verify_greedy_all_position_batch_outcome_count_;
+            last_request_batch_outcome_request_ids_.clear();
+            last_request_batch_outcome_row_counts_.clear();
+            last_request_batch_outcome_first_target_slots_.clear();
+            last_request_batch_outcome_first_draft_slots_.clear();
+            last_request_batch_outcome_bonus_target_slots_.clear();
+            last_request_batch_outcome_first_tokens_.clear();
+            last_request_batch_outcome_draft_tokens_.clear();
+            last_request_batch_outcome_accept_thresholds_.clear();
+            last_request_batch_outcome_residual_thresholds_.clear();
+            last_request_batch_outcome_bonus_thresholds_.clear();
+            last_request_batch_outcome_inverse_sample_seeds_.clear();
+            last_request_batch_outcome_inverse_sample_first_positions_.clear();
+            last_request_batch_outcome_derived_thresholds_.clear();
+            if (!requests ||
+                request_count <= 0 ||
+                request_count > kMockResidentOutcomeRequestCapacity ||
+                !out_handle)
+            {
+                return false;
+            }
+
+            resident_output_tokens_.fill(-1);
+            resident_meta_.fill(0);
+            for (int request_index = 0;
+                 request_index < request_count;
+                 ++request_index)
+            {
+                const DeviceGreedyBatchOutcomeRequest &request =
+                    requests[request_index];
+                if (request.verifier_token_count <= 0 ||
+                    request.verifier_token_count >
+                        kSpeculativeBatchMaxOutputTokens ||
+                    request.token_row_offset < 0 ||
+                    request.token_row_offset + request.verifier_token_count >
+                        static_cast<int>(device_verifier_input_tokens_.size()))
+                {
+                    return false;
+                }
+
+                last_request_batch_outcome_request_ids_.push_back(
+                    request.request_id);
+                last_request_batch_outcome_row_counts_.push_back(
+                    request.verifier_token_count);
+                last_request_batch_outcome_first_target_slots_.push_back(
+                    request.first_target_row);
+                last_request_batch_outcome_first_draft_slots_.push_back(
+                    request.token_row_offset);
+                last_request_batch_outcome_bonus_target_slots_.push_back(
+                    request.first_target_row + request.verifier_token_count - 1);
+                last_request_batch_outcome_first_tokens_.push_back(
+                    request.first_token);
+
+                std::array<int32_t, kSpeculativeBatchMaxOutputTokens>
+                    verify_tokens = {-1, -1, -1, -1, -1};
+                if (!sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                        request.first_target_row,
+                        request.verifier_token_count,
+                        verify_tokens.data()))
+                {
+                    return false;
+                }
+
+                const int compare_rows = request.verifier_token_count - 1;
+                std::array<int, kSpeculativeBatchMaxRows> tokens =
+                    {-1, -1, -1, -1};
+                std::array<int, kSpeculativeBatchMaxRows> accepted =
+                    {0, 0, 0, 0};
+                std::vector<int32_t> draft_tokens;
+                draft_tokens.reserve(static_cast<size_t>(compare_rows));
+                for (int row = 0; row < compare_rows; ++row)
+                {
+                    const int32_t expected_draft =
+                        device_verifier_input_tokens_[
+                            static_cast<size_t>(
+                                request.token_row_offset + row + 1)];
+                    draft_tokens.push_back(expected_draft);
+                    tokens[static_cast<size_t>(row)] =
+                        verify_tokens[static_cast<size_t>(row)];
+                    accepted[static_cast<size_t>(row)] =
+                        verify_tokens[static_cast<size_t>(row)] ==
+                                expected_draft
+                            ? 1
+                            : 0;
+                }
+                last_request_batch_outcome_draft_tokens_.push_back(
+                    std::move(draft_tokens));
+
+                std::array<int, kSpeculativeBatchMaxStopTokens>
+                    packed_stop_tokens = {-1, -1, -1, -1, -1, -1, -1, -1};
+                for (int stop = 0; stop < request.stop_token_count; ++stop)
+                {
+                    packed_stop_tokens[static_cast<size_t>(stop)] =
+                        request.stop_tokens[static_cast<size_t>(stop)];
+                }
+
+                std::array<int, kSpeculativeBatchMaxOutputTokens>
+                    output_tokens = {-1, -1, -1, -1, -1};
+                std::array<int, kSpeculativeBatchMetaCount> meta = {};
+                const int32_t first_token =
+                    device_verifier_input_tokens_[
+                        static_cast<size_t>(request.token_row_offset)];
+                summarize_speculative_verify_batch(
+                    first_token,
+                    tokens.data(),
+                    accepted.data(),
+                    compare_rows,
+                    packed_stop_tokens.data(),
+                    request.stop_token_count,
+                    verify_tokens[static_cast<size_t>(compare_rows)],
+                    1,
+                    output_tokens.data(),
+                    meta.data());
+                if (meta[kSpecBatchMetaOk] == 0)
+                    return false;
+
+                DeviceSpeculativeVerifyBatchOutcome outcome;
+                outcome.ok = true;
+                for (size_t token_index = 0;
+                     token_index < outcome.output_tokens.size();
+                     ++token_index)
+                {
+                    outcome.output_tokens[token_index] =
+                        output_tokens[token_index];
+                }
+                outcome.output_token_count =
+                    meta[kSpecBatchMetaOutputCount];
+                outcome.accepted_speculative_prefix =
+                    meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+                outcome.target_verifier_state_commit_count =
+                    meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+                outcome.ready_token = meta[kSpecBatchMetaReadyToken];
+                outcome.rejected_verified_token =
+                    meta[kSpecBatchMetaRejectedVerifiedToken];
+                outcome.stopped_on_output =
+                    meta[kSpecBatchMetaStoppedOnOutput] != 0;
+                outcome.all_speculative_accepted =
+                    meta[kSpecBatchMetaAllSpeculativeAccepted] != 0;
+                outcome.consumed_verifier_rows =
+                    meta[kSpecBatchMetaConsumedVerifierRows];
+                outcome.sampled_terminal =
+                    meta[kSpecBatchMetaSampledTerminal] != 0;
+                writeResidentOutcomeRow(request_index, outcome);
+            }
+
+            out_handle->output_tokens_device = resident_output_tokens_.data();
+            out_handle->meta_device = resident_meta_.data();
+            out_handle->request_count = request_count;
+            out_handle->output_token_stride =
+                kSpeculativeBatchMaxOutputTokens;
+            out_handle->meta_stride = sampling_math::kSpeculativeBatchMetaCount;
+            out_handle->device = primary_device_;
+            out_handle->stream = &resident_stream_token_;
+            out_handle->response_ready_event =
+                std::shared_ptr<void>(
+                    &resident_outcome_response_ready_event_token_,
+                    [](void *) {});
+            return out_handle->valid();
+        }
+
         int vocab_size() const override { return VOCAB_SIZE; }
 
         void clear_cache() override
@@ -3237,9 +3498,14 @@ namespace
         }
         const void *lastForwardDeviceTokenIds() const { return last_forward_device_token_ids_; }
         int lastForwardDeviceTokenSeqLen() const { return last_forward_device_token_seq_len_; }
-        const std::array<int32_t, 8> &deviceVerifierInputTokens() const
+        const std::array<int32_t, kMockVerifierTokenCapacity>
+            &deviceVerifierInputTokens() const
         {
             return device_verifier_input_tokens_;
+        }
+        const std::vector<bool> &lastMTPVerifierBatchFirstTokensFromDevice() const
+        {
+            return last_mtp_verifier_batch_first_tokens_from_device_;
         }
         int clearCacheCount() const { return clear_cache_count_; }
         int forwardMTPCount() const { return forward_mtp_count_; }
@@ -4581,6 +4847,7 @@ namespace
         std::vector<int> last_commit_mtp_tokens_;
         std::vector<int32_t> last_mtp_spec_verifier_rows_;
         std::vector<int32_t> last_mtp_spec_verifier_tokens_;
+        std::vector<bool> last_mtp_verifier_batch_first_tokens_from_device_;
         std::vector<int32_t> last_mtp_batch_condition_tokens_;
         std::vector<int> last_mtp_batch_position_ids_;
         std::vector<int32_t> last_chained_mtp_batch_condition_tokens_;
@@ -4612,12 +4879,18 @@ namespace
         std::vector<int> verifier_reject_token_script_;
         std::vector<int> decode_argmax_script_;
         mutable std::vector<PrefixStateSnapshot> captured_checkpoint_script_;
-        std::array<std::vector<SamplingDistributionEntry>, 8> target_device_distributions_;
-        std::array<std::vector<SamplingDistributionEntry>, 6> draft_device_distributions_;
-        std::array<int32_t, 8> device_target_sample_tokens_ = {-1, -1, -1, -1, -1, -1, -1, -1};
-        std::array<int32_t, 6> device_draft_sample_tokens_ = {-1, -1, -1, -1, -1, -1};
-        std::array<int32_t, 8> device_verifier_input_tokens_ = {-1, -1, -1, -1, -1, -1, -1, -1};
-        static constexpr int kMockResidentOutcomeRequestCapacity = 4;
+        std::array<std::vector<SamplingDistributionEntry>,
+                   kMockVerifierTokenCapacity>
+            target_device_distributions_;
+        std::array<std::vector<SamplingDistributionEntry>,
+                   kMockVerifierTokenCapacity>
+            draft_device_distributions_;
+        std::array<int32_t, kMockVerifierTokenCapacity>
+            device_target_sample_tokens_{};
+        std::array<int32_t, kMockVerifierTokenCapacity>
+            device_draft_sample_tokens_{};
+        std::array<int32_t, kMockVerifierTokenCapacity>
+            device_verifier_input_tokens_{};
         std::array<int32_t,
                    sampling_math::kSpeculativeBatchMaxOutputTokens *
                        kMockResidentOutcomeRequestCapacity>
@@ -5385,6 +5658,7 @@ namespace
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
         mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
 
         SamplingParams sampling;
         sampling.temperature = 0.1f;
@@ -5447,6 +5721,7 @@ namespace
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
         mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
 
         SamplingParams sampling;
         sampling.temperature = 0.1f;
@@ -5566,6 +5841,7 @@ namespace
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
         mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
         mock->hideMTPSpecStatePublicationFromPolicy();
 
         SamplingParams sampling;
@@ -5605,6 +5881,141 @@ namespace
     }
 
     /**
+     * @brief Request-batched greedy GPU MTP publishes resident compact outcomes.
+     *
+     * Greedy request batching uses the same vLLM-style ownership contract as
+     * stochastic request batching: sidecar drafts are sampled into device slots,
+     * the verifier forward consumes a device-token matrix, and live state is
+     * published from compact resident metadata before the host response bridge
+     * observes the accepted tokens.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           RequestBatchedGreedyResidentPublicationDoesNotRequireDirectAdvert)
+    {
+        auto [runner, mock] =
+            createSingleDeviceRequestBatchRunner(
+                /*max_request_batch=*/2,
+                /*mtp_draft_tokens=*/2,
+                MTPVerifyMode::Greedy);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMainLogitsBatchRowsOnDevice();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+
+        ASSERT_TRUE(runner->prefillBatch({{1, 2, 3}, {4, 5}}))
+            << runner->lastError();
+
+        GenerationBatchResult first = runner->decodeStepBatch(2);
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        EXPECT_TRUE(runner->supportsDecodeStepBatch(2))
+            << "GPU greedy request batching should advertise only when compact "
+               "device-resident publication can execute.";
+
+        GenerationBatchResult second = runner->decodeStepBatch(2);
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_THAT(second.requests, SizeIs(2));
+        EXPECT_THAT(second.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(second.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(mock->forwardMTPBatchAndSampleToDeviceDraftSlotsCount(), 1);
+        EXPECT_EQ(mock->forwardMTPBatchFromLastDraftAndSampleToDeviceDraftSlotsCount(), 1);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostRowCount(), 0);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
+        EXPECT_EQ(mock->forwardBatchCallCount(), 2);
+        EXPECT_THAT(mock->lastRequestBatchOutcomeRequestIds(), ElementsAre(0, 1));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeRowCounts(), ElementsAre(3, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTargetSlots(),
+                    ElementsAre(0, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstDraftSlots(),
+                    ElementsAre(0, 3));
+        ASSERT_THAT(mock->lastRequestBatchOutcomeDraftTokens(), SizeIs(2));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[0],
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[1],
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
+            << "The hidden direct publisher must not be used.";
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_THAT(mock->publicationEvents(),
+                    ElementsAre("device_outcome_publish",
+                                "host_outcome_bridge"));
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
+        EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+    }
+
+    /**
+     * @brief Post-publication greedy request batches reuse resident row-zero tokens.
+     *
+     * The first request-batched MTP verifier after prefill has no prior device
+     * logical-state mailbox, so its condition token is still the host-visible
+     * sampled prefill token.  Once compact resident publication has produced
+     * `next_condition_tokens_device`, the next grouped verifier must consume
+     * those device rows directly instead of re-uploading the same token from
+     * the per-request host shadow.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           RequestBatchedGreedyVerifierUsesResidentConditionTokensAfterPublication)
+    {
+        auto [runner, mock] =
+            createSingleDeviceRequestBatchRunner(
+                /*max_request_batch=*/2,
+                /*mtp_draft_tokens=*/2,
+                MTPVerifyMode::Greedy);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMainLogitsBatchRowsOnDevice();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+
+        ASSERT_TRUE(runner->prefillBatch({{1, 2, 3}, {4, 5}}))
+            << runner->lastError();
+
+        GenerationBatchResult prefill_sample = runner->decodeStepBatch(2);
+        ASSERT_TRUE(prefill_sample.error.empty()) << prefill_sample.error;
+
+        GenerationBatchResult first_mtp = runner->decodeStepBatch(2);
+        ASSERT_TRUE(first_mtp.error.empty()) << first_mtp.error;
+        EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
+                    ElementsAre(false, false));
+
+        GenerationBatchResult ready_bonus = runner->decodeStepBatch(2);
+        ASSERT_TRUE(ready_bonus.error.empty()) << ready_bonus.error;
+        ASSERT_THAT(ready_bonus.requests, SizeIs(2));
+        EXPECT_THAT(ready_bonus.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+        EXPECT_THAT(ready_bonus.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+
+        GenerationBatchResult resident_continuation = runner->decodeStepBatch(2);
+        ASSERT_TRUE(resident_continuation.error.empty())
+            << resident_continuation.error;
+        ASSERT_THAT(resident_continuation.requests, SizeIs(2));
+        EXPECT_THAT(resident_continuation.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(resident_continuation.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 2);
+        EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
+                    ElementsAre(true, true));
+        const auto &verifier_tokens = mock->deviceVerifierInputTokens();
+        EXPECT_EQ(verifier_tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+        EXPECT_EQ(verifier_tokens[3], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 2);
+    }
+
+    /**
      * @brief Pins the scalar-equivalent RNG contract for batched stochastic MTP.
      *
      * Request batching must not key accept, residual, or bonus draws by compact
@@ -5625,6 +6036,7 @@ namespace
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
         mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
         mock->forceStochasticRequestBatchReject(/*request_id=*/1,
                                                 /*correction_token=*/4);
 

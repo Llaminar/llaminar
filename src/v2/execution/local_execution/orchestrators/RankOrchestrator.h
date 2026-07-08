@@ -450,6 +450,10 @@ namespace llaminar2
             const int *token_shadow,
             const void *token_ids_device,
             int seq_len) override;
+        bool forwardBatchWithDeviceTokenIds(
+            const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len) override;
         bool supportsPrefillChunkSchedule(int seq_len) const override;
         bool forwardPrefillChunkSchedule(
             const int *tokens,
@@ -687,6 +691,10 @@ namespace llaminar2
             const int32_t *stop_tokens,
             int stop_token_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+            const DeviceGreedyBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
         /**
          * @brief Materialize a rank-owned compact verifier handle for response
          *        bookkeeping.
@@ -757,6 +765,10 @@ namespace llaminar2
             int first_draft_slot,
             int draft_token_count,
             int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokenBatchOnDevice(
+            const DeviceMTPVerifierInputBatchRequest *requests,
+            int request_count,
+            int padded_seq_len) override;
         const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
             const int32_t *verifier_tokens,
             int total_verifier_input_tokens,

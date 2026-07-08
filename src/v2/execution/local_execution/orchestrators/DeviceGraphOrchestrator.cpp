@@ -4018,7 +4018,7 @@ namespace llaminar2
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::MTP_VERIFIER_INPUT_TOKENS,
                                         1,
-                                        sampling_math::kSpeculativeBatchMaxRows + 1,
+                                        static_cast<size_t>(stochastic_target_row_capacity_),
                                         "INT32",
                                         state_.device_id) ||
                 !arena_->registerBuffer(BufferId::STOCHASTIC_TOPK_PARTIAL_VALS,
@@ -8525,6 +8525,109 @@ namespace llaminar2
                 first_draft_slot,
                 draft_token_count,
                 total_verifier_input_tokens};
+        pending_mtp_verifier_device_token_batch_plan_.reset();
+        materialized_mtp_verifier_device_token_batch_ = {};
+        return mtp_verifier_input_tokens_dev_;
+    }
+
+    const void *DeviceGraphOrchestrator::prepareMTPVerifierInputTokenBatchOnDevice(
+        const DeviceMTPVerifierInputBatchRequest *requests,
+        int request_count,
+        int padded_seq_len)
+    {
+        if (!state_.device_id.is_gpu() ||
+            !mtp_verifier_input_tokens_dev_ ||
+            !stochastic_draft_sample_tokens_dev_)
+        {
+            return nullptr;
+        }
+        if (!requests ||
+            request_count <= 0 ||
+            request_count >
+                static_cast<int>(sampling_math::kSpeculativeBatchMaxRows) ||
+            padded_seq_len <= 0 ||
+            padded_seq_len >
+                static_cast<int>(sampling_math::kSpeculativeBatchMaxRows + 1) ||
+            request_count * padded_seq_len > stochastic_target_row_capacity_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP verifier input token batch: requests="
+                      << request_count
+                      << " padded_seq_len=" << padded_seq_len
+                      << " capacity=" << stochastic_target_row_capacity_);
+            return nullptr;
+        }
+
+        PendingMTPVerifierDeviceTokenBatchPlan plan;
+        plan.request_count = request_count;
+        plan.padded_seq_len = padded_seq_len;
+        for (int i = 0; i < request_count; ++i)
+        {
+            const DeviceMTPVerifierInputBatchRequest &row = requests[i];
+            if (row.total_verifier_input_tokens <= 0 ||
+                row.total_verifier_input_tokens > padded_seq_len ||
+                row.draft_token_count < 0 ||
+                row.draft_token_count + 1 != row.total_verifier_input_tokens ||
+                row.first_draft_slot < 0 ||
+                row.first_draft_slot + row.draft_token_count >
+                    stochastic_draft_row_capacity_ ||
+                (!row.first_token_from_device && row.first_token < 0))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP verifier input token batch row "
+                          << i);
+                return nullptr;
+            }
+            if (row.first_token_from_device)
+            {
+                const bool uses_resident_logical_state =
+                    row.first_token_device != nullptr;
+                const bool uses_target_sample_slot =
+                    row.first_target_sample_slot >= 0;
+                if (uses_resident_logical_state == uses_target_sample_slot)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier input token batch row "
+                              << i
+                              << " must name exactly one device first-token source");
+                    return nullptr;
+                }
+                if (uses_resident_logical_state)
+                {
+                    const DeviceResidentLogicalSequenceStateHandle mailbox =
+                        deviceResidentLogicalSequenceState();
+                    const int32_t *begin =
+                        mailbox.next_condition_tokens_device;
+                    const int32_t *end =
+                        begin ? begin + mailbox.request_count : nullptr;
+                    if (!mailbox.valid() || !begin)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier input token batch row "
+                                  << i
+                                  << " requested a resident first-token pointer without a live logical-state mailbox");
+                        return nullptr;
+                    }
+                    if (row.first_token_device < begin ||
+                        row.first_token_device >= end)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier input token batch row "
+                                  << i
+                                  << " uses a first-token pointer outside the resident logical-state mailbox");
+                        return nullptr;
+                    }
+                }
+                else if (!stochastic_target_sample_tokens_dev_ ||
+                         row.first_target_sample_slot >= stochastic_target_row_capacity_)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Invalid device first-token slot for MTP verifier input token batch row "
+                              << i);
+                    return nullptr;
+                }
+            }
+            plan.requests[static_cast<size_t>(i)] = row;
+        }
+
+        pending_mtp_verifier_device_token_plan_.reset();
+        pending_mtp_verifier_device_token_batch_plan_ = plan;
+        materialized_mtp_verifier_device_token_row_ = {};
+        materialized_mtp_verifier_device_token_batch_ = {};
         return mtp_verifier_input_tokens_dev_;
     }
 
@@ -8556,6 +8659,8 @@ namespace llaminar2
         for (int i = 0; i < total_verifier_input_tokens; ++i)
             plan.host_tokens[static_cast<size_t>(i)] = verifier_tokens[i];
         pending_mtp_verifier_device_token_plan_ = plan;
+        pending_mtp_verifier_device_token_batch_plan_.reset();
+        materialized_mtp_verifier_device_token_batch_ = {};
         return mtp_verifier_input_tokens_dev_;
     }
 
@@ -8615,6 +8720,8 @@ namespace llaminar2
                 first_draft_slot,
                 draft_token_count,
                 total_verifier_input_tokens};
+        pending_mtp_verifier_device_token_batch_plan_.reset();
+        materialized_mtp_verifier_device_token_batch_ = {};
         return mtp_verifier_input_tokens_dev_;
     }
 
@@ -13129,7 +13236,9 @@ namespace llaminar2
 
         pending_mtp_spec_verifier_input_plan_.reset();
         pending_mtp_verifier_device_token_plan_.reset();
+        pending_mtp_verifier_device_token_batch_plan_.reset();
         materialized_mtp_verifier_device_token_row_ = {};
+        materialized_mtp_verifier_device_token_batch_ = {};
         mtp_publication_base_cache_snapshot_ready_ = false;
         mtp_publication_base_cache_snapshot_request_count_ = 0;
         request_batched_prefill_logits_row_count_ = 0;
@@ -16584,9 +16693,11 @@ namespace llaminar2
         mtp_spec_decode_metadata_binding_.setShape(plan.shape);
         pending_mtp_spec_verifier_input_plan_ = plan;
         pending_mtp_verifier_device_token_plan_.reset();
+        pending_mtp_verifier_device_token_batch_plan_.reset();
         mtp_publication_base_cache_snapshot_ready_ = false;
         mtp_publication_base_cache_snapshot_request_count_ = 0;
         materialized_mtp_verifier_device_token_row_ = {};
+        materialized_mtp_verifier_device_token_batch_ = {};
         return true;
     }
 
@@ -16594,6 +16705,7 @@ namespace llaminar2
     {
         pending_mtp_spec_verifier_input_plan_.reset();
         pending_mtp_verifier_device_token_plan_.reset();
+        pending_mtp_verifier_device_token_batch_plan_.reset();
         /*
          * The scoped verifier plan is cleared immediately after the verifier
          * forward, but direct publication still needs the pre-verifier
@@ -16611,8 +16723,17 @@ namespace llaminar2
         void *execution_stream,
         DeviceId execution_device)
     {
-        if (!pending_mtp_verifier_device_token_plan_)
+        const bool has_single_row_plan =
+            pending_mtp_verifier_device_token_plan_.has_value();
+        const bool has_batch_plan =
+            pending_mtp_verifier_device_token_batch_plan_.has_value();
+        if (!has_single_row_plan && !has_batch_plan)
             return true;
+        if (has_single_row_plan && has_batch_plan)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Conflicting MTP verifier device-token row and batch plans");
+            return false;
+        }
         if (!state_.device_id.is_gpu())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Pending MTP verifier device-token plan on non-GPU runner");
@@ -16628,18 +16749,6 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token buffers are not allocated");
             return false;
         }
-        const auto &plan = *pending_mtp_verifier_device_token_plan_;
-        if (!plan.all_tokens_from_host && !stochastic_draft_sample_tokens_dev_)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token plan requires STOCHASTIC_DRAFT_SAMPLE_TOKENS");
-            return false;
-        }
-        if (pending_mtp_verifier_device_token_plan_->first_token_from_device &&
-            !stochastic_target_sample_tokens_dev_)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token plan requires STOCHASTIC_TARGET_SAMPLE_TOKENS");
-            return false;
-        }
 
         const DeviceId token_device =
             execution_device.is_gpu() ? execution_device : state_.device_id;
@@ -16653,6 +16762,218 @@ namespace llaminar2
 
         auto *verifier_tokens =
             static_cast<int32_t *>(mtp_verifier_input_tokens_dev_);
+        if (has_batch_plan)
+        {
+            if (!stochastic_draft_sample_tokens_dev_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token batch requires STOCHASTIC_DRAFT_SAMPLE_TOKENS");
+                return false;
+            }
+            const auto &batch_plan =
+                *pending_mtp_verifier_device_token_batch_plan_;
+            if (batch_plan.request_count <= 0 ||
+                batch_plan.request_count >
+                    static_cast<int>(sampling_math::kSpeculativeBatchMaxRows) ||
+                batch_plan.padded_seq_len <= 0 ||
+                batch_plan.padded_seq_len >
+                    static_cast<int>(sampling_math::kSpeculativeBatchMaxRows + 1) ||
+                batch_plan.request_count * batch_plan.padded_seq_len >
+                    stochastic_target_row_capacity_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP verifier device-token batch plan: requests="
+                          << batch_plan.request_count
+                          << " padded_seq_len=" << batch_plan.padded_seq_len
+                          << " capacity=" << stochastic_target_row_capacity_);
+                return false;
+            }
+
+            for (int request = 0; request < batch_plan.request_count; ++request)
+            {
+                const DeviceMTPVerifierInputBatchRequest &row =
+                    batch_plan.requests[static_cast<size_t>(request)];
+                if (row.total_verifier_input_tokens <= 0 ||
+                    row.total_verifier_input_tokens > batch_plan.padded_seq_len ||
+                    row.draft_token_count < 0 ||
+                    row.draft_token_count + 1 !=
+                        row.total_verifier_input_tokens ||
+                    row.first_draft_slot < 0 ||
+                    row.first_draft_slot + row.draft_token_count >
+                        stochastic_draft_row_capacity_ ||
+                    (!row.first_token_from_device && row.first_token < 0))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP verifier device-token batch row "
+                              << request);
+                    return false;
+                }
+                if (row.first_token_from_device)
+                {
+                    const bool uses_resident_logical_state =
+                        row.first_token_device != nullptr;
+                    const bool uses_target_sample_slot =
+                        row.first_target_sample_slot >= 0;
+                    if (uses_resident_logical_state == uses_target_sample_slot)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token batch row "
+                                  << request
+                                  << " must name exactly one device first-token source");
+                        return false;
+                    }
+                    if (uses_resident_logical_state)
+                    {
+                        const DeviceResidentLogicalSequenceStateHandle mailbox =
+                            deviceResidentLogicalSequenceState();
+                        const int32_t *begin =
+                            mailbox.next_condition_tokens_device;
+                        const int32_t *end =
+                            begin ? begin + mailbox.request_count : nullptr;
+                        if (!mailbox.valid() || !begin)
+                        {
+                            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier batch row "
+                                      << request
+                                      << " requested a resident first-token pointer without a live logical-state mailbox");
+                            return false;
+                        }
+                        if (row.first_token_device < begin ||
+                            row.first_token_device >= end)
+                        {
+                            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier batch row "
+                                      << request
+                                      << " uses a first-token pointer outside the resident logical-state mailbox");
+                            return false;
+                        }
+                    }
+                    else if (!stochastic_target_sample_tokens_dev_ ||
+                             row.first_target_sample_slot >=
+                                 stochastic_target_row_capacity_)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Invalid device first-token slot for MTP verifier batch row "
+                                  << request);
+                        return false;
+                    }
+                }
+
+                int32_t *row_tokens =
+                    verifier_tokens +
+                    static_cast<size_t>(request) *
+                        static_cast<size_t>(batch_plan.padded_seq_len);
+                if (row.first_token_from_device)
+                {
+                    const int32_t *first_token_device = row.first_token_device;
+                    if (first_token_device)
+                    {
+                        if (!waitForDeviceResidentLogicalSequenceStateMailbox(
+                                execution_stream,
+                                "mtp_verifier_batch_first_token"))
+                        {
+                            LOG_ERROR("[DeviceGraphOrchestrator] Failed to order verifier batch token copy after resident logical-state mailbox for row "
+                                      << request);
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        first_token_device =
+                            static_cast<const int32_t *>(
+                                stochastic_target_sample_tokens_dev_) +
+                            row.first_target_sample_slot;
+                        if (!waitForRequiredStochasticTargetSampleReady(
+                                row.first_target_sample_slot,
+                                execution_stream,
+                                "mtp_verifier_batch_first_token"))
+                        {
+                            LOG_ERROR("[DeviceGraphOrchestrator] Failed to order verifier batch token copy after target sample for row "
+                                      << request);
+                            return false;
+                        }
+                    }
+                    if (!backend->deviceCopyAsync(
+                            row_tokens,
+                            first_token_device,
+                            sizeof(int32_t),
+                            token_device.gpu_ordinal(),
+                            execution_stream))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to copy device first token for MTP verifier batch row "
+                                  << request);
+                        return false;
+                    }
+                }
+                else if (!backend->hostToDeviceOnStream(
+                             row_tokens,
+                             &batch_plan.requests[static_cast<size_t>(request)]
+                                  .first_token,
+                             sizeof(int32_t),
+                             token_device.gpu_ordinal(),
+                             execution_stream))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload first token for MTP verifier batch row "
+                              << request);
+                    return false;
+                }
+
+                if (row.draft_token_count > 0 &&
+                    !waitForRequiredStochasticDraftSampleReadyRange(
+                        row.first_draft_slot,
+                        row.draft_token_count,
+                        execution_stream,
+                        "mtp_verifier_batch_input_tokens"))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to order verifier batch token copy after draft samples");
+                    return false;
+                }
+                if (row.draft_token_count > 0)
+                {
+                    const auto *draft_tokens =
+                        static_cast<const int32_t *>(
+                            stochastic_draft_sample_tokens_dev_) +
+                        row.first_draft_slot;
+                    if (!backend->deviceCopyAsync(
+                            row_tokens + 1,
+                            draft_tokens,
+                            sizeof(int32_t) *
+                                static_cast<size_t>(row.draft_token_count),
+                            token_device.gpu_ordinal(),
+                            execution_stream))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to copy MTP verifier batch draft tokens for row "
+                                  << request);
+                        return false;
+                    }
+                }
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "verifier_device_token_batch_input_prepares",
+                1.0,
+                "decode",
+                token_device.toString(),
+                {{"requests", std::to_string(batch_plan.request_count)},
+                 {"padded_seq_len", std::to_string(batch_plan.padded_seq_len)}});
+            materialized_mtp_verifier_device_token_batch_.valid = true;
+            materialized_mtp_verifier_device_token_batch_.request_count =
+                batch_plan.request_count;
+            materialized_mtp_verifier_device_token_batch_.padded_seq_len =
+                batch_plan.padded_seq_len;
+            materialized_mtp_verifier_device_token_batch_.total_token_capacity =
+                batch_plan.request_count * batch_plan.padded_seq_len;
+            materialized_mtp_verifier_device_token_row_ = {};
+            pending_mtp_verifier_device_token_batch_plan_.reset();
+            return true;
+        }
+
+        const auto &plan = *pending_mtp_verifier_device_token_plan_;
+        if (!plan.all_tokens_from_host && !stochastic_draft_sample_tokens_dev_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token plan requires STOCHASTIC_DRAFT_SAMPLE_TOKENS");
+            return false;
+        }
+        if (plan.first_token_from_device &&
+            !stochastic_target_sample_tokens_dev_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP verifier device-token plan requires STOCHASTIC_TARGET_SAMPLE_TOKENS");
+            return false;
+        }
         if (plan.all_tokens_from_host)
         {
             if (!backend->hostToDeviceOnStream(
@@ -16683,6 +17004,7 @@ namespace llaminar2
                  {"draft_tokens", std::to_string(plan.draft_token_count)},
                  {"source", "host_fixture"}});
             pending_mtp_verifier_device_token_plan_.reset();
+            pending_mtp_verifier_device_token_batch_plan_.reset();
             return true;
         }
         const auto *draft_tokens =
@@ -16769,6 +17091,7 @@ namespace llaminar2
         materialized_mtp_verifier_device_token_row_.draft_token_count =
             plan.draft_token_count;
         pending_mtp_verifier_device_token_plan_.reset();
+        pending_mtp_verifier_device_token_batch_plan_.reset();
         return true;
     }
 
@@ -19424,6 +19747,7 @@ namespace llaminar2
                 StochasticSampleReadyClearMode::Force);
         }
         materialized_mtp_verifier_device_token_row_ = {};
+        materialized_mtp_verifier_device_token_batch_ = {};
 
         out_handle->output_tokens_device =
             static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
@@ -19447,6 +19771,295 @@ namespace llaminar2
             "decode",
             state_.device_id.toString(),
             {{"compare_rows", std::to_string(compare_rows)}});
+        return out_handle->valid();
+    }
+
+    bool DeviceGraphOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+        const DeviceGreedyBatchOutcomeRequest *requests,
+        int request_count,
+        DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        using namespace sampling_math;
+        if (out_handle)
+            *out_handle = DeviceSpeculativeOutcomeHandle{};
+        if (!out_handle ||
+            !requests ||
+            request_count <= 0 ||
+            request_count > stochastic_batch_output_request_capacity_ ||
+            !state_.all_position_logits ||
+            !state_.device_id.is_gpu() ||
+            !materialized_mtp_verifier_device_token_batch_.valid ||
+            materialized_mtp_verifier_device_token_batch_.request_count !=
+                request_count ||
+            !mtp_verifier_input_tokens_dev_ ||
+            !stochastic_verify_tokens_dev_ ||
+            !stochastic_verify_accept_probs_dev_ ||
+            !stochastic_batch_output_tokens_dev_ ||
+            !stochastic_batch_output_meta_dev_)
+        {
+            return false;
+        }
+
+        int max_target_row = 0;
+        for (int i = 0; i < request_count; ++i)
+        {
+            const DeviceGreedyBatchOutcomeRequest &request = requests[i];
+            if (request.first_target_row < 0 ||
+                request.verifier_token_count <= 0 ||
+                request.verifier_token_count >
+                    static_cast<int>(kSpeculativeBatchMaxRows + 1) ||
+                request.token_row_offset < 0 ||
+                request.token_row_stride <= 0 ||
+                request.token_row_stride !=
+                    materialized_mtp_verifier_device_token_batch_
+                        .padded_seq_len ||
+                request.stop_token_count < 0 ||
+                request.stop_token_count >
+                    static_cast<int>(kSpeculativeBatchMaxStopTokens) ||
+                request.token_row_offset + request.verifier_token_count >
+                    materialized_mtp_verifier_device_token_batch_
+                        .total_token_capacity)
+            {
+                return false;
+            }
+            max_target_row = std::max(
+                max_target_row,
+                request.first_target_row + request.verifier_token_count);
+        }
+        if (max_target_row <= 0 ||
+            max_target_row > stochastic_target_row_capacity_ ||
+            activeAllPositionLogitsAreColumnParallel(max_target_row))
+        {
+            return false;
+        }
+
+        const IGlobalTPContext *global_ctx =
+            globalTPContextForMTPCoordination();
+        if (global_ctx && global_ctx->degree() > 1)
+            return false;
+
+        TensorBase *tensor = state_.all_position_logits.get();
+        const auto &shape = tensor->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            static_cast<size_t>(max_target_row) > rows ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            !state_.all_position_logits->deviceValid())
+        {
+            return false;
+        }
+
+        auto device_opt = tensor->current_device();
+        if (!device_opt.has_value() || !device_opt->is_gpu())
+            return false;
+
+        IBackend *backend = getBackendFor(*device_opt);
+        const void *gpu_ptr = tensor->gpu_data_ptr();
+        if (!backend || !gpu_ptr)
+            return false;
+
+        void *stream = consumePendingLogitsStream(
+            PendingLogitsStreamRole::AllPositionVerifier,
+            "verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident");
+        if (!stream)
+        {
+            stream = explicitGPUStreamForOperation(
+                "verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident");
+        }
+        if (!stream)
+            return false;
+
+        std::shared_ptr<void> producer_start_timing_event;
+        std::shared_ptr<void> producer_stop_timing_event;
+        const bool collect_producer_gpu_timing =
+            PerfStatsCollector::isEnabled() && state_.device_id.is_gpu();
+        if (collect_producer_gpu_timing)
+        {
+            const int device_ordinal = device_opt->gpu_ordinal();
+            void *raw_start_event = backend->createTimingEvent(device_ordinal);
+            void *raw_stop_event = backend->createTimingEvent(device_ordinal);
+            if (raw_start_event && raw_stop_event)
+            {
+                producer_start_timing_event.reset(
+                    raw_start_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+                producer_stop_timing_event.reset(
+                    raw_stop_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+                if (!backend->recordEvent(
+                        producer_start_timing_event.get(),
+                        device_ordinal,
+                        stream))
+                {
+                    producer_start_timing_event.reset();
+                    producer_stop_timing_event.reset();
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "greedy_request_batch_summary_gpu_timing_record_failures",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"event", "start"}});
+                }
+            }
+            else
+            {
+                if (raw_start_event)
+                    backend->destroyEvent(raw_start_event, device_ordinal);
+                if (raw_stop_event)
+                    backend->destroyEvent(raw_stop_event, device_ordinal);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "greedy_request_batch_summary_gpu_timing_event_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString());
+            }
+        }
+
+        const auto *base = static_cast<const float *>(gpu_ptr);
+        if (!backend->enqueueArgmaxF32BatchedRowsDevice(
+                base,
+                max_target_row,
+                static_cast<int>(cols),
+                device_opt->gpu_ordinal(),
+                stream,
+                stochastic_verify_accept_probs_dev_,
+                stochastic_verify_tokens_dev_,
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Greedy request-batch verifier device argmax failed on "
+                      << device_opt->toString());
+            return false;
+        }
+
+        auto *prepared_tokens =
+            static_cast<const int32_t *>(mtp_verifier_input_tokens_dev_);
+        auto *verify_tokens =
+            static_cast<const int32_t *>(stochastic_verify_tokens_dev_);
+        auto *output_tokens =
+            static_cast<int32_t *>(stochastic_batch_output_tokens_dev_);
+        auto *output_meta =
+            static_cast<int *>(stochastic_batch_output_meta_dev_);
+        for (int request_index = 0;
+             request_index < request_count;
+             ++request_index)
+        {
+            const DeviceGreedyBatchOutcomeRequest &request =
+                requests[request_index];
+            std::array<int, kSpeculativeBatchMaxStopTokens>
+                packed_stop_tokens = {-1, -1, -1, -1, -1, -1, -1, -1};
+            for (int stop_index = 0;
+                 stop_index < request.stop_token_count;
+                 ++stop_index)
+            {
+                packed_stop_tokens[static_cast<size_t>(stop_index)] =
+                    request.stop_tokens[static_cast<size_t>(stop_index)];
+            }
+
+            if (!backend->enqueueSummarizeGreedySpeculativeVerifyBatch(
+                    verify_tokens + request.first_target_row,
+                    prepared_tokens + request.token_row_offset,
+                    request.verifier_token_count - 1,
+                    request.first_token,
+                    packed_stop_tokens.data(),
+                    request.stop_token_count,
+                    device_opt->gpu_ordinal(),
+                    stream,
+                    output_tokens +
+                        static_cast<size_t>(request_index) *
+                            static_cast<size_t>(
+                                kSpeculativeBatchMaxOutputTokens),
+                    output_meta +
+                        static_cast<size_t>(request_index) *
+                            static_cast<size_t>(kSpeculativeBatchMetaCount)))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Greedy request-batch verifier summary failed on "
+                          << device_opt->toString()
+                          << " request_index=" << request_index);
+                return false;
+            }
+        }
+
+        if (producer_stop_timing_event)
+        {
+            if (!backend->recordEvent(
+                    producer_stop_timing_event.get(),
+                    device_opt->gpu_ordinal(),
+                    stream))
+            {
+                producer_start_timing_event.reset();
+                producer_stop_timing_event.reset();
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "greedy_request_batch_summary_gpu_timing_record_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"event", "stop"}});
+            }
+        }
+
+        void *raw_response_ready_event =
+            backend->createEvent(device_opt->gpu_ordinal());
+        if (!raw_response_ready_event)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create greedy request-batch outcome response-ready event");
+            return false;
+        }
+        const int device_ordinal = device_opt->gpu_ordinal();
+        std::shared_ptr<void> response_ready_event(
+            raw_response_ready_event,
+            [backend, device_ordinal](void *event)
+            {
+                if (event)
+                    backend->destroyEvent(event, device_ordinal);
+            });
+        if (!backend->recordEvent(
+                response_ready_event.get(),
+                device_ordinal,
+                stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to record greedy request-batch outcome response-ready event");
+            return false;
+        }
+
+        materialized_mtp_verifier_device_token_batch_ = {};
+        out_handle->output_tokens_device =
+            static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
+        out_handle->meta_device =
+            static_cast<const int *>(stochastic_batch_output_meta_dev_);
+        out_handle->request_count = request_count;
+        out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
+        out_handle->meta_stride = kSpeculativeBatchMetaCount;
+        out_handle->device = state_.device_id;
+        out_handle->stream = stream;
+        out_handle->response_ready_event = std::move(response_ready_event);
+        out_handle->producer_start_timing_event =
+            std::move(producer_start_timing_event);
+        out_handle->producer_stop_timing_event =
+            std::move(producer_stop_timing_event);
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "request_batch_greedy_device_resident_outcomes",
+            static_cast<double>(request_count),
+            "decode",
+            state_.device_id.toString(),
+            {{"rows", std::to_string(max_target_row)}});
         return out_handle->valid();
     }
 
@@ -26572,7 +27185,9 @@ namespace llaminar2
         clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
         clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
         pending_mtp_verifier_device_token_plan_.reset();
+        pending_mtp_verifier_device_token_batch_plan_.reset();
         materialized_mtp_verifier_device_token_row_ = {};
+        materialized_mtp_verifier_device_token_batch_ = {};
 
         for (auto &cache : layer_graph_cache_)
         {

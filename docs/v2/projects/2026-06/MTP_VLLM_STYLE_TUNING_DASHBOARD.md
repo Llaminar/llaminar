@@ -90,11 +90,11 @@ build time on both CUDA and ROCm.
 - CUDA2 ExpertOverlay Dynamic long-context prefix+MTP passed with explicit
   sidecar graph invalidation.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
-- LocalTP GPU grouped path: mirrored children reduce and publish their own
-  resident verifier outcomes; rank compact metadata is diagnostic/non-GPU only.
-  No row replay or pre-publication host outcome staging is accepted. Focused gates:
-  `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`,
-  MTP units, full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
+- LocalTP GPU grouped path: mirrored children publish resident outcomes; greedy
+  request-batch verifier now uses resident condition-token rows after
+  publication. No row replay or host-plan GPU publication. Gates:
+  `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, MTP units,
+  full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,
   CPU MTP thinking `27/27`, dense Qwen3.6 E2E `261/261`.
 - Model-load/MTP lifecycle guards pass: `V2_Unit_NodeLeaderPageCache` and

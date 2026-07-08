@@ -386,6 +386,57 @@ namespace llaminar2
     };
 
     /**
+     * @brief One row in a device-resident MTP verifier token batch.
+     *
+     * Request-batched GPU MTP verifier forwards consume a padded INT32 matrix
+     * laid out as `[request_count, padded_seq_len]`.  Each descriptor tells the
+     * runner how to compose one logical row on the graph replay stream:
+     *
+     * - entry 0 is either a host-owned condition-token shadow, a resident
+     *   logical-state next-condition token, or a device target sample slot;
+     * - entries 1..N are copied from runner-owned draft sample slots;
+     * - the returned matrix pointer is the only token source used by the verifier
+     *   embedding graph.
+     */
+    struct DeviceMTPVerifierInputBatchRequest
+    {
+        int request_id = -1; ///< Logical request id for diagnostics.
+        int32_t first_token = -1; ///< Host shadow for row entry 0.
+        bool first_token_from_device = false; ///< Read row entry 0 from device memory.
+        const int32_t *first_token_device = nullptr; ///< Resident logical-state row entry 0.
+        int first_target_sample_slot = -1; ///< Device target-sample slot for row entry 0.
+        int first_draft_slot = -1; ///< First device draft slot copied into row entry 1.
+        int draft_token_count = 0; ///< Number of draft tokens copied after entry 0.
+        int total_verifier_input_tokens = 0; ///< Valid row width before padding.
+    };
+
+    /**
+     * @brief One logical request inside a resident greedy outcome batch.
+     *
+     * The verifier graph has already produced compact all-position logits and the
+     * device-token matrix has already been materialized.  This descriptor binds
+     * one request's compact logit rows to the matching verifier-token matrix row
+     * so the backend can run argmax and the greedy acceptance reducer entirely on
+     * device.
+     */
+    struct DeviceGreedyBatchOutcomeRequest
+    {
+        int request_id = -1; ///< Logical request id for diagnostics.
+        int first_target_row = -1; ///< First compact all-position logit row.
+        int verifier_token_count = 0; ///< Total verifier rows: drafts plus bonus.
+        int token_row_offset = -1; ///< INT32 offset in the prepared token matrix.
+        int token_row_stride = 0; ///< INT32 stride between prepared token rows.
+        int32_t first_token = -1; ///< Host shadow for diagnostics/backend ABI.
+        std::array<int32_t, sampling_math::kSpeculativeBatchMaxStopTokens> stop_tokens;
+        int stop_token_count = 0;
+
+        DeviceGreedyBatchOutcomeRequest()
+        {
+            stop_tokens.fill(-1);
+        }
+    };
+
+    /**
      * @brief Lightweight view of a captured snapshot with 2D shape metadata
      *
      * Returned by getSnapshotWithShape() to provide shape information
@@ -655,6 +706,32 @@ namespace llaminar2
             (void)first_draft_slot;
             (void)draft_token_count;
             (void)total_verifier_input_tokens;
+            return nullptr;
+        }
+
+        /**
+         * @brief Prepare a padded request-batch verifier token matrix on device.
+         *
+         * Implementations enqueue all first-token and draft-token copies on the
+         * verifier graph stream when that stream becomes known, then return a
+         * stable runner-owned pointer suitable for forwardBatchWithDeviceTokenIds().
+         * The host descriptors are shadows and coordinates only; the verifier
+         * embedding graph reads the returned device matrix.
+         *
+         * @param requests Value-owned row composition descriptors.
+         * @param request_count Number of logical rows in the matrix.
+         * @param padded_seq_len Row width of the matrix consumed by the graph.
+         * @return Stable device pointer on success, nullptr if the runner cannot
+         *         execute the contract exactly.
+         */
+        virtual const void *prepareMTPVerifierInputTokenBatchOnDevice(
+            const DeviceMTPVerifierInputBatchRequest *requests,
+            int request_count,
+            int padded_seq_len)
+        {
+            (void)requests;
+            (void)request_count;
+            (void)padded_seq_len;
             return nullptr;
         }
 
@@ -1890,6 +1967,29 @@ namespace llaminar2
             (void)draft_token_count;
             (void)stop_tokens;
             (void)stop_token_count;
+            (void)out_handle;
+            return false;
+        }
+
+        /**
+         * @brief Summarize a request-batched greedy verifier into resident rows.
+         *
+         * This is the request-batch version of
+         * verifyGreedyAllPositionBatchOutcomeOnDeviceResident().  Callers must
+         * have already run one grouped verifier forward using the device matrix
+         * prepared by prepareMTPVerifierInputTokenBatchOnDevice().  Implementations
+         * enqueue all argmax and greedy summary kernels on the pending verifier
+         * stream and return compact outcome rows that
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome() can consume before
+         * any host response bridge runs.
+         */
+        virtual bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+            const DeviceGreedyBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle)
+        {
+            (void)requests;
+            (void)request_count;
             (void)out_handle;
             return false;
         }

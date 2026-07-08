@@ -3927,6 +3927,17 @@ Current status:
   Focused gate:
   `V2_Unit_PrefillDecodeTransition` and
   `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- Request-batched greedy GPU MTP now follows the same direct resident
+  publication contract: the verifier input is a device-token matrix, grouped
+  all-position rows are reduced into `DeviceSpeculativeOutcomeHandle`, and
+  `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()` runs before any host
+  response bridge. A follow-up tightened the continuation token source: after
+  a resident publication, row zero of the next grouped verifier is copied from
+  `DeviceResidentLogicalSequenceStateHandle::next_condition_tokens_device`
+  on the verifier stream instead of re-uploading the per-request host shadow.
+  The initial post-prefill step remains explicit because no prior resident
+  mailbox exists. Focused regression:
+  `RequestBatchedGreedyVerifierUsesResidentConditionTokensAfterPublication`.
 - A follow-up code dive confirmed why DGO cannot safely advertise the new
   capability yet: `MTPSpecStatePublisher`, `GDNRecurrenceStage`, and
   `ShortConv1dStage` still restore verifier state from a host integer row, and

@@ -2030,6 +2030,183 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::forwardBatchWithDeviceTokenIds(
+        const std::vector<std::vector<int>> &token_batches,
+        const void *token_ids_device,
+        int padded_seq_len)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->forwardBatchWithDeviceTokenIds(
+                token_batches,
+                token_ids_device,
+                padded_seq_len);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->forwardBatchWithDeviceTokenIds(
+                token_batches,
+                token_ids_device,
+                padded_seq_len);
+        }
+        if (device_runners_.size() < 2 ||
+            token_batches.empty() ||
+            padded_seq_len <= 0 ||
+            token_ids_device != rank_mtp_verifier_child_token_inputs_.data() ||
+            rank_mtp_verifier_child_token_inputs_.size() !=
+                device_runners_.size() ||
+            rank_mtp_verifier_child_token_count_ != padded_seq_len)
+        {
+            LOG_ERROR("RankOrchestrator::forwardBatchWithDeviceTokenIds: invalid LocalTP verifier token bundle");
+            return false;
+        }
+
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i] ||
+                !rank_mtp_verifier_child_token_inputs_[i])
+            {
+                LOG_ERROR("RankOrchestrator::forwardBatchWithDeviceTokenIds: participant "
+                          << i << " has no staged verifier token matrix");
+                return false;
+            }
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] device-token batch verifier forward failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        tp_worker_pool_->dispatch(
+            [this,
+             &token_batches,
+             padded_seq_len,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t i) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                auto device_id = device_runners_[i]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                if (debugEnv().tp_collective_contract_trace)
+                {
+                    LOG_DEBUG("[TP_WORKER_CONTRACT] event=device_token_batch_forward_enter"
+                              << " worker=" << i
+                              << " device=" << device_id.toString()
+                              << " padded_seq_len=" << padded_seq_len
+                              << " request_batch=" << token_batches.size());
+                }
+
+                const bool ok =
+                    device_runners_[i]->forwardBatchWithDeviceTokenIds(
+                        token_batches,
+                        rank_mtp_verifier_child_token_inputs_[i],
+                        padded_seq_len);
+
+                if (debugEnv().tp_collective_contract_trace)
+                {
+                    LOG_DEBUG("[TP_WORKER_CONTRACT] event=device_token_batch_forward_leave"
+                              << " worker=" << i
+                              << " device=" << device_id.toString()
+                              << " success=" << (ok ? 1 : 0));
+                }
+                return ok;
+            });
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+        auto results = tp_worker_pool_->collectAll(collect_timeout_ms);
+        bool worker_timeout = false;
+        for (auto &r : results)
+        {
+            if (!r.completed)
+            {
+                worker_timeout = true;
+                all_success = false;
+                if (tp_ctx_)
+                    tp_ctx_->requestAbort();
+                continue;
+            }
+            if (r.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = r.exception;
+                    first_exception_device = r.worker_index;
+                }
+                continue;
+            }
+            if (!r.success)
+                all_success = false;
+        }
+        if (worker_timeout && collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "forwardBatchWithDeviceTokenIds",
+                collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::forwardBatchWithDeviceTokenIds: Re-throwing primary exception from device "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+        if (!all_success)
+            return false;
+
+        current_position_ += padded_seq_len;
+        current_padded_seq_len_ = padded_seq_len;
+        current_sequence_lengths_.resize(std::max(
+            current_sequence_lengths_.size(),
+            token_batches.size()),
+            0);
+        for (size_t request = 0; request < token_batches.size(); ++request)
+        {
+            current_sequence_lengths_[request] +=
+                static_cast<int>(token_batches[request].size());
+        }
+        stats_dirty_ = true;
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_verifier_device_token_batch_forwards",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"requests", std::to_string(token_batches.size())},
+             {"padded_seq_len", std::to_string(padded_seq_len)}});
+        return true;
+    }
+
     bool RankOrchestrator::supportsPrefillChunkSchedule(int seq_len) const
     {
         if (mode_ != ParallelismMode::TP || device_runners_.empty())
@@ -5812,6 +5989,98 @@ namespace llaminar2
         return rank_compact_outcome_valid_;
     }
 
+    bool RankOrchestrator::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+        const DeviceGreedyBatchOutcomeRequest *requests,
+        int request_count,
+        DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+                requests,
+                request_count,
+                out_handle);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+                requests,
+                request_count,
+                out_handle);
+        }
+        if (out_handle)
+            *out_handle = DeviceSpeculativeOutcomeHandle{};
+        rank_compact_outcome_valid_ = false;
+        rank_compact_outcome_kind_ = RankCompactOutcomeKind::None;
+        rank_mirrored_child_outcomes_.clear();
+        rank_mirrored_primary_outcome_ = DeviceSpeculativeOutcomeHandle{};
+        rank_mirrored_child_outcomes_valid_ = false;
+        rank_resident_child_logical_state_handles_.clear();
+
+        if (!out_handle ||
+            !requests ||
+            request_count <= 0 ||
+            device_runners_.size() < 2)
+        {
+            return false;
+        }
+        if (!usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            if (primaryDeviceId().is_gpu())
+            {
+                LOG_ERROR("[RankOrchestrator] GPU LocalTP MTP resident greedy request batching requires mirrored full-head child verifier outcomes");
+            }
+            return false;
+        }
+
+        std::vector<DeviceSpeculativeOutcomeHandle> child_outcomes(
+            device_runners_.size());
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            IInferenceRunner *child = device_runners_[i].get();
+            if (!child ||
+                !child->primaryDeviceId().is_gpu() ||
+                !child->usesMirroredLocalTPMTPHeadForVerifier() ||
+                !child->supportsDeviceResidentMTPSpecStatePublication())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy request-batch MTP requires every child to expose a GPU mirrored-head resident publisher; participant "
+                          << i << " is not ready");
+                return false;
+            }
+            if (!child->verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+                    requests,
+                    request_count,
+                    &child_outcomes[i]) ||
+                !child_outcomes[i].valid())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy request-batch MTP child "
+                          << i << " failed resident verifier reduction");
+                return false;
+            }
+        }
+
+        rank_mirrored_child_outcomes_ = std::move(child_outcomes);
+        rank_mirrored_primary_outcome_ =
+            rank_mirrored_child_outcomes_.front();
+        *out_handle = rank_mirrored_primary_outcome_;
+        rank_compact_outcome_kind_ = RankCompactOutcomeKind::MirroredGreedy;
+        rank_compact_outcome_valid_ = out_handle->valid();
+        rank_mirrored_child_outcomes_valid_ = rank_compact_outcome_valid_;
+
+        if (rank_compact_outcome_valid_)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_greedy_request_batch_resident_outcomes",
+                static_cast<double>(request_count),
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"implementation", "mirrored_child_device_outcomes"}});
+        }
+        return rank_compact_outcome_valid_;
+    }
+
     bool RankOrchestrator::verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
         const DeviceStochasticBatchOutcomeRequest *requests,
         int request_count,
@@ -7340,6 +7609,66 @@ namespace llaminar2
             first_draft_slot,
             draft_token_count,
             total_verifier_input_tokens);
+    }
+
+    const void *RankOrchestrator::prepareMTPVerifierInputTokenBatchOnDevice(
+        const DeviceMTPVerifierInputBatchRequest *requests,
+        int request_count,
+        int padded_seq_len)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->prepareMTPVerifierInputTokenBatchOnDevice(
+                requests,
+                request_count,
+                padded_seq_len);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->prepareMTPVerifierInputTokenBatchOnDevice(
+                requests,
+                request_count,
+                padded_seq_len);
+        }
+        if (device_runners_.size() < 2 ||
+            !requests ||
+            request_count <= 0 ||
+            padded_seq_len <= 0)
+        {
+            return nullptr;
+        }
+
+        rank_mtp_verifier_child_token_inputs_.assign(
+            device_runners_.size(),
+            nullptr);
+        rank_mtp_verifier_child_token_count_ = padded_seq_len;
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (!device_runners_[i])
+                return nullptr;
+            rank_mtp_verifier_child_token_inputs_[i] =
+                device_runners_[i]->prepareMTPVerifierInputTokenBatchOnDevice(
+                    requests,
+                    request_count,
+                    padded_seq_len);
+            if (!rank_mtp_verifier_child_token_inputs_[i])
+            {
+                rank_mtp_verifier_child_token_inputs_.clear();
+                rank_mtp_verifier_child_token_count_ = 0;
+                return nullptr;
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_verifier_token_batches_prepared_from_device_slots",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"requests", std::to_string(request_count)},
+             {"padded_seq_len", std::to_string(padded_seq_len)}});
+        return rank_mtp_verifier_child_token_inputs_.data();
     }
 
     const void *RankOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromHostRow(

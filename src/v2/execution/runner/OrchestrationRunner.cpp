@@ -1988,20 +1988,19 @@ namespace llaminar2
             !active_sampling_params_.has_penalties() &&
             runner_->supportsDeviceStochasticMTPVerification();
         /*
-         * Request-batched stochastic GPU decode publishes from the compact
-         * device outcome mailbox, not from the older direct all-position
-         * host-plan publisher.  LocalTP grouped verification deliberately hides
-         * supportsMTPSpecStatePublication() from the policy while still
-         * supporting publishAcceptedMTPSpecStateBatchFromDeviceOutcome(), so
-         * advertise batch continuation when either the direct contract or the
-         * resident compact stochastic contract is available.
+         * CPU request batching may still publish the grouped transaction plan
+         * directly.  GPU request batching must publish from compact resident
+         * outcome rows and must feed verifier rows from device draft-token slots.
          */
+        const bool gpu_request_batch =
+            runner_->primaryDeviceId().is_gpu();
         const bool direct_publication_ok =
+            !gpu_request_batch &&
             runner_->supportsMTPSpecStatePublication();
-        const bool resident_stochastic_publication_ok =
-            stochastic_batch_verify &&
-            runner_->primaryDeviceId().is_gpu() &&
-            runner_->supportsDeviceResidentMTPSpecStatePublication();
+        const bool resident_publication_ok =
+            gpu_request_batch &&
+            runner_->supportsDeviceResidentMTPSpecStatePublication() &&
+            runner_->supportsMTPDeviceDraftTokenInput();
         const bool chained_ok =
             draft_depth <= 1 || runner_->supportsChainedMTPDrafts();
         return has_verifier_continuation &&
@@ -2011,8 +2010,7 @@ namespace llaminar2
                draft_depth >= 1 &&
                draft_depth <= 3 &&
                chained_ok &&
-               (direct_publication_ok ||
-                resident_stochastic_publication_ok);
+               (direct_publication_ok || resident_publication_ok);
     }
 
     GenerationBatchResult OrchestrationRunner::decodeStepBatch(int request_batch)
@@ -2369,25 +2367,26 @@ namespace llaminar2
             return batch_result;
         }
         /*
-         * Non-stochastic request batches still require the direct batch
-         * publisher.  Stochastic GPU request batches can instead use the
-         * compact resident outcome publisher below; requiring the direct
-         * all-position advert here would incorrectly reject grouped LocalTP
-         * lanes before their rank-owned compact reducer can run.
+         * CPU request batches can publish the grouped transaction plan directly.
+         * GPU request batches publish compact resident verifier outcomes and feed
+         * verifier inputs from device draft-token slots; the direct host-plan
+         * publisher is intentionally not considered a GPU continuation path.
          */
+        const bool gpu_request_batch = runner_->primaryDeviceId().is_gpu();
         const bool request_batch_direct_publication_ok =
+            !gpu_request_batch &&
             runner_->supportsMTPSpecStatePublication();
         const bool request_batch_resident_publication_ok =
-            stochastic_batch_verify &&
-            runner_->primaryDeviceId().is_gpu() &&
-            runner_->supportsDeviceResidentMTPSpecStatePublication();
+            gpu_request_batch &&
+            runner_->supportsDeviceResidentMTPSpecStatePublication() &&
+            runner_->supportsMTPDeviceDraftTokenInput();
         if (!request_batch_direct_publication_ok &&
             !request_batch_resident_publication_ok)
         {
             batch_result.error =
                 "decodeStepBatch() request-batched verifier continuation "
-                "requires runner MTP spec-state publication or stochastic "
-                "device-resident compact publication";
+                "requires CPU grouped publication or GPU device-resident "
+                "compact publication with device draft-token input";
             return batch_result;
         }
 
@@ -2429,9 +2428,13 @@ namespace llaminar2
         std::vector<std::vector<int32_t>> request_drafts(
             static_cast<size_t>(request_batch));
         const bool use_request_batch_device_draft_slots =
-            stochastic_batch_verify &&
-            runner_->primaryDeviceId().is_gpu() &&
-            runner_->supportsDeviceStochasticMTPVerification();
+            gpu_request_batch &&
+            runner_->supportsMTPDeviceDraftTokenInput();
+        const bool use_request_batch_resident_condition_tokens =
+            gpu_request_batch &&
+            resident_batch_state.valid() &&
+            !runner_->hostLogicalStateMirrorsDeviceResidentState() &&
+            resident_batch_state.request_count >= request_batch;
         for (int request = 0; request < request_batch; ++request)
         {
             const BatchedDecodeRequestState &state =
@@ -2641,13 +2644,20 @@ namespace llaminar2
                             : MTPSpecRequestBatchMode::GREEDY});
 
         const bool use_device_resident_request_batch_publication =
-            stochastic_batch_verify && runner_->primaryDeviceId().is_gpu();
+            gpu_request_batch;
         if (use_device_resident_request_batch_publication &&
             !runner_->supportsDeviceResidentMTPSpecStatePublication())
         {
             return fail_after_checkpoint(
-                "decodeStepBatch() GPU stochastic request batching requires "
+                "decodeStepBatch() GPU request batching requires "
                 "device-resident MTP state publication");
+        }
+        if (use_device_resident_request_batch_publication &&
+            !runner_->supportsMTPDeviceDraftTokenInput())
+        {
+            return fail_after_checkpoint(
+                "decodeStepBatch() GPU request batching requires "
+                "device draft-token verifier input");
         }
 
         DeviceSpeculativeOutcomeHandle resident_request_batch_outcome;
@@ -2747,24 +2757,488 @@ namespace llaminar2
 
         if (!stochastic_batch_verify)
         {
-            MTPOwnedGreedyVerifierBatchTransactionResult tx =
-                executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
-                    *runner_,
-                    owner,
-                    scheduler,
-                    publish);
-            if (!tx.ok)
+            if (use_device_resident_request_batch_publication)
             {
-                return fail_after_checkpoint(
-                    std::string("decodeStepBatch() request-batched verifier "
-                                "transaction failed: ") +
-                    tx.error);
-            }
+                auto release_and_fail =
+                    [&](MTPOwnedDeviceOutcomeBatchTransactionResult &tx,
+                        std::string message) -> GenerationBatchResult
+                {
+                    if (owner.hasInFlightBatch())
+                    {
+                        std::string release_error;
+                        tx.released =
+                            owner.releaseInFlightBatch(&release_error);
+                        if (!tx.released)
+                        {
+                            message += "; release failed: ";
+                            message += release_error;
+                        }
+                    }
+                    return fail_after_checkpoint(message);
+                };
 
-            scheduled_request_ids = tx.scheduled_batch.request_ids;
-            scheduled_base_cached_tokens =
-                tx.scheduled_batch.base_cached_tokens;
-            catchup_results = tx.transaction.catchup.results;
+                auto produce_greedy_resident_outcomes =
+                    [&](const MTPSpecRequestBatch &scheduled_batch,
+                        DeviceSpeculativeOutcomeHandle *resident_handle,
+                        std::string *error) -> bool
+                {
+                    auto set_producer_error = [&](std::string message) -> bool
+                    {
+                        if (error)
+                            *error = std::move(message);
+                        return false;
+                    };
+
+                    if (!resident_handle)
+                        return set_producer_error("greedy resident outcome handle is null");
+                    *resident_handle = {};
+                    if (!scheduled_batch.ok)
+                        return set_producer_error("scheduled greedy batch is invalid");
+                    if (scheduled_batch.request_count <= 0)
+                        return set_producer_error("scheduled greedy batch is empty");
+
+                    std::vector<MTPSpecDecodeVerifierDraftRequest>
+                        verifier_requests;
+                    verifier_requests.reserve(
+                        scheduled_batch.greedy_requests.size());
+                    for (size_t i = 0;
+                         i < scheduled_batch.greedy_requests.size();
+                         ++i)
+                    {
+                        MTPSpecDecodeVerifierDraftRequest request;
+                        request.request_id = scheduled_batch.request_ids[i];
+                        request.draft_tokens =
+                            scheduled_batch.greedy_requests[i].draft_tokens;
+                        verifier_requests.push_back(std::move(request));
+                    }
+
+                    MTPSpecDecodeVerifierInputPlan verifier_input_plan =
+                        buildMTPSpecDecodeVerifierInputPlan(
+                            scheduled_batch.shape,
+                            verifier_requests);
+                    if (!verifier_input_plan.ok)
+                    {
+                        return set_producer_error(
+                            std::string("greedy request-batch verifier input plan failed: ") +
+                            verifier_input_plan.error);
+                    }
+                    if (!verifierInputPlanHasCompactRows(verifier_input_plan))
+                    {
+                        return set_producer_error(
+                            "greedy request-batch verifier row metadata is malformed");
+                    }
+
+                    const int padded_seq_len =
+                        scheduled_batch.shape.max_draft_tokens;
+                    std::vector<DeviceMTPVerifierInputBatchRequest>
+                        token_batch_requests;
+                    token_batch_requests.reserve(
+                        scheduled_batch.greedy_requests.size());
+                    for (size_t i = 0;
+                         i < scheduled_batch.greedy_requests.size();
+                         ++i)
+                    {
+                        const int request_id = scheduled_batch.request_ids[i];
+                        if (request_id < 0 || request_id >= request_batch)
+                        {
+                            return set_producer_error(
+                                "greedy request-batch verifier returned an out-of-range request id");
+                        }
+                        const MTPDecodeCatchupGreedyRequest &request =
+                            scheduled_batch.greedy_requests[i];
+                        const int verifier_token_count =
+                            static_cast<int>(request.draft_tokens.size());
+                        if (verifier_token_count <= 1 ||
+                            verifier_token_count > padded_seq_len)
+                        {
+                            return set_producer_error(
+                                "greedy request-batch verifier request shape is invalid");
+                        }
+
+                        DeviceMTPVerifierInputBatchRequest descriptor;
+                        descriptor.request_id = request_id;
+                        descriptor.first_token = request.draft_tokens.front();
+                        if (use_request_batch_resident_condition_tokens)
+                        {
+                            descriptor.first_token_from_device = true;
+                            descriptor.first_token_device =
+                                resident_batch_state
+                                    .nextConditionTokenDeviceForRequest(request_id);
+                            descriptor.first_target_sample_slot = -1;
+                            if (!descriptor.first_token_device)
+                            {
+                                return set_producer_error(
+                                    "greedy request-batch verifier has no resident condition-token row for request");
+                            }
+                        }
+                        else
+                        {
+                            descriptor.first_token_from_device = false;
+                            descriptor.first_token_device = nullptr;
+                            descriptor.first_target_sample_slot = -1;
+                        }
+                        descriptor.first_draft_slot =
+                            request_id * draft_depth;
+                        descriptor.draft_token_count =
+                            verifier_token_count - 1;
+                        descriptor.total_verifier_input_tokens =
+                            verifier_token_count;
+                        token_batch_requests.push_back(descriptor);
+                    }
+
+                    const void *device_token_batch =
+                        runner_->prepareMTPVerifierInputTokenBatchOnDevice(
+                            token_batch_requests.data(),
+                            static_cast<int>(token_batch_requests.size()),
+                            padded_seq_len);
+                    if (!device_token_batch)
+                    {
+                        return set_producer_error(
+                            "greedy request-batch verifier could not prepare device token matrix");
+                    }
+
+                    bool row_indexed_enabled = false;
+                    bool all_position_enabled = false;
+                    auto cleanup_row_modes = [&]() -> bool
+                    {
+                        bool ok = true;
+                        runner_->clearMTPSpecVerifierInputPlan();
+                        if (all_position_enabled)
+                        {
+                            all_position_enabled = false;
+                            ok = runner_->setComputeAllPositionLogits(false) && ok;
+                        }
+                        if (row_indexed_enabled)
+                        {
+                            row_indexed_enabled = false;
+                            ok = runner_->setComputeRowIndexedAllPositionLogits(false, 0) && ok;
+                        }
+                        return ok;
+                    };
+
+                    const int compact_row_count =
+                        verifier_input_plan.compact_logit_row_count;
+                    if (!runner_->setComputeRowIndexedAllPositionLogits(
+                            true,
+                            compact_row_count))
+                    {
+                        return set_producer_error(
+                            "greedy request-batch verifier could not enable row-indexed logits");
+                    }
+                    row_indexed_enabled = true;
+                    if (!runner_->setMTPSpecVerifierInputPlan(
+                            verifier_input_plan))
+                    {
+                        const bool cleanup_ok = cleanup_row_modes();
+                        return set_producer_error(
+                            cleanup_ok
+                                ? "greedy request-batch verifier could not install row plan"
+                                : "greedy request-batch verifier could not install row plan and cleanup failed");
+                    }
+                    if (!runner_->setComputeAllPositionLogits(true))
+                    {
+                        const bool cleanup_ok = cleanup_row_modes();
+                        return set_producer_error(
+                            cleanup_ok
+                                ? "greedy request-batch verifier could not enable all-position logits"
+                                : "greedy request-batch verifier could not enable all-position logits and cleanup failed");
+                    }
+                    all_position_enabled = true;
+
+                    MTPVerifierForwardExecutionOptions forward_options;
+                    forward_options.device_token_ids = device_token_batch;
+                    forward_options.allow_batched_host_forward = false;
+                    {
+                        ScopedMTPAllPositionVerifierSyncDeferral
+                            verifier_sync_deferral(
+                                runner_.get(),
+                                runner_->primaryDeviceId().is_gpu());
+                        PerfStatsCollector::ScopedTimer verifier_timer(
+                            "mtp",
+                            "request_batch_greedy_verifier_forward_device_tokens",
+                            "decode",
+                            {},
+                            {{"requests",
+                              std::to_string(
+                                  scheduled_batch.request_count)},
+                             {"draft_depth", std::to_string(draft_depth)}});
+                        const MTPVerifierForwardExecutionResult forward =
+                            executeMTPSpecVerifierForward(
+                                *runner_,
+                                verifier_input_plan,
+                                forward_options);
+                        if (!forward.ok)
+                        {
+                            const bool cleanup_ok = cleanup_row_modes();
+                            return set_producer_error(
+                                cleanup_ok
+                                    ? std::string("greedy request-batch verifier forward failed: ") +
+                                          forward.error
+                                    : std::string("greedy request-batch verifier forward failed and cleanup failed: ") +
+                                          forward.error);
+                        }
+                    }
+
+                    if (!cleanup_row_modes())
+                    {
+                        return set_producer_error(
+                            "greedy request-batch verifier could not disable row-indexed logits");
+                    }
+
+                    std::vector<DeviceGreedyBatchOutcomeRequest>
+                        outcome_requests;
+                    outcome_requests.reserve(
+                        scheduled_batch.greedy_requests.size());
+                    for (size_t i = 0;
+                         i < scheduled_batch.greedy_requests.size();
+                         ++i)
+                    {
+                        const MTPDecodeCatchupGreedyRequest &request =
+                            scheduled_batch.greedy_requests[i];
+                        const int verifier_token_count =
+                            static_cast<int>(request.draft_tokens.size());
+                        if (static_cast<int>(
+                                verifier_input_plan.query_start_locs.size()) <=
+                            static_cast<int>(i))
+                        {
+                            return set_producer_error(
+                                "greedy request-batch verifier query row metadata is undersized");
+                        }
+
+                        DeviceGreedyBatchOutcomeRequest descriptor;
+                        descriptor.request_id =
+                            scheduled_batch.request_ids[i];
+                        descriptor.first_target_row =
+                            verifier_input_plan.query_start_locs[i];
+                        descriptor.verifier_token_count =
+                            verifier_token_count;
+                        descriptor.token_row_stride = padded_seq_len;
+                        descriptor.token_row_offset =
+                            static_cast<int>(i) * padded_seq_len;
+                        descriptor.first_token =
+                            request.draft_tokens.front();
+                        descriptor.stop_token_count =
+                            static_cast<int>(stop_tokens_.size());
+                        if (descriptor.stop_token_count >
+                            static_cast<int>(
+                                sampling_math::kSpeculativeBatchMaxStopTokens))
+                        {
+                            return set_producer_error(
+                                "greedy request-batch stop-token count exceeds device summary capacity");
+                        }
+                        for (int stop_index = 0;
+                             stop_index < descriptor.stop_token_count;
+                             ++stop_index)
+                        {
+                            descriptor.stop_tokens[
+                                static_cast<size_t>(stop_index)] =
+                                stop_tokens_[static_cast<size_t>(stop_index)];
+                        }
+                        outcome_requests.push_back(descriptor);
+                    }
+
+                    if (!runner_->verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+                            outcome_requests.data(),
+                            static_cast<int>(outcome_requests.size()),
+                            resident_handle))
+                    {
+                        return set_producer_error(
+                            "greedy request-batch resident device outcome verifier failed");
+                    }
+                    return resident_handle->valid();
+                };
+
+                MTPOwnedDeviceOutcomeBatchTransactionResult tx;
+                tx.scheduled_batch = owner.scheduleNextBatch(scheduler);
+                if (!tx.scheduled_batch.ok)
+                {
+                    return fail_after_checkpoint(
+                        std::string("decodeStepBatch() request-batched greedy "
+                                    "verifier scheduling failed: ") +
+                        tx.scheduled_batch.error);
+                }
+
+                std::string produce_error;
+                tx.produced = produce_greedy_resident_outcomes(
+                    tx.scheduled_batch,
+                    &resident_request_batch_outcome,
+                    &produce_error);
+                resident_request_batch_outcome_ready =
+                    tx.produced && resident_request_batch_outcome.valid();
+                resident_request_batch_verifier_rows =
+                    tx.scheduled_batch.shape.max_draft_tokens;
+                if (!tx.produced)
+                {
+                    std::string message =
+                        "decodeStepBatch() request-batched greedy resident "
+                        "verifier production failed";
+                    if (!produce_error.empty())
+                    {
+                        message += ": ";
+                        message += produce_error;
+                    }
+                    return release_and_fail(tx, std::move(message));
+                }
+                if (!resident_request_batch_outcome_ready ||
+                    resident_request_batch_verifier_rows <= 0)
+                {
+                    return release_and_fail(
+                        tx,
+                        "decodeStepBatch() request-batched greedy resident "
+                        "verifier produced no valid device outcome");
+                }
+
+                DeviceSpeculativePublicationRequest publication_request;
+                publication_request.outcome = resident_request_batch_outcome;
+                publication_request.request_count =
+                    tx.scheduled_batch.request_count;
+                publication_request.max_draft_tokens =
+                    resident_request_batch_verifier_rows;
+                publication_request.base_sidecar_position = 0;
+                publication_request.publish_mtp_shifted_kv =
+                    tx.scheduled_batch.requires_shifted_kv_publication;
+
+                std::string publication_error;
+                {
+                    PerfStatsCollector::ScopedTimer publication_timer(
+                        "mtp",
+                        "request_batch_publish_accepted_state_device_resident",
+                        "decode",
+                        {},
+                        {{"sampling", "greedy"},
+                         {"request_count",
+                          std::to_string(publication_request.request_count)},
+                         {"max_draft_tokens",
+                          std::to_string(
+                              publication_request.max_draft_tokens)}});
+                    tx.published =
+                        runner_->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+                            publication_request,
+                            &publication_error);
+                }
+                if (!tx.published)
+                {
+                    std::string message =
+                        "decodeStepBatch() request-batched greedy resident "
+                        "state publication failed";
+                    if (!publication_error.empty())
+                    {
+                        message += ": ";
+                        message += publication_error;
+                    }
+                    return release_and_fail(tx, std::move(message));
+                }
+
+                const DeviceResidentLogicalSequenceStateHandle logical_state =
+                    runner_->deviceResidentLogicalSequenceState();
+                if (!logical_state.valid() ||
+                    logical_state.request_count <
+                        tx.scheduled_batch.request_count)
+                {
+                    return release_and_fail(
+                        tx,
+                        "decodeStepBatch() request-batched greedy resident "
+                        "publication produced no valid logical-state mailbox");
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "request_batch_resident_plan_checks",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"request_count",
+                      std::to_string(tx.scheduled_batch.request_count)},
+                     {"host_mirror_source", "none"},
+                     {"sampling", "greedy"}});
+
+                tx.device_outcomes.assign(
+                    static_cast<size_t>(tx.scheduled_batch.request_count),
+                    MTPDeviceRejectionBatchOutcome{});
+                {
+                    PerfStatsCollector::ScopedTimer bridge_timer(
+                        "mtp",
+                        "request_batch_greedy_device_outcome_host_bridge",
+                        "decode",
+                        {},
+                        {{"request_count",
+                          std::to_string(tx.scheduled_batch.request_count)}});
+                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
+                            resident_request_batch_outcome,
+                            tx.device_outcomes.data()))
+                    {
+                        return release_and_fail(
+                            tx,
+                            "decodeStepBatch() request-batched greedy resident "
+                            "outcome host-response materialization failed");
+                    }
+                }
+
+                std::string commit_error;
+                tx.committed = owner.commitInFlightBatch(&commit_error);
+                if (!tx.committed)
+                {
+                    return fail_after_checkpoint(
+                        std::string("decodeStepBatch() request-batched greedy "
+                                    "resident publication succeeded but owner "
+                                    "commit failed: ") +
+                        commit_error);
+                }
+
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "request_batch_device_resident_state_publications",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"request_count",
+                      std::to_string(publication_request.request_count)},
+                     {"max_draft_tokens",
+                      std::to_string(
+                          publication_request.max_draft_tokens)},
+                     {"sampling", "greedy"}});
+                tx.ok = true;
+
+                scheduled_request_ids = tx.scheduled_batch.request_ids;
+                scheduled_base_cached_tokens =
+                    tx.scheduled_batch.base_cached_tokens;
+                catchup_results.reserve(tx.device_outcomes.size());
+                for (size_t i = 0; i < tx.device_outcomes.size(); ++i)
+                {
+                    MTPDecodeCatchupGreedyResult catchup =
+                        buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                            tx.scheduled_batch.greedy_requests[i],
+                            tx.device_outcomes[i]);
+                    if (!catchup.ok)
+                    {
+                        return fail_after_checkpoint(
+                            std::string("decodeStepBatch() greedy catch-up "
+                                        "summary failed: ") +
+                            catchup.error);
+                    }
+                    catchup_results.push_back(std::move(catchup));
+                }
+            }
+            else
+            {
+                MTPOwnedGreedyVerifierBatchTransactionResult tx =
+                    executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
+                        *runner_,
+                        owner,
+                        scheduler,
+                        publish);
+                if (!tx.ok)
+                {
+                    return fail_after_checkpoint(
+                        std::string("decodeStepBatch() request-batched verifier "
+                                    "transaction failed: ") +
+                        tx.error);
+                }
+
+                scheduled_request_ids = tx.scheduled_batch.request_ids;
+                scheduled_base_cached_tokens =
+                    tx.scheduled_batch.base_cached_tokens;
+                catchup_results = tx.transaction.catchup.results;
+            }
         }
         else
         {

@@ -1877,6 +1877,10 @@ namespace llaminar2
             int first_draft_slot,
             int draft_token_count,
             int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokenBatchOnDevice(
+            const DeviceMTPVerifierInputBatchRequest *requests,
+            int request_count,
+            int padded_seq_len) override;
         const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
             const int32_t *verifier_tokens,
             int total_verifier_input_tokens,
@@ -2073,6 +2077,10 @@ namespace llaminar2
             int draft_token_count,
             const int32_t *stop_tokens,
             int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(
+            const DeviceGreedyBatchOutcomeRequest *requests,
+            int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
 
         /**
@@ -4640,7 +4648,7 @@ namespace llaminar2
         void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, 3], p(sampled draft token)
         void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1, mtp_sidecar_condition_token_capacity_]
         int mtp_sidecar_condition_token_capacity_ = 0; ///< Total staged condition-token scalars across all sidecar slots.
-        void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 [1, 4], stable verifier token input
+        void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
         void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 target/verifier top-k partial scratch.
         void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 target/verifier top-k partial scratch.
         int stochastic_topk_partial_capacity_ = 0;
@@ -4830,6 +4838,16 @@ namespace llaminar2
         };
         std::optional<PendingMTPVerifierDeviceTokenPlan>
             pending_mtp_verifier_device_token_plan_;
+        struct PendingMTPVerifierDeviceTokenBatchPlan
+        {
+            int request_count = 0;
+            int padded_seq_len = 0;
+            std::array<DeviceMTPVerifierInputBatchRequest,
+                       sampling_math::kSpeculativeBatchMaxRows>
+                requests{};
+        };
+        std::optional<PendingMTPVerifierDeviceTokenBatchPlan>
+            pending_mtp_verifier_device_token_batch_plan_;
         struct MaterializedMTPVerifierDeviceTokenRow
         {
             bool valid = false;
@@ -4840,6 +4858,15 @@ namespace llaminar2
         };
         MaterializedMTPVerifierDeviceTokenRow
             materialized_mtp_verifier_device_token_row_;
+        struct MaterializedMTPVerifierDeviceTokenBatch
+        {
+            bool valid = false;
+            int request_count = 0;
+            int padded_seq_len = 0;
+            int total_token_capacity = 0;
+        };
+        MaterializedMTPVerifierDeviceTokenBatch
+            materialized_mtp_verifier_device_token_batch_;
 
         /**
          * @brief Device-resident logical sequence-state publication mailbox.
