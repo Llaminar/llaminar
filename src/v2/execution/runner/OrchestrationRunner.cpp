@@ -4144,6 +4144,20 @@ namespace llaminar2
             !use_grouped_outcome_device_resident_publication_verifier &&
             !runner_->primaryDeviceId().is_gpu() &&
             (!stochastic_verify || stochastic_host_verify);
+        if (use_all_position_state_publication_verifier &&
+            runner_->primaryDeviceId().is_gpu() &&
+            !runner_->supportsDeviceResidentMTPSpecStatePublication())
+        {
+            /*
+             * GPU all-position verification may still compute row-indexed
+             * verifier logits, but accepted-state publication must consume the
+             * compact resident outcome directly.  A host MTPSpecStepPlanBatch
+             * would make the CPU mirror the owner of KV/GDN/shifted-MTP state,
+             * which is exactly the production shape Phase 10 is removing.
+             */
+            return fail_without_checkpoint(
+                "GPU all-position MTP verifier requires device-resident accepted-state publication");
+        }
         if (use_grouped_outcome_host_publication_verifier)
         {
             /*
@@ -7445,6 +7459,13 @@ namespace llaminar2
                 draft_tokens.size() <=
                     static_cast<size_t>(
                         sampling_math::kSpeculativeBatchMaxOutputTokens);
+            if (!stochastic_verify &&
+                runner_->primaryDeviceId().is_gpu() &&
+                !use_greedy_device_batch_outcome)
+            {
+                return fail_after_checkpoint(
+                    "GPU all-position greedy MTP requires resident compact outcome reduction");
+            }
             bool sampled_greedy_verifier_rows_before_cleanup = false;
             const bool defer_all_position_verifier_sync =
                 runner_->primaryDeviceId().is_gpu() &&
@@ -7735,6 +7756,12 @@ namespace llaminar2
                     stop_tokens_.size() <=
                         static_cast<size_t>(
                             sampling_math::kSpeculativeBatchMaxStopTokens);
+                if (runner_->primaryDeviceId().is_gpu() &&
+                    !batched_device_rejection)
+                {
+                    return fail_after_checkpoint(
+                        "GPU all-position stochastic MTP requires resident batched compact outcome reduction");
+                }
                 bool used_device_batch_outcome = false;
                 std::vector<float> batched_accept_thresholds;
                 std::vector<float> batched_residual_thresholds;
@@ -7860,7 +7887,11 @@ namespace llaminar2
                             "All-position stochastic MTP resident device outcome verifier failed");
                     }
 
-                    if (runner_->supportsDeviceResidentMTPSpecStatePublication())
+                    if (!runner_->supportsDeviceResidentMTPSpecStatePublication())
+                    {
+                        return fail_after_checkpoint(
+                            "All-position stochastic MTP resident outcome has no resident publication path");
+                    }
                     {
                         DeviceSpeculativePublicationRequest publication_request;
                         publication_request.outcome = device_outcome_handle;
@@ -8342,7 +8373,11 @@ namespace llaminar2
                             "All-position greedy MTP resident compact device outcome verifier failed");
                     }
 
-                    if (runner_->supportsDeviceResidentMTPSpecStatePublication())
+                    if (!runner_->supportsDeviceResidentMTPSpecStatePublication())
+                    {
+                        return fail_after_checkpoint(
+                            "All-position greedy MTP resident outcome has no resident publication path");
+                    }
                     {
                         DeviceSpeculativePublicationRequest publication_request;
                         publication_request.outcome = device_outcome_handle;

@@ -39,6 +39,16 @@ gates passed:
 `V2_Unit_{PrefixMTPConfig,RankOrchestrator,PrefillDecodeTransition,MTPGraphConstruction}`
 and the MTP unit gate covering `V2_Unit_MTP*`.
 
+2026-07-08 update 2: GPU all-position MTP verification now also refuses the
+old host `MTPSpecStepPlanBatch` publisher. CUDA/ROCm all-position greedy and
+stochastic paths require resident compact outcome reduction plus
+`publishAcceptedMTPSpecStateBatchFromDeviceOutcome()`; CPU retains the host plan
+publisher only for host-owned execution. The regression
+`GreedyGPUAllPositionWithoutResidentPublicationFailsBeforeHostPublish` proves a
+GPU runner cannot reach row-indexed verifier setup, all-position sampling, or
+state publication without resident publication support. Focused MTP unit gate
+passed.
+
 ## Why vLLM Is Fast
 
 The local vLLM source shape to port is:

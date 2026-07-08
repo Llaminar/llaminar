@@ -24,6 +24,8 @@ CUDA dense greedy d2/d3 acceptance recovered after verifier-row ownership fix.
 2026-07-08 LocalTP GPU MTP uses mirrored full-head child-resident outcomes.
 Initial shifted row and suffix catch-up are now prepared from resident compact
 outcome metadata/tokens before publication; the host bridge is response-only.
+GPU all-position verifier publication now hard-fails without resident compact
+outcome publication; host `MTPSpecStepPlanBatch` publication is CPU-only.
 Focused MTP/Rank/runner gates pass; full unit `517/517` passes for this slice.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert

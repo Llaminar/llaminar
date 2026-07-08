@@ -6992,6 +6992,7 @@ namespace
             EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
             EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 3);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
             EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 1);
             EXPECT_EQ(mock->lastPublishedMTPSpecBatch().request_count, 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
@@ -7081,7 +7082,7 @@ namespace
             /*chained_mtp_support=*/true);
         mock->enableMTPSidecarPreservesMainState();
         mock->requireMTPDecodeEquivalentReplay();
-        mock->enableMTPSpecStatePublication();
+        mock->enableDeviceResidentMTPSpecStatePublication();
         mock->setVerifierAcceptedPrefixScript({2});
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
@@ -7090,11 +7091,50 @@ namespace
 
         EXPECT_EQ(mock->setAllPositionCount(), 2);
         EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
-        EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+        EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(mock->allPositionVerifierSyncDeferralEnableCount(), 1);
         EXPECT_EQ(mock->allPositionVerifierSyncDeferralDisableCount(), 1);
         EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 2);
         EXPECT_FALSE(mock->allPositionVerifierSyncDeferralEnabled());
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, GreedyGPUAllPositionWithoutResidentPublicationFailsBeforeHostPublish)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/2,
+            /*chained_mtp_support=*/true);
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->requireMTPDecodeEquivalentReplay();
+        mock->enableMTPSpecStatePublication();
+        mock->setVerifierAcceptedPrefixScript({2});
+
+        ASSERT_FALSE(mock->supportsDeviceResidentMTPSpecStatePublication())
+            << "This regression must keep CUDA from using the host plan publisher.";
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult step = runner->decodeStep();
+        ASSERT_FALSE(step.success());
+        EXPECT_THAT(step.error,
+                    HasSubstr("GPU all-position MTP verifier requires device-resident accepted-state publication"));
+
+        EXPECT_EQ(mock->setMTPSpecVerifierPlanCount(), 0);
+        EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 0);
+        EXPECT_EQ(mock->setAllPositionCount(), 0);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+        EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 0);
+        EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
+        EXPECT_THAT(mock->publicationEvents(), IsEmpty());
     }
 
     TEST_F(Test__PrefillDecodeTransition, PenaltyGreedyGPUUsesRowLocalAllPositionVerifier)
@@ -7118,7 +7158,7 @@ namespace
                 /*chained_mtp_support=*/true);
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
-            mock->enableMTPSpecStatePublication();
+            mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({2});
 
             SamplingParams sampling;
@@ -7150,7 +7190,8 @@ namespace
                 << "penalty-greedy should use the compact all-position reducer "
                    "after row-local penalty application";
             EXPECT_EQ(mock->verifyGreedyAllPositionBatchOutcomeCount(), 1);
-            EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
                 << "the promoted penalty-greedy lane must not fall back to "
                    "stepwise decode-equivalent replay";
@@ -7749,6 +7790,7 @@ namespace
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
             EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
                 << "the rejected correction is only a pending condition here; "
                    "its shifted row is appended when the next verifier step "
@@ -7816,7 +7858,7 @@ namespace
                 /*mpi_ctx=*/nullptr,
                 /*mtp_token_coordination=*/true,
                 /*hide_local_logits=*/false,
-                DeviceId::cuda(0),
+                DeviceId::cpu(),
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true);
             mock->enableMTPSpecStatePublication();
@@ -7906,7 +7948,7 @@ namespace
                 /*mpi_ctx=*/nullptr,
                 /*mtp_token_coordination=*/true,
                 /*hide_local_logits=*/false,
-                DeviceId::cuda(0),
+                DeviceId::cpu(),
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true);
             mock->enableMTPSpecStatePublication();
@@ -8234,7 +8276,7 @@ namespace
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->enableMTPSidecarLogitsStreamHandoff();
             mock->requireMTPDecodeEquivalentReplay();
-            mock->enableMTPSpecStatePublication();
+            mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({1});
 
             SamplingParams sampling;
@@ -8257,13 +8299,13 @@ namespace
             EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
             EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 0);
-            EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
                 << "the first stochastic sidecar row is reused for shifted MTP KV";
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 1)
-                << "the accepted stochastic verifier row should fill the remaining shifted prefix without replay";
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
-            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 0)
+                << "resident publication owns shifted MTP KV; the host commit "
+                   "helper must not replay accepted stochastic rows";
             EXPECT_EQ(mock->restoreCount(), 0);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
             EXPECT_EQ(mock->deviceDistributionBuildCount(), 3)
@@ -8296,11 +8338,12 @@ namespace
                    "target-side rejection correction owns the final policy";
             EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
 
-            const MTPSpecStepPlan &published = mock->lastPublishedMTPSpecStep();
-            EXPECT_EQ(published.accepted_count, 2);
-            EXPECT_EQ(published.target_cached_tokens, 7);
-            EXPECT_FALSE(published.requiresCorrectionReplay());
-            EXPECT_TRUE(published.hasBonusReadyToken());
+            const DeviceSpeculativePublicationRequest &publication_request =
+                mock->lastDeviceResidentPublicationRequest();
+            EXPECT_TRUE(publication_request.valid());
+            EXPECT_EQ(publication_request.request_count, 1);
+            EXPECT_EQ(publication_request.max_draft_tokens, 2);
+            EXPECT_TRUE(publication_request.publish_mtp_shifted_kv);
 
             const auto probe = runner->prefixStateProbe();
             EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
@@ -9233,7 +9276,7 @@ namespace
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->enableMTPSidecarLogitsStreamHandoff();
             mock->enableMTPDeviceDraftTokenInput();
-            mock->enableMTPSpecStatePublication();
+            mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({2});
 
             SamplingParams sampling;
@@ -9469,7 +9512,7 @@ namespace
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->enableMTPSidecarLogitsStreamHandoff();
-            mock->enableMTPSpecStatePublication();
+            mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setVerifierAcceptedPrefixScript({0, 1});
             mock->setDecodeArgmaxScript({MockInferenceRunner::DECODE_ARGMAX_TOKEN});
 
@@ -9491,7 +9534,8 @@ namespace
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
 
             EXPECT_EQ(mock->setAllPositionCount(), 2);
-            EXPECT_EQ(mock->publishMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
             EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 0);
             EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
                 << "penalty-bearing stochastic sampling is history-dependent, "
@@ -9531,11 +9575,12 @@ namespace
                 << "the current vLLM batch prepares verifier and bonus rows "
                    "before the summary knows whether the bonus is consumed";
 
-            const MTPSpecStepPlan &published = mock->lastPublishedMTPSpecStep();
-            EXPECT_EQ(published.accepted_count, 1);
-            EXPECT_TRUE(published.requiresCorrectionReplay());
-            EXPECT_EQ(published.correction_replay_count, 1);
-            EXPECT_FALSE(published.hasBonusReadyToken());
+            const DeviceSpeculativePublicationRequest &publication_request =
+                mock->lastDeviceResidentPublicationRequest();
+            EXPECT_TRUE(publication_request.valid());
+            EXPECT_EQ(publication_request.request_count, 1);
+            EXPECT_EQ(publication_request.max_draft_tokens, 2);
+            EXPECT_TRUE(publication_request.publish_mtp_shifted_kv);
 
             const auto probe = runner->prefixStateProbe();
             EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
