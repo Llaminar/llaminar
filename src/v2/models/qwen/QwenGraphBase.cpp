@@ -3492,11 +3492,33 @@ namespace llaminar2
             attn_params.workspace_mask = buffers.workspace_mask;
             attn_params.kv_cache = kv_cache;
             attn_params.layer_idx = kv_stage_layer;
+            const bool cache_is_q8_1 =
+                kv_cache &&
+                kv_cache->k_precision() == ActivationPrecision::Q8_1 &&
+                kv_cache->v_precision() == ActivationPrecision::Q8_1;
+            const bool cache_is_turboquant =
+                kv_cache &&
+                (kv_cache->k_precision() == ActivationPrecision::TQ8 ||
+                 kv_cache->k_precision() == ActivationPrecision::TQ4 ||
+                 kv_cache->v_precision() == ActivationPrecision::TQ8 ||
+                 kv_cache->v_precision() == ActivationPrecision::TQ4);
+            const bool cache_storage_needs_converted_rope_read =
+                config_.rope_on_read && (cache_is_q8_1 || cache_is_turboquant);
+            const bool cache_storage_directly_readable =
+                !kv_cache || (!cache_is_q8_1 && !cache_is_turboquant);
+            /*
+             * RoPE-on-read is the intentional production path for quantized GPU
+             * KV caches: attention consumes the converted post-append cache view,
+             * not the tiny current-token K/V tensor.  Excluding Q8_1/TQ caches
+             * here makes grouped verifier rows attend over only their local
+             * candidate rows, which is fast but not serial-decode equivalent.
+             * Backends that cannot materialize the converted view should fail in
+             * AttentionComputeStage rather than silently taking the wrong path.
+             */
             attn_params.read_kv_from_cache = !phase_split_handoff &&
                                              device.is_gpu() &&
-                                             (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
-                                             (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
-                                                            kv_cache->precision() != ActivationPrecision::TQ4));
+                                             (cache_storage_directly_readable ||
+                                              cache_storage_needs_converted_rope_read);
             attn_params.position_offset = position_ids ? position_ids[0] : 0;
             attn_params.mpi_ctx = mpi_ctx_.get();
             attn_params.q_buffer_id = buffers.idFor(BufferId::Q_PROJ);

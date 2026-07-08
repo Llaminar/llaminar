@@ -88,6 +88,12 @@ state machines.
 
 Use strict gates before promoting any MTP optimization:
 
+- **Grouped verifier decode must be bitwise serial-row equivalent.** For
+  grouped MTP verifier rows, the acceptance threshold is byte-for-byte identical
+  FP32 output compared with running the same rows through the production M=1
+  serial decode path in the same backend and tensor format. Cosine similarity,
+  relative L2, symmetric KLD, and max-absolute-error are diagnostics for finding
+  the first drift; they are not pass criteria for grouped decode publication.
 - Relative L2: tight enough to catch drift for the tested precision/path.
 - Cosine similarity: near 1.0 for logits, hidden rows, and kernel outputs.
 - Symmetric KLD: required when outputs feed sampling or softmax decisions.
@@ -96,9 +102,10 @@ Use strict gates before promoting any MTP optimization:
 - Decode-equivalent continuation: accepted-state publication must match serial
   decode after continuing for enough rows to expose KV/GDN/short-conv mistakes.
 
-For grouped verifier rows, prove M=1,2,3,4 against serial decode for every
-backend that claims support. If a grouped path is not faster, keep it out of the
-hot path and track the performance debt in the plan/dashboard.
+For grouped verifier rows, prove M=1,2,3,4 bitwise against serial decode for
+every backend that claims support and for every advertised tensor codebook or
+floating-point tensor format. If a grouped path is not faster, keep it out of
+the hot path and track the performance debt in the plan/dashboard.
 
 Prefer dedicated integration tests before wiring a new kernel into graph
 execution. Good test names to search for include:
@@ -165,6 +172,10 @@ Use `scripts/summarize_mtp_perfstats.py` to compare:
 
 MTP only becomes economical when grouped verifier work is genuinely grouped.
 Wrapping serial decode rows under a grouped API is not enough.
+Grouped decode publication also has a stricter correctness bar than ordinary
+numeric parity: every grouped output row must be bitwise identical to the
+backend's serial M=1 decode row for the same codebook/format. Treat relaxed
+numeric metrics as failure breadcrumbs, not success thresholds.
 
 ### Verifier Kernel Mode Convention
 

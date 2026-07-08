@@ -910,6 +910,7 @@ namespace llaminar2
             int n_kv_heads = 0;                                ///< Number of KV heads
             int head_dim = 0;                                  ///< Dimension per attention head
             int rope_dim = 0;                                  ///< Number of dimensions to rotate per head (0 = full head_dim)
+            int requested_token_count = 0;                     ///< Optional graph-captured logical span to expose after a device-side append.
             const TurboQuantContext *turboquant_ctx = nullptr; ///< Required for TQ cache dequant (optional otherwise)
             void *gpu_stream = nullptr;                        ///< Optional GPU stream for fused conversion/read kernels
         };

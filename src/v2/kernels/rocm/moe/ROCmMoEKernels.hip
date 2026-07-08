@@ -8955,10 +8955,34 @@ __global__ void rocm_moe_shared_expert_gate_dot_kernel(
 
     const float *x = input + token * d_model;
 
+    /*
+     * MTP verifier rows compare the grouped M=2..4 shared-gate path against
+     * serial M=1 decode row replay.  The serial ROCm decode kernel below
+     * accumulates four contiguous FP32 products at a time before participating
+     * in the block reduction.  Use the same per-lane accumulation order here;
+     * a scalar stride loop is mathematically equivalent, but it changes FP32
+     * rounding by a few ulps and those differences can amplify after later MoE
+     * and residual stages.
+     */
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    if ((d_model & 3) == 0)
     {
-        sum += x[i] * gate_inp[i];
+        const int d4 = d_model >> 2;
+        const float4 *__restrict__ input4 = reinterpret_cast<const float4 *>(x);
+        const float4 *__restrict__ gate4 = reinterpret_cast<const float4 *>(gate_inp);
+        for (int i = threadIdx.x; i < d4; i += blockDim.x)
+        {
+            const float4 xv = input4[i];
+            const float4 gv = gate4[i];
+            sum += xv.x * gv.x + xv.y * gv.y + xv.z * gv.z + xv.w * gv.w;
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            sum += x[i] * gate_inp[i];
+        }
     }
 
     // Wave reduction

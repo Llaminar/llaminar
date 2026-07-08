@@ -35,7 +35,12 @@
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
+#include "config/TensorParallelConfig.h"
 #include "loaders/ModelLoader.h"
+#include "loaders/ModelContext.h"
+#include "loaders/ModelContextConfig.h"
+#include "models/qwen35moe/Qwen35MoESchema.h"
+#include "tensors/TensorSlice.h"
 #include "tensors/TensorFactory.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/DebugEnv.h"
@@ -575,6 +580,154 @@ namespace
         if (ok)
             std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
+    }
+
+    /**
+     * @brief Execute one CUDA verifier projection through the grouped LM-head path.
+     *
+     * This mirrors LMHeadStage::executeDecodeEquivalentVerifierPrefill(): the
+     * input rows are FP32 verifier hidden states, the output tensor is FP32
+     * logits, and the backend owns the decode-equivalent small-M dispatch scope.
+     * Keeping this helper in the CUDA parity suite lets real model-weight tests
+     * prove the production grouped path without loading a full graph.
+     */
+    bool cudaGroupedVerifierProjectionViaTensor(
+        ITensorGemm *kernel,
+        const float *A_host,
+        float *C_host,
+        int M,
+        int N,
+        int K,
+        DeviceId gpu_device,
+        DeviceWorkspaceManager *workspace)
+    {
+        auto A_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::memcpy(A_tensor->mutable_data(), A_host,
+                    static_cast<size_t>(M) * static_cast<size_t>(K) * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        bool ok = withExplicitCudaGemmStream(
+            {kernel},
+            [&]
+            {
+                return with_gpu_coherence(
+                    gpu_device,
+                    {A_tensor.get()},
+                    {C_tensor.get()},
+                    [&]
+                    {
+                        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                            {kernel, C_tensor.get(), N, nullptr, "lm_head"}};
+                        return kernel->multiply_fused_verifier_rows_decode_equivalent(
+                            A_tensor.get(),
+                            projections,
+                            M,
+                            K,
+                            nullptr,
+                            workspace);
+                    });
+            });
+        if (ok)
+            std::memcpy(C_host, C_tensor->data(),
+                        static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float));
+        return ok;
+    }
+
+    /**
+     * @brief Return the Qwen3.6 MoE GGUF used by real-weight kernel regressions.
+     */
+    std::filesystem::path qwen36MoEModelPath()
+    {
+        if (const char *env = std::getenv("LLAMINAR_QWEN36_MOE_MODEL"))
+            return std::filesystem::path(env);
+        return std::filesystem::path("/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf");
+    }
+
+    /**
+     * @brief Load a model context whose raw quantized weights can be GPU-prepared.
+     *
+     * The production GPU upload/repack helper consumes the host GGUF blocks
+     * directly, so the context must keep native tensor formats and avoid CPU-side
+     * requantization.
+     */
+    std::shared_ptr<ModelContext> loadQwen36ModelForGpuWeights(
+        const std::filesystem::path &model_path)
+    {
+        ModelContextConfig config = ModelContextConfig::defaults();
+        config.strategy = WeightDistributionStrategy::REPLICATED;
+        config.weight_precision = WeightPrecision::NATIVE;
+        config.use_mmap = true;
+        config.target_is_gpu = true;
+        return ModelContext::create(model_path.string(), config);
+    }
+
+    /**
+     * @brief Return the raw tensor that the GPU upload pipeline should consume.
+     *
+     * LocalTP weight slicing wraps already-materialized row/column slices in a
+     * `TensorSlice` so graph builders retain sharding metadata.  The CUDA weight
+     * upload/repack harness, like the production GPU loader, needs the actual
+     * native tensor that exposes format metadata such as `IINT8Unpackable`.
+     * Stage tests should still pass the wrapper to the stage so tensor-sharding
+     * metadata remains part of the exercised contract.
+     */
+    TensorBase *gpuPreparationTensor(TensorBase *tensor)
+    {
+        if (auto *slice = dynamic_cast<TensorSlice *>(tensor))
+            return slice->inner();
+        return tensor;
+    }
+
+    /**
+     * @brief Configure a loaded Qwen3.6 MoE context for two-way LocalTP slicing.
+     *
+     * The sharder needs both the schema's weight-sharding annotations and GDN
+     * dimensions.  Fused GDN QKV is asymmetric: Q and K are replicated, while V
+     * is sharded.  Missing any one of these hints changes the physical weight
+     * presented to `GDNProjectionStage`, so this helper mirrors the production
+     * LocalTP setup before a regression requests per-device weights.
+     */
+    std::shared_ptr<TensorParallelConfig> configureQwen36MoELocalTPWeights(
+        const std::shared_ptr<ModelContext> &model_ctx,
+        const std::vector<DeviceId> &devices)
+    {
+        auto weight_manager = model_ctx ? model_ctx->concreteWeightManager() : nullptr;
+        if (!model_ctx || !weight_manager)
+            return nullptr;
+
+        Qwen35MoESchemaFactory schema_factory;
+        weight_manager->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+        const int n_heads = model_ctx->headCount();
+        const int n_kv_heads = std::max(1, model_ctx->headCountKV());
+        const int head_dim = model_ctx->keyLength() > 0
+                                 ? model_ctx->keyLength()
+                                 : (n_heads > 0 ? model_ctx->embeddingLength() / n_heads : 0);
+        const int d_ff = std::max(
+            32,
+            std::max(
+                model_ctx->feedForwardLength(),
+                model_ctx->concreteLoader().getInt("expert_feed_forward_length", 0)));
+        const int vocab_size = model_ctx->vocabSize();
+
+        weight_manager->setModelDimensions(n_heads, n_kv_heads, head_dim);
+        weight_manager->setGDNDimensions(
+            model_ctx->concreteLoader().getInt("ssm.group_count", 0),
+            model_ctx->concreteLoader().getInt("ssm.time_step_rank", 0),
+            model_ctx->concreteLoader().getInt("ssm.state_size", 0));
+
+        auto tp_config = std::make_shared<TensorParallelConfig>(
+            TensorParallelConfig::equalSplit(
+                static_cast<int>(devices.size()),
+                n_heads,
+                n_kv_heads,
+                d_ff,
+                vocab_size,
+                devices));
+        weight_manager->setTensorParallelConfig(tp_config);
+        return tp_config;
     }
 
     bool cpuFusedSwiGLUDownToVector(ITensorGemm *kernel,
@@ -1975,6 +2128,84 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs
 }
 
 /**
+ * @brief Guard the Qwen3.6 MoE LocalTP GDN output projection verifier shape.
+ *
+ * The MoE model stores `ssm_out` as Q6_K. In LocalTP each participant projects
+ * its local 2048-value-head slice into the full hidden width, then the graph
+ * allreduces those partials.  This test isolates the grouped verifier GEMM used
+ * before that allreduce: M=2/3/4 grouped rows must match repeated M=1 decode
+ * rows for the exact local shard shape.
+ */
+TEST_F(Test__CUDAGemmParity, Q6_K_Qwen36MoEGDNOutLocalTP_M234MatchesSerialDecodeGEMVs)
+{
+    constexpr int N = 2048;
+    constexpr int K = 2048;
+
+    auto weights = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 2421);
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+
+    for (const int M : {2, 3, 4})
+    {
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K))
+            << "workspace for Qwen3.6 MoE GDN out M=" << M;
+
+        auto A_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
+        std::vector<float> C_grouped(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+            cuda_kernel,
+            A_data.data(),
+            C_grouped.data(),
+            M,
+            N,
+            K,
+            gpu_device_,
+            workspace_.get()))
+            << "M=" << M << " Qwen3.6 MoE GDN output grouped verifier GEMM failed";
+
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                cuda_kernel,
+                A_data.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                C_m1.data(),
+                1,
+                N,
+                K,
+                gpu_device_))
+                << "M=1 Qwen3.6 MoE GDN output projection GEMV failed for row " << row;
+
+            const float *grouped_row =
+                C_grouped.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const auto result = checkParity(
+                grouped_row,
+                C_m1.data(),
+                C_m1.size(),
+                0.999999,
+                1.0e-5);
+            EXPECT_FALSE(result.has_nan_inf)
+                << "M=" << M << " Qwen3.6 MoE GDN output row " << row
+                << " produced non-finite output";
+            EXPECT_GE(result.cosine_similarity, 0.999999)
+                << "M=" << M << " Qwen3.6 MoE GDN output row " << row
+                << " diverges from single-row decode GEMV"
+                << " rel_l2=" << result.relative_l2_error
+                << " max_abs=" << result.max_abs_error
+                << " symmetric_kl=" << result.symmetric_kl;
+            EXPECT_LE(result.relative_l2_error, 1.0e-5)
+                << "M=" << M << " Qwen3.6 MoE GDN output row " << row
+                << " relative L2 differs from single-row decode GEMV";
+        }
+
+        cleanupWorkspaceIfNeeded(cuda_kernel);
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
  * @brief Guard the Qwen3.6 GDN QKV verifier projection shape.
  *
  * The model-level grouped verifier parity test first diverged at
@@ -2416,10 +2647,31 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     auto output_beta = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_BETA)});
 
-    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
-    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
-    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
-    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    auto qkv_prepared = llaminar2::test::makeGpuPreparedGemm(
+        weights_qkv.get(),
+        gpu_device_,
+        "blk.5.attn_qkv.weight",
+        ModelContextId{23881});
+    auto z_prepared = llaminar2::test::makeGpuPreparedGemm(
+        weights_z.get(),
+        gpu_device_,
+        "blk.5.attn_gate.weight",
+        ModelContextId{23881});
+    auto alpha_prepared = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_alpha.get(),
+        gpu_device_,
+        "blk.5.ssm_alpha.weight",
+        ModelContextId{23881});
+    auto beta_prepared = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_beta.get(),
+        gpu_device_,
+        "blk.5.ssm_beta.weight",
+        ModelContextId{23881});
+
+    auto *kernel_qkv = qkv_prepared.kernel;
+    auto *kernel_z = z_prepared.kernel;
+    auto *kernel_alpha = alpha_prepared.kernel;
+    auto *kernel_beta = beta_prepared.kernel;
     ASSERT_NE(kernel_qkv, nullptr);
     ASSERT_NE(kernel_z, nullptr);
     ASSERT_NE(kernel_alpha, nullptr);
@@ -3015,6 +3267,553 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialSt
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+}
+
+/**
+ * @brief Prove the sharded LocalTP Qwen3.6 MoE GDN projection verifier shape.
+ *
+ * The LocalTP graph keeps Q/K replicated but shards the GDN value heads, so the
+ * production projection dimensions differ from the full single-device MoE
+ * shape: QKV is `[6144, 2048]`, Z is `[2048, 2048]`, and alpha/beta are
+ * `[16, 2048]`. This regression prevents the grouped verifier implementation
+ * from being correct only for the unsharded GDN tensor geometry.
+ */
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_M234MatchesSerialStageRows)
+{
+    constexpr int kK = 2048;
+    constexpr int kNQKV = 6144;
+    constexpr int kNZ = 2048;
+    constexpr int kNAlpha = 16;
+    constexpr int kNBeta = 16;
+
+    auto weights_qkv = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(kNQKV), static_cast<size_t>(kK)}, 6531);
+    auto weights_z = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(kNZ), static_cast<size_t>(kK)}, 6532);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNAlpha), static_cast<size_t>(kK)}, -0.1f, 0.1f, 6533);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNBeta), static_cast<size_t>(kK)}, -0.1f, 0.1f, 6534);
+
+    auto qkv_prepared = llaminar2::test::makeGpuPreparedGemm(
+        weights_qkv.get(), gpu_device_, "blk.0.attn_qkv.weight.localtp", ModelContextId{65381});
+    auto z_prepared = llaminar2::test::makeGpuPreparedGemm(
+        weights_z.get(), gpu_device_, "blk.0.attn_gate.weight.localtp", ModelContextId{65381});
+    auto alpha_prepared = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_alpha.get(), gpu_device_, "blk.0.ssm_alpha.weight.localtp", ModelContextId{65381});
+    auto beta_prepared = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_beta.get(), gpu_device_, "blk.0.ssm_beta.weight.localtp", ModelContextId{65381});
+
+    struct StageOutputs
+    {
+        std::unique_ptr<FP32Tensor> qkv;
+        std::unique_ptr<FP32Tensor> z;
+        std::unique_ptr<FP32Tensor> alpha;
+        std::unique_ptr<FP32Tensor> beta;
+    };
+
+    auto make_outputs = [](int rows) -> StageOutputs
+    {
+        return {
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNQKV)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNZ)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNAlpha)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNBeta)})};
+    };
+
+    auto run_stage = [&](int rows, const float *input_data, StageOutputs *outputs)
+    {
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kK)});
+        std::memcpy(
+            input->mutable_data(),
+            input_data,
+            static_cast<size_t>(rows) * static_cast<size_t>(kK) * sizeof(float));
+
+        GDNProjectionStage::Params params;
+        params.device_id = gpu_device_;
+        params.input = input.get();
+        params.m = rows;
+        params.k = kK;
+        params.w_qkv = weights_qkv.get();
+        params.output_qkv = outputs->qkv.get();
+        params.n_qkv = kNQKV;
+        params.w_z = weights_z.get();
+        params.output_z = outputs->z.get();
+        params.n_z = kNZ;
+        params.w_a = weights_alpha.get();
+        params.output_a = outputs->alpha.get();
+        params.n_a = kNAlpha;
+        params.w_b = weights_beta.get();
+        params.output_b = outputs->beta.get();
+        params.n_b = kNBeta;
+        params.gemm_qkv = qkv_prepared.kernel;
+        params.gemm_z = z_prepared.kernel;
+        params.gemm_a = alpha_prepared.kernel;
+        params.gemm_b = beta_prepared.kernel;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        GDNProjectionStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(rows, 0, kK);
+        DeviceWorkspaceManager workspace(gpu_device_, workspaceBudgetFor(reqs));
+        ASSERT_TRUE(workspace.allocate(reqs));
+        stage.bindWorkspace(&workspace);
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        stage.setGPUStream(static_cast<void *>(stream));
+        CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+        const bool ok = with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            [&]
+            {
+                return stage.execute(&ctx);
+            });
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        stage.unbindWorkspace();
+        qkv_prepared.kernel->resetDynamicState();
+        z_prepared.kernel->resetDynamicState();
+        alpha_prepared.kernel->resetDynamicState();
+        beta_prepared.kernel->resetDynamicState();
+    };
+
+    auto expect_projection = [&](const char *name,
+                                 const float *grouped,
+                                 const float *serial,
+                                 size_t count,
+                                 int m,
+                                 int row)
+    {
+        const auto result = checkParity(grouped, serial, count, 0.999999, 1.0e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << name << " M=" << m << " row=" << row << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << name << " M=" << m << " row=" << row
+            << " cosine drift rel_l2=" << result.relative_l2_error
+            << " max_abs=" << result.max_abs_error
+            << " symmetric_kl=" << result.symmetric_kl;
+        EXPECT_LE(result.relative_l2_error, 1.0e-5)
+            << name << " M=" << m << " row=" << row
+            << " relative-L2 drift cosine=" << result.cosine_similarity
+            << " max_abs=" << result.max_abs_error;
+    };
+
+    for (const int M : {2, 3, 4})
+    {
+        const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(kK));
+        StageOutputs grouped = make_outputs(M);
+        run_stage(M, input_data.data(), &grouped);
+
+        for (int row = 0; row < M; ++row)
+        {
+            StageOutputs serial = make_outputs(1);
+            run_stage(
+                1,
+                input_data.data() + static_cast<size_t>(row) * static_cast<size_t>(kK),
+                &serial);
+            expect_projection(
+                "qkv",
+                grouped.qkv->data() + static_cast<size_t>(row) * static_cast<size_t>(kNQKV),
+                serial.qkv->data(),
+                static_cast<size_t>(kNQKV),
+                M,
+                row);
+            expect_projection(
+                "z",
+                grouped.z->data() + static_cast<size_t>(row) * static_cast<size_t>(kNZ),
+                serial.z->data(),
+                static_cast<size_t>(kNZ),
+                M,
+                row);
+            expect_projection(
+                "alpha",
+                grouped.alpha->data() + static_cast<size_t>(row) * static_cast<size_t>(kNAlpha),
+                serial.alpha->data(),
+                static_cast<size_t>(kNAlpha),
+                M,
+                row);
+            expect_projection(
+                "beta",
+                grouped.beta->data() + static_cast<size_t>(row) * static_cast<size_t>(kNBeta),
+                serial.beta->data(),
+                static_cast<size_t>(kNBeta),
+                M,
+                row);
+        }
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+}
+
+/**
+ * @brief Prove real Qwen3.6 MoE LocalTP GDN verifier projections by rank.
+ *
+ * The synthetic LocalTP-shard regression above proves the shape, but it cannot
+ * catch bugs in the production weight sharder.  This test loads the actual
+ * Qwen3.6 MoE layer-0 GDN projection weights through the LocalTP two-device
+ * sharding path:
+ *
+ * - `attn_qkv.weight`: fused asymmetric Q/K/V, with Q and K replicated and V
+ *   sharded.
+ * - `attn_gate.weight`: Q6_K column-parallel gate/Z projection.
+ * - `ssm_alpha.weight` and `ssm_beta.weight`: FP32 column-parallel per-value
+ *   head projections.
+ *
+ * Each local rank then runs the production `GDNProjectionStage` in grouped
+ * verifier mode for M=2/3/4 and compares every grouped row to a separate M=1
+ * stage execution with the same rank-local weights.  That is the exact
+ * decode-equivalence contract the graph relies on before recurrence, MoE, and
+ * LM-head stages consume these rows.
+ */
+TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMatchSerialStageRows)
+{
+    SKIP_IF_NO_CUDA();
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+
+    const std::filesystem::path model_path = qwen36MoEModelPath();
+    if (!std::filesystem::exists(model_path))
+        GTEST_SKIP() << "Qwen 3.6 MoE model not found at " << model_path
+                     << "; set LLAMINAR_QWEN36_MOE_MODEL to run this real-weight regression";
+
+    auto model_ctx = loadQwen36ModelForGpuWeights(model_path);
+    ASSERT_NE(model_ctx, nullptr);
+
+    const std::vector<DeviceId> logical_tp_devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    auto tp_config = configureQwen36MoELocalTPWeights(model_ctx, logical_tp_devices);
+    ASSERT_NE(tp_config, nullptr);
+    ASSERT_TRUE(tp_config->validate()) << tp_config->validationError();
+
+    constexpr int kK = 2048;
+    constexpr int kNQKV = 6144;
+    constexpr int kNZ = 2048;
+    constexpr int kNAlpha = 16;
+    constexpr int kNBeta = 16;
+    const ModelContextId model_id{36363};
+
+    struct StageOutputs
+    {
+        std::unique_ptr<FP32Tensor> qkv;
+        std::unique_ptr<FP32Tensor> z;
+        std::unique_ptr<FP32Tensor> alpha;
+        std::unique_ptr<FP32Tensor> beta;
+    };
+
+    auto make_outputs = [](int rows) -> StageOutputs
+    {
+        return {
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNQKV)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNZ)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNAlpha)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNBeta)})};
+    };
+
+    auto expect_projection = [&](const char *name,
+                                 const float *grouped,
+                                 const float *serial,
+                                 size_t count,
+                                 int rank,
+                                 int m,
+                                 int row)
+    {
+        const auto result = checkParity(grouped, serial, count, 0.999999, 1.0e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << name << " rank=" << rank << " M=" << m << " row=" << row
+            << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << name << " rank=" << rank << " M=" << m << " row=" << row
+            << " cosine drift rel_l2=" << result.relative_l2_error
+            << " max_abs=" << result.max_abs_error
+            << " symmetric_kl=" << result.symmetric_kl;
+        EXPECT_LE(result.relative_l2_error, 1.0e-5)
+            << name << " rank=" << rank << " M=" << m << " row=" << row
+            << " relative-L2 drift cosine=" << result.cosine_similarity
+            << " max_abs=" << result.max_abs_error;
+    };
+
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        const DeviceId shard_device = logical_tp_devices[static_cast<size_t>(rank)];
+
+        auto weights_qkv = model_ctx->getWeightForDevice("blk.0.attn_qkv.weight", shard_device);
+        auto weights_z = model_ctx->getWeightForDevice("blk.0.attn_gate.weight", shard_device);
+        auto weights_alpha = model_ctx->getWeightForDevice("blk.0.ssm_alpha.weight", shard_device);
+        auto weights_beta = model_ctx->getWeightForDevice("blk.0.ssm_beta.weight", shard_device);
+
+        ASSERT_NE(weights_qkv, nullptr);
+        ASSERT_NE(weights_z, nullptr);
+        ASSERT_NE(weights_alpha, nullptr);
+        ASSERT_NE(weights_beta, nullptr);
+        ASSERT_EQ(weights_qkv->native_type(), TensorType::Q6_K);
+        ASSERT_EQ(weights_z->native_type(), TensorType::Q6_K);
+        ASSERT_EQ(weights_alpha->native_type(), TensorType::FP32);
+        ASSERT_EQ(weights_beta->native_type(), TensorType::FP32);
+        ASSERT_EQ(weights_qkv->rows(), static_cast<size_t>(kNQKV));
+        ASSERT_EQ(weights_qkv->cols(), static_cast<size_t>(kK));
+        ASSERT_EQ(weights_z->rows(), static_cast<size_t>(kNZ));
+        ASSERT_EQ(weights_z->cols(), static_cast<size_t>(kK));
+        ASSERT_EQ(weights_alpha->rows(), static_cast<size_t>(kNAlpha));
+        ASSERT_EQ(weights_alpha->cols(), static_cast<size_t>(kK));
+        ASSERT_EQ(weights_beta->rows(), static_cast<size_t>(kNBeta));
+        ASSERT_EQ(weights_beta->cols(), static_cast<size_t>(kK));
+
+        auto qkv_prepared = llaminar2::test::makeGpuPreparedGemm(
+            gpuPreparationTensor(weights_qkv.get()),
+            gpu_device_,
+            "blk.0.attn_qkv.weight.localtp.rank" + std::to_string(rank),
+            model_id);
+        auto z_prepared = llaminar2::test::makeGpuPreparedGemm(
+            gpuPreparationTensor(weights_z.get()),
+            gpu_device_,
+            "blk.0.attn_gate.weight.localtp.rank" + std::to_string(rank),
+            model_id);
+        auto alpha_prepared = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+            gpuPreparationTensor(weights_alpha.get()),
+            gpu_device_,
+            "blk.0.ssm_alpha.weight.localtp.rank" + std::to_string(rank),
+            model_id);
+        auto beta_prepared = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+            gpuPreparationTensor(weights_beta.get()),
+            gpu_device_,
+            "blk.0.ssm_beta.weight.localtp.rank" + std::to_string(rank),
+            model_id);
+
+        auto run_stage = [&](int rows, const float *input_data, StageOutputs *outputs)
+        {
+            auto input = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kK)});
+            std::memcpy(
+                input->mutable_data(),
+                input_data,
+                static_cast<size_t>(rows) * static_cast<size_t>(kK) * sizeof(float));
+
+            GDNProjectionStage::Params params;
+            params.device_id = gpu_device_;
+            params.input = input.get();
+            params.m = rows;
+            params.k = kK;
+            params.w_qkv = weights_qkv.get();
+            params.output_qkv = outputs->qkv.get();
+            params.n_qkv = kNQKV;
+            params.w_z = weights_z.get();
+            params.output_z = outputs->z.get();
+            params.n_z = kNZ;
+            params.w_a = weights_alpha.get();
+            params.output_a = outputs->alpha.get();
+            params.n_a = kNAlpha;
+            params.w_b = weights_beta.get();
+            params.output_b = outputs->beta.get();
+            params.n_b = kNBeta;
+            params.gemm_qkv = qkv_prepared.kernel;
+            params.gemm_z = z_prepared.kernel;
+            params.gemm_a = alpha_prepared.kernel;
+            params.gemm_b = beta_prepared.kernel;
+            params.force_decode_equivalent_verifier_prefill = true;
+
+            GDNProjectionStage stage(params);
+            WorkspaceRequirements reqs = stage.getWorkspaceRequirements(rows, 0, kK);
+            DeviceWorkspaceManager workspace(gpu_device_, workspaceBudgetFor(reqs));
+            ASSERT_TRUE(workspace.allocate(reqs));
+            stage.bindWorkspace(&workspace);
+
+            cudaStream_t stream = nullptr;
+            ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+            stage.setGPUStream(static_cast<void *>(stream));
+            CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+            const bool ok = with_gpu_coherence(
+                gpu_device_,
+                {input.get()},
+                {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+                [&]
+                {
+                    return stage.execute(&ctx);
+                });
+            ASSERT_TRUE(ok) << "real LocalTP GDN projection failed for rank=" << rank
+                            << " rows=" << rows;
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+            stage.unbindWorkspace();
+            qkv_prepared.kernel->resetDynamicState();
+            z_prepared.kernel->resetDynamicState();
+            alpha_prepared.kernel->resetDynamicState();
+            beta_prepared.kernel->resetDynamicState();
+        };
+
+        for (const int M : {2, 3, 4})
+        {
+            const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(kK));
+            StageOutputs grouped = make_outputs(M);
+            run_stage(M, input_data.data(), &grouped);
+
+            for (int row = 0; row < M; ++row)
+            {
+                StageOutputs serial = make_outputs(1);
+                run_stage(
+                    1,
+                    input_data.data() + static_cast<size_t>(row) * static_cast<size_t>(kK),
+                    &serial);
+
+                expect_projection(
+                    "qkv",
+                    grouped.qkv->data() + static_cast<size_t>(row) * static_cast<size_t>(kNQKV),
+                    serial.qkv->data(),
+                    static_cast<size_t>(kNQKV),
+                    rank,
+                    M,
+                    row);
+                expect_projection(
+                    "z",
+                    grouped.z->data() + static_cast<size_t>(row) * static_cast<size_t>(kNZ),
+                    serial.z->data(),
+                    static_cast<size_t>(kNZ),
+                    rank,
+                    M,
+                    row);
+                expect_projection(
+                    "alpha",
+                    grouped.alpha->data() + static_cast<size_t>(row) * static_cast<size_t>(kNAlpha),
+                    serial.alpha->data(),
+                    static_cast<size_t>(kNAlpha),
+                    rank,
+                    M,
+                    row);
+                expect_projection(
+                    "beta",
+                    grouped.beta->data() + static_cast<size_t>(row) * static_cast<size_t>(kNBeta),
+                    serial.beta->data(),
+                    static_cast<size_t>(kNBeta),
+                    rank,
+                    M,
+                    row);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Prove CUDA real Qwen3.6 MoE LM-head verifier rows match serial decode.
+ *
+ * LocalTP MTP verifier failures surface as full-vocab logit drift after the
+ * compact row-indexed LM head. Synthetic Q6_K tests cover the dispatch family,
+ * but they do not prove the production `output.weight` geometry or the GPU
+ * upload/repack path. This regression loads the real Q6_K LM head, executes
+ * M=2/3/4 rows through the grouped verifier projection API used by
+ * LMHeadStage, and compares each row to an ordinary M=1 decode projection.
+ */
+TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    SKIP_IF_NO_CUDA();
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+
+    const std::filesystem::path model_path = qwen36MoEModelPath();
+    if (!std::filesystem::exists(model_path))
+        GTEST_SKIP() << "Qwen 3.6 MoE model not found at " << model_path
+                     << "; set LLAMINAR_QWEN36_MOE_MODEL to run this real-weight regression";
+
+    auto model_ctx = loadQwen36ModelForGpuWeights(model_path);
+    ASSERT_NE(model_ctx, nullptr);
+    ASSERT_TRUE(model_ctx->hasTensor("output.weight"))
+        << "Qwen 3.6 MoE test fixture must expose a concrete LM head";
+
+    auto lm_head = model_ctx->getWeightForDevice("output.weight", DeviceId::cpu());
+    ASSERT_NE(lm_head, nullptr);
+    ASSERT_EQ(lm_head->native_type(), TensorType::Q6_K)
+        << "This regression guards the Qwen 3.6 MoE Q6_K LM-head path";
+
+    constexpr int kExpectedVocab = 248320;
+    constexpr int kExpectedHidden = 2048;
+    const int N = static_cast<int>(lm_head->rows());
+    const int K = static_cast<int>(lm_head->cols());
+    ASSERT_EQ(N, kExpectedVocab);
+    ASSERT_EQ(K, kExpectedHidden);
+
+    auto prepared = llaminar2::test::makeGpuPreparedGemm(
+        lm_head.get(),
+        gpu_device_,
+        "output.weight",
+        ModelContextId{36362});
+    ASSERT_NE(prepared.kernel, nullptr);
+
+    for (const int M : {2, 3, 4})
+    {
+        ASSERT_TRUE(setupWorkspaceIfNeeded(prepared.kernel, M, N, K))
+            << "workspace for Qwen3.6 MoE LM-head M=" << M;
+        const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
+        std::vector<float> grouped(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+            prepared.kernel,
+            input_data.data(),
+            grouped.data(),
+            M,
+            N,
+            K,
+            gpu_device_,
+            workspace_.get()))
+            << "grouped verifier LM-head projection failed at M=" << M;
+
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                prepared.kernel,
+                input_data.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                serial.data(),
+                1,
+                N,
+                K,
+                gpu_device_))
+                << "serial M=1 LM-head projection failed at grouped M=" << M
+                << " row=" << row;
+
+            const float *grouped_row =
+                grouped.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
+            const auto result = checkParity(
+                grouped_row,
+                serial.data(),
+                serial.size(),
+                0.999999,
+                1.0e-5);
+            EXPECT_FALSE(result.has_nan_inf)
+                << "real Qwen3.6 MoE LM-head grouped M=" << M
+                << " row=" << row << " produced non-finite logits";
+            EXPECT_GE(result.cosine_similarity, 0.999999)
+                << "real Qwen3.6 MoE LM-head grouped M=" << M
+                << " row=" << row << " cosine drift rel_l2="
+                << result.relative_l2_error << " max_abs="
+                << result.max_abs_error << " symmetric_kl="
+                << result.symmetric_kl;
+            EXPECT_LE(result.relative_l2_error, 1.0e-5)
+                << "real Qwen3.6 MoE LM-head grouped M=" << M
+                << " row=" << row << " relative-L2 drift cosine="
+                << result.cosine_similarity << " max_abs="
+                << result.max_abs_error << " symmetric_kl="
+                << result.symmetric_kl;
+            EXPECT_LE(result.symmetric_kl, 1.0e-8)
+                << "real Qwen3.6 MoE LM-head grouped M=" << M
+                << " row=" << row << " softmax distribution drift cosine="
+                << result.cosine_similarity << " rel_l2="
+                << result.relative_l2_error << " max_abs="
+                << result.max_abs_error;
+        }
+
+        cleanupWorkspaceIfNeeded(prepared.kernel);
+    }
+
+    prepared.kernel->setGPUStream(nullptr);
 }
 
 TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)

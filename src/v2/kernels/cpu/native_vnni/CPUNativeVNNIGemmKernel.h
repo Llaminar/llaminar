@@ -1106,13 +1106,18 @@ namespace llaminar2::cpu::native_vnni
                                                 std::min(32, k - kb * 32));
             }
 
-            // Build fused multi-input GEMV descriptors
-            FusedGemvMultiInputDesc mi_descs[16]; // max 16 experts
-            int num_mi = 0;
-            for (int i = 0; i < num_descs && num_mi < 16; ++i)
+            /*
+             * Build one fused multi-input descriptor per routed expert.  The
+             * verifier regression matrix intentionally exercises every native
+             * tensor format in one call, so a fixed small stack array would
+             * silently drop valid descriptors and leave stale output rows.
+             */
+            std::vector<FusedGemvMultiInputDesc> mi_descs;
+            mi_descs.reserve(static_cast<size_t>(num_descs));
+            for (int i = 0; i < num_descs; ++i)
             {
                 auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
-                auto &d = mi_descs[num_mi++];
+                auto &d = mi_descs.emplace_back();
                 d.A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
                 d.packed = &vnni->packed_;
                 d.output = descs[i].output;
@@ -1124,7 +1129,9 @@ namespace llaminar2::cpu::native_vnni
             }
 
             // Single OMP region with nowait between expert projections
-            gemv_fused_multi_input_preq(mi_descs, num_mi);
+            gemv_fused_multi_input_preq(
+                mi_descs.data(),
+                static_cast<int>(mi_descs.size()));
 
             // Clean up deferred workspace
             for (int i = 0; i < num_descs; ++i)
@@ -1132,6 +1139,20 @@ namespace llaminar2::cpu::native_vnni
                 auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
                 if (vnni->deferred_packing_)
                     vnni->packed_.clearWorkspace();
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_fused_expert_down_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"k", std::to_string(k)},
+                        {"experts", std::to_string(num_descs)}});
             }
 
             return true;

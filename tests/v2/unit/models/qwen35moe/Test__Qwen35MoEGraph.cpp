@@ -7,10 +7,14 @@
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/GDNLiveStateLocalizeStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
+#include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/compute_stages/stages/LMHeadStage.h"
 #include "execution/compute_stages/stages/RoPEStage.h"
+#include "execution/compute_stages/stages/ShortConv1dStage.h"
 #include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
@@ -1330,16 +1334,19 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherWhenAva
 }
 
 /**
- * @brief MTP all-position verifier rows must publish GDN state through the handoff stage.
+ * @brief MTP all-position verifier rows keep the mirrored GDN decode contract.
  *
- * The production MTP publisher restores accepted short-conv and recurrence rows
- * from the verifier graph, then scans that same graph for post-restore
- * publication stages.  If an all-position verifier graph is built directly from
- * the replicated dense decode view, GDN capture rows are full-sized and no
- * `GDNLiveStateAllGatherStage` appears, leaving the TP-local accepted row unable
- * to refresh the full mirrored device bank used by the next replicated decode.
+ * LocalTP replicated dense decode avoids tiny GDN output allreduces by giving
+ * every participant the full GDN decode weights and a full mirrored live-state
+ * bank.  Grouped verifier rows must use the same mirrored path once that bank is
+ * available; otherwise the verifier compares a row-parallel `ssm_out`
+ * partial-sum/allreduce against serial decode's full projection and accumulates
+ * non-equivalent FP32 rounding.  Full mirrored verifier capture is also enough
+ * for publication: accepted short-conv and recurrence rows restore the same
+ * full state shape that ordinary decode consumes, so no local-to-full handoff
+ * stage is required in the verifier graph.
  */
-TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierKeepsGDNStateTPLocalForPublicationHandoff)
+TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierUsesMirroredGDNStateWhenHandoffAvailable)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
@@ -1432,7 +1439,7 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierKeepsGDNStateTPLocalForPublicat
         DeviceId::cpu());
 
     ActivationBuffers verifier_buffers = makeGDNTPActivationBuffers(
-        arena, /*tokens=*/2, config, /*value_heads=*/1);
+        arena, /*tokens=*/2, config, /*value_heads=*/2);
     int position_ids[2] = {0, 1};
     ComputeGraph verifier_graph = graph_builder.buildAttentionGraphForTokenCount(
         decode_layer,
@@ -1444,23 +1451,128 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierKeepsGDNStateTPLocalForPublicat
         position_ids,
         DeviceId::cuda(0));
 
-    const auto *handoff_node = verifier_graph.getNode("layer0_gdn_live_state_allgather");
-    ASSERT_NE(handoff_node, nullptr)
-        << "MTP verifier publication needs a post-restore GDN state handoff stage in the verifier graph.";
-    const auto *handoff =
-        dynamic_cast<const GDNLiveStateAllGatherStage *>(handoff_node->stage.get());
-    ASSERT_NE(handoff, nullptr);
-    EXPECT_TRUE(handoff->requiresPostVerifierStatePublication());
-    EXPECT_TRUE(hasDependency(verifier_graph, "layer0_gdn_live_state_allgather", "layer0_gdn_recurrence"));
-    EXPECT_TRUE(hasDependency(verifier_graph, "layer0_gated_norm", "layer0_gdn_live_state_allgather"));
-    EXPECT_NE(verifier_graph.getNode("layer0_gdn_wo_allreduce"), nullptr)
-        << "Verifier GDN remains TP-local until the explicit local-to-full state handoff has run.";
+    EXPECT_EQ(verifier_graph.getNode("layer0_gdn_live_state_localize"), nullptr)
+        << "Verifier rows should start from the mirrored full GDN decode state, "
+           "not re-slice that state into a TP-local row-parallel path.";
+    EXPECT_EQ(verifier_graph.getNode("layer0_gdn_live_state_allgather"), nullptr)
+        << "Accepted verifier rows already capture full mirrored GDN state; "
+           "there is no TP-local state to allgather after publication.";
+    EXPECT_EQ(verifier_graph.getNode("layer0_gdn_wo_allreduce"), nullptr)
+        << "Mirrored verifier GDN output projection must avoid the tiny "
+           "row-parallel allreduce that is not serial-decode equivalent.";
+    EXPECT_TRUE(hasDependency(verifier_graph, "layer0_gated_norm", "layer0_gdn_recurrence"));
 
-    const auto &params = handoff->getParams();
-    EXPECT_EQ(params.local_conv_state_floats, 18);
-    EXPECT_EQ(params.full_conv_state_floats, 36);
-    EXPECT_EQ(params.local_recurrence_state_floats, 4);
-    EXPECT_EQ(params.full_recurrence_state_floats, 8);
+    const auto *short_conv_node = verifier_graph.getNode("layer0_short_conv");
+    ASSERT_NE(short_conv_node, nullptr);
+    const auto *short_conv =
+        dynamic_cast<const ShortConv1dStage *>(short_conv_node->stage.get());
+    ASSERT_NE(short_conv, nullptr);
+    EXPECT_EQ(short_conv->getParams().channels, 12)
+        << "The verifier short-conv must own full Q/K/V channels: "
+           "2*full_key_heads*d_state + full_value_heads*d_state.";
+    EXPECT_EQ(short_conv->getParams().verifier_state_capture_rows, 4)
+        << "Full mirrored short-conv post-row state is the publication source.";
+
+    const auto *recurrence_node = verifier_graph.getNode("layer0_gdn_recurrence");
+    ASSERT_NE(recurrence_node, nullptr);
+    const auto *recurrence =
+        dynamic_cast<const GDNRecurrenceStage *>(recurrence_node->stage.get());
+    ASSERT_NE(recurrence, nullptr);
+    EXPECT_EQ(recurrence->getParams().n_heads, 2);
+    EXPECT_EQ(recurrence->getParams().n_k_heads, 2);
+    EXPECT_EQ(recurrence->getParams().verifier_state_capture_rows, 4)
+        << "Full mirrored recurrence post-row state is restored directly by "
+           "accepted-state publication.";
+}
+
+/**
+ * @brief MTP all-position verifier logits must use grouped decode-equivalent LM-head projection.
+ *
+ * ROCm LocalTP exposed this as a model-level grouped-verifier failure: the
+ * hidden rows were compact verifier rows, but the graph left the terminal
+ * LM-head stage on ordinary all-position GEMM.  That generic GEMM is allowed
+ * to reduce columns in a different order from serial one-token decode, while
+ * the verifier contract requires row 0..M-1 logits to match M independent
+ * decode rows.  This graph-level regression proves that tiny MTP verifier
+ * batches request the backend small-M decode-equivalent implementation before
+ * the heavier CUDA/ROCm parity suites execute it.
+ */
+TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierLMHeadRequestsDecodeEquivalentRows)
+{
+    GraphConfig config = makeMoEConfig();
+    config.n_layers = 1;
+    config.total_n_layers = 1;
+    config.compute_all_position_logits = true;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    TensorArena arena;
+    ModelWeights model_weights;
+    model_weights.embedding_table = arena.fp32({static_cast<size_t>(config.vocab_size),
+                                                static_cast<size_t>(config.d_model)});
+    model_weights.lm_head = arena.fp32({static_cast<size_t>(config.vocab_size),
+                                        static_cast<size_t>(config.d_model)});
+    model_weights.final_norm = arena.fp32({static_cast<size_t>(config.d_model)});
+
+    LayerWeights attention = makeFALayerWeights(arena, config);
+    LayerWeights dense = makeDenseFFNLayerWeights(arena, config);
+    attention.ffn_norm = dense.ffn_norm;
+    attention.gate_proj = dense.gate_proj;
+    attention.up_proj = dense.up_proj;
+    attention.down_proj = dense.down_proj;
+
+    MTPDepthWeights mtp_weights;
+    mtp_weights.depth_index = 0;
+    mtp_weights.source_layer_index = 0;
+    mtp_weights.fc = arena.fp32({static_cast<size_t>(config.d_model),
+                                 static_cast<size_t>(config.d_model * 2)});
+    mtp_weights.pre_fc_norm_hidden = arena.fp32({static_cast<size_t>(config.d_model)});
+    mtp_weights.pre_fc_norm_embedding = arena.fp32({static_cast<size_t>(config.d_model)});
+    mtp_weights.final_norm = arena.fp32({static_cast<size_t>(config.d_model)});
+    mtp_weights.fa_block = attention;
+
+    MTPForwardOutput output;
+    output.embedding = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    output.norm_hidden = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    output.norm_embedding = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    output.concat = arena.fp32({2, static_cast<size_t>(config.d_model * 2)});
+    output.projected = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    output.hidden = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    output.logits = arena.fp32({2, static_cast<size_t>(config.vocab_size)});
+    output.q = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim)});
+    output.k = arena.fp32({2, static_cast<size_t>(config.n_kv_heads * config.head_dim)});
+    output.v = arena.fp32({2, static_cast<size_t>(config.n_kv_heads * config.head_dim)});
+    output.q_raw = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim * 2)});
+    output.q_gate = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim)});
+    output.attn_output = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim)});
+    output.attn_proj = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    output.gate = arena.fp32({2, static_cast<size_t>(config.d_ff)});
+    output.up = arena.fp32({2, static_cast<size_t>(config.d_ff)});
+    output.ffn_output = arena.fp32({2, static_cast<size_t>(config.d_ff)});
+
+    int draft_tokens[2] = {1, 2};
+    int position_ids[2] = {0, 1};
+    MTPForwardInput input;
+    input.draft_token_ids = draft_tokens;
+    input.terminal_hidden = arena.fp32({2, static_cast<size_t>(config.d_model)});
+    input.position_ids = position_ids;
+    input.batch_size = 2;
+    input.seq_len = 1;
+    input.device = DeviceId::cpu();
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeights(model_weights);
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        /*depth_idx=*/0, mtp_weights, input, output);
+
+    const auto *lm_head_node = graph.getNode("mtp0_lm_head");
+    ASSERT_NE(lm_head_node, nullptr);
+    const auto *lm_head =
+        dynamic_cast<const LMHeadStage *>(lm_head_node->stage.get());
+    ASSERT_NE(lm_head, nullptr);
+    EXPECT_TRUE(lm_head->usesDecodeEquivalentVerifierPrefillForTesting())
+        << "Compact MTP verifier logits must use the backend's grouped "
+           "serial-row-equivalent small-M LM-head path.";
 }
 
 /**

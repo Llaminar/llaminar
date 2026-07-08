@@ -126,7 +126,8 @@ namespace llaminar2
         // Attention projections - column-parallel (split on num_heads)
         if (stage_type == "Q_PROJECTION" || stage_type == "K_PROJECTION" ||
             stage_type == "V_PROJECTION" || stage_type == "QKV_PROJECTION" ||
-            stage_type == "Q_NORM" || stage_type == "K_NORM")
+            stage_type == "Q_NORM" || stage_type == "K_NORM" ||
+            stage_type == "FA_GATE")
             return SnapshotShardingMode::COLUMN_PARALLEL;
 
         // RoPE outputs - column-parallel (split on num_heads for Q, num_kv_heads for K)
@@ -139,6 +140,22 @@ namespace llaminar2
         // Attention context - column-parallel (split on num_heads)
         if (stage_type == "ATTENTION_CONTEXT" || stage_type == "ATTENTION_CONTEXT_GATED")
             return SnapshotShardingMode::COLUMN_PARALLEL;
+
+        // GDN projections and per-head state are column-parallel by local head/channel.
+        if (stage_type == "GDN_PROJECTION" ||
+            stage_type == "GDN_CONV1D" ||
+            stage_type == "GDN_CONV1D_OUTPUT" ||
+            stage_type == "GDN_RECURRENCE" ||
+            stage_type == "GDN_DELTA_RULE_OUTPUT" ||
+            stage_type == "GATED_RMSNORM" ||
+            stage_type == "GDN_NORM_GATE_OUTPUT" ||
+            stage_type == "GDN_Z_PROJECTION" ||
+            stage_type == "GDN_ALPHA" ||
+            stage_type == "GDN_BETA")
+            return SnapshotShardingMode::COLUMN_PARALLEL;
+
+        if (stage_type == "GDN_OUTPUT")
+            return SnapshotShardingMode::ROW_PARALLEL;
 
         // Attention output (Wo) - row-parallel before AllReduce, replicated after it.
         if (stage_type == "ATTENTION_OUTPUT")

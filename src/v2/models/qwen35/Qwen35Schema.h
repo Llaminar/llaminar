@@ -472,6 +472,7 @@ namespace llaminar2
             config["GDN_BETA"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GDN_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["ATTENTION_OUTPUT_GATE"] = SnapshotShardingMode::REPLICATED;
+            config["FA_GATE"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["ATTENTION_CONTEXT_GATED"] = SnapshotShardingMode::COLUMN_PARALLEL;
 
             return config;

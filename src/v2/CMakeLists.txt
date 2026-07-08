@@ -1325,6 +1325,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
+    execution/compute_stages/stages/GDNLiveStateLocalizeStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
     execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp

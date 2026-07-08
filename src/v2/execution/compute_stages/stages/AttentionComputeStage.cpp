@@ -360,10 +360,21 @@ namespace llaminar2
 
         const auto kp = params_.kv_cache->k_precision();
         const auto vp = params_.kv_cache->v_precision();
+        /*
+         * CUDA grouped verifier attention consumes FP16 K/V whenever the cache
+         * is either physically FP16 or RoPE-on-read asks get_kv_converted() for
+         * an FP16 shadow.  The latter is the production Q8/BF16 cache path:
+         * cache precision describes storage, while verifier attention sees the
+         * converted post-append span.  Preparing only one AttentionDeviceParams
+         * row in that case sends the M=2..4 verifier through multi-row prefill
+         * semantics instead of row-local serial-decode semantics.
+         */
+        const bool cuda_effective_fp16_kv =
+            (kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
+            params_.apply_rope_to_k;
         const bool cuda_small_fp16_decode =
             params_.device_id.is_cuda() &&
-            kp == ActivationPrecision::FP16 &&
-            vp == ActivationPrecision::FP16 &&
+            cuda_effective_fp16_kv &&
             params_.batch_size == 1 &&
             params_.causal &&
             logical_seq_len > 1 &&
@@ -740,6 +751,14 @@ namespace llaminar2
             LOG_TRACE("[AttentionComputeStage] Dynamic kv_len from cache: " << effective_kv_len
                                                                             << " (static was: " << params_.kv_len << ")");
         }
+        const bool grouped_verifier_device_sequence_state =
+            gpu_stage &&
+            params_.kv_cache &&
+            params_.layer_idx >= 0 &&
+            has_current_dynamic_sequence_state &&
+            logical_seq_len > 1 &&
+            logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            effective_kv_len > logical_seq_len;
 
         // Read K/V from cache at execution time when requested.
         // This allows GPU prefill to use the FP16 tensors in the KV cache
@@ -925,7 +944,43 @@ namespace llaminar2
                     }
 
                     if (effective_K == params_.K &&
-                        (params_.apply_rope_to_k || effective_kv_len > params_.seq_len))
+                        grouped_verifier_device_sequence_state &&
+                        !params_.apply_rope_to_k)
+                    {
+                        /*
+                         * Captured verifier graphs append M=2..4 rows on the
+                         * device and intentionally delay host cache bookkeeping
+                         * until replay completion.  A normal get_kv() view is
+                         * therefore sized from the stale host entry.count.  For
+                         * non-RoPE caches the ring payload is already in the
+                         * right precision, so request a direct physical snapshot
+                         * sized to the post-append verifier horizon.
+                         */
+                        int snapshot_kv_len = 0;
+                        if (!params_.kv_cache->get_kv_snapshot_view(
+                                params_.layer_idx,
+                                0,
+                                effective_kv_len,
+                                &cache_k,
+                                &cache_v,
+                                &snapshot_kv_len) ||
+                            snapshot_kv_len != effective_kv_len)
+                        {
+                            LOG_ERROR("[AttentionComputeStage] GPU verifier attention could not materialize a post-append KV snapshot"
+                                      << " layer=" << params_.layer_idx
+                                      << " requested=" << effective_kv_len
+                                      << " returned=" << snapshot_kv_len
+                                      << " seq_len=" << params_.seq_len);
+                            return false;
+                        }
+                        effective_K = cache_k;
+                        effective_V = cache_v;
+                        LOG_TRACE("[AttentionComputeStage] GPU verifier using post-append KV snapshot"
+                                  << " layer=" << params_.layer_idx
+                                  << " kv_len=" << effective_kv_len);
+                    }
+                    else if (effective_K == params_.K &&
+                             (params_.apply_rope_to_k || effective_kv_len > params_.seq_len))
                     {
                         LOG_DEBUG("[AttentionComputeStage] GPU KV CONVERTED PATH layer=" << params_.layer_idx
                                                                                          << " apply_rope=" << params_.apply_rope_to_k
@@ -944,6 +999,18 @@ namespace llaminar2
                         read_params.head_dim = params_.head_dim;
                         read_params.turboquant_ctx = params_.turboquant_ctx;
                         read_params.gpu_stream = gpuStream();
+                        if (grouped_verifier_device_sequence_state)
+                        {
+                            /*
+                             * RoPE-on-read caches must build the converted
+                             * shadow over the same post-append span used by
+                             * row-local attention params.  Without this field
+                             * get_kv_converted() sizes the shadow from host
+                             * cache metadata, which is deliberately stale while
+                             * a captured verifier graph is still replaying.
+                             */
+                            read_params.requested_token_count = effective_kv_len;
+                        }
 
                         int kv_len_out = 0;
                         if (params_.kv_cache->get_kv_converted(
@@ -958,6 +1025,15 @@ namespace llaminar2
                             {
                                 LOG_ERROR("[AttentionComputeStage] GPU get_kv_converted returned invalid kv_len="
                                           << kv_len_out << " for layer " << params_.layer_idx);
+                                return false;
+                            }
+                            if (grouped_verifier_device_sequence_state &&
+                                kv_len_out != effective_kv_len)
+                            {
+                                LOG_ERROR("[AttentionComputeStage] GPU verifier converted KV span mismatch"
+                                          << " layer=" << params_.layer_idx
+                                          << " requested=" << effective_kv_len
+                                          << " returned=" << kv_len_out);
                                 return false;
                             }
                             effective_kv_len = kv_len_out;

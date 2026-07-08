@@ -2632,7 +2632,13 @@ namespace llaminar2
             return false;
 
         const auto &entry = entries_[layer][seq_idx];
-        if (entry.count == 0)
+        const int requested_token_count =
+            rope && rope->requested_token_count > 0
+                ? rope->requested_token_count
+                : 0;
+        const bool read_past_host_count =
+            requested_token_count > entry.count;
+        if (entry.count == 0 && !read_past_host_count)
         {
             if (out_k)
                 *out_k = nullptr;
@@ -2651,6 +2657,12 @@ namespace llaminar2
         const bool want_rope = (rope && rope->rope_theta > 0.0f);
         if (!want_rope)
         {
+            if (read_past_host_count)
+            {
+                return ROCmRingKVCache::get_kv_snapshot_view(
+                    layer, seq_idx, requested_token_count,
+                    out_k, out_v, out_kv_len);
+            }
             return ROCmRingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
         }
 
@@ -2660,6 +2672,166 @@ namespace llaminar2
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];
+        const int read_count =
+            requested_token_count > 0 ? requested_token_count : entry.count;
+        if (read_count <= 0 || read_count > max_seq_len_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Invalid requested token count "
+                      << read_count << " for max_seq_len=" << max_seq_len_);
+            return false;
+        }
+
+        if (read_past_host_count)
+        {
+            /*
+             * Captured MTP verifier graphs append grouped rows on device and
+             * intentionally postpone host ring metadata updates.  When the
+             * requested span is still a direct physical prefix, the RoPE shadow
+             * can be built from the post-append device payload in graph order.
+             */
+            if ((entry.count > 0 && entry.tail(max_seq_len_) != 0) ||
+                entry.head != entry.count)
+            {
+                LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Requested post-append RoPE shadow is not physically contiguous"
+                          << " layer=" << layer
+                          << " seq=" << seq_idx
+                          << " host_count=" << entry.count
+                          << " head=" << entry.head
+                          << " requested=" << read_count);
+                return false;
+            }
+
+            auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
+            auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
+            if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                const size_t bytes =
+                    static_cast<size_t>(read_count) *
+                    static_cast<size_t>(kv_dim_) *
+                    sizeof(_Float16);
+                hipError_t err = hipMemcpyAsync(
+                    shadow_k, entry.d_K, bytes,
+                    hipMemcpyDeviceToDevice, stream);
+                if (err == hipSuccess)
+                {
+                    err = hipMemcpyAsync(
+                        shadow_v, entry.d_V, bytes,
+                        hipMemcpyDeviceToDevice, stream);
+                }
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP16 shadow copy failed: "
+                              << hipGetErrorString(err));
+                    return false;
+                }
+                if (!hip_rope_apply_fp16(shadow_k, read_count, local_n_kv_heads_, head_dim_,
+                                         rope->rope_theta, rope->position_start, stream,
+                                         rope->rope_dim))
+                {
+                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP16 RoPE application failed");
+                    return false;
+                }
+            }
+            else if constexpr (Precision == ActivationPrecision::FP32)
+            {
+                const size_t bytes =
+                    static_cast<size_t>(read_count) *
+                    static_cast<size_t>(kv_dim_) *
+                    sizeof(float);
+                if (!ensureConvScratch(bytes))
+                    return false;
+
+                auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
+                auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
+                hipError_t err = hipMemcpyAsync(
+                    d_temp_k, entry.d_K, bytes,
+                    hipMemcpyDeviceToDevice, stream);
+                if (err == hipSuccess)
+                {
+                    err = hipMemcpyAsync(
+                        d_temp_v, entry.d_V, bytes,
+                        hipMemcpyDeviceToDevice, stream);
+                }
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP32 scratch copy failed: "
+                              << hipGetErrorString(err));
+                    return false;
+                }
+                if (!hip_rope_apply_fp32(d_temp_k, read_count, local_n_kv_heads_, head_dim_,
+                                         rope->rope_theta, rope->position_start, stream,
+                                         rope->rope_dim) ||
+                    !hip_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
+                                                reinterpret_cast<uint16_t *>(shadow_k),
+                                                read_count * kv_dim_, stream) ||
+                    !hip_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
+                                                reinterpret_cast<uint16_t *>(shadow_v),
+                                                read_count * kv_dim_, stream))
+                {
+                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP32 RoPE/convert failed");
+                    return false;
+                }
+            }
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                if (!hip_convert_tensor_to_fp16(entry.d_K, TensorType::Q8_1,
+                                                reinterpret_cast<uint16_t *>(shadow_k),
+                                                read_count * kv_dim_, stream) ||
+                    !hip_convert_tensor_to_fp16(entry.d_V, TensorType::Q8_1,
+                                                reinterpret_cast<uint16_t *>(shadow_v),
+                                                read_count * kv_dim_, stream) ||
+                    !hip_rope_apply_fp16(shadow_k, read_count, local_n_kv_heads_, head_dim_,
+                                         rope->rope_theta, rope->position_start, stream,
+                                         rope->rope_dim))
+                {
+                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append Q8_1 RoPE/convert failed");
+                    return false;
+                }
+            }
+            else if constexpr (Precision == ActivationPrecision::BF16)
+            {
+                if (!hip_convert_tensor_to_fp16(entry.d_K, TensorType::BF16,
+                                                reinterpret_cast<uint16_t *>(shadow_k),
+                                                read_count * kv_dim_, stream) ||
+                    !hip_convert_tensor_to_fp16(entry.d_V, TensorType::BF16,
+                                                reinterpret_cast<uint16_t *>(shadow_v),
+                                                read_count * kv_dim_, stream) ||
+                    !hip_rope_apply_fp16(shadow_k, read_count, local_n_kv_heads_, head_dim_,
+                                         rope->rope_theta, rope->position_start, stream,
+                                         rope->rope_dim))
+                {
+                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append BF16 RoPE/convert failed");
+                    return false;
+                }
+            }
+
+            shadow.converted_count = read_count;
+            shadow.last_head = read_count;
+            shadow.rope_applied = true;
+
+            if (!shadow.k_view ||
+                shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+            {
+                shadow.k_view = std::make_unique<GpuTensorView>(
+                    shadow.d_K, shadow.converted_count, kv_dim_,
+                    TensorType::FP16, device_id_);
+            }
+            if (!shadow.v_view ||
+                shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+            {
+                shadow.v_view = std::make_unique<GpuTensorView>(
+                    shadow.d_V, shadow.converted_count, kv_dim_,
+                    TensorType::FP16, device_id_);
+            }
+
+            if (out_k)
+                *out_k = shadow.k_view.get();
+            if (out_v)
+                *out_v = shadow.v_view.get();
+            if (out_kv_len)
+                *out_kv_len = shadow.converted_count;
+            return true;
+        }
 
         // Detect incremental vs full rebuild
         const int new_tokens = entry.count - shadow.converted_count;

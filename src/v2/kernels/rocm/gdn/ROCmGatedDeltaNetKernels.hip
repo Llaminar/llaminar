@@ -1143,6 +1143,63 @@ __global__ void rocm_gdn_compact_modular_conv_state_kernel(
     }
 }
 
+/**
+ * @brief Slice one participant's modular short-conv bank from a full bank.
+ *
+ * Q and K history are replicated in modular GDN TP, while V history is sharded.
+ * The grouped verifier needs the economical local layout, so this helper copies
+ * all mirrored Q/K channels and only this rank's V slice.
+ */
+__global__ void rocm_gdn_slice_modular_conv_state_kernel(
+    const float *__restrict__ full,
+    float *__restrict__ local,
+    int rank,
+    int degree,
+    int qk_channels,
+    int local_v_channels,
+    int full_v_channels,
+    int history_len)
+{
+    if (!full || !local ||
+        rank < 0 || rank >= degree ||
+        degree <= 0 || qk_channels <= 0 ||
+        local_v_channels <= 0 || full_v_channels <= 0 ||
+        history_len <= 0)
+    {
+        return;
+    }
+
+    const int local_channels = qk_channels + local_v_channels;
+    const int full_channels = qk_channels + full_v_channels;
+    const int local_state_size = local_channels * history_len;
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < local_state_size;
+         idx += stride)
+    {
+        const int channel = idx / history_len;
+        const int history = idx - channel * history_len;
+        size_t src_idx = 0;
+        if (channel < qk_channels)
+        {
+            src_idx = static_cast<size_t>(channel) * static_cast<size_t>(history_len) +
+                      static_cast<size_t>(history);
+        }
+        else
+        {
+            const int local_v_channel = channel - qk_channels;
+            const int full_v_channel = rank * local_v_channels + local_v_channel;
+            if (full_v_channel < 0 || full_v_channel >= full_v_channels)
+                continue;
+            src_idx = static_cast<size_t>(qk_channels + full_v_channel) *
+                          static_cast<size_t>(history_len) +
+                      static_cast<size_t>(history);
+        }
+        if (src_idx < static_cast<size_t>(full_channels) * static_cast<size_t>(history_len))
+            local[idx] = full[src_idx];
+    }
+}
+
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
@@ -1350,6 +1407,70 @@ bool rocmGDN_compact_modular_conv_state(
     {
         fprintf(stderr,
                 "[rocmGDN_compact_modular_conv_state] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_slice_modular_conv_state(
+    const float *full,
+    float *local,
+    int rank,
+    int degree,
+    int qk_channels,
+    int local_v_channels,
+    int full_v_channels,
+    int history_len,
+    int device_idx,
+    void *stream)
+{
+    if (!full || !local || !stream ||
+        rank < 0 || rank >= degree ||
+        degree <= 0 || qk_channels <= 0 ||
+        local_v_channels <= 0 || full_v_channels <= 0 ||
+        full_v_channels != local_v_channels * degree ||
+        history_len <= 0)
+    {
+        return false;
+    }
+
+    hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx));
+    if (set_err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_slice_modular_conv_state] hipSetDevice(%d) failed: %s\n",
+                device_idx,
+                hipGetErrorString(set_err));
+        return false;
+    }
+    (void)hipGetLastError();
+    const int local_state_size = (qk_channels + local_v_channels) * history_len;
+    constexpr int threads = 256;
+    int blocks = (local_state_size + threads - 1) / threads;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+    hipLaunchKernelGGL(
+        rocm_gdn_slice_modular_conv_state_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        (hipStream_t)stream,
+        full,
+        local,
+        rank,
+        degree,
+        qk_channels,
+        local_v_channels,
+        full_v_channels,
+        history_len);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_slice_modular_conv_state] %s\n",
                 hipGetErrorString(err));
         return false;
     }

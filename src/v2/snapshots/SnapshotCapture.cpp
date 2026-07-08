@@ -259,12 +259,27 @@ namespace llaminar2
             return;
         }
 
-        // Handle FusedResidualNormStage — store outputs[1] (norm_output), not outputs[0] (residual)
+        // Handle FusedResidualNormStage. The normalized output keeps the long-standing
+        // semantic key, while residual_out exposes the hidden-state handoff that
+        // happens inside this fused stage. That handoff is essential for grouped
+        // verifier diagnostics because non-terminal FFN residual adds are often
+        // represented by the next layer's fused attention norm rather than by a
+        // standalone ResidualAddStage node.
         if ((name.find("_attn_norm") != std::string::npos ||
              name.find("_ffn_norm") != std::string::npos) &&
             dump.outputs.size() >= 2)
         {
             std::string key = convertStageNameToSnapshotKey(name);
+
+            if (dump.outputs[0].data)
+            {
+                auto data = extractFp32FromOutput(dump.outputs[0]);
+                LOG_DEBUG("[Snapshot] FusedResidualNorm: storing residual_out as key="
+                          << key << "_RESIDUAL_OUT count=" << data.size());
+                if (!data.empty())
+                    snapshots_[key + "_RESIDUAL_OUT"] =
+                        {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
+            }
 
             if (dump.outputs[1].data)
             {
@@ -665,7 +680,8 @@ namespace llaminar2
         if ((stage_name.find("_attn_norm") != std::string::npos ||
              stage_name.find("_ffn_norm") != std::string::npos))
         {
-            return {convertStageNameToSnapshotKey(stage_name)};
+            const std::string key = convertStageNameToSnapshotKey(stage_name);
+            return {key, key + "_RESIDUAL_OUT"};
         }
         if (stage_name.find("_moe_ffn") != std::string::npos)
         {

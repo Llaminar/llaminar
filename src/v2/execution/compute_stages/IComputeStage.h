@@ -344,6 +344,7 @@ namespace llaminar2
         GDN_PROJECTION,        ///< 4 separate GEMMs: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b
         SHORT_CONV1D,          ///< Causal depthwise conv1d (kernel=4) + SiLU
         GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
+        GDN_LIVE_STATE_LOCALIZE,  ///< Slice mirrored GDN state into TP-local verifier state
         GDN_LIVE_STATE_ALLGATHER, ///< Gather TP-local GDN state into mirrored decode state
 
         // Qwen 3.5 FA-specific

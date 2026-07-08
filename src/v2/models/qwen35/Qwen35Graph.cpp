@@ -709,6 +709,12 @@ namespace llaminar2
 
         const int mtp_lm_head_vocab_size =
             mtp_lm_head_column_parallel ? config_.vocab_local : config_.vocab_size;
+        const bool force_decode_equivalent_lm_head_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            total_tokens <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
 
         graph.addNode(prefix + "lm_head",
                       ComputeStageFactory::createLMHead({
@@ -721,6 +727,19 @@ namespace llaminar2
                           .vocab_size = mtp_lm_head_vocab_size,
                           .use_prefill_replay_row_offset = false,
                           .compute_all_positions = true,
+                          /*
+                           * MTP verifier logits are compared row-by-row against
+                           * ordinary serial decode.  The generic all-position
+                           * GEMM path is allowed to choose a reduction order
+                           * that is mathematically close but not identical to
+                           * the rowwise decode GEMV path, which is exactly the
+                           * kind of drift ROCm LocalTP surfaced at the LM head.
+                           * Keep the graph on the economical grouped small-M
+                           * verifier implementation that the backend kernel
+                           * suites prove serial-row-equivalent.
+                           */
+                          .force_decode_equivalent_verifier_prefill =
+                              force_decode_equivalent_lm_head_verifier_prefill,
                           .input_buffer_id = BufferId::MTP_HIDDEN,
                           .output_buffer_id = BufferId::MTP_LOGITS,
                           .prepared_ref = preparedRefForGraphWeight(
@@ -796,20 +815,28 @@ namespace llaminar2
         /*
          * LocalTP dense decode normally runs from replicated GDN weights and a
          * full mirrored GDN live-state bank after the prefill handoff.  The MTP
-         * all-position verifier must project exactly the same rows as ordinary
-         * serial decode, so keep the replicated decode view for ordinary decode
-         * whenever the live handoff is available.  MTP all-position verifier
-         * rows are different: accepted-row publication scans the verifier graph
-         * for the explicit GDN handoff stage after restoring speculative state,
-         * so verifier capture keeps the TP-local state path even when ordinary
-         * decode would already have a full mirrored bank.
+         * all-position verifier has the same numerical contract as ordinary
+         * serial decode: every verifier row must see the same GDN math, the same
+         * output-projection reduction order, and the same post-row state shape.
+         *
+         * Earlier builds forced verifier rows back through the TP-local GDN path
+         * so an explicit local-to-full handoff stage could publish accepted
+         * state.  That made publication possible, but it also made the verifier
+         * compare a row-parallel `ssm_out` partial-sum/allreduce against serial
+         * decode's replicated full projection.  Those two paths are not
+         * bitwise-equivalent because they reduce the dot product in different
+         * FP32 orders.  Once the mirrored live-state handoff is available, keep
+         * verifier rows on the mirrored dense GDN path instead: the short-conv
+         * and recurrence stages capture full post-row state directly, so
+         * accepted-state publication can restore the same full bank that serial
+         * decode would have produced without a tiny verifier allreduce.
          */
         const bool keep_gdn_state_tp_local =
             useDecodeReplicatedDenseWeights() &&
             config_.dense_tp_decode_replicated &&
             config_.qkv_column_parallel &&
             weight_bindings_.get_layer_weights != nullptr &&
-            (!live_state_allgather_available || verifier_state_capture_supported);
+            !live_state_allgather_available;
 
         LayerWeightBindings layer_bindings = keep_gdn_state_tp_local
                                                  ? weight_bindings_.get_layer_weights(layer_idx)
@@ -892,6 +919,30 @@ namespace llaminar2
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4;
+        const int full_key_dim = n_k_heads_full * d_k;
+        const int full_value_dim = config_.gdn.inner_size > 0
+                                       ? config_.gdn.inner_size
+                                       : n_v_heads_full * d_v;
+        const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
+        const int conv_history_len = std::max(0, config_.gdn.conv_kernel_size - 1);
+        const bool modular_conv_state =
+            n_v_heads_full > n_k_heads_full &&
+            n_k_heads == n_k_heads_full &&
+            n_v_heads < n_v_heads_full;
+        const int local_conv_state_floats = qkv_dim * conv_history_len;
+        const int full_conv_state_floats = full_qkv_dim * conv_history_len;
+        const int local_recurrence_state_floats = n_v_heads * d_k * d_v;
+        const int full_recurrence_state_floats = n_v_heads_full * d_k * d_v;
+        const bool gdn_state_already_full =
+            local_conv_state_floats == full_conv_state_floats &&
+            local_recurrence_state_floats == full_recurrence_state_floats;
+        const bool gdn_live_state_handoff_candidate =
+            total_tokens > 1 && live_state_allgather_available;
+        const bool needs_gdn_live_state_localize =
+            gdn_live_state_handoff_candidate &&
+            verifier_state_capture_supported &&
+            keep_gdn_state_tp_local &&
+            !gdn_state_already_full;
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -943,6 +994,43 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "gdn_proj", prefix + "attn_norm");
 
+        std::string gdn_state_localize_node;
+        if (needs_gdn_live_state_localize)
+        {
+            GDNLiveStateLocalizeStage::Params state_localize_params;
+            state_localize_params.device_id = device;
+            state_localize_params.tp_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
+            state_localize_params.conv_kernel = gdn_state->conv_kernel.get();
+            state_localize_params.recurrence_kernel = gdn_state->rec_kernel.get();
+            state_localize_params.layer_idx = layer_idx;
+            state_localize_params.tp_device_idx = config_.tp_device_idx;
+            state_localize_params.local_conv_state_floats = local_conv_state_floats;
+            state_localize_params.full_conv_state_floats = full_conv_state_floats;
+            state_localize_params.modular_conv_state = modular_conv_state;
+            if (modular_conv_state)
+            {
+                state_localize_params.conv_history_len = conv_history_len;
+                state_localize_params.conv_qk_channels = 2 * full_key_dim;
+                state_localize_params.conv_local_v_channels = value_dim;
+                state_localize_params.conv_full_v_channels = full_value_dim;
+            }
+            state_localize_params.local_recurrence_state_floats = local_recurrence_state_floats;
+            state_localize_params.full_recurrence_state_floats = full_recurrence_state_floats;
+            state_localize_params.stage_name = prefix + "gdn_live_state_localize";
+
+            /*
+             * The localize stage has no arena inputs, but tying it to attn_norm
+             * keeps the graph connected and lets the projection run in parallel.
+             * short_conv depends on both this handoff and gdn_proj, so it cannot
+             * consume stale TP-local state from a previous verifier capture.
+             */
+            gdn_state_localize_node = prefix + "gdn_live_state_localize";
+            graph.addNode(gdn_state_localize_node,
+                          ComputeStageFactory::createGDNLiveStateLocalize(state_localize_params),
+                          device);
+            graph.addDependency(gdn_state_localize_node, prefix + "attn_norm");
+        }
+
         // =====================================================================
         // Stage 3: Short Conv1d + SiLU on QKV
         // =====================================================================
@@ -973,6 +1061,8 @@ namespace llaminar2
                       ComputeStageFactory::createShortConv1d(conv_params),
                       device);
         graph.addDependency(prefix + "short_conv", prefix + "gdn_proj");
+        if (!gdn_state_localize_node.empty())
+            graph.addDependency(prefix + "short_conv", gdn_state_localize_node);
 
         // =====================================================================
         // Stage 4: GDN Recurrence (delta rule linear attention)
@@ -1046,18 +1136,8 @@ namespace llaminar2
         graph.addDependency(prefix + "gdn_recurrence", prefix + "short_conv");
 
         std::string gdn_state_ready_node = prefix + "gdn_recurrence";
-        if (total_tokens > 1 && live_state_allgather_available)
+        if (gdn_live_state_handoff_candidate)
         {
-            const int full_key_dim = n_k_heads_full * d_k;
-            const int full_value_dim = config_.gdn.inner_size > 0
-                                           ? config_.gdn.inner_size
-                                           : n_v_heads_full * d_v;
-            const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
-            const int conv_history_len = std::max(0, config_.gdn.conv_kernel_size - 1);
-            const bool modular_conv_state =
-                n_v_heads_full > n_k_heads_full &&
-                n_k_heads == n_k_heads_full &&
-                n_v_heads < n_v_heads_full;
             GDNLiveStateAllGatherStage::Params state_gather_params;
             state_gather_params.device_id = device;
             state_gather_params.tp_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
@@ -1065,10 +1145,8 @@ namespace llaminar2
             state_gather_params.recurrence_kernel = gdn_state->rec_kernel.get();
             state_gather_params.layer_idx = layer_idx;
             state_gather_params.tp_device_idx = config_.tp_device_idx;
-            state_gather_params.local_conv_state_floats =
-                qkv_dim * conv_history_len;
-            state_gather_params.full_conv_state_floats =
-                full_qkv_dim * conv_history_len;
+            state_gather_params.local_conv_state_floats = local_conv_state_floats;
+            state_gather_params.full_conv_state_floats = full_conv_state_floats;
             state_gather_params.modular_conv_state = modular_conv_state;
             if (modular_conv_state)
             {
@@ -1077,17 +1155,10 @@ namespace llaminar2
                 state_gather_params.conv_local_v_channels = value_dim;
                 state_gather_params.conv_full_v_channels = full_value_dim;
             }
-            state_gather_params.local_recurrence_state_floats =
-                n_v_heads * d_k * d_v;
-            state_gather_params.full_recurrence_state_floats =
-                n_v_heads_full * d_k * d_v;
+            state_gather_params.local_recurrence_state_floats = local_recurrence_state_floats;
+            state_gather_params.full_recurrence_state_floats = full_recurrence_state_floats;
             state_gather_params.stage_name = prefix + "gdn_live_state_allgather";
 
-            const bool gdn_state_already_full =
-                state_gather_params.local_conv_state_floats ==
-                    state_gather_params.full_conv_state_floats &&
-                state_gather_params.local_recurrence_state_floats ==
-                    state_gather_params.full_recurrence_state_floats;
             if (!gdn_state_already_full)
             {
                 graph.addNode(prefix + "gdn_live_state_allgather",

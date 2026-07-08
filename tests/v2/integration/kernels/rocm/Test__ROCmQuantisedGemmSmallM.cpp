@@ -272,6 +272,65 @@ namespace
     }
 
     /**
+     * @brief Require FP32 verifier rows to be byte-for-byte identical.
+     *
+     * The grouped MoE verifier path publishes rows that serial decode would
+     * otherwise own.  Similarity thresholds are useful diagnostics, but they do
+     * not prove that grouped publication is safe: a one-ulp perturbation can be
+     * amplified by later residual, GDN, MoE, and sampler stages.  The all-format
+     * sweep therefore treats serial M=1 decode as the canonical byte stream and
+     * fails on the first differing float bit pattern.
+     */
+    void expectBitwiseFP32RowsEqual(
+        const std::string &label,
+        const float *actual,
+        const float *reference,
+        size_t count,
+        size_t row_width)
+    {
+        ASSERT_NE(actual, nullptr) << label;
+        ASSERT_NE(reference, nullptr) << label;
+        ASSERT_GT(count, 0u) << label;
+        if (std::memcmp(actual, reference, count * sizeof(float)) == 0)
+            return;
+
+        size_t first_mismatch = 0;
+        uint32_t actual_bits = 0;
+        uint32_t reference_bits = 0;
+        for (; first_mismatch < count; ++first_mismatch)
+        {
+            std::memcpy(&actual_bits, actual + first_mismatch, sizeof(actual_bits));
+            std::memcpy(&reference_bits, reference + first_mismatch, sizeof(reference_bits));
+            if (actual_bits != reference_bits)
+                break;
+        }
+
+        const auto max_diff = maxDifference(actual, reference, count);
+        const float cos = cosineSim(actual, reference, count);
+        const float rel_l2 = relativeL2(actual, reference, count);
+        const float max_abs = maxAbsDiff(actual, reference, count);
+        const size_t safe_row_width = row_width == 0 ? count : row_width;
+        const size_t mismatch_row = first_mismatch / safe_row_width;
+        const size_t mismatch_col = first_mismatch % safe_row_width;
+        ADD_FAILURE()
+            << label
+            << " first_mismatch=" << first_mismatch
+            << " row=" << mismatch_row
+            << " col=" << mismatch_col
+            << " actual=" << (first_mismatch < count ? actual[first_mismatch] : 0.0f)
+            << " reference=" << (first_mismatch < count ? reference[first_mismatch] : 0.0f)
+            << " actual_bits=0x" << std::hex << actual_bits
+            << " reference_bits=0x" << reference_bits << std::dec
+            << " cosine=" << cos
+            << " rel_l2=" << rel_l2
+            << " max_abs=" << max_abs
+            << " max_diff_index=" << max_diff.index
+            << " max_diff_actual=" << max_diff.actual
+            << " max_diff_reference=" << max_diff.reference
+            << " max_diff_abs=" << max_diff.abs_diff;
+    }
+
+    /**
      * @brief Symmetric KL divergence after a numerically stable softmax.
      *
      * Grouped verifier rows are accepted only if they match serial decode as a
@@ -688,7 +747,9 @@ namespace
                 (tag_equals("seq_len", std::to_string(seq_len)) &&
                  tag_equals("top_k", std::to_string(top_k)) &&
                  tag_equals("active_expert_slots", std::to_string(num_experts)) &&
-                 tag_equals("gateup_kparts", "4"));
+                 tag_equals("gateup_route", "decode_equiv_prefill") &&
+                 tag_equals("down_route", "decode_equiv_ordered_publish") &&
+                 tag_equals("gateup_kparts", "0"));
         }
 
         EXPECT_TRUE(saw_small_grouping)
@@ -696,7 +757,8 @@ namespace
             << PerfStatsCollector::summaryString(
                    {"kernel.rocm_moe_small_prefill_grouping_calls"}, 40);
         EXPECT_TRUE(saw_grouped_prefill)
-            << label << " must exercise ROCm grouped K-part verifier prefill\n"
+            << label << " must exercise ROCm grouped decode-equivalent verifier prefill "
+            << "with ordered down publication\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"}, 40);
     }
@@ -712,11 +774,13 @@ namespace
      * hidden rows.
      */
     void runROCmMoECodegroupVerifierRowsMatchSerialDecode(
-        const NativeCodegroupCase &format,
+        const NativeCodegroupCase &gateup_format,
+        const NativeCodegroupCase &down_format,
         int seq_len)
     {
 #ifndef HAVE_ROCM
-        (void)format;
+        (void)gateup_format;
+        (void)down_format;
         (void)seq_len;
         GTEST_SKIP() << "HAVE_ROCM not enabled";
 #else
@@ -728,7 +792,8 @@ namespace
 
         hipStream_t stream = nullptr;
         ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess)
-            << format.label << " explicit HIP stream";
+            << gateup_format.label << "/" << down_format.label
+            << " explicit HIP stream";
 
         ROCmMoEKernel moe_kernel(0);
         static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
@@ -739,7 +804,9 @@ namespace
             intermediate,
             num_experts,
             top_k);
-        ASSERT_NE(moe_workspace, nullptr) << format.label << " MoE workspace";
+        ASSERT_NE(moe_workspace, nullptr)
+            << gateup_format.label << "/" << down_format.label
+            << " MoE workspace";
 
         std::vector<std::unique_ptr<TensorBase>> owned_weights;
         std::vector<GpuPreparedGemm> prepared_weights;
@@ -748,10 +815,11 @@ namespace
 
         auto add_prepared = [&](int rows,
                                 int cols,
+                                const NativeCodegroupCase &codegroup,
                                 uint32_t seed,
                                 const char *role) -> ITensorGemm *
         {
-            auto weight = format.create(
+            auto weight = codegroup.create(
                 {static_cast<size_t>(rows), static_cast<size_t>(cols)},
                 seed);
             auto *weight_ptr = weight.get();
@@ -760,19 +828,22 @@ namespace
                 weight_ptr,
                 device,
                 std::string("test.rocm_moe.all_codegroups.") +
-                    format.label + "." + role + "." + std::to_string(seed),
+                    gateup_format.label + "_gateup." + down_format.label + "_down." +
+                    role + "." + std::to_string(seed),
                 ModelContextId{970000 + static_cast<uint64_t>(seed)}));
 
             auto *kernel = prepared_weights.back().kernel;
             DeviceNativeVNNIMatrixDesc desc{};
             const bool exported = kernel->exportNativeVNNIMatrixDesc(desc);
             EXPECT_TRUE(exported)
-                << format.label << " descriptor export for " << role;
+                << gateup_format.label << "/" << down_format.label
+                << " descriptor export for " << role;
             if (!exported)
                 return nullptr;
-            EXPECT_EQ(desc.codebook_id, format.codebook_id)
-                << format.label << " must exercise the intended native-VNNI codegroup";
-            if (desc.codebook_id != format.codebook_id)
+            EXPECT_EQ(desc.codebook_id, codegroup.codebook_id)
+                << gateup_format.label << "/" << down_format.label
+                << " must exercise the intended native-VNNI codegroup for " << role;
+            if (desc.codebook_id != codegroup.codebook_id)
                 return nullptr;
             return kernel;
         };
@@ -789,16 +860,19 @@ namespace
         {
             experts[static_cast<size_t>(expert)].gate =
                 add_prepared(intermediate, d_model,
+                             gateup_format,
                              1000u + static_cast<uint32_t>(expert),
                              "gate");
             ASSERT_NE(experts[static_cast<size_t>(expert)].gate, nullptr);
             experts[static_cast<size_t>(expert)].up =
                 add_prepared(intermediate, d_model,
+                             gateup_format,
                              2000u + static_cast<uint32_t>(expert),
                              "up");
             ASSERT_NE(experts[static_cast<size_t>(expert)].up, nullptr);
             experts[static_cast<size_t>(expert)].down =
                 add_prepared(d_model, intermediate,
+                             down_format,
                              3000u + static_cast<uint32_t>(expert),
                              "down");
             ASSERT_NE(experts[static_cast<size_t>(expert)].down, nullptr);
@@ -824,13 +898,17 @@ namespace
             num_experts,
             d_model,
             intermediate);
-        ASSERT_GE(gateup_table, 0) << format.label << " gate/up table";
+        ASSERT_GE(gateup_table, 0)
+            << gateup_format.label << "/" << down_format.label
+            << " gate/up table";
         const int down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
             down_descs.data(),
             num_experts,
             d_model,
             intermediate);
-        ASSERT_GE(down_table, 0) << format.label << " down table";
+        ASSERT_GE(down_table, 0)
+            << gateup_format.label << "/" << down_format.label
+            << " down table";
 
         auto hidden = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
@@ -841,7 +919,8 @@ namespace
                 0.003f * static_cast<float>(static_cast<int>((i / 11) % 23) - 11);
         }
         ASSERT_TRUE(hidden->ensureOnDevice(device, stream))
-            << format.label << " hidden upload M=" << seq_len;
+            << gateup_format.label << "/" << down_format.label
+            << " hidden upload M=" << seq_len;
 
         auto routing_indices = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
@@ -923,7 +1002,8 @@ namespace
                 up_outputs.data(),
                 d_model,
                 intermediate))
-                << format.label << " rowwise gate/up row=" << row;
+                << gateup_format.label << "/" << down_format.label
+                << " rowwise gate/up row=" << row;
             ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
                 gate_outputs.data(),
                 up_outputs.data(),
@@ -934,7 +1014,8 @@ namespace
                 decode_output.get(),
                 d_model,
                 intermediate))
-                << format.label << " rowwise down row=" << row;
+                << gateup_format.label << "/" << down_format.label
+                << " rowwise down row=" << row;
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             decode_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
             std::copy(decode_output->data(),
@@ -954,7 +1035,8 @@ namespace
             seq_len,
             num_experts,
             top_k))
-            << format.label << " grouped expert planning M=" << seq_len;
+            << gateup_format.label << "/" << down_format.label
+            << " grouped expert planning M=" << seq_len;
         ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
             hidden.get(),
             grouped_output.get(),
@@ -965,12 +1047,13 @@ namespace
             intermediate,
             num_experts,
             top_k))
-            << format.label << " grouped verifier prefill M=" << seq_len;
+            << gateup_format.label << "/" << down_format.label
+            << " grouped verifier prefill M=" << seq_len;
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
 
         expectMoEGroupedVerifierPerfStats(
-            format.label,
+            (std::string(gateup_format.label) + "/" + down_format.label).c_str(),
             seq_len,
             num_experts,
             top_k);
@@ -978,7 +1061,8 @@ namespace
         const size_t output_count =
             static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
         const auto label = std::string("ROCm MoE grouped verifier codegroup ") +
-                           format.label + " M=" + std::to_string(seq_len) +
+                           gateup_format.label + "_gateup/" + down_format.label +
+                           "_down M=" + std::to_string(seq_len) +
                            " must match rowwise serial decode";
         const auto metrics = [&]()
         {
@@ -993,9 +1077,12 @@ namespace
             const auto max_diff = maxDifference(actual, reference, output_count);
             const size_t max_row = max_diff.index / static_cast<size_t>(d_model);
             const size_t max_col = max_diff.index % static_cast<size_t>(d_model);
-            LOG_INFO("[SmallM][MoECodegroup] " << format.label
-                                               << " codebook="
-                                               << static_cast<int>(format.codebook_id)
+            LOG_INFO("[SmallM][MoECodegroup] gateup=" << gateup_format.label
+                                               << " gateup_codebook="
+                                               << static_cast<int>(gateup_format.codebook_id)
+                                               << " down=" << down_format.label
+                                               << " down_codebook="
+                                               << static_cast<int>(down_format.codebook_id)
                                                << " M=" << seq_len
                                                << " cosine=" << cos
                                                << " rel_l2=" << rel_l2
@@ -1013,10 +1100,13 @@ namespace
             << label << " produced an all-zero serial decode witness";
         ASSERT_GT(l2Norm(grouped_output->data(), output_count), 1.0e-7)
             << label << " produced an all-zero grouped decode witness";
-        EXPECT_GE(std::get<0>(metrics), 0.99995f) << label;
-        EXPECT_LE(std::get<1>(metrics), 5.0e-3f) << label;
-        EXPECT_LE(std::get<2>(metrics), 2.5e-1f) << label;
-        EXPECT_LE(std::get<3>(metrics), 1.0e-5) << label;
+        (void)metrics;
+        expectBitwiseFP32RowsEqual(
+            label,
+            grouped_output->data(),
+            rowwise_expected.data(),
+            output_count,
+            static_cast<size_t>(d_model));
 
         static_cast<ITensorKernel &>(moe_kernel).setGPUStream(nullptr);
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
@@ -3683,6 +3773,38 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVSmallMMatchesSerialM1DecodeRowsSt
     }
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, FusedIQ3SQwen36QKVSmallMMatchesSerialM1DecodeRowsStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * Qwen3.6 MoE MTP verifier parity first drifted at layer2_QKV_PROJECTION
+     * on the ROCm IQ3_S model.  The smaller synthetic Q4_K QKV regression above
+     * proves the algorithm family, but it does not cover the production
+     * codebook or the 5120-wide hidden rows used by this model.  Keep this test
+     * strict: the grouped M=2..4 Q/K/V publication must match running the same
+     * rows one at a time through the ordinary decode GEMV path.
+     */
+    constexpr int K = 5120;
+    constexpr int Nq = 5120;
+    constexpr int Nk = 1024;
+    constexpr int Nv = 1024;
+    for (int M : {2, 3, 4})
+    {
+        runFusedQKVSmallMMatchesSerialM1DecodeRows(
+            "IQ3_S native-VNNI Qwen3.6 fused QKV strict serial decode",
+            M,
+            K,
+            PackedPath::NativeVNNI,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createIQ3_SRandom(shape, seed); },
+            Nq,
+            Nk,
+            Nv);
+    }
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMMatchesSeparate)
 {
     if (!hasROCmDevice())
@@ -4938,6 +5060,41 @@ TEST(Test__ROCmQuantisedGemmSmallM, MixedCodebookQwen36GDNQkvZPairSmallMMatchesS
     }
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, GDNIQ4XSQwen36MoEQkvZPairSmallMMatchesSerialM1DecodeRowsStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * The Qwen3.6 MoE GGUF advertises its GDN projection tensors as:
+     *   blk.0.attn_qkv.weight  [2048, 8192] IQ4_XS
+     *   blk.0.attn_gate.weight [2048, 4096] IQ4_XS
+     *
+     * In Llaminar's row-major GEMM convention those become N={8192,4096}
+     * projections over K=2048 hidden rows.  The model-level grouped verifier
+     * diagnostic first showed a visible drift downstream of layer2 GDN
+     * projection, so keep this exact-shape regression strict against ordinary
+     * M=1 decode rows.
+     */
+    std::vector<WeightCreator> creators = {
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createIQ4_XSRandom(shape, seed); },
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }};
+
+    constexpr int K = 2048;
+    for (int M : {2, 3, 4})
+    {
+        runMixedProjectionGroupSmallMMatchesSerialM1DecodeRows(
+            "IQ4_XS native-VNNI Qwen3.6 MoE GDN qkv/z strict serial decode",
+            M,
+            K,
+            creators,
+            {8192, 4096},
+            {"gdn_qkv", "gdn_z"});
+    }
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, ROCmMoERoutedVerifierSmallM234_AllNativeCodegroupsMatchSerialDecode)
 {
     if (!hasROCmDevice())
@@ -4951,20 +5108,27 @@ TEST(Test__ROCmQuantisedGemmSmallM, ROCmMoERoutedVerifierSmallM234_AllNativeCode
 
     /*
      * The grouped routed MoE verifier path is a composition of codebook
-     * dispatch, compact route planning, gate/up split-K reduction, SwiGLU Q8
-     * publication, and down projection publication.  Dense GEMV codebook sweeps
-     * prove the individual matrix multiply helpers; this sweep proves the full
-     * MoE grouped verifier transaction against rowwise serial decode for every
-     * native-VNNI codegroup ROCm currently advertises.
+     * dispatch, compact route planning, gate/up projection, SwiGLU Q8
+     * publication, and down projection publication.  Gate/up descriptors must
+     * share one codebook, but down descriptors are independent in production
+     * models.  Sweep the full gate/up-codegroup x down-codegroup matrix so mixed
+     * GGUF layouts such as IQ2_S gate/up with IQ4_XS down cannot escape behind
+     * same-format coverage.
      */
-    for (const auto &format : nativeMoECodegroupCases())
+    const auto formats = nativeMoECodegroupCases();
+    for (const auto &gateup_format : formats)
     {
-        SCOPED_TRACE(format.label);
-        for (int verifier_rows : {2, 3, 4})
+        for (const auto &down_format : formats)
         {
-            runROCmMoECodegroupVerifierRowsMatchSerialDecode(
-                format,
-                verifier_rows);
+            SCOPED_TRACE(std::string(gateup_format.label) + "_gateup/" +
+                         down_format.label + "_down");
+            for (int verifier_rows : {2, 3, 4})
+            {
+                runROCmMoECodegroupVerifierRowsMatchSerialDecode(
+                    gateup_format,
+                    down_format,
+                    verifier_rows);
+            }
         }
     }
 

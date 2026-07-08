@@ -6,6 +6,7 @@
 
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "tensors/Tensors.h"
 
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
@@ -963,6 +964,74 @@ namespace
                 << " max_row_relative_l2=" << max_observed_row_relative_l2
                 << " worst_row=" << worst_row;
         }
+    }
+
+    /**
+     * @brief Require grouped CUDA verifier rows to match serial decode exactly.
+     *
+     * CUDA MoE grouped verifier rows are a publication path, not a loose
+     * approximation path.  The focused sweep therefore compares the grouped
+     * prefill bytes against the production M=1 grouped-expert decode entry
+     * points and reports the first differing IEEE-754 payload.
+     */
+    void expectBitwiseFP32RowsEqual(
+        const std::string &label,
+        const float *actual,
+        const float *expected,
+        size_t count,
+        size_t row_width)
+    {
+        ASSERT_NE(actual, nullptr) << label;
+        ASSERT_NE(expected, nullptr) << label;
+        ASSERT_GT(count, 0u) << label;
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
+
+        size_t first_mismatch = 0;
+        std::uint32_t actual_bits = 0;
+        std::uint32_t expected_bits = 0;
+        double max_abs = 0.0;
+        size_t max_abs_index = 0;
+        bool found_first_mismatch = false;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double diff = std::abs(
+                static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
+            if (diff > max_abs)
+            {
+                max_abs = diff;
+                max_abs_index = i;
+            }
+            if (!found_first_mismatch)
+            {
+                std::uint32_t a_bits = 0;
+                std::uint32_t e_bits = 0;
+                std::memcpy(&a_bits, actual + i, sizeof(a_bits));
+                std::memcpy(&e_bits, expected + i, sizeof(e_bits));
+                if (a_bits != e_bits)
+                {
+                    first_mismatch = i;
+                    actual_bits = a_bits;
+                    expected_bits = e_bits;
+                    found_first_mismatch = true;
+                }
+            }
+        }
+
+        const size_t safe_row_width = row_width == 0 ? count : row_width;
+        ADD_FAILURE()
+            << label
+            << " first_mismatch=" << first_mismatch
+            << " row=" << (first_mismatch / safe_row_width)
+            << " col=" << (first_mismatch % safe_row_width)
+            << " actual=" << actual[first_mismatch]
+            << " expected=" << expected[first_mismatch]
+            << " actual_bits=0x" << std::hex << actual_bits
+            << " expected_bits=0x" << expected_bits << std::dec
+            << " max_abs=" << max_abs
+            << " max_abs_index=" << max_abs_index
+            << " rel_l2=" << relativeL2Error(actual, expected, count)
+            << " cosine=" << cosineSimilarity(actual, expected, count);
     }
 
     /// @brief Build a minimal native-VNNI descriptor backed by CUDA device pointers.
@@ -12559,16 +12628,15 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
             llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
             device);
 
-        expectVectorsClose(
-            std::vector<float>(grouped_output->data(),
-                               grouped_output->data() + grouped_output->numel()),
-            row_by_row_expected,
-            0.9999,
-            0.006,
-            /*row_width=*/d_model,
-            /*min_row_cosine=*/0.9998,
-            /*max_row_relative_l2=*/0.008,
-            /*max_row_kl=*/1.0e-4);
+        const std::vector<float> grouped_values(
+            grouped_output->data(),
+            grouped_output->data() + grouped_output->numel());
+        expectBitwiseFP32RowsEqual(
+            "CUDA IQ3_S routed verifier grouped prefill M=" + std::to_string(seq_len),
+            grouped_values.data(),
+            row_by_row_expected.data(),
+            grouped_values.size(),
+            static_cast<size_t>(d_model));
     }
 #endif
 }
@@ -12604,9 +12672,34 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
         /*down_kpart=*/true,
         /*down_kparts=*/4);
 
-    for (const auto &format : cudaMoEGroupedNativeFormats())
+    const auto formats = cudaMoEGroupedNativeFormats();
+    for (const auto &gateup_format : formats)
     {
-        SCOPED_TRACE(format.label);
+        for (const auto &down_format : formats)
+        {
+        SCOPED_TRACE(std::string(gateup_format.label) + "_gateup/" +
+                     down_format.label + "_down");
+        const std::string case_label =
+            std::string(gateup_format.label) + "/" + down_format.label;
+
+        auto moe_reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+            /*max_seq_len=*/4,
+            d_model,
+            intermediate,
+            num_experts,
+            top_k);
+        llaminar2::DeviceWorkspaceManager moe_workspace(
+            device,
+            moe_reqs.total_bytes_with_alignment() + 4 * 1024 * 1024);
+        ASSERT_TRUE(moe_workspace.allocate(moe_reqs))
+            << case_label << " CUDA MoE workspace";
+        llaminar2::CUDAMoEKernel moe_kernel(0);
+        static_cast<llaminar2::ITensorKernel &>(moe_kernel).setGPUStream(stream_);
+        auto *workspace_consumer =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(&moe_kernel);
+        ASSERT_NE(workspace_consumer, nullptr)
+            << case_label << " CUDA MoE workspace consumer";
+        workspace_consumer->bindWorkspace(&moe_workspace);
 
         std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
         std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
@@ -12615,6 +12708,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
 
         auto add_prepared = [&](int rows,
                                 int cols,
+                                const CUDAMoEFormatCase &format,
                                 uint32_t seed,
                                 const char *role) -> llaminar2::ITensorGemm *
         {
@@ -12626,8 +12720,10 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
             prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
                 weight_ptr,
                 device,
-                std::string("test.cuda_moe.all_native_formats.") + format.label +
-                    "." + role + "." + std::to_string(seed),
+                std::string("test.cuda_moe.all_native_formats.") +
+                    gateup_format.label + "_gateup." +
+                    down_format.label + "_down." + role + "." +
+                    std::to_string(seed),
                 llaminar2::ModelContextId{1320000 + static_cast<uint64_t>(seed)}));
 
             auto *kernel = prepared_weights.back().kernel;
@@ -12660,16 +12756,19 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
         {
             experts[static_cast<size_t>(expert)].gate =
                 add_prepared(intermediate, d_model,
+                             gateup_format,
                              601000u + static_cast<uint32_t>(expert),
                              "gate");
             ASSERT_NE(experts[static_cast<size_t>(expert)].gate, nullptr);
             experts[static_cast<size_t>(expert)].up =
                 add_prepared(intermediate, d_model,
+                             gateup_format,
                              602000u + static_cast<uint32_t>(expert),
                              "up");
             ASSERT_NE(experts[static_cast<size_t>(expert)].up, nullptr);
             experts[static_cast<size_t>(expert)].down =
                 add_prepared(d_model, intermediate,
+                             down_format,
                              603000u + static_cast<uint32_t>(expert),
                              "down");
             ASSERT_NE(experts[static_cast<size_t>(expert)].down, nullptr);
@@ -12686,12 +12785,12 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
             ASSERT_TRUE(triplet.down->exportNativeVNNIMatrixDesc(down_descs[static_cast<size_t>(expert)]));
         }
 
-        const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
             gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
-        ASSERT_GE(gateup_table, 0) << format.label << " gate/up descriptor table";
-        const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        ASSERT_GE(gateup_table, 0) << case_label << " gate/up descriptor table";
+        const int down_table = moe_kernel.uploadGroupedExpertDownDescriptorTable(
             down_descs.data(), num_experts, d_model, intermediate);
-        ASSERT_GE(down_table, 0) << format.label << " down descriptor table";
+        ASSERT_GE(down_table, 0) << case_label << " down descriptor table";
 
         for (int seq_len : {2, 3, 4})
         {
@@ -12774,14 +12873,14 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
                 auto decode_output = llaminar2::test::TestTensorFactory::createFP32(
                     {1u, static_cast<size_t>(d_model)});
                 ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
-                ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+                ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromTable(
                     hidden_row.get(), expert_ids.data(), gateup_table, top_k,
                     gate_outputs.data(), up_outputs.data(), d_model, intermediate))
-                    << format.label << " rowwise gate/up M=" << seq_len << " row=" << row;
-                ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
+                    << case_label << " rowwise gate/up M=" << seq_len << " row=" << row;
+                ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
                     gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
                     down_table, top_k, decode_output.get(), d_model, intermediate))
-                    << format.label << " rowwise down M=" << seq_len << " row=" << row;
+                    << case_label << " rowwise down M=" << seq_len << " row=" << row;
                 ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
                 decode_output->transitionTo(
                     llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
@@ -12796,10 +12895,10 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
             ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
 
             llaminar2::PerfStatsCollector::reset();
-            ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+            ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
                 routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k))
-                << format.label << " grouped expert planning M=" << seq_len;
-            ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+                << case_label << " grouped expert planning M=" << seq_len;
+            ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
                 hidden.get(),
                 grouped_output.get(),
                 gateup_table,
@@ -12809,7 +12908,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
                 intermediate,
                 num_experts,
                 top_k))
-                << format.label << " grouped verifier prefill M=" << seq_len;
+                << case_label << " grouped verifier prefill M=" << seq_len;
             ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
             grouped_output->transitionTo(
                 llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
@@ -12819,23 +12918,21 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_AllNativeFormats_M234Match
                 grouped_output->data(),
                 grouped_output->data() + grouped_output->numel());
             ASSERT_GT(l2Norm(rowwise_expected.data(), rowwise_expected.size()), 1.0e-7)
-                << format.label << " produced an all-zero serial decode witness";
+                << case_label << " produced an all-zero serial decode witness";
             ASSERT_GT(l2Norm(grouped_values.data(), grouped_values.size()), 1.0e-7)
-                << format.label << " produced an all-zero grouped decode witness";
-            expectVectorsClose(
-                grouped_values,
-                rowwise_expected,
-                0.9999,
-                0.006,
-                /*row_width=*/d_model,
-                /*min_row_cosine=*/0.9998,
-                /*max_row_relative_l2=*/0.008,
-                /*max_row_kl=*/1.0e-4);
+                << case_label << " produced an all-zero grouped decode witness";
+            expectBitwiseFP32RowsEqual(
+                case_label + " CUDA grouped verifier prefill M=" + std::to_string(seq_len),
+                grouped_values.data(),
+                rowwise_expected.data(),
+                grouped_values.size(),
+                static_cast<size_t>(d_model));
             expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2,
                                           "kpart_swiglu",
                                           "kpart_prefill",
                                           "token_direct",
                                           /*expected_active_expert_slots=*/num_experts);
+        }
         }
     }
 

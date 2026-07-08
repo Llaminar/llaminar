@@ -111,6 +111,20 @@ namespace llaminar2
         int activationRowOffsetForLogits() const;
 
         /**
+         * @brief Report whether this stage will use grouped decode-equivalent verifier rows.
+         *
+         * MTP graph-construction tests use this narrow accessor to prove that
+         * compact all-position verifier logits are routed through the same
+         * serial-row-equivalent small-M projection path that CUDA and ROCm
+         * backend regressions validate.  Production execution still goes
+         * through execute() and the immutable Params captured by the stage.
+         */
+        bool usesDecodeEquivalentVerifierPrefillForTesting() const
+        {
+            return params_.force_decode_equivalent_verifier_prefill;
+        }
+
+        /**
          * @brief Return FULL policy - cohere inputs AND allocate output GPU buffers
          *
          * Quantized GEMM kernels (ROCm/CUDA) pack and upload weights internally

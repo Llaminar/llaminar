@@ -381,6 +381,14 @@ namespace llaminar2
 
         if (params_.force_decode_equivalent_verifier_prefill && M > 1)
         {
+            /**
+             * Group verifier projections only when the prepared GEMM engines
+             * can legally share one fused decode path.  The verifier rows must
+             * be bitwise-equivalent to running the decode stage once per row;
+             * mixing native VNNI projections with different codebooks under the
+             * first projection's kernel can decode the later projections with
+             * the wrong format even though the C++ kernel type is identical.
+             */
             auto try_grouped_verifier_projections =
                 [&](const std::vector<ITensorGemm::TensorProjectionDesc> &all_projections) -> bool
             {
@@ -396,7 +404,11 @@ namespace llaminar2
                     for (size_t j = i + 1; j < all_projections.size(); ++j)
                     {
                         if (!completed[j] && all_projections[j].kernel &&
-                            sameKernelType(all_projections[i].kernel, all_projections[j].kernel))
+                            fusedProjectionCompatible(
+                                all_projections[i].kernel,
+                                all_projections[j].kernel,
+                                native_codebooks[i],
+                                native_codebooks[j]))
                         {
                             group_indices.push_back(j);
                         }
@@ -433,12 +445,12 @@ namespace llaminar2
                 return std::all_of(completed.begin(), completed.end(), [](bool done) { return done; });
             };
 
-            const bool homogeneous_projection_kernels =
-                sameKernelType(gemm_qkv, gemm_z) &&
-                sameKernelType(gemm_qkv, gemm_a) &&
-                sameKernelType(gemm_qkv, gemm_b);
+            const bool homogeneous_projection_group =
+                fusedProjectionCompatible(gemm_qkv, gemm_z, native_codebooks[0], native_codebooks[1]) &&
+                fusedProjectionCompatible(gemm_qkv, gemm_a, native_codebooks[0], native_codebooks[2]) &&
+                fusedProjectionCompatible(gemm_qkv, gemm_b, native_codebooks[0], native_codebooks[3]);
 
-            if ((homogeneous_projection_kernels &&
+            if ((homogeneous_projection_group &&
                  gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
                      A_base,
                      projections,
@@ -449,7 +461,7 @@ namespace llaminar2
                 try_grouped_verifier_projections(projections))
             {
                 recordGDNProjectionRoute(
-                    homogeneous_projection_kernels
+                    homogeneous_projection_group
                         ? "grouped_decode_equivalent_verifier"
                         : "grouped_decode_equivalent_verifier_mixed",
                     M,

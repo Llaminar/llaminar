@@ -19,6 +19,7 @@
 #include "collective/BackendRouter.h"
 #include "collective/LocalTPContext.h"
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
@@ -372,7 +373,8 @@ namespace llaminar2::test::parity::qwen36
          * capture every instrumented stage, but the large prefill graph remains
          * a normal production-style forward without diagnostic storage.
          */
-        void enable(IInferenceRunner &runner)
+        void enable(IInferenceRunner &runner,
+                    const std::vector<std::string> &snapshot_keys = {})
         {
             if (active_)
             {
@@ -380,6 +382,10 @@ namespace llaminar2::test::parity::qwen36
             }
 
             runner_ = &runner;
+            if (!snapshot_keys.empty())
+            {
+                runner_->setSnapshotCaptureFilter(snapshot_keys);
+            }
             runner_->enableSnapshotCapture();
             active_ = true;
         }
@@ -1777,6 +1783,7 @@ namespace llaminar2::test::parity::qwen36
         IInferenceRunner &runner);
     inline std::map<std::string, std::vector<float>> captureMoERunnerSnapshots(
         IOrchestrationRunner &runner);
+    inline std::vector<std::string> qwen36MoEGroupedVerifierSnapshotKeys();
     inline std::vector<std::string> qwen36MoEPrefixInvarianceSnapshotKeys();
     inline std::string compareMoEPrefixLeadingSnapshotRows(
         const std::map<std::string, std::vector<float>> &full_prefill,
@@ -4099,10 +4106,21 @@ namespace llaminar2::test::parity::qwen36
         IInferenceRunner &runner)
     {
         std::map<std::string, std::vector<float>> snapshots;
+        const auto *rank_runner = dynamic_cast<const RankOrchestrator *>(&runner);
         for (const auto &key : runner.getSnapshotKeys())
         {
             size_t size = 0;
-            const float *data = runner.getSnapshot(key, size);
+            const float *data = nullptr;
+            TPSnapshot tp_snapshot;
+            if (rank_runner)
+            {
+                tp_snapshot = rank_runner->getTPSnapshot(key);
+                data = tp_snapshot.getCombinedData(size);
+            }
+            else
+            {
+                data = runner.getSnapshot(key, size);
+            }
             if (!data || size == 0)
             {
                 continue;
@@ -4186,6 +4204,96 @@ namespace llaminar2::test::parity::qwen36
         keys.push_back("layer31_KV_APPEND_SOURCE_V");
         keys.push_back("layer31_KV_CACHE_K");
         keys.push_back("layer31_KV_CACHE_V");
+        return keys;
+    }
+
+    /**
+     * @brief Return a compact stage filter for grouped verifier decode proofs.
+     *
+     * The grouped verifier diagnostic compares an M=2..4 all-position verifier
+     * pass against the same candidate rows replayed one token at a time.  The
+     * most useful failure signal is the earliest layer-0 boundary where the
+     * grouped row stops matching the serial row: attention input norm, Q/K/V,
+     * RoPE, KV append payload, persistent KV cache payload, effective K/V after
+     * cache conversion, attention context, Wo projection, or the first MoE
+     * boundary.  Keeping the filter focused here avoids recording the whole
+     * long-context prompt while still proving whether the bug lives in the
+     * grouped attention/KV contract or in a downstream grouped verifier stage.
+     *
+     * @return Ordered snapshot keys requested by grouped verifier diagnostics.
+     */
+    inline std::vector<std::string> qwen36MoEGroupedVerifierSnapshotKeys()
+    {
+        std::vector<std::string> keys = {"EMBEDDING"};
+        for (int layer = 0; layer < 2; ++layer)
+        {
+            const std::string prefix = "layer" + std::to_string(layer);
+            keys.push_back(prefix + "_ATTENTION_NORM");
+            keys.push_back(prefix + "_Q_PROJECTION");
+            keys.push_back(prefix + "_K_PROJECTION");
+            keys.push_back(prefix + "_V_PROJECTION");
+            keys.push_back(prefix + "_Q_NORM");
+            keys.push_back(prefix + "_K_NORM");
+            keys.push_back(prefix + "_Q_ROPE");
+            keys.push_back(prefix + "_K_ROPE");
+            keys.push_back(prefix + "_FA_GATE");
+            keys.push_back(prefix + "_QKV_PROJECTION");
+            keys.push_back(prefix + "_GDN_Z_PROJECTION");
+            keys.push_back(prefix + "_GDN_ALPHA");
+            keys.push_back(prefix + "_GDN_BETA");
+            keys.push_back(prefix + "_GDN_CONV1D_OUTPUT");
+            keys.push_back(prefix + "_GDN_DELTA_RULE_OUTPUT");
+            keys.push_back(prefix + "_GDN_NORM_GATE_OUTPUT");
+            keys.push_back(prefix + "_GDN_OUTPUT");
+            keys.push_back(prefix + "_KV_APPEND_SOURCE_K");
+            keys.push_back(prefix + "_KV_APPEND_SOURCE_V");
+            keys.push_back(prefix + "_KV_CACHE_K");
+            keys.push_back(prefix + "_KV_CACHE_V");
+            keys.push_back(prefix + "_ATTENTION_EFFECTIVE_K");
+            keys.push_back(prefix + "_ATTENTION_EFFECTIVE_V");
+            keys.push_back(prefix + "_ATTENTION_CONTEXT");
+            keys.push_back(prefix + "_ATTENTION_CONTEXT_GATED");
+            keys.push_back(prefix + "_ATTENTION_OUTPUT");
+            keys.push_back(prefix + "_ATTENTION_OUTPUT_ALLREDUCED");
+            keys.push_back(prefix + "_FFN_NORM_RESIDUAL_OUT");
+            keys.push_back(prefix + "_FFN_NORM");
+            keys.push_back(prefix + "_MOE_ROUTER_OUTPUT");
+            keys.push_back(prefix + "_MOE_ROUTING_INDICES");
+            keys.push_back(prefix + "_MOE_ROUTING_WEIGHTS");
+            keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+            keys.push_back(prefix + "_MOE_SHARED_EXPERT_OUTPUT");
+            keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
+            keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+            keys.push_back(prefix + "_FFN_RESIDUAL");
+        }
+        /*
+         * Qwen3.6 MoE has many layers, and LocalTP verifier bugs often emerge
+         * after a numerically tiny per-layer drift accumulates.  Keep the deep
+         * probe cheap by asking later layers only for replicated row-boundary
+         * tensors instead of every local projection/state snapshot.
+         */
+        for (int layer = 2; layer < 40; ++layer)
+        {
+            const std::string prefix = "layer" + std::to_string(layer);
+            keys.push_back(prefix + "_ATTENTION_NORM_RESIDUAL_OUT");
+            keys.push_back(prefix + "_ATTENTION_NORM");
+            keys.push_back(prefix + "_QKV_PROJECTION");
+            keys.push_back(prefix + "_GDN_Z_PROJECTION");
+            keys.push_back(prefix + "_GDN_ALPHA");
+            keys.push_back(prefix + "_GDN_BETA");
+            keys.push_back(prefix + "_GDN_CONV1D_OUTPUT");
+            keys.push_back(prefix + "_GDN_DELTA_RULE_OUTPUT");
+            keys.push_back(prefix + "_GDN_NORM_GATE_OUTPUT");
+            keys.push_back(prefix + "_GDN_OUTPUT");
+            keys.push_back(prefix + "_ATTENTION_OUTPUT");
+            keys.push_back(prefix + "_FFN_NORM_RESIDUAL_OUT");
+            keys.push_back(prefix + "_FFN_NORM");
+            keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+            keys.push_back(prefix + "_FFN_RESIDUAL");
+        }
+        keys.push_back("FINAL_NORM");
+        keys.push_back("LM_HEAD");
+        keys.push_back("LM_HEAD_ROWS_SELECT");
         return keys;
     }
 
@@ -6355,7 +6463,9 @@ namespace llaminar2::test::parity::qwen36
                "running the all-position candidate";
         if (grouped_snapshot_diagnostic)
         {
-            grouped_snapshot_capture.enable(*runner);
+            grouped_snapshot_capture.enable(
+                *runner,
+                qwen36MoEGroupedVerifierSnapshotKeys());
             grouped_snapshot_capture.clear();
         }
 

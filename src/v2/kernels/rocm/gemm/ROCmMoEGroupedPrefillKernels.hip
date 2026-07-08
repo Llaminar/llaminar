@@ -125,6 +125,80 @@ __device__ __forceinline__ bool prefill_native_vnni_desc_shape_ok(
            (!Traits::is_dual_scale_asym || desc.emins);
 }
 
+/**
+ * @brief Serial-GEMV-shaped correction term for dual-scale NativeVNNI formats.
+ *
+ * ROCm serial MoE down decode computes the base dual-scale dot first, then adds
+ * a helper-returned correction for Q2_K asymmetric minima and IQ1_M delta signs.
+ * MTP verifier grouped prefill needs to match that FP32 expression tree exactly;
+ * writing the correction inline is enough for the HIP compiler to choose a
+ * slightly different rounding sequence on IQ1_M and break bitwise publication.
+ */
+template <NativeVNNIFormatPrefill FMT>
+__device__ __forceinline__ float moe_prefill_native_vnni_dual_scale_correction(
+    const int32_t* __restrict__ a4,
+    const uint8_t* __restrict__ payload,
+    const uint32_t* __restrict__ emin_base,
+    size_t linear,
+    float scale_lo,
+    float scale_hi,
+    float scale_ab)
+{
+    using Traits = PrefillNVNNITraits<FMT>;
+    float correction = 0.0f;
+
+    if constexpr (Traits::is_dual_scale_asym)
+    {
+        constexpr int32_t ones = 0x01010101;
+        int32_t sum_a_lo = 0;
+        int32_t sum_a_hi = 0;
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+            sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+#pragma unroll
+        for (int g = 4; g < 8; ++g)
+            sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+
+        const uint32_t emin_packed = emin_base[linear];
+        const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
+        const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
+        const float min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
+        const float min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
+        correction += (static_cast<float>(sum_a_lo) * min_lo +
+                       static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
+    }
+
+    if constexpr (FMT == NVNNI_PF_IQ1_M)
+    {
+        constexpr float IQ1S_DELTA = 0.125f;
+        constexpr int32_t ones = 0x01010101;
+        const uint8_t qh0 = payload[4];
+        const uint8_t qh1 = payload[5];
+
+        const int32_t sum_a_g0 = __builtin_amdgcn_sdot4(
+            a4[1], ones, __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+        const int32_t sum_a_g1 = __builtin_amdgcn_sdot4(
+            a4[3], ones, __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+        const int32_t sum_a_g2 = __builtin_amdgcn_sdot4(
+            a4[5], ones, __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+        const int32_t sum_a_g3 = __builtin_amdgcn_sdot4(
+            a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+        const float delta0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float delta1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float delta2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float delta3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+        correction += ((delta0 * static_cast<float>(sum_a_g0) +
+                        delta1 * static_cast<float>(sum_a_g1)) * scale_lo +
+                       (delta2 * static_cast<float>(sum_a_g2) +
+                        delta3 * static_cast<float>(sum_a_g3)) * scale_hi) *
+                      scale_ab;
+    }
+
+    return correction;
+}
+
 __host__ __device__ inline int rocm_moe_select_grouped_prefill_tile_m(
     int requested_tile_m,
     int max_tokens_per_expert)
@@ -664,55 +738,8 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
             const float s_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
             acc += (static_cast<float>(acc_lo) * s_lo +
                     static_cast<float>(acc_hi) * s_hi) * scale_ab;
-
-            if constexpr (Traits::is_dual_scale_asym)
-            {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum_a_lo = 0;
-                int32_t sum_a_hi = 0;
-#pragma unroll
-                for (int g = 0; g < 4; ++g)
-                    sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
-#pragma unroll
-                for (int g = 4; g < 8; ++g)
-                    sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
-
-                const uint32_t emin_packed = emin_base[linear];
-                const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
-                const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
-                const float emin_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
-                const float emin_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
-                acc += (static_cast<float>(sum_a_lo) * emin_lo +
-                        static_cast<float>(sum_a_hi) * emin_hi) * scale_ab;
-            }
-
-            if constexpr (FMT == NVNNI_PF_IQ1_M)
-            {
-                constexpr float IQ1S_DELTA = 0.125f;
-                constexpr int32_t ones = 0x01010101;
-                const uint8_t qh0 = payload[4];
-                const uint8_t qh1 = payload[5];
-
-                const int32_t sa_g0 = __builtin_amdgcn_sdot4(
-                    a4[1], ones, __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-                const int32_t sa_g1 = __builtin_amdgcn_sdot4(
-                    a4[3], ones, __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-                const int32_t sa_g2 = __builtin_amdgcn_sdot4(
-                    a4[5], ones, __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-                const int32_t sa_g3 = __builtin_amdgcn_sdot4(
-                    a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
-
-                const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                // IQ1_M has two dequant scales. Groups 0/1 use the low scale,
-                // groups 2/3 use the high scale. This matches ROCm GEMV and
-                // CUDA MoE; using s_lo for all groups drifts verifier rows.
-                acc += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * s_lo +
-                        (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * s_hi) *
-                       scale_ab;
-            }
+            acc += moe_prefill_native_vnni_dual_scale_correction<FMT>(
+                a4, payload, emin_base, linear, s_lo, s_hi, scale_ab);
         }
         else
         {
@@ -1172,6 +1199,65 @@ void moe_grouped_gate_up_swiglu_prefill_gemm_kernel(
     }
 }
 
+/**
+ * @brief Decode-equivalent grouped gate/up projection for verifier-sized rows.
+ *
+ * The fused prefill gate/up kernel above is fast, but it combines projection,
+ * SwiGLU, and quantization in one register-resident path.  MTP verifier rows
+ * need a stricter contract: their grouped publication must match rowwise serial
+ * decode byte-for-byte.  This kernel keeps the economical grouped launch shape
+ * (all active experts and all verifier slots in one dispatch) while writing
+ * FP32 gate/up scratch exactly like the M=1 decode-table path before a separate
+ * SwiGLU quantization pass consumes it.
+ */
+template <NativeVNNIFormatPrefill FMT>
+__global__ __launch_bounds__(64)
+void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
+    const int8_t*  __restrict__ A_int8,              // [total_slots, K]
+    const float*   __restrict__ scales_A_blockwise,  // [total_slots, K / 32]
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs, // [num_experts]
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,   // [num_experts]
+    const int*     __restrict__ d_group_counts,      // [num_experts]
+    const int*     __restrict__ d_group_offsets,     // [num_experts]
+    const int*     __restrict__ d_active_expert_ids, // [active_expert_slots]
+    float*         __restrict__ gate_out,            // [total_slots, N]
+    float*         __restrict__ up_out,              // [total_slots, N]
+    int N,
+    int K)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int token_in_expert = blockIdx.y;
+    const int expert_id =
+        d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
+    if (expert_id < 0 || n >= N)
+        return;
+
+    const int count = d_group_counts[expert_id];
+    if (token_in_expert >= count)
+        return;
+
+    const int grouped_slot = d_group_offsets[expert_id] + token_in_expert;
+    const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+    const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !prefill_native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int8_t* slot_A = A_int8 + static_cast<size_t>(grouped_slot) * K;
+    const float* slot_scales =
+        scales_A_blockwise + static_cast<size_t>(grouped_slot) * blocks_per_row;
+    const size_t out_index = static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
+                             static_cast<size_t>(n);
+    gate_out[out_index] = moe_prefill_dot_desc_range<FMT>(
+        gate_desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+    up_out[out_index] = moe_prefill_dot_desc_range<FMT>(
+        up_desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+}
+
 
 // ============================================================================
 // Kernel 3: Grouped SwiGLU + Quantize (all experts, single launch)
@@ -1522,6 +1608,149 @@ void moe_grouped_weighted_scatter_ordered_prefill_kernel(
 }
 
 /**
+ * @brief Dispatch one NativeVNNI down dot by the descriptor's codebook id.
+ *
+ * The verifier publication kernel below must walk original route slots in a
+ * single thread so it can preserve serial decode's `route 0, route 1, ...`
+ * accumulation order.  Production descriptor tables are allowed to contain
+ * mixed down codebooks across experts, so launching one templated kernel per
+ * codebook would either overwrite earlier partial sums or reintroduce atomic
+ * ordering.  This small device-side switch keeps the ordered publication kernel
+ * generic while still reusing the exact same per-codebook dot helper as the
+ * grouped gate/up and down kernels.
+ */
+__device__ __forceinline__ float moe_prefill_dot_desc_range_dispatch(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ slot_A,
+    const float* __restrict__ slot_scales,
+    int N,
+    int b_start,
+    int b_end)
+{
+    switch (static_cast<NativeVNNIFormatPrefill>(desc.codebook_id))
+    {
+    case NVNNI_PF_Q4_0:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q4_0>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ4_NL:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ4_NL>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q4_1:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q4_1>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q5_0:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q5_0>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q5_1:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q5_1>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q6_K:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q6_K>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q3_K:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q3_K>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q2_K:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q2_K>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ3_S:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ3_S>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ3_XXS:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ3_XXS>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ2_S:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ2_S>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ2_XS:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ2_XS>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ2_XXS:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ2_XXS>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ1_S:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ1_S>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_IQ1_M:
+        return moe_prefill_dot_desc_range<NVNNI_PF_IQ1_M>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    case NVNNI_PF_Q8_0:
+        return moe_prefill_dot_desc_range<NVNNI_PF_Q8_0>(
+            desc, n, slot_A, slot_scales, N, b_start, b_end);
+    default:
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return 0.0f;
+    }
+}
+
+/**
+ * @brief Decode-equivalent ordered down projection and publication.
+ *
+ * This is the ROCm verifier counterpart to serial row decode's canonical down
+ * contract: for each token/output column, one thread walks the original route
+ * slots in top-k order, computes the down dot for that route's expert, applies
+ * the route weight, and accumulates into a single FP32 total.  No per-route down
+ * rows are materialized and no atomic add participates in the verifier result,
+ * so the grouped prefill path is bitwise comparable to row-by-row decode.
+ *
+ * The kernel is still a true grouped implementation: all verifier tokens, all
+ * route slots, and all active experts are published by one graph-capturable
+ * device dispatch.  The only serial loop is the tiny top-k route loop inside
+ * each token/column lane, exactly where serial decode defines the mathematical
+ * accumulation order.
+ */
+__global__ __launch_bounds__(64)
+void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
+    const int8_t* __restrict__ swiglu_int8,          // [total_slots, intermediate]
+    const float* __restrict__ swiglu_scales,         // [total_slots, intermediate / 32]
+    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs, // [num_experts]
+    const int* __restrict__ original_to_grouped,     // [seq_len * top_k]
+    const int* __restrict__ original_expert_ids,     // [seq_len * top_k], null when num_experts == 1
+    const float* __restrict__ grouped_weights,       // [total_slots]
+    float* __restrict__ output,                      // [seq_len, d_model], overwritten
+    int seq_len,
+    int top_k,
+    int N,
+    int K,
+    int num_experts)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int token = blockIdx.y;
+    if (token >= seq_len || n >= N)
+        return;
+
+    const int blocks_per_row = K / 32;
+    float total = 0.0f;
+#pragma unroll 1
+    for (int route = 0; route < top_k; ++route)
+    {
+        const int original_slot = token * top_k + route;
+        const int grouped_slot = original_to_grouped[original_slot];
+        if (grouped_slot < 0)
+            continue;
+
+        const int expert_id = original_expert_ids
+                                  ? original_expert_ids[original_slot]
+                                  : ((num_experts == 1) ? 0 : -1);
+        if (expert_id < 0 || expert_id >= num_experts)
+            continue;
+
+        const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
+        const int8_t* slot_A = swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
+        const float* slot_scales =
+            swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
+        const float expert_acc = moe_prefill_dot_desc_range_dispatch(
+            desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
+        const float weight = grouped_weights[grouped_slot];
+        total += weight * expert_acc;
+    }
+
+    output[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] = total;
+}
+
+/**
  * @brief Decode-equivalent down projection and publication for MTP verifier rows.
  *
  * Serial ROCm decode's parallel-down path does not materialize a per-route down
@@ -1657,7 +1886,17 @@ bool rocmMoE_grouped_prefill_pipeline(
     llaminar2::HipDeviceGuard::setDevice(device_id);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError(); // clear prior errors
+    const bool verifier_decode_equivalent_gateup =
+        use_active_expert_grid &&
+        max_tokens_per_expert <= 4 &&
+        d_scratch_gate &&
+        d_scratch_up;
+    const bool verifier_decode_equivalent_down =
+        verifier_decode_equivalent_gateup &&
+        d_original_to_grouped &&
+        (d_original_expert_ids || num_experts == 1);
     const bool use_gateup_kpart =
+        !verifier_decode_equivalent_gateup &&
         use_active_expert_grid &&
         max_tokens_per_expert <= 4 &&
         gateup_k_partitions > 1 &&
@@ -1700,7 +1939,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     {
         constexpr int kFusedTileN = 128;
         constexpr int kKPartTileN = 64;
-        const int tile_n = use_gateup_kpart ? kKPartTileN : kFusedTileN;
+        const int tile_n =
+            (use_gateup_kpart || verifier_decode_equivalent_gateup) ? kKPartTileN : kFusedTileN;
         dim3 block(tile_n);
         const int n_tiles = (intermediate + tile_n - 1) / tile_n;
         const int m_tiles = (max_tokens_per_expert + tile_m - 1) / tile_m;
@@ -1708,6 +1948,16 @@ bool rocmMoE_grouped_prefill_pipeline(
         const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
         const auto* up_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_up_desc_table);
 
+        #define LAUNCH_GATEUP_DECODE_EQUIV(FMT) \
+            do { \
+                dim3 grid(n_tiles, max_tokens_per_expert, expert_grid); \
+                hipLaunchKernelGGL( \
+                    HIP_KERNEL_NAME(moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT>), \
+                    grid, block, 0, hip_stream, \
+                    d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
+                    d_group_counts, d_group_offsets, d_active_expert_ids, \
+                    d_scratch_gate, d_scratch_up, intermediate, d_model); \
+            } while (0)
         #define LAUNCH_GATEUP_PREFILL_TM(FMT, TM) \
             do { \
                 dim3 grid(n_tiles, m_tiles, expert_grid); \
@@ -1730,7 +1980,9 @@ bool rocmMoE_grouped_prefill_pipeline(
             } while (0)
         #define LAUNCH_GATEUP_PREFILL(FMT) \
             do { \
-                if (use_gateup_kpart) { \
+                if (verifier_decode_equivalent_gateup) { \
+                    LAUNCH_GATEUP_DECODE_EQUIV(FMT); \
+                } else if (use_gateup_kpart) { \
                     if (tile_m <= 2)      LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, 2); \
                     else if (tile_m <= 4) LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, 4); \
                     else                  LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, 8); \
@@ -1776,6 +2028,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         #undef LAUNCH_GATEUP_PREFILL
         #undef LAUNCH_GATEUP_KPART_PREFILL_TM
         #undef LAUNCH_GATEUP_PREFILL_TM
+        #undef LAUNCH_GATEUP_DECODE_EQUIV
 
         if (use_gateup_kpart)
         {
@@ -1789,12 +2042,31 @@ bool rocmMoE_grouped_prefill_pipeline(
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                 total_slots, intermediate, gateup_k_partitions);
         }
+        else if (verifier_decode_equivalent_gateup)
+        {
+            /*
+             * Keep verifier rows on the same FP32 gate/up -> SwiGLU-quantize
+             * boundary as rowwise decode.  This is one extra graph node versus
+             * the fused prefill shortcut, but it is still a single grouped
+             * quantization pass over all route slots and avoids production row
+             * replay.
+             */
+            constexpr int TILE_N = 32;
+            dim3 quant_grid((intermediate + TILE_N - 1) / TILE_N, total_slots);
+            dim3 quant_block(TILE_N);
+            hipLaunchKernelGGL(
+                moe_grouped_swiglu_quantize_prefill_kernel,
+                quant_grid, quant_block, 0, hip_stream,
+                d_scratch_gate, d_scratch_up,
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                intermediate);
+        }
     }
 
     // =========================================================================
     // Kernel 3: Down GEMM (same TILE_M bucket as gate/up)
     // =========================================================================
-    if (!original_slot_atomic_scatter)
+    if (!original_slot_atomic_scatter && !verifier_decode_equivalent_down)
     {
         /*
          * CUDA's verifier path uses narrower down tiles for tiny active-expert
@@ -1880,7 +2152,25 @@ bool rocmMoE_grouped_prefill_pipeline(
         dim3 block(TILE_N);
         if (d_original_to_grouped)
         {
-            if (original_slot_atomic_scatter)
+            if (verifier_decode_equivalent_down)
+            {
+                /*
+                 * Verifier rows need the grouped path to be exactly comparable
+                 * with row-by-row decode.  Publish directly from grouped SwiGLU
+                 * rows in original route order instead of materializing per-slot
+                 * down rows or using atomics.
+                 */
+                const auto* down_descs =
+                    static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
+                dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
+                hipLaunchKernelGGL(
+                    moe_grouped_down_publish_original_token_ordered_prefill_kernel,
+                    grid, block, 0, hip_stream,
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs,
+                    d_original_to_grouped, d_original_expert_ids, d_group_weights,
+                    d_output, seq_len, top_k, d_model, intermediate, num_experts);
+            }
+            else if (original_slot_atomic_scatter)
             {
                 const auto* down_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
                 dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots);

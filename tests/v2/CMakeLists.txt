@@ -8922,7 +8922,7 @@ add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters
+            --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters
             --gtest_brief=1
     LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;oneDNN;Regression"
     MPI_PROCS 1
@@ -9770,6 +9770,20 @@ if(HAVE_ROCM)
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.ROCmMoERoutedVerifierSmallM234_AllNativeCodegroupsMatchSerialDecode
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllCodegroups;NativeVNNI;Regression"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_DenseQKV
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.FusedIQ3SQwen36QKVSmallMMatchesSerialM1DecodeRowsStrict
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMM;Attention;MTP;GroupedVerifierRows;DecodeEquivalent;IQ3_S;NativeVNNI;Regression"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNProjection
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNIQ4XSQwen36MoEQkvZPairSmallMMatchesSerialM1DecodeRowsStrict
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;IQ4_XS;NativeVNNI;Regression"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added focused ROCm small-M GEMM integration tests")
@@ -10654,7 +10668,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoEKernel.SharedExpertGroupedPrefillMatchesSequentialPath:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByRowDecode
+                --gtest_filter=Test__ROCmMoEKernel.SharedExpertGateVerifierRowsM234MatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertGroupedPrefillMatchesSequentialPath:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36IQ3S_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36ShapeIQ3S_M234MatchesRowByRowDecode
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;NativeVNNI;Regression"
         MPI_PROCS 1

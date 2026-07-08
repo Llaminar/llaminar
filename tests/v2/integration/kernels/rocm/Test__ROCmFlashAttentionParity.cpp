@@ -32,6 +32,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
 #include "transfer/TransferEngine.h"
@@ -342,7 +343,15 @@ protected:
 
     void runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
         MPIContext &mpi_ctx,
-        int seq_len);
+        int seq_len,
+        int history_len = -1,
+        int n_heads = 16,
+        int n_kv_heads = 2,
+        int head_dim = 256,
+        const char *label = nullptr,
+        ActivationPrecision cache_precision = ActivationPrecision::FP16,
+        int head_start = 0,
+        int gqa_n_rep = 0);
 #endif
 };
 
@@ -1858,7 +1867,15 @@ TEST_F(Test__ROCmFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M4RoPEOnRe
 
 void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
     MPIContext &mpi_ctx,
-    int seq_len)
+    int seq_len,
+    int requested_history_len,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    const char *label,
+    ActivationPrecision cache_precision,
+    int head_start,
+    int gqa_n_rep)
 {
     if (!hasROCm())
     {
@@ -1872,11 +1889,9 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
      * shadow at the history length exercises the incremental cache-shadow path
      * that real decode graphs use before adding the verifier rows.
      */
-    const int history_len = 599 - seq_len;
+    const int history_len = requested_history_len > 0 ? requested_history_len : 599 - seq_len;
     const int kv_len = history_len + seq_len;
-    constexpr int n_heads = 16;
-    constexpr int n_kv_heads = 2;
-    constexpr int head_dim = 256;
+    const int effective_gqa_n_rep = gqa_n_rep > 0 ? gqa_n_rep : n_heads / n_kv_heads;
     constexpr float rope_theta = 10000000.0f;
     constexpr float partial_rotary_factor = 0.25f;
     const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
@@ -1932,7 +1947,7 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     ASSERT_TRUE(transfer.uploadFull(out_grouped_tensor.get(), device, stream).success);
 
     llaminar::v2::kernels::KVCacheConfig config;
-    config.precision = ActivationPrecision::FP16;
+    config.precision = cache_precision;
     config.device = device;
     config.num_layers = 1;
     config.batch_size = 1;
@@ -1941,6 +1956,22 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     config.head_dim = head_dim;
     auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(kv_cache, nullptr);
+    std::unique_ptr<DeviceWorkspaceManager> kv_workspace;
+    if (auto *cache_workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kv_cache.get()))
+    {
+        /*
+         * Q8_1 verifier appends convert the FP16 projection rows into native
+         * cache blocks before publishing them.  The conversion scratch must be
+         * predeclared and bound before HIP graph capture; allocating it lazily
+         * inside the captured verifier append would make the graph invalid.
+         */
+        const WorkspaceRequirements kv_reqs =
+            cache_workspace_consumer->getWorkspaceRequirements(kv_len, 1, head_dim);
+        kv_workspace = std::make_unique<DeviceWorkspaceManager>(
+            device, kv_reqs.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(kv_workspace->allocate(kv_reqs));
+        cache_workspace_consumer->bindWorkspace(kv_workspace.get());
+    }
     ASSERT_TRUE(kv_cache->appendWithStream(0, 0, history_k_tensor.get(), history_v_tensor.get(), history_len, stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), history_len);
@@ -1981,6 +2012,8 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     attn_params.rope_theta = rope_theta;
     attn_params.partial_rotary_factor = partial_rotary_factor;
     attn_params.mpi_ctx = &mpi_ctx;
+    attn_params.head_start = head_start;
+    attn_params.gqa_n_rep = effective_gqa_n_rep;
 
     KVCacheAppendStage::Params append_params;
     append_params.device_id = device;
@@ -2068,7 +2101,7 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
             1, 1, row_kv_len,
             n_heads, n_kv_heads, head_dim,
             true, -1, nullptr, nullptr, &mpi_ctx, 0,
-            0, n_heads, n_kv_heads, n_heads / n_kv_heads));
+            head_start, n_heads, n_kv_heads, effective_gqa_n_rep));
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         std::vector<float> m1_output(q_cols, 0.0f);
@@ -2081,10 +2114,12 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
         const double cosine = cosineSimilarity(grouped_row, m1_output.data(), q_cols);
         const double l2_error = relativeL2Error(grouped_row, m1_output.data(), q_cols);
         const double max_error = maxAbsError(grouped_row, m1_output.data(), q_cols);
-        const std::string label = "Captured append+attention FP16 cache Qwen3.6 M" +
-                                  std::to_string(seq_len) +
-                                  " RoPE-on-read vs M1";
-        printComparisonStats(label.c_str(), cosine, l2_error, max_error, q_cols);
+        const std::string generated_label =
+            "Captured append+attention FP16 cache Qwen3.6 M" +
+            std::to_string(seq_len) +
+            " RoPE-on-read vs M1";
+        printComparisonStats(label ? label : generated_label.c_str(),
+                             cosine, l2_error, max_error, q_cols);
         EXPECT_GE(cosine, 0.999999)
             << "ROCm captured append+attention M=" << seq_len << " row " << row
             << " must match serial decode";
@@ -2112,6 +2147,83 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
 TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36M4RoPEOnReadRowsMatchSerialDecode)
 {
     runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(mpi_ctx_, 4);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPM2RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * LocalTP halves the Qwen3.6 full-attention head set to eight query heads
+     * and one local KV head per device.  The grouped verifier graph still has
+     * to publish rows that are identical to serial decode for that local shard.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/2,
+        /*history_len=*/597,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP M2 RoPE-on-read vs M1");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM2RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Production ROCm MTP decode normally stores KV in Q8_1 and consumes an
+     * FP16 RoPE-on-read shadow.  This focused regression keeps the same
+     * captured append+attention boundary as the model graph, without the full
+     * parity harness cost.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/2,
+        /*history_len=*/597,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP M2 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPSecondShardM2RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * The second LocalTP participant has a non-zero global Q-head offset.  Its
+     * local KV head mapping must use the global GQA repetition count, or local
+     * row groups can verify against the wrong KV head while still looking
+     * plausible in broad cosine gates.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/2,
+        /*history_len=*/597,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP shard1 M2 RoPE-on-read vs M1",
+        ActivationPrecision::FP16,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM2RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Same second-shard proof through Q8_1 cache storage.  This is the narrow
+     * ROCm regression for grouped verifier rows that combine LocalTP,
+     * graph-captured append, converted RoPE-on-read KV, and global GQA mapping.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/2,
+        /*history_len=*/597,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP shard1 M2 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)

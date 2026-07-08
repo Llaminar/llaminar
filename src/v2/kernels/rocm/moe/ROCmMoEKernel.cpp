@@ -8254,6 +8254,14 @@ namespace llaminar2
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
             return false;
 
+        const bool verifier_decode_equivalent_gateup =
+            active_expert_slots > 0 &&
+            max_tokens_per_expert <= 4 &&
+            d_prefill_gate_ != nullptr &&
+            d_prefill_up_ != nullptr;
+        const bool pipeline_use_gateup_kpart =
+            use_gateup_kpart && !verifier_decode_equivalent_gateup;
+
         // Ensure hidden and output are on device
         hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
         output->ensureOnDevice(DeviceId::rocm(device_ordinal_));
@@ -8278,8 +8286,18 @@ namespace llaminar2
             debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
+        const bool shared_singleton_expert = (num_experts == 1 && top_k == 1);
+        const bool verifier_decode_equivalent_down =
+            verifier_decode_equivalent_gateup &&
+            ordered_scatter_overwrites_output &&
+            (shared_singleton_expert || d_group_int_indices_ != nullptr);
         const bool scatter_overwrites_output =
-            ordered_scatter_overwrites_output && !original_slot_atomic_scatter;
+            ordered_scatter_overwrites_output &&
+            (verifier_decode_equivalent_down || !original_slot_atomic_scatter);
+        const int *d_original_expert_ids_for_pipeline =
+            (verifier_decode_equivalent_down || original_slot_atomic_scatter)
+                ? (shared_singleton_expert ? nullptr : d_group_int_indices_)
+                : nullptr;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         if (!scatter_overwrites_output)
         {
@@ -8302,15 +8320,15 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
-            original_slot_atomic_scatter ? d_group_int_indices_ : nullptr,
+            d_original_expert_ids_for_pipeline,
             d_group_weights_,
             d_active_expert_ids,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
-            use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
+            pipeline_use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
+            pipeline_use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
             d_prefill_gate_,
@@ -8329,7 +8347,7 @@ namespace llaminar2
             gateup_table.codebook_mask,
             down_table.codebook_mask,
             debugEnv().rocm.moe_prefill_tile_m,
-            use_gateup_kpart ? gateup_k_partitions : 0,
+            pipeline_use_gateup_kpart ? gateup_k_partitions : 0,
             device_ordinal_,
             getStream());
 
@@ -8361,8 +8379,19 @@ namespace llaminar2
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},
-                    {"gateup_route", use_gateup_kpart ? "kpart_prefill" : "fused_prefill"},
-                    {"gateup_kparts", std::to_string(use_gateup_kpart ? gateup_k_partitions : 0)}});
+                    {"gateup_route",
+                     verifier_decode_equivalent_gateup
+                         ? "decode_equiv_prefill"
+                         : (pipeline_use_gateup_kpart ? "kpart_prefill" : "fused_prefill")},
+                    {"down_route",
+                     verifier_decode_equivalent_down
+                         ? "decode_equiv_ordered_publish"
+                         : (original_slot_atomic_scatter
+                                ? "original_slot_atomic"
+                                : (ordered_scatter_overwrites_output
+                                       ? "ordered_scatter"
+                                       : "atomic_scatter"))},
+                    {"gateup_kparts", std::to_string(pipeline_use_gateup_kpart ? gateup_k_partitions : 0)}});
         }
         return true;
     }
@@ -8515,7 +8544,14 @@ namespace llaminar2
 
         const bool original_slot_atomic_scatter =
             debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
-        if (original_slot_atomic_scatter)
+        const bool verifier_decode_equivalent_down =
+            active_expert_slots > 0 &&
+            max_tokens_per_expert <= 4 &&
+            d_prefill_gate_ != nullptr &&
+            d_prefill_up_ != nullptr &&
+            d_group_original_to_grouped_ != nullptr &&
+            runtime_host_layer.route_expert_ids != nullptr;
+        if (original_slot_atomic_scatter && !verifier_decode_equivalent_down)
         {
             hipError_t memset_err = hipMemsetAsync(
                 d_output,
@@ -8539,7 +8575,9 @@ namespace llaminar2
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
             d_group_original_to_grouped_,
-            original_slot_atomic_scatter ? runtime_host_layer.route_expert_ids : nullptr,
+            (verifier_decode_equivalent_down || original_slot_atomic_scatter)
+                ? runtime_host_layer.route_expert_ids
+                : nullptr,
             runtime_host_layer.grouped_route_weights,
             d_group_active_expert_ids_,
             d_prefill_A_int8_,
