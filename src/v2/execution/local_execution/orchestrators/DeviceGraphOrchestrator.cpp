@@ -10271,7 +10271,14 @@ namespace llaminar2
         bool draft_condition_ready_is_target,
         int request_batch,
         const int *position_ids_override,
-        const void *position_ids_device_override)
+        const void *position_ids_device_override,
+        const void *speculative_outcome_meta_device,
+        int speculative_outcome_meta_stride,
+        const void *speculative_outcome_output_tokens_device,
+        int speculative_outcome_output_token_stride,
+        int speculative_outcome_request_index,
+        int speculative_first_output_token_index,
+        void *speculative_outcome_ready_event)
     {
         const int seq_len = token_count;
         const int total_rows =
@@ -10286,6 +10293,10 @@ namespace llaminar2
                 ? sidecar_perf_context
                 : ((phase == "prefill") ? "mtp_shifted_prefill" : "mtp_decode_sidecar");
         const bool external_device_condition_tokens = draft_condition_tokens_device != nullptr;
+        const bool prepare_device_condition_tokens_from_speculative_outcome =
+            speculative_outcome_meta_device != nullptr ||
+            speculative_outcome_output_tokens_device != nullptr ||
+            speculative_outcome_ready_event != nullptr;
         /*
          * GPU graph replay must not depend on host token storage.  The
          * embedding kernels can read token IDs from a persistent device
@@ -10295,10 +10306,16 @@ namespace llaminar2
          * values.
          */
         const bool stage_host_condition_tokens_on_device =
-            state_.device_id.is_gpu() && !external_device_condition_tokens;
+            state_.device_id.is_gpu() &&
+            !external_device_condition_tokens &&
+            !prepare_device_condition_tokens_from_speculative_outcome;
         const bool use_device_condition_tokens =
-            external_device_condition_tokens || stage_host_condition_tokens_on_device;
-        if ((!draft_condition_tokens && !external_device_condition_tokens) ||
+            external_device_condition_tokens ||
+            stage_host_condition_tokens_on_device ||
+            prepare_device_condition_tokens_from_speculative_outcome;
+        if ((!draft_condition_tokens &&
+             !external_device_condition_tokens &&
+             !prepare_device_condition_tokens_from_speculative_outcome) ||
             token_count <= 0 || request_batch <= 0 || total_rows <= 0 ||
             total_rows > 4)
         {
@@ -10328,7 +10345,23 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Device-position MTP sidecar requires a GPU device");
             return false;
         }
-        if (external_device_condition_tokens && total_rows != 1)
+        if (prepare_device_condition_tokens_from_speculative_outcome &&
+            (!state_.device_id.is_gpu() ||
+             !speculative_outcome_meta_device ||
+             speculative_outcome_meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+             !speculative_outcome_output_tokens_device ||
+             speculative_outcome_output_token_stride <
+                 sampling_math::kSpeculativeBatchMaxOutputTokens ||
+             speculative_outcome_request_index < 0 ||
+             speculative_first_output_token_index < 0 ||
+             !speculative_outcome_ready_event))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Speculative-outcome MTP sidecar token preparation received invalid resident metadata");
+            return false;
+        }
+        if (external_device_condition_tokens &&
+            !prepare_device_condition_tokens_from_speculative_outcome &&
+            total_rows != 1)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] External device-token MTP sidecar currently supports one token per replay");
             return false;
@@ -10873,7 +10906,40 @@ namespace llaminar2
             const size_t staged_token_bytes =
                 sizeof(int32_t) * static_cast<size_t>(total_rows);
             bool staged_tokens_ok = false;
-            if (external_device_condition_tokens)
+            if (prepare_device_condition_tokens_from_speculative_outcome)
+            {
+                /*
+                 * The compact verifier reducer has already produced output
+                 * tokens and accepted counts on its own stream.  Wait for that
+                 * producer event from the sidecar stream, then prepare the
+                 * bounded suffix directly into the persistent condition-token
+                 * slot consumed by the captured KV-only MTP graph.  Rows beyond
+                 * the device-resident accepted count receive a harmless filler
+                 * token and are removed by shifted-KV publication.
+                 */
+                if (!backend->streamWaitEvent(
+                        sidecar_dynamic_stream,
+                        speculative_outcome_ready_event,
+                        state_.device_id.gpu_ordinal()))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to order shifted MTP suffix token preparation after compact verifier outcome");
+                    return false;
+                }
+                staged_tokens_ok =
+                    backend->enqueuePrepareSpeculativeShiftedKVTokens(
+                        speculative_outcome_meta_device,
+                        speculative_outcome_meta_stride,
+                        speculative_outcome_output_tokens_device,
+                        speculative_outcome_output_token_stride,
+                        speculative_outcome_request_index,
+                        speculative_first_output_token_index,
+                        total_rows,
+                        /*filler_token=*/0,
+                        state_.device_id.gpu_ordinal(),
+                        sidecar_dynamic_stream,
+                        condition_token_device);
+            }
+            else if (external_device_condition_tokens)
             {
                 /*
                  * Keep the sidecar graph pointer stable by copying the
@@ -10907,7 +10973,10 @@ namespace llaminar2
             if (!staged_tokens_ok)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to stage MTP sidecar token rows"
-                          << " source=" << (external_device_condition_tokens ? "device" : "host")
+                          << " source="
+                          << (prepare_device_condition_tokens_from_speculative_outcome
+                                  ? "resident_outcome"
+                                  : (external_device_condition_tokens ? "device" : "host"))
                           << " rows=" << total_rows);
                 return false;
             }
@@ -15782,6 +15851,230 @@ namespace llaminar2
             {
                 return false;
             }
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromDeviceOutcome(
+        const DeviceSpeculativeOutcomeHandle &outcome,
+        int request_index,
+        int already_appended_tokens,
+        int max_state_commit_rows,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (!state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit requires a GPU runner");
+            return false;
+        }
+        if (!supportsMTPDeviceDraftTokenInput())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit requires device-token sidecar input support");
+            return false;
+        }
+        if (!outcome.valid() || outcome.device != state_.device_id ||
+            request_index < 0 || request_index >= outcome.request_count)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit received an invalid or foreign outcome handle");
+            return false;
+        }
+        if (already_appended_tokens < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit received negative already_appended_tokens");
+            return false;
+        }
+        if (max_state_commit_rows <= already_appended_tokens)
+            return true;
+
+        const int catchup_token_count =
+            max_state_commit_rows - already_appended_tokens;
+        if (catchup_token_count <= 0)
+            return true;
+        if (catchup_token_count > sampling_math::kSpeculativeBatchMaxRows)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit exceeds graph capacity: "
+                      << catchup_token_count);
+            return false;
+        }
+
+        const int hidden_source_row_start = already_appended_tokens - 1;
+        const int hidden_source_row_end =
+            hidden_source_row_start + catchup_token_count;
+        if (main_forward_token_count <= 0 ||
+            hidden_source_row_start < 0 ||
+            hidden_source_row_end > main_forward_token_count)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit received invalid verifier hidden-row bounds: start="
+                      << hidden_source_row_start
+                      << " end=" << hidden_source_row_end
+                      << " main_forward_token_count=" << main_forward_token_count
+                      << " max_state_commit_rows=" << max_state_commit_rows);
+            return false;
+        }
+        if (position_offset_override < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit requires a device-derived verifier-base position");
+            return false;
+        }
+        const int position_offset = position_offset_override;
+
+        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
+        if (!cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit requires an initialized MTP KV cache");
+            return false;
+        }
+
+        void *stream =
+            explicitGPUStreamForOperation("commitMTPShiftedRowsFromDeviceOutcome");
+        if (!stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit requires an explicit GPU stream");
+            return false;
+        }
+        if (!waitForPendingShiftedMTPKVReady(
+                stream,
+                "shifted_row_device_outcome_metadata"))
+        {
+            return false;
+        }
+
+        const int resident_shifted_kv_tokens =
+            already_appended_shifted_kv_tokens >= 0
+                ? already_appended_shifted_kv_tokens
+                : already_appended_tokens;
+        if (resident_shifted_kv_tokens < 0 ||
+            resident_shifted_kv_tokens > already_appended_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit received invalid resident shifted-KV count="
+                      << resident_shifted_kv_tokens
+                      << " already_appended_tokens=" << already_appended_tokens);
+            return false;
+        }
+
+        const int expected_cached_tokens =
+            std::max(0, position_offset - 1 + resident_shifted_kv_tokens);
+        int current_cached_tokens =
+            cache->get_cached_tokens(cache->first_layer_index(), 0);
+        if (current_cached_tokens > expected_cached_tokens)
+        {
+            if (!allow_speculative_discard)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit cache has unexpected extra rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " position_offset=" << position_offset
+                          << " resident_shifted_kv=" << resident_shifted_kv_tokens);
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit failed to discard speculative rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "speculative_shifted_rows_discarded",
+                static_cast<double>(current_cached_tokens - expected_cached_tokens),
+                perfPhaseName(),
+                state_.device_id.toString());
+            current_cached_tokens = expected_cached_tokens;
+        }
+        if (current_cached_tokens < expected_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit cache mismatch: current="
+                      << current_cached_tokens << " expected=" << expected_cached_tokens
+                      << " position_offset=" << position_offset
+                      << " resident_shifted_kv=" << resident_shifted_kv_tokens);
+            return false;
+        }
+
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "shifted_row_device_outcome_commit",
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"rows", std::to_string(catchup_token_count)},
+             {"request_index", std::to_string(request_index)}});
+        const uint64_t workspace_generation_before_commit =
+            workspaceGeneration(state_.device_id);
+
+        /*
+         * Select the verifier hidden rows that would have fed the serial shifted
+         * sidecar suffix.  The current row-select helper synchronizes its owned
+         * helper stream when no stream is supplied; using that contract keeps the
+         * following sidecar graph ordered without making compact metadata visible
+         * to the CPU.
+         */
+        if (!selectMTPTerminalHiddenRows(
+                hidden_source_row_start,
+                catchup_token_count,
+                main_forward_token_count))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome MTP shifted-row commit failed to select verifier hidden rows "
+                      << hidden_source_row_start << ".."
+                      << (hidden_source_row_end - 1));
+            return false;
+        }
+
+        if (!executeMTPDepth0Batched(
+                /*draft_condition_tokens=*/nullptr,
+                catchup_token_count,
+                state_.prefix_terminal_hidden.get(),
+                position_offset + already_appended_tokens,
+                kMTPDecodeCatchupContext,
+                /*kv_cache_only=*/true,
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                /*defer_final_sync=*/true,
+                /*draft_condition_tokens_device=*/nullptr,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false,
+                /*request_batch=*/1,
+                /*position_ids_override=*/nullptr,
+                /*position_ids_device_override=*/nullptr,
+                outcome.meta_device,
+                outcome.meta_stride,
+                outcome.output_tokens_device,
+                outcome.output_token_stride,
+                request_index,
+                already_appended_tokens,
+                outcome.response_ready_event.get()))
+        {
+            return false;
+        }
+        if (!refreshMTPTerminalHiddenState(main_forward_token_count, 1))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after device-outcome MTP shifted-row commit");
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_rows_device_outcome_committed",
+            static_cast<double>(catchup_token_count),
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)},
+             {"already_appended", std::to_string(already_appended_tokens)},
+             {"max_state_commit_rows", std::to_string(max_state_commit_rows)}});
+
+        const uint64_t workspace_generation_after_commit =
+            workspaceGeneration(state_.device_id);
+        if (workspace_generation_after_commit != workspace_generation_before_commit)
+        {
+            handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::Unknown,
+                "mtp_shifted_row_device_outcome_commit_workspace_rebind");
+        }
+        else
+        {
+            recordShiftedMTPKVReplayStateMutation(
+                "mtp_shifted_row_device_outcome_commit");
         }
         return true;
     }
@@ -24868,8 +25161,8 @@ namespace llaminar2
         const size_t meta_elements =
             static_cast<size_t>(request_count) *
             static_cast<size_t>(handle.meta_stride);
-        std::vector<int32_t> fallback_output_tokens;
-        std::vector<int> fallback_meta;
+        std::vector<int32_t> cpu_output_tokens_storage;
+        std::vector<int> cpu_meta_storage;
         int32_t *output_tokens = nullptr;
         int *meta = nullptr;
 
@@ -24890,10 +25183,10 @@ namespace llaminar2
         }
         else
         {
-            fallback_output_tokens.assign(output_token_elements, -1);
-            fallback_meta.assign(meta_elements, 0);
-            output_tokens = fallback_output_tokens.data();
-            meta = fallback_meta.data();
+            cpu_output_tokens_storage.assign(output_token_elements, -1);
+            cpu_meta_storage.assign(meta_elements, 0);
+            output_tokens = cpu_output_tokens_storage.data();
+            meta = cpu_meta_storage.data();
         }
 
         {

@@ -21,10 +21,10 @@ partials/params use fixed staging plus declared workspace buffers.
 
 CUDA dense greedy d2/d3 acceptance recovered after verifier-row ownership fix.
 
-2026-07-08 LocalTP GPU MTP now requires mirrored full-head child-resident
-outcomes for greedy/stochastic publication. Rank compact outcome staging was
-retired from the GPU production path; focused MTP/Rank/runner gates and full
-unit suite `517/517` pass. Prior Qwen3.6 LocalTP parity was `13/13`.
+2026-07-08 LocalTP GPU MTP uses mirrored full-head child-resident outcomes.
+Shifted suffix catch-up is now prepared from compact device metadata before
+publication; the host outcome bridge is response-only after publication.
+Focused MTP/Rank/runner gates pass; full unit `517/517` passed earlier.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
@@ -90,7 +90,7 @@ build time on both CUDA and ROCm.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
 - LocalTP GPU grouped path: mirrored children reduce and publish their own
   resident verifier outcomes; rank compact metadata is diagnostic/non-GPU only.
-  No row replay or host outcome staging is accepted. Focused gates:
+  No row replay or pre-publication host outcome staging is accepted. Focused gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`,
   MTP units, full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,

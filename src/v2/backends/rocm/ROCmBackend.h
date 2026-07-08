@@ -414,6 +414,18 @@ namespace llaminar2
             void *out_target_cached_tokens_device,
             void *out_accepted_state_counts_device,
             void *out_ok_device) override;
+        bool enqueuePrepareSpeculativeShiftedKVTokens(
+            const void *meta_device,
+            int meta_stride,
+            const void *output_tokens_device,
+            int output_token_stride,
+            int request_index,
+            int first_output_token_index,
+            int row_count,
+            int32_t filler_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device) override;
 
         // GPU-side sparse logit penalty application
         bool applyLogitPenaltiesF32(void *logits_device,

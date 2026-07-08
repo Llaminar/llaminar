@@ -1126,6 +1126,18 @@ namespace llaminar2
         int *out_ok,
         int device_idx,
         void *stream);
+    extern "C" bool cudaOps_prepare_speculative_shifted_kv_tokens(
+        const int *meta,
+        int meta_stride,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int request_index,
+        int first_output_token_index,
+        int row_count,
+        int32_t filler_token,
+        int32_t *out_tokens,
+        int device_idx,
+        void *stream);
 
     bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -2610,6 +2622,49 @@ namespace llaminar2
             static_cast<int *>(out_target_cached_tokens_device),
             static_cast<int *>(out_accepted_state_counts_device),
             static_cast<int *>(out_ok_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueuePrepareSpeculativeShiftedKVTokens(
+        const void *meta_device,
+        int meta_stride,
+        const void *output_tokens_device,
+        int output_token_stride,
+        int request_index,
+        int first_output_token_index,
+        int row_count,
+        int32_t filler_token,
+        int device_id,
+        void *stream,
+        void *out_tokens_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !meta_device ||
+            !output_tokens_device ||
+            !out_tokens_device ||
+            !stream ||
+            meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+            output_token_stride < sampling_math::kSpeculativeBatchMaxOutputTokens ||
+            request_index < 0 ||
+            first_output_token_index < 0 ||
+            row_count <= 0 ||
+            row_count > sampling_math::kSpeculativeBatchMaxRows)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_prepare_speculative_shifted_kv_tokens(
+            static_cast<const int *>(meta_device),
+            meta_stride,
+            static_cast<const int32_t *>(output_tokens_device),
+            output_token_stride,
+            request_index,
+            first_output_token_index,
+            row_count,
+            filler_token,
+            static_cast<int32_t *>(out_tokens_device),
             device_id,
             stream);
     }

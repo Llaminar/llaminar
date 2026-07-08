@@ -901,6 +901,89 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Prepare valid shifted-MTP suffix tokens without reading metadata on host.
+     *
+     * LocalTP device-resident publication may need to append shifted sidecar KV
+     * rows for accepted verifier outputs after the first sidecar-owned row.  The
+     * accepted-state count is stored in compact device metadata, so GPU callers
+     * use this helper to build a fixed-shape sidecar token rowset while preserving
+     * the exact serial boundary:
+     *
+     * - rows before `accepted_state_count - first_output_token_index` copy the
+     *   matching compact output token,
+     * - rows beyond that boundary receive @p filler_token and are discarded by the
+     *   later shifted-KV publication count,
+     * - invalid metadata never copies speculative output tokens.
+     */
+    LLAMINAR_SAMPLING_HD void prepare_speculative_shifted_kv_tokens(
+        const int *meta,
+        int meta_stride,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int request_index,
+        int first_output_token_index,
+        int row_count,
+        int32_t filler_token,
+        int32_t *out_tokens)
+    {
+        if (!out_tokens || row_count <= 0)
+            return;
+
+        for (int row = 0; row < row_count; ++row)
+            out_tokens[row] = filler_token;
+
+        if (!meta ||
+            !output_tokens ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            output_token_stride < kSpeculativeBatchMaxOutputTokens ||
+            request_index < 0 ||
+            first_output_token_index < 0)
+        {
+            return;
+        }
+
+        const int *request_meta =
+            meta + static_cast<size_t>(request_index) *
+                       static_cast<size_t>(meta_stride);
+        if (request_meta[kSpecBatchMetaOk] == 0)
+            return;
+
+        const int accepted_state_count =
+            request_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+        const int output_count = request_meta[kSpecBatchMetaOutputCount];
+        const int32_t *request_tokens =
+            output_tokens + static_cast<size_t>(request_index) *
+                                static_cast<size_t>(output_token_stride);
+        if (output_count > 0)
+        {
+            const int32_t live_filler = request_tokens[0];
+            for (int row = 0; row < row_count; ++row)
+                out_tokens[row] = live_filler;
+        }
+        if (accepted_state_count <= first_output_token_index ||
+            output_count <= first_output_token_index)
+        {
+            return;
+        }
+
+        const int accepted_suffix_rows =
+            accepted_state_count - first_output_token_index;
+        const int output_suffix_rows =
+            output_count - first_output_token_index;
+        const int copy_rows =
+            accepted_suffix_rows < output_suffix_rows
+                ? accepted_suffix_rows
+                : output_suffix_rows;
+        const int bounded_copy_rows =
+            copy_rows < row_count ? copy_rows : row_count;
+        for (int row = 0; row < bounded_copy_rows; ++row)
+        {
+            out_tokens[row] =
+                request_tokens[first_output_token_index + row];
+        }
+    }
+
+    /**
      * @brief Decide whether a speculative batch needs a bonus ready token.
      *
      * GPU lazy verifier kernels use this before sampling the bonus distribution:

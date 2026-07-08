@@ -4300,6 +4300,152 @@ namespace llaminar2
             position_offset_override);
     }
 
+    bool RankOrchestrator::commitMTPShiftedRowsFromDeviceOutcome(
+        const DeviceSpeculativeOutcomeHandle &outcome,
+        int request_index,
+        int already_appended_tokens,
+        int max_state_commit_rows,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->commitMTPShiftedRowsFromDeviceOutcome(
+                outcome,
+                request_index,
+                already_appended_tokens,
+                max_state_commit_rows,
+                main_forward_token_count,
+                allow_speculative_discard,
+                position_offset_override,
+                already_appended_shifted_kv_tokens);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->commitMTPShiftedRowsFromDeviceOutcome(
+                outcome,
+                request_index,
+                already_appended_tokens,
+                max_state_commit_rows,
+                main_forward_token_count,
+                allow_speculative_discard,
+                position_offset_override,
+                already_appended_shifted_kv_tokens);
+        }
+
+        const bool mirrored_child_outcome =
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
+        if (!mirrored_child_outcome ||
+            !rank_compact_outcome_valid_ ||
+            !rank_mirrored_child_outcomes_valid_ ||
+            rank_mirrored_child_outcomes_.size() != device_runners_.size() ||
+            !outcome.valid() ||
+            outcome.output_tokens_device !=
+                rank_mirrored_primary_outcome_.output_tokens_device ||
+            outcome.meta_device != rank_mirrored_primary_outcome_.meta_device ||
+            outcome.device != rank_mirrored_primary_outcome_.device ||
+            outcome.request_count != rank_mirrored_primary_outcome_.request_count)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-outcome shifted MTP commit requires the primary handle from a mirrored LocalTP resident verifier reduction");
+            return false;
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] device-outcome shifted commit failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        tp_worker_pool_->dispatch(
+            [this,
+             request_index,
+             already_appended_tokens,
+             max_state_commit_rows,
+             main_forward_token_count,
+             allow_speculative_discard,
+             position_offset_override,
+             already_appended_shifted_kv_tokens,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t i) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                auto device_id = device_runners_[i]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                return device_runners_[i] &&
+                       device_runners_[i]->commitMTPShiftedRowsFromDeviceOutcome(
+                           rank_mirrored_child_outcomes_[i],
+                           request_index,
+                           already_appended_tokens,
+                           max_state_commit_rows,
+                           main_forward_token_count,
+                           allow_speculative_discard,
+                           position_offset_override,
+                           already_appended_shifted_kv_tokens);
+            });
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        auto results =
+            tp_worker_pool_->collectAll(effectiveTPWorkerJoinTimeoutMs());
+        for (auto &r : results)
+        {
+            if (!r.completed || !r.success)
+                all_success = false;
+            if (r.exception && !first_exception)
+            {
+                first_exception = r.exception;
+                first_exception_device = r.worker_index;
+                all_success = false;
+            }
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-outcome shifted commit rethrowing exception from participant "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+        if (all_success)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_device_outcome_shifted_commits",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"request_index", std::to_string(request_index)},
+                 {"rows", std::to_string(std::max(0, max_state_commit_rows - already_appended_tokens))}});
+        }
+        return all_success;
+    }
+
     bool RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
         int32_t token,
         int already_appended_tokens,

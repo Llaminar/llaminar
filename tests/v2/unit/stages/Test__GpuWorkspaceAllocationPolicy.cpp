@@ -1095,9 +1095,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsStageConditionTokensInAre
         << "Host condition tokens must be staged on the explicit sidecar stream.";
     EXPECT_NE(sidecar_body.find("sidecar_cache.token_ids.data()"), std::string::npos)
         << "Async host staging must source from cache-owned stable storage, not stack token arrays.";
-    EXPECT_NE(executable_sidecar_body.find("external_device_condition_tokens&&total_rows!=1"),
+    EXPECT_NE(executable_sidecar_body.find(
+                  "external_device_condition_tokens&&!prepare_device_condition_tokens_from_speculative_outcome&&total_rows!=1"),
               std::string::npos)
-        << "Only externally supplied device-token slots are limited to one row.";
+        << "Only externally supplied arbitrary device-token slots are limited to one row.";
+    EXPECT_NE(sidecar_body.find("enqueuePrepareSpeculativeShiftedKVTokens"),
+              std::string::npos)
+        << "Multi-row shifted catch-up tokens must come from resident compact outcome metadata.";
     EXPECT_EQ(executable_sidecar_body.find("use_device_condition_tokens&&token_count!=1"),
               std::string::npos)
         << "Batched GPU catch-up sidecars must be allowed to use the device-token staging path.";

@@ -1533,6 +1533,55 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Append shifted MTP KV suffix rows from a resident verifier outcome.
+         *
+         * Grouped LocalTP MTP publication keeps compact verifier metadata and
+         * output tokens on device until after live state is published.  When the
+         * shifted sidecar cache already owns the first accepted row, this method
+         * appends the remaining accepted prefix rows by reading
+         * @p outcome.output_tokens_device and @p outcome.meta_device on an
+         * explicit GPU stream.  Implementations must not materialize the compact
+         * outcome on host to learn the accepted count.  They may run a fixed
+         * bounded suffix shape and rely on device-resident shifted-KV publication
+         * to discard rows beyond the compact accepted-state count.
+         *
+         * @param outcome Device-resident compact verifier output handle.
+         * @param request_index Logical request row inside @p outcome.
+         * @param already_appended_tokens Number of accepted shifted rows already
+         *        resident, usually one sidecar-owned row.
+         * @param max_state_commit_rows Maximum verifier state rows represented by
+         *        the outcome's graph shape.
+         * @param main_forward_token_count Verifier hidden-row count available for
+         *        suffix row selection.
+         * @param allow_speculative_discard Whether stale speculative shifted rows
+         *        may be truncated before appending the bounded suffix.
+         * @param position_offset_override Device-derived verifier-base position.
+         * @param already_appended_shifted_kv_tokens Shifted-cache resident row
+         *        count at the serial boundary, or -1 to match
+         *        @p already_appended_tokens.
+         */
+        virtual bool commitMTPShiftedRowsFromDeviceOutcome(
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int already_appended_tokens,
+            int max_state_commit_rows,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1)
+        {
+            (void)outcome;
+            (void)request_index;
+            (void)already_appended_tokens;
+            (void)max_state_commit_rows;
+            (void)main_forward_token_count;
+            (void)allow_speculative_discard;
+            (void)position_offset_override;
+            (void)already_appended_shifted_kv_tokens;
+            return false;
+        }
+
         virtual const float *mtpLogits() const
         {
             return nullptr;

@@ -1839,6 +1839,51 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prepare shifted-MTP catch-up condition tokens from compact outcome metadata.
+         *
+         * Device-resident LocalTP MTP publication must sometimes materialize the
+         * accepted shifted sidecar suffix before publishing shifted KV cache
+         * counts.  The accepted-count metadata is intentionally still on device,
+         * so callers cannot choose the suffix length on the CPU without
+         * reintroducing a D2H planning dependency.  This helper writes exactly
+         * @p row_count valid token IDs into @p out_tokens_device.  Rows whose
+         * suffix index is publishable copy from @p output_tokens_device starting
+         * at @p first_output_token_index; rows beyond the compact accepted-state
+         * count receive @p filler_token and are later discarded by device-resident
+         * shifted-KV publication.
+         *
+         * Backends must enqueue this work on the explicit @p stream, perform no
+         * allocation, and keep the same metadata semantics as SamplingMath's
+         * speculative batch reducer.
+         */
+        virtual bool enqueuePrepareSpeculativeShiftedKVTokens(
+            const void *meta_device,
+            int meta_stride,
+            const void *output_tokens_device,
+            int output_token_stride,
+            int request_index,
+            int first_output_token_index,
+            int row_count,
+            int32_t filler_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device)
+        {
+            (void)meta_device;
+            (void)meta_stride;
+            (void)output_tokens_device;
+            (void)output_token_stride;
+            (void)request_index;
+            (void)first_output_token_index;
+            (void)row_count;
+            (void)filler_token;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            return false;
+        }
+
+        /**
          * @brief GPU-side sparse logit penalty application
          *
          * Applies a sparse set of additive penalties to logits in-place on the GPU.

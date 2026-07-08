@@ -544,6 +544,15 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool commitMTPShiftedRowsFromDeviceOutcome(
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int already_appended_tokens,
+            int max_state_commit_rows,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
         bool flushPendingMTPWork() override;
         bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;

@@ -3440,6 +3440,40 @@ __global__ void rocm_derive_shifted_speculative_publication_metadata_kernel(
         out_ok ? out_ok + request_index : nullptr);
 }
 
+/**
+ * @brief Prepare shifted-MTP suffix condition tokens from compact metadata.
+ *
+ * One HIP thread handles the bounded MTP suffix.  Rows beyond the compact
+ * accepted-state count receive a valid filler token and are removed by the
+ * later shifted-KV publication count, preserving device-resident ownership of
+ * the accepted-prefix decision.
+ */
+__global__ void rocm_prepare_speculative_shifted_kv_tokens_kernel(
+    const int *__restrict__ meta,
+    int meta_stride,
+    const int32_t *__restrict__ output_tokens,
+    int output_token_stride,
+    int request_index,
+    int first_output_token_index,
+    int row_count,
+    int32_t filler_token,
+    int32_t *__restrict__ out_tokens)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    llaminar2::sampling_math::prepare_speculative_shifted_kv_tokens(
+        meta,
+        meta_stride,
+        output_tokens,
+        output_token_stride,
+        request_index,
+        first_output_token_index,
+        row_count,
+        filler_token,
+        out_tokens);
+}
+
 // ============================================================================
 // Extern "C" Wrapper
 // ============================================================================
@@ -5097,6 +5131,59 @@ bool rocmOps_derive_shifted_speculative_publication_metadata(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Shifted Speculative Publication Metadata kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_prepare_speculative_shifted_kv_tokens(
+    const int *meta,
+    int meta_stride,
+    const int32_t *output_tokens,
+    int output_token_stride,
+    int request_index,
+    int first_output_token_index,
+    int row_count,
+    int32_t filler_token,
+    int32_t *out_tokens,
+    int device_idx,
+    void *stream)
+{
+    if (!meta ||
+        !output_tokens ||
+        !out_tokens ||
+        !stream ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        output_token_stride <
+            llaminar2::sampling_math::kSpeculativeBatchMaxOutputTokens ||
+        request_index < 0 ||
+        first_output_token_index < 0 ||
+        row_count <= 0 ||
+        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_prepare_speculative_shifted_kv_tokens_kernel,
+        dim3(1), dim3(1), 0,
+        static_cast<hipStream_t>(stream),
+        meta,
+        meta_stride,
+        output_tokens,
+        output_token_stride,
+        request_index,
+        first_output_token_index,
+        row_count,
+        filler_token,
+        out_tokens);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Speculative Shifted KV Token Prep kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

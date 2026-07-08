@@ -3632,6 +3632,39 @@ __global__ void cuda_derive_shifted_speculative_publication_metadata_kernel(
         out_ok ? out_ok + request_index : nullptr);
 }
 
+/**
+ * @brief Prepare shifted-MTP suffix condition tokens from compact metadata.
+ *
+ * A single CUDA thread is enough for the four-row MTP verifier bound.  Keeping
+ * this as a kernel still matters because the accepted-state count stays
+ * device-resident; the CPU never decides how many suffix rows are publishable.
+ */
+__global__ void cuda_prepare_speculative_shifted_kv_tokens_kernel(
+    const int *__restrict__ meta,
+    int meta_stride,
+    const int32_t *__restrict__ output_tokens,
+    int output_token_stride,
+    int request_index,
+    int first_output_token_index,
+    int row_count,
+    int32_t filler_token,
+    int32_t *__restrict__ out_tokens)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    llaminar2::sampling_math::prepare_speculative_shifted_kv_tokens(
+        meta,
+        meta_stride,
+        output_tokens,
+        output_token_stride,
+        request_index,
+        first_output_token_index,
+        row_count,
+        filler_token,
+        out_tokens);
+}
+
 // ============================================================================
 // Logit Penalty Application Kernel — Subtract sparse penalties from logits
 // ============================================================================
@@ -5379,6 +5412,60 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Shifted Speculative Publication Metadata kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_prepare_speculative_shifted_kv_tokens(
+        const int *meta,
+        int meta_stride,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int request_index,
+        int first_output_token_index,
+        int row_count,
+        int32_t filler_token,
+        int32_t *out_tokens,
+        int device_idx,
+        void *stream)
+    {
+        if (!meta ||
+            !output_tokens ||
+            !out_tokens ||
+            !stream ||
+            meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+            output_token_stride <
+                llaminar2::sampling_math::kSpeculativeBatchMaxOutputTokens ||
+            request_index < 0 ||
+            first_output_token_index < 0 ||
+            row_count <= 0 ||
+            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_prepare_speculative_shifted_kv_tokens_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            meta,
+            meta_stride,
+            output_tokens,
+            output_token_stride,
+            request_index,
+            first_output_token_index,
+            row_count,
+            filler_token,
+            out_tokens);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Speculative Shifted KV Token Prep kernel launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

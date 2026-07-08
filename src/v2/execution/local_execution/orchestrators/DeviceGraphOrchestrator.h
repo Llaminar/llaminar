@@ -2016,6 +2016,15 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool commitMTPShiftedRowsFromDeviceOutcome(
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int already_appended_tokens,
+            int max_state_commit_rows,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
         bool ensureMTPCheckpointTerminalHidden() override;
         uint64_t forwardReplayLiveStateEpoch() const
         {
@@ -3986,7 +3995,14 @@ namespace llaminar2
                                      bool draft_condition_ready_is_target = false,
                                      int request_batch = 1,
                                      const int *position_ids_override = nullptr,
-                                     const void *position_ids_device_override = nullptr);
+                                     const void *position_ids_device_override = nullptr,
+                                     const void *speculative_outcome_meta_device = nullptr,
+                                     int speculative_outcome_meta_stride = 0,
+                                     const void *speculative_outcome_output_tokens_device = nullptr,
+                                     int speculative_outcome_output_token_stride = 0,
+                                     int speculative_outcome_request_index = -1,
+                                     int speculative_first_output_token_index = 0,
+                                     void *speculative_outcome_ready_event = nullptr);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,

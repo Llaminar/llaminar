@@ -9682,144 +9682,63 @@ namespace llaminar2
 
                 DeviceSpeculativeVerifyBatchOutcome device_outcome;
                 MTPDecodeCatchupGreedyResult catchup;
-                bool device_outcome_materialized_for_shifted_kv = false;
                 int shifted_publication_commit_count = 0;
                 if (plan_.usesLocalTP())
                 {
-                    /*
-                     * The compact outcome is still the authority for accepted
-                     * counts and response tokens.  Materializing it here is not
-                     * a replay oracle: it decodes the same SamplingMath metadata
-                     * that the device publication call will consume, so the
-                     * shifted-KV catch-up below can append only the accepted
-                     * verifier rows that serial decode would make visible.
-                     */
-                    PerfStatsCollector::ScopedTimer bridge_timer(
-                        "mtp",
-                        "grouped_outcome_stochastic_device_outcome_host_bridge",
-                        "decode",
-                        {},
-                        {{"policy_path", "grouped_outcome_device_resident_publication"},
-                         {"timing", "pre_publication_shifted_kv_metadata"}});
-                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
-                            outcome_handle,
-                            &device_outcome))
-                    {
-                        return fail_after_checkpoint(
-                            "Grouped-outcome stochastic MTP resident outcome materialization failed");
-                    }
-                    device_outcome_materialized_for_shifted_kv = true;
-
-                    catchup =
-                        buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
-                        catchup_request,
-                        device_outcome);
-                    if (!catchup.ok)
-                        return fail_after_checkpoint(catchup.error);
-
-                    const int accepted_state_count =
-                        std::max(0, device_outcome.target_verifier_state_commit_count);
                     const bool first_shifted_row_available_from_sidecar =
                         sidecar_preserves_main_state &&
                         runner_->supportsMTPShiftedRowReuseFromSidecar() &&
                         !first_token_is_stop;
-                    bool first_shifted_row_available_for_publication =
-                        first_shifted_row_available_from_sidecar;
-                    if (!first_shifted_row_available_for_publication &&
-                        accepted_state_count > 0)
+                    const int max_state_commit_rows =
+                        static_cast<int>(draft_tokens.size());
+                    if (!first_shifted_row_available_from_sidecar &&
+                        !first_token_is_stop &&
+                        max_state_commit_rows > 0)
                     {
-                        if (catchup.accepted_tokens.empty())
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome stochastic MTP has no token for initial shifted-cache publication");
-                        }
-
-                        bool initial_shifted_commit_ok = false;
-                        {
-                            PerfStatsCollector::ScopedTimer timer(
-                                "mtp",
-                                "grouped_outcome_stochastic_initial_shifted_commit",
-                                "decode");
-                            /*
-                             * Non-reusable sidecars restored or never produced the
-                             * row-zero shifted boundary.  Rebuild only that single
-                             * sidecar KV row from the verifier-base terminal hidden
-                             * after the grouped verifier outcome proves that the
-                             * first output token is publishable.
-                             */
-                            initial_shifted_commit_ok =
-                                runner_->commitMTPShiftedRowFromCheckpointTerminalHidden(
-                                    verifier_base_checkpoint,
-                                    catchup.accepted_tokens.front(),
-                                    /*already_appended_tokens=*/0,
-                                    /*allow_speculative_discard=*/true,
-                                    static_cast<int>(
-                                        verifier_base_checkpoint.cached_tokens));
-                        }
-                        if (!initial_shifted_commit_ok)
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome stochastic MTP initial shifted-cache commit failed");
-                        }
-                        first_shifted_row_available_for_publication = true;
-                        shifted_publication_commit_count += 1;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "grouped_outcome_stochastic_initial_shifted_commits",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"source", "verifier_base_checkpoint_terminal_hidden"}});
+                        return fail_after_checkpoint(
+                            "Grouped-outcome stochastic LocalTP MTP requires a device-resident initial shifted-row repair when sidecar reuse is unavailable; host checkpoint-token repair is not a production path");
                     }
-                    if (accepted_state_count > 1)
+                    if (first_shifted_row_available_from_sidecar &&
+                        max_state_commit_rows > 1)
                     {
-                        if (accepted_state_count >
-                            static_cast<int>(catchup.accepted_tokens.size()))
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome stochastic MTP accepted-state publication exceeds committed outputs");
-                        }
-
                         bool shifted_catchup_ok = false;
                         {
                             PerfStatsCollector::ScopedTimer timer(
                                 "mtp",
-                                "grouped_outcome_stochastic_shifted_prefix_commit",
+                                "grouped_outcome_stochastic_shifted_prefix_device_commit",
                                 "decode");
                             /*
-                             * Row zero is either the sidecar-owned shifted row or
-                             * the checkpoint-terminal-hidden repair above.  Commit
-                             * only rows strictly after that boundary from verifier
-                             * hidden rows, then let grouped publication truncate
-                             * every shifted cache to the invariant target length.
+                             * The sidecar owns row zero.  Rows after that boundary
+                             * are prepared from compact device outcome metadata on
+                             * the sidecar stream; non-accepted suffix rows are valid
+                             * speculative writes and are discarded by shifted-KV
+                             * publication's device-derived target count.
                              */
-                            const int shifted_commit_position_offset =
-                                first_shifted_row_available_from_sidecar
-                                    ? base_sidecar_position
-                                    : static_cast<int>(
-                                          verifier_base_checkpoint.cached_tokens);
                             shifted_catchup_ok =
-                                runner_->commitMTPShiftedRowsFromPartialForward(
-                                    catchup.accepted_tokens.data(),
-                                    accepted_state_count,
+                                runner_->commitMTPShiftedRowsFromDeviceOutcome(
+                                    outcome_handle,
+                                    /*request_index=*/0,
                                     /*already_appended_tokens=*/1,
-                                    catchup.main_forward_token_count,
+                                    max_state_commit_rows,
+                                    /*main_forward_token_count=*/max_state_commit_rows,
                                     /*allow_speculative_discard=*/true,
-                                    shifted_commit_position_offset,
+                                    base_sidecar_position,
                                     /*already_appended_shifted_kv_tokens=*/1);
                         }
                         if (!shifted_catchup_ok)
                         {
                             return fail_after_checkpoint(
-                                "Grouped-outcome stochastic MTP shifted-cache accepted-prefix commit failed");
+                                "Grouped-outcome stochastic MTP device-resident shifted-cache suffix commit failed");
                         }
                         shifted_publication_commit_count +=
-                            accepted_state_count - 1;
+                            max_state_commit_rows - 1;
                         PerfStatsCollector::addCounter(
                             "mtp",
-                            "grouped_outcome_stochastic_shifted_prefix_commits",
-                            static_cast<double>(accepted_state_count - 1),
-                            "decode");
+                            "grouped_outcome_stochastic_shifted_prefix_device_commits",
+                            static_cast<double>(max_state_commit_rows - 1),
+                            "decode",
+                            {},
+                            {{"rows", std::to_string(max_state_commit_rows - 1)}});
                     }
                 }
 
@@ -9844,7 +9763,7 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"policy_path", "grouped_outcome_device_resident_publication"},
-                     {"sampling", "greedy"},
+                     {"sampling", "stochastic"},
                      {"max_draft_tokens",
                       std::to_string(publication_request.max_draft_tokens)}});
 
@@ -9944,35 +9863,32 @@ namespace llaminar2
                           std::to_string(stop_tokens_.size())}});
                 }
 
-                if (!device_outcome_materialized_for_shifted_kv)
+                /*
+                 * Live state has already been published from device metadata.
+                 * The compatibility bridge below is only for served response
+                 * tokens and temporary host mirror adoption; it must not be a
+                 * state mutation dependency.
+                 */
+                PerfStatsCollector::ScopedTimer bridge_timer(
+                    "mtp",
+                    "grouped_outcome_stochastic_device_outcome_host_bridge",
+                    "decode",
+                    {},
+                    {{"policy_path", "grouped_outcome_device_resident_publication"},
+                     {"timing", "post_publication_response_bridge"}});
+                if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
+                        outcome_handle,
+                        &device_outcome))
                 {
-                    /*
-                     * Live state has already been published from device
-                     * metadata. The compatibility bridge below is only for
-                     * served response tokens and temporary host mirror
-                     * adoption; it must not be a state mutation dependency.
-                     */
-                    PerfStatsCollector::ScopedTimer bridge_timer(
-                        "mtp",
-                        "grouped_outcome_stochastic_device_outcome_host_bridge",
-                        "decode",
-                        {},
-                        {{"policy_path", "grouped_outcome_device_resident_publication"},
-                         {"timing", "post_publication_response_bridge"}});
-                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
-                            outcome_handle,
-                            &device_outcome))
-                    {
-                        return fail_after_checkpoint(
-                            "Grouped-outcome stochastic MTP resident outcome materialization failed");
-                    }
-                    catchup =
-                        buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
-                            catchup_request,
-                            device_outcome);
-                    if (!catchup.ok)
-                        return fail_after_checkpoint(catchup.error);
+                    return fail_after_checkpoint(
+                        "Grouped-outcome stochastic MTP resident outcome materialization failed");
                 }
+                catchup =
+                    buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                        catchup_request,
+                        device_outcome);
+                if (!catchup.ok)
+                    return fail_after_checkpoint(catchup.error);
 
                 if (device_outcome.sampled_terminal)
                     sampler_ = bonus_sampler;
@@ -10818,139 +10734,56 @@ namespace llaminar2
 
                 DeviceSpeculativeVerifyBatchOutcome device_outcome;
                 MTPDecodeCatchupGreedyResult catchup;
-                bool device_outcome_materialized_for_shifted_kv = false;
                 int shifted_publication_commit_count = 0;
                 if (plan_.usesLocalTP())
                 {
-                    /*
-                     * LocalTP grouped publication still needs shifted MTP KV rows
-                     * to exist before the per-child publisher truncates caches to
-                     * the serial-decode target length.  Decode the compact
-                     * SamplingMath outcome once here to learn the accepted tokens;
-                     * the outcome handle remains the authoritative publication
-                     * input and no verifier row is replayed.
-                     */
-                    PerfStatsCollector::ScopedTimer bridge_timer(
-                        "mtp",
-                        "grouped_outcome_greedy_device_outcome_host_bridge",
-                        "decode",
-                        {},
-                        {{"policy_path", "grouped_outcome_device_resident_publication"},
-                         {"timing", "pre_publication_shifted_kv_metadata"}});
-                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
-                            outcome_handle,
-                            &device_outcome))
-                    {
-                        return fail_after_checkpoint(
-                            "Grouped-outcome greedy MTP resident outcome materialization failed");
-                    }
-                    device_outcome_materialized_for_shifted_kv = true;
-
-                    catchup =
-                        buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
-                            catchup_request,
-                            device_outcome);
-                    if (!catchup.ok)
-                        return fail_after_checkpoint(catchup.error);
-
-                    const int compact_accepted_state_count =
-                        std::max(0, device_outcome.target_verifier_state_commit_count);
                     const bool first_shifted_row_available_from_sidecar =
                         sidecar_preserves_main_state &&
                         runner_->supportsMTPShiftedRowReuseFromSidecar() &&
                         !first_token_is_stop;
-                    bool first_shifted_row_available_for_publication =
-                        first_shifted_row_available_from_sidecar;
-                    if (!first_shifted_row_available_for_publication &&
-                        compact_accepted_state_count > 0)
+                    const int max_state_commit_rows =
+                        static_cast<int>(draft_tokens.size());
+                    if (!first_shifted_row_available_from_sidecar &&
+                        !first_token_is_stop &&
+                        max_state_commit_rows > 0)
                     {
-                        if (catchup.accepted_tokens.empty())
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome greedy MTP has no token for initial shifted-cache publication");
-                        }
-
-                        bool initial_shifted_commit_ok = false;
-                        {
-                            PerfStatsCollector::ScopedTimer timer(
-                                "mtp",
-                                "grouped_outcome_greedy_initial_shifted_commit",
-                                "decode");
-                            /*
-                             * The first accepted output's shifted sidecar row is
-                             * sourced from verifier-base terminal hidden when
-                             * LocalTP cannot reuse a speculative sidecar row.  This
-                             * repairs only the shifted KV boundary; main KV and
-                             * recurrent state are still published from grouped
-                             * verifier rows below.
-                             */
-                            initial_shifted_commit_ok =
-                                runner_->commitMTPShiftedRowFromCheckpointTerminalHidden(
-                                    verifier_base_checkpoint,
-                                    catchup.accepted_tokens.front(),
-                                    /*already_appended_tokens=*/0,
-                                    /*allow_speculative_discard=*/true,
-                                    static_cast<int>(
-                                        verifier_base_checkpoint.cached_tokens));
-                        }
-                        if (!initial_shifted_commit_ok)
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome greedy MTP initial shifted-cache commit failed");
-                        }
-                        first_shifted_row_available_for_publication = true;
-                        shifted_publication_commit_count += 1;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "grouped_outcome_greedy_initial_shifted_commits",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"source", "verifier_base_checkpoint_terminal_hidden"}});
+                        return fail_after_checkpoint(
+                            "Grouped-outcome greedy LocalTP MTP requires a device-resident initial shifted-row repair when sidecar reuse is unavailable; host checkpoint-token repair is not a production path");
                     }
-                    if (compact_accepted_state_count > 1)
+                    if (first_shifted_row_available_from_sidecar &&
+                        max_state_commit_rows > 1)
                     {
-                        if (compact_accepted_state_count >
-                            static_cast<int>(catchup.accepted_tokens.size()))
-                        {
-                            return fail_after_checkpoint(
-                                "Grouped-outcome greedy MTP accepted-state publication exceeds committed outputs");
-                        }
-
                         bool shifted_catchup_ok = false;
                         {
                             PerfStatsCollector::ScopedTimer timer(
                                 "mtp",
-                                "grouped_outcome_greedy_shifted_prefix_commit",
+                                "grouped_outcome_greedy_shifted_prefix_device_commit",
                                 "decode");
-                            const int shifted_commit_position_offset =
-                                first_shifted_row_available_from_sidecar
-                                    ? base_sidecar_position
-                                    : static_cast<int>(
-                                          verifier_base_checkpoint.cached_tokens);
                             shifted_catchup_ok =
-                                runner_->commitMTPShiftedRowsFromPartialForward(
-                                    catchup.accepted_tokens.data(),
-                                    compact_accepted_state_count,
+                                runner_->commitMTPShiftedRowsFromDeviceOutcome(
+                                    outcome_handle,
+                                    /*request_index=*/0,
                                     /*already_appended_tokens=*/1,
-                                    catchup.main_forward_token_count,
+                                    max_state_commit_rows,
+                                    /*main_forward_token_count=*/max_state_commit_rows,
                                     /*allow_speculative_discard=*/true,
-                                    shifted_commit_position_offset,
+                                    base_sidecar_position,
                                     /*already_appended_shifted_kv_tokens=*/1);
                         }
                         if (!shifted_catchup_ok)
                         {
                             return fail_after_checkpoint(
-                                "Grouped-outcome greedy MTP shifted-cache accepted-prefix commit failed");
+                                "Grouped-outcome greedy MTP device-resident shifted-cache suffix commit failed");
                         }
                         shifted_publication_commit_count +=
-                            compact_accepted_state_count - 1;
+                            max_state_commit_rows - 1;
                         PerfStatsCollector::addCounter(
                             "mtp",
-                            "grouped_outcome_greedy_shifted_prefix_commits",
-                            static_cast<double>(
-                                compact_accepted_state_count - 1),
-                            "decode");
+                            "grouped_outcome_greedy_shifted_prefix_device_commits",
+                            static_cast<double>(max_state_commit_rows - 1),
+                            "decode",
+                            {},
+                            {{"rows", std::to_string(max_state_commit_rows - 1)}});
                     }
                 }
 
@@ -11017,8 +10850,7 @@ namespace llaminar2
                         "decode",
                         {},
                         {{"policy_path", "grouped_outcome_device_resident_publication"}});
-                    if (!device_outcome_materialized_for_shifted_kv &&
-                        !runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
+                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
                             outcome_handle,
                             &device_outcome))
                     {
