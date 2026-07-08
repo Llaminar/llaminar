@@ -17,6 +17,7 @@
 #include "config/OrchestrationConfig.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "utils/DebugEnv.h"
@@ -37,8 +38,23 @@ namespace
             position += seq_len;
             if (all_position_logits_enabled)
             {
-                all_position_logits.assign(static_cast<size_t>(seq_len) * vocab_size(), -1.0f);
-                for (int row = 0; row < seq_len; ++row)
+                /*
+                 * MTP grouped verification enables row-indexed all-position
+                 * logits before the verifier forward.  The graph still consumes
+                 * every verifier input token, but the logits surface contains
+                 * only the compact rows selected by MTPSpecDecode metadata.
+                 * Modeling that distinction here keeps prefix-cache tests on
+                 * the same grouped publication contract as production.
+                 */
+                const int row_count =
+                    row_indexed_all_position_logits_enabled
+                        ? row_indexed_all_position_logits_row_count
+                        : seq_len;
+                all_position_logits.assign(
+                    static_cast<size_t>(row_count) *
+                        static_cast<size_t>(vocab_size()),
+                    -1.0f);
+                for (int row = 0; row < row_count; ++row)
                 {
                     const int token =
                         row < static_cast<int>(verify_argmax_tokens.size())
@@ -217,17 +233,137 @@ namespace
             return already_appended_tokens >= 0;
         }
 
+        /**
+         * @brief Append the first shifted MTP row from a verifier-base checkpoint.
+         *
+         * Grouped publication verifies all target rows before publishing live
+         * state.  When the sidecar's first shifted row is not reusable, the
+         * serial-equivalent source for the accepted first token is the terminal
+         * hidden state captured before draft work.  The mock records the same
+         * logical repair that production runners perform without pretending to
+         * own tensor payloads.
+         */
+        bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            ++checkpoint_terminal_hidden_commit_calls;
+            if (!checkpoint.valid || already_appended_tokens < 0)
+                return false;
+            if (position_offset_override >= 0 &&
+                position_offset_override != checkpoint.cached_tokens)
+            {
+                return false;
+            }
+            return commitMTPShiftedRowFromCurrentTerminalHidden(
+                token,
+                already_appended_tokens,
+                allow_speculative_discard,
+                checkpoint.cached_tokens);
+        }
+
         bool setComputeAllPositionLogits(bool enabled) override
         {
             if (!mtp_enabled)
                 return false;
             all_position_logits_enabled = enabled;
+            if (!enabled)
+                row_indexed_all_position_logits_enabled = false;
             return true;
+        }
+
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
+        {
+            if (!mtp_enabled)
+                return false;
+            if (enabled && row_count <= 0)
+                return false;
+            row_indexed_all_position_logits_enabled = enabled;
+            row_indexed_all_position_logits_row_count = enabled ? row_count : 0;
+            all_position_logits_enabled = enabled || all_position_logits_enabled;
+            return true;
+        }
+
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override
+        {
+            if (!mtp_enabled || !plan.ok)
+                return false;
+            ++set_mtp_verifier_plan_calls;
+            mtp_verifier_plan_installed = true;
+            last_mtp_verifier_plan = plan;
+            return true;
+        }
+
+        void clearMTPSpecVerifierInputPlan() override
+        {
+            ++clear_mtp_verifier_plan_calls;
+            mtp_verifier_plan_installed = false;
+            last_mtp_verifier_plan = MTPSpecDecodeVerifierInputPlan{};
         }
 
         const float *getAllPositionLogits() const override
         {
             return all_position_logits.empty() ? nullptr : all_position_logits.data();
+        }
+
+        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override
+        {
+            return mtp_enabled;
+        }
+
+        /**
+         * @brief Publish a grouped verifier transaction into the mock live state.
+         *
+         * The mock does not own KV/GDN tensors, so this method validates the
+         * externally visible step-plan shape and updates the same logical
+         * counters that production publication updates after copying accepted
+         * verifier rows.  Tests can then prove that prefix-cache MTP exercised
+         * grouped publication without smuggling the old serial row-replay path
+         * back into the unit double.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override
+        {
+            if (!mtp_enabled)
+            {
+                if (error)
+                    *error = "MTP is disabled";
+                return false;
+            }
+            if (!plans.ok)
+            {
+                if (error)
+                    *error = "invalid grouped MTP plan: " + plans.error;
+                return false;
+            }
+            if (plans.request_count != 1 || plans.steps.size() != 1)
+            {
+                if (error)
+                    *error = "prefix-flow mock supports exactly one grouped MTP request";
+                return false;
+            }
+
+            const MTPSpecStepPlan &step = plans.steps.front();
+            if (step.request_index != 0 ||
+                step.target_cached_tokens !=
+                    step.base_cached_tokens + step.accepted_count)
+            {
+                if (error)
+                    *error = "grouped MTP plan has inconsistent single-request metadata";
+                return false;
+            }
+
+            ++grouped_mtp_publication_calls;
+            last_grouped_mtp_publication_plan = plans;
+            last_grouped_mtp_step = step;
+            position = step.target_cached_tokens;
+            syncShiftedRowsToPosition();
+            return true;
         }
 
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
@@ -259,6 +395,8 @@ namespace
                 restored_mtp_rows.push_back(shifted_mtp_rows);
             }
             all_position_logits_enabled = false;
+            row_indexed_all_position_logits_enabled = false;
+            row_indexed_all_position_logits_row_count = 0;
             return true;
         }
 
@@ -268,6 +406,9 @@ namespace
         bool mtp_enabled = false;
         bool supports_chained_mtp = true;
         bool all_position_logits_enabled = false;
+        bool row_indexed_all_position_logits_enabled = false;
+        int row_indexed_all_position_logits_row_count = 0;
+        bool mtp_verifier_plan_installed = false;
         bool supports_chunk_schedule = false;
         bool chunk_schedule_ok = true;
         std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
@@ -285,6 +426,10 @@ namespace
         int forward_mtp_calls = 0;
         int chained_mtp_calls = 0;
         int commit_mtp_calls = 0;
+        int checkpoint_terminal_hidden_commit_calls = 0;
+        int set_mtp_verifier_plan_calls = 0;
+        int clear_mtp_verifier_plan_calls = 0;
+        int grouped_mtp_publication_calls = 0;
         int clear_calls = 0;
         int lookup_calls = 0;
         int populate_calls = 0;
@@ -306,6 +451,9 @@ namespace
         std::vector<int> restored_mtp_rows;
         std::vector<int> last_chunk_schedule_tokens;
         PrefillChunkSchedulerPolicy last_chunk_schedule_policy;
+        MTPSpecDecodeVerifierInputPlan last_mtp_verifier_plan;
+        MTPSpecStepPlanBatch last_grouped_mtp_publication_plan;
+        MTPSpecStepPlan last_grouped_mtp_step;
         int last_chunk_schedule_pad_token_id = -1;
         bool last_chunk_schedule_allow_padded = false;
         std::vector<int32_t> lookup_tokens;
@@ -923,9 +1071,14 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPCommitsAcceptedVerifierStateWit
     EXPECT_EQ(mock_ptr->last_mtp_condition_token, mock_ptr->prefill_argmax_token);
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
     EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
+    EXPECT_EQ(mock_ptr->checkpoint_terminal_hidden_commit_calls, 1);
     EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
     EXPECT_THAT(mock_ptr->last_commit_tokens,
-                ElementsAre(mock_ptr->mtp_argmax_token));
+                ElementsAre(mock_ptr->prefill_argmax_token,
+                            mock_ptr->mtp_argmax_token));
+    EXPECT_EQ(mock_ptr->grouped_mtp_publication_calls, 1);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.accepted_count, 2);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.rejected_count, 0);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_TRUE(probe.prefix_request.hit);
@@ -986,6 +1139,9 @@ TEST(Test__PrefixCachePrefillFlow, MTPStatsRecordRejectedDraftToken)
     ASSERT_TRUE(step.success()) << step.error;
     EXPECT_THAT(step.tokens, ElementsAre(mock_ptr->prefill_argmax_token,
                                          mock_ptr->verify_argmax_token));
+    EXPECT_EQ(mock_ptr->grouped_mtp_publication_calls, 1);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.accepted_count, 1);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.rejected_count, 1);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -1018,9 +1174,13 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeComm
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 4);
-    EXPECT_EQ(mock_ptr->last_commit_already_appended, 3);
-    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(13));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
+    EXPECT_EQ(mock_ptr->checkpoint_terminal_hidden_commit_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 12, 13));
+    EXPECT_EQ(mock_ptr->grouped_mtp_publication_calls, 1);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.accepted_count, 4);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.rejected_count, 0);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.mtp_draft_steps, 3u);
@@ -1061,9 +1221,13 @@ TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreSupportsChainedMTPDr
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 4);
-    EXPECT_EQ(mock_ptr->last_commit_already_appended, 3);
-    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(13));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
+    EXPECT_EQ(mock_ptr->checkpoint_terminal_hidden_commit_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 12, 13));
+    EXPECT_EQ(mock_ptr->grouped_mtp_publication_calls, 1);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.accepted_count, 4);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.rejected_count, 0);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_TRUE(probe.prefix_request.hit);
@@ -1077,7 +1241,7 @@ TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreSupportsChainedMTPDr
     EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
 }
 
-TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeReplaysCorrectionOnReject)
+TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreePublishesGroupedCorrectionOnReject)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -1086,7 +1250,7 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeRepl
     mock_ptr->lookup_result.block_size = 2;
     mock_ptr->lookup_result.cached_tokens = 2;
     mock_ptr->mtp_argmax_tokens = {11, 12, 13};
-    mock_ptr->decode_argmax_tokens = {11, 15, 14};
+    mock_ptr->verify_argmax_tokens = {11, 15, 14};
 
     auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/3);
     ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
@@ -1099,12 +1263,16 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeRepl
     EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
     EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
     EXPECT_EQ(mock_ptr->restore_live_calls, 0);
-    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(15));
-    EXPECT_EQ(mock_ptr->commit_mtp_calls, 3);
-    EXPECT_EQ(mock_ptr->last_commit_already_appended, 2);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(9, 11, 12, 13));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 2);
+    EXPECT_EQ(mock_ptr->checkpoint_terminal_hidden_commit_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
     EXPECT_TRUE(mock_ptr->last_commit_allow_speculative_discard);
     EXPECT_EQ(mock_ptr->last_commit_position_offset_override, 4);
-    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(15));
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11));
+    EXPECT_EQ(mock_ptr->grouped_mtp_publication_calls, 1);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.accepted_count, 2);
+    EXPECT_EQ(mock_ptr->last_grouped_mtp_step.rejected_count, 2);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.mtp_draft_steps, 3u);
@@ -1112,7 +1280,7 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeRepl
     EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
     EXPECT_EQ(probe.mtp_rollbacks, 0u);
     EXPECT_EQ(probe.mtp_verifier_runs, 1u);
-    EXPECT_EQ(probe.mtp_verifier_token_count, 3u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
 }
 
 TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthHardFailsWhenRunnerDoesNotSupportIt)

@@ -94,16 +94,15 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                     "value": 4,
                     "tags": {
                         "lane": "dense",
-                        "perf_gate_status": "correct_serial_oracle_not_economical",
+                        "perf_gate_status": "grouped_outcome_economics_pending",
                         "max_rows": "4",
-                        "serial_decode_equivalent_oracle_only": "true",
-                        "grouped_decode_equivalent": "false",
-                        "row_indexed_lm_head": "false",
-                        "device_resident_input": "false",
-                        "device_resident_outcome": "false",
-                        "device_resident_publication": "false",
+                        "grouped_decode_equivalent": "true",
+                        "row_indexed_lm_head": "true",
+                        "device_resident_input": "true",
+                        "device_resident_outcome": "true",
+                        "device_resident_publication": "true",
                         "host_bridge_free_hot_path": "false",
-                        "graph_capturable": "false",
+                        "graph_capturable": "true",
                         "greedy": "true",
                         "stochastic": "true",
                     },
@@ -119,7 +118,6 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                         "lane": "moe",
                         "perf_gate_status": "grouped_promoted",
                         "max_rows": "3",
-                        "serial_decode_equivalent_oracle_only": "false",
                         "grouped_decode_equivalent": "true",
                         "row_indexed_lm_head": "true",
                         "device_resident_input": "true",
@@ -815,11 +813,11 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["stochastic_seeded_device_threshold_rows"], 5.0)
         self.assertEqual(
             summary["verifier_economy_dense"],
-            "status=correct_serial_oracle_not_economical;rows=4;oracle=true;grouped=false;row_lm=false;resident=false/false/false;bridge_free=false;graph=false;greedy=true;stochastic=true",
+            "status=grouped_outcome_economics_pending;rows=4;grouped=true;row_lm=true;resident=true/true/true;bridge_free=false;graph=true;greedy=true;stochastic=true",
         )
         self.assertEqual(
             summary["verifier_economy_moe"],
-            "status=grouped_promoted;rows=3;oracle=false;grouped=true;row_lm=true;resident=true/true/true;bridge_free=true;graph=true;greedy=true;stochastic=true",
+            "status=grouped_promoted;rows=3;grouped=true;row_lm=true;resident=true/true/true;bridge_free=true;graph=true;greedy=true;stochastic=true",
         )
         self.assertEqual(summary["condition_ms"], 9.75)
         self.assertEqual(summary["condition_count"], 2)

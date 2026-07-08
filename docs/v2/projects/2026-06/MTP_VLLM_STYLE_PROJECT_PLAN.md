@@ -2898,8 +2898,8 @@ Implementation plan:
      projections, LM-head, MoE routing, routed experts, shared experts,
      sampling, and accepted-state publication. A helper that loops over M
      ordinary one-token stage executions is a correctness oracle only; it must
-     stay labelled `serial_decode_equivalent_oracle_only` and cannot satisfy
-     Phase 9.8 performance acceptance.
+     remain outside production capability reporting and cannot satisfy Phase
+     9.8 performance acceptance.
    - MoE: replace promoted uses of `executeDecodeEquivalentVerifierPrefill`
      row replay with grouped decode-equivalent routed+shared prefill for
      M=2/3/4. Serial replay remains available only as an offline diagnostic
@@ -2958,9 +2958,9 @@ Implementation plan:
    - Reconcile the Phase 10 documentation/status rows with the code capability
      flags so "grouped verifier green" cannot mean "serial oracle is a
      production lane".
-   - Rename comments and metrics where needed to separate
-     `serial_decode_equivalent_oracle_only` from
-     `grouped_decode_equivalent_verifier`.
+   - Rename comments and metrics where needed so production surfaces advertise
+     only `grouped_decode_equivalent_verifier`; serial row replay remains an
+     offline diagnostic/oracle implementation detail.
    - Delete or demote retired experimental all-position verifier paths only
      after the grouped path has passed correctness and perf gates on CPU, CUDA,
      and ROCm.

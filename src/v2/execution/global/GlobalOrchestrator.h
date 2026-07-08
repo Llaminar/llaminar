@@ -146,6 +146,22 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens);
+        /**
+         * @brief Commit accepted grouped verifier rows through every local stage.
+         *
+         * Grouped MTP verification may publish only a suffix of the verifier
+         * forward rows into shifted MTP state.  The extra row-count, base
+         * offset, and discard arguments preserve the exact single-rank
+         * publication contract when GlobalTP wraps the real rank runner.
+         */
+        bool commitMTPShiftedRowsFromPartialForwardAll(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1);
         bool commitMTPShiftedRowFromCurrentTerminalHiddenAll(
             int32_t token,
             int already_appended_tokens,
@@ -159,6 +175,42 @@ namespace llaminar2
             int position_offset_override = -1);
         bool ensureMTPCheckpointTerminalHiddenAll();
         bool setComputeAllPositionLogitsAll(bool enabled);
+        /**
+         * @brief Toggle compact row-indexed all-position verifier logits.
+         *
+         * GlobalTP is a transparent IInferenceRunner wrapper.  The grouped
+         * verifier planner installs compact verifier rows on the wrapper, so
+         * this helper fans the shape toggle out to the actual rank-local
+         * runner that owns graph execution and LM-head row packing.
+         */
+        bool setComputeRowIndexedAllPositionLogitsAll(bool enabled, int row_count);
+        /**
+         * @brief Install grouped verifier input metadata on every local runner.
+         *
+         * Row-indexed verifier forwards need the compact row plan and token
+         * ordering to live beside the runner that executes the graph.  Without
+         * this fan-out, GlobalTP would enable row-indexed logits but leave the
+         * child runner without row metadata.
+         */
+        bool setMTPSpecVerifierInputPlanAll(const MTPSpecDecodeVerifierInputPlan &plan);
+        /**
+         * @brief Clear stale grouped verifier row metadata from local runners.
+         */
+        void clearMTPSpecVerifierInputPlanAll();
+        /**
+         * @brief True when all local runners can publish grouped verifier plans.
+         */
+        bool supportsGroupedDecodeEquivalentMTPSpecStatePublicationAll() const;
+        /**
+         * @brief Publish the accepted grouped verifier prefix through all local runners.
+         *
+         * The same MTPSpecStepPlanBatch must reach every GlobalTP participant
+         * so positions, KV, shifted MTP KV, and recurrent payloads advance in
+         * lockstep after the rank-wide verifier decision.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr);
         uint64_t moePlacementEpochAll() const;
         uint64_t moeRuntimeMovementEpochAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
@@ -294,6 +346,22 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens) override;
+        /**
+         * @brief Forward grouped verifier shifted-row publication to local stages.
+         *
+         * IInferenceRunner's default implementation intentionally has a narrow
+         * legacy shape.  GlobalTP must override it so grouped publication keeps
+         * the verifier row count, base offset, and speculative-discard
+         * semantics supplied by OrchestrationRunner.
+         */
+        bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
             int32_t token,
             int already_appended_tokens,
@@ -308,11 +376,34 @@ namespace llaminar2
         bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
+        /**
+         * @brief Forward compact verifier LM-head row packing to local runners.
+         */
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
+        /**
+         * @brief Forward grouped verifier input metadata to local runners.
+         */
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override;
+        /**
+         * @brief Clear grouped verifier input metadata from local runners.
+         */
+        void clearMTPSpecVerifierInputPlan() override;
         const float *getAllPositionLogits() const override;
         bool hasMTPLogitsLocal() const override;
         LogitsLocalInfo getMTPLogitsLocalInfo() const override;
         bool hasAllPositionLogitsLocal() const override;
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
+        /**
+         * @brief True when every local stage can publish grouped verifier rows.
+         */
+        bool supportsGroupedDecodeEquivalentMTPSpecStatePublication() const override;
+        /**
+         * @brief Publish accepted grouped verifier rows through GlobalTP children.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
         std::string mtpDecodeUnsupportedReason() const override;
         bool supportsMTPTokenCoordination() const override;
         uint64_t moePlacementEpoch() const override;

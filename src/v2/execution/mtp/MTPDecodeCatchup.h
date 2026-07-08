@@ -223,32 +223,20 @@ namespace llaminar2
     struct MTPVerifierEconomyLane
     {
         bool correct = false;
-        bool serial_decode_equivalent_oracle_only = false;
         bool grouped_decode_equivalent = false;
         bool row_indexed_lm_head = false;
         bool device_resident_input = false;
         bool device_resident_outcome = false;
         bool device_resident_publication = false;
+        bool host_native_input = false;
+        bool host_native_outcome = false;
+        bool host_plan_publication = false;
         bool host_bridge_free_hot_path = false;
         bool graph_capturable = false;
         bool greedy = false;
         bool stochastic = false;
         int max_rows = 0;
         std::string perf_gate_status = "unproven";
-
-        static MTPVerifierEconomyLane serialOracleOnlyCorrect(int rows)
-        {
-            MTPVerifierEconomyLane lane;
-            lane.correct = rows > 0;
-            lane.serial_decode_equivalent_oracle_only = lane.correct;
-            lane.greedy = lane.correct;
-            lane.stochastic = lane.correct;
-            lane.max_rows = lane.correct ? rows : 0;
-            lane.perf_gate_status = lane.correct
-                                        ? "correct_serial_oracle_not_economical"
-                                        : "unproven";
-            return lane;
-        }
 
         /**
          * @brief Report grouped decode-equivalent verifier math that is proven
@@ -284,6 +272,9 @@ namespace llaminar2
             lane.device_resident_input = lane.correct;
             lane.device_resident_outcome = lane.correct;
             lane.device_resident_publication = lane.correct;
+            lane.host_native_input = false;
+            lane.host_native_outcome = false;
+            lane.host_plan_publication = false;
             lane.host_bridge_free_hot_path = lane.correct;
             lane.graph_capturable = lane.correct;
             lane.greedy = lane.correct;
@@ -317,6 +308,9 @@ namespace llaminar2
             lane.device_resident_input = lane.correct;
             lane.device_resident_outcome = lane.correct;
             lane.device_resident_publication = lane.correct;
+            lane.host_native_input = false;
+            lane.host_native_outcome = false;
+            lane.host_plan_publication = false;
             lane.host_bridge_free_hot_path = false;
             lane.graph_capturable = lane.correct;
             lane.greedy = lane.correct;
@@ -324,6 +318,38 @@ namespace llaminar2
             lane.max_rows = lane.correct ? rows : 0;
             lane.perf_gate_status = lane.correct
                                         ? "grouped_outcome_economics_pending"
+                                        : "unproven";
+            return lane;
+        }
+
+        /**
+         * @brief Report a grouped verifier outcome with native CPU publication.
+         *
+         * CPU does not have a "device-resident" hot path in the GPU sense:
+         * verifier inputs, logits, sampler distributions, and publication
+         * plans are already native host data.  This lane therefore advertises
+         * the real CPU contract explicitly instead of setting misleading
+         * device_resident_* bits.  The grouped verifier still runs once over
+         * M rows and publishGroupedDecodeEquivalentMTPSpecStateBatch() restores
+         * accepted KV/GDN/short-conv state from those grouped verifier rows.
+         */
+        static MTPVerifierEconomyLane groupedOutcomeHostPublicationEconomical(
+            int rows)
+        {
+            MTPVerifierEconomyLane lane;
+            lane.correct = rows > 0;
+            lane.grouped_decode_equivalent = lane.correct;
+            lane.row_indexed_lm_head = lane.correct;
+            lane.host_native_input = lane.correct;
+            lane.host_native_outcome = lane.correct;
+            lane.host_plan_publication = lane.correct;
+            lane.host_bridge_free_hot_path = lane.correct;
+            lane.graph_capturable = lane.correct;
+            lane.greedy = lane.correct;
+            lane.stochastic = lane.correct;
+            lane.max_rows = lane.correct ? rows : 0;
+            lane.perf_gate_status = lane.correct
+                                        ? "grouped_host_outcome_economical"
                                         : "unproven";
             return lane;
         }
@@ -344,9 +370,12 @@ namespace llaminar2
             return supportsRows(rows, stochastic_requested) &&
                    grouped_decode_equivalent &&
                    row_indexed_lm_head &&
-                   device_resident_input &&
-                   device_resident_outcome &&
-                   device_resident_publication &&
+                   ((device_resident_input &&
+                     device_resident_outcome &&
+                     device_resident_publication) ||
+                    (host_native_input &&
+                     host_native_outcome &&
+                     host_plan_publication)) &&
                    host_bridge_free_hot_path &&
                    graph_capturable;
         }
@@ -355,9 +384,6 @@ namespace llaminar2
         {
             correct = correct && other.correct;
             max_rows = correct ? std::min(max_rows, other.max_rows) : 0;
-            serial_decode_equivalent_oracle_only =
-                serial_decode_equivalent_oracle_only &&
-                other.serial_decode_equivalent_oracle_only;
             grouped_decode_equivalent =
                 grouped_decode_equivalent &&
                 other.grouped_decode_equivalent;
@@ -368,6 +394,12 @@ namespace llaminar2
                 device_resident_outcome && other.device_resident_outcome;
             device_resident_publication =
                 device_resident_publication && other.device_resident_publication;
+            host_native_input =
+                host_native_input && other.host_native_input;
+            host_native_outcome =
+                host_native_outcome && other.host_native_outcome;
+            host_plan_publication =
+                host_plan_publication && other.host_plan_publication;
             host_bridge_free_hot_path =
                 host_bridge_free_hot_path && other.host_bridge_free_hot_path;
             graph_capturable = graph_capturable && other.graph_capturable;

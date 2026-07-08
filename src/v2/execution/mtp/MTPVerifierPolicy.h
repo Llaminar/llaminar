@@ -1,5 +1,17 @@
 #pragma once
 
+/**
+ * @file MTPVerifierPolicy.h
+ * @brief Production policy for choosing an MTP verifier execution lane.
+ *
+ * The policy is intentionally fail-closed.  A production MTP verifier may use
+ * direct all-position state publication when that stronger continuation proof
+ * exists, or it uses grouped decode-equivalent verifier outcomes as the
+ * mandatory baseline.  Serial row replay remains a diagnostic/oracle concept
+ * owned by focused tests and helper utilities; it is not a production fallback
+ * selected from this policy.
+ */
+
 namespace llaminar2
 {
 
@@ -8,17 +20,17 @@ namespace llaminar2
         Unsupported,
         AllPositionStatePublication,
         GroupedDecodeEquivalentOutcome,
-        DecodeEquivalentSequential,
     };
 
     /**
      * @brief Inputs that choose the verifier execution contract for one MTP step.
      *
-     * The policy deliberately separates three increasingly strong contracts:
-     * correctness-only serial replay, grouped verifier outcomes, and direct
-     * accepted-state publication.  Phase 9.8 depends on that distinction because
-     * a runner can prove M=2..4 verifier rows numerically decode-equivalent
-     * before it is safe to publish live KV/GDN state from those rows.
+     * Direct all-position publication is a stronger path and therefore remains
+     * an explicit input.  Grouped decode-equivalent verification is not a
+     * capability advertisement anymore: every production backend is expected to
+     * implement it.  If the selected runner later lacks the structural
+     * publisher required for the grouped outcome, the caller must fail loudly
+     * instead of falling back to serial row replay.
      */
     struct MTPVerifierPolicyInput
     {
@@ -27,14 +39,12 @@ namespace llaminar2
         bool uses_sampling_penalties = false;
         bool supports_row_local_penalty_application = false;
         bool supports_spec_state_publication = false;
-        bool supports_grouped_decode_equivalent_outcome = false;
     };
 
     struct MTPVerifierPolicyDecision
     {
         MTPVerifierExecutionPath path =
             MTPVerifierExecutionPath::Unsupported;
-        bool accepted_all_position_state_requires_replay = true;
         const char *reason = "decode_equivalent_verifier_unavailable";
     };
 
@@ -48,12 +58,25 @@ namespace llaminar2
         const bool row_local_penalties_supported =
             !input.uses_sampling_penalties ||
             input.supports_row_local_penalty_application;
+
+        if (!supported_sampling_mode)
+        {
+            decision.reason =
+                "sampling_mode_not_supported_by_grouped_verifier";
+            return decision;
+        }
+
+        if (!row_local_penalties_supported)
+        {
+            decision.reason =
+                "row_local_penalty_application_required_for_grouped_verifier";
+            return decision;
+        }
+
         if (supported_sampling_mode &&
-            row_local_penalties_supported &&
             input.supports_spec_state_publication)
         {
             decision.path = MTPVerifierExecutionPath::AllPositionStatePublication;
-            decision.accepted_all_position_state_requires_replay = false;
             decision.reason =
                 input.uses_sampling_penalties
                     ? "greedy_penalties_use_all_position_state_publication"
@@ -64,52 +87,21 @@ namespace llaminar2
         }
 
         /*
-         * This is the Phase 10 grouped-outcome lane. It lets the runner record
-         * that grouped verifier math and row-indexed logits are proven, while
-         * the orchestrator still decides whether a device-resident publisher is
-         * available for the accepted rows. Sampling penalties enter this lane
-         * only after the runner proves it can mutate each verifier row with
-         * branch-local sampler history.
+         * Grouped verifier publication is now the target-state baseline.  The
+         * policy no longer asks a runner to advertise this as an optional
+         * feature because doing so made production correctness depend on stale
+         * capability tables.  Route selection below this policy chooses the
+         * concrete structural publisher, and missing grouped infrastructure
+         * fails at that boundary.
          */
-        if (supported_sampling_mode &&
-            row_local_penalties_supported &&
-            input.supports_grouped_decode_equivalent_outcome)
-        {
-            decision.path =
-                MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
-            decision.accepted_all_position_state_requires_replay = true;
-            decision.reason =
-                input.uses_sampling_penalties
-                    ? "greedy_penalties_use_grouped_decode_equivalent_outcome_with_device_resident_publication"
-                    : (input.stochastic_verify
-                           ? "stochastic_uses_grouped_decode_equivalent_outcome_with_device_resident_publication"
-                           : "greedy_uses_grouped_decode_equivalent_outcome_with_device_resident_publication");
-            return decision;
-        }
-
-        /*
-         * Greedy decode with penalties is still deterministic: the accepted
-         * token is the argmax after applying the request-local sparse penalty
-         * map. It stays on the shared sequential verifier unless the runner
-         * advertises row-local verifier-logit penalty application above.
-         */
-        const bool use_decode_equivalent_sequential =
-            supported_sampling_mode;
-        if (use_decode_equivalent_sequential)
-        {
-            decision.path = MTPVerifierExecutionPath::DecodeEquivalentSequential;
-            decision.accepted_all_position_state_requires_replay = true;
-            decision.reason = input.uses_sampling_penalties
-                                  ? "greedy_penalties_use_shared_decode_equivalent_verifier"
-                                  : (input.stochastic_verify
-                                         ? "stochastic_uses_shared_decode_equivalent_verifier"
-                                         : "greedy_uses_shared_decode_equivalent_verifier");
-            return decision;
-        }
-
-        decision.path = MTPVerifierExecutionPath::Unsupported;
-        decision.accepted_all_position_state_requires_replay = true;
-        decision.reason = "sampling_mode_not_supported_by_shared_verifier";
+        decision.path =
+            MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
+        decision.reason =
+            input.uses_sampling_penalties
+                ? "greedy_penalties_use_grouped_decode_equivalent_outcome"
+                : (input.stochastic_verify
+                       ? "stochastic_uses_grouped_decode_equivalent_outcome"
+                       : "greedy_uses_grouped_decode_equivalent_outcome");
         return decision;
     }
 

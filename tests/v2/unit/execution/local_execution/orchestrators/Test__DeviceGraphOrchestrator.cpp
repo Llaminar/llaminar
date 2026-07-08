@@ -581,15 +581,28 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     EXPECT_FALSE(moe_orchestrator.supportsMTPSpecStatePublication())
         << "CPU MoE must remain replay-published until it has a resident-state "
            "publication proof of its own.";
+    EXPECT_TRUE(moe_orchestrator.supportsGroupedDecodeEquivalentMTPSpecStatePublication())
+        << "CPU MoE must publish grouped decode-equivalent verifier rows through "
+           "the narrow host-native grouped publication API, not row replay.";
     const auto cpu_moe_economy =
         moe_orchestrator.mtpVerifierEconomyCapability();
     EXPECT_TRUE(cpu_moe_economy.supportsMoERows(4, true));
-    EXPECT_FALSE(cpu_moe_economy.moe.serial_decode_equivalent_oracle_only)
-        << "CPU MoE must not advertise row replay as a production economy lane.";
     EXPECT_TRUE(cpu_moe_economy.moe.grouped_decode_equivalent)
         << "CPU MoE now has a grouped decode-equivalent verifier proof, even "
            "before full hot-path economics are accepted.";
-    EXPECT_FALSE(cpu_moe_economy.hasEconomicalMoEPath(4, true));
+    EXPECT_TRUE(cpu_moe_economy.moe.row_indexed_lm_head);
+    EXPECT_FALSE(cpu_moe_economy.moe.device_resident_input);
+    EXPECT_FALSE(cpu_moe_economy.moe.device_resident_outcome);
+    EXPECT_FALSE(cpu_moe_economy.moe.device_resident_publication);
+    EXPECT_TRUE(cpu_moe_economy.moe.host_native_input);
+    EXPECT_TRUE(cpu_moe_economy.moe.host_native_outcome);
+    EXPECT_TRUE(cpu_moe_economy.moe.host_plan_publication);
+    EXPECT_TRUE(cpu_moe_economy.moe.host_bridge_free_hot_path);
+    EXPECT_TRUE(cpu_moe_economy.moe.graph_capturable);
+    EXPECT_STREQ(
+        cpu_moe_economy.moe.perf_gate_status.c_str(),
+        "grouped_host_outcome_economical");
+    EXPECT_TRUE(cpu_moe_economy.hasEconomicalMoEPath(4, true));
 
     DeviceId gpu_device = DeviceId::invalid();
     if (DeviceManager::instance().cuda_device_count() > 0)
@@ -637,9 +650,6 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         const auto gpu_moe_economy =
             gpu_moe_orchestrator.mtpVerifierEconomyCapability();
         EXPECT_TRUE(gpu_moe_economy.supportsMoERows(4, true));
-        EXPECT_FALSE(gpu_moe_economy.moe.serial_decode_equivalent_oracle_only)
-            << "Serial replay remains a diagnostic oracle, not an advertised "
-               "production economy lane.";
         EXPECT_TRUE(gpu_moe_economy.moe.grouped_decode_equivalent)
             << "GPU MoE exposes the strict grouped verifier outcome proof.";
         EXPECT_TRUE(gpu_moe_economy.moe.row_indexed_lm_head);
@@ -682,6 +692,9 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         << "CPU dense MTP must stay on the decode-equivalent verifier until "
            "CPU all-position GDN/KV publication has a continuation-equivalence "
            "proof.";
+    EXPECT_TRUE(dense_orchestrator.supportsGroupedDecodeEquivalentMTPSpecStatePublication())
+        << "CPU dense must publish accepted grouped verifier rows through the "
+           "narrow grouped API instead of falling back to serial row replay.";
     const auto cpu_dense_capability =
         dense_orchestrator.mtpVerifierRowCapability();
     EXPECT_TRUE(cpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true))
@@ -692,11 +705,20 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     const auto cpu_dense_economy =
         dense_orchestrator.mtpVerifierEconomyCapability();
     EXPECT_TRUE(cpu_dense_economy.supportsDenseRows(4, true));
-    EXPECT_FALSE(cpu_dense_economy.dense.serial_decode_equivalent_oracle_only)
-        << "CPU dense verifier support must be reported as grouped/pending, "
-           "not as a production row replay lane.";
     EXPECT_TRUE(cpu_dense_economy.dense.grouped_decode_equivalent);
-    EXPECT_FALSE(cpu_dense_economy.hasEconomicalDensePath(4, false));
+    EXPECT_TRUE(cpu_dense_economy.dense.row_indexed_lm_head);
+    EXPECT_FALSE(cpu_dense_economy.dense.device_resident_input);
+    EXPECT_FALSE(cpu_dense_economy.dense.device_resident_outcome);
+    EXPECT_FALSE(cpu_dense_economy.dense.device_resident_publication);
+    EXPECT_TRUE(cpu_dense_economy.dense.host_native_input);
+    EXPECT_TRUE(cpu_dense_economy.dense.host_native_outcome);
+    EXPECT_TRUE(cpu_dense_economy.dense.host_plan_publication);
+    EXPECT_TRUE(cpu_dense_economy.dense.host_bridge_free_hot_path);
+    EXPECT_TRUE(cpu_dense_economy.dense.graph_capturable);
+    EXPECT_STREQ(
+        cpu_dense_economy.dense.perf_gate_status.c_str(),
+        "grouped_host_outcome_economical");
+    EXPECT_TRUE(cpu_dense_economy.hasEconomicalDensePath(4, false));
 
     if (gpu_device.is_valid())
     {
@@ -721,9 +743,6 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         const auto gpu_dense_economy =
             gpu_dense_orchestrator.mtpVerifierEconomyCapability();
         EXPECT_TRUE(gpu_dense_economy.supportsDenseRows(4, true));
-        EXPECT_FALSE(gpu_dense_economy.dense.serial_decode_equivalent_oracle_only)
-            << "The serial replay contract remains an oracle only while the "
-               "grouped GPU lane is economy-pending.";
         EXPECT_TRUE(gpu_dense_economy.dense.grouped_decode_equivalent)
             << "GPU dense must expose the M=1..4 grouped verifier-row proof "
                "so SingleDevice stochastic MTP can use the resident outcome path.";

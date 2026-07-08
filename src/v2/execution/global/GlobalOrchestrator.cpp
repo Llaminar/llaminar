@@ -545,6 +545,46 @@ namespace llaminar2
         return saw_runner && ok;
     }
 
+    bool StageRunnerRegistry::commitMTPShiftedRowsFromPartialForwardAll(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->commitMTPShiftedRowsFromPartialForward(
+                     tokens,
+                     token_count,
+                     already_appended_tokens,
+                     main_forward_token_count,
+                     allow_speculative_discard,
+                     position_offset_override,
+                     already_appended_shifted_kv_tokens) &&
+                 ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->commitMTPShiftedRowsFromPartialForward(
+                     tokens,
+                     token_count,
+                     already_appended_tokens,
+                     main_forward_token_count,
+                     allow_speculative_discard,
+                     position_offset_override,
+                     already_appended_shifted_kv_tokens) &&
+                 ok;
+        }
+        return saw_runner && ok;
+    }
+
     bool StageRunnerRegistry::commitMTPShiftedRowFromCurrentTerminalHiddenAll(
         int32_t token,
         int already_appended_tokens,
@@ -631,6 +671,122 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = compatibility_runner_->setComputeAllPositionLogits(enabled) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::setComputeRowIndexedAllPositionLogitsAll(
+        bool enabled,
+        int row_count)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->setComputeRowIndexedAllPositionLogits(
+                     enabled,
+                     row_count) &&
+                 ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->setComputeRowIndexedAllPositionLogits(
+                     enabled,
+                     row_count) &&
+                 ok;
+        }
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::setMTPSpecVerifierInputPlanAll(
+        const MTPSpecDecodeVerifierInputPlan &plan)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->setMTPSpecVerifierInputPlan(plan) && ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->setMTPSpecVerifierInputPlan(plan) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    void StageRunnerRegistry::clearMTPSpecVerifierInputPlanAll()
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->clearMTPSpecVerifierInputPlan();
+        }
+        if (compatibility_runner_)
+        {
+            compatibility_runner_->clearMTPSpecVerifierInputPlan();
+        }
+    }
+
+    bool StageRunnerRegistry::supportsGroupedDecodeEquivalentMTPSpecStatePublicationAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner ||
+                !entry.runner->supportsGroupedDecodeEquivalentMTPSpecStatePublication())
+            {
+                return false;
+            }
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            if (!compatibility_runner_->supportsGroupedDecodeEquivalentMTPSpecStatePublication())
+                return false;
+        }
+        return saw_runner;
+    }
+
+    bool StageRunnerRegistry::publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        std::string first_error;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            std::string local_error;
+            const bool runner_ok =
+                entry.runner->publishGroupedDecodeEquivalentMTPSpecStateBatch(
+                    plans,
+                    &local_error);
+            if (!runner_ok && first_error.empty())
+                first_error = local_error;
+            ok = runner_ok && ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            std::string local_error;
+            const bool runner_ok =
+                compatibility_runner_->publishGroupedDecodeEquivalentMTPSpecStateBatch(
+                    plans,
+                    &local_error);
+            if (!runner_ok && first_error.empty())
+                first_error = local_error;
+            ok = runner_ok && ok;
+        }
+        if ((!saw_runner || !ok) && error)
+        {
+            *error = first_error.empty()
+                         ? "global grouped decode-equivalent publication had no local runner"
+                         : first_error;
         }
         return saw_runner && ok;
     }
@@ -1455,6 +1611,27 @@ namespace llaminar2
             already_appended_tokens);
     }
 
+    bool GlobalOrchestrator::commitMTPShiftedRowsFromPartialForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.commitMTPShiftedRowsFromPartialForwardAll(
+            tokens,
+            token_count,
+            already_appended_tokens,
+            main_forward_token_count,
+            allow_speculative_discard,
+            position_offset_override,
+            already_appended_shifted_kv_tokens);
+    }
+
     bool GlobalOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
         int32_t token,
         int already_appended_tokens,
@@ -1509,6 +1686,30 @@ namespace llaminar2
         return stage_runners_.setComputeAllPositionLogitsAll(enabled);
     }
 
+    bool GlobalOrchestrator::setComputeRowIndexedAllPositionLogits(
+        bool enabled,
+        int row_count)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.setComputeRowIndexedAllPositionLogitsAll(
+            enabled,
+            row_count);
+    }
+
+    bool GlobalOrchestrator::setMTPSpecVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.setMTPSpecVerifierInputPlanAll(plan);
+    }
+
+    void GlobalOrchestrator::clearMTPSpecVerifierInputPlan()
+    {
+        stage_runners_.clearMTPSpecVerifierInputPlanAll();
+    }
+
     const float *GlobalOrchestrator::getAllPositionLogits() const
     {
         if (!is_pipeline_tail_)
@@ -1547,6 +1748,28 @@ namespace llaminar2
             return {};
         const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
         return runner ? runner->getAllPositionLogitsLocalInfo() : LogitsLocalInfo{};
+    }
+
+    bool GlobalOrchestrator::supportsGroupedDecodeEquivalentMTPSpecStatePublication() const
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.supportsGroupedDecodeEquivalentMTPSpecStatePublicationAll();
+    }
+
+    bool GlobalOrchestrator::publishGroupedDecodeEquivalentMTPSpecStateBatch(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+        {
+            if (error)
+                *error = mtpDecodeUnsupportedReason();
+            return false;
+        }
+        return stage_runners_.publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
+            plans,
+            error);
     }
 
     std::string GlobalOrchestrator::mtpDecodeUnsupportedReason() const

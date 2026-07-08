@@ -710,7 +710,9 @@ namespace
 
         bool supportsRowLocalAllPositionPenaltyApplication() const override
         {
-            return primary_device_.is_gpu() && supports_mtp_token_coordination_;
+            return supports_mtp_token_coordination_ ||
+                   (primary_device_.is_cpu() &&
+                    supports_grouped_decode_equivalent_mtp_spec_state_publication_);
         }
 
         bool supportsMTPSidecarSampleFusion() const override
@@ -946,12 +948,6 @@ namespace
             {
                 if (error)
                     *error = "mock device-resident MTP spec-state publication is disabled";
-                return false;
-            }
-            if (!supports_mtp_spec_state_publication_)
-            {
-                if (error)
-                    *error = "mock host-plan MTP spec-state publication is disabled";
                 return false;
             }
             if (!publish_mtp_spec_state_ok_)
@@ -3476,6 +3472,10 @@ namespace
             mtp_enabled_ = true;
             accept_mtp_token_ = accept_mtp_token;
             mtp_shifted_cached_tokens_ = shiftedTargetForMainTokens(position_);
+            if (primary_device_.is_cpu())
+            {
+                enableGroupedOutcomeHostPublication(/*rows=*/4);
+            }
         }
         void setMTPDraftTokens(int draft_tokens)
         {
@@ -3493,6 +3493,22 @@ namespace
         void setPrimaryDevice(DeviceId device)
         {
             primary_device_ = device;
+            if (!mtp_enabled_)
+                return;
+            if (primary_device_.is_cpu())
+            {
+                enableGroupedOutcomeHostPublication(/*rows=*/4);
+                return;
+            }
+            if (mtp_verifier_economy_capability_.dense.perf_gate_status ==
+                    "grouped_host_outcome_economical" &&
+                mtp_verifier_economy_capability_.moe.perf_gate_status ==
+                    "grouped_host_outcome_economical")
+            {
+                mtp_verifier_economy_capability_ = {};
+                supports_grouped_decode_equivalent_mtp_spec_state_publication_ =
+                    false;
+            }
         }
         void enableColumnParallelShard(int vocab_start, int vocab_local)
         {
@@ -3725,6 +3741,16 @@ namespace
                 MTPVerifierEconomyLane::groupedOutcomeDevicePublicationEconomicsPending(rows);
             mtp_verifier_economy_capability_.dense = lane;
             mtp_verifier_economy_capability_.moe = lane;
+            supports_device_resident_mtp_spec_state_publication_ = true;
+        }
+        void enableGroupedOutcomeHostPublication(int rows)
+        {
+            const MTPVerifierEconomyLane lane =
+                MTPVerifierEconomyLane::groupedOutcomeHostPublicationEconomical(rows);
+            mtp_verifier_economy_capability_.dense = lane;
+            mtp_verifier_economy_capability_.moe = lane;
+            supports_grouped_decode_equivalent_mtp_spec_state_publication_ =
+                true;
         }
         void enableGroupedDecodeEquivalentMTPSpecStatePublication()
         {
@@ -4580,6 +4606,10 @@ namespace
             }
             mock_ptr->setMTPUnsupportedReason(std::move(mtp_unsupported_reason));
             mock_ptr->setPrimaryDevice(primary_device);
+            if (mtp_enabled && primary_device.is_cpu())
+            {
+                mock_ptr->enableGroupedOutcomeHostPublication(/*rows=*/4);
+            }
             if (mtp_token_coordination)
             {
                 mock_ptr->enableMTPTokenCoordination(hide_local_logits);
@@ -5803,11 +5833,13 @@ namespace
         EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
         EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
         EXPECT_THAT(mock->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->restoreCount(), 1);
-        EXPECT_EQ(mock->setAllPositionCount(), 0);
+        EXPECT_EQ(mock->setAllPositionCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->captureCheckpointCount(), 2);
 
         const auto probe = runner->prefixStateProbe();
@@ -5822,7 +5854,7 @@ namespace
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPGreedyPenaltiesUseSequentialVerifier)
+    TEST_F(Test__PrefillDecodeTransition, MTPGreedyPenaltiesUseGroupedRowLocalVerifier)
     {
         PerfStatsCollector::reset();
 
@@ -5846,15 +5878,14 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
-        EXPECT_EQ(mock->applyMainPenaltiesCount(), 3)
-            << "penalty-greedy catch-up must mutate main logits after each "
-               "forwarded verifier token, using a branch-local sampler "
-               "history that includes the token just replayed";
+        EXPECT_EQ(mock->applyMainPenaltiesCount(), 1)
+            << "the first target token still applies request-local penalties "
+               "to the live main logits before sidecar drafting";
         EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
-        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
-        EXPECT_EQ(mock->setAllPositionCount(), 0)
-            << "Greedy penalties must stay on the decode-equivalent verifier "
-               "until the all-position path applies row-local penalty history.";
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2)
+            << "grouped greedy verification mutates the verifier rows in place "
+               "with branch-local sampler history instead of replaying rows.";
+        EXPECT_EQ(mock->setAllPositionCount(), 2);
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
@@ -5981,7 +6012,7 @@ namespace
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, CUDAMTPUsesSequentialGreedyVerifierInsteadOfAllPositionReplay)
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPUsesGroupedGreedyVerifierInsteadOfSerialReplay)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() / "llaminar_mtp_cuda_sequential_verifier_unit.json";
@@ -6000,7 +6031,8 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
-            mock->requireMTPDecodeEquivalentReplay();
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -6016,21 +6048,20 @@ namespace
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
-            EXPECT_EQ(mock->setAllPositionCount(), 0)
-                << "CUDA dense must not enter the unsafe multi-row verifier shortcut path";
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 0);
-            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
-            EXPECT_EQ(mock->restoreCount(), 1)
-                << "depth>1 speculative sidecar rows are discarded back to the first sidecar checkpoint";
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 3);
-            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
-            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
+                << "grouped device-resident publication must not replay rows "
+                   "through the serial shifted-cache commit helper.";
 
-            ASSERT_GE(mock->forwardHistory().size(), 4u);
+            ASSERT_GE(mock->forwardHistory().size(), 2u);
             EXPECT_THAT(mock->forwardHistory()[0], ElementsAre(1, 2, 3, 4, 5));
-            EXPECT_THAT(mock->forwardHistory()[1], ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
-            EXPECT_THAT(mock->forwardHistory()[2], ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
-            EXPECT_THAT(mock->forwardHistory()[3], ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_THAT(mock->forwardHistory()[1],
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto probe = runner->prefixStateProbe();
             EXPECT_EQ(probe.mtp_draft_steps, 2u);
@@ -6041,28 +6072,16 @@ namespace
             EXPECT_EQ(probe.mtp_rollbacks, 0u);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *catchup =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_catchup_runs",
-                                       {{"implementation", "shared_stepwise"},
-                                        {"draft_tokens", "7,9,9"},
-                                        {"accepted_tokens", "7,9,9"},
-                                        {"verifier_tokens", "9,9"}});
-            ASSERT_NE(catchup, nullptr);
-            const PerfStatRecord *verifier_forward =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Timer,
-                                       "verifier_forward",
-                                       {{"implementation", "shared_stepwise"},
-                                        {"verifier_path", "decode_equivalent_catchup"}});
-            ASSERT_NE(verifier_forward, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "decode_equivalent_catchup_runs"),
+                      nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, CUDAMTPSequentialVerifierSkipsBaseRestoreWhenSidecarPreservesMainState)
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPGroupedVerifierSkipsBaseRestoreWhenSidecarPreservesMainState)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() / "llaminar_mtp_cuda_sidecar_preserved_unit.json";
@@ -6082,7 +6101,8 @@ namespace
                 /*chained_mtp_support=*/false,
                 /*sidecar_sample_fusion=*/true);
             mock->enableMTPSidecarPreservesMainState();
-            mock->requireMTPDecodeEquivalentReplay();
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableDeviceResidentMTPSpecStatePublication();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
@@ -6098,40 +6118,36 @@ namespace
 
             EXPECT_EQ(mock->restoreCount(), 0)
                 << "graph-native sidecar execution preserves main verifier state, so "
-                   "the CUDA sequential verifier should not restore the base checkpoint";
-            EXPECT_EQ(mock->captureCheckpointCount(), 1)
+                   "the CUDA grouped verifier should not restore the base checkpoint";
+            EXPECT_EQ(mock->captureCheckpointCount(), 0)
                 << "a main-state-preserving sidecar should not export the "
-                   "post-sidecar checkpoint that decode-equivalent replay "
-                   "would immediately discard";
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
-            EXPECT_EQ(mock->forwardCallCount(), 3);
-            EXPECT_THAT(mock->forwardHistory()[1], ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
-            EXPECT_THAT(mock->forwardHistory()[2], ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                   "post-sidecar checkpoint that grouped publication does not use";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->forwardCallCount(), 2);
+            EXPECT_THAT(mock->forwardHistory()[1],
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *catchup =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_catchup_runs",
-                                       {{"implementation", "shared_stepwise"},
-                                        {"draft_tokens", "7,9"},
-                                        {"accepted_tokens", "7,9"},
-                                        {"verifier_tokens", "9"}});
-            ASSERT_NE(catchup, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "decode_equivalent_catchup_runs"),
+                      nullptr);
 
             const PerfStatRecord *restore_counter =
-                findPerfRecord(records, PerfStatRecord::Kind::Counter, "decode_equivalent_sequential_verifier_base_restores");
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "grouped_decode_equivalent_verifier_base_restores");
             EXPECT_EQ(restore_counter, nullptr);
             const PerfStatRecord *restore_timer =
-                findPerfRecord(records, PerfStatRecord::Kind::Timer, "decode_equivalent_sequential_verifier_restore_base_checkpoint");
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "grouped_decode_equivalent_verifier_restore_base_checkpoint");
             EXPECT_EQ(restore_timer, nullptr);
             const PerfStatRecord *skipped_restore =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
-                               "decode_equivalent_sequential_verifier_base_restore_skipped_sidecar_preserved");
-            ASSERT_NE(skipped_restore, nullptr);
-            EXPECT_DOUBLE_EQ(skipped_restore->value, 1.0);
-            EXPECT_EQ(skipped_restore->tags.at("discarded_sidecar_checkpoint"), "false");
+                               "grouped_decode_equivalent_verifier_base_restore_skipped_sidecar_preserved");
+            EXPECT_EQ(skipped_restore, nullptr)
+                << "device-resident grouped publication can skip the entire "
+                   "logical base checkpoint when sidecar state is isolated.";
 
             const PerfStatRecord *post_sidecar_capture =
                 findPerfRecord(records,
@@ -6142,8 +6158,7 @@ namespace
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "post_sidecar_checkpoint_skipped_sidecar_preserved");
-            ASSERT_NE(skipped_post_sidecar_capture, nullptr);
-            EXPECT_DOUBLE_EQ(skipped_post_sidecar_capture->value, 1.0);
+            EXPECT_EQ(skipped_post_sidecar_capture, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -6174,11 +6189,7 @@ namespace
             /*chained_mtp_support=*/true,
             /*sidecar_sample_fusion=*/false,
             depth_policy);
-        mock->setDecodeArgmaxScript({
-            MockInferenceRunner::VERIFY_REJECT_TOKEN,
-            MockInferenceRunner::DECODE_ARGMAX_TOKEN,
-            MockInferenceRunner::VERIFY_REJECT_TOKEN,
-            MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+        mock->setVerifierAcceptedPrefixScript({0, 0});
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -6228,10 +6239,7 @@ namespace
             /*chained_mtp_support=*/true,
             /*sidecar_sample_fusion=*/false,
             depth_policy);
-        mock->setDecodeArgmaxScript({
-            MockInferenceRunner::VERIFY_REJECT_TOKEN,
-            MockInferenceRunner::DECODE_ARGMAX_TOKEN,
-            MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+        mock->setVerifierAcceptedPrefixScript({0, 0});
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -6291,11 +6299,7 @@ namespace
             /*chained_mtp_support=*/true,
             /*sidecar_sample_fusion=*/false,
             depth_policy);
-        mock->setDecodeArgmaxScript({
-            MockInferenceRunner::VERIFY_REJECT_TOKEN,
-            MockInferenceRunner::DECODE_ARGMAX_TOKEN,
-            MockInferenceRunner::VERIFY_REJECT_TOKEN,
-            MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+        mock->setVerifierAcceptedPrefixScript({0, 0});
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
         GenerationResult step1 = runner->decodeStep();
@@ -6426,7 +6430,7 @@ namespace
 
             auto [runner, mock] = createRunner(
                 /*mtp_enabled=*/true,
-                /*mtp_accept=*/false,
+                /*mtp_accept=*/true,
                 /*mtp_unsupported_reason=*/{},
                 /*mpi_ctx=*/nullptr,
                 /*mtp_token_coordination=*/false,
@@ -6434,6 +6438,8 @@ namespace
                 DeviceId::cpu(),
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true);
+
+            mock->setVerifierAcceptedPrefixScript({0, 1});
 
             ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -6447,13 +6453,15 @@ namespace
             EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 1);
             EXPECT_EQ(mock->restoreCount(), 1);
             EXPECT_EQ(mock->captureCheckpointCount(), 2);
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 0);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
-                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
             EXPECT_THAT(mock->lastForwardTokens(),
-                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *reject_trace =
@@ -6468,15 +6476,10 @@ namespace
                                        });
             ASSERT_NE(reject_trace, nullptr);
 
-            const PerfStatRecord *catchup =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_catchup_runs",
-                                       {{"accepted_tokens", "7,4"},
-                                        {"verifier_tokens", "4"},
-                                        {"accepted_speculative_prefix", "0"},
-                                        {"all_speculative_accepted", "false"}});
-            ASSERT_NE(catchup, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "decode_equivalent_catchup_runs"),
+                      nullptr);
 
             const PerfStatRecord *skipped_speculative =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "post_sidecar_checkpoint_skipped_speculative");
@@ -6512,7 +6515,8 @@ namespace
             EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
-                        ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *step_calls =
@@ -6583,7 +6587,8 @@ namespace
             ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
             PerfStatsCollector::reset();
 
-            auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
+            auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+            mock->setVerifierAcceptedPrefixScript({0});
 
             ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -6592,11 +6597,11 @@ namespace
             EXPECT_EQ(mock->forwardMTPCount(), 1);
             EXPECT_EQ(mock->restoreCount(), 1);
             EXPECT_EQ(mock->captureCheckpointCount(), 2);
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 0);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
-                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *reject_trace =
@@ -7165,7 +7170,6 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
-            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
             mock->enableGroupedDecodeEquivalentMTPSpecStatePublication();
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
@@ -7289,7 +7293,6 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
-            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
             mock->enableGroupedDecodeEquivalentMTPSpecStatePublication();
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
@@ -9674,10 +9677,10 @@ namespace
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, StatefulMTPVerifierUsesSharedDecodeEquivalentCatchup)
+    TEST_F(Test__PrefillDecodeTransition, StatefulMTPVerifierUsesGroupedDeviceOutcomePublication)
     {
         const std::filesystem::path export_path =
-            std::filesystem::temp_directory_path() / "llaminar_mtp_shared_catchup_unit.json";
+            std::filesystem::temp_directory_path() / "llaminar_mtp_grouped_device_publication_stateful_unit.json";
         {
             ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
             PerfStatsCollector::reset();
@@ -9692,11 +9695,10 @@ namespace
                 DeviceId::cuda(0),
                 /*mtp_draft_tokens=*/3,
                 /*chained_mtp_support=*/true);
-            mock->requireMTPDecodeEquivalentReplay();
-            mock->setDecodeArgmaxScript({
-                MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
-                MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableMTPSidecarPreservesMainState();
+            mock->enableMTPShiftedRowReuseFromSidecar();
+            mock->setVerifierAcceptedPrefixScript({3});
 
             ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
             const int forward_count_after_prefill = mock->forwardCallCount();
@@ -9705,85 +9707,67 @@ namespace
             ASSERT_TRUE(step1.success()) << step1.error;
             EXPECT_THAT(step1.tokens,
                         ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                    MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+                                     MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                     MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                     MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
-            EXPECT_EQ(mock->setAllPositionCount(), 0)
-                << "stateful catch-up must not use all-position verifier rows";
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 3);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 3);
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 2);
-            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
-            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
-            EXPECT_THAT(mock->lastCommitMTPTokens(),
-                        ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->setAllPositionCount(), 2)
+                << "grouped publication verifies all target rows in one forward";
+            EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 2);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
+                << "stateful grouped verification must not row-replay accepted rows";
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
+            ASSERT_GT(mock->forwardHistory().size(),
+                      static_cast<size_t>(forward_count_after_prefill));
             EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill)],
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
-            EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill + 1)],
-                        ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
-            EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill + 2)],
-                        ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *catchup =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_catchup_runs",
-                                       {{"implementation", "shared_stepwise"},
-                                        {"draft_tokens", "7,9,9,9"},
-                                        {"accepted_tokens", "7,9,3"},
-                                        {"verifier_tokens", "9,3"},
-                                        {"accepted_speculative_prefix", "1"},
-                                        {"all_speculative_accepted", "false"}});
-            ASSERT_NE(catchup, nullptr);
-
-            const PerfStatRecord *legacy_run_counter =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_sequential_verifier_runs",
-                                       {{"forward_tokens", "3"},
-                                        {"draft_tokens", "4"},
-                                        {"catchup_implementation", "shared_stepwise"}});
-            ASSERT_NE(legacy_run_counter, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "decode_equivalent_catchup_runs"),
+                      nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "decode_equivalent_sequential_verifier_runs"),
+                      nullptr);
 
             const PerfStatRecord *accept_trace =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
                                        "acceptance_trace",
                                        {{"first_token", std::to_string(MockInferenceRunner::PREFILL_ARGMAX_TOKEN)},
-                                        {"accepted_speculative_prefix", "1"},
-                                        {"all_speculative_accepted", "false"},
-                                        {"verifier_path", "decode_equivalent_catchup"},
-                                        {"catchup_implementation", "shared_stepwise"},
-                                        {"decode_equivalent_replay_required", "true"},
-                                        {"output_tokens", "3"}});
+                                        {"accepted_speculative_prefix", "3"},
+                                        {"all_speculative_accepted", "true"},
+                                        {"verifier_path", "grouped_decode_equivalent_greedy"},
+                                        {"catchup_implementation",
+                                         "device_batch_outcome_device_resident_publication"},
+                                        {"policy_path",
+                                         "grouped_outcome_device_resident_publication"},
+                                        {"decode_equivalent_replay_required", "false"},
+                                        {"output_tokens", "4"}});
             ASSERT_NE(accept_trace, nullptr);
 
             const PerfStatRecord *spec_tx =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
                                        "spec_decode_transaction_metadata",
-                                       {{"path", "decode_equivalent_sequential_verifier"},
-                                        {"implementation", "shared_stepwise"},
-                                        {"target_query_len", "5"},
-                                        {"valid_sampled_count", "3"},
-                                        {"committed_output_count", "3"},
-                                        {"accepted_state_count", "2"},
-                                        {"committed_state_row", "1"},
-                                        {"committed_state_index", "1"},
-                                        {"accepted_state_slot_index", "1"},
-                                        {"bonus_ready_token_row", "-1"},
-                                        {"bonus_ready_token_index", "-1"},
-                                        {"bonus_ready_state_slot_index", "-1"},
-                                        {"accepted_verifier_input_prefix", "2"},
-                                        {"accepted_mtp_draft_prefix", "1"},
-                                        {"rejected_token_count", "2"},
-                                        {"token_index_to_sample", "2"},
-                                        {"next_condition_token", std::to_string(MockInferenceRunner::DECODE_ARGMAX_TOKEN)},
-                                        {"all_drafts_accepted", "false"},
-                                        {"stopped_on_output", "false"},
+                                       {{"path", "grouped_decode_equivalent_greedy_verifier"},
+                                        {"implementation",
+                                         "device_batch_outcome_device_resident_publication"},
+                                        {"committed_output_count", "4"},
+                                        {"accepted_state_count", "4"},
+                                        {"accepted_verifier_input_prefix", "4"},
+                                        {"accepted_mtp_draft_prefix", "3"},
+                                        {"rejected_token_count", "0"},
+                                        {"all_drafts_accepted", "true"},
                                         {"draft_tokens", "7,9,9,9"},
-                                        {"committed_output_tokens", "7,9,3"}});
+                                        {"committed_output_tokens", "7,9,9,9"}});
             ASSERT_NE(spec_tx, nullptr);
         }
         std::filesystem::remove(export_path);
@@ -9799,9 +9783,10 @@ namespace
             /*mtp_accept=*/true,
             /*mtp_unsupported_reason=*/{},
             /*mpi_ctx=*/nullptr,
-            /*mtp_token_coordination=*/false,
+            /*mtp_token_coordination=*/true,
             /*hide_local_logits=*/false,
             DeviceId::rocm(0));
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -9824,9 +9809,11 @@ namespace
             /*mtp_accept=*/true,
             /*mtp_unsupported_reason=*/{},
             /*mpi_ctx=*/nullptr,
-            /*mtp_token_coordination=*/false,
+            /*mtp_token_coordination=*/true,
             /*hide_local_logits=*/false,
             DeviceId::rocm(0));
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -9849,9 +9836,10 @@ namespace
             /*mtp_accept=*/true,
             /*mtp_unsupported_reason=*/{},
             /*mpi_ctx=*/nullptr,
-            /*mtp_token_coordination=*/false,
+            /*mtp_token_coordination=*/true,
             /*hide_local_logits=*/false,
             DeviceId::rocm(0));
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
 
         ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
@@ -9917,7 +9905,8 @@ namespace
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::DECODE_ARGMAX_TOKEN);
         EXPECT_EQ(mock->restoreCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPReadyVerifierTokenCanBeConsumedByGreedyBypass)
@@ -9940,7 +9929,9 @@ namespace
         GenerationResult step2 = runner->decodeStep();
         ASSERT_TRUE(step2.success()) << step2.error;
         EXPECT_THAT(step2.tokens, ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->forwardCallCount(), 3);
+        EXPECT_EQ(mock->forwardCallCount(), 2)
+            << "ready verifier logits should satisfy the bypass without an "
+               "extra decode forward";
         EXPECT_EQ(mock->forwardMTPCount(), 1);
     }
 
@@ -9974,7 +9965,8 @@ namespace
 
     TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeForcedRejectReplaysReturnedCorrection)
     {
-        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+        mock->setVerifierAcceptedPrefixScript({0, 1});
 
         std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
         ASSERT_TRUE(runner->prefill(prompt));
@@ -9987,13 +9979,14 @@ namespace
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->restoreCount(), 1);
         EXPECT_EQ(mock->captureCheckpointCount(), 2);
-        EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
-        EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 0);
         EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
         EXPECT_THAT(mock->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -10012,10 +10005,10 @@ namespace
         EXPECT_NE(step2.tokens.front(), MockInferenceRunner::VERIFY_REJECT_TOKEN);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectUsesSequentialVerifierAndShiftedCommit)
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectUsesGroupedDeviceVerifierAndPublication)
     {
         const std::filesystem::path export_path =
-            std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_shared_catchup_unit.json";
+            std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_grouped_forced_reject_unit.json";
         {
             ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
             PerfStatsCollector::reset();
@@ -10025,14 +10018,11 @@ namespace
                 /*mtp_accept=*/false,
                 /*mtp_unsupported_reason=*/{},
                 /*mpi_ctx=*/nullptr,
-                /*mtp_token_coordination=*/false,
+                /*mtp_token_coordination=*/true,
                 /*hide_local_logits=*/false,
                 DeviceId::cuda(0));
-            mock->requireMTPDecodeEquivalentReplay();
-            mock->setDecodeArgmaxScript({
-                MockInferenceRunner::VERIFY_REJECT_TOKEN,
-                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
-            });
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->setVerifierAcceptedPrefixScript({0});
 
             std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
             ASSERT_TRUE(runner->prefill(prompt));
@@ -10045,20 +10035,24 @@ namespace
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
             EXPECT_EQ(mock->restoreCount(), 1);
             EXPECT_EQ(mock->captureCheckpointCount(), 2)
-                << "shared catch-up keeps the post-sidecar checkpoint until a "
-                   "backend-optimized multi-row path is explicitly promoted.";
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+                << "non-preserving sidecars still need rollback and verifier "
+                   "base checkpoints before grouped publication.";
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 0)
+                << "device-resident grouped publication owns live-state commit";
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 0);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
-            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
-            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
-                << "CUDA verifies the first row, commits the correction, and forwards it exactly once";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0);
+            EXPECT_FALSE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), -1);
+            EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "CUDA should run one grouped verifier forward and no "
+                   "row-serial correction forward";
             EXPECT_THAT(mock->lastForwardTokens(),
-                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
-            EXPECT_EQ(mock->setAllPositionCount(), 0);
-            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *post_sidecar_capture =
@@ -10076,14 +10070,18 @@ namespace
             EXPECT_EQ(replay_forward, nullptr);
 
             const PerfStatRecord *catchup =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_catchup_runs",
-                                       {{"implementation", "shared_stepwise"},
-                                        {"draft_tokens", "7,9"},
-                                        {"accepted_tokens", "7,4"},
-                                        {"verifier_tokens", "4"}});
-            ASSERT_NE(catchup, nullptr);
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "decode_equivalent_catchup_runs");
+            EXPECT_EQ(catchup, nullptr);
+            ASSERT_NE(findPerfRecordWithTags(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "grouped_decode_equivalent_greedy_verifier_runs",
+                          {{"verifier_forward_tokens", "2"},
+                           {"verifier_rows", "2"},
+                           {"state_publication", "device_resident"}}),
+                      nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -10286,6 +10284,7 @@ namespace
             {},
             MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
 
         SamplingParams sampling;
         sampling.temperature = 0.8f;
@@ -10317,13 +10316,13 @@ namespace
                "the MTP draft sample comes from the proposal path";
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-        EXPECT_EQ(mock->applyMainPenaltiesCount(), 2)
-            << "empty first-token penalties are skipped; the sequential verifier "
-               "and ready-token rows still apply non-empty history penalties";
+        EXPECT_EQ(mock->applyMainPenaltiesCount(), 0)
+            << "grouped stochastic verification applies row-local target "
+               "history to verifier rows instead of replaying main rows";
         EXPECT_EQ(mock->applyMTPPenaltiesCount(), 0)
             << "vLLM-style draft proposal ignores draft-side penalties; "
                "target-side rejection correction owns the final policy";
-        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
         EXPECT_EQ(mock->forwardMTPCount(), 1);
 
         const auto probe = runner->prefixStateProbe();
@@ -10356,6 +10355,7 @@ namespace
             {},
             MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
         mock->requireMTPDecodeEquivalentReplay();
         mock->setDecodeArgmaxScript({
             MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -10379,9 +10379,9 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->restoreCount(), 1)
             << "stateful stochastic verification must restore the verifier base";
-        EXPECT_EQ(mock->setAllPositionCount(), 0)
-            << "stateful stochastic verification must not use all-position verifier rows";
-        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
+        EXPECT_EQ(mock->setAllPositionCount(), 2)
+            << "stateful stochastic verification uses one grouped verifier forward";
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 3)
             << "first target token, sequential target row, and ready token "
                "use compact distributions; MTP draft uses the proposal path";
@@ -10389,8 +10389,8 @@ namespace
         EXPECT_EQ(mock->deviceDraftTemperatureProposalDeferredCount(), 0);
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 2);
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-        EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2)
-            << "first token and accepted draft must publish shifted MTP rows from sequential terminal hidden";
+        EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
+            << "grouped stochastic publication must not replay shifted rows";
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
@@ -10426,6 +10426,7 @@ namespace
                 {},
                 MTPVerifyMode::SpeculativeSampling);
             mock->enableStochasticDeviceSampling();
+            mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
             mock->enableMTPSidecarPreservesMainState();
             mock->requireMTPDecodeEquivalentReplay();
             mock->setDecodeArgmaxScript({
@@ -10451,33 +10452,33 @@ namespace
                 << "graph-native sidecar execution preserves main verifier state, "
                    "so stochastic decode-equivalent verification should not restore "
                    "the same base checkpoint after sidecar draft";
-            EXPECT_EQ(mock->setAllPositionCount(), 0);
+            EXPECT_EQ(mock->setAllPositionCount(), 2);
             EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *restore_counter =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
-                               "decode_equivalent_sequential_verifier_base_restores");
+                               "grouped_decode_equivalent_verifier_base_restores");
             EXPECT_EQ(restore_counter, nullptr);
             const PerfStatRecord *restore_timer =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Timer,
-                               "decode_equivalent_sequential_verifier_restore_base_checkpoint");
+                               "grouped_decode_equivalent_verifier_restore_base_checkpoint");
             EXPECT_EQ(restore_timer, nullptr);
             const PerfStatRecord *skipped_restore =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
-                               "decode_equivalent_sequential_verifier_base_restore_skipped_sidecar_preserved");
+                               "grouped_decode_equivalent_verifier_base_restore_skipped_sidecar_preserved");
             ASSERT_NE(skipped_restore, nullptr);
             EXPECT_DOUBLE_EQ(skipped_restore->value, 1.0);
 
             const PerfStatRecord *verifier_runs =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
-                                       "decode_equivalent_stochastic_verifier_runs",
-                                       {{"restored_verifier_base", "true"}});
+                                       "grouped_decode_equivalent_stochastic_verifier_runs",
+                                       {{"state_publication", "device_resident"}});
             ASSERT_NE(verifier_runs, nullptr);
         }
         std::filesystem::remove(export_path);
@@ -10516,9 +10517,10 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
-        EXPECT_EQ(mock->commitMTPShiftedCount(), 2)
-            << "CPU stochastic verification still commits shifted rows for the first token and residual correction";
-        EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+        EXPECT_EQ(mock->commitMTPShiftedCount(), 1)
+            << "CPU grouped host publication commits only the accepted prefix; "
+               "the residual correction remains a pending condition";
+        EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1);
         EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
         EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
@@ -10541,7 +10543,7 @@ namespace
         EXPECT_EQ(probe.mtp_request.stochastic_terminal_samples, 0u);
         EXPECT_DOUBLE_EQ(probe.mtp_request.stochastic_acceptance_rate, 0.0);
         EXPECT_EQ(probe.mtp_transaction_commits, 1u);
-        EXPECT_EQ(probe.mtp_transaction_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_transaction_rollbacks, 0u);
         EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
     }
 
@@ -10561,6 +10563,7 @@ namespace
             {},
             MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
 
         SamplingParams sampling;
         sampling.temperature = 0.8f;
@@ -10588,7 +10591,7 @@ namespace
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0)
             << "the first rejected row should use the batched residual-capable verifier";
-        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 0);
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
@@ -10714,9 +10717,9 @@ namespace
         EXPECT_GE(mock->sampleMainLogitsCount(), 1);
         EXPECT_EQ(mock->sampleMTPLogitsCount(), 1);
         EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 0);
-        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
-        EXPECT_EQ(mock->lastSampleAllPositionStartRow(), -1);
-        EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 0);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+        EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
+        EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 2);
 
         auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
@@ -10769,7 +10772,8 @@ namespace
         EXPECT_EQ(child_ptr->commitMTPShiftedCount(), 2);
         EXPECT_EQ(child_ptr->lastCommitMTPAlreadyAppended(), 1);
         EXPECT_THAT(child_ptr->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(child_ptr->restoreCount(), 1)
             << "GlobalTP restores the verifier base and commits through shared decode-equivalent replay";
 
@@ -10886,15 +10890,19 @@ namespace
         EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 1);
         EXPECT_EQ(harness.child1->lastCommitMTPAlreadyAppended(), 1);
         EXPECT_THAT(harness.child0->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
-        EXPECT_EQ(harness.child0->setAllPositionCount(), 0);
-        EXPECT_EQ(harness.child1->setAllPositionCount(), 0);
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(harness.child0->setAllPositionCount(), 2);
+        EXPECT_EQ(harness.child1->setAllPositionCount(), 2);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         const auto probe = harness.runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -11261,20 +11269,22 @@ namespace
         EXPECT_EQ(harness.child1->restoreCount(), 1);
         EXPECT_EQ(harness.child0->captureCheckpointCount(), 2);
         EXPECT_EQ(harness.child1->captureCheckpointCount(), 2);
-        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 2);
-        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 2);
-        EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 1);
-        EXPECT_EQ(harness.child1->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 0);
+        EXPECT_EQ(harness.child1->lastCommitMTPAlreadyAppended(), 0);
         EXPECT_EQ(harness.child0->lastCommitMTPMainForwardTokenCount(), 0);
         EXPECT_EQ(harness.child1->lastCommitMTPMainForwardTokenCount(), 0);
         EXPECT_THAT(harness.child0->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastCommitMTPTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child0->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         const auto probe = harness.runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -11303,9 +11313,11 @@ namespace
         EXPECT_EQ(harness.child0->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_EQ(harness.child1->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         const auto probe = harness.runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -11331,14 +11343,16 @@ namespace
 
         EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
-        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 2);
-        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 2);
+        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
         EXPECT_EQ(harness.child0->lastCommitMTPMainForwardTokenCount(), 0);
         EXPECT_EQ(harness.child1->lastCommitMTPMainForwardTokenCount(), 0);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         const auto probe = harness.runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -11657,7 +11671,8 @@ namespace
             EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0)
                 << "token budget leaves room for only one speculative output";
             EXPECT_THAT(mock->lastForwardTokens(),
-                        ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto probe = runner->prefixStateProbe();
             EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -11755,7 +11770,8 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
     }
 
     /**

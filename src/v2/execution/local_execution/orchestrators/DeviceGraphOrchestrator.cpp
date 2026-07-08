@@ -13344,8 +13344,16 @@ namespace llaminar2
             }
             else
             {
-                economy.dense = MTPVerifierEconomyLane::groupedDecodeEquivalentEconomicsPending(
-                    correctness.dense_decode_equivalent.max_rows);
+                /*
+                 * CPU verifier publication is native host work, not a hidden
+                 * row replay.  The grouped verifier forward produces M rows,
+                 * row-indexed LM head exposes exactly the rows that determine
+                 * the accepted prefix, and the grouped host-plan publisher
+                 * restores accepted KV/GDN/short-conv state from those rows.
+                 */
+                economy.dense =
+                    MTPVerifierEconomyLane::groupedOutcomeHostPublicationEconomical(
+                        correctness.dense_decode_equivalent.max_rows);
             }
         }
         if (correctness.moe_decode_equivalent.enabled)
@@ -13364,8 +13372,16 @@ namespace llaminar2
             }
             else
             {
-                economy.moe = MTPVerifierEconomyLane::groupedDecodeEquivalentEconomicsPending(
-                    correctness.moe_decode_equivalent.max_rows);
+                /*
+                 * CPU MoE follows the same grouped host-publication contract
+                 * as dense CPU: grouped routed/shared expert rows are the
+                 * production verifier result, and the accepted prefix is
+                 * published from verifier graph rows instead of replaying rows
+                 * through the serial decode loop.
+                 */
+                economy.moe =
+                    MTPVerifierEconomyLane::groupedOutcomeHostPublicationEconomical(
+                        correctness.moe_decode_equivalent.max_rows);
             }
         }
         return economy;
@@ -13999,8 +14015,19 @@ namespace llaminar2
          * MTP caches to advance after accepting speculative rows.
          */
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled ||
-            !state_.device_id.is_gpu() ||
-            state_.kv_cache == nullptr || state_.mtp_kv_caches.empty() ||
+            state_.kv_cache == nullptr || state_.mtp_kv_caches.empty())
+        {
+            return false;
+        }
+        /*
+         * CPU grouped publication is host-native: all verifier rows and step
+         * plans already live in ordinary addressable memory, so requiring the
+         * GPU resident mailbox would falsely disable the real grouped path.
+         * GPU runners still need the resident logical-state handoff here so a
+         * host-plan grouped publisher cannot accidentally bypass stream-ordered
+         * live-state readiness.
+         */
+        if (state_.device_id.is_gpu() &&
             !supportsDeviceResidentLogicalSequenceStatePublication())
         {
             return false;
@@ -23642,12 +23669,14 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::supportsRowLocalAllPositionPenaltyApplication() const
     {
         /*
-         * CPU rows are already host-visible, but the promoted Phase 9.8 path is
-         * specifically for compact verifier reduction without full-logit host
-         * traffic.  GPU rows have the explicit-stream sparse penalty kernel
-         * used by applyPenaltiesToAllPositionLogitsOnDeviceRow().
+         * CPU all-position rows are native host tensors, and the method above
+         * applies the same sparse row-local penalty map directly to that row.
+         * GPU rows use the explicit-stream sparse penalty kernel.  Both are
+         * grouped-verifier implementations: the caller mutates each verifier
+         * row in place, then samples/reduces the grouped outcome without
+         * replaying rows through the serial decode loop.
          */
-        return state_.device_id.is_gpu();
+        return state_.device_id.is_cpu() || state_.device_id.is_gpu();
     }
 
     bool DeviceGraphOrchestrator::supportsDeviceStochasticMTPVerification() const

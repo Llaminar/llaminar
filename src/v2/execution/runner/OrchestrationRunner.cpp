@@ -423,60 +423,6 @@ namespace llaminar2
                 tags);
         }
 
-        bool laneSupportsGroupedDecodeEquivalentOutcome(
-            const MTPVerifierEconomyLane &lane,
-            int rows,
-            bool stochastic_requested)
-        {
-            return lane.supportsRows(rows, stochastic_requested) &&
-                   lane.grouped_decode_equivalent &&
-                   lane.row_indexed_lm_head &&
-                   lane.device_resident_input &&
-                   lane.device_resident_outcome &&
-                   lane.graph_capturable;
-        }
-
-        /**
-         * @brief True when the active model lane has proven grouped verifier
-         *        outcomes but may not yet have economical live-state publication.
-         *
-         * This deliberately does not check device_resident_publication or
-         * host_bridge_free_hot_path.  Those fields describe the stronger
-         * economical vLLM-style path; Phase 9.8 needs to represent the earlier
-         * milestone where grouped row math is green while live KV/GDN ownership
-         * and full hot-path economics are still being proven separately.
-         */
-        bool supportsGroupedVerifierOutcomeForModel(
-            const MTPVerifierEconomyCapability &capability,
-            MTPDepthPolicyModelClass model_class,
-            int rows,
-            bool stochastic_requested)
-        {
-            switch (model_class)
-            {
-            case MTPDepthPolicyModelClass::Dense:
-                return laneSupportsGroupedDecodeEquivalentOutcome(
-                    capability.dense,
-                    rows,
-                    stochastic_requested);
-            case MTPDepthPolicyModelClass::MoE:
-                return laneSupportsGroupedDecodeEquivalentOutcome(
-                    capability.moe,
-                    rows,
-                    stochastic_requested);
-            case MTPDepthPolicyModelClass::Any:
-                return laneSupportsGroupedDecodeEquivalentOutcome(
-                           capability.dense,
-                           rows,
-                           stochastic_requested) ||
-                       laneSupportsGroupedDecodeEquivalentOutcome(
-                           capability.moe,
-                           rows,
-                           stochastic_requested);
-            }
-            return false;
-        }
-
         const char *mtpDepthPolicyModelClassName(MTPDepthPolicyModelClass model_class)
         {
             switch (model_class)
@@ -3602,12 +3548,14 @@ namespace llaminar2
                 {{"lane", lane_name},
                  {"active_model_class", active_model_class},
                  {"correct", perfBool(lane.correct)},
-                 {"serial_decode_equivalent_oracle_only", perfBool(lane.serial_decode_equivalent_oracle_only)},
                  {"grouped_decode_equivalent", perfBool(lane.grouped_decode_equivalent)},
                  {"row_indexed_lm_head", perfBool(lane.row_indexed_lm_head)},
                  {"device_resident_input", perfBool(lane.device_resident_input)},
                  {"device_resident_outcome", perfBool(lane.device_resident_outcome)},
                  {"device_resident_publication", perfBool(lane.device_resident_publication)},
+                 {"host_native_input", perfBool(lane.host_native_input)},
+                 {"host_native_outcome", perfBool(lane.host_native_outcome)},
+                 {"host_plan_publication", perfBool(lane.host_plan_publication)},
                  {"host_bridge_free_hot_path", perfBool(lane.host_bridge_free_hot_path)},
                  {"graph_capturable", perfBool(lane.graph_capturable)},
                  {"greedy", perfBool(lane.greedy)},
@@ -4089,18 +4037,10 @@ namespace llaminar2
         const bool supports_all_position_state_publication =
             runner_->supportsMTPSpecStatePublication() &&
             (!stochastic_verify || stochastic_device_verify || stochastic_host_verify);
-        const MTPVerifierEconomyCapability verifier_economy =
-            runner_->mtpVerifierEconomyCapability();
         const MTPDepthPolicyModelClass verifier_model_class =
             inferMTPDepthPolicyModelClass(model_ctx_);
         const int verifier_policy_probe_rows =
             std::max(1, effectiveMTPMaxDraftDepth(mtp));
-        const bool supports_grouped_decode_equivalent_outcome =
-            supportsGroupedVerifierOutcomeForModel(
-                verifier_economy,
-                verifier_model_class,
-                verifier_policy_probe_rows,
-                stochastic_verify);
         const MTPVerifierPolicyDecision verifier_policy =
             chooseMTPVerifierPolicy(
                 MTPVerifierPolicyInput{
@@ -4112,8 +4052,6 @@ namespace llaminar2
                         runner_->supportsRowLocalAllPositionPenaltyApplication(),
                     .supports_spec_state_publication =
                         supports_all_position_state_publication,
-                    .supports_grouped_decode_equivalent_outcome =
-                        supports_grouped_decode_equivalent_outcome,
                 });
         if (verifier_policy.path == MTPVerifierExecutionPath::Unsupported)
         {
@@ -4131,7 +4069,7 @@ namespace llaminar2
              {"reason", verifier_policy.reason},
              {"model_class", mtpDepthPolicyModelClassName(verifier_model_class)},
              {"probe_rows", std::to_string(verifier_policy_probe_rows)},
-             {"grouped_outcome_supported", perfBool(supports_grouped_decode_equivalent_outcome)},
+             {"grouped_outcome_required", "true"},
              {"direct_publication_supported", perfBool(supports_all_position_state_publication)}});
         const bool use_all_position_state_publication_verifier =
             verifier_policy.path ==
@@ -4146,13 +4084,10 @@ namespace llaminar2
             verifier_policy.path ==
                 MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome &&
             !use_grouped_outcome_device_resident_publication_verifier &&
-            !stochastic_verify &&
-            runner_->supportsGroupedDecodeEquivalentMTPSpecStatePublication();
-        const bool use_decode_equivalent_replay_publication_verifier =
+            (!stochastic_verify || stochastic_host_verify);
+        const bool use_grouped_decode_equivalent_outcome_verifier =
             verifier_policy.path ==
-                MTPVerifierExecutionPath::DecodeEquivalentSequential ||
-            verifier_policy.path ==
-                MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
+            MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
         if (use_grouped_outcome_host_publication_verifier)
         {
             /*
@@ -5951,16 +5886,15 @@ namespace llaminar2
                         1.0,
                         "decode");
                 }
-                else if (use_decode_equivalent_replay_publication_verifier &&
+                else if (use_grouped_decode_equivalent_outcome_verifier &&
                          runner_->supportsMTPSidecarPreservesMainState())
                 {
                     /*
-                     * Decode-equivalent replay still uses the main verifier
-                     * base checkpoint, but graph-native sidecars prove they do
-                     * not mutate that base while drafting. Capturing a
+                     * Grouped decode-equivalent publication still uses the main
+                     * verifier base checkpoint, but graph-native sidecars prove
+                     * they do not mutate that base while drafting. Capturing a
                      * post-sidecar payload checkpoint here would only export
-                     * hybrid KV/GDN state that the replay branch immediately
-                     * discards.
+                     * hybrid KV/GDN state that grouped publication does not use.
                      */
                     PerfStatsCollector::addCounter(
                         "mtp",
@@ -5969,10 +5903,7 @@ namespace llaminar2
                         "decode",
                         {},
                         {{"verifier_path",
-                          verifier_policy.path ==
-                                  MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome
-                              ? "grouped_decode_equivalent_outcome"
-                              : "decode_equivalent_sequential"}});
+                          "grouped_decode_equivalent_outcome"}});
                 }
                 else
                 {
@@ -9117,7 +9048,7 @@ namespace llaminar2
             return result;
         }
 
-        if (use_decode_equivalent_replay_publication_verifier)
+        if (use_grouped_decode_equivalent_outcome_verifier)
         {
             const bool grouped_outcome_device_resident_publication =
                 use_grouped_outcome_device_resident_publication_verifier;
@@ -9168,14 +9099,14 @@ namespace llaminar2
                 if (sidecar_checkpoints.empty())
                 {
                     return fail_after_checkpoint(
-                        "Decode-equivalent sequential MTP verifier requires a post-sidecar checkpoint");
+                        "Grouped decode-equivalent MTP verifier requires a post-sidecar checkpoint");
                 }
 
                 sidecar_checkpoint = &sidecar_checkpoints.front();
                 if (!sidecar_checkpoint->valid)
                 {
                     return fail_after_checkpoint(
-                        "Decode-equivalent sequential MTP verifier received an invalid post-sidecar checkpoint");
+                        "Grouped decode-equivalent MTP verifier received an invalid post-sidecar checkpoint");
                 }
             }
             bool restored_verifier_base = sidecar_preserves_main_state;
@@ -9183,7 +9114,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "mtp",
-                    "decode_equivalent_sequential_verifier_base_restore_skipped_sidecar_preserved",
+                    "grouped_decode_equivalent_verifier_base_restore_skipped_sidecar_preserved",
                     1.0,
                     "decode",
                     {},
@@ -9196,7 +9127,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
-                    "decode_equivalent_sequential_verifier_restore_base_checkpoint",
+                    "grouped_decode_equivalent_verifier_restore_base_checkpoint",
                     "decode");
                 restored_verifier_base =
                     runner_->restoreLivePrefixState(verifier_base_checkpoint);
@@ -9204,7 +9135,7 @@ namespace llaminar2
                 {
                     PerfStatsCollector::addCounter(
                         "mtp",
-                        "decode_equivalent_sequential_verifier_base_restores",
+                        "grouped_decode_equivalent_verifier_base_restores",
                         1.0,
                         "decode",
                         {},
@@ -9217,7 +9148,21 @@ namespace llaminar2
             if (!restored_verifier_base)
             {
                 return fail_after_checkpoint(
-                    "Decode-equivalent sequential MTP verifier could not restore verifier base checkpoint after sidecar draft");
+                    "Grouped decode-equivalent MTP verifier could not restore verifier base checkpoint after sidecar draft");
+            }
+
+            if (!grouped_outcome_device_resident_publication)
+            {
+                if (stochastic_verify &&
+                    runner_->primaryDeviceId().is_gpu() &&
+                    runner_->supportsDeviceResidentMTPSpecStatePublication() &&
+                    !stochastic_device_verify)
+                {
+                    return fail_after_checkpoint(
+                        "Grouped decode-equivalent stochastic MTP verifier requires device-resident distribution verification");
+                }
+                return fail_after_checkpoint(
+                    "Grouped decode-equivalent MTP verifier has no grouped publication path; serial row replay is diagnostic-only and is not a production fallback");
             }
 
             if (stochastic_verify && grouped_outcome_device_resident_publication)
@@ -11397,704 +11342,6 @@ namespace llaminar2
                 return result;
             }
 
-            if (stochastic_verify)
-            {
-                if (runner_->primaryDeviceId().is_gpu() && !stochastic_device_verify)
-                {
-                    return fail_after_checkpoint(
-                        "Decode-equivalent stochastic MTP verifier requires device-resident distribution verification");
-                }
-
-                std::vector<int32_t> accepted_tokens;
-                accepted_tokens.reserve(draft_tokens.size());
-                std::vector<int32_t> verifier_tokens;
-                verifier_tokens.reserve(draft_tokens.size());
-
-                accepted_tokens.push_back(first_token);
-                bool all_speculative_accepted = true;
-                bool stopped_on_output = first_token_is_stop;
-                int accepted_speculative_prefix = 0;
-                int32_t rejected_verified_token = -1;
-                int32_t ready_token = -1;
-                int main_forward_token_count = 0;
-                int shifted_commit_count = 0;
-                std::vector<SamplingDistributionEntry> host_target_distribution;
-
-                auto commit_shifted_before_forward =
-                    [&](int32_t token, int token_index) -> bool
-                {
-                    bool ok = false;
-                    {
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "decode_equivalent_stochastic_shifted_commit",
-                            "decode",
-                            {},
-                            {{"implementation", "shared_stepwise_stochastic"}});
-                        ok = runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
-                            token,
-                            token_index,
-                            /*allow_speculative_discard=*/true,
-                            base_sidecar_position);
-                    }
-                    if (ok)
-                        ++shifted_commit_count;
-                    return ok;
-                };
-
-                auto forward_one = [&](int32_t token) -> bool
-                {
-                    int forward_token = static_cast<int>(token);
-                    bool ok = false;
-                    {
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "decode_equivalent_stochastic_forward_one",
-                            "decode",
-                            {},
-                            {{"implementation", "shared_stepwise_stochastic"}});
-                        ok = runner_->forward(&forward_token, 1);
-                    }
-                    if (ok)
-                        ++main_forward_token_count;
-                    return ok;
-                };
-
-                Sampler verifier_penalty_sampler = sampler_;
-                auto build_target_distribution = [&]() -> bool
-                {
-                    if (stochastic_host_verify)
-                    {
-                        const float *main_logits = runner_->logits();
-                        if (!main_logits)
-                            return false;
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "decode_equivalent_stochastic_host_target_distribution",
-                            "decode",
-                            {},
-                            {{"implementation", "shared_stepwise_stochastic"}});
-                        host_target_distribution =
-                            verifier_penalty_sampler.compute_distribution(
-                                main_logits,
-                                static_cast<size_t>(vocab),
-                                active_sampling_params_);
-                        return !host_target_distribution.empty();
-                    }
-
-                    auto penalty_map =
-                        verifier_penalty_sampler.compute_penalty_map(
-                            active_sampling_params_,
-                            vocab);
-                    if (!penalty_map.empty() &&
-                        !runner_->applyPenaltiesOnDevice(penalty_map, vocab))
-                    {
-                        return false;
-                    }
-                    return runner_->buildStochasticDistributionOnDevice(
-                        DeviceLogitsSource::Main,
-                        0,
-                        DeviceDistributionBuffer::Target,
-                        0,
-                        active_sampling_params_,
-                        vocab);
-                };
-
-                if (!commit_shifted_before_forward(first_token, 0))
-                {
-                    return fail_after_checkpoint(
-                        "Decode-equivalent stochastic MTP initial shifted-cache commit failed");
-                }
-                if (!forward_one(first_token))
-                {
-                    return fail_after_checkpoint(
-                        "Decode-equivalent stochastic MTP failed to forward first token");
-                }
-                verifier_penalty_sampler.record_token(first_token);
-
-                for (int draft_idx = 1;
-                     !stopped_on_output &&
-                     draft_idx < static_cast<int>(draft_tokens.size());
-                     ++draft_idx)
-                {
-                    if (!build_target_distribution())
-                    {
-                        return fail_after_checkpoint(
-                            "Decode-equivalent stochastic MTP target distribution build failed");
-                    }
-
-                    const int row = draft_idx - 1;
-                    const int32_t draft_token =
-                        draft_tokens[static_cast<size_t>(draft_idx)];
-                    const int row_logical_position =
-                        transaction_base_cached_tokens + draft_idx;
-                    const float accept_threshold =
-                        accept_threshold_for_position(
-                            sampler_,
-                            row_logical_position);
-                    const float residual_threshold =
-                        residual_threshold_for_position(
-                            sampler_,
-                            row_logical_position);
-                    DeviceSpeculativeVerifyResult verify_result;
-                    if (stochastic_device_verify)
-                    {
-                        if (draft_token == kDeferredMTPDraftTokenShadow)
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP cannot verify a deferred draft token without a host-visible shadow");
-                        }
-                        if (draft_token < 0)
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP found an invalid draft token before device verifier staging");
-                        }
-                        /*
-                         * The decode-equivalent verifier restores the main
-                         * base checkpoint after sidecar drafting.  That restore
-                         * can deliberately clear runner-local device readiness
-                         * metadata, so publish the host-visible draft shadow
-                         * into the verifier-owned device slot at the exact row
-                         * boundary where it is consumed.  CUDA and ROCm share
-                         * this runner contract; backend code only sees a
-                         * prepared device token slot plus an explicit stream
-                         * readiness event.
-                         */
-                        if (!runner_->stageStochasticDraftTokensForDeviceVerification(
-                                &draft_token,
-                                /*draft_token_count=*/1,
-                                /*first_draft_slot=*/row))
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP draft-token device staging failed");
-                        }
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "decode_equivalent_stochastic_draft_token_stages",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"row", std::to_string(row)}});
-                        if (!runner_->verifyStochasticDistributionsBatchOnDevice(
-                                /*first_target_slot=*/0,
-                                /*first_draft_slot=*/row,
-                                &draft_token,
-                                &accept_threshold,
-                                &residual_threshold,
-                                /*row_count=*/1,
-                                &verify_result))
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP device verifier failed");
-                        }
-                    }
-                    else
-                    {
-                        if (row < 0 ||
-                            row >= static_cast<int>(host_mtp_draft_distributions.size()) ||
-                            host_mtp_draft_distributions[static_cast<size_t>(row)].empty() ||
-                            host_target_distribution.empty())
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP host verifier missing distributions");
-                        }
-                        const auto &draft_distribution =
-                            host_mtp_draft_distributions[static_cast<size_t>(row)];
-                        const float p =
-                            Sampler::probability_of_token(host_target_distribution, draft_token);
-                        const float q =
-                            Sampler::probability_of_token(draft_distribution, draft_token);
-                        verify_result.accept_probability =
-                            Sampler::speculative_accept_probability(p, q);
-                        verify_result.accept_threshold = accept_threshold;
-                        verify_result.accepted =
-                            accept_threshold < verify_result.accept_probability;
-                        verify_result.token = verify_result.accepted
-                                                  ? draft_token
-                                                  : sampleResidualDistributionWithThreshold(
-                                                        host_target_distribution,
-                                                        draft_distribution,
-                                                        residual_threshold);
-                        if (verify_result.token < 0)
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP host residual verifier failed");
-                        }
-                    }
-
-                    ++mtp_stats_.stochastic_accept_tests;
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "stochastic_accept_tests",
-                        1.0,
-                        "decode",
-                        {},
-                        {{"row", std::to_string(row)},
-                         {"draft_token", std::to_string(draft_token)},
-                         {"accept_probability", std::to_string(verify_result.accept_probability)},
-                         {"threshold", std::to_string(verify_result.accept_threshold)},
-                         {"device_resident", stochastic_device_verify ? "true" : "false"},
-                         {"verifier_path", "decode_equivalent_stochastic"}});
-
-                    int32_t output_token = -1;
-                    if (verify_result.accepted)
-                    {
-                        output_token = draft_token;
-                        verifier_tokens.push_back(draft_token);
-                        ++accepted_speculative_prefix;
-                        ++mtp_stats_.stochastic_accepts;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "stochastic_accepts",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"verifier_path", "decode_equivalent_stochastic"}});
-                    }
-                    else
-                    {
-                        output_token = verify_result.token;
-                        if (output_token < 0)
-                        {
-                            return fail_after_checkpoint(
-                                "Decode-equivalent stochastic MTP residual verifier produced no correction token");
-                        }
-                        all_speculative_accepted = false;
-                        rejected_verified_token = output_token;
-                        verifier_tokens.push_back(output_token);
-                        ++mtp_stats_.stochastic_residual_samples;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            stochastic_device_verify
-                                ? "stochastic_residual_device_samples"
-                                : "stochastic_residual_host_samples",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"row", std::to_string(row)},
-                             {"draft_token", std::to_string(draft_token)},
-                             {"correction_token", std::to_string(output_token)},
-                             {"verifier_path", "decode_equivalent_stochastic"}});
-                    }
-
-                    accepted_tokens.push_back(output_token);
-                    const int token_index =
-                        static_cast<int>(accepted_tokens.size()) - 1;
-                    if (!commit_shifted_before_forward(output_token, token_index))
-                    {
-                        return fail_after_checkpoint(
-                            "Decode-equivalent stochastic MTP shifted-cache commit failed");
-                    }
-                    if (!forward_one(output_token))
-                    {
-                        return fail_after_checkpoint(
-                            "Decode-equivalent stochastic MTP failed while forwarding accepted output");
-                    }
-                    verifier_penalty_sampler.record_token(output_token);
-
-                    if (std::find(stop_tokens_.begin(),
-                                  stop_tokens_.end(),
-                                  output_token) != stop_tokens_.end())
-                    {
-                        stopped_on_output = true;
-                        break;
-                    }
-                    if (!verify_result.accepted)
-                        break;
-                }
-
-                if (!stopped_on_output)
-                {
-                    if (!build_target_distribution())
-                    {
-                        return fail_after_checkpoint(
-                            "Decode-equivalent stochastic MTP ready-token distribution build failed");
-                    }
-                    ready_token = stochastic_device_verify
-                                      ? runner_->sampleStochasticDistributionOnDevice(
-                                            DeviceDistributionBuffer::Target,
-                                            0,
-                                            sample_threshold_for_position(
-                                                sampler_,
-                                                transaction_base_cached_tokens +
-                                                    static_cast<int>(accepted_tokens.size())))
-                                      : sampleDistributionWithThreshold(
-                                            host_target_distribution,
-                                            sample_threshold_for_position(
-                                                sampler_,
-                                                transaction_base_cached_tokens +
-                                                    static_cast<int>(accepted_tokens.size())));
-                    if (ready_token < 0)
-                    {
-                        return fail_after_checkpoint(
-                            "Decode-equivalent stochastic MTP ready-token sampling failed");
-                    }
-                    if (all_speculative_accepted)
-                    {
-                        ++mtp_stats_.stochastic_terminal_samples;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            stochastic_device_verify
-                                ? "stochastic_terminal_device_samples"
-                                : "stochastic_terminal_host_samples",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"verifier_path", "decode_equivalent_stochastic"}});
-                    }
-                    else
-                    {
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "phase138_stochastic_correction_ready_samples",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"verifier_path", "decode_equivalent_stochastic"}});
-                    }
-                }
-
-                result.is_complete = result.is_complete || stopped_on_output;
-
-                ++mtp_stats_.verifier_runs;
-                mtp_stats_.verifier_token_count +=
-                    static_cast<uint64_t>(main_forward_token_count);
-                PerfStatsCollector::addCounter("mtp", "verifier_runs", 1.0, "decode");
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "verifier_tokens",
-                    static_cast<double>(main_forward_token_count),
-                    "decode");
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "decode_equivalent_stochastic_verifier_runs",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"forward_tokens", std::to_string(main_forward_token_count)},
-                     {"draft_tokens", std::to_string(draft_tokens.size())},
-                     {"accepted_tokens", std::to_string(accepted_tokens.size())},
-                     {"shifted_commits", std::to_string(shifted_commit_count)},
-                     {"restored_verifier_base", restored_verifier_base ? "true" : "false"}});
-
-                recordMTPDepthObservation(
-                    requested_speculative_draft_count,
-                    speculative_draft_count,
-                    accepted_speculative_prefix,
-                    draft_count_budget_limited,
-                    !all_speculative_accepted);
-
-                if (!all_speculative_accepted)
-                {
-                    ++mtp_stats_.rejected_tokens;
-                    ++mtp_stats_.rollbacks;
-                    ++mtp_stats_.transaction_rollbacks;
-                    PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
-                    PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
-                    PerfStatsCollector::addCounter("mtp", "transaction_rollbacks", 1.0, "decode");
-                }
-
-                if (accepted_speculative_prefix > 0)
-                {
-                    mtp_stats_.accepted_tokens +=
-                        static_cast<uint64_t>(accepted_speculative_prefix);
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "accepted_tokens",
-                        static_cast<double>(accepted_speculative_prefix),
-                        "decode");
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "accepted_second_draft_tokens",
-                        accepted_speculative_prefix > 0 ? 1.0 : 0.0,
-                        "decode");
-                }
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "output_tokens",
-                    static_cast<double>(accepted_tokens.size()),
-                    "decode");
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "acceptance_trace",
-                    1.0,
-                    "decode",
-                    {},
-                    {{"request_epoch", std::to_string(request_epoch_)},
-                     {"draft_step", std::to_string(mtp_stats_.draft_steps)},
-                     {"condition_token", std::to_string(condition_token)},
-                     {"first_token", std::to_string(first_token)},
-                     {"draft_tokens", join_tokens(draft_tokens)},
-                     {"verifier_tokens", join_tokens(verifier_tokens)},
-                     {"rejected_verified_token", std::to_string(rejected_verified_token)},
-                     {"accepted_speculative_prefix", std::to_string(accepted_speculative_prefix)},
-                     {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
-                     {"verifier_state_matches_output", "true"},
-                     {"verifier_path", "decode_equivalent_stochastic"},
-                     {"catchup_implementation", "shared_stepwise_stochastic"},
-                     {"decode_equivalent_replay_required", "true"},
-                     {"output_tokens", std::to_string(accepted_tokens.size())},
-                     {"ready_token", std::to_string(ready_token)},
-                     {"used_ready_logits", use_ready_logits ? "true" : "false"}});
-
-                if (!stopped_on_output && ready_token >= 0)
-                {
-                    if (auto mismatch = verify_committed_prefix_replay(
-                            "decode_equivalent_stochastic_verifier",
-                            accepted_tokens,
-                            ready_token))
-                    {
-                        return fail_after_checkpoint(*mismatch);
-                    }
-                }
-
-                if (auto commit_error = commit_mtp_transaction_outputs(
-                        "decode_equivalent_stochastic_verifier",
-                        verifier_base_checkpoint,
-                        accepted_tokens,
-                        stopped_on_output || ready_token < 0
-                            ? std::optional<int32_t>{}
-                            : std::optional<int32_t>{ready_token},
-                        /*terminal_logits_ready=*/!stopped_on_output && ready_token >= 0,
-                        /*is_complete=*/stopped_on_output,
-                        PrefixStateProvenance::DecodeEquivalent,
-                        /*state_advanced=*/true))
-                {
-                    return fail_after_checkpoint(*commit_error);
-                }
-
-                return result;
-            }
-
-            Sampler verifier_penalty_sampler = sampler_;
-            auto sample_after_forward = [&](int32_t forwarded_token) -> int32_t
-            {
-                if (forwarded_token >= 0)
-                {
-                    verifier_penalty_sampler.record_token(forwarded_token);
-                }
-
-                bool penalties_applied_to_logits = false;
-                if (use_sampling_penalties)
-                {
-                    auto penalty_map =
-                        verifier_penalty_sampler.compute_penalty_map(
-                            active_sampling_params_,
-                            vocab);
-                    if (!penalty_map.empty())
-                    {
-                        if (!runner_->applyPenaltiesOnDevice(penalty_map, vocab))
-                        {
-                            return -1;
-                        }
-                        penalties_applied_to_logits = true;
-                        PerfStatsCollector::addCounter(
-                            "mtp",
-                            "decode_equivalent_catchup_penalty_applications",
-                            1.0,
-                            "decode",
-                            {},
-                            {{"implementation", "shared_stepwise"}});
-                    }
-                }
-
-                int32_t sampled = runner_->sampleGreedyOnDevice();
-                if (sampled >= 0)
-                    return sampled;
-
-                const float *main_logits = runner_->logits();
-                if (!main_logits)
-                    return -1;
-
-                PerfStatsCollector::ScopedTimer timer(
-                    "mtp",
-                        "decode_equivalent_catchup_sample_one_host",
-                        "decode",
-                        {},
-                        {{"implementation", "shared_stepwise"}});
-                SamplingParams host_params = active_sampling_params_;
-                if (penalties_applied_to_logits)
-                {
-                    host_params.presence_penalty = 0.0f;
-                    host_params.frequency_penalty = 0.0f;
-                    host_params.dry_multiplier = 0.0f;
-                    host_params.dry_penalty_last_n = 0;
-                }
-                return verifier_penalty_sampler.sample(
-                    main_logits,
-                    static_cast<size_t>(vocab),
-                    host_params);
-            };
-
-            MTPDecodeCatchupGreedyRequest catchup_request;
-            catchup_request.draft_tokens = draft_tokens;
-            catchup_request.stop_tokens = stop_tokens_;
-            catchup_request.base_sidecar_position = base_sidecar_position;
-            catchup_request.allow_speculative_discard = true;
-            catchup_request.verifier_path = "decode_equivalent_catchup";
-            catchup_request.verifier_base_checkpoint = &verifier_base_checkpoint;
-
-            std::string catchup_implementation = "shared_stepwise";
-            MTPDecodeCatchupGreedyResult catchup;
-            {
-                PerfStatsCollector::ScopedTimer verifier_timer(
-                    "mtp",
-                    "verifier_forward",
-                    "decode",
-                    {},
-                    {{"implementation", catchup_implementation},
-                     {"verifier_path", "decode_equivalent_catchup"}});
-                catchup = runSharedStepwiseMTPDecodeCatchupGreedy(
-                    *runner_,
-                    catchup_request,
-                    sample_after_forward);
-            }
-            if (!catchup.ok)
-            {
-                return fail_after_checkpoint(catchup.error);
-            }
-
-            std::vector<int32_t> accepted_tokens = std::move(catchup.accepted_tokens);
-            std::vector<int32_t> verifier_tokens = std::move(catchup.verifier_tokens);
-            const bool all_speculative_accepted = catchup.all_speculative_accepted;
-            const int accepted_speculative_prefix = catchup.accepted_speculative_prefix;
-            const int32_t rejected_verified_token = catchup.rejected_verified_token;
-            const int32_t ready_token = catchup.ready_token;
-            const bool stopped_on_output = catchup.stopped_on_output;
-            const int main_forward_token_count = catchup.main_forward_token_count;
-            result.is_complete = result.is_complete || stopped_on_output;
-
-            if (!all_speculative_accepted &&
-                !stopped_on_output &&
-                ready_token < 0)
-            {
-                return fail_after_checkpoint(
-                    "MTP optimized catch-up returned a rejected transaction without advancing correction state or producing a ready token");
-            }
-
-            if (auto tx_error = validate_spec_decode_transaction(
-                    "decode_equivalent_sequential_verifier",
-                    catchup_implementation,
-                    draft_tokens,
-                    accepted_tokens,
-                    stopped_on_output || ready_token < 0
-                        ? std::optional<int32_t>{}
-                        : std::optional<int32_t>{ready_token},
-                    all_speculative_accepted,
-                    stopped_on_output,
-                    accepted_speculative_prefix))
-            {
-                return fail_after_checkpoint(*tx_error);
-            }
-
-            ++mtp_stats_.verifier_runs;
-            mtp_stats_.verifier_token_count +=
-                static_cast<uint64_t>(main_forward_token_count);
-            PerfStatsCollector::addCounter("mtp", "verifier_runs", 1.0, "decode");
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "verifier_tokens",
-                static_cast<double>(main_forward_token_count),
-                "decode");
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "decode_equivalent_sequential_verifier_runs",
-                1.0,
-                "decode",
-                {},
-                {{"forward_tokens", std::to_string(main_forward_token_count)},
-                 {"draft_tokens", std::to_string(draft_tokens.size())},
-                 {"restored_verifier_base", restored_verifier_base ? "true" : "false"},
-                 {"catchup_implementation", catchup_implementation},
-                 {"policy_path", grouped_outcome_device_resident_publication
-                                     ? "grouped_outcome_device_resident_publication"
-                                     : "decode_equivalent_sequential"}});
-
-            recordMTPDepthObservation(
-                requested_speculative_draft_count,
-                speculative_draft_count,
-                accepted_speculative_prefix,
-                draft_count_budget_limited,
-                /*rollback=*/false);
-
-            if (!all_speculative_accepted)
-            {
-                ++mtp_stats_.rejected_tokens;
-                PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
-            }
-
-            if (accepted_speculative_prefix > 0)
-            {
-                mtp_stats_.accepted_tokens +=
-                    static_cast<uint64_t>(accepted_speculative_prefix);
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "accepted_tokens",
-                    static_cast<double>(accepted_speculative_prefix),
-                    "decode");
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "accepted_second_draft_tokens",
-                    accepted_speculative_prefix > 0 ? 1.0 : 0.0,
-                    "decode");
-            }
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "output_tokens",
-                static_cast<double>(accepted_tokens.size()),
-                "decode");
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "acceptance_trace",
-                1.0,
-                "decode",
-                {},
-                 {{"draft_step", std::to_string(mtp_stats_.draft_steps)},
-                  {"condition_token", std::to_string(condition_token)},
-                  {"first_token", std::to_string(first_token)},
-                  {"draft_tokens", join_tokens(draft_tokens)},
-                  {"verifier_tokens", join_tokens(verifier_tokens)},
-                  {"rejected_verified_token", std::to_string(rejected_verified_token)},
-                  {"accepted_speculative_prefix", std::to_string(accepted_speculative_prefix)},
-                  {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
-                 {"verifier_state_matches_output", "true"},
-                 {"verifier_path", "decode_equivalent_catchup"},
-                 {"catchup_implementation", catchup_implementation},
-                 {"policy_path", grouped_outcome_device_resident_publication
-                                      ? "grouped_outcome_device_resident_publication"
-                                      : "decode_equivalent_sequential"},
-                 {"decode_equivalent_replay_required", "true"},
-                 {"output_tokens", std::to_string(accepted_tokens.size())},
-                 {"ready_token", std::to_string(ready_token)},
-                 {"used_ready_logits", use_ready_logits ? "true" : "false"}});
-
-            if (!stopped_on_output && ready_token >= 0)
-            {
-                if (auto mismatch = verify_committed_prefix_replay(
-                        "decode_equivalent_sequential_verifier",
-                        accepted_tokens,
-                        ready_token))
-                {
-                    return fail_after_checkpoint(*mismatch);
-                }
-            }
-
-            if (auto commit_error = commit_mtp_transaction_outputs(
-                    "decode_equivalent_sequential_verifier",
-                    verifier_base_checkpoint,
-                    accepted_tokens,
-                    stopped_on_output || ready_token < 0
-                        ? std::optional<int32_t>{}
-                        : std::optional<int32_t>{ready_token},
-                    /*terminal_logits_ready=*/!stopped_on_output && ready_token >= 0,
-                    /*is_complete=*/stopped_on_output,
-                    PrefixStateProvenance::DecodeEquivalent,
-                    /*state_advanced=*/true))
-            {
-                return fail_after_checkpoint(*commit_error);
-            }
-
-            return result;
         }
 
         return fail_after_checkpoint(

@@ -5369,7 +5369,8 @@ TEST_F(Test__RankOrchestrator, VerifierEconomyCapabilityClampsToWeakestParticipa
     strong.moe = MTPVerifierEconomyLane::groupedPromoted(4);
 
     MTPVerifierEconomyCapability weak;
-    weak.dense = MTPVerifierEconomyLane::serialOracleOnlyCorrect(4);
+    weak.dense =
+        MTPVerifierEconomyLane::groupedDecodeEquivalentEconomicsPending(4);
     weak.moe = MTPVerifierEconomyLane::groupedPromoted(2);
     weak.moe.host_bridge_free_hot_path = false;
     weak.moe.perf_gate_status = "device_bridge_pending";
@@ -5394,8 +5395,8 @@ TEST_F(Test__RankOrchestrator, VerifierEconomyCapabilityClampsToWeakestParticipa
         orchestrator->mtpVerifierEconomyCapability();
     EXPECT_TRUE(capability.supportsDenseRows(4, true));
     EXPECT_FALSE(capability.hasEconomicalDensePath(4, false))
-        << "A correct serial oracle must not be advertised as an "
-           "economical grouped verifier.";
+        << "Grouped verifier correctness alone must not be advertised as an "
+           "economical hot path until publication and perf gates are green.";
     EXPECT_TRUE(capability.supportsMoERows(2, true));
     EXPECT_FALSE(capability.supportsMoERows(3, false))
         << "Rank-level MoE economy must clamp row count to the weakest child.";
