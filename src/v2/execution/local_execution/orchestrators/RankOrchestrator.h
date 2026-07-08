@@ -611,10 +611,10 @@ namespace llaminar2
          *        grouped accepted-state publication.
          *
          * Multi-child LocalTP does not have a single participant device mailbox
-         * for the entire rank.  It can still avoid row replay: the rank reduces
-         * sharded verifier logits into the shared compact SamplingMath outcome,
-         * builds the canonical accepted-row transaction, and fans that plan out
-         * through every child's grouped decode-equivalent publisher.
+         * for the entire rank.  The rank reduces sharded verifier logits into a
+         * shared compact SamplingMath outcome, stages that compact outcome into
+         * each child's resident outcome workspace, and then lets each child run
+         * its native device-resident publisher.
          */
         bool supportsDeviceResidentMTPSpecStatePublication() const override;
         /**
@@ -622,9 +622,10 @@ namespace llaminar2
          *
          * The outcome handle must have been produced by
          * verifyGreedyAllPositionBatchOutcomeOnDeviceResident() on this same
-         * RankOrchestrator instance.  Publication uses grouped child APIs only;
-         * it must not call serial row replay or promote LocalTP to the broader
-         * direct all-position publication capability.
+         * RankOrchestrator instance.  Publication must call child
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome() directly after
+         * staging the compact outcome; it must not expand the outcome into
+         * host step plans for live-state mutation or call serial row replay.
          */
         bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
             const DeviceSpeculativePublicationRequest &request,
@@ -646,6 +647,7 @@ namespace llaminar2
         bool supportsMTPDeviceDraftTokenInput() const override;
         bool supportsMTPSidecarPreservesMainState() const override;
         bool supportsMTPShiftedRowReuseFromSidecar() const override;
+        bool usesMirroredLocalTPMTPHeadForVerifier() const override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool applyPenaltiesOnDevice(
             const std::vector<LogitPenalty> &penalties,
@@ -1477,7 +1479,8 @@ namespace llaminar2
         {
             None,
             Greedy,
-            Stochastic
+            Stochastic,
+            MirroredGreedy
         };
         RankCompactOutcomeKind rank_compact_outcome_kind_ =
             RankCompactOutcomeKind::None;
@@ -1672,6 +1675,36 @@ namespace llaminar2
             std::vector<int32_t> *out_tokens) const;
 
         /**
+         * @brief Run greedy verifier reduction independently on mirrored LocalTP children.
+         *
+         * When every LocalTP child owns a replicated MTP verifier head, each child
+         * writes the same full-vocabulary verifier rows and can produce a native
+         * DeviceSpeculativeOutcomeHandle. The rank stores those per-child handles
+         * and returns the primary child's handle only as the response
+         * materialization representative. Publication later replays no rows and
+         * stages no rank compact metadata; it forwards each stored handle back to
+         * the child that produced it.
+         */
+        bool verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle);
+
+        /**
+         * @brief Publish the child-resident outcomes from mirrored LocalTP greedy verification.
+         *
+         * The request outcome must be the primary child handle returned by the
+         * most recent mirrored verifier reduction. Each participant receives its
+         * own stored handle, preserving stream ownership and avoiding both a tiny
+         * verifier collective and rank-to-child compact metadata uploads.
+         */
+        bool publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
+            const DeviceSpeculativePublicationRequest &request,
+            std::string *error);
+
+        /**
          * @brief Return a previously sampled rank draft token slot.
          */
         int32_t rankStochasticDraftSampleToken(int slot) const;
@@ -1687,6 +1720,10 @@ namespace llaminar2
         mutable int rank_resident_logical_state_ready_event_token_ = 0;
         mutable uint64_t rank_resident_logical_state_epoch_ = 1;
         MTPSpecStepPlanBatch rank_last_device_outcome_step_plans_;
+        std::vector<DeviceSpeculativeOutcomeHandle>
+            rank_mirrored_child_outcomes_;
+        DeviceSpeculativeOutcomeHandle rank_mirrored_primary_outcome_;
+        bool rank_mirrored_child_outcomes_valid_ = false;
         int rank_compact_outcome_stream_token_ = 0;
         int rank_compact_outcome_ready_event_token_ = 0;
         bool rank_compact_outcome_valid_ = false;

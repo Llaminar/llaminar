@@ -2719,7 +2719,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
     const size_t first_token_device_sample =
         first_token_body.find("sampleGreedyFromMainLogitsToDeviceTargetSlot(");
     const size_t first_token_device_failure =
-        first_token_body.find("MTP greedy first-token GPU deferred sampling failed");
+        first_token_body.find("device target-slot deferred sampling failed");
     const size_t first_token_legacy_sample =
         first_token_body.find("sampleGreedyOnDevice()");
     ASSERT_NE(first_token_device_sample, std::string::npos);

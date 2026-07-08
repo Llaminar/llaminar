@@ -426,7 +426,7 @@ namespace llaminar2
 
     void LogitsGatherer::copyFromStage(
         const IInferenceRunner &stage_runner,
-        size_t fallback_copy_elements,
+        size_t copy_elements_hint,
         int batch_size, int max_seq_len)
     {
         const float *stage_logits = stage_runner.logits();
@@ -453,10 +453,16 @@ namespace llaminar2
                       << max_tokens << ", " << vocab << "]");
         }
 
-        size_t copy_elements = last_gathered_size_ > 0
-                                   ? last_gathered_size_
-                                   : (fallback_copy_elements > 0 ? fallback_copy_elements
-                                                                 : static_cast<size_t>(vocab));
+        const size_t copy_elements = copy_elements_hint > 0
+                                         ? copy_elements_hint
+                                         : static_cast<size_t>(vocab);
+        if (copy_elements == 0 || copy_elements > buffer_->numel())
+        {
+            LOG_ERROR("LogitsGatherer::copyFromStage: requested copy of "
+                      << copy_elements << " elements exceeds buffer capacity "
+                      << buffer_->numel());
+            return;
+        }
         std::memcpy(buffer_->mutable_data(), stage_logits, copy_elements * sizeof(float));
         last_gathered_size_ = copy_elements;
 

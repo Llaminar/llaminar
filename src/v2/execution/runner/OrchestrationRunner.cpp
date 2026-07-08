@@ -4055,22 +4055,46 @@ namespace llaminar2
             (!stochastic_verify || stochastic_device_verify) &&
             runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsDeviceResidentMTPSpecStatePublication();
+        const bool use_grouped_decode_equivalent_outcome_verifier =
+            verifier_policy.path ==
+            MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
+        if (use_grouped_decode_equivalent_outcome_verifier &&
+            runner_->primaryDeviceId().is_gpu() &&
+            stochastic_verify &&
+            !stochastic_device_verify)
+        {
+            return fail_without_checkpoint(
+                "GPU stochastic MTP requires device-resident distribution verification");
+        }
+        if (use_grouped_decode_equivalent_outcome_verifier &&
+            runner_->primaryDeviceId().is_gpu() &&
+            !use_grouped_outcome_device_resident_publication_verifier)
+        {
+            /*
+             * CUDA/ROCm grouped verifier rows are only a production path when
+             * the accepted-state publication also stays device-resident.  If we
+             * already know the runner cannot publish the compact outcome on
+             * device, fail before enabling verifier-row logits or forwarding
+             * any grouped rows; row replay and host step plans are diagnostics,
+             * not GPU hot-path substitutes.
+             */
+            return fail_without_checkpoint(
+                "Grouped decode-equivalent MTP verifier has no grouped publication path; GPU grouped verifier requires device-resident accepted-state publication");
+        }
         const bool use_grouped_outcome_host_publication_verifier =
             verifier_policy.path ==
                 MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome &&
             !use_grouped_outcome_device_resident_publication_verifier &&
+            !runner_->primaryDeviceId().is_gpu() &&
             (!stochastic_verify || stochastic_host_verify);
-        const bool use_grouped_decode_equivalent_outcome_verifier =
-            verifier_policy.path ==
-            MTPVerifierExecutionPath::GroupedDecodeEquivalentOutcome;
         if (use_grouped_outcome_host_publication_verifier)
         {
             /*
-             * LocalTP can publish a grouped greedy outcome through host-visible
-             * step plans when direct all-position publication and compact
-             * device-resident publication are both unavailable.  Record the
-             * selected lane before control enters the shared verifier branch,
-             * because that branch returns before the sequential replay block.
+             * CPU grouped verification still publishes through host-visible step
+             * plans. GPU grouped verification must use the compact
+             * device-resident publisher; allowing this middle lane on CUDA/ROCm
+             * quietly reintroduced host-owned MTP state after verifier rows had
+             * already been proven decode-equivalent.
              */
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -4935,6 +4959,7 @@ namespace llaminar2
             runner_->supportsMTPDeviceDraftTokenInput();
 
         int32_t first_token = -1;
+        bool first_token_device_target_slot_available = false;
         bool first_token_is_pending_condition = false;
         if (use_pending_condition_row)
         {
@@ -5091,12 +5116,44 @@ namespace llaminar2
                             /*out_token=*/nullptr))
                     {
                         return fail_after_checkpoint(
-                            "MTP greedy first-token GPU deferred sampling failed");
+                            "MTP first-token GPU sampling failed; device target-slot deferred sampling failed; host logits sampling is CPU-only");
                     }
                     first_token = kDeferredMTPFirstTokenShadow;
+                    first_token_device_target_slot_available = true;
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "first_token_greedy_deferred_host_reads",
+                        1.0,
+                        "decode");
+                }
+                else if (verifier_accepts_device_first_token &&
+                         runner_->primaryDeviceId().is_gpu() &&
+                         runner_->supportsMTPDeviceDraftTokenInput() &&
+                         pre_sample_effective_draft_count > 0)
+                {
+                    /*
+                     * Penalty-bearing greedy decode still needs a host shadow so
+                     * sampler history can be updated today, but the verifier
+                     * token row itself must be assembled from runner-owned device
+                     * sample slots.  Sampling through the target-slot API records
+                     * that device source while returning the same token shadow the
+                     * history code already consumed.
+                     */
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "sample_first_token_greedy_device_target_slot_shadow",
+                        "decode");
+                    if (!runner_->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                            /*target_sample_slot=*/0,
+                            &first_token))
+                    {
+                        return fail_after_checkpoint(
+                            "MTP first-token GPU sampling failed; device target-slot shadow sampling failed; host logits sampling is CPU-only");
+                    }
+                    first_token_device_target_slot_available = true;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "first_token_greedy_device_target_slot_shadow_samples",
                         1.0,
                         "decode");
                 }
@@ -5115,7 +5172,7 @@ namespace llaminar2
                     if (runner_->primaryDeviceId().is_gpu())
                     {
                         return fail_after_checkpoint(
-                            "MTP first-token GPU sampling failed; CPU logits fallback is disabled");
+                            "MTP first-token GPU sampling failed; host logits sampling is CPU-only");
                     }
                     PerfStatsCollector::addCounter("mtp", "first_token_cpu_host_samples", 1.0, "decode");
                     const float *main_logits = runner_->logits();
@@ -5310,7 +5367,6 @@ namespace llaminar2
             (use_all_position_state_publication_verifier ||
              use_grouped_outcome_device_resident_publication_verifier) &&
             !stochastic_verify &&
-            !use_sampling_penalties &&
             runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsMTPDeviceDraftTokenInput();
 
@@ -5457,6 +5513,8 @@ namespace llaminar2
                         "decode",
                         {},
                         {{"draft_idx", std::to_string(draft_idx)}});
+                    mtp_token_sampling_error =
+                        "MTP draft-token GPU sampling failed; device draft-slot sampling failed; host logits sampling is CPU-only";
                     return -1;
                 }
                 PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_device", "decode");
@@ -5478,7 +5536,7 @@ namespace llaminar2
             if (runner_->primaryDeviceId().is_gpu())
             {
                 mtp_token_sampling_error =
-                    "MTP draft-token GPU sampling failed; CPU logits fallback is disabled";
+                    "MTP draft-token GPU sampling failed; host logits sampling is CPU-only";
                 return -1;
             }
 
@@ -10427,6 +10485,11 @@ namespace llaminar2
                     return fail_after_checkpoint(
                         "Grouped-outcome greedy MTP cannot apply row-local penalties to deferred token shadows");
                 }
+                if (!runner_->supportsMTPDeviceDraftTokenInput())
+                {
+                    return fail_after_checkpoint(
+                        "Grouped-outcome greedy GPU MTP requires device-resident verifier token input");
+                }
 
                 const MTPSpecDecodeVerifierInputPlan verifier_input_plan =
                     buildSingleRequestVerifierInputPlan(draft_tokens);
@@ -10483,7 +10546,8 @@ namespace llaminar2
                     }
                     if (needs_device_verifier_tokens)
                     {
-                        if (first_token_deferred)
+                        if (first_token_deferred ||
+                            first_token_device_target_slot_available)
                         {
                             verifier_input_tokens_device =
                                 runner_->prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
@@ -10510,6 +10574,13 @@ namespace llaminar2
                              * the verifier stream so the forward graph and the
                              * outcome reducer consume one coherent device row.
                              */
+                            if (runner_->primaryDeviceId().is_gpu())
+                            {
+                                runner_->setComputeAllPositionLogits(false);
+                                runner_->setComputeRowIndexedAllPositionLogits(false, 0);
+                                return fail_after_checkpoint(
+                                    "Grouped-outcome greedy GPU MTP cannot upload host verifier rows");
+                            }
                             verifier_input_tokens_device =
                                 runner_->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
                                     verifier_input_plan.verifier_input_tokens.data(),
@@ -11515,7 +11586,7 @@ namespace llaminar2
 
         // Tail stage: keep GPU logits on the device sampling path.  CPU-only
         // runners may sample from host logits below, but a GPU sampler failure
-        // is a hard error rather than a silent D2H fallback.
+        // is a hard error rather than a hidden D2H host sampling path.
         int token = -1;
         bool device_sampling_attempted = false;
         bool device_penalty_application_failed = false;
@@ -11537,7 +11608,7 @@ namespace llaminar2
             /*
              * Worker ranks must participate in any device/distributed sampling
              * collectives, but rank 0 owns the committed token.  Do not run
-             * root-only CPU fallback here; after the post-sampling fence below,
+             * root-only CPU sampling here; after the post-sampling fence below,
              * workers receive the authoritative token and record that in their
              * local sampler history.
              */
@@ -11650,17 +11721,17 @@ namespace llaminar2
                 if (device_penalty_application_failed)
                 {
                     result.error =
-                        "GPU decode penalty application failed; CPU logits fallback is disabled";
+                        "GPU decode penalty application failed; host logits sampling is CPU-only";
                 }
                 else if (device_sampling_attempted)
                 {
                     result.error =
-                        "GPU decode sampling failed; CPU logits fallback is disabled";
+                        "GPU decode sampling failed; host logits sampling is CPU-only";
                 }
                 else
                 {
                     result.error =
-                        "GPU decode sampling was required but not attempted; CPU logits fallback is disabled";
+                        "GPU decode sampling was required but not attempted; host logits sampling is CPU-only";
                 }
                 if (decode_sampling_sync_deferred)
                     result.error += " after deferred logits sync";

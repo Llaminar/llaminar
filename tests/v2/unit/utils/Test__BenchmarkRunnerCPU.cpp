@@ -4,7 +4,7 @@
  *
  * Regression tests for:
  * - setSkipLogitsGatherDecode must NOT be enabled on CPU devices
- * - CPU decode may sample host logits when sampleGreedyOnDevice() returns -1
+ * - CPU decode samples from host logits as the CPU implementation
  * - GPU decode must fail hard when device sampling fails
  */
 
@@ -110,7 +110,11 @@ namespace
             skip_logits_gather_decode_called_ = true;
         }
 
-        void setSkipLogitsGatherPrefill(bool) override {}
+        void setSkipLogitsGatherPrefill(bool skip) override
+        {
+            skip_logits_gather_prefill_ = skip;
+            skip_logits_gather_prefill_called_ = true;
+        }
         void setSuppressTimeline(bool) override {}
         void setAccumulatePrefill(bool) override {}
 
@@ -121,6 +125,8 @@ namespace
         // Test inspection
         bool skipLogitsGatherDecodeWasEnabled() const { return skip_logits_gather_decode_; }
         bool skipLogitsGatherDecodeWasCalled() const { return skip_logits_gather_decode_called_; }
+        bool skipLogitsGatherPrefillWasEnabled() const { return skip_logits_gather_prefill_; }
+        bool skipLogitsGatherPrefillWasCalled() const { return skip_logits_gather_prefill_called_; }
         int forwardCount() const { return forward_count_; }
 
     private:
@@ -129,6 +135,8 @@ namespace
         int clear_count_ = 0;
         bool skip_logits_gather_decode_ = false;
         bool skip_logits_gather_decode_called_ = false;
+        bool skip_logits_gather_prefill_ = false;
+        bool skip_logits_gather_prefill_called_ = false;
     };
 
     /**
@@ -178,7 +186,10 @@ namespace
             skip_logits_gather_decode_ = skip;
         }
 
-        void setSkipLogitsGatherPrefill(bool) override {}
+        void setSkipLogitsGatherPrefill(bool skip) override
+        {
+            skip_logits_gather_prefill_ = skip;
+        }
         void setSuppressTimeline(bool) override {}
         void setAccumulatePrefill(bool) override {}
 
@@ -193,11 +204,13 @@ namespace
         }
 
         bool skipLogitsGatherDecodeWasEnabled() const { return skip_logits_gather_decode_; }
+        bool skipLogitsGatherPrefillWasEnabled() const { return skip_logits_gather_prefill_; }
 
     private:
         std::vector<float> logits_;
         PrefixRuntimeStateSnapshot snapshot_;
         bool skip_logits_gather_decode_ = false;
+        bool skip_logits_gather_prefill_ = false;
         bool device_argmax_available_ = true;
     };
 
@@ -275,6 +288,8 @@ namespace
     class MockBenchmarkEventOrderRunner : public MockOrchestratedDecodeRunner
     {
     public:
+        DeviceId primaryDeviceId() const override { return DeviceId::cuda(0); }
+
         bool forward(const int *tokens, int seq_len) override
         {
             events_.push_back(seq_len > 1 ? "prefill" : "forward");
@@ -648,6 +663,10 @@ TEST(Test__BenchmarkRunnerCPU, DoesNotSkipLogitsGatherOnCPU)
         << "BenchmarkRunner must call setSkipLogitsGatherDecode";
     EXPECT_FALSE(runner->skipLogitsGatherDecodeWasEnabled())
         << "CPU device must NOT enable skip-logits-gather (no GPU argmax available)";
+    EXPECT_TRUE(runner->skipLogitsGatherPrefillWasCalled())
+        << "BenchmarkRunner must configure prefill gather policy";
+    EXPECT_FALSE(runner->skipLogitsGatherPrefillWasEnabled())
+        << "CPU device must keep prefill logits visible to host-side CPU sampling";
 }
 
 /**
@@ -672,13 +691,15 @@ TEST(Test__BenchmarkRunnerCPU, EnablesSkipLogitsGatherOnGPU)
     // GPU runner should have skip-logits-gather enabled
     EXPECT_TRUE(runner->skipLogitsGatherDecodeWasEnabled())
         << "GPU device must enable skip-logits-gather for performance";
+    EXPECT_TRUE(runner->skipLogitsGatherPrefillWasEnabled())
+        << "GPU device must skip prefill logits gather when benchmark sampling stays device-side";
 }
 
 /**
- * @brief Verify CPU decode falls back to host-side argmax and succeeds.
+ * @brief Verify CPU decode uses host-side argmax and succeeds.
  *
  * Regression test: BenchmarkRunner previously treated sampleGreedyOnDevice() == -1
- * as a hard error. Now it falls back to logits() + CPU argmax.
+ * as a hard error for CPU. CPU decode should instead use logits() + CPU argmax.
  */
 TEST(Test__BenchmarkRunnerCPU, CPUDecodeSucceedsWithHostArgmax)
 {
@@ -696,7 +717,7 @@ TEST(Test__BenchmarkRunnerCPU, CPUDecodeSucceedsWithHostArgmax)
 
     // Benchmark must succeed — CPU decode via host argmax should work
     EXPECT_TRUE(result.success)
-        << "CPU benchmark must succeed using host-side argmax fallback";
+        << "CPU benchmark must succeed using host-side argmax";
     EXPECT_TRUE(result.decode_success)
         << "CPU decode phase must succeed";
     EXPECT_EQ(result.decode_tokens, 5)
@@ -798,7 +819,7 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeFailsHardWhenDeviceArgmaxFails)
     EXPECT_FALSE(result.decode_success);
     EXPECT_NE(result.failure_reason.find("GPU device sampling failed"),
               std::string::npos);
-    EXPECT_NE(result.failure_reason.find("CPU logits fallback is disabled"),
+    EXPECT_NE(result.failure_reason.find("host logits sampling is CPU-only"),
               std::string::npos);
 }
 

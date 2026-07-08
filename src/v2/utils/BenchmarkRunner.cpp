@@ -1094,9 +1094,9 @@ namespace llaminar2
             {
                 auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
-                // Try device-side argmax first.  CPU-only runners may fall
-                // back to host logits; GPU runners must fail loudly instead of
-                // silently paying a D2H logits transfer.
+                // Try device-side argmax first. CPU-only runners then use the
+                // host-logits CPU implementation; GPU runners fail loudly
+                // instead of silently paying a D2H logits transfer.
                 next_token = runner_->sampleGreedyOnDevice();
 
                 if (next_token < 0)
@@ -1104,9 +1104,9 @@ namespace llaminar2
                     if (runner_->primaryDeviceId().is_gpu())
                     {
                         LOG_ERROR("GPU device sampling failed at decode step " << i
-                                                                                << "; CPU logits fallback is disabled.");
+                                                                                << "; host logits sampling is CPU-only.");
                         last_failure_reason_ =
-                            "GPU device sampling failed: CPU logits fallback is disabled";
+                            "GPU device sampling failed: host logits sampling is CPU-only";
                         auto end = std::chrono::high_resolution_clock::now();
                         result.success = false;
                         result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -1118,9 +1118,9 @@ namespace llaminar2
                     const float *logit_data = runner_->logits();
                     if (!logit_data)
                     {
-                        LOG_ERROR("CPU sampling fallback failed at decode step " << i
-                                                                                 << ": logits() returned nullptr.");
-                        last_failure_reason_ = "CPU sampling fallback failed: logits unavailable";
+                        LOG_ERROR("CPU host sampling failed at decode step " << i
+                                                                             << ": logits() returned nullptr.");
+                        last_failure_reason_ = "CPU host sampling failed: logits unavailable";
                         auto end = std::chrono::high_resolution_clock::now();
                         result.success = false;
                         result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -1420,10 +1420,9 @@ namespace llaminar2
         // numbers and don't reflect steady-state performance.
         runner_->setSuppressTimeline(true);
 
-        // Skip D2H logits gather for prefill — prefill logits are never consumed
-        // in the benchmark flow (sampling happens during decode via GPU-side argmax).
-        // This eliminates ~405ms of PCIe traffic for TP=2 prefill.
-        runner_->setSkipLogitsGatherPrefill(true);
+        // Skip D2H logits gather for GPU prefill. CPU benchmarks keep host logits
+        // visible because host-side sampling is the CPU implementation.
+        runner_->setSkipLogitsGatherPrefill(has_gpu);
 
         auto requirePrefillGraphCapture = [&](const char *context) -> bool
         {
@@ -1447,6 +1446,19 @@ namespace llaminar2
 
         auto warmPrefillGraphCapture = [&]() -> bool
         {
+            if (!has_gpu)
+            {
+                if (debugEnv().execution.prefill_graph_required)
+                {
+                    last_failure_reason_ =
+                        "LLAMINAR_PREFILL_GRAPH_REQUIRED=1 but the benchmark runner is CPU-only";
+                    if (mpi_ctx_->rank() == 0)
+                        LOG_ERROR(last_failure_reason_);
+                    return false;
+                }
+                return true;
+            }
+
             if (!debugEnv().execution.gpu_graphs)
             {
                 if (debugEnv().execution.prefill_graph_required)

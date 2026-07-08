@@ -371,6 +371,11 @@ TEST_F(Test__LogitsGatherer, GatherEmptyRunners_ReturnsFalse)
 TEST_F(Test__LogitsGatherer, CopyFromStage_CopiesLogits)
 {
     auto g = createGatherer();
+    auto one_token_runner = std::make_unique<LogitsGathererMockRunner>(1);
+    one_token_runner->setLogitsData({123.0f});
+    g->copyFromStage(*one_token_runner, 1, 1, 16);
+    ASSERT_EQ(g->lastGatheredSize(), 1u);
+
     auto runner = std::make_unique<LogitsGathererMockRunner>(VOCAB);
     std::vector<float> expected(VOCAB);
     for (int i = 0; i < VOCAB; ++i)

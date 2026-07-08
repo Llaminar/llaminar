@@ -2825,7 +2825,42 @@ namespace llaminar2
         }
 
         if (all_local_logits)
+        {
+            /*
+             * CPU LocalTP has no graph-stream handoff to consume: the current
+             * LOGITS_LOCAL tensors are ordinary host-resident shard rows.  Use
+             * the non-consuming local views directly so ready prefill logits and
+             * MTP condition logits are reduced by the same grouped argmax used
+             * for verifier rows.  GPU children still route through
+             * DeviceSampler::sampleGreedy(), whose consuming view enforces the
+             * producer stream contract before launching per-shard argmax.
+             */
+            std::vector<LogitsLocalInfo> host_local_infos;
+            host_local_infos.reserve(device_runners_.size());
+            bool all_host_local_infos = true;
+            for (const auto &runner : device_runners_)
+            {
+                LogitsLocalInfo info = runner ? runner->getLogitsLocalInfo() : LogitsLocalInfo{};
+                if (!info || info.vocab_local == 0)
+                {
+                    all_host_local_infos = false;
+                    break;
+                }
+                if (info.device.has_value() && info.device->is_gpu())
+                {
+                    all_host_local_infos = false;
+                    break;
+                }
+                host_local_infos.push_back(info);
+            }
+            if (all_host_local_infos)
+            {
+                return DeviceSampler::sampleGreedyFromLocalInfos(
+                    host_local_infos,
+                    /*row=*/0);
+            }
             return DeviceSampler::sampleGreedy(device_runners_);
+        }
         if (!any_local_logits && !device_runners_.empty() && device_runners_[0])
             return device_runners_[0]->sampleGreedyOnDevice();
         return -1;
@@ -5253,7 +5288,21 @@ namespace llaminar2
         *out_handle = DeviceSpeculativeOutcomeHandle{};
         rank_compact_outcome_valid_ = false;
         rank_compact_outcome_published_ = false;
+        rank_compact_outcome_kind_ = RankCompactOutcomeKind::None;
+        rank_mirrored_child_outcomes_.clear();
+        rank_mirrored_primary_outcome_ = DeviceSpeculativeOutcomeHandle{};
+        rank_mirrored_child_outcomes_valid_ = false;
         rank_resident_child_logical_state_handles_.clear();
+
+        if (usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            return verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(
+                draft_tokens,
+                draft_token_count,
+                stop_tokens,
+                stop_token_count,
+                out_handle);
+        }
 
         std::vector<int32_t> resolved_draft_tokens;
         if (!resolveRankGreedyOutcomeTokensForLocalTP(
@@ -5340,6 +5389,89 @@ namespace llaminar2
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
                  {"implementation", "rank_owned_compact_sampling_math"}});
+        }
+        return rank_compact_outcome_valid_;
+    }
+
+    bool RankOrchestrator::verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(
+        const int32_t *draft_tokens,
+        int draft_token_count,
+        const int32_t *stop_tokens,
+        int stop_token_count,
+        DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        using namespace sampling_math;
+        if (!out_handle)
+            return false;
+
+        const int compare_rows = draft_token_count - 1;
+        if (device_runners_.size() < 2 ||
+            !draft_tokens ||
+            draft_token_count <= 0 ||
+            draft_token_count > kSpeculativeBatchMaxRows ||
+            compare_rows < 0 ||
+            compare_rows > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens))
+        {
+            return false;
+        }
+
+        std::vector<DeviceSpeculativeOutcomeHandle> child_outcomes(
+            device_runners_.size());
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            IInferenceRunner *child = device_runners_[i].get();
+            if (!child ||
+                !child->primaryDeviceId().is_gpu() ||
+                !child->usesMirroredLocalTPMTPHeadForVerifier() ||
+                !child->supportsDeviceResidentMTPSpecStatePublication())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy MTP requires every child to expose a GPU mirrored-head resident publisher; participant "
+                          << i << " is not ready");
+                return false;
+            }
+
+            /*
+             * Pass the verifier token shadows through unchanged.  If the first
+             * token or drafts are device-resident, the child reducer reads the
+             * already-materialized verifier input row from its own arena buffer;
+             * resolving the shadows here would reintroduce a host ownership edge.
+             */
+            if (!child->verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+                    draft_tokens,
+                    draft_token_count,
+                    stop_tokens,
+                    stop_token_count,
+                    &child_outcomes[i]) ||
+                !child_outcomes[i].valid())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy MTP child "
+                          << i << " failed resident verifier reduction");
+                return false;
+            }
+        }
+
+        rank_mirrored_child_outcomes_ = std::move(child_outcomes);
+        rank_mirrored_primary_outcome_ =
+            rank_mirrored_child_outcomes_.front();
+        *out_handle = rank_mirrored_primary_outcome_;
+        rank_compact_outcome_kind_ = RankCompactOutcomeKind::MirroredGreedy;
+        rank_compact_outcome_valid_ = out_handle->valid();
+        rank_mirrored_child_outcomes_valid_ = rank_compact_outcome_valid_;
+
+        if (rank_compact_outcome_valid_)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_greedy_resident_outcomes",
+                static_cast<double>(draft_token_count),
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"compare_rows", std::to_string(compare_rows)},
+                 {"implementation", "mirrored_child_device_outcomes"}});
         }
         return rank_compact_outcome_valid_;
     }
@@ -6230,6 +6362,25 @@ namespace llaminar2
         return supportsDeviceResidentMTPSpecStatePublication();
     }
 
+    bool RankOrchestrator::usesMirroredLocalTPMTPHeadForVerifier() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->usesMirroredLocalTPMTPHeadForVerifier();
+        }
+        if (device_runners_.empty())
+            return false;
+
+        return std::all_of(
+            device_runners_.begin(),
+            device_runners_.end(),
+            [](const std::unique_ptr<IInferenceRunner> &runner)
+            {
+                return runner &&
+                       runner->usesMirroredLocalTPMTPHeadForVerifier();
+            });
+    }
+
     bool RankOrchestrator::supportsDeviceStochasticMTPVerification() const
     {
         if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -7010,6 +7161,9 @@ namespace llaminar2
         rank_compact_outcome_valid_ = false;
         rank_compact_outcome_published_ = false;
         rank_compact_outcome_kind_ = RankCompactOutcomeKind::None;
+        rank_mirrored_child_outcomes_.clear();
+        rank_mirrored_primary_outcome_ = DeviceSpeculativeOutcomeHandle{};
+        rank_mirrored_child_outcomes_valid_ = false;
         rank_resident_child_logical_state_handles_.clear();
 
         if (!requests ||
@@ -7363,10 +7517,7 @@ namespace llaminar2
     {
         /*
          * Single-child ranks are only a wrapper around the real runner, so keep
-         * their resident publication capability identical to the child.  The
-         * multi-child LocalTP implementation below is intentionally separate:
-         * it owns a rank-level compact outcome and publishes through grouped
-         * decode-equivalent child APIs rather than delegating to one child.
+         * their resident publication capability identical to the child.
          */
         if (pp_stage_runners_.empty() &&
             device_runners_.size() == 1 &&
@@ -7391,7 +7542,9 @@ namespace llaminar2
             device_runners_.end(),
             [](const std::unique_ptr<IInferenceRunner> &runner)
             {
-                return runner != nullptr;
+                return runner &&
+                       runner->primaryDeviceId().is_gpu() &&
+                       runner->supportsDeviceResidentMTPSpecStatePublication();
             });
     }
 
@@ -7399,6 +7552,43 @@ namespace llaminar2
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
     {
+        if (rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy)
+        {
+            if (!outcomes ||
+                !rank_compact_outcome_valid_ ||
+                !rank_mirrored_child_outcomes_valid_ ||
+                rank_mirrored_child_outcomes_.empty() ||
+                !handle.valid() ||
+                handle.output_tokens_device !=
+                    rank_mirrored_primary_outcome_.output_tokens_device ||
+                handle.meta_device !=
+                    rank_mirrored_primary_outcome_.meta_device ||
+                handle.device != rank_mirrored_primary_outcome_.device ||
+                handle.request_count !=
+                    rank_mirrored_primary_outcome_.request_count)
+            {
+                return false;
+            }
+
+            if (!device_runners_.front() ||
+                !device_runners_.front()->materializeDeviceSpeculativeOutcomesForHostResponse(
+                    rank_mirrored_child_outcomes_.front(),
+                    outcomes))
+            {
+                return false;
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_greedy_outcome_host_materializations",
+                1.0,
+                "decode",
+                "rank",
+                {{"requests", std::to_string(handle.request_count)},
+                 {"source", "primary_child_device_outcome"}});
+            return true;
+        }
+
         if (!outcomes ||
             !rank_compact_outcome_valid_ ||
             !handle.valid() ||
@@ -7481,6 +7671,12 @@ namespace llaminar2
             request.outcome.meta_device != rank_compact_output_meta_.data() ||
             request.outcome.request_count != 1)
         {
+            if (rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy)
+            {
+                return publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
+                    request,
+                    error);
+            }
             return fail(
                 "rank compact MTP publication request does not reference the current rank-owned verifier outcome");
         }
@@ -7552,14 +7748,55 @@ namespace llaminar2
             step.publish_mtp_shifted_kv = request.publish_mtp_shifted_kv;
         }
 
-        std::string publish_error;
-        if (!publishGroupedDecodeEquivalentMTPSpecStateBatch(
-                transaction_plan.step_plans,
-                &publish_error))
+        /*
+         * The compact rank outcome is the only accepted-count source for
+         * LocalTP.  Each child stages that same compact SamplingMath row into
+         * its own arena-backed resident buffers, then runs the native
+         * single-device resident publisher.  This keeps KV, recurrent state,
+         * short-conv state, terminal hidden, and resident logical-state
+         * mailboxes owned by the child GPU path; the transaction plan above is
+         * retained only for response bookkeeping and host mirror adoption.
+         */
+        for (size_t i = 0; i < device_runners_.size(); ++i)
         {
-            return fail(
-                std::string("rank compact MTP grouped publication failed: ") +
-                publish_error);
+            IInferenceRunner *child = device_runners_[i].get();
+            if (!child)
+            {
+                return fail(
+                    "rank compact MTP resident publication lost a LocalTP participant while staging compact outcome");
+            }
+
+            DeviceSpeculativeOutcomeHandle child_outcome;
+            std::string stage_error;
+            if (!child->stageMTPSpecOutcomeForDeviceResidentPublication(
+                    rank_compact_output_tokens_.data(),
+                    rank_compact_output_meta_.data(),
+                    request.outcome.request_count,
+                    request.outcome.output_token_stride,
+                    request.outcome.meta_stride,
+                    &child_outcome,
+                    &stage_error))
+            {
+                return fail(
+                    "rank compact MTP resident publication could not stage compact outcome on participant " +
+                    std::to_string(i) +
+                    (stage_error.empty() ? std::string()
+                                         : ": " + stage_error));
+            }
+
+            DeviceSpeculativePublicationRequest child_request = request;
+            child_request.outcome = child_outcome;
+            std::string publish_error;
+            if (!child->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+                    child_request,
+                    &publish_error))
+            {
+                return fail(
+                    "rank compact MTP resident publication failed on participant " +
+                    std::to_string(i) +
+                    (publish_error.empty() ? std::string()
+                                           : ": " + publish_error));
+            }
         }
 
         rank_resident_child_logical_state_handles_.clear();
@@ -7606,7 +7843,109 @@ namespace llaminar2
             {{"participants", std::to_string(device_runners_.size())},
              {"request_count", std::to_string(request.request_count)},
              {"max_draft_tokens", std::to_string(request.max_draft_tokens)},
-             {"implementation", "grouped_decode_equivalent_child_publish"}});
+             {"implementation", "device_resident_child_publish"}});
+        return true;
+    }
+
+    bool RankOrchestrator::publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
+        const DeviceSpeculativePublicationRequest &request,
+        std::string *error)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR("[RankOrchestrator] " << reason);
+            return false;
+        };
+
+        if (rank_compact_outcome_kind_ != RankCompactOutcomeKind::MirroredGreedy ||
+            !rank_compact_outcome_valid_ ||
+            !rank_mirrored_child_outcomes_valid_ ||
+            rank_mirrored_child_outcomes_.size() != device_runners_.size())
+        {
+            return fail(
+                "mirrored LocalTP MTP publication has no current child-resident verifier outcomes");
+        }
+        if (!request.valid() ||
+            request.outcome.output_tokens_device !=
+                rank_mirrored_primary_outcome_.output_tokens_device ||
+            request.outcome.meta_device !=
+                rank_mirrored_primary_outcome_.meta_device ||
+            request.outcome.device != rank_mirrored_primary_outcome_.device ||
+            request.outcome.request_count !=
+                rank_mirrored_primary_outcome_.request_count)
+        {
+            return fail(
+                "mirrored LocalTP MTP publication request does not reference the current primary child verifier outcome");
+        }
+
+        /*
+         * Every child produced its own compact outcome from its own mirrored
+         * full-vocab verifier logits.  Feed those handles straight back to their
+         * owners; staging the primary child outcome into every other child would
+         * add an avoidable host upload and erase stream ownership information.
+         */
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            IInferenceRunner *child = device_runners_[i].get();
+            if (!child)
+            {
+                return fail(
+                    "mirrored LocalTP MTP resident publication lost a participant");
+            }
+
+            DeviceSpeculativePublicationRequest child_request = request;
+            child_request.outcome = rank_mirrored_child_outcomes_[i];
+            std::string publish_error;
+            if (!child->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+                    child_request,
+                    &publish_error))
+            {
+                return fail(
+                    "mirrored LocalTP MTP resident publication failed on participant " +
+                    std::to_string(i) +
+                    (publish_error.empty() ? std::string()
+                                           : ": " + publish_error));
+            }
+        }
+
+        rank_resident_child_logical_state_handles_.clear();
+        rank_resident_child_logical_state_handles_.reserve(
+            device_runners_.size());
+        int child_request_count = -1;
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            DeviceResidentLogicalSequenceStateHandle child_handle =
+                device_runners_[i]->deviceResidentLogicalSequenceState();
+            if (!child_handle.valid())
+            {
+                return fail(
+                    "mirrored LocalTP MTP resident publication did not produce a resident logical-state mailbox on participant " +
+                    std::to_string(i));
+            }
+            if (child_request_count < 0)
+                child_request_count = child_handle.request_count;
+            if (child_handle.request_count != child_request_count)
+            {
+                return fail(
+                    "mirrored LocalTP MTP resident publication produced mismatched resident mailbox request counts");
+            }
+            rank_resident_child_logical_state_handles_.push_back(child_handle);
+        }
+        ++rank_resident_logical_state_epoch_;
+        rank_compact_outcome_published_ = true;
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_greedy_device_outcome_publications",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"request_count", std::to_string(request.request_count)},
+             {"max_draft_tokens", std::to_string(request.max_draft_tokens)},
+             {"implementation", "mirrored_child_device_publish"}});
         return true;
     }
 
@@ -7650,11 +7989,10 @@ namespace llaminar2
 
         /*
          * Publication already mutated every child through
-         * publishGroupedDecodeEquivalentMTPSpecStateBatch(), which also
-         * refreshed the rank mirrors.  Keep this hook as an explicit no-op
-         * adoption boundary so OrchestrationRunner can use the same lifecycle
-         * as single-device resident publication without accidentally publishing
-         * the same accepted rows twice.
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  Keep this hook
+         * as an explicit mirror-adoption boundary so OrchestrationRunner can use
+         * the same lifecycle as single-device resident publication without
+         * accidentally publishing the same accepted rows twice.
          */
         rank_last_device_outcome_step_plans_ = plans;
         refreshAggregateSequenceStateFromPrimaryRunnerAfterPublication();
@@ -7668,7 +8006,7 @@ namespace llaminar2
             "decode",
             "rank",
             {{"request_count", std::to_string(plans.request_count)},
-             {"implementation", "already_grouped_published"}});
+             {"implementation", "already_device_resident_published"}});
         return true;
     }
 

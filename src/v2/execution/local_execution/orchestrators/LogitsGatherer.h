@@ -103,8 +103,7 @@ namespace llaminar2
          * @brief Gather already-resolved local logits shards into the combined buffer.
          *
          * This is used for logits surfaces that are not the main LOGITS_LOCAL buffer,
-         * such as MTP sidecar logits. The copy semantics and CPU/GPU fallbacks are
-         * identical to gather().
+         * such as MTP sidecar logits. The copy semantics are identical to gather().
          */
         bool gatherLocalInfos(const std::vector<LogitsLocalInfo> &device_infos,
                               size_t seq_len,
@@ -114,12 +113,14 @@ namespace llaminar2
          * @brief Copy logits from a PP stage runner into the combined buffer.
          *
          * @param stage_runner The stage runner with logits
-         * @param fallback_copy_elements Fallback element count if no prior gather size
+         * @param copy_elements_hint Explicit element count when the caller already
+         *                           knows the PP-stage logits width; 0 means copy
+         *                           one full stage vocabulary row.
          * @param batch_size Batch size for buffer allocation
          * @param max_seq_len Max sequence length for buffer allocation
          */
         void copyFromStage(const IInferenceRunner &stage_runner,
-                           size_t fallback_copy_elements,
+                           size_t copy_elements_hint,
                            int batch_size, int max_seq_len);
 
         // =========================================================================

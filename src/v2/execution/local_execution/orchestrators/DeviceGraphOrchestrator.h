@@ -1953,6 +1953,23 @@ namespace llaminar2
         void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
         bool supportsMTPSpecStatePublication() const override;
         bool supportsDeviceResidentMTPSpecStatePublication() const override;
+        /**
+         * @brief Stage a rank-owned compact LocalTP outcome into this device runner.
+         *
+         * The copied compact rows land in the same persistent arena buffers used
+         * by native device-side greedy/stochastic reducers.  The returned handle
+         * can therefore be passed directly to
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome(), preserving the
+         * single-device resident publication contract for every LocalTP shard.
+         */
+        bool stageMTPSpecOutcomeForDeviceResidentPublication(
+            const int32_t *output_tokens_host,
+            const int *meta_host,
+            int request_count,
+            int output_token_stride,
+            int meta_stride,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            std::string *error = nullptr) override;
         bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
         MTPVerifierRowCapability mtpVerifierRowCapability() const override;
         bool publishAcceptedMTPSpecState(
@@ -2051,6 +2068,7 @@ namespace llaminar2
             int row_count,
             int32_t *out_tokens) override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
+        bool usesMirroredLocalTPMTPHeadForVerifier() const override;
         bool verifyGreedyAllPositionBatchOutcomeOnDevice(
             const int32_t *draft_tokens,
             int draft_token_count,

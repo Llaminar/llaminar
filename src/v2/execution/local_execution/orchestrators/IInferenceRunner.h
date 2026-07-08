@@ -896,6 +896,48 @@ namespace llaminar2
         virtual bool supportsDeviceResidentMTPSpecStatePublication() const { return false; }
 
         /**
+         * @brief Import a rank-wide compact verifier outcome into child device storage.
+         *
+         * LocalTP owns the final accepted-count decision at rank scope because
+         * no single tensor-parallel shard has the full vocabulary.  Once the
+         * rank reducer has produced the compact SamplingMath outcome, each
+         * child runner must publish its local KV/recurrent/terminal state from
+         * a child-owned DeviceSpeculativeOutcomeHandle.  This method is that
+         * handoff: implementations copy or otherwise alias the compact outcome
+         * into persistent runner-owned device buffers on an explicit stream and
+         * return a normal resident handle for
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().
+         *
+         * Implementations must not allocate device memory in the decode hot
+         * path.  GPU runners should use arena/workspace buffers and explicit
+         * stream-ordered copies.  The host pointers describe compact metadata
+         * only; they must not be expanded into MTPSpecStepPlan rows or trigger
+         * serial verifier replay.
+         */
+        virtual bool stageMTPSpecOutcomeForDeviceResidentPublication(
+            const int32_t *output_tokens_host,
+            const int *meta_host,
+            int request_count,
+            int output_token_stride,
+            int meta_stride,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            std::string *error = nullptr)
+        {
+            (void)output_tokens_host;
+            (void)meta_host;
+            (void)request_count;
+            (void)output_token_stride;
+            (void)meta_stride;
+            (void)out_handle;
+            if (error)
+            {
+                *error =
+                    "runner does not support staging rank compact MTP outcomes for device-resident publication";
+            }
+            return false;
+        }
+
+        /**
          * @brief Publish accepted verifier state for a grouped
          *        decode-equivalent outcome.
          *
@@ -1703,6 +1745,18 @@ namespace llaminar2
          * MTP draft and verifier tokens.
          */
         virtual bool supportsMTPTokenCoordination() const { return false; }
+
+        /**
+         * @brief True when LocalTP MTP verifier graphs use a replicated full head.
+         *
+         * This is a topology/configuration fact, not a fallback capability. A
+         * LocalTP rank uses it to choose the economical verifier contract: every
+         * child has full-vocabulary verifier logits, so every child can reduce its
+         * own compact outcome and later publish from that same device-resident
+         * handle. Returning false means the child is exposing sharded verifier
+         * logits and rank-scope candidate coordination is still required.
+         */
+        virtual bool usesMirroredLocalTPMTPHeadForVerifier() const { return false; }
 
         /**
          * @brief Sample the current MTP sidecar logits in greedy mode.
