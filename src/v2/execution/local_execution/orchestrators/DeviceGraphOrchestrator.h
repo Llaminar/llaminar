@@ -3665,8 +3665,11 @@ namespace llaminar2
          * @brief Shared implementation for host-token and device-token batch summaries.
          *
          * `first_token_from_device=false` preserves the legacy host-scalar
-         * summary contract.  `true` reads the first sampled token from
-         * STOCHASTIC_TARGET_SAMPLE_TOKENS inside the backend summary kernel.
+         * summary contract.  `true` reads entry 0 either from
+         * STOCHASTIC_TARGET_SAMPLE_TOKENS or from the prepared verifier-token
+         * matrix that fed the graph replay.  Request-batched GPU MTP uses the
+         * matrix source so summary and verifier observe the exact same
+         * device-resident row zero.
          */
         bool verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
             int first_target_slot,
@@ -3677,6 +3680,8 @@ namespace llaminar2
             int row_count,
             int32_t first_token,
             int first_target_sample_slot,
+            int first_token_row_offset,
+            int first_token_row_stride,
             bool first_token_from_device,
             const int32_t *stop_tokens,
             int stop_token_count,

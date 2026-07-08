@@ -25846,6 +25846,8 @@ namespace llaminar2
                     request.row_count,
                     request.first_token,
                     request.first_target_sample_slot,
+                    request.token_row_offset,
+                    request.token_row_stride,
                     request.first_token_from_device,
                     stop_tokens,
                     request.stop_token_count,
@@ -25911,6 +25913,7 @@ namespace llaminar2
             return false;
         }
 
+        materialized_mtp_verifier_device_token_batch_ = {};
         out_handle->output_tokens_device =
             static_cast<const int32_t *>(stochastic_batch_output_tokens_dev_);
         out_handle->meta_device =
@@ -26201,6 +26204,8 @@ namespace llaminar2
         int row_count,
         int32_t first_token,
         int first_target_sample_slot,
+        int first_token_row_offset,
+        int first_token_row_stride,
         bool first_token_from_device,
         const int32_t *stop_tokens,
         int stop_token_count,
@@ -26253,6 +26258,10 @@ namespace llaminar2
             accept_thresholds = derived_accept_thresholds.data();
             residual_thresholds = derived_residual_thresholds.data();
         }
+        const bool first_token_from_target_sample =
+            first_token_from_device && first_target_sample_slot >= 0;
+        const bool first_token_from_verifier_tokens =
+            first_token_from_device && first_token_row_offset >= 0;
         if (!supportsDeviceStochasticMTPVerification() ||
             first_target_slot < 0 || first_draft_slot < 0 ||
             row_count <= 0 ||
@@ -26263,9 +26272,19 @@ namespace llaminar2
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens) ||
             (first_token_from_device &&
-             (first_target_sample_slot < 0 ||
-              first_target_sample_slot >= kSpeculativeBatchMaxOutputTokens ||
+             (first_token_from_target_sample ==
+              first_token_from_verifier_tokens)) ||
+            (first_token_from_target_sample &&
+             (first_target_sample_slot >= kSpeculativeBatchMaxOutputTokens ||
               !stochastic_target_sample_tokens_dev_)) ||
+            (first_token_from_verifier_tokens &&
+             (!materialized_mtp_verifier_device_token_batch_.valid ||
+              !mtp_verifier_input_tokens_dev_ ||
+              first_token_row_stride !=
+                  materialized_mtp_verifier_device_token_batch_.padded_seq_len ||
+              first_token_row_offset >=
+                  materialized_mtp_verifier_device_token_batch_
+                      .total_token_capacity)) ||
             (has_bonus &&
              bonus_target_slot >= stochastic_target_row_capacity_) ||
             output_request_slot < 0 ||
@@ -26586,16 +26605,25 @@ namespace llaminar2
         const int *first_token_dev = nullptr;
         if (first_token_from_device)
         {
-            first_token_dev =
-                static_cast<const int *>(stochastic_target_sample_tokens_dev_) +
-                first_target_sample_slot;
-            if (!waitForRequiredStochasticTargetSampleReady(
-                    first_target_sample_slot,
-                    stream,
-                    "stochastic_batch_summary_first_token"))
+            if (first_token_from_verifier_tokens)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to order stochastic batch summary after deferred target sample");
-                return false;
+                first_token_dev =
+                    static_cast<const int *>(mtp_verifier_input_tokens_dev_) +
+                    first_token_row_offset;
+            }
+            else
+            {
+                first_token_dev =
+                    static_cast<const int *>(stochastic_target_sample_tokens_dev_) +
+                    first_target_sample_slot;
+                if (!waitForRequiredStochasticTargetSampleReady(
+                        first_target_sample_slot,
+                        stream,
+                        "stochastic_batch_summary_first_token"))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to order stochastic batch summary after deferred target sample");
+                    return false;
+                }
             }
         }
 
@@ -26673,7 +26701,12 @@ namespace llaminar2
                 state_.device_id.toString(),
                 {{"rows", std::to_string(row_count)},
                  {"top_k", std::to_string(target_top_k)},
-                 {"first_token_source", first_token_from_device ? "device" : "host"},
+                 {"first_token_source",
+                  first_token_from_device
+                      ? (first_token_from_verifier_tokens
+                             ? "verifier_token_batch"
+                             : "device")
+                      : "host"},
                  {"has_bonus", has_bonus ? "true" : "false"}});
             summary_enqueued =
                 first_token_from_device
@@ -26716,7 +26749,11 @@ namespace llaminar2
                 1.0,
                 "decode",
                 state_.device_id.toString(),
-                {{"slot", std::to_string(first_target_sample_slot)}});
+                {{"source",
+                  first_token_from_verifier_tokens
+                      ? "verifier_token_batch"
+                      : "target_sample_slot"},
+                 {"slot", std::to_string(first_target_sample_slot)}});
         }
 
         std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
@@ -26828,7 +26865,7 @@ namespace llaminar2
                     static_cast<size_t>(bonus_target_slot)] =
                     StochasticRowFormat::Empty;
             }
-            if (first_token_from_device)
+            if (first_token_from_target_sample)
             {
                 clearStochasticTargetSampleReadySlot(
                     first_target_sample_slot,
@@ -26921,7 +26958,7 @@ namespace llaminar2
                 static_cast<size_t>(bonus_target_slot)] =
                 StochasticRowFormat::Empty;
         }
-        if (first_token_from_device)
+        if (first_token_from_target_sample)
         {
             clearStochasticTargetSampleReadySlot(
                 first_target_sample_slot,

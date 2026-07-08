@@ -65,6 +65,23 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Test-factory resolver that prevents unit tests from touching GPU backends.
+         *
+         * `RankOrchestrator::createForTest()` is used with injected mock runners
+         * and GPU-shaped `DeviceId`s to exercise orchestration policy.  Unit tests
+         * must not page-lock host memory or initialize CUDA/HIP contexts, so rank
+         * gatherers created by that factory resolve no backend and copy from the
+         * mock tensors already owned by the injected runners.
+         */
+        IBackend *resolveNoBackendForInjectedUnitTest(DeviceId)
+        {
+            return nullptr;
+        }
+    } // namespace
+
     namespace rank_orchestrator_detail
     {
         /**
@@ -795,7 +812,8 @@ namespace llaminar2
           tp_ctx_(std::move(tp_ctx)),
           mode_(ParallelismMode::TP), // Test factory currently only supports TP mode
           device_runners_(std::move(device_runners)),
-          config_(config)
+          config_(config),
+          logits_backend_resolver_(resolveNoBackendForInjectedUnitTest)
     {
         // Initialize stage sharding map from model architecture (if registered)
         const auto arch = model_ctx_->architecture();
@@ -815,7 +833,10 @@ namespace llaminar2
             {
                 size_t max_tokens = static_cast<size_t>(config_.batch_size) *
                                     static_cast<size_t>(config_.max_seq_len);
-                logits_gatherer_ = std::make_unique<LogitsGatherer>(vocab, max_tokens);
+                logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                    vocab,
+                    max_tokens,
+                    logits_backend_resolver_);
 
                 if (device_runners_.size() > 1)
                 {
@@ -1322,7 +1343,10 @@ namespace llaminar2
             {
                 size_t max_tokens = static_cast<size_t>(config_.batch_size) *
                                     static_cast<size_t>(config_.max_seq_len);
-                logits_gatherer_ = std::make_unique<LogitsGatherer>(vocab, max_tokens);
+                logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                    vocab,
+                    max_tokens,
+                    logits_backend_resolver_);
 
                 // Pin the logits buffer for faster D2H DMA
                 if (device_runners_.size() > 1)
@@ -2892,7 +2916,10 @@ namespace llaminar2
             {
                 if (!logits_gatherer_)
                 {
-                    logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0);
+                    logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                        0,
+                        0,
+                        logits_backend_resolver_);
                     applyLogitsGatherSkipFlags();
                 }
                 logits_gatherer_->copyFromStage(*pp_stage_runners_[last_stage],
@@ -5287,7 +5314,10 @@ namespace llaminar2
             if (!mtp_logits_gatherer_ ||
                 mtp_logits_gatherer_->bufferNumel() < static_cast<size_t>(full_vocab))
             {
-                mtp_logits_gatherer_ = std::make_unique<LogitsGatherer>(full_vocab, 1);
+                mtp_logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                    full_vocab,
+                    1,
+                    logits_backend_resolver_);
             }
 
             if (!mtp_logits_gatherer_ ||
@@ -9478,7 +9508,10 @@ namespace llaminar2
             if (!all_position_logits_gatherer_ ||
                 all_position_logits_gatherer_->bufferNumel() < required_elements)
             {
-                all_position_logits_gatherer_ = std::make_unique<LogitsGatherer>(full_vocab, rows);
+                all_position_logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                    full_vocab,
+                    rows,
+                    logits_backend_resolver_);
             }
 
             if (!all_position_logits_gatherer_ ||
@@ -10418,7 +10451,10 @@ namespace llaminar2
         {
             if (!logits_gatherer_)
             {
-                logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0);
+                logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                    0,
+                    0,
+                    logits_backend_resolver_);
                 applyLogitsGatherSkipFlags();
             }
             logits_gatherer_->copyFromStage(*pp_stage_runners_.back(),

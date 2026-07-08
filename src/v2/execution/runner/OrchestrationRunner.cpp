@@ -3294,6 +3294,81 @@ namespace llaminar2
                         "stochastic request-batch verifier row metadata is malformed");
                 }
 
+                const int padded_seq_len =
+                    scheduled_batch.shape.max_draft_tokens;
+                const void *device_token_batch = nullptr;
+                if (use_device_resident_request_batch_publication)
+                {
+                    std::vector<DeviceMTPVerifierInputBatchRequest>
+                        token_batch_requests;
+                    token_batch_requests.reserve(
+                        scheduled_batch.greedy_requests.size());
+                    for (size_t i = 0;
+                         i < scheduled_batch.greedy_requests.size();
+                         ++i)
+                    {
+                        const int request_id = scheduled_batch.request_ids[i];
+                        if (request_id < 0 || request_id >= request_batch)
+                        {
+                            return set_producer_error(
+                                "stochastic request-batch verifier returned an out-of-range request id");
+                        }
+
+                        const MTPDecodeCatchupGreedyRequest &request =
+                            scheduled_batch.greedy_requests[i];
+                        const int verifier_token_count =
+                            static_cast<int>(request.draft_tokens.size());
+                        if (verifier_token_count <= 1 ||
+                            verifier_token_count > padded_seq_len)
+                        {
+                            return set_producer_error(
+                                "stochastic request-batch verifier request shape is invalid");
+                        }
+
+                        DeviceMTPVerifierInputBatchRequest descriptor;
+                        descriptor.request_id = request_id;
+                        descriptor.first_token = request.draft_tokens.front();
+                        if (use_request_batch_resident_condition_tokens)
+                        {
+                            descriptor.first_token_from_device = true;
+                            descriptor.first_token_device =
+                                resident_batch_state
+                                    .nextConditionTokenDeviceForRequest(
+                                        request_id);
+                            descriptor.first_target_sample_slot = -1;
+                            if (!descriptor.first_token_device)
+                            {
+                                return set_producer_error(
+                                    "stochastic request-batch verifier has no resident condition-token row for request");
+                            }
+                        }
+                        else
+                        {
+                            descriptor.first_token_from_device = false;
+                            descriptor.first_token_device = nullptr;
+                            descriptor.first_target_sample_slot = -1;
+                        }
+                        descriptor.first_draft_slot =
+                            request_id * draft_depth;
+                        descriptor.draft_token_count =
+                            verifier_token_count - 1;
+                        descriptor.total_verifier_input_tokens =
+                            verifier_token_count;
+                        token_batch_requests.push_back(descriptor);
+                    }
+
+                    device_token_batch =
+                        runner_->prepareMTPVerifierInputTokenBatchOnDevice(
+                            token_batch_requests.data(),
+                            static_cast<int>(token_batch_requests.size()),
+                            padded_seq_len);
+                    if (!device_token_batch)
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch verifier could not prepare device token matrix");
+                    }
+                }
+
                 bool row_indexed_enabled = false;
                 bool all_position_enabled = false;
                 auto cleanup_row_modes = [&]() -> bool
@@ -3347,15 +3422,22 @@ namespace llaminar2
                         runner_->primaryDeviceId().is_gpu());
                     PerfStatsCollector::ScopedTimer verifier_timer(
                         "mtp",
-                        "request_batch_stochastic_verifier_forward",
+                        use_device_resident_request_batch_publication
+                            ? "request_batch_stochastic_verifier_forward_device_tokens"
+                            : "request_batch_stochastic_verifier_forward",
                         "decode",
                         {},
                         {{"requests", std::to_string(scheduled_batch.request_count)},
                          {"draft_depth", std::to_string(draft_depth)}});
+                    MTPVerifierForwardExecutionOptions forward_options;
+                    forward_options.device_token_ids = device_token_batch;
+                    forward_options.allow_batched_host_forward =
+                        !use_device_resident_request_batch_publication;
                     const MTPVerifierForwardExecutionResult forward =
                         executeMTPSpecVerifierForward(
                             *runner_,
-                            verifier_input_plan);
+                            verifier_input_plan,
+                            forward_options);
                     if (!forward.ok)
                     {
                         const bool cleanup_ok = cleanup_row_modes();
@@ -3414,7 +3496,10 @@ namespace llaminar2
 
                     const int first_compact_row =
                         verifier_input_plan.query_start_locs[i];
-                    const int first_draft_slot = next_draft_slot;
+                    const int first_draft_slot =
+                        use_request_batch_device_draft_slots
+                            ? request_id * draft_depth
+                            : next_draft_slot;
                     next_draft_slot += compare_rows;
                     const int bonus_row = compare_rows;
                     if (!runner_->buildStochasticDistributionsOnDevice(
@@ -3449,7 +3534,21 @@ namespace llaminar2
                     descriptor.first_draft_slot = first_draft_slot;
                     descriptor.row_count = compare_rows;
                     descriptor.first_token = request.draft_tokens.front();
-                    descriptor.first_token_from_device = false;
+                    if (use_device_resident_request_batch_publication)
+                    {
+                        descriptor.first_token_from_device = true;
+                        descriptor.first_target_sample_slot = -1;
+                        descriptor.token_row_offset =
+                            static_cast<int>(i) * padded_seq_len;
+                        descriptor.token_row_stride = padded_seq_len;
+                    }
+                    else
+                    {
+                        descriptor.first_token_from_device = false;
+                        descriptor.first_target_sample_slot = -1;
+                        descriptor.token_row_offset = -1;
+                        descriptor.token_row_stride = 0;
+                    }
                     descriptor.bonus_target_slot = first_compact_row + bonus_row;
                     descriptor.use_device_draft_tokens = true;
                     descriptor.use_vllm_probability_rejection = true;

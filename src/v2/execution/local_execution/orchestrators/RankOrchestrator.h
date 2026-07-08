@@ -76,6 +76,7 @@ namespace llaminar2
     // Forward declarations
     class IModelContext;
     class ILocalTPContext;
+    class IBackend;
     class TensorBase;
     class LogitsGatherer;
     class DeviceSampler;
@@ -1425,6 +1426,7 @@ namespace llaminar2
         std::unique_ptr<LogitsGatherer> logits_gatherer_;
         mutable std::unique_ptr<LogitsGatherer> mtp_logits_gatherer_;
         mutable std::unique_ptr<LogitsGatherer> all_position_logits_gatherer_;
+        IBackend *(*logits_backend_resolver_)(DeviceId) = nullptr;
         bool skip_logits_gather_decode_ = false;
         bool skip_logits_gather_prefill_ = false;
 

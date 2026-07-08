@@ -3938,6 +3938,11 @@ Current status:
   The initial post-prefill step remains explicit because no prior resident
   mailbox exists. Focused regression:
   `RequestBatchedGreedyVerifierUsesResidentConditionTokensAfterPublication`.
+- Request-batched stochastic GPU MTP now uses the same resident verifier-token
+  matrix boundary. The verifier forward hard-disables batched host tokens, and
+  the stochastic summary reads row zero from the prepared device matrix so
+  mirrored LocalTP children consume child-local resident rows. Focused
+  regression: `RequestBatchedStochasticContinuationPublishesDeviceOutcomes`.
 - A follow-up code dive confirmed why DGO cannot safely advertise the new
   capability yet: `MTPSpecStatePublisher`, `GDNRecurrenceStage`, and
   `ShortConv1dStage` still restore verifier state from a host integer row, and

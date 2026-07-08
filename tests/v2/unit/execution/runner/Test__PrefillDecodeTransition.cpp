@@ -1909,6 +1909,9 @@ namespace
             last_request_batch_outcome_first_draft_slots_.clear();
             last_request_batch_outcome_bonus_target_slots_.clear();
             last_request_batch_outcome_first_tokens_.clear();
+            last_request_batch_outcome_first_tokens_from_device_.clear();
+            last_request_batch_outcome_token_row_offsets_.clear();
+            last_request_batch_outcome_token_row_strides_.clear();
             last_request_batch_outcome_draft_tokens_.clear();
             last_request_batch_outcome_accept_thresholds_.clear();
             last_request_batch_outcome_residual_thresholds_.clear();
@@ -1954,6 +1957,12 @@ namespace
                     request.first_target_row + request.verifier_token_count - 1);
                 last_request_batch_outcome_first_tokens_.push_back(
                     request.first_token);
+                last_request_batch_outcome_first_tokens_from_device_.push_back(
+                    false);
+                last_request_batch_outcome_token_row_offsets_.push_back(
+                    request.token_row_offset);
+                last_request_batch_outcome_token_row_strides_.push_back(
+                    request.token_row_stride);
 
                 std::array<int32_t, kSpeculativeBatchMaxOutputTokens>
                     verify_tokens = {-1, -1, -1, -1, -1};
@@ -2919,6 +2928,9 @@ namespace
             last_request_batch_outcome_first_draft_slots_.clear();
             last_request_batch_outcome_bonus_target_slots_.clear();
             last_request_batch_outcome_first_tokens_.clear();
+            last_request_batch_outcome_first_tokens_from_device_.clear();
+            last_request_batch_outcome_token_row_offsets_.clear();
+            last_request_batch_outcome_token_row_strides_.clear();
             last_request_batch_outcome_draft_tokens_.clear();
             last_request_batch_outcome_accept_thresholds_.clear();
             last_request_batch_outcome_residual_thresholds_.clear();
@@ -2944,6 +2956,12 @@ namespace
                     request.bonus_target_slot);
                 last_request_batch_outcome_first_tokens_.push_back(
                     request.first_token);
+                last_request_batch_outcome_first_tokens_from_device_.push_back(
+                    request.first_token_from_device);
+                last_request_batch_outcome_token_row_offsets_.push_back(
+                    request.token_row_offset);
+                last_request_batch_outcome_token_row_strides_.push_back(
+                    request.token_row_stride);
                 last_request_batch_outcome_bonus_thresholds_.push_back(
                     request.bonus_threshold);
                 last_request_batch_outcome_inverse_sample_seeds_.push_back(
@@ -3086,6 +3104,9 @@ namespace
             last_request_batch_outcome_first_draft_slots_.clear();
             last_request_batch_outcome_bonus_target_slots_.clear();
             last_request_batch_outcome_first_tokens_.clear();
+            last_request_batch_outcome_first_tokens_from_device_.clear();
+            last_request_batch_outcome_token_row_offsets_.clear();
+            last_request_batch_outcome_token_row_strides_.clear();
             last_request_batch_outcome_draft_tokens_.clear();
             last_request_batch_outcome_accept_thresholds_.clear();
             last_request_batch_outcome_residual_thresholds_.clear();
@@ -3113,6 +3134,12 @@ namespace
                     request.bonus_target_slot);
                 last_request_batch_outcome_first_tokens_.push_back(
                     request.first_token);
+                last_request_batch_outcome_first_tokens_from_device_.push_back(
+                    request.first_token_from_device);
+                last_request_batch_outcome_token_row_offsets_.push_back(
+                    request.token_row_offset);
+                last_request_batch_outcome_token_row_strides_.push_back(
+                    request.token_row_stride);
                 last_request_batch_outcome_bonus_thresholds_.push_back(
                     request.bonus_threshold);
                 last_request_batch_outcome_inverse_sample_seeds_.push_back(
@@ -3199,8 +3226,24 @@ namespace
                                 ? request.draft_tokens[static_cast<size_t>(row)]
                                 : (100 + row);
                     }
-                    const int32_t first_token =
-                        request.first_token_from_device ? 99 : request.first_token;
+                    int32_t first_token = request.first_token;
+                    if (request.first_token_from_device)
+                    {
+                        if (request.token_row_offset >= 0 &&
+                            request.token_row_offset <
+                                static_cast<int>(
+                                    device_verifier_input_tokens_.size()))
+                        {
+                            first_token =
+                                device_verifier_input_tokens_[
+                                    static_cast<size_t>(
+                                        request.token_row_offset)];
+                        }
+                        else
+                        {
+                            first_token = 99;
+                        }
+                    }
                     sampling_math::summarize_speculative_verify_batch(
                         first_token,
                         row_tokens.data(),
@@ -3285,22 +3328,49 @@ namespace
                     bool ok = false;
                     if (request.first_token_from_device)
                     {
-                        ok = verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
-                            request.first_target_slot,
-                            request.first_draft_slot,
-                            draft_tokens,
-                            accept_thresholds,
-                            residual_thresholds,
-                            request.row_count,
-                            request.first_target_sample_slot,
-                            stop_tokens,
-                            request.stop_token_count,
-                            request.bonus_target_slot,
-                            request.bonus_threshold,
-                            &outcomes[static_cast<size_t>(i)],
-                            request.inverse_sample_seed,
-                            request.inverse_sample_first_logical_position,
-                            request.use_vllm_probability_rejection);
+                        if (request.token_row_offset >= 0 &&
+                            request.token_row_offset <
+                                static_cast<int>(
+                                    device_verifier_input_tokens_.size()))
+                        {
+                            ok = verifyStochasticDistributionsBatchOutcomeOnDevice(
+                                request.first_target_slot,
+                                request.first_draft_slot,
+                                draft_tokens,
+                                accept_thresholds,
+                                residual_thresholds,
+                                request.row_count,
+                                device_verifier_input_tokens_[
+                                    static_cast<size_t>(
+                                        request.token_row_offset)],
+                                stop_tokens,
+                                request.stop_token_count,
+                                request.bonus_target_slot,
+                                request.bonus_threshold,
+                                &outcomes[static_cast<size_t>(i)],
+                                request.inverse_sample_seed,
+                                request.inverse_sample_first_logical_position,
+                                request.use_vllm_probability_rejection);
+                        }
+                        else
+                        {
+                            ok = verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+                                request.first_target_slot,
+                                request.first_draft_slot,
+                                draft_tokens,
+                                accept_thresholds,
+                                residual_thresholds,
+                                request.row_count,
+                                request.first_target_sample_slot,
+                                stop_tokens,
+                                request.stop_token_count,
+                                request.bonus_target_slot,
+                                request.bonus_threshold,
+                                &outcomes[static_cast<size_t>(i)],
+                                request.inverse_sample_seed,
+                                request.inverse_sample_first_logical_position,
+                                request.use_vllm_probability_rejection);
+                        }
                     }
                     else
                     {
@@ -3635,6 +3705,18 @@ namespace
         const std::vector<int32_t> &lastRequestBatchOutcomeFirstTokens() const
         {
             return last_request_batch_outcome_first_tokens_;
+        }
+        const std::vector<bool> &lastRequestBatchOutcomeFirstTokensFromDevice() const
+        {
+            return last_request_batch_outcome_first_tokens_from_device_;
+        }
+        const std::vector<int> &lastRequestBatchOutcomeTokenRowOffsets() const
+        {
+            return last_request_batch_outcome_token_row_offsets_;
+        }
+        const std::vector<int> &lastRequestBatchOutcomeTokenRowStrides() const
+        {
+            return last_request_batch_outcome_token_row_strides_;
         }
         const std::vector<std::vector<int32_t>> &lastRequestBatchOutcomeDraftTokens() const
         {
@@ -4865,6 +4947,9 @@ namespace
         std::vector<int> last_request_batch_outcome_first_draft_slots_;
         std::vector<int> last_request_batch_outcome_bonus_target_slots_;
         std::vector<int32_t> last_request_batch_outcome_first_tokens_;
+        std::vector<bool> last_request_batch_outcome_first_tokens_from_device_;
+        std::vector<int> last_request_batch_outcome_token_row_offsets_;
+        std::vector<int> last_request_batch_outcome_token_row_strides_;
         std::vector<std::vector<int32_t>> last_request_batch_outcome_draft_tokens_;
         std::vector<std::vector<float>> last_request_batch_outcome_accept_thresholds_;
         std::vector<std::vector<float>> last_request_batch_outcome_residual_thresholds_;
@@ -5761,6 +5846,12 @@ namespace
         EXPECT_EQ(mock->forwardBatchCallCount(), 2)
             << "Stochastic request batching should amortize one verifier "
                "forward across both requests";
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
+        EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
+                    ElementsAre(false, false));
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
+        EXPECT_EQ(mock->lastForwardDeviceTokenIds(),
+                  mock->deviceVerifierInputTokens().data());
         EXPECT_EQ(mock->stageStochasticDraftTokensCount(), 0)
             << "Request-batched GPU stochastic sidecars should publish every "
                "draft depth directly into request-major device slots.";
@@ -5773,6 +5864,12 @@ namespace
                     ElementsAre(0, 3));
         EXPECT_THAT(mock->lastRequestBatchOutcomeFirstDraftSlots(),
                     ElementsAre(0, 2));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokensFromDevice(),
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowOffsets(),
+                    ElementsAre(0, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowStrides(),
+                    ElementsAre(3, 3));
         EXPECT_THAT(mock->lastRequestBatchOutcomeBonusTargetSlots(),
                     ElementsAre(2, 5));
         EXPECT_THAT(mock->lastBatchOutcomeFirstTargetSlots(),
@@ -5811,6 +5908,19 @@ namespace
 
         GenerationBatchResult fourth = runner->decodeStepBatch(2);
         ASSERT_TRUE(fourth.error.empty()) << fourth.error;
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 2);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 2);
+        EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokensFromDevice(),
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowOffsets(),
+                    ElementsAre(0, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowStrides(),
+                    ElementsAre(3, 3));
+        const auto &verifier_tokens = mock->deviceVerifierInputTokens();
+        EXPECT_EQ(verifier_tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+        EXPECT_EQ(verifier_tokens[3], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
         EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
                     ElementsAre(7, 6))
             << "The next verifier step should schedule from per-request "
@@ -5870,6 +5980,16 @@ namespace
                     ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
+        EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
+        EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
+        EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
+                    ElementsAre(false, false));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokensFromDevice(),
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowOffsets(),
+                    ElementsAre(0, 3));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowStrides(),
+                    ElementsAre(3, 3));
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
             << "The hidden direct publisher must not be used.";
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);

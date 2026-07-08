@@ -356,8 +356,10 @@ namespace llaminar2
         int first_draft_slot = -1;    ///< First sampled draft-token slot.
         int row_count = 0;            ///< Number of speculative rows to compare.
         int32_t first_token = -1;     ///< First main-model token, if host-owned.
-        bool first_token_from_device = false; ///< Read first token from sample slot.
-        int first_target_sample_slot = -1;    ///< Device first-token slot.
+        bool first_token_from_device = false; ///< Read first token from a device-owned source.
+        int first_target_sample_slot = -1;    ///< STOCHASTIC_TARGET_SAMPLE_TOKENS source slot.
+        int token_row_offset = -1;            ///< Prepared verifier-token row entry 0.
+        int token_row_stride = 0;             ///< Prepared verifier-token row stride.
         int bonus_target_slot = -1;           ///< Bonus row slot, or -1.
         float bonus_threshold = 0.0f;         ///< RNG draw for bonus sampling.
         uint64_t inverse_sample_seed = 0;     ///< vLLM rejection inverse RNG seed.
