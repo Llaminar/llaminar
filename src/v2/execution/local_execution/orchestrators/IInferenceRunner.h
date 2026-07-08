@@ -1481,6 +1481,54 @@ namespace llaminar2
         }
 
         /**
+         * @brief Append the first shifted MTP row from checkpoint hidden and resident outcome token zero.
+         *
+         * Grouped GPU publication keeps the compact verifier outcome on device
+         * until accepted live state is published.  When the sidecar cannot prove
+         * that its own row-zero shifted KV append is serial-decode equivalent,
+         * the initial shifted row must be rebuilt from the verifier-base
+         * terminal hidden checkpoint and the compact outcome's first output
+         * token.  Implementations must read that token from
+         * @p outcome.output_tokens_device, ordered by @p outcome.response_ready_event;
+         * they must not materialize the compact outcome on host just to learn
+         * the token or accepted-state count.
+         *
+         * The method may run the fixed one-row sidecar append even when the
+         * compact accepted-state count is zero.  The later device-resident
+         * shifted-KV publication derives the serial target length from the same
+         * compact metadata and discards the speculative row if it was not
+         * accepted.
+         *
+         * @param checkpoint Verifier-base checkpoint containing terminal hidden
+         *        for this runner or participant.
+         * @param outcome Device-resident compact verifier outcome.
+         * @param request_index Logical request row inside @p outcome.
+         * @param main_forward_token_count Verifier hidden-row count to restore
+         *        after the sidecar append; pass the grouped verifier row count.
+         * @param allow_speculative_discard Whether stale speculative shifted rows
+         *        may be truncated before appending row zero.
+         * @param position_offset_override Expected verifier-base cached-token
+         *        count. GPU implementations must reject stale or mismatched
+         *        offsets instead of deriving from host mirrors.
+         */
+        virtual bool commitMTPInitialShiftedRowFromDeviceOutcome(
+            const PrefixStateSnapshot &checkpoint,
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1)
+        {
+            (void)checkpoint;
+            (void)outcome;
+            (void)request_index;
+            (void)main_forward_token_count;
+            (void)allow_speculative_discard;
+            (void)position_offset_override;
+            return false;
+        }
+
+        /**
          * @brief Append one shifted MTP KV row from a device-resident target token.
          *
          * Penalty-free stochastic GPU decode can defer the first main-token host

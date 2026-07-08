@@ -15472,6 +15472,184 @@ namespace llaminar2
             position_offset);
     }
 
+    bool DeviceGraphOrchestrator::commitMTPInitialShiftedRowFromDeviceOutcome(
+        const PrefixStateSnapshot &checkpoint,
+        const DeviceSpeculativeOutcomeHandle &outcome,
+        int request_index,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (!state_.device_id.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires a GPU runner");
+            return false;
+        }
+        if (!supportsMTPDeviceDraftTokenInput())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires device-token sidecar input support");
+            return false;
+        }
+        if (!checkpoint.valid)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires a valid verifier-base checkpoint");
+            return false;
+        }
+        if (!outcome.valid() || outcome.device != state_.device_id ||
+            request_index < 0 || request_index >= outcome.request_count)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit received an invalid or foreign outcome handle");
+            return false;
+        }
+        if (main_forward_token_count <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires verifier hidden rows to restore terminal hidden");
+            return false;
+        }
+
+        const int position_offset =
+            position_offset_override >= 0
+                ? position_offset_override
+                : checkpoint.cached_tokens;
+        if (position_offset != checkpoint.cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit anchor mismatch: checkpoint_cached="
+                      << checkpoint.cached_tokens
+                      << " position_offset=" << position_offset);
+            return false;
+        }
+
+        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
+        if (!cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires an initialized MTP KV cache");
+            return false;
+        }
+
+        void *stream =
+            explicitGPUStreamForOperation("commitMTPInitialShiftedRowFromDeviceOutcome");
+        if (!stream)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires an explicit GPU stream");
+            return false;
+        }
+        if (!waitForPendingShiftedMTPKVReady(
+                stream,
+                "shifted_row_initial_device_outcome_metadata"))
+        {
+            return false;
+        }
+
+        const int expected_cached_tokens =
+            std::max(0, position_offset - 1);
+        int current_cached_tokens =
+            cache->get_cached_tokens(cache->first_layer_index(), 0);
+        if (current_cached_tokens > expected_cached_tokens)
+        {
+            if (!allow_speculative_discard)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit cache has unexpected extra rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " position_offset=" << position_offset);
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit failed to discard speculative rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "speculative_shifted_rows_discarded",
+                static_cast<double>(current_cached_tokens - expected_cached_tokens),
+                perfPhaseName(),
+                state_.device_id.toString());
+            current_cached_tokens = expected_cached_tokens;
+        }
+        if (current_cached_tokens < expected_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit cache mismatch: current="
+                      << current_cached_tokens << " expected=" << expected_cached_tokens
+                      << " position_offset=" << position_offset);
+            return false;
+        }
+
+        if (!importMTPCheckpointTerminalHidden(
+                checkpoint,
+                stream,
+                "commit_mtp_initial_shifted_row_device_outcome_checkpoint_terminal_hidden"))
+        {
+            return false;
+        }
+
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "initial_shifted_row_device_outcome_commit",
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)}});
+        const uint64_t workspace_generation_before_commit =
+            workspaceGeneration(state_.device_id);
+
+        if (!executeMTPDepth0Batched(
+                /*draft_condition_tokens=*/nullptr,
+                /*token_count=*/1,
+                state_.prefix_terminal_hidden.get(),
+                position_offset,
+                kMTPDecodeCatchupContext,
+                /*kv_cache_only=*/true,
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+                /*defer_final_sync=*/true,
+                /*draft_condition_tokens_device=*/nullptr,
+                /*draft_condition_ready_slot=*/-1,
+                /*draft_condition_ready_is_target=*/false,
+                /*request_batch=*/1,
+                /*position_ids_override=*/nullptr,
+                /*position_ids_device_override=*/nullptr,
+                outcome.meta_device,
+                outcome.meta_stride,
+                outcome.output_tokens_device,
+                outcome.output_token_stride,
+                request_index,
+                /*speculative_first_output_token_index=*/0,
+                outcome.response_ready_event.get()))
+        {
+            return false;
+        }
+        if (!refreshMTPTerminalHiddenState(main_forward_token_count, 1))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after device-outcome initial MTP shifted-row commit");
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "initial_shifted_rows_device_outcome_committed",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)},
+             {"checkpoint_cached_tokens", std::to_string(checkpoint.cached_tokens)}});
+
+        const uint64_t workspace_generation_after_commit =
+            workspaceGeneration(state_.device_id);
+        if (workspace_generation_after_commit != workspace_generation_before_commit)
+        {
+            handleLivePrefixReplayStateAfterMutation(
+                LivePrefixMutationReason::Unknown,
+                "mtp_initial_shifted_row_device_outcome_commit_workspace_rebind");
+        }
+        else
+        {
+            recordShiftedMTPKVReplayStateMutation(
+                "mtp_initial_shifted_row_device_outcome_commit");
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(
         int target_sample_slot,
         int already_appended_tokens,

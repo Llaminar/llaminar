@@ -796,6 +796,57 @@ public:
         return true;
     }
 
+    bool commitMTPInitialShiftedRowFromDeviceOutcome(
+        const PrefixStateSnapshot &checkpoint,
+        const DeviceSpeculativeOutcomeHandle &outcome,
+        int request_index,
+        int main_forward_token_count,
+        bool allow_speculative_discard = false,
+        int position_offset_override = -1) override
+    {
+        using namespace sampling_math;
+        ++commit_mtp_initial_device_outcome_calls_;
+        last_commit_mtp_already_appended_ = 0;
+        last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
+        last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
+        last_commit_mtp_position_offset_override_ = position_offset_override;
+        last_commit_mtp_checkpoint_valid_ = checkpoint.valid;
+        last_commit_mtp_checkpoint_logical_ = checkpoint.logical_checkpoint;
+        last_commit_mtp_checkpoint_cached_tokens_ = checkpoint.cached_tokens;
+        last_commit_mtp_checkpoint_provenance_ = checkpoint.provenance;
+        last_commit_mtp_tokens_.clear();
+        if (!checkpoint.valid ||
+            !outcome.valid() ||
+            outcome.device != device_id_ ||
+            request_index < 0 ||
+            request_index >= outcome.request_count ||
+            outcome.meta_stride < kSpeculativeBatchMetaCount ||
+            outcome.output_token_stride < kSpeculativeBatchMaxOutputTokens ||
+            main_forward_token_count <= 0)
+        {
+            return false;
+        }
+        if (position_offset_override >= 0 &&
+            position_offset_override != checkpoint.cached_tokens)
+        {
+            return false;
+        }
+
+        const int *meta =
+            static_cast<const int *>(outcome.meta_device) +
+            static_cast<size_t>(request_index) *
+                static_cast<size_t>(outcome.meta_stride);
+        const int32_t *tokens =
+            static_cast<const int32_t *>(outcome.output_tokens_device) +
+            static_cast<size_t>(request_index) *
+                static_cast<size_t>(outcome.output_token_stride);
+        if (meta[kSpecBatchMetaOk] == 0)
+            return false;
+        const int output_count = meta[kSpecBatchMetaOutputCount];
+        last_commit_mtp_tokens_.assign(1, output_count > 0 ? tokens[0] : 0);
+        return true;
+    }
+
     bool ensureMTPCheckpointTerminalHidden() override
     {
         ++ensure_mtp_checkpoint_terminal_hidden_calls_;
@@ -1927,6 +1978,10 @@ public:
     {
         return commit_mtp_checkpoint_terminal_hidden_calls_;
     }
+    size_t commit_mtp_initial_device_outcome_call_count() const
+    {
+        return commit_mtp_initial_device_outcome_calls_;
+    }
     size_t ensure_mtp_checkpoint_terminal_hidden_call_count() const
     {
         return ensure_mtp_checkpoint_terminal_hidden_calls_;
@@ -2255,6 +2310,7 @@ private:
     size_t sample_on_device_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
     size_t commit_mtp_checkpoint_terminal_hidden_calls_ = 0;
+    size_t commit_mtp_initial_device_outcome_calls_ = 0;
     size_t apply_penalties_on_device_calls_ = 0;
     size_t apply_penalties_to_mtp_logits_calls_ = 0;
     size_t apply_penalties_to_all_position_row_calls_ = 0;
@@ -5521,6 +5577,34 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomePublishesChildResiden
     EXPECT_EQ(materialized.output_tokens[0], 10);
     EXPECT_EQ(materialized.output_tokens[1], 4);
     EXPECT_EQ(materialized.ready_token, 2);
+
+    PrefixStateSnapshot checkpoint;
+    checkpoint.valid = true;
+    checkpoint.cached_tokens = 64;
+    checkpoint.participant_snapshots.resize(2);
+    for (PrefixStateSnapshot &participant : checkpoint.participant_snapshots)
+    {
+        participant.valid = true;
+        participant.cached_tokens = 64;
+        participant.provenance = PrefixStateProvenance::PayloadCheckpoint;
+    }
+    EXPECT_TRUE(orchestrator->commitMTPInitialShiftedRowFromDeviceOutcome(
+        checkpoint,
+        handle,
+        /*request_index=*/0,
+        /*main_forward_token_count=*/2,
+        /*allow_speculative_discard=*/true,
+        /*position_offset_override=*/64));
+    EXPECT_EQ(runner0_ptr->commit_mtp_initial_device_outcome_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->commit_mtp_initial_device_outcome_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->commit_mtp_checkpoint_terminal_hidden_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->commit_mtp_checkpoint_terminal_hidden_call_count(), 0u);
+    EXPECT_THAT(runner0_ptr->last_commit_mtp_tokens(),
+                ::testing::ElementsAre(10));
+    EXPECT_THAT(runner1_ptr->last_commit_mtp_tokens(),
+                ::testing::ElementsAre(10));
+    EXPECT_EQ(runner0_ptr->last_commit_mtp_checkpoint_cached_tokens(), 64);
+    EXPECT_EQ(runner1_ptr->last_commit_mtp_checkpoint_cached_tokens(), 64);
 
     DeviceSpeculativePublicationRequest request;
     request.outcome = handle;

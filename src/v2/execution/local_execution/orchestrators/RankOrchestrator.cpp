@@ -4836,6 +4836,191 @@ namespace llaminar2
         return all_success;
     }
 
+    bool RankOrchestrator::commitMTPInitialShiftedRowFromDeviceOutcome(
+        const PrefixStateSnapshot &checkpoint,
+        const DeviceSpeculativeOutcomeHandle &outcome,
+        int request_index,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "rank_mtp_initial_shifted_device_outcome_commit_total",
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())}});
+        if (!checkpoint.valid || request_index < 0 || main_forward_token_count <= 0)
+            return false;
+
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            const PrefixStateSnapshot *tail_checkpoint = &checkpoint;
+            if (!checkpoint.participant_snapshots.empty())
+                tail_checkpoint = &checkpoint.participant_snapshots.back();
+            return pp_sidecar->commitMTPInitialShiftedRowFromDeviceOutcome(
+                *tail_checkpoint,
+                outcome,
+                request_index,
+                main_forward_token_count,
+                allow_speculative_discard,
+                position_offset_override);
+        }
+        if (device_runners_.empty())
+            return false;
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            const PrefixStateSnapshot *child_checkpoint = &checkpoint;
+            if (!checkpoint.participant_snapshots.empty())
+                child_checkpoint = &checkpoint.participant_snapshots.front();
+            return device_runners_[0]->commitMTPInitialShiftedRowFromDeviceOutcome(
+                *child_checkpoint,
+                outcome,
+                request_index,
+                main_forward_token_count,
+                allow_speculative_discard,
+                position_offset_override);
+        }
+
+        const bool aggregate_checkpoint =
+            !checkpoint.participant_snapshots.empty();
+        const bool shared_logical_checkpoint =
+            !aggregate_checkpoint && checkpoint.logical_checkpoint;
+        if (aggregate_checkpoint &&
+            checkpoint.participant_snapshots.size() != device_runners_.size())
+        {
+            LOG_ERROR("[RankOrchestrator] Device-outcome initial shifted MTP commit checkpoint count mismatch: snapshots="
+                      << checkpoint.participant_snapshots.size()
+                      << " runners=" << device_runners_.size());
+            return false;
+        }
+        auto child_checkpoint = [&](size_t i) -> const PrefixStateSnapshot *
+        {
+            if (aggregate_checkpoint)
+                return &checkpoint.participant_snapshots[i];
+            if (shared_logical_checkpoint)
+                return &checkpoint;
+            return nullptr;
+        };
+
+        const bool mirrored_child_outcome =
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
+        if (!mirrored_child_outcome ||
+            !rank_compact_outcome_valid_ ||
+            !rank_mirrored_child_outcomes_valid_ ||
+            rank_mirrored_child_outcomes_.size() != device_runners_.size() ||
+            !outcome.valid() ||
+            outcome.output_tokens_device !=
+                rank_mirrored_primary_outcome_.output_tokens_device ||
+            outcome.meta_device != rank_mirrored_primary_outcome_.meta_device ||
+            outcome.device != rank_mirrored_primary_outcome_.device ||
+            outcome.request_count != rank_mirrored_primary_outcome_.request_count)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-outcome initial shifted MTP commit requires the primary handle from a mirrored LocalTP resident verifier reduction");
+            return false;
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] device-outcome initial shifted commit failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        tp_worker_pool_->dispatch(
+            [this,
+             &child_checkpoint,
+             request_index,
+             main_forward_token_count,
+             allow_speculative_discard,
+             position_offset_override,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t i) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                if (i >= device_runners_.size() ||
+                    !device_runners_[i])
+                {
+                    return false;
+                }
+                const PrefixStateSnapshot *child = child_checkpoint(i);
+                if (!child)
+                {
+                    LOG_ERROR("[RankOrchestrator] Device-outcome initial shifted MTP commit has no participant checkpoint for child "
+                              << i);
+                    return false;
+                }
+
+                auto device_id = device_runners_[i]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                return device_runners_[i]->commitMTPInitialShiftedRowFromDeviceOutcome(
+                    *child,
+                    rank_mirrored_child_outcomes_[i],
+                    request_index,
+                    main_forward_token_count,
+                    allow_speculative_discard,
+                    position_offset_override);
+            });
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        auto results =
+            tp_worker_pool_->collectAll(effectiveTPWorkerJoinTimeoutMs());
+        for (auto &r : results)
+        {
+            if (!r.completed || !r.success)
+                all_success = false;
+            if (r.exception && !first_exception)
+            {
+                first_exception = r.exception;
+                first_exception_device = r.worker_index;
+                all_success = false;
+            }
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-outcome initial shifted commit rethrowing exception from participant "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+        if (all_success)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_device_outcome_initial_shifted_commits",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"request_index", std::to_string(request_index)}});
+        }
+        return all_success;
+    }
+
     bool RankOrchestrator::flushPendingMTPWork()
     {
         if (!pp_stage_runners_.empty())

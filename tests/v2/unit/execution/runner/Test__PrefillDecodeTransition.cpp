@@ -1112,6 +1112,65 @@ namespace
                 allow_speculative_discard);
         }
 
+        bool commitMTPInitialShiftedRowFromDeviceOutcome(
+            const PrefixStateSnapshot &checkpoint,
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            using namespace sampling_math;
+            ++device_outcome_initial_shifted_commit_count_;
+            if (!checkpoint.valid ||
+                !outcome.valid() ||
+                request_index < 0 ||
+                request_index >= outcome.request_count ||
+                outcome.meta_stride < kSpeculativeBatchMetaCount ||
+                outcome.output_token_stride < kSpeculativeBatchMaxOutputTokens ||
+                main_forward_token_count <= 0)
+            {
+                return false;
+            }
+            if (position_offset_override >= 0 &&
+                position_offset_override !=
+                    static_cast<int>(checkpoint.cached_tokens))
+            {
+                return false;
+            }
+
+            const int *meta =
+                outcome.meta_device +
+                static_cast<size_t>(request_index) *
+                    static_cast<size_t>(outcome.meta_stride);
+            if (meta[kSpecBatchMetaOk] == 0)
+                return false;
+
+            const int32_t *tokens =
+                outcome.output_tokens_device +
+                static_cast<size_t>(request_index) *
+                    static_cast<size_t>(outcome.output_token_stride);
+            const int output_count = meta[kSpecBatchMetaOutputCount];
+            const int32_t token = output_count > 0 ? tokens[0] : 0;
+
+            ++commit_mtp_shifted_count_;
+            last_commit_mtp_already_appended_ = 0;
+            last_commit_mtp_main_forward_token_count_ =
+                main_forward_token_count;
+            last_commit_mtp_allow_speculative_discard_ =
+                allow_speculative_discard;
+            last_commit_mtp_position_offset_override_ =
+                position_offset_override;
+            last_commit_mtp_already_appended_shifted_kv_ = 0;
+            last_commit_mtp_tokens_.assign(1, token);
+            return appendOneShiftedMTPRow(
+                /*already_appended_tokens=*/0,
+                position_offset_override >= 0
+                    ? position_offset_override
+                    : static_cast<int>(checkpoint.cached_tokens),
+                allow_speculative_discard);
+        }
+
         bool commitMTPShiftedRowsFromDeviceOutcome(
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
@@ -3210,6 +3269,10 @@ namespace
         {
             return resident_logical_state_shifted_commit_count_;
         }
+        int deviceOutcomeInitialShiftedCommitCount() const
+        {
+            return device_outcome_initial_shifted_commit_count_;
+        }
         int deviceOutcomeShiftedCommitCount() const
         {
             return device_outcome_shifted_commit_count_;
@@ -4440,6 +4503,7 @@ namespace
         int prepare_mtp_verifier_input_tokens_host_row_count_{0};
         int device_target_shifted_commit_count_{0};
         int resident_logical_state_shifted_commit_count_{0};
+        int device_outcome_initial_shifted_commit_count_{0};
         int device_outcome_shifted_commit_count_{0};
         int forward_mtp_from_resident_logical_state_for_device_sampling_count_{0};
         int resident_sidecar_count_at_last_host_bridge_{-1};
@@ -11221,7 +11285,6 @@ namespace
             child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
             child->enableMTPDeviceDraftTokenInput();
             child->enableMTPSidecarPreservesMainState();
-            child->enableMTPShiftedRowReuseFromSidecar();
             child->enableMirroredLocalTPMTPHeadForVerifier();
             child->setVerifierAcceptedPrefixScript({2});
         }
@@ -11248,8 +11311,12 @@ namespace
         EXPECT_EQ(harness.child1->publishMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(harness.child0->deviceOutcomeInitialShiftedCommitCount(), 1);
+        EXPECT_EQ(harness.child1->deviceOutcomeInitialShiftedCommitCount(), 1);
         EXPECT_EQ(harness.child0->deviceOutcomeShiftedCommitCount(), 1);
         EXPECT_EQ(harness.child1->deviceOutcomeShiftedCommitCount(), 1);
+        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 2);
+        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 2);
         EXPECT_THAT(harness.child0->publicationEvents(),
                     ElementsAre("device_outcome_publish", "host_outcome_bridge"));
         EXPECT_THAT(harness.child1->publicationEvents(),

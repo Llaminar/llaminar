@@ -9691,14 +9691,48 @@ namespace llaminar2
                         !first_token_is_stop;
                     const int max_state_commit_rows =
                         static_cast<int>(draft_tokens.size());
+                    bool first_shifted_row_available_for_publication =
+                        first_shifted_row_available_from_sidecar;
+                    int shifted_row_position_offset =
+                        base_sidecar_position;
                     if (!first_shifted_row_available_from_sidecar &&
                         !first_token_is_stop &&
                         max_state_commit_rows > 0)
                     {
-                        return fail_after_checkpoint(
-                            "Grouped-outcome stochastic LocalTP MTP requires a device-resident initial shifted-row repair when sidecar reuse is unavailable; host checkpoint-token repair is not a production path");
+                        bool initial_shifted_commit_ok = false;
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "grouped_outcome_stochastic_initial_shifted_device_commit",
+                                "decode");
+                            initial_shifted_commit_ok =
+                                runner_->commitMTPInitialShiftedRowFromDeviceOutcome(
+                                    verifier_base_checkpoint,
+                                    outcome_handle,
+                                    /*request_index=*/0,
+                                    /*main_forward_token_count=*/max_state_commit_rows,
+                                    /*allow_speculative_discard=*/true,
+                                    static_cast<int>(
+                                        verifier_base_checkpoint.cached_tokens));
+                        }
+                        if (!initial_shifted_commit_ok)
+                        {
+                            return fail_after_checkpoint(
+                                "Grouped-outcome stochastic MTP device-resident initial shifted-cache commit failed");
+                        }
+                        first_shifted_row_available_for_publication = true;
+                        shifted_row_position_offset =
+                            static_cast<int>(verifier_base_checkpoint.cached_tokens);
+                        shifted_publication_commit_count += 1;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "grouped_outcome_stochastic_initial_shifted_device_commits",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"source", "device_outcome_checkpoint_terminal_hidden"}});
                     }
-                    if (first_shifted_row_available_from_sidecar &&
+                    if (first_shifted_row_available_for_publication &&
                         max_state_commit_rows > 1)
                     {
                         bool shifted_catchup_ok = false;
@@ -9722,7 +9756,7 @@ namespace llaminar2
                                     max_state_commit_rows,
                                     /*main_forward_token_count=*/max_state_commit_rows,
                                     /*allow_speculative_discard=*/true,
-                                    base_sidecar_position,
+                                    shifted_row_position_offset,
                                     /*already_appended_shifted_kv_tokens=*/1);
                         }
                         if (!shifted_catchup_ok)
@@ -10743,14 +10777,48 @@ namespace llaminar2
                         !first_token_is_stop;
                     const int max_state_commit_rows =
                         static_cast<int>(draft_tokens.size());
+                    bool first_shifted_row_available_for_publication =
+                        first_shifted_row_available_from_sidecar;
+                    int shifted_row_position_offset =
+                        base_sidecar_position;
                     if (!first_shifted_row_available_from_sidecar &&
                         !first_token_is_stop &&
                         max_state_commit_rows > 0)
                     {
-                        return fail_after_checkpoint(
-                            "Grouped-outcome greedy LocalTP MTP requires a device-resident initial shifted-row repair when sidecar reuse is unavailable; host checkpoint-token repair is not a production path");
+                        bool initial_shifted_commit_ok = false;
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "grouped_outcome_greedy_initial_shifted_device_commit",
+                                "decode");
+                            initial_shifted_commit_ok =
+                                runner_->commitMTPInitialShiftedRowFromDeviceOutcome(
+                                    verifier_base_checkpoint,
+                                    outcome_handle,
+                                    /*request_index=*/0,
+                                    /*main_forward_token_count=*/max_state_commit_rows,
+                                    /*allow_speculative_discard=*/true,
+                                    static_cast<int>(
+                                        verifier_base_checkpoint.cached_tokens));
+                        }
+                        if (!initial_shifted_commit_ok)
+                        {
+                            return fail_after_checkpoint(
+                                "Grouped-outcome greedy MTP device-resident initial shifted-cache commit failed");
+                        }
+                        first_shifted_row_available_for_publication = true;
+                        shifted_row_position_offset =
+                            static_cast<int>(verifier_base_checkpoint.cached_tokens);
+                        shifted_publication_commit_count += 1;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "grouped_outcome_greedy_initial_shifted_device_commits",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"source", "device_outcome_checkpoint_terminal_hidden"}});
                     }
-                    if (first_shifted_row_available_from_sidecar &&
+                    if (first_shifted_row_available_for_publication &&
                         max_state_commit_rows > 1)
                     {
                         bool shifted_catchup_ok = false;
@@ -10767,7 +10835,7 @@ namespace llaminar2
                                     max_state_commit_rows,
                                     /*main_forward_token_count=*/max_state_commit_rows,
                                     /*allow_speculative_discard=*/true,
-                                    base_sidecar_position,
+                                    shifted_row_position_offset,
                                     /*already_appended_shifted_kv_tokens=*/1);
                         }
                         if (!shifted_catchup_ok)

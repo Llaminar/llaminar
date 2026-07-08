@@ -22,9 +22,9 @@ partials/params use fixed staging plus declared workspace buffers.
 CUDA dense greedy d2/d3 acceptance recovered after verifier-row ownership fix.
 
 2026-07-08 LocalTP GPU MTP uses mirrored full-head child-resident outcomes.
-Shifted suffix catch-up is now prepared from compact device metadata before
-publication; the host outcome bridge is response-only after publication.
-Focused MTP/Rank/runner gates pass; full unit `517/517` passed earlier.
+Initial shifted row and suffix catch-up are now prepared from resident compact
+outcome metadata/tokens before publication; the host bridge is response-only.
+Focused MTP/Rank/runner gates pass; full unit `517/517` passes for this slice.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive

@@ -24,19 +24,18 @@ publication, and initialized MoE runtime decode predicates on both CUDA
 participants. Remaining debt: the lane is too slow and still emits compact
 rebalance missing-source diagnostics under the movement-friendly Dynamic policy.
 
-2026-07-08 update: LocalTP grouped GPU MTP shifted-KV suffix repair no longer
+2026-07-08 update: LocalTP grouped GPU MTP shifted-KV publication no longer
 materializes compact verifier outcomes on the host before publication. CUDA and
 ROCm expose `enqueuePrepareSpeculativeShiftedKVTokens()`, a fixed-shape
 device-resident token-prep kernel that reads compact accepted-count metadata
 and output tokens on the sidecar stream. `DeviceGraphOrchestrator` now commits
-the shifted suffix through `commitMTPShiftedRowsFromDeviceOutcome()`, restoring
-terminal hidden afterward just like the existing partial-forward path. The
-rank runner fans the operation to every mirrored LocalTP child outcome. Greedy
-and stochastic grouped publication now order as device suffix prep, device
-accepted-state publication, then response-only host materialization. If row-zero
-shifted state cannot be reused from the sidecar, the path fails closed; the
-remaining implementation slice is a device-resident initial-row repair, not a
-host checkpoint-token repair. Focused gates passed:
+the initial shifted row from the verifier-base terminal-hidden checkpoint plus
+resident compact output token zero, then commits the shifted suffix through
+`commitMTPShiftedRowsFromDeviceOutcome()`. The rank runner fans both operations
+to every mirrored LocalTP child outcome. Greedy and stochastic grouped
+publication now order as device initial-row prep, device suffix prep, device
+accepted-state publication, then response-only host materialization. Focused
+gates passed:
 `V2_Unit_{PrefixMTPConfig,RankOrchestrator,PrefillDecodeTransition,MTPGraphConstruction}`
 and the MTP unit gate covering `V2_Unit_MTP*`.
 
