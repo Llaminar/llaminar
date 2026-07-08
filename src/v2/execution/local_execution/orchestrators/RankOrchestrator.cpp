@@ -5287,7 +5287,6 @@ namespace llaminar2
             return false;
         *out_handle = DeviceSpeculativeOutcomeHandle{};
         rank_compact_outcome_valid_ = false;
-        rank_compact_outcome_published_ = false;
         rank_compact_outcome_kind_ = RankCompactOutcomeKind::None;
         rank_mirrored_child_outcomes_.clear();
         rank_mirrored_primary_outcome_ = DeviceSpeculativeOutcomeHandle{};
@@ -5302,6 +5301,12 @@ namespace llaminar2
                 stop_tokens,
                 stop_token_count,
                 out_handle);
+        }
+
+        if (primaryDeviceId().is_gpu())
+        {
+            LOG_ERROR("[RankOrchestrator] GPU LocalTP MTP resident greedy verification requires mirrored full-head child verifier outcomes");
+            return false;
         }
 
         std::vector<int32_t> resolved_draft_tokens;
@@ -5471,6 +5476,79 @@ namespace llaminar2
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
                  {"compare_rows", std::to_string(compare_rows)},
+                 {"implementation", "mirrored_child_device_outcomes"}});
+        }
+        return rank_compact_outcome_valid_;
+    }
+
+    bool RankOrchestrator::verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
+        const DeviceStochasticBatchOutcomeRequest *requests,
+        int request_count,
+        DeviceSpeculativeOutcomeHandle *out_handle)
+    {
+        if (!out_handle)
+            return false;
+        *out_handle = DeviceSpeculativeOutcomeHandle{};
+
+        if (!requests ||
+            request_count <= 0 ||
+            device_runners_.size() < 2)
+        {
+            return false;
+        }
+
+        std::vector<DeviceSpeculativeOutcomeHandle> child_outcomes(
+            device_runners_.size());
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            IInferenceRunner *child = device_runners_[i].get();
+            if (!child ||
+                !child->primaryDeviceId().is_gpu() ||
+                !child->usesMirroredLocalTPMTPHeadForVerifier() ||
+                !child->supportsDeviceStochasticMTPVerification() ||
+                !child->supportsDeviceResidentMTPSpecStatePublication())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic MTP requires every child to expose a GPU mirrored-head resident stochastic publisher; participant "
+                          << i << " is not ready");
+                return false;
+            }
+
+            /*
+             * The descriptors are value-owned and already name child-local target
+             * distribution slots, draft-token slots, first-token slots, and RNG
+             * draws.  Forward the exact same descriptor list to every mirrored
+             * child so the compact summaries remain decode-equivalent without a
+             * rank-owned top-k table or host metadata upload.
+             */
+            if (!child->verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+                    requests,
+                    request_count,
+                    &child_outcomes[i]) ||
+                !child_outcomes[i].valid())
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic MTP child "
+                          << i << " failed resident verifier reduction");
+                return false;
+            }
+        }
+
+        rank_mirrored_child_outcomes_ = std::move(child_outcomes);
+        rank_mirrored_primary_outcome_ =
+            rank_mirrored_child_outcomes_.front();
+        *out_handle = rank_mirrored_primary_outcome_;
+        rank_compact_outcome_kind_ = RankCompactOutcomeKind::MirroredStochastic;
+        rank_compact_outcome_valid_ = out_handle->valid();
+        rank_mirrored_child_outcomes_valid_ = rank_compact_outcome_valid_;
+
+        if (rank_compact_outcome_valid_)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_stochastic_resident_outcomes",
+                static_cast<double>(request_count),
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
                  {"implementation", "mirrored_child_device_outcomes"}});
         }
         return rank_compact_outcome_valid_;
@@ -6354,10 +6432,10 @@ namespace llaminar2
         }
 
         /*
-         * Multi-child LocalTP advertises this only when the full compact
-         * lifecycle is available: sharded row argmax reduction in this rank,
-         * compact SamplingMath summary storage, and grouped decode-equivalent
-         * accepted-state publication on every participant.
+         * GPU LocalTP does not advertise the rank-compact reducer as a production
+         * resident verifier.  Every child must own a mirrored full-vocab verifier
+         * head so it can reduce its own compact outcome and publish that exact
+         * device handle later.
          */
         return supportsDeviceResidentMTPSpecStatePublication();
     }
@@ -6371,6 +6449,13 @@ namespace llaminar2
         if (device_runners_.empty())
             return false;
 
+        /*
+         * The rank is only an aggregator here.  Mirroring is a property of the
+         * child graph builders and their verifier heads, so the aggregate answer
+         * is true exactly when every participant reports the mirrored full-vocab
+         * verifier head.  Do not route through any rank-side compact reducer:
+         * resident LocalTP MTP publication feeds each child its own device handle.
+         */
         return std::all_of(
             device_runners_.begin(),
             device_runners_.end(),
@@ -6393,13 +6478,21 @@ namespace llaminar2
         }
 
         /*
-         * In multi-child LocalTP, no child owns a full-vocab distribution.
-         * The rank itself owns stochastic verification by reducing each
-         * child-local top-k candidate set into one compact table and then
-         * publishing the compact outcome through grouped child publication.
+         * Stochastic GPU LocalTP mirrors the full verifier head so each child runs
+         * the native full-vocabulary resident stochastic reducer.  Rank-owned
+         * sharded top-k tables are useful diagnostics, but they are not a
+         * production publication path.
          */
         return device_runners_.size() >= 2 &&
-               supportsDeviceResidentMTPSpecStatePublication();
+               supportsDeviceResidentMTPSpecStatePublication() &&
+               std::all_of(
+                   device_runners_.begin(),
+                   device_runners_.end(),
+                   [](const std::unique_ptr<IInferenceRunner> &runner)
+                   {
+                       return runner &&
+                              runner->supportsDeviceStochasticMTPVerification();
+                   });
     }
 
     bool RankOrchestrator::buildStochasticDistributionOnDevice(
@@ -6429,6 +6522,45 @@ namespace llaminar2
                 slot,
                 params,
                 vocab_size);
+        }
+        if (source == DeviceLogitsSource::AllPosition &&
+            usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            for (size_t i = 0; i < device_runners_.size(); ++i)
+            {
+                IInferenceRunner *child = device_runners_[i].get();
+                if (!child ||
+                    !child->supportsDeviceStochasticMTPVerification() ||
+                    !child->buildStochasticDistributionOnDevice(
+                        source,
+                        row,
+                        buffer,
+                        slot,
+                        params,
+                        vocab_size))
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic target distribution build failed on participant "
+                              << i);
+                    return false;
+                }
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_stochastic_distribution_builds",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"source", "all_position"},
+                 {"rows", "1"},
+                 {"implementation", "mirrored_child_full_vocab"}});
+            return true;
+        }
+        if (primaryDeviceId().is_gpu() &&
+            source == DeviceLogitsSource::AllPosition)
+        {
+            LOG_ERROR("[RankOrchestrator] GPU LocalTP stochastic verifier target distributions require mirrored full-head child reducers");
+            return false;
         }
         return buildRankStochasticDistributionFromLocalTP(
             source,
@@ -6472,6 +6604,46 @@ namespace llaminar2
         }
         if (buffer != DeviceDistributionBuffer::Target)
             return false;
+        if (source == DeviceLogitsSource::AllPosition &&
+            usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            for (size_t i = 0; i < device_runners_.size(); ++i)
+            {
+                IInferenceRunner *child = device_runners_[i].get();
+                if (!child ||
+                    !child->supportsDeviceStochasticMTPVerification() ||
+                    !child->buildStochasticDistributionsOnDevice(
+                        source,
+                        first_row,
+                        buffer,
+                        first_slot,
+                        row_count,
+                        params,
+                        vocab_size))
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic target-row distribution build failed on participant "
+                              << i);
+                    return false;
+                }
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_stochastic_distribution_builds",
+                static_cast<double>(row_count),
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"source", "all_position"},
+                 {"rows", std::to_string(row_count)},
+                 {"implementation", "mirrored_child_full_vocab"}});
+            return true;
+        }
+        if (primaryDeviceId().is_gpu() &&
+            source == DeviceLogitsSource::AllPosition)
+        {
+            LOG_ERROR("[RankOrchestrator] GPU LocalTP stochastic verifier target-row distributions require mirrored full-head child reducers");
+            return false;
+        }
         return buildRankStochasticTargetDistributionsFromLocalTPRows(
             source,
             first_row,
@@ -7159,12 +7331,24 @@ namespace llaminar2
         if (out_handle)
             *out_handle = DeviceSpeculativeOutcomeHandle{};
         rank_compact_outcome_valid_ = false;
-        rank_compact_outcome_published_ = false;
         rank_compact_outcome_kind_ = RankCompactOutcomeKind::None;
         rank_mirrored_child_outcomes_.clear();
         rank_mirrored_primary_outcome_ = DeviceSpeculativeOutcomeHandle{};
         rank_mirrored_child_outcomes_valid_ = false;
         rank_resident_child_logical_state_handles_.clear();
+
+        if (usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            return verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
+                requests,
+                request_count,
+                out_handle);
+        }
+        if (primaryDeviceId().is_gpu())
+        {
+            LOG_ERROR("[RankOrchestrator] GPU LocalTP MTP resident stochastic verification requires mirrored full-head child verifier outcomes");
+            return false;
+        }
 
         if (!requests ||
             request_count != 1 ||
@@ -7536,6 +7720,10 @@ namespace llaminar2
         {
             return false;
         }
+        if (!usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            return false;
+        }
 
         return std::all_of(
             device_runners_.begin(),
@@ -7552,7 +7740,10 @@ namespace llaminar2
         const DeviceSpeculativeOutcomeHandle &handle,
         DeviceSpeculativeVerifyBatchOutcome *outcomes)
     {
-        if (rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy)
+        const bool mirrored_child_outcome =
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
+        if (mirrored_child_outcome)
         {
             if (!outcomes ||
                 !rank_compact_outcome_valid_ ||
@@ -7580,7 +7771,9 @@ namespace llaminar2
 
             PerfStatsCollector::addCounter(
                 "mtp",
-                "rank_mirrored_localtp_greedy_outcome_host_materializations",
+                rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic
+                    ? "rank_mirrored_localtp_stochastic_outcome_host_materializations"
+                    : "rank_mirrored_localtp_greedy_outcome_host_materializations",
                 1.0,
                 "decode",
                 "rank",
@@ -7658,193 +7851,22 @@ namespace llaminar2
         if (!supportsDeviceResidentMTPSpecStatePublication())
         {
             return fail(
-                "rank compact MTP publication requires multi-child LocalTP grouped publication support on every participant");
+                "GPU LocalTP MTP resident publication requires mirrored full-head child verifier outcomes on every participant");
         }
         if (!request.valid())
         {
             return fail(
-                "rank compact MTP publication received an invalid device outcome request");
+                "mirrored LocalTP MTP publication received an invalid device outcome request");
         }
-        if (!rank_compact_outcome_valid_ ||
-            request.outcome.output_tokens_device !=
-                rank_compact_output_tokens_.data() ||
-            request.outcome.meta_device != rank_compact_output_meta_.data() ||
-            request.outcome.request_count != 1)
+        if (rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic)
         {
-            if (rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy)
-            {
-                return publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
-                    request,
-                    error);
-            }
-            return fail(
-                "rank compact MTP publication request does not reference the current rank-owned verifier outcome");
+            return publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
+                request,
+                error);
         }
-        if (rank_compact_last_draft_tokens_.empty() ||
-            static_cast<int>(rank_compact_last_draft_tokens_.size()) !=
-                request.max_draft_tokens)
-        {
-            return fail(
-                "rank compact MTP publication has no matching draft-token shape for the compact outcome");
-        }
-
-        DeviceSpeculativeVerifyBatchOutcome device_outcome;
-        if (!copyDeviceSpeculativeOutcomesToHost(request.outcome, &device_outcome))
-        {
-            return fail(
-                "rank compact MTP publication could not decode compact verifier metadata");
-        }
-
-        MTPDecodeCatchupGreedyRequest catchup_request;
-        catchup_request.draft_tokens = rank_compact_last_draft_tokens_;
-        catchup_request.stop_tokens = rank_compact_last_stop_tokens_;
-        catchup_request.base_sidecar_position = request.base_sidecar_position;
-        catchup_request.allow_speculative_discard = true;
-        catchup_request.verifier_path =
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::Stochastic
-                ? "rank_grouped_decode_equivalent_stochastic"
-                : "rank_grouped_decode_equivalent_greedy";
-        catchup_request.implementation_name =
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::Stochastic
-                ? "rank_compact_cross_shard_stochastic_grouped_publication"
-                : "rank_compact_cross_shard_argmax_grouped_publication";
-
-        MTPSpecDecodeMetadataShape metadata_shape;
-        metadata_shape.max_requests = request.request_count;
-        metadata_shape.max_draft_tokens = request.max_draft_tokens;
-
-        const std::vector<int> request_ids{0};
-        const std::vector<MTPDecodeCatchupGreedyRequest> requests{
-            catchup_request};
-        const std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes{
-            device_outcome};
-        const std::vector<int32_t> base_cached_tokens{
-            !request.base_cached_tokens.empty()
-                ? request.base_cached_tokens.front()
-                : static_cast<int32_t>(request.base_sidecar_position)};
-
-        MTPSpecTransactionBatchPlan transaction_plan =
-            buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
-                metadata_shape,
-                request_ids,
-                vocab_size(),
-                requests,
-                device_outcomes,
-                base_cached_tokens);
-        if (!transaction_plan.ok)
-        {
-            return fail(
-                std::string("rank compact MTP transaction planning failed: ") +
-                transaction_plan.error);
-        }
-        if (transaction_plan.requiresDecodeEquivalentReplayPublication())
-        {
-            return fail(
-                "rank compact MTP transaction unexpectedly requested decode-equivalent replay publication");
-        }
-
-        for (MTPSpecStepPlan &step : transaction_plan.step_plans.steps)
-        {
-            step.publish_mtp_shifted_kv = request.publish_mtp_shifted_kv;
-        }
-
-        /*
-         * The compact rank outcome is the only accepted-count source for
-         * LocalTP.  Each child stages that same compact SamplingMath row into
-         * its own arena-backed resident buffers, then runs the native
-         * single-device resident publisher.  This keeps KV, recurrent state,
-         * short-conv state, terminal hidden, and resident logical-state
-         * mailboxes owned by the child GPU path; the transaction plan above is
-         * retained only for response bookkeeping and host mirror adoption.
-         */
-        for (size_t i = 0; i < device_runners_.size(); ++i)
-        {
-            IInferenceRunner *child = device_runners_[i].get();
-            if (!child)
-            {
-                return fail(
-                    "rank compact MTP resident publication lost a LocalTP participant while staging compact outcome");
-            }
-
-            DeviceSpeculativeOutcomeHandle child_outcome;
-            std::string stage_error;
-            if (!child->stageMTPSpecOutcomeForDeviceResidentPublication(
-                    rank_compact_output_tokens_.data(),
-                    rank_compact_output_meta_.data(),
-                    request.outcome.request_count,
-                    request.outcome.output_token_stride,
-                    request.outcome.meta_stride,
-                    &child_outcome,
-                    &stage_error))
-            {
-                return fail(
-                    "rank compact MTP resident publication could not stage compact outcome on participant " +
-                    std::to_string(i) +
-                    (stage_error.empty() ? std::string()
-                                         : ": " + stage_error));
-            }
-
-            DeviceSpeculativePublicationRequest child_request = request;
-            child_request.outcome = child_outcome;
-            std::string publish_error;
-            if (!child->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
-                    child_request,
-                    &publish_error))
-            {
-                return fail(
-                    "rank compact MTP resident publication failed on participant " +
-                    std::to_string(i) +
-                    (publish_error.empty() ? std::string()
-                                           : ": " + publish_error));
-            }
-        }
-
-        rank_resident_child_logical_state_handles_.clear();
-        rank_resident_child_logical_state_handles_.reserve(
-            device_runners_.size());
-        int child_request_count = -1;
-        for (size_t i = 0; i < device_runners_.size(); ++i)
-        {
-            if (!device_runners_[i])
-            {
-                return fail(
-                    "rank compact MTP grouped publication lost a LocalTP participant while aggregating resident mailboxes");
-            }
-            DeviceResidentLogicalSequenceStateHandle child_handle =
-                device_runners_[i]->deviceResidentLogicalSequenceState();
-            if (!child_handle.valid())
-            {
-                return fail(
-                    "rank compact MTP grouped publication did not produce a resident logical-state mailbox on participant " +
-                    std::to_string(i));
-            }
-            if (child_request_count < 0)
-                child_request_count = child_handle.request_count;
-            if (child_handle.request_count != child_request_count)
-            {
-                return fail(
-                    "rank compact MTP grouped publication produced mismatched resident mailbox request counts");
-            }
-            rank_resident_child_logical_state_handles_.push_back(child_handle);
-        }
-        ++rank_resident_logical_state_epoch_;
-
-        rank_last_device_outcome_step_plans_ = transaction_plan.step_plans;
-        rank_compact_outcome_published_ = true;
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            rank_compact_outcome_kind_ == RankCompactOutcomeKind::Stochastic
-                ? "rank_compact_stochastic_device_outcome_publications"
-                : "rank_compact_greedy_device_outcome_publications",
-            1.0,
-            "decode",
-            "rank",
-            {{"participants", std::to_string(device_runners_.size())},
-             {"request_count", std::to_string(request.request_count)},
-             {"max_draft_tokens", std::to_string(request.max_draft_tokens)},
-             {"implementation", "device_resident_child_publish"}});
-        return true;
+        return fail(
+            "GPU LocalTP MTP publication refuses rank-owned compact metadata; run mirrored child verifier reduction first");
     }
 
     bool RankOrchestrator::publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
@@ -7859,7 +7881,10 @@ namespace llaminar2
             return false;
         };
 
-        if (rank_compact_outcome_kind_ != RankCompactOutcomeKind::MirroredGreedy ||
+        const bool mirrored_child_outcome =
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredGreedy ||
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic;
+        if (!mirrored_child_outcome ||
             !rank_compact_outcome_valid_ ||
             !rank_mirrored_child_outcomes_valid_ ||
             rank_mirrored_child_outcomes_.size() != device_runners_.size())
@@ -7934,11 +7959,12 @@ namespace llaminar2
             rank_resident_child_logical_state_handles_.push_back(child_handle);
         }
         ++rank_resident_logical_state_epoch_;
-        rank_compact_outcome_published_ = true;
 
         PerfStatsCollector::addCounter(
             "mtp",
-            "rank_mirrored_localtp_greedy_device_outcome_publications",
+            rank_compact_outcome_kind_ == RankCompactOutcomeKind::MirroredStochastic
+                ? "rank_mirrored_localtp_stochastic_device_outcome_publications"
+                : "rank_mirrored_localtp_greedy_device_outcome_publications",
             1.0,
             "decode",
             "rank",
@@ -8025,11 +8051,6 @@ namespace llaminar2
                          ? std::string("missing clamped stage plans")
                          : common_plan.error));
             }
-            if (common_plan.requires_common_fallback_replay)
-            {
-                return fail("PP MTP spec-state publication cannot publish divergent stages directly");
-            }
-
             bool all_success = true;
             std::vector<std::string> child_errors(pp_stage_runners_.size());
             for (size_t i = 0; i < pp_stage_runners_.size(); ++i)
@@ -8111,11 +8132,6 @@ namespace llaminar2
                 (common_plan.ok ? std::string("missing clamped participant plans")
                                 : common_plan.error));
         }
-        if (common_plan.requires_common_fallback_replay)
-        {
-            return fail("MTP spec-state publication cannot publish divergent rank participants directly");
-        }
-
         for (size_t i = 0; i < device_runners_.size(); ++i)
         {
             if (!device_runners_[i])
@@ -8378,11 +8394,6 @@ namespace llaminar2
                              ? std::string("missing clamped participant plans")
                              : common_plan.error));
                 }
-                if (common_plan.requires_common_fallback_replay)
-                {
-                    return fail("MTP spec-state batch publication cannot publish divergent participants directly");
-                }
-
                 for (size_t participant = 0; participant < count; ++participant)
                 {
                     MTPSpecStepPlan clamped_step =

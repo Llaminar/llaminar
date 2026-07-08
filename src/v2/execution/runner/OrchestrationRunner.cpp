@@ -2662,20 +2662,6 @@ namespace llaminar2
         auto publish = [&](const MTPSpecTransactionBatchPlan &plan,
                            std::string *error) -> bool
         {
-            if (plan.requiresDecodeEquivalentReplayPublication())
-            {
-                if (error)
-                {
-                    *error =
-                        "request-batched MTP direct publication received a replay-required transaction plan";
-                    if (!plan.publication_contract_reason.empty())
-                    {
-                        *error += ": ";
-                        *error += plan.publication_contract_reason;
-                    }
-                }
-                return false;
-            }
             return runner_->publishAcceptedMTPSpecStateBatch(
                 plan.step_plans,
                 error);
@@ -3506,25 +3492,24 @@ namespace llaminar2
         {
             /*
              * Global/MPI TP still needs an inter-rank stochastic reducer before
-             * it can be decode-equivalent without row replay.  LocalTP is
-             * different: RankOrchestrator can own the compact stochastic
-             * outcome for all device-local vocab shards, then publish the same
-             * accepted-state transaction through every child runner.  Keep the
-             * gate capability-driven so unsupported distributed shapes fail
-             * before entering the transaction, while CUDA/ROCm LocalTP follows
-             * the real grouped production path once the rank advertises it.
+             * it can be decode-equivalent without row replay.  LocalTP GPU MTP
+             * uses the mirrored verifier head instead: each child owns a
+             * full-vocab stochastic summary and later publishes that same resident
+             * handle.  Rank-owned compact stochastic metadata is intentionally not
+             * a production substitute for this path.
              */
             const bool global_or_mpi_tp =
                 plan_.usesGlobalTP() ||
                 (mpi_ctx_ && mpi_ctx_->world_size() > 1);
-            const bool local_tp_without_rank_compact_stochastic =
+            const bool local_tp_without_mirrored_stochastic =
                 plan_.usesLocalTP() &&
                 (!runner_->primaryDeviceId().is_gpu() ||
+                 !runner_->usesMirroredLocalTPMTPHeadForVerifier() ||
                  !runner_->supportsDeviceStochasticMTPVerification() ||
                  !runner_->supportsDeviceResidentMTPSpecStatePublication());
-            if (global_or_mpi_tp || local_tp_without_rank_compact_stochastic)
+            if (global_or_mpi_tp || local_tp_without_mirrored_stochastic)
             {
-                return "MTP speculative sampling verification requires a full-logit owner or a rank-owned LocalTP compact stochastic reducer";
+                return "MTP speculative sampling verification requires a full-logit owner or mirrored LocalTP child-resident verifier outcomes";
             }
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
@@ -8736,12 +8721,6 @@ namespace llaminar2
             std::string publication_error;
             if (!state_published_from_device_outcome)
             {
-                if (transaction_plan.requiresDecodeEquivalentReplayPublication())
-                {
-                    return fail_after_checkpoint(
-                        std::string("MTP grouped verifier publication received a replay-required transaction plan: ") +
-                        transaction_plan.publication_contract_reason);
-                }
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
                     use_grouped_outcome_host_publication_verifier
@@ -9543,7 +9522,8 @@ namespace llaminar2
                      * history, the first emitted token, then only earlier draft
                      * rows.  Applying those sparse maps directly to the compact
                      * all-position rows lets the grouped outcome reducer remain
-                     * decode-equivalent while publication is still replayed.
+                     * decode-equivalent while the accepted-state publication stays
+                     * on the resident compact-outcome path.
                      */
                     Sampler row_penalty_sampler = sampler_;
                     row_penalty_sampler.record_token(first_token);
@@ -10032,12 +10012,6 @@ namespace llaminar2
                     return fail_after_checkpoint(
                         std::string("Grouped-outcome MTP verifier transaction plan failed: ") +
                         transaction_plan.error);
-                }
-                if (transaction_plan.requiresDecodeEquivalentReplayPublication())
-                {
-                    return fail_after_checkpoint(
-                        std::string("Grouped-outcome MTP direct publication received a replay-required transaction plan: ") +
-                        transaction_plan.publication_contract_reason);
                 }
                 MTPSpecStepPlanBatch &step_plans =
                     transaction_plan.step_plans;
@@ -11156,13 +11130,6 @@ namespace llaminar2
                         std::string("Grouped-outcome greedy MTP verifier transaction plan failed: ") +
                         transaction_plan.error);
                 }
-                if (transaction_plan.requiresDecodeEquivalentReplayPublication())
-                {
-                    return fail_after_checkpoint(
-                        std::string("Grouped-outcome greedy MTP direct publication received a replay-required transaction plan: ") +
-                        transaction_plan.publication_contract_reason);
-                }
-
                 MTPSpecStepPlanBatch &step_plans =
                     transaction_plan.step_plans;
                 if (step_plans.steps.size() != 1)

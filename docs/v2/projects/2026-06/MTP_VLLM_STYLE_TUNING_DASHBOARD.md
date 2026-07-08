@@ -21,10 +21,10 @@ partials/params use fixed staging plus declared workspace buffers.
 
 CUDA dense greedy d2/d3 acceptance recovered after verifier-row ownership fix.
 
-2026-07-07 LocalTP CUDA/ROCm prefix+MTP correctness is green: Qwen3.6 LocalTP
-parity `13/13`, full unit suite `517/517`. Fixes covered sidecar graph-capture
-boundary fencing, rank greedy compact sampling/publication, and logical
-verifier-base shifted-row fanout to every TP participant.
+2026-07-08 LocalTP GPU MTP now requires mirrored full-head child-resident
+outcomes for greedy/stochastic publication. Rank compact outcome staging was
+retired from the GPU production path; focused MTP/Rank/runner gates and full
+unit suite `517/517` pass. Prior Qwen3.6 LocalTP parity was `13/13`.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
@@ -37,8 +37,8 @@ combined routed+shared without strict L2/KLD/cosine/max_abs/token proof.
 | SingleDevice | CPU d1 | R | R | A | A | CPU refresh paused |
 | SingleDevice | CUDA d1 | G | G | R | R | Dense green; MoE below baseline |
 | SingleDevice | ROCm d1 | A | A | A | A | MoE nearly break-even |
-| LocalTP | CUDA deg2 | A | A | R | R | Dense correctness green; perf/tuning pending |
-| LocalTP | ROCm deg2 | A | A | R | R | Dense correctness green after topology swap |
+| LocalTP | CUDA deg2 | A | A | R | R | Mirrored resident outcome gate green; perf pending |
+| LocalTP | ROCm deg2 | A | A | R | R | Mirrored resident outcome gate green; perf pending |
 | LocalTP | ROCm deg4 | A | R | R | R | Preset/bench refresh pending |
 | LocalPP | CUDA stages | A | R | R | R | Correctness/bench refresh pending |
 | LocalPP | ROCm stages | R | R | R | R | Prior dense run speed-negative |
@@ -88,12 +88,11 @@ build time on both CUDA and ROCm.
 - CUDA2 ExpertOverlay Dynamic long-context prefix+MTP passed with explicit
   sidecar graph invalidation.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
-- LocalTP grouped path: rank-owned compact greedy sampling reduces child
-  `LogitsLocalInfo`, grouped child publishers mutate accepted state without row
-  replay, resident mailboxes prelaunch the next step, and logical checkpoint
-  shifted-row repair fans out to every TP participant. Focused gates:
+- LocalTP GPU grouped path: mirrored children reduce and publish their own
+  resident verifier outcomes; rank compact metadata is diagnostic/non-GPU only.
+  No row replay or host outcome staging is accepted. Focused gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`,
-  `V2_Unit_GpuWorkspaceAllocationPolicy`, Qwen3.6 LocalTP parity `13/13`.
+  MTP units, full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,
   CPU MTP thinking `27/27`, dense Qwen3.6 E2E `261/261`.
 - Model-load/MTP lifecycle guards pass: `V2_Unit_NodeLeaderPageCache` and

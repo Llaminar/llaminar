@@ -89,7 +89,9 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_EQ(config.mtp.draft_tokens, 1);
     EXPECT_EQ(config.mtp.max_request_batch, 1);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
-    EXPECT_FALSE(config.mtp.mirror_full_head_for_local_tp);
+    EXPECT_TRUE(config.mtp.mirror_full_head_for_local_tp)
+        << "LocalTP MTP defaults to mirrored verifier heads; disabled MTP "
+           "configurations simply never activate the flag.";
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);

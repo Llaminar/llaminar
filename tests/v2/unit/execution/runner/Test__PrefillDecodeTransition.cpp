@@ -1643,79 +1643,6 @@ namespace
             return out_handle->valid();
         }
 
-        bool stageMTPSpecOutcomeForDeviceResidentPublication(
-            const int32_t *output_tokens_host,
-            const int *meta_host,
-            int request_count,
-            int output_token_stride,
-            int meta_stride,
-            DeviceSpeculativeOutcomeHandle *out_handle,
-            std::string *error = nullptr) override
-        {
-            using namespace sampling_math;
-            ++stage_device_resident_mtp_spec_outcome_count_;
-            if (out_handle)
-                *out_handle = DeviceSpeculativeOutcomeHandle{};
-            if (!supports_device_resident_mtp_spec_state_publication_)
-            {
-                if (error)
-                    *error = "mock resident compact outcome staging is disabled";
-                return false;
-            }
-            if (!output_tokens_host || !meta_host || !out_handle ||
-                request_count <= 0 ||
-                request_count > kMockResidentOutcomeRequestCapacity ||
-                output_token_stride < kSpeculativeBatchMaxOutputTokens ||
-                meta_stride < kSpeculativeBatchMetaCount)
-            {
-                if (error)
-                    *error = "mock resident compact outcome staging received invalid input";
-                return false;
-            }
-
-            resident_output_tokens_.fill(-1);
-            resident_meta_.fill(0);
-            for (int request_index = 0;
-                 request_index < request_count;
-                 ++request_index)
-            {
-                const size_t src_token_base =
-                    static_cast<size_t>(request_index) *
-                    static_cast<size_t>(output_token_stride);
-                const size_t dst_token_base =
-                    static_cast<size_t>(request_index) *
-                    static_cast<size_t>(kSpeculativeBatchMaxOutputTokens);
-                const size_t src_meta_base =
-                    static_cast<size_t>(request_index) *
-                    static_cast<size_t>(meta_stride);
-                const size_t dst_meta_base =
-                    static_cast<size_t>(request_index) *
-                    static_cast<size_t>(kSpeculativeBatchMetaCount);
-                std::copy_n(
-                    output_tokens_host + src_token_base,
-                    kSpeculativeBatchMaxOutputTokens,
-                    resident_output_tokens_.data() + dst_token_base);
-                std::copy_n(
-                    meta_host + src_meta_base,
-                    kSpeculativeBatchMetaCount,
-                    resident_meta_.data() + dst_meta_base);
-            }
-
-            out_handle->output_tokens_device = resident_output_tokens_.data();
-            out_handle->meta_device = resident_meta_.data();
-            out_handle->request_count = request_count;
-            out_handle->output_token_stride =
-                kSpeculativeBatchMaxOutputTokens;
-            out_handle->meta_stride = kSpeculativeBatchMetaCount;
-            out_handle->device = primary_device_;
-            out_handle->stream = &resident_stream_token_;
-            out_handle->response_ready_event =
-                std::shared_ptr<void>(
-                    &resident_outcome_response_ready_event_token_,
-                    [](void *) {});
-            return out_handle->valid();
-        }
-
         int vocab_size() const override { return VOCAB_SIZE; }
 
         void clear_cache() override
@@ -3806,10 +3733,6 @@ namespace
         {
             return publish_device_resident_mtp_spec_state_count_;
         }
-        int stageDeviceResidentMTPSpecOutcomeCount() const
-        {
-            return stage_device_resident_mtp_spec_outcome_count_;
-        }
         const MTPSpecStepPlan &lastPublishedMTPSpecStep() const
         {
             return last_published_mtp_spec_step_;
@@ -4570,7 +4493,6 @@ namespace
         int publish_mtp_spec_state_batch_count_{0};
         int publish_grouped_decode_equivalent_mtp_spec_state_batch_count_{0};
         int publish_device_resident_mtp_spec_state_count_{0};
-        int stage_device_resident_mtp_spec_outcome_count_{0};
         int position_{0};
         int batch_capacity_{1};
         int padded_seq_len_{0};
@@ -11055,8 +10977,6 @@ namespace
         EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 1);
         EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
         EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
-        EXPECT_EQ(harness.child0->stageDeviceResidentMTPSpecOutcomeCount(), 0);
-        EXPECT_EQ(harness.child1->stageDeviceResidentMTPSpecOutcomeCount(), 0);
         EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
@@ -11121,8 +11041,6 @@ namespace
             EXPECT_EQ(harness.child1->publishMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
             EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
-            EXPECT_EQ(harness.child0->stageDeviceResidentMTPSpecOutcomeCount(), 0);
-            EXPECT_EQ(harness.child1->stageDeviceResidentMTPSpecOutcomeCount(), 0);
             EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
             EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
             EXPECT_THAT(harness.child0->publicationEvents(),
@@ -11214,8 +11132,6 @@ namespace
             << "Mirrored LocalTP owns compact greedy outcomes per child.";
         EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 1);
         EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 1);
-        EXPECT_EQ(harness.child0->stageDeviceResidentMTPSpecOutcomeCount(), 0);
-        EXPECT_EQ(harness.child1->stageDeviceResidentMTPSpecOutcomeCount(), 0);
         EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);

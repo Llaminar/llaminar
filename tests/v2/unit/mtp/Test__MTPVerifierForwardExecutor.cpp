@@ -815,7 +815,7 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishCommit
     EXPECT_EQ(owner.pendingCount(), 0u);
 }
 
-TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledGreedyTransactionRejectsReplayPublicationPlan)
+TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledGreedyTransactionPublishesGroupedPlanDirectly)
 {
     RecordingInferenceRunner runner;
     runner.scripted_verifier_samples = {9, 8, 4};
@@ -836,34 +836,39 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledGreedyTransactionRejectsRep
             MTPSpecRequestBatchMode::GREEDY});
 
     bool publisher_called = false;
+    int published_request_id = -1;
+    int published_accepted_count = -1;
     MTPOwnedGreedyVerifierBatchTransactionResult result =
         executeOwnedMTPGreedyVerifierScheduledBatchTransactionAndPublish(
             runner,
             owner,
             scheduler,
-            [&](const MTPSpecTransactionBatchPlan &,
+            [&](const MTPSpecTransactionBatchPlan &plan,
                 std::string *) -> bool
             {
                 publisher_called = true;
+                if (plan.step_plans.steps.size() == 1u)
+                {
+                    const MTPSpecStepPlan &step =
+                        plan.step_plans.steps.front();
+                    published_request_id = step.request_id;
+                    published_accepted_count = step.accepted_count;
+                }
                 return true;
-            },
-            {},
-            MTPSpecTransactionPublicationContract::
-                DecodeEquivalentReplayPublicationRequired);
+            });
 
-    EXPECT_FALSE(result.ok);
-    EXPECT_FALSE(result.published);
-    EXPECT_FALSE(result.committed);
-    EXPECT_TRUE(result.released);
-    EXPECT_FALSE(publisher_called)
-        << "Replay-required greedy grouped outcomes must not reach direct publication.";
+    EXPECT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.published);
+    EXPECT_TRUE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_TRUE(publisher_called);
     EXPECT_FALSE(owner.hasInFlightBatch());
-    EXPECT_EQ(owner.pendingCount(), 1u);
-    EXPECT_THAT(result.error, testing::HasSubstr("requires decode-equivalent replay publication"));
-    EXPECT_THAT(result.error, testing::HasSubstr("grouped_greedy_outcome"));
+    EXPECT_EQ(owner.pendingCount(), 0u);
     ASSERT_TRUE(result.transaction.ok) << result.transaction.error;
-    EXPECT_TRUE(result.transaction.transaction_plan
-                    .requiresDecodeEquivalentReplayPublication());
+    ASSERT_THAT(result.transaction.transaction_plan.step_plans.steps,
+                testing::SizeIs(1));
+    EXPECT_EQ(published_request_id, 32);
+    EXPECT_EQ(published_accepted_count, 3);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, OwnedScheduledTransactionAndPublishReleasesOnPublicationFailure)
@@ -1024,7 +1029,7 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionPublishesBef
     EXPECT_EQ(owner.pendingCount(), 0u);
 }
 
-TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionRejectsReplayPublicationPlan)
+TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionPublishesGroupedPlanDirectly)
 {
     MTPSpecRequestBatchOwner owner;
     MTPSpecSchedulableRequest request;
@@ -1044,6 +1049,8 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionRejectsRepla
 
     bool producer_called = false;
     bool publisher_called = false;
+    int published_request_id = -1;
+    int published_accepted_count = -1;
     MTPOwnedDeviceOutcomeBatchTransactionResult result =
         executeOwnedMTPDeviceOutcomeScheduledBatchTransactionAndPublish(
             owner,
@@ -1058,28 +1065,32 @@ TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionRejectsRepla
                 *outcomes = {makeDeviceAcceptAllOutcome()};
                 return true;
             },
-            [&](const MTPSpecTransactionBatchPlan &,
+            [&](const MTPSpecTransactionBatchPlan &plan,
                 std::string *) -> bool
             {
                 publisher_called = true;
+                if (plan.step_plans.steps.size() == 1u)
+                {
+                    const MTPSpecStepPlan &step =
+                        plan.step_plans.steps.front();
+                    published_request_id = step.request_id;
+                    published_accepted_count = step.accepted_count;
+                }
                 return true;
-            },
-            MTPSpecTransactionPublicationContract::
-                DecodeEquivalentReplayPublicationRequired);
+            });
 
-    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(result.ok) << result.error;
     EXPECT_TRUE(producer_called);
     EXPECT_TRUE(result.produced);
-    EXPECT_FALSE(result.published);
-    EXPECT_FALSE(result.committed);
-    EXPECT_TRUE(result.released);
-    EXPECT_FALSE(publisher_called)
-        << "Replay-required grouped outcomes must not reach direct publication.";
+    EXPECT_TRUE(result.published);
+    EXPECT_TRUE(result.committed);
+    EXPECT_FALSE(result.released);
+    EXPECT_TRUE(publisher_called);
     EXPECT_FALSE(owner.hasInFlightBatch());
-    EXPECT_EQ(owner.pendingCount(), 1u);
-    EXPECT_THAT(result.error, testing::HasSubstr("requires decode-equivalent replay publication"));
-    EXPECT_THAT(result.error, testing::HasSubstr("grouped_outcome"));
-    EXPECT_TRUE(result.transaction_plan.requiresDecodeEquivalentReplayPublication());
+    EXPECT_EQ(owner.pendingCount(), 0u);
+    ASSERT_THAT(result.transaction_plan.step_plans.steps, testing::SizeIs(1));
+    EXPECT_EQ(published_request_id, 62);
+    EXPECT_EQ(published_accepted_count, 3);
 }
 
 TEST(Test__MTPVerifierForwardExecutor, OwnedDeviceOutcomeTransactionReleasesOnProducerFailure)

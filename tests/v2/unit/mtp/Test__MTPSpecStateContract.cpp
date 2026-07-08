@@ -255,7 +255,7 @@ TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixLeavesMatchingParticipantsD
     ASSERT_TRUE(common.ok) << common.error;
     EXPECT_EQ(common.common_accepted_count, 3);
     EXPECT_TRUE(common.all_participants_direct);
-    EXPECT_FALSE(common.requires_common_fallback_replay);
+    EXPECT_FALSE(common.clamped_participant_suffix);
     ASSERT_THAT(common.clamped_steps, SizeIs(2));
     EXPECT_EQ(common.clamped_steps[0].accepted_count, 3);
     EXPECT_EQ(common.clamped_steps[1].accepted_count, 3);
@@ -270,9 +270,9 @@ TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixClampsLongerParticipant)
     };
     /*
      * Participant 1 is already at the common prefix, but it still carries a
-     * participant-local correction suffix.  Once any other participant is
-     * shortened, the topology owner must replay from the shared prefix, so that
-     * local suffix is no longer safe to publish either.
+     * participant-local correction suffix. Once any other participant is
+     * shortened, the grouped publisher must clear every unshared suffix and
+     * publish only the shared serial-decode prefix.
      */
     participants[1].correction_replay_start_index = 1;
     participants[1].correction_replay_count = 1;
@@ -283,7 +283,7 @@ TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixClampsLongerParticipant)
     ASSERT_TRUE(common.ok) << common.error;
     EXPECT_EQ(common.common_accepted_count, 1);
     EXPECT_FALSE(common.all_participants_direct);
-    EXPECT_TRUE(common.requires_common_fallback_replay);
+    EXPECT_TRUE(common.clamped_participant_suffix);
     ASSERT_THAT(common.clamped_steps, SizeIs(2));
 
     for (const MTPSpecStepPlan &step : common.clamped_steps)
@@ -607,7 +607,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedDeviceRejectionOu
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
-TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPublication)
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGroupedOutcomePublicationPlan)
 {
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 8};
@@ -626,7 +626,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPubli
     outcome.sampled_terminal = true;
 
     MTPSpecTransactionBatchPlan plan =
-        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomesForReplayPublication(
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
             shapeFor(/*requests=*/1, /*draft_tokens=*/3),
             /*request_ids=*/{10},
             /*vocab_size=*/100,
@@ -635,12 +635,6 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPubli
             /*base_cached_tokens=*/{100});
 
     ASSERT_TRUE(plan.ok) << plan.error;
-    EXPECT_TRUE(plan.requiresDecodeEquivalentReplayPublication());
-    EXPECT_EQ(plan.publication_contract,
-              MTPSpecTransactionPublicationContract::
-                  DecodeEquivalentReplayPublicationRequired);
-    EXPECT_THAT(plan.publication_contract_reason,
-                HasSubstr("replay_publication"));
     ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
     EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 3);
     EXPECT_EQ(plan.step_plans.steps.front().accepted_state_slot_index, 2);
@@ -783,7 +777,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
-TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeReplayPublication)
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyGroupedOutcomePublicationPlan)
 {
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 8};
@@ -794,7 +788,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeRepla
     ASSERT_TRUE(result.ok) << result.error;
 
     MTPSpecTransactionBatchPlan plan =
-        buildMTPSpecTransactionBatchPlanFromGreedyCatchupForReplayPublication(
+        buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
             shapeFor(/*requests=*/1, /*draft_tokens=*/3),
             /*request_id=*/23,
             /*vocab_size=*/100,
@@ -803,12 +797,6 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeRepla
             /*base_cached_tokens=*/64);
 
     ASSERT_TRUE(plan.ok) << plan.error;
-    EXPECT_TRUE(plan.requiresDecodeEquivalentReplayPublication());
-    EXPECT_EQ(plan.publication_contract,
-              MTPSpecTransactionPublicationContract::
-                  DecodeEquivalentReplayPublicationRequired);
-    EXPECT_THAT(plan.publication_contract_reason,
-                HasSubstr("replay_publication"));
     ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
     EXPECT_EQ(plan.step_plans.steps.front().request_id, 23);
     EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 3);

@@ -353,7 +353,7 @@ namespace llaminar2
         result.ok = true;
         result.common_accepted_count = common_accepted;
         result.all_participants_direct = all_direct;
-        result.requires_common_fallback_replay = !all_direct;
+        result.clamped_participant_suffix = !all_direct;
         result.clamped_steps.reserve(participant_steps.size());
 
         for (const MTPSpecStepPlan &input_step : participant_steps)
@@ -366,9 +366,9 @@ namespace llaminar2
                 /*
                  * A participant that ran further than the common prefix may
                  * have verifier-row state the rest of the domain cannot use.
-                 * Clamp the publishable state and force the topology owner to
-                 * replay from the common prefix instead of pretending the
-                 * participant-local suffix is globally valid.
+                 * Clamp the publishable state to the shared prefix and clear the
+                 * participant-local suffix so grouped publication advances every
+                 * participant to the same serial-decode boundary.
                  */
                 step.accepted_count = common_accepted;
                 step.target_cached_tokens =
@@ -378,7 +378,7 @@ namespace llaminar2
                         ? common_accepted - 1
                         : kMTPSpecDecodeInvalidToken;
             }
-            if (result.requires_common_fallback_replay || common_accepted == 0)
+            if (result.clamped_participant_suffix || common_accepted == 0)
             {
                 if (common_accepted == 0)
                 {

@@ -871,48 +871,6 @@ namespace llaminar2
         virtual bool supportsDeviceResidentMTPSpecStatePublication() const { return false; }
 
         /**
-         * @brief Import a rank-wide compact verifier outcome into child device storage.
-         *
-         * LocalTP owns the final accepted-count decision at rank scope because
-         * no single tensor-parallel shard has the full vocabulary.  Once the
-         * rank reducer has produced the compact SamplingMath outcome, each
-         * child runner must publish its local KV/recurrent/terminal state from
-         * a child-owned DeviceSpeculativeOutcomeHandle.  This method is that
-         * handoff: implementations copy or otherwise alias the compact outcome
-         * into persistent runner-owned device buffers on an explicit stream and
-         * return a normal resident handle for
-         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().
-         *
-         * Implementations must not allocate device memory in the decode hot
-         * path.  GPU runners should use arena/workspace buffers and explicit
-         * stream-ordered copies.  The host pointers describe compact metadata
-         * only; they must not be expanded into MTPSpecStepPlan rows or trigger
-         * serial verifier replay.
-         */
-        virtual bool stageMTPSpecOutcomeForDeviceResidentPublication(
-            const int32_t *output_tokens_host,
-            const int *meta_host,
-            int request_count,
-            int output_token_stride,
-            int meta_stride,
-            DeviceSpeculativeOutcomeHandle *out_handle,
-            std::string *error = nullptr)
-        {
-            (void)output_tokens_host;
-            (void)meta_host;
-            (void)request_count;
-            (void)output_token_stride;
-            (void)meta_stride;
-            (void)out_handle;
-            if (error)
-            {
-                *error =
-                    "runner does not support staging rank compact MTP outcomes for device-resident publication";
-            }
-            return false;
-        }
-
-        /**
          * @brief Publish accepted verifier state for a grouped
          *        decode-equivalent outcome.
          *

@@ -5544,8 +5544,6 @@ namespace llaminar2::test::parity::qwen36
                     {static_cast<int32_t>(verifier_base.cached_tokens)});
             ASSERT_TRUE(transaction_plan.ok)
                 << transaction_plan.error;
-            ASSERT_FALSE(transaction_plan.requiresDecodeEquivalentReplayPublication())
-                << transaction_plan.publication_contract_reason;
             const MTPSpecStepPlanBatch &batch =
                 transaction_plan.step_plans;
             ASSERT_EQ(batch.steps.size(), 1u);

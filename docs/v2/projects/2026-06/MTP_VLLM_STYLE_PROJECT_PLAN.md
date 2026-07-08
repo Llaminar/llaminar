@@ -1968,6 +1968,16 @@ Status:
   the accepted step plan, and Rank aggregates those child mailboxes into a
   domain handle that fans out next-step resident sidecar prelaunch. Focused gate:
   `V2_Unit_RankOrchestrator|V2_Unit_PrefillDecodeTransition|V2_Unit_MTPVerifierPolicy`.
+- 2026-07-08 GPU LocalTP resident MTP publication now requires mirrored
+  full-vocab child verifier heads. Greedy and stochastic mirrored children build
+  their own compact resident outcomes and publish those handles directly; the
+  rank no longer uploads or stages compact outcome metadata into child runners.
+  `IInferenceRunner::stageMTPSpecOutcomeForDeviceResidentPublication()` and its
+  DeviceGraphOrchestrator implementation were removed. Non-mirrored GPU LocalTP
+  hard-fails before publication rather than taking rank-owned compact metadata
+  as a fallback. Focused gates passed:
+  `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, the MTP unit
+  cluster, and full `V2_Unit_` `517/517`.
 - Request-batch admission now has a first-class scheduler contract.
   `MTPSpecRequestBatchScheduler` groups pending requests in stable order,
   admits only matching mode/topology/vocab shapes, preserves variable verifier

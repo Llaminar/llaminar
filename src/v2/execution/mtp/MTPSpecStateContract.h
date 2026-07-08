@@ -83,10 +83,11 @@ namespace llaminar2
      * Multi-device MTP must make one publication decision for the whole
      * topology.  A TP shard, PP stage, or ExpertParallel participant is not
      * allowed to publish a verifier state row that another participant cannot
-     * publish.  This result records the minimum accepted prefix, a per-
-     * participant clamped publication plan, and whether the clamping changed
-     * any participant enough that the caller should replay from the common
-     * prefix instead of publishing directly.
+     * publish. This result records the minimum accepted prefix, a per-
+     * participant clamped publication plan, and whether any participant-local
+     * suffix was shortened. A shortened suffix is not a replay request: callers
+     * publish the clamped common prefix and discard the unshared speculative
+     * metadata so the whole topology advances to one serial-decode boundary.
      */
     struct MTPSpecCommonStepPlan
     {
@@ -95,7 +96,7 @@ namespace llaminar2
 
         int common_accepted_count = 0;
         bool all_participants_direct = false;
-        bool requires_common_fallback_replay = false;
+        bool clamped_participant_suffix = false;
 
         std::vector<MTPSpecStepPlan> clamped_steps;
     };
@@ -125,10 +126,10 @@ namespace llaminar2
      *
      * The input plans must describe the same logical request and sampled token
      * stream.  The returned `clamped_steps` never publish more verifier state
-     * than the smallest participant-local `accepted_count`.  If any participant
-     * had to be shortened, `requires_common_fallback_replay` is set so the
-     * topology coordinator can clear speculative local state and replay from
-     * that common point.
+     * than the smallest participant-local `accepted_count`. If any participant
+     * had to be shortened, `clamped_participant_suffix` is set and the returned
+     * steps have all unshared bonus/correction suffix metadata cleared. This
+     * makes the clamped plans directly publishable as the grouped production path.
      */
     MTPSpecCommonStepPlan coordinateMTPSpecCommonAcceptedPrefix(
         const std::vector<MTPSpecStepPlan> &participant_steps);

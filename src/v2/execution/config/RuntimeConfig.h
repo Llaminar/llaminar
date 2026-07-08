@@ -595,11 +595,14 @@ namespace llaminar2
          * column-parallel LM-head layout, which makes each child produce only a
          * vocab shard and forces a tiny cross-device logits collective before
          * sampling.  When this flag is enabled, LocalTP verifier/sidecar graphs
-         * bind a replicated full-vocab terminal head instead.  The mode is
-         * intentionally LocalTP-only: GlobalTP still needs true cross-rank
-         * vocab ownership and candidate coordination.
+         * bind a replicated full-vocab terminal head instead.  This is the
+         * production LocalTP MTP path: each participant can reduce and publish
+         * its own resident verifier outcome without rank-owned compact metadata
+         * uploads or tiny logits collectives.  The mode is intentionally
+         * LocalTP-only: GlobalTP still needs true cross-rank vocab ownership and
+         * candidate coordination.
          */
-        bool mirror_full_head_for_local_tp = false;
+        bool mirror_full_head_for_local_tp = true;
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;
     };

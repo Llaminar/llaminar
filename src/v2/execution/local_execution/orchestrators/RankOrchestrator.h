@@ -607,25 +607,23 @@ namespace llaminar2
             const MTPSpecStepPlanBatch &plans,
             std::string *error = nullptr) override;
         /**
-         * @brief True when rank-owned compact verifier outcomes can drive
-         *        grouped accepted-state publication.
+         * @brief True when LocalTP has child-resident verifier publication.
          *
-         * Multi-child LocalTP does not have a single participant device mailbox
-         * for the entire rank.  The rank reduces sharded verifier logits into a
-         * shared compact SamplingMath outcome, stages that compact outcome into
-         * each child's resident outcome workspace, and then lets each child run
-         * its native device-resident publisher.
+         * Multi-child GPU LocalTP only advertises this when every child owns a
+         * mirrored full-vocabulary MTP verifier head and can publish the compact
+         * outcome it produced itself.  Rank-owned compact metadata uploads are not
+         * a production path.
          */
         bool supportsDeviceResidentMTPSpecStatePublication() const override;
         /**
-         * @brief Publish LocalTP accepted state from a rank-owned compact outcome.
+         * @brief Publish LocalTP accepted state from child-resident outcomes.
          *
          * The outcome handle must have been produced by
          * verifyGreedyAllPositionBatchOutcomeOnDeviceResident() on this same
-         * RankOrchestrator instance.  Publication must call child
-         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome() directly after
-         * staging the compact outcome; it must not expand the outcome into
-         * host step plans for live-state mutation or call serial row replay.
+         * RankOrchestrator instance or by the stochastic resident request-batch
+         * verifier.  Publication feeds every child the exact handle produced by
+         * that child; it must not expand the outcome into host step plans, upload
+         * rank compact metadata, or call serial row replay.
          */
         bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
             const DeviceSpeculativePublicationRequest &request,
@@ -1452,13 +1450,12 @@ namespace llaminar2
         bool grouped_decode_equivalent_spec_publication_scope_ = false;
 
         /**
-         * @brief Rank-owned compact greedy verifier outcome for LocalTP.
+         * @brief Rank-local compact verifier scratch for diagnostics.
          *
-         * The single-device device-resident ABI carries one compact metadata
-         * pointer.  A LocalTP rank spans multiple devices, so the rank stores
-         * the already-reduced compact SamplingMath outcome and uses it to build
-         * grouped accepted-state plans for every child runner.  These arrays are
-         * overwritten by the next resident-compatible verifier outcome.
+         * GPU LocalTP production MTP uses child-owned mirrored verifier outcomes.
+         * These arrays remain available for response materialization in rank-level
+         * diagnostic reducers and CPU-local coordination paths; they must not be
+         * uploaded into GPU child runners for live-state publication.
          */
         std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens>
             rank_compact_output_tokens_{};
@@ -1469,7 +1466,8 @@ namespace llaminar2
             None,
             Greedy,
             Stochastic,
-            MirroredGreedy
+            MirroredGreedy,
+            MirroredStochastic
         };
         RankCompactOutcomeKind rank_compact_outcome_kind_ =
             RankCompactOutcomeKind::None;
@@ -1682,12 +1680,27 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle);
 
         /**
-         * @brief Publish the child-resident outcomes from mirrored LocalTP greedy verification.
+         * @brief Run stochastic verifier reduction independently on mirrored children.
+         *
+         * Each LocalTP child has already produced the same full-vocabulary
+         * all-position verifier logits through its replicated terminal head.  This
+         * helper asks every child to run the native resident stochastic summary for
+         * the same logical descriptors and stores the resulting handle beside the
+         * child that owns it.
+         */
+        bool verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle);
+
+        /**
+         * @brief Publish child-resident outcomes from mirrored LocalTP verification.
          *
          * The request outcome must be the primary child handle returned by the
-         * most recent mirrored verifier reduction. Each participant receives its
-         * own stored handle, preserving stream ownership and avoiding both a tiny
-         * verifier collective and rank-to-child compact metadata uploads.
+         * most recent mirrored greedy or stochastic verifier reduction. Each
+         * participant receives its own stored handle, preserving stream ownership
+         * and avoiding both a tiny verifier collective and rank-to-child compact
+         * metadata uploads.
          */
         bool publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
             const DeviceSpeculativePublicationRequest &request,
@@ -1708,7 +1721,6 @@ namespace llaminar2
         mutable int rank_resident_logical_state_stream_token_ = 0;
         mutable int rank_resident_logical_state_ready_event_token_ = 0;
         mutable uint64_t rank_resident_logical_state_epoch_ = 1;
-        MTPSpecStepPlanBatch rank_last_device_outcome_step_plans_;
         std::vector<DeviceSpeculativeOutcomeHandle>
             rank_mirrored_child_outcomes_;
         DeviceSpeculativeOutcomeHandle rank_mirrored_primary_outcome_;
@@ -1716,7 +1728,6 @@ namespace llaminar2
         int rank_compact_outcome_stream_token_ = 0;
         int rank_compact_outcome_ready_event_token_ = 0;
         bool rank_compact_outcome_valid_ = false;
-        bool rank_compact_outcome_published_ = false;
 
         /// Guard against registering duplicate sibling histogram callbacks.
         bool local_tp_moe_histogram_syncs_wired_ = false;
