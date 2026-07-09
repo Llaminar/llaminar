@@ -14,12 +14,14 @@ ROCm, dense and MoE, greedy and stochastic.
 
 Always keep these files current:
 
-- `docs/v2/MTP_VLLM_STYLE_PROJECT_PLAN.md`: phase plan, accepted architecture,
-  gates, and known debt.
-- `docs/v2/MTP_VLLM_STYLE_TUNING_DASHBOARD.md`: compact RAG status and latest
-  speed/correctness evidence. Keep it under the documented size limit.
-- `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md`: only for broader historical
-  benchmark notes when the current dashboard is not the right home.
+- `docs/v2/projects/2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md`: phase plan,
+  accepted architecture, gates, and known debt.
+- `docs/v2/projects/2026-06/MTP_VLLM_STYLE_TUNING_DASHBOARD.md`: compact RAG
+  status and latest speed/correctness evidence. Keep it under the documented
+  size limit.
+- `docs/v2/projects/2026-06/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md`: only for
+  broader historical benchmark notes when the current dashboard is not the
+  right home.
 
 For backend kernel work, also use the relevant sibling skill:
 

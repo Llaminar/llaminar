@@ -1041,6 +1041,11 @@ namespace
             {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)}, 6102);
         auto down_w = format.create(
             {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 6103);
+        auto *moe = KernelFactory::getOrCreateMoEKernel(device);
+        EXPECT_NE(moe, nullptr);
+        moe->setGPUStream(stream);
+        auto *moe_workspace = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
+        EXPECT_NE(moe_workspace, nullptr);
         auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
             gate_w.get(),
             up_w.get(),
@@ -1052,14 +1057,11 @@ namespace
         const auto hidden_values = makeHiddenValues(rows, d_model);
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto grouped_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
-        auto serial_output = makeZeros({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
         EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
         EXPECT_TRUE(grouped_output->ensureOnDevice(device, stream));
-        EXPECT_TRUE(serial_output->ensureOnDevice(device, stream));
 
         auto make_params = [&](llaminar2::TensorBase *output,
-                               bool grouped_verifier,
-                               bool serial_decode_equivalent)
+                               bool grouped_verifier)
         {
             llaminar2::SharedExpertFFNStage::Params params;
             params.device_id = device;
@@ -1076,20 +1078,15 @@ namespace
             params.prepared_ref_down = prepared.down_ref;
             params.prepared_store = prepared.store.get();
             params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
-            params.force_decode_equivalent_verifier_prefill = serial_decode_equivalent;
+            params.force_decode_equivalent_verifier_prefill = false;
             return params;
         };
 
         llaminar2::SharedExpertFFNStage grouped_stage(
-            make_params(grouped_output.get(), /*grouped_verifier=*/true,
-                        /*serial_decode_equivalent=*/false));
-        llaminar2::SharedExpertFFNStage serial_stage(
-            make_params(serial_output.get(), /*grouped_verifier=*/false,
-                        /*serial_decode_equivalent=*/true));
+            make_params(grouped_output.get(), /*grouped_verifier=*/true));
         grouped_stage.setGPUStream(stream);
-        serial_stage.setGPUStream(stream);
+        grouped_stage.setMoEKernelForTesting(moe);
         EXPECT_TRUE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
-        EXPECT_TRUE(serial_stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
 
         auto reqs = grouped_stage.getWorkspaceRequirements(rows, d_model, intermediate);
         reqs.merge(llaminar2::MoEWorkspaceBuffers::rocmMoE(
@@ -1103,7 +1100,25 @@ namespace
             reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
         EXPECT_TRUE(workspace->allocate(reqs));
         grouped_stage.bindWorkspace(workspace.get());
-        serial_stage.bindWorkspace(workspace.get());
+        if (moe_workspace)
+            moe_workspace->bindWorkspace(workspace.get());
+
+        llaminar2::DeviceNativeVNNIMatrixDesc gate_desc{};
+        llaminar2::DeviceNativeVNNIMatrixDesc up_desc{};
+        llaminar2::DeviceNativeVNNIMatrixDesc down_desc{};
+        EXPECT_TRUE(prepared.gate_kernel->exportNativeVNNIMatrixDesc(gate_desc));
+        EXPECT_TRUE(prepared.up_kernel->exportNativeVNNIMatrixDesc(up_desc));
+        EXPECT_TRUE(prepared.down_kernel->exportNativeVNNIMatrixDesc(down_desc));
+        const int gateup_table =
+            moe ? moe->uploadGroupedExpertGateUpDescriptorTables(
+                      &gate_desc, &up_desc, /*num_experts=*/1, d_model, intermediate)
+                : -1;
+        const int down_table =
+            moe ? moe->uploadGroupedExpertDownDescriptorTable(
+                      &down_desc, /*num_experts=*/1, d_model, intermediate)
+                : -1;
+        EXPECT_GE(gateup_table, 0);
+        EXPECT_GE(down_table, 0);
 
         llaminar2::testing::MockDeviceContext ctx(
             device, llaminar2::ComputeBackendType::GPU_ROCM);
@@ -1111,9 +1126,64 @@ namespace
         {
             return grouped_stage.execute(&ctx);
         };
+        std::vector<float> serial;
         auto run_serial = [&]()
         {
-            return serial_stage.execute(&ctx);
+            if (!moe || gateup_table < 0 || down_table < 0)
+                return false;
+            serial.clear();
+            serial.reserve(static_cast<size_t>(rows) * static_cast<size_t>(d_model));
+            for (int row = 0; row < rows; ++row)
+            {
+                const auto row_begin = hidden_values.begin() + static_cast<ptrdiff_t>(row) * d_model;
+                std::vector<float> row_hidden_values(row_begin, row_begin + d_model);
+                auto row_hidden = makeTensor({1u, static_cast<size_t>(d_model)}, row_hidden_values);
+                auto row_gate = makeZeros({1u, static_cast<size_t>(intermediate)});
+                auto row_up = makeZeros({1u, static_cast<size_t>(intermediate)});
+                auto row_output = makeZeros({1u, static_cast<size_t>(d_model)});
+                EXPECT_TRUE(row_hidden->ensureOnDevice(device, stream));
+                EXPECT_TRUE(row_gate->ensureOnDevice(device, stream));
+                EXPECT_TRUE(row_up->ensureOnDevice(device, stream));
+                EXPECT_TRUE(row_output->ensureOnDevice(device, stream));
+
+                constexpr int expert_id = 0;
+                constexpr float expert_weight = 1.0f;
+                llaminar2::ITensor *gate_outputs[1] = {row_gate.get()};
+                llaminar2::ITensor *up_outputs[1] = {row_up.get()};
+                if (!moe->groupedExpertGateUpDecodeFromTable(
+                        row_hidden.get(),
+                        &expert_id,
+                        gateup_table,
+                        1,
+                        gate_outputs,
+                        up_outputs,
+                        d_model,
+                        intermediate))
+                {
+                    return false;
+                }
+                if (!moe->groupedExpertDownDecodeFromTable(
+                        gate_outputs,
+                        up_outputs,
+                        &expert_id,
+                        &expert_weight,
+                        down_table,
+                        1,
+                        row_output.get(),
+                        d_model,
+                        intermediate))
+                {
+                    return false;
+                }
+                EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                row_output->transitionTo(
+                    llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                serial.insert(
+                    serial.end(),
+                    row_output->data(),
+                    row_output->data() + row_output->numel());
+            }
+            return true;
         };
 
         for (int i = 0; i < warmups; ++i)
@@ -1148,17 +1218,14 @@ namespace
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         grouped_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
-        serial_output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
         std::vector<float> grouped(
             grouped_output->data(),
             grouped_output->data() + grouped_output->numel());
-        std::vector<float> serial(
-            serial_output->data(),
-            serial_output->data() + serial_output->numel());
         CloseMetrics metrics = compareVectors(grouped, serial, static_cast<size_t>(d_model));
 
         grouped_stage.unbindWorkspace();
-        serial_stage.unbindWorkspace();
+        if (moe_workspace)
+            moe_workspace->unbindWorkspace();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 
         return BenchResult{
@@ -1500,7 +1567,13 @@ namespace
             make_params(reference_output.get(), false));
         grouped_stage.setGPUStream(stream);
         reference_stage.setGPUStream(stream);
-        EXPECT_FALSE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
+        /*
+         * M=1 is still a verifier bucket in the MTP transaction.  Keep it on
+         * the same grouped table-prefill route as M=2..4 so the publication
+         * path has one production implementation and this perf regression
+         * proves that even the smallest bucket remains decode-equivalent.
+         */
+        EXPECT_TRUE(grouped_stage.usesGroupedVerifierPrefillRouteForTesting());
         EXPECT_FALSE(grouped_stage.usesGroupedDecodeForTesting());
         EXPECT_FALSE(reference_stage.usesGroupedVerifierPrefillRouteForTesting());
         EXPECT_FALSE(reference_stage.usesGroupedDecodeForTesting());

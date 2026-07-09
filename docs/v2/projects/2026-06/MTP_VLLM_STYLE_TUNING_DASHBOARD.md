@@ -77,9 +77,9 @@ build time on both CUDA and ROCm.
   ROCm M4: `0.1778 ms` graph vs `4.7366 ms` row replay. CUDA M4:
   `0.1035 ms` graph vs `9.8135 ms` row replay.
 - ROCm verifier handoff reruns M4 after workspace rebind/reset.
-- CUDA/ROCm shared direct and `SharedExpertFFNStage` M=2/3/4 gates pass.
-- 2026-06-23 ROCm Qwen3.6 MoE verifier rows M1-M4 grouped/rowwise pass after
-  forcing main all-position ROCm rows onto decode-equivalent replay.
+- CUDA/ROCm shared `SharedExpertFFNStage` now proves production grouped
+  table-prefill M=1..4 all-format rows against public M=1 table decode;
+  MoE expert-path sweeps and `V2_Perf_MoEVerifierPrefill` pass.
 - CUDA long-prompt MoE greedy parity and CUDA/ROCm stochastic verifier runs are
   green after pruning the broken combined owner.
 - Replay preservation gates pass:
@@ -92,8 +92,8 @@ build time on both CUDA and ROCm.
   sidecar graph invalidation.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
 - LocalTP GPU grouped path: mirrored children publish resident outcomes;
-  greedy/stochastic request-batch verifier rows now use device-token matrices
-  and resident condition tokens after publication. No row replay or host-plan GPU publication. Gates:
+  request-batch rows use device-token matrices/resident conditions. No row
+  replay, host-plan GPU publication, or host base-cache vector. Gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, MTP units,
   full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,

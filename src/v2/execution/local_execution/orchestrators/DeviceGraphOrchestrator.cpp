@@ -14840,6 +14840,12 @@ namespace llaminar2
 
         if (!request.valid())
             return fail("device-resident MTP publication metadata request is invalid");
+        if (!request.base_cached_tokens.empty())
+        {
+            return fail(
+                "device-resident MTP publication metadata forbids host base-cache vectors; "
+                "stage a device snapshot before verifier replay instead");
+        }
         if (!state_.device_id.is_gpu())
             return fail("device-resident MTP publication metadata requires a GPU runner");
         if (request.outcome.device != state_.device_id)

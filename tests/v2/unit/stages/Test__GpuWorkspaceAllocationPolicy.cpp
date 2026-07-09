@@ -3052,6 +3052,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationMetadataSta
 
     EXPECT_NE(compact.find("!request.outcome.stream"), std::string::npos)
         << "Device-resident publication metadata must reject implicit/default GPU streams.";
+    EXPECT_NE(compact.find("!request.base_cached_tokens.empty()"),
+              std::string::npos)
+        << "GPU resident publication must fail closed if a caller tries to "
+           "provide host base-cache counts.";
     EXPECT_NE(compact.find("forward_engine_->lastAllPositionVerifierForwardGraph()"),
               std::string::npos)
         << "The metadata helper must validate against the retained all-position "

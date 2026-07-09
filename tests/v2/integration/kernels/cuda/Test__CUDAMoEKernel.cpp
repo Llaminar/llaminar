@@ -10319,14 +10319,14 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows
  * @brief Prove production shared-expert verifier rows match CUDA serial decode.
  *
  * The model-level Qwen3.6 MoE MTP verifier test compares grouped all-position
- * rows with ordinary one-token serial decode.  The shared expert is a dense
- * SwiGLU FFN, so production CUDA verifier rows use the grouped GEMM verifier
- * hooks instead of the older MoE table-prefill shortcut.  This test exercises
- * every NativeVNNI tensor format through that target route: M=2/3/4 grouped
- * verifier publication on the left, and M=1 grouped table decode replay on the
- * right as the public serial-decode witness.
+ * rows with ordinary one-token serial decode.  The shared expert has only one
+ * always-active route, but production CUDA verifier rows still use the same MoE
+ * grouped descriptor-table family as ordinary one-token decode.  This test
+ * exercises every NativeVNNI tensor format through that production route:
+ * M=2/3/4 grouped verifier publication on the left, and repeated M=1 grouped
+ * table decode on the right as the public serial-decode witness.
  */
-TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialDecode)
+TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -10346,236 +10346,247 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
         /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
-    auto expect_bitwise_equal =
-        [](const std::vector<float> &actual,
-           const std::vector<float> &expected,
-           const std::string &label)
-    {
-        ASSERT_EQ(actual.size(), expected.size()) << label;
-        for (size_t i = 0; i < actual.size(); ++i)
-        {
-            if (actual[i] != expected[i])
-            {
-                ADD_FAILURE()
-                    << label
-                    << " first differing element=" << i
-                    << " actual=" << actual[i]
-                    << " expected=" << expected[i]
-                    << " abs_diff=" << std::abs(actual[i] - expected[i]);
-                return;
-            }
-        }
-    };
-
     const auto formats = cudaMoEGroupedNativeFormats();
     for (const int intermediate : {512, 256})
     {
-    SCOPED_TRACE(std::string("shared_intermediate=") + std::to_string(intermediate));
-    for (size_t format_index = 0; format_index < formats.size(); ++format_index)
-    {
-        const auto &format = formats[format_index];
-        SCOPED_TRACE(format.label);
-        llaminar2::PerfStatsCollector::reset();
-
-        auto gate_w = format.create(
-            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
-            static_cast<uint32_t>(6201 + 10 * format_index));
-        auto up_w = format.create(
-            {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
-            static_cast<uint32_t>(6202 + 10 * format_index));
-        auto down_w = format.create(
-            {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)},
-            static_cast<uint32_t>(6203 + 10 * format_index));
-        auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
-            gate_w.get(),
-            up_w.get(),
-            down_w.get(),
-            device,
-            std::string("test.cuda_moe.qwen36_shared_stage_verifier.") +
-                format.label,
-            llaminar2::ModelContextId{620000 + format_index});
-
-        auto make_params = [&](llaminar2::TensorBase *input,
-                               llaminar2::TensorBase *output,
-                               int seq_len,
-                               bool grouped_verifier,
-                               bool disable_grouped_decode_shortcut = false)
+        SCOPED_TRACE(std::string("shared_intermediate=") + std::to_string(intermediate));
+        for (size_t format_index = 0; format_index < formats.size(); ++format_index)
         {
-            llaminar2::SharedExpertFFNStage::Params params;
-            params.device_id = device;
-            params.input = input;
-            params.gate_w = gate_w.get();
-            params.up_w = up_w.get();
-            params.down_w = down_w.get();
-            params.output = output;
-            params.seq_len = seq_len;
-            params.d_model = d_model;
-            params.intermediate = intermediate;
-            params.force_grouped_verifier_prefill_for_decode = false;
-            params.force_decode_equivalent_verifier_prefill = grouped_verifier;
-            params.disable_grouped_decode_shortcut = disable_grouped_decode_shortcut;
-            params.prepared_ref_gate = prepared.gate_ref;
-            params.prepared_ref_up = prepared.up_ref;
-            params.prepared_ref_down = prepared.down_ref;
-            params.prepared_store = prepared.store.get();
-            return params;
-        };
+            const auto &format = formats[format_index];
+            SCOPED_TRACE(format.label);
+            llaminar2::PerfStatsCollector::reset();
 
-        auto make_stage = [&](llaminar2::SharedExpertFFNStage::Params params)
-        {
-            auto stage = std::make_unique<llaminar2::SharedExpertFFNStage>(params);
-            stage->setGPUStream(stream_);
-            stage->setMoEKernelForTesting(cuda_kernel_);
-            return stage;
-        };
+            auto gate_w = format.create(
+                {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
+                static_cast<uint32_t>(6201 + 10 * format_index));
+            auto up_w = format.create(
+                {static_cast<size_t>(intermediate), static_cast<size_t>(d_model)},
+                static_cast<uint32_t>(6202 + 10 * format_index));
+            auto down_w = format.create(
+                {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)},
+                static_cast<uint32_t>(6203 + 10 * format_index));
+            auto prepared = llaminar2::test::makeGpuPreparedFFNFixture(
+                gate_w.get(),
+                up_w.get(),
+                down_w.get(),
+                device,
+                std::string("test.cuda_moe.qwen36_shared_stage_verifier.") +
+                    format.label,
+                llaminar2::ModelContextId{620000 + format_index});
 
-        /*
-         * Allocate the production stage's declared workspace once at the maximum
-         * verifier bucket.  Both sides of the comparison reuse it so differences
-         * cannot be explained by missing scratch, first-use allocation, or an
-         * accidental change to a non-workspace-backed path.
-         */
-        auto planning_input = makeZeros({4u, static_cast<size_t>(d_model)});
-        auto planning_output = makeZeros({4u, static_cast<size_t>(d_model)});
-        auto planning_stage = make_stage(
-            make_params(planning_input.get(), planning_output.get(), 4, true));
-        auto reqs = planning_stage->getWorkspaceRequirements(4, d_model, intermediate);
-        auto serial_planning_input = makeZeros({1u, static_cast<size_t>(d_model)});
-        auto serial_planning_output = makeZeros({1u, static_cast<size_t>(d_model)});
-        auto serial_planning_stage = make_stage(
-            make_params(
-                serial_planning_input.get(),
-                serial_planning_output.get(),
-                1,
-                false,
-                true));
-        reqs.merge(serial_planning_stage->getWorkspaceRequirements(1, d_model, intermediate));
-        auto stage_workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
-            device,
-            reqs.total_bytes_with_alignment() + 4 * 1024 * 1024);
-        ASSERT_TRUE(stage_workspace->allocate(reqs))
-            << "SharedExpertFFNStage Qwen3.6 verifier workspace format=" << format.label;
-
-        llaminar2::CUDADeviceContext ctx(device, 0);
-
-        for (int seq_len : {2, 3, 4})
-        {
-            std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
-            for (size_t i = 0; i < input_values.size(); ++i)
+            auto make_params = [&](llaminar2::TensorBase *input,
+                                   llaminar2::TensorBase *output,
+                                   int seq_len,
+                                   bool grouped_verifier)
             {
-                input_values[i] =
-                    0.017f * std::sin(0.0041f * static_cast<float>(i + 13)) -
-                    0.011f * std::cos(0.0063f * static_cast<float>(i + 29)) +
-                    0.0008f * static_cast<float>(static_cast<int>(i % 31) - 15);
-            }
+                llaminar2::SharedExpertFFNStage::Params params;
+                params.device_id = device;
+                params.input = input;
+                params.gate_w = gate_w.get();
+                params.up_w = up_w.get();
+                params.down_w = down_w.get();
+                params.output = output;
+                params.seq_len = seq_len;
+                params.d_model = d_model;
+                params.intermediate = intermediate;
+                params.force_grouped_verifier_prefill_for_decode = grouped_verifier;
+                params.force_decode_equivalent_verifier_prefill = false;
+                params.disable_grouped_decode_shortcut = false;
+                params.prepared_ref_gate = prepared.gate_ref;
+                params.prepared_ref_up = prepared.up_ref;
+                params.prepared_ref_down = prepared.down_ref;
+                params.prepared_store = prepared.store.get();
+                return params;
+            };
 
-            auto grouped_input = makeTensor(
-                {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
-                input_values);
-            auto grouped_output = makeZeros(
-                {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-            ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream_));
-            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
-
-            auto grouped_stage = make_stage(
-                make_params(grouped_input.get(), grouped_output.get(), seq_len, true));
-            grouped_stage->bindWorkspace(stage_workspace.get());
-            ASSERT_TRUE(grouped_stage->usesDecodeEquivalentVerifierPrefillForTesting())
-                << "The left side must exercise the production decode-equivalent grouped verifier route";
-            ASSERT_TRUE(grouped_stage->execute(&ctx))
-                << "grouped shared verifier stage failed at seq_len=" << seq_len
-                << " format=" << format.label;
-            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-            const auto grouped_host = copyCudaFP32TensorToHost(grouped_output, stream_);
-
-            std::vector<float> serial_host(static_cast<size_t>(seq_len) * d_model);
-            for (int row = 0; row < seq_len; ++row)
+            auto make_stage = [&](llaminar2::SharedExpertFFNStage::Params params)
             {
-                const auto row_offset = static_cast<size_t>(row) * d_model;
-                std::vector<float> row_values(static_cast<size_t>(d_model));
-                std::copy_n(input_values.data() + row_offset, d_model, row_values.data());
-                auto row_input = makeTensor({1u, static_cast<size_t>(d_model)}, row_values);
-                auto row_output = makeZeros({1u, static_cast<size_t>(d_model)});
-                ASSERT_TRUE(row_input->ensureOnDevice(device, stream_));
-                ASSERT_TRUE(row_output->ensureOnDevice(device, stream_));
+                auto stage = std::make_unique<llaminar2::SharedExpertFFNStage>(params);
+                stage->setGPUStream(stream_);
+                stage->setMoEKernelForTesting(cuda_kernel_);
+                return stage;
+            };
 
-                auto row_stage = make_stage(
-                    make_params(row_input.get(), row_output.get(), 1, true));
-                row_stage->bindWorkspace(stage_workspace.get());
-                ASSERT_TRUE(row_stage->usesDecodeEquivalentVerifierPrefillForTesting())
-                    << "The right side must enter the same production verifier contract at M=1";
-                ASSERT_FALSE(row_stage->usesGroupedDecodeForTesting())
-                    << "force_decode_equivalent_verifier_prefill must be enough to bypass CUDA's "
-                       "ordinary grouped table shortcut at M=1";
-                ASSERT_TRUE(row_stage->execute(&ctx))
-                    << "serial shared decode stage failed at seq_len="
-                    << seq_len << " row=" << row << " format=" << format.label;
-                ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            /*
+             * Allocate the production stage's declared workspace once at the maximum
+             * verifier bucket.  The grouped side uses it through SharedExpertFFNStage,
+             * while the serial side calls the public M=1 MoE table-decode entry points
+             * below.  That is intentional: row replay is a test oracle here, never the
+             * production verifier path.
+             */
+            auto planning_input = makeZeros({4u, static_cast<size_t>(d_model)});
+            auto planning_output = makeZeros({4u, static_cast<size_t>(d_model)});
+            auto planning_stage = make_stage(
+                make_params(planning_input.get(), planning_output.get(), 4, true));
+            auto reqs = planning_stage->getWorkspaceRequirements(4, d_model, intermediate);
+            auto stage_workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+                device,
+                reqs.total_bytes_with_alignment() + 4 * 1024 * 1024);
+            ASSERT_TRUE(stage_workspace->allocate(reqs))
+                << "SharedExpertFFNStage Qwen3.6 verifier workspace format=" << format.label;
+            auto *moe_workspace_consumer =
+                dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);
+            ASSERT_NE(moe_workspace_consumer, nullptr);
+            moe_workspace_consumer->bindWorkspace(stage_workspace.get());
 
-                const auto row_host = copyCudaFP32TensorToHost(row_output, stream_);
-                std::copy_n(row_host.data(), d_model, serial_host.data() + row_offset);
-                row_stage->unbindWorkspace();
-            }
+            llaminar2::DeviceNativeVNNIMatrixDesc serial_gate_desc{};
+            llaminar2::DeviceNativeVNNIMatrixDesc serial_up_desc{};
+            llaminar2::DeviceNativeVNNIMatrixDesc serial_down_desc{};
+            ASSERT_TRUE(prepared.gate_kernel->exportNativeVNNIMatrixDesc(serial_gate_desc));
+            ASSERT_TRUE(prepared.up_kernel->exportNativeVNNIMatrixDesc(serial_up_desc));
+            ASSERT_TRUE(prepared.down_kernel->exportNativeVNNIMatrixDesc(serial_down_desc));
+            const int serial_gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+                &serial_gate_desc, &serial_up_desc, /*num_experts=*/1, d_model, intermediate);
+            ASSERT_GE(serial_gateup_table, 0)
+                << "shared gate/up serial table rejected format=" << format.label;
+            const int serial_down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+                &serial_down_desc, /*num_experts=*/1, d_model, intermediate);
+            ASSERT_GE(serial_down_table, 0)
+                << "shared down serial table rejected format=" << format.label;
 
-            expect_bitwise_equal(
-                grouped_host,
-                serial_host,
-                    std::string("SharedExpertFFNStage Qwen3.6 ") + format.label +
-                    " grouped verifier vs serial decode seq_len=" +
-                    std::to_string(seq_len));
-            grouped_stage->unbindWorkspace();
-        }
+            llaminar2::CUDADeviceContext ctx(device, 0);
 
-        const auto records =
-            llaminar2::PerfStatsCollector::snapshot({"kernel", "mtp"});
-        auto has_counter = [&](const char *domain,
-                               const char *name,
-                               const char *route,
-                               const char *active_slots) -> bool
-        {
-            return std::any_of(
-                records.begin(),
-                records.end(),
-                [&](const llaminar2::PerfStatRecord &record)
+            for (int seq_len : {2, 3, 4})
+            {
+                std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
+                for (size_t i = 0; i < input_values.size(); ++i)
                 {
-                    if (record.domain != domain || record.name != name)
-                        return false;
-                    auto tag_equals = [&](const char *key, const char *value)
-                    {
-                        const auto it = record.tags.find(key);
-                        return it != record.tags.end() && it->second == value;
-                    };
-                    return (!route || tag_equals("route", route)) &&
-                           (!active_slots || tag_equals("active_slots", active_slots));
-                });
-        };
-        EXPECT_TRUE(has_counter(
-            "mtp",
-            "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
-            "gemm_grouped_verifier_hooks",
-            nullptr))
-            << "The grouped side must not silently leave the grouped GEMM verifier route for "
-            << format.label << "\n"
-            << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
-        EXPECT_FALSE(has_counter(
-            "kernel",
-            "cuda_moe_grouped_decode_gateup_calls",
-            nullptr,
-            "1"))
-            << "The canonical serial oracle must bypass grouped table gate/up decode for "
-            << format.label << "\n"
-            << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
-        EXPECT_FALSE(has_counter(
-            "kernel",
-            "cuda_moe_grouped_decode_down_calls",
-            nullptr,
-            "1"))
-            << "The canonical serial oracle must bypass grouped table down decode for "
-            << format.label << "\n"
-            << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+                    input_values[i] =
+                        0.017f * std::sin(0.0041f * static_cast<float>(i + 13)) -
+                        0.011f * std::cos(0.0063f * static_cast<float>(i + 29)) +
+                        0.0008f * static_cast<float>(static_cast<int>(i % 31) - 15);
+                }
 
-        planning_stage->unbindWorkspace();
-    }
+                auto grouped_input = makeTensor(
+                    {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+                    input_values);
+                auto grouped_output = makeZeros(
+                    {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+                ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
+
+                auto grouped_stage = make_stage(
+                    make_params(grouped_input.get(), grouped_output.get(), seq_len, true));
+                grouped_stage->bindWorkspace(stage_workspace.get());
+                ASSERT_TRUE(grouped_stage->usesGroupedVerifierPrefillRouteForTesting())
+                    << "The left side must exercise the production grouped table-prefill verifier route";
+                ASSERT_FALSE(grouped_stage->usesDecodeEquivalentVerifierPrefillForTesting())
+                    << "CUDA shared verifier rows must not exercise obsolete dense GEMM-hook verifier paths";
+                ASSERT_TRUE(grouped_stage->execute(&ctx))
+                    << "grouped shared verifier stage failed at seq_len=" << seq_len
+                    << " format=" << format.label;
+                ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+                const auto grouped_host = copyCudaFP32TensorToHost(grouped_output, stream_);
+
+                std::vector<float> serial_host(static_cast<size_t>(seq_len) * d_model);
+                for (int row = 0; row < seq_len; ++row)
+                {
+                    const auto row_offset = static_cast<size_t>(row) * d_model;
+                    std::vector<float> row_values(static_cast<size_t>(d_model));
+                    std::copy_n(input_values.data() + row_offset, d_model, row_values.data());
+                    auto row_input = makeTensor({1u, static_cast<size_t>(d_model)}, row_values);
+                    auto row_gate = makeZeros({1u, static_cast<size_t>(intermediate)});
+                    auto row_up = makeZeros({1u, static_cast<size_t>(intermediate)});
+                    auto row_output = makeZeros({1u, static_cast<size_t>(d_model)});
+                    ASSERT_TRUE(row_input->ensureOnDevice(device, stream_));
+                    ASSERT_TRUE(row_gate->ensureOnDevice(device, stream_));
+                    ASSERT_TRUE(row_up->ensureOnDevice(device, stream_));
+                    ASSERT_TRUE(row_output->ensureOnDevice(device, stream_));
+
+                    constexpr int expert_id = 0;
+                    constexpr float expert_weight = 1.0f;
+                    llaminar2::ITensor *gate_outputs[1] = {row_gate.get()};
+                    llaminar2::ITensor *up_outputs[1] = {row_up.get()};
+                    ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+                        row_input.get(),
+                        &expert_id,
+                        serial_gateup_table,
+                        1,
+                        gate_outputs,
+                        up_outputs,
+                        d_model,
+                        intermediate))
+                        << "serial shared gate/up table decode failed at seq_len="
+                        << seq_len << " row=" << row << " format=" << format.label;
+                    ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
+                        gate_outputs,
+                        up_outputs,
+                        &expert_id,
+                        &expert_weight,
+                        serial_down_table,
+                        1,
+                        row_output.get(),
+                        d_model,
+                        intermediate))
+                        << "serial shared down table decode failed at seq_len="
+                        << seq_len << " row=" << row << " format=" << format.label;
+                    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+                    const auto row_host = copyCudaFP32TensorToHost(row_output, stream_);
+                    std::copy_n(row_host.data(), d_model, serial_host.data() + row_offset);
+                }
+
+                expectBitwiseFP32RowsEqual(
+                    std::string("SharedExpertFFNStage Qwen3.6 ") + format.label +
+                    " grouped table verifier vs serial grouped decode seq_len=" +
+                    std::to_string(seq_len),
+                    grouped_host.data(),
+                    serial_host.data(),
+                    grouped_host.size(),
+                    static_cast<size_t>(d_model));
+                grouped_stage->unbindWorkspace();
+            }
+
+            const auto records =
+                llaminar2::PerfStatsCollector::snapshot({"kernel", "mtp"});
+            auto has_counter = [&](const char *domain,
+                                   const char *name,
+                                   const char *route,
+                                   const char *active_slots) -> bool
+            {
+                return std::any_of(
+                    records.begin(),
+                    records.end(),
+                    [&](const llaminar2::PerfStatRecord &record)
+                    {
+                        if (record.domain != domain || record.name != name)
+                            return false;
+                        auto tag_equals = [&](const char *key, const char *value)
+                        {
+                            const auto it = record.tags.find(key);
+                            return it != record.tags.end() && it->second == value;
+                        };
+                        return (!route || tag_equals("route", route)) &&
+                               (!active_slots || tag_equals("active_slots", active_slots));
+                    });
+            };
+            EXPECT_TRUE(has_counter(
+                "mtp",
+                "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
+                "grouped_table_prefill",
+                nullptr))
+                << "The grouped side must not silently leave the grouped table-prefill verifier route for "
+                << format.label << "\n"
+                << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+            EXPECT_TRUE(has_counter(
+                "kernel",
+                "cuda_moe_grouped_decode_gateup_calls",
+                nullptr,
+                "1"))
+                << "The canonical serial oracle must exercise grouped table gate/up decode for "
+                << format.label << "\n"
+                << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+            EXPECT_TRUE(has_counter(
+                "kernel",
+                "cuda_moe_grouped_decode_down_calls",
+                nullptr,
+                "1"))
+                << "The canonical serial oracle must exercise grouped table down decode for "
+                << format.label << "\n"
+                << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
+
+            moe_workspace_consumer->bindWorkspace(workspace_.get());
+        }
     }
     llaminar2::PerfStatsCollector::reset();
 #endif

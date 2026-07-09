@@ -1053,6 +1053,13 @@ namespace
                     *error = "mock device-resident MTP publication request is invalid";
                 return false;
             }
+            if (primary_device_.is_gpu() && !request.base_cached_tokens.empty())
+            {
+                if (error)
+                    *error =
+                        "mock GPU device-resident MTP publication forbids host base-cache vectors";
+                return false;
+            }
 
             const int *meta = request.outcome.meta_device;
             for (int request_index = 0;
@@ -5793,6 +5800,9 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty())
+            << "GPU request-batch publication must consume the pre-verifier "
+               "device base-cache snapshot, not a host vector.";
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticContinuationPublishesDeviceOutcomes)
@@ -5892,6 +5902,9 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty())
+            << "GPU request-batch publication must not smuggle host base-cache "
+               "counts into resident state mutation.";
         EXPECT_THAT(mock->sequence_lengths(), ElementsAre(3, 3))
             << "The backend host mirror intentionally remains at the prefill "
                "length after resident request-batch publication.";
@@ -5998,6 +6011,7 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty());
     }
 
     /**
@@ -6069,6 +6083,7 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty());
     }
 
     /**
