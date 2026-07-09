@@ -93,7 +93,8 @@ build time on both CUDA and ROCm.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
 - LocalTP GPU grouped path: mirrored children publish resident outcomes;
   request-batch rows use device-token matrices/resident conditions. No row
-  replay, host-plan GPU publication, or host base-cache vector. Gates:
+  replay, host-plan GPU publication, host base-cache vectors, or synthetic
+  recurrent-state step plans. Gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, MTP units,
   full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,

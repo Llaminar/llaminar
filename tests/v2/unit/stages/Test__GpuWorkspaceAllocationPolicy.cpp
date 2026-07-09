@@ -3184,6 +3184,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
     EXPECT_NE(compact_publish.find("state_.mtp_kv_caches"),
               std::string::npos)
         << "Direct publication must update shifted MTP KV caches as part of the atomic handoff.";
+    EXPECT_NE(compact_publish.find("MTPDeviceVerifierStatePublicationShapedevice_state_shape"),
+              std::string::npos)
+        << "Resident GPU publication should describe request shape without "
+           "building synthetic host step plans.";
+    EXPECT_EQ(compact_publish.find("MTPSpecStepPlandirect_state_plan"),
+              std::string::npos)
+        << "Resident GPU publication must not synthesize host scalar plans for recurrent state.";
+    EXPECT_EQ(compact_publish.find("MTPSpecStepPlanBatchdirect_state_batch"),
+              std::string::npos)
+        << "Resident GPU publication must not synthesize host batch plans for recurrent state.";
     EXPECT_NE(compact_publish.find("publishAcceptedMTPSpecStateFromDeviceVerifierRow("),
               std::string::npos)
         << "Scalar direct publication keeps the single-row device-indexed helper.";

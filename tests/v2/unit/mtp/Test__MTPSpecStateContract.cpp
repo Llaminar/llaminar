@@ -162,6 +162,17 @@ namespace
         return plan;
     }
 
+    MTPDeviceVerifierStatePublicationShape devicePublicationShape(
+        int request_count = 1,
+        int target_rows = 4)
+    {
+        MTPDeviceVerifierStatePublicationShape shape;
+        shape.request_count = request_count;
+        shape.target_rows = target_rows;
+        shape.request_id = 9;
+        return shape;
+    }
+
     MTPSpecStepPlan participantPlan(int participant_id, int accepted_count)
     {
         MTPSpecStepPlan plan;
@@ -851,6 +862,7 @@ TEST(Test__MTPSpecStateContract, PublisherRestoresAcceptedRowOnCapturedStages)
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 2);
     EXPECT_EQ(result.restored_stage_count, 2);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_THAT(captured0.restored_rows, ElementsAre(1));
@@ -972,6 +984,8 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnE
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 3)
+        << "Legacy plan-shaped device publication should preserve plan accounting.";
     EXPECT_EQ(result.restored_stage_count, 2);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_TRUE(captured0.restored_rows.empty())
@@ -983,6 +997,30 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnE
     EXPECT_THAT(captured1.device_restored_rows, ElementsAre(&device_row));
     EXPECT_THAT(captured0.device_streams, ElementsAre(&explicit_stream));
     EXPECT_THAT(captured1.device_streams, ElementsAre(&explicit_stream));
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherAcceptsShapeWithoutHostPlan)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_row = 2;
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            devicePublicationShape(),
+            &device_row,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.request_id, 9);
+    EXPECT_EQ(result.accepted_count, 0)
+        << "Device-resident publication must not report a host-plan accepted count.";
+    EXPECT_TRUE(captured.restored_rows.empty());
+    EXPECT_THAT(captured.device_restored_rows, ElementsAre(&device_row));
+    EXPECT_THAT(captured.device_streams, ElementsAre(&explicit_stream));
 }
 
 TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsMissingMandatoryVerifierStateStage)
@@ -1083,6 +1121,8 @@ TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherUsesBatchRestoreHo
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 2)
+        << "Legacy batched device publication should preserve plan accounting.";
     EXPECT_EQ(result.restored_stage_count, 2);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_TRUE(captured0.device_restored_rows.empty())
@@ -1098,6 +1138,69 @@ TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherUsesBatchRestoreHo
     EXPECT_THAT(captured0.batch_streams, ElementsAre(&explicit_stream));
     EXPECT_THAT(captured1.batch_streams, ElementsAre(&explicit_stream));
     EXPECT_TRUE(skipped.batch_device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherAcceptsShapeWithoutHostPlans)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_rows[4] = {0, -1, 2, 3};
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            devicePublicationShape(/*request_count=*/2, /*target_rows=*/4),
+            device_rows,
+            /*row_index_stride=*/2,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 0)
+        << "Accepted counts stay in compact device metadata for the resident path.";
+    EXPECT_TRUE(captured.device_restored_rows.empty());
+    EXPECT_THAT(captured.batch_device_restored_rows, ElementsAre(device_rows));
+    EXPECT_THAT(captured.batch_request_counts, ElementsAre(2));
+    EXPECT_THAT(captured.batch_row_index_strides, ElementsAre(2));
+    EXPECT_THAT(captured.batch_streams, ElementsAre(&explicit_stream));
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsInvalidShapes)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_row = 0;
+    int explicit_stream = 0;
+
+    MTPDeviceVerifierStatePublicationShape scalar_shape =
+        devicePublicationShape();
+    scalar_shape.target_rows = 0;
+    MTPSpecStatePublicationResult scalar_result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            scalar_shape,
+            &device_row,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(scalar_result.ok);
+    EXPECT_THAT(scalar_result.error, HasSubstr("invalid scalar request shape"));
+
+    MTPDeviceVerifierStatePublicationShape batch_shape =
+        devicePublicationShape(/*request_count=*/0, /*target_rows=*/4);
+    MTPSpecStatePublicationResult batch_result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            batch_shape,
+            &device_row,
+            /*row_index_stride=*/1,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(batch_result.ok);
+    EXPECT_THAT(batch_result.error, HasSubstr("invalid request shape"));
+    EXPECT_TRUE(captured.device_restored_rows.empty());
+    EXPECT_TRUE(captured.batch_device_restored_rows.empty());
 }
 
 TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherRejectsCpuAndNullStream)
