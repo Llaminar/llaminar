@@ -85,10 +85,13 @@ namespace llaminar2
          *
          * @param runners Device runners with logits_local on GPU
          * @param params Sampling parameters (temperature, top_k, top_p, seed)
+         * @param threshold Caller-provided uniform draw in [0, 1), already keyed
+         *                  by the request's logical output position.
          * @return Token ID (>= 0) if succeeded, -1 if not supported
          */
         static int sample(const std::vector<std::unique_ptr<IInferenceRunner>> &runners,
-                          const SamplingParams &params);
+                          const SamplingParams &params,
+                          float threshold);
     };
 
 } // namespace llaminar2

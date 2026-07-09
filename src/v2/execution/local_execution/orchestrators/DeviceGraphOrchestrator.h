@@ -2440,6 +2440,9 @@ namespace llaminar2
          */
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
+        int sampleOnDeviceAtLogicalPosition(
+            const SamplingParams &params,
+            int logical_position) override;
         bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
         bool sampleMainLogitsBatchRowsOnDevice(
             int request_count,
@@ -2497,6 +2500,14 @@ namespace llaminar2
             const SamplingParams &params,
             int vocab_size,
             float threshold) override;
+        DeviceStochasticDraftSampleSlotHandle
+        deviceStochasticDraftSampleSlot(
+            int slot,
+            bool require_ready = false) override;
+        bool recordStochasticDraftSampleSlotReadyFromDevice(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true) override;
         bool stageStochasticDraftTokensForDeviceVerification(
             const int32_t *draft_tokens,
             int draft_token_count,
@@ -3677,6 +3688,7 @@ namespace llaminar2
             const int32_t *draft_tokens,
             const float *accept_thresholds,
             const float *residual_thresholds,
+            const float *sample_thresholds,
             int row_count,
             int32_t first_token,
             int first_target_sample_slot,
@@ -3691,6 +3703,7 @@ namespace llaminar2
             uint64_t inverse_sample_seed,
             int inverse_sample_first_logical_position,
             bool use_vllm_probability_rejection,
+            bool serial_sample_equivalent,
             int output_request_slot,
             void *stream_override,
             bool copy_summary_to_host);

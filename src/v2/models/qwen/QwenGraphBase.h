@@ -373,6 +373,69 @@ namespace llaminar2
         bool usesVocabParallelEmbeddingForCurrentGraph() const;
         int embeddingVocabOffsetForCurrentGraph(DeviceId device) const;
         bool useReplicatedAttentionStateWeights() const;
+
+        /**
+         * @brief Declarative source for the norm that feeds a final projection.
+         *
+         * The ordinary model LM head consumes `output_norm.weight`, while MTP
+         * sidecars consume their own `mtp.norm.weight` or
+         * `nextn.shared_head_norm.weight`.  Keeping this as a typed policy
+         * prevents graph code from accidentally pairing a full-vocabulary LM
+         * head with the wrong normalizer.
+         */
+        enum class FinalNormSource
+        {
+            ModelOutputNorm,
+            MTPSidecarNorm,
+        };
+
+        /**
+         * @brief Declarative LM-head weight/layout selected for a graph.
+         */
+        enum class FinalHeadPolicy
+        {
+            PrimaryColumnParallel,
+            PrimaryFullVocabulary,
+            DecodeReplicatedFullVocabulary,
+            MirroredLocalTPMTPFullVocabulary,
+        };
+
+        /**
+         * @brief Request object for resolving a graph final-projection policy.
+         */
+        struct FinalProjectionPolicyRequest
+        {
+            FinalNormSource norm_source = FinalNormSource::ModelOutputNorm;
+            TensorBase *mtp_norm = nullptr;
+            TensorBase *full_vocab_output = nullptr;
+            TensorBase *column_parallel_output = nullptr;
+            int total_tokens = 1;
+            bool force_full_vocabulary_head = false;
+            bool compute_all_positions = false;
+        };
+
+        /**
+         * @brief Resolved tensors and metadata for a final projection stage.
+         *
+         * Model-specific graph files should ask for one of these policies and
+         * wire the returned tensors into the base graph-building blocks instead
+         * of duplicating sharded/replicated LM-head decisions inline.
+         */
+        struct FinalProjectionPolicy
+        {
+            FinalNormSource norm_source = FinalNormSource::ModelOutputNorm;
+            FinalHeadPolicy head_policy = FinalHeadPolicy::PrimaryFullVocabulary;
+            TensorBase *norm_gamma = nullptr;
+            TensorBase *lm_head_weight = nullptr;
+            const WeightBinding *lm_head_binding = nullptr;
+            TensorBase *lm_head_output = nullptr;
+            int lm_head_vocab_size = 0;
+            bool column_parallel = false;
+            bool needs_allgather = false;
+        };
+
+        FinalProjectionPolicy resolveFinalProjectionPolicy(
+            const FinalProjectionPolicyRequest &request) const;
         /**
          * @brief Decide whether the current LM-head stage writes a local vocab shard.
          *

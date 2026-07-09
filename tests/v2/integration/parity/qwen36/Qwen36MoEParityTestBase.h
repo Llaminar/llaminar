@@ -63,6 +63,7 @@ namespace llaminar2::test::parity::qwen36
     enum class MoEPrefixParityTopology
     {
         SingleDevice,
+        NodeLocalTP,
         ExpertOverlayCuda2TPHotOnly,
         ExpertOverlayRocm2TPHotOnly,
         ExpertOverlayRocm2TPHotCpu2LocalTPCold,
@@ -86,6 +87,7 @@ namespace llaminar2::test::parity::qwen36
         int required_cuda_devices = 0;
         int required_rocm_devices = 0;
         int required_cpu_sockets = 0;
+        int mpi_ranks = 1;
         std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
         std::optional<MoERebalanceRuntimeConfig> moe_rebalance;
         std::vector<std::pair<std::string, std::string>> env_overrides;
@@ -1148,7 +1150,18 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case)
     {
         const int world_size = mpiWorldSize();
-        if (world_size != 1)
+        if (test_case.topology == MoEPrefixParityTopology::NodeLocalTP)
+        {
+            if (world_size != test_case.mpi_ranks)
+            {
+                std::ostringstream oss;
+                oss << test_case.name << " requires exactly "
+                    << test_case.mpi_ranks << " MPI rank(s), got "
+                    << world_size;
+                return oss.str();
+            }
+        }
+        else if (world_size != 1)
         {
             return test_case.name + " is a local topology test and must run with one MPI rank";
         }
@@ -1245,6 +1258,25 @@ namespace llaminar2::test::parity::qwen36
                                               ? GlobalDeviceAddress::cpu()
                                               : test_case.devices.front();
             break;
+        case MoEPrefixParityTopology::NodeLocalTP:
+            config.tp_degree = test_case.mpi_ranks;
+            config.tp_scope = TPScope::NODE_LOCAL;
+            config.pp_degree = 1;
+            config.default_backend = CollectiveBackendType::MPI;
+            config.device_mode = DeviceAssignmentMode::EXPLICIT;
+            config.device_map.clear();
+            config.device_map_numa_explicit.clear();
+            for (int rank = 0;
+                 rank < test_case.mpi_ranks &&
+                 rank < static_cast<int>(test_case.devices.size());
+                 ++rank)
+            {
+                config.device_map.emplace_back(rank, test_case.devices[rank]);
+                config.device_map_numa_explicit.emplace_back(
+                    rank,
+                    test_case.devices[rank].hasValidNuma());
+            }
+            break;
         case MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly:
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
@@ -1317,6 +1349,14 @@ namespace llaminar2::test::parity::qwen36
         case MoEPrefixParityTopology::SingleDevice:
             test_case.devices = {GlobalDeviceAddress::rocm(0)};
             test_case.required_rocm_devices = 1;
+            break;
+        case MoEPrefixParityTopology::NodeLocalTP:
+            test_case.devices = {
+                GlobalDeviceAddress::cpu(0),
+                GlobalDeviceAddress::cpu(1),
+            };
+            test_case.required_cpu_sockets = 2;
+            test_case.mpi_ranks = 2;
             break;
         case MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly:
             test_case.devices = {
@@ -1696,7 +1736,11 @@ namespace llaminar2::test::parity::qwen36
             hasMTPPerfCounter(
                 records,
                 "grouped_outcome_device_resident_publication_uses") &&
-            hasMTPPerfCounter(records, "spec_state_publications");
+            (hasMTPPerfCounter(records, "spec_state_publications") ||
+             hasMTPPerfCounter(records, "spec_state_batch_publications") ||
+             hasMTPPerfCounter(
+                 records,
+                 "rank_grouped_decode_equivalent_spec_state_batch_publications"));
         const bool used_direct_all_position_publication =
             hasMTPPerfCounter(
                 records,
@@ -2746,15 +2790,155 @@ namespace llaminar2::test::parity::qwen36
         PerfStatsCollector::reset();
     }
 
-    inline void runMoEStochasticMTPVerifierParity(
-        const MoEPrefixRestoreParityCase &test_case,
-        int draft_depth = 1,
-        bool require_accepted_draft_after_reuse = false)
+    /**
+     * @brief Construct the dynamic-depth policy used by MoE stochastic MTP parity.
+     *
+     * MoE stochastic validation uses a deliberately short controller window so
+     * the dynamic-depth tests prove the controller participates during the
+     * integration run.  A fixed-depth-looking dynamic run is a coverage hole.
+     */
+    inline MTPDepthPolicyConfig qwen36MoEStochasticDynamicDepthPolicy(
+        int max_depth = 3)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = std::max(1, max_depth);
+        depth_policy.initial_depth = depth_policy.max_depth;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        return depth_policy;
+    }
+
+    /**
+     * @brief Stochastic sampling parameters shared by MoE serial and MTP parity.
+     *
+     * Keeping the seeded sampling policy in one helper prevents the serial
+     * reproducibility regression from drifting away from the MTP verifier cells.
+     * These values intentionally exercise temperature, top-k, top-p, and sparse
+     * penalty handling instead of collapsing into a greedy argmax check.
+     */
+    inline SamplingParams qwen36MoEStochasticVerifierSamplingParams()
+    {
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.presence_penalty = 0.25f;
+        stochastic.seed = 123;
+        return stochastic;
+    }
+
+    /**
+     * @brief Prove same-seed serial stochastic decode is request-local.
+     *
+     * The stochastic MTP oracle is only meaningful when the corresponding
+     * no-MTP production decode path is deterministic for the same prompt and
+     * seed.  GPU LocalTP once sampled from a process-static RNG in
+     * DeviceSampler, so a second no-MTP runner in the same test process could
+     * consume a later RNG segment even with the same seed.  This regression
+     * exercises the real production GPU decode path and requires the
+     * logical-position sampler counter so the test cannot pass by silently
+     * routing through a host logits fallback.
+     */
+    inline void runMoESerialStochasticSameSeedReplay(
+        const MoEPrefixRestoreParityCase &test_case)
     {
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
-        ASSERT_EQ(test_case.topology, MoEPrefixParityTopology::SingleDevice)
-            << "MoE stochastic MTP verifier parity is currently single-device only";
+        ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides);
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        auto phase_start = parityPhaseStart();
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+            return;
+        logMoEParityPhase(test_case, "serial-stochastic-reference-inputs", phase_start);
+
+        constexpr int block_size = 2;
+        const int stochastic_decode_steps = std::max(2, test_case.decode_steps);
+        const SamplingParams stochastic =
+            qwen36MoEStochasticVerifierSamplingParams();
+        auto factory = createOrchestrationRunnerFactory();
+        auto run_once = [&](const char *label)
+        {
+            auto config =
+                makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, false);
+            auto runner = factory->createFromOrchestrationConfig(config);
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+                return std::vector<int32_t>{};
+
+            auto local_phase_start = parityPhaseStart();
+            EXPECT_TRUE(runner->initialize()) << runner->lastError();
+            const std::string init_phase = std::string(label) + ".initialize";
+            logMoEParityPhase(test_case, init_phase.c_str(), local_phase_start);
+
+            PerfStatsCollector::reset();
+            local_phase_start = parityPhaseStart();
+            auto result =
+                runner->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+            const std::string generate_phase = std::string(label) + ".generate";
+            logMoEParityPhase(test_case, generate_phase.c_str(), local_phase_start);
+            const auto records = PerfStatsCollector::snapshot({"sampling", "mtp"});
+            const auto snapshot = runner->prefixStateProbe();
+            runner->shutdown();
+
+            EXPECT_TRUE(result.error.empty()) << result.error;
+            EXPECT_EQ(result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+            EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
+            EXPECT_EQ(snapshot.mtp_stochastic_accept_tests, 0u);
+            EXPECT_GE(
+                perfCounterSum(
+                    records,
+                    "sampling",
+                    "main_stochastic_logical_position_samples"),
+                static_cast<double>(stochastic_decode_steps))
+                << test_case.name
+                << " serial stochastic decode must use the logical-position "
+                   "production sampler, not process-static RNG or host "
+                   "logits fallback";
+            return result.tokens;
+        };
+
+        const std::vector<int32_t> first = run_once("serial-stochastic.first");
+        const std::vector<int32_t> second = run_once("serial-stochastic.second");
+        ASSERT_FALSE(first.empty());
+        ASSERT_FALSE(second.empty());
+        EXPECT_EQ(second, first)
+            << test_case.name
+            << " serial stochastic decode must be reproducible for two "
+               "independent same-seed requests in one process";
+        PerfStatsCollector::reset();
+    }
+
+    inline void runMoEStochasticMTPVerifierParity(
+        const MoEPrefixRestoreParityCase &test_case,
+        int draft_depth = 1,
+        bool require_stochastic_outcome_after_reuse = false,
+        MTPDepthPolicyConfig mtp_depth_policy = {},
+        bool enable_prefix_cache = false)
+    {
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
+        ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides);
+        ASSERT_TRUE(test_case.topology == MoEPrefixParityTopology::SingleDevice ||
+                    test_case.topology == MoEPrefixParityTopology::NodeLocalTP ||
+                    test_case.topology ==
+                        MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
+                    test_case.topology ==
+                        MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly)
+            << "MoE stochastic MTP verifier parity requires a full local owner, "
+               "NodeLocalTP CPU domain, or homogeneous GPU expert-overlay TP domain";
 
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -2774,16 +2958,16 @@ namespace llaminar2::test::parity::qwen36
         }
         logMoEParityPhase(test_case, "stochastic-reference-inputs", phase_start);
 
-        constexpr int block_size = 2;
+        const int block_size = enable_prefix_cache
+                                   ? static_cast<int>(prompt_tokens.size())
+                                   : 2;
+        const int requested_draft_depth = std::max(1, draft_depth);
+        const bool dynamic_depth =
+            mtp_depth_policy.mode == MTPDepthPolicyMode::Dynamic;
         const int stochastic_decode_steps = std::max(2, test_case.decode_steps);
         auto factory = createOrchestrationRunnerFactory();
 
-        SamplingParams stochastic;
-        stochastic.temperature = 0.6f;
-        stochastic.top_k = 20;
-        stochastic.top_p = 0.95f;
-        stochastic.presence_penalty = 0.25f;
-        stochastic.seed = 123;
+        SamplingParams stochastic = qwen36MoEStochasticVerifierSamplingParams();
 
         auto baseline_config =
             makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, false);
@@ -2809,10 +2993,11 @@ namespace llaminar2::test::parity::qwen36
             makeMoEPrefixRestoreConfig(
                 test_case,
                 model_path,
-                false,
+                enable_prefix_cache,
                 block_size,
                 true,
-                draft_depth);
+                requested_draft_depth,
+                mtp_depth_policy);
         mtp_config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
 
         auto mtp = factory->createFromOrchestrationConfig(mtp_config);
@@ -2828,8 +3013,62 @@ namespace llaminar2::test::parity::qwen36
         auto mtp_result =
             mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         logMoEParityPhase(test_case, "stochastic-mtp.first-generate", phase_start);
+        const auto after_first_mtp = mtp->prefixStateProbe();
         ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
         ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+        EXPECT_EQ(mtp_result.tokens, baseline_result.tokens)
+            << "MoE stochastic MTP must match serial stochastic decode for "
+               "the same seed on the first request";
+        if (enable_prefix_cache)
+        {
+            EXPECT_TRUE(after_first_mtp.prefix_cache_ready);
+            EXPECT_GE(after_first_mtp.prefix_cache_inserts, 1u);
+            EXPECT_GT(after_first_mtp.prefix_cache_mtp_state_bytes, 0u);
+
+            PerfStatsCollector::reset();
+            phase_start = parityPhaseStart();
+            auto restored_mtp_result =
+                mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+            logMoEParityPhase(
+                test_case,
+                "stochastic-mtp.prefix-restored-generate",
+                phase_start);
+            const auto after_restored_mtp = mtp->prefixStateProbe();
+            const auto restored_records = PerfStatsCollector::snapshot(
+                {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
+
+            ASSERT_TRUE(restored_mtp_result.error.empty())
+                << restored_mtp_result.error;
+            ASSERT_EQ(restored_mtp_result.tokens.size(), mtp_result.tokens.size());
+            EXPECT_EQ(restored_mtp_result.tokens, baseline_result.tokens)
+                << "MoE stochastic MTP after prefix restore must match serial "
+                   "stochastic decode for the same seed";
+            EXPECT_EQ(restored_mtp_result.tokens, mtp_result.tokens)
+                << "MoE stochastic MTP with the same seed must be reproducible "
+                   "after a prefix-cache restore";
+            EXPECT_TRUE(after_restored_mtp.prefix_cache_ready);
+            EXPECT_GE(after_restored_mtp.prefix_cache_hits, 1u);
+            EXPECT_TRUE(after_restored_mtp.prefix_request.hit);
+            EXPECT_EQ(after_restored_mtp.prefix_request.matched_tokens,
+                      static_cast<int>(prompt_tokens.size()));
+            EXPECT_TRUE(after_restored_mtp.prefix_request.terminal_logits_restored);
+            EXPECT_TRUE(after_restored_mtp.prefix_request.terminal_hidden_restored);
+            EXPECT_TRUE(after_restored_mtp.prefix_request.mtp_state_restored);
+            EXPECT_FALSE(after_restored_mtp.mtp_bypassed)
+                << after_restored_mtp.mtp_bypass_reason;
+            EXPECT_GE(after_restored_mtp.mtp_stochastic_accept_tests, 1u);
+            expectMoEPrefixCachePerfPath(
+                restored_records,
+                test_case.name + " stochastic restored-prefix request");
+            expectMoERebalancePerfPath(
+                test_case,
+                restored_records,
+                test_case.name + " stochastic restored-prefix request");
+            expectMoEBackendKernelPerfPath(
+                test_case,
+                restored_records,
+                test_case.name + " stochastic restored-prefix request");
+        }
 
         mtp->clearCache();
         PerfStatsCollector::reset();
@@ -2838,17 +3077,36 @@ namespace llaminar2::test::parity::qwen36
             mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         logMoEParityPhase(test_case, "stochastic-mtp.reused-generate", phase_start);
         const auto after_reused_mtp = mtp->prefixStateProbe();
-        const auto phase138_records = PerfStatsCollector::snapshot({"mtp"});
+        const auto phase138_records =
+            PerfStatsCollector::snapshot({"mtp", "moe_rebalance", "kernel"});
         mtp->shutdown();
 
         ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
         ASSERT_EQ(reused_mtp_result.tokens.size(), mtp_result.tokens.size());
+        EXPECT_EQ(reused_mtp_result.tokens, baseline_result.tokens)
+            << "MoE stochastic MTP after clearCache() must match serial "
+               "stochastic decode for the same seed";
         EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
             << "MoE stochastic MTP with the same seed must be reproducible after clearCache()";
         EXPECT_FALSE(after_reused_mtp.mtp_bypassed)
             << after_reused_mtp.mtp_bypass_reason;
         EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(after_reused_mtp.mtp_request.stochastic_verify);
+        if (dynamic_depth)
+        {
+            EXPECT_TRUE(after_reused_mtp.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(after_reused_mtp.mtp_request.depth_policy_mode, "dynamic");
+            EXPECT_GE(after_reused_mtp.mtp_depth_policy_windows, 1u);
+            EXPECT_GE(after_reused_mtp.mtp_min_depth, mtp_depth_policy.min_depth);
+            EXPECT_EQ(after_reused_mtp.mtp_max_depth, mtp_depth_policy.max_depth);
+            EXPECT_GE(after_reused_mtp.mtp_current_depth, mtp_depth_policy.min_depth);
+            EXPECT_LE(after_reused_mtp.mtp_current_depth, mtp_depth_policy.max_depth);
+        }
+        else
+        {
+            EXPECT_FALSE(after_reused_mtp.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(after_reused_mtp.mtp_max_depth, requested_draft_depth);
+        }
         EXPECT_EQ(after_reused_mtp.mtp_transaction_validation_failures, 0u)
             << test_case.name
             << " MoE stochastic MTP hit MTP transaction validation failures";
@@ -2881,13 +3139,19 @@ namespace llaminar2::test::parity::qwen36
                         expected_rate,
                         1e-12);
         }
-        if (require_accepted_draft_after_reuse)
+        if (require_stochastic_outcome_after_reuse)
         {
-            EXPECT_GT(after_reused_mtp.mtp_stochastic_accepts, 0u)
-                << "Fixed-depth stochastic MTP must accept at least one draft "
-                   "after clearCache(); zero accepts usually means a preserved "
-                   "captured sidecar/verifier graph is reading stale dynamic "
-                   "kernel or request metadata.\n"
+            EXPECT_GT(after_reused_mtp.mtp_stochastic_accept_tests, 0u)
+                << "Fixed-depth stochastic MTP must run at least one verifier "
+                   "acceptance test after clearCache().\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_GT(after_reused_mtp.mtp_stochastic_residual_samples +
+                          after_reused_mtp.mtp_stochastic_terminal_samples,
+                      0u)
+                << "Fixed-depth stochastic MTP must exercise stochastic "
+                   "correction or terminal sampling after clearCache(); token "
+                   "equality alone is not proof that the stochastic verifier "
+                   "path ran.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
 
@@ -2902,7 +3166,11 @@ namespace llaminar2::test::parity::qwen36
             hasMTPPerfCounter(
                 phase138_records,
                 "grouped_outcome_device_resident_publication_uses") &&
-            hasMTPPerfCounter(phase138_records, "spec_state_publications");
+            (hasMTPPerfCounter(phase138_records, "spec_state_publications") ||
+             hasMTPPerfCounter(phase138_records, "spec_state_batch_publications") ||
+             hasMTPPerfCounter(
+                 phase138_records,
+                 "rank_grouped_decode_equivalent_spec_state_batch_publications"));
         const bool used_all_position_publication =
             hasMTPPerfCounter(
                 phase138_records,

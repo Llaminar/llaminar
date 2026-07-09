@@ -9,7 +9,8 @@
 # Feature branches run a 7-step suite:
 #   1. Integration build
 #   2. Unit tests (parallel)
-#   3. Focused integration tests (grouped verifier decode-equivalence)
+#   3. Focused integration tests (grouped verifier decode-equivalence +
+#      Qwen3.6 stochastic MTP depth matrix)
 #   4. Focused parity baseline (56 tests, all model families, sequential)
 #   5. E2E release build
 #   6. E2E server integration tests
@@ -100,10 +101,13 @@ echo ""
 # Step 3: Run Focused Integration Tests
 # This gate is intentionally small and high-signal: grouped verifier rows must
 # be bitwise-equivalent to serial decode across CPU, CUDA, ROCm, and supported
-# tensor formats/codebooks. It runs before the heavier parity/E2E gates so MTP
-# decode-equivalence regressions fail quickly.
+# tensor formats/codebooks. The stochastic Qwen3.6 matrix then proves Dense and
+# MoE speculative sampling at fixed depths 1/2/3 and dynamic depth across CPU,
+# CUDA, and ROCm, including Dense CUDA/ROCm LocalTP, MoE CUDA/ROCm ExpertOverlay
+# LocalTP, and MoE CPU NodeLocalTP. It also covers MoE Dynamic/LLEP + prefix
+# cache rows so TP/EP path-exercise regressions fail before the heavier gates.
 FOCUSED_INTEG_STEP=3
-echo -e "${YELLOW}[${FOCUSED_INTEG_STEP}/${TOTAL_STEPS}] Running focused integration tests (grouped verifier rows)...${NC}"
+echo -e "${YELLOW}[${FOCUSED_INTEG_STEP}/${TOTAL_STEPS}] Running focused integration tests (grouped verifier rows + stochastic MTP matrix)...${NC}"
 echo ""
 
 set +e
@@ -117,6 +121,25 @@ if [ $FOCUSED_INTEG_EXIT_CODE -ne 0 ]; then
     echo ""
     echo -e "${YELLOW}Re-run standalone for details:${NC}"
     echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R \"^V2_Integration_GroupedVerifierRows_\" --output-on-failure --parallel${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+
+STOCHASTIC_MTP_REGEX='^(V2_Integration_Parity_Qwen36_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36MoE_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36_LocalTP_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfterClearCache|V2_Integration_Parity_Qwen36MoE_(ExpertOverlay|NodeLocalTP)_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfter(ClearCache|PrefixRestore).*|V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*PrefixCacheMTPRestore_(CUDA2TP|ROCm2TP)(Dynamic|LLEP)PhaseSplit)$'
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "$STOCHASTIC_MTP_REGEX" --output-on-failure
+STOCHASTIC_MTP_EXIT_CODE=$?
+set -e
+
+if [ $STOCHASTIC_MTP_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo -e "${RED}❌ Focused stochastic MTP matrix failed — speculative sampling may not be decode-equivalent across depth/backend/model lanes.${NC}"
+    echo ""
+    echo -e "${YELLOW}Re-run standalone for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R '$STOCHASTIC_MTP_REGEX' --output-on-failure${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"

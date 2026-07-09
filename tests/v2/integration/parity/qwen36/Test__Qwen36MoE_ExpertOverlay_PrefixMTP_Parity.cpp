@@ -220,6 +220,30 @@ namespace
     }
 
     /**
+     * @brief Converts a hot-only fixture into a stochastic MTP depth probe.
+     *
+     * The stochastic matrix needs enough decode steps to exercise fixed depths
+     * 1/2/3 and the dynamic depth controller, but it should not inherit the
+     * long ledger metadata used by rebalance migration cells.  This helper keeps
+     * the GPU TP stochastic rows affordable while still using a prompt with
+     * enough entropy to drive accept/reject sampling behavior.
+     *
+     * @param test_case Case object to mutate.
+     * @param metadata_path Backend-specific PyTorch metadata for the benchmark prompt.
+     */
+    void configureHotOnlyStochasticBenchmarkProbe(
+        MoEPrefixRestoreParityCase &test_case,
+        const std::string &metadata_path)
+    {
+        test_case.name += " stochastic benchmark-prompt MTP";
+        test_case.prompt = qwen36MoEBenchmarkPrompt();
+        test_case.metadata_envs = {};
+        test_case.default_metadata_path = metadata_path;
+        test_case.decode_steps = 4;
+        test_case.max_seq_len = 768;
+    }
+
+    /**
      * @brief Builds the mixed ROCm-hot/CPU-cold expert-overlay fixture.
      *
      * @return Qwen3.6 MoE prefix parity case with ROCm hot experts and CPU cold experts.
@@ -244,6 +268,20 @@ namespace
     }
 
     /**
+     * @brief Builds the ROCm hot-only stochastic benchmark fixture.
+     *
+     * @return ROCm two-device expert-overlay case with benchmark prompt metadata.
+     */
+    MoEPrefixRestoreParityCase rocmOnlyStochasticBenchmarkCase()
+    {
+        auto test_case = rocmOnlyExpertOverlayCase();
+        configureHotOnlyStochasticBenchmarkProbe(
+            test_case,
+            "pytorch_qwen36_moe_expert_overlay_rocm2_mtp_diagnostic_snapshots/metadata.txt");
+        return test_case;
+    }
+
+    /**
      * @brief Builds the CUDA two-device hot-only expert-overlay fixture.
      *
      * @return Qwen3.6 MoE prefix parity case using CUDA local TP for hot experts.
@@ -259,6 +297,20 @@ namespace
          * Exact prefix/MTP restore equality is asserted on the stable prefix.
          */
         test_case.decode_steps = 2;
+        return test_case;
+    }
+
+    /**
+     * @brief Builds the CUDA hot-only stochastic benchmark fixture.
+     *
+     * @return CUDA two-device expert-overlay case with benchmark prompt metadata.
+     */
+    MoEPrefixRestoreParityCase cudaOnlyStochasticBenchmarkCase()
+    {
+        auto test_case = cudaOnlyExpertOverlayCase();
+        configureHotOnlyStochasticBenchmarkProbe(
+            test_case,
+            "pytorch_qwen36_moe_expert_overlay_cuda2_mtp_diagnostic_snapshots/metadata.txt");
         return test_case;
     }
 
@@ -363,6 +415,48 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_CUDA2TPHotOnly
     runMoEMTPParity(cudaOnlyExpertOverlayCase(), true);
 }
 
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, SerialStochasticSameSeedReplay_CUDA2TPHotOnly)
+{
+    runMoESerialStochasticSameSeedReplay(cudaOnlyStochasticBenchmarkCase());
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth1VerifierMatchesAfterClearCache_CUDA2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(cudaOnlyStochasticBenchmarkCase(), 1);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth2VerifierMatchesAfterClearCache_CUDA2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(cudaOnlyStochasticBenchmarkCase(), 2);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterClearCache_CUDA2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyStochasticBenchmarkCase(),
+        3,
+        true);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache_CUDA2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyStochasticBenchmarkCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3));
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_CUDA2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyStochasticBenchmarkCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
+}
+
 /**
  * @brief Proves CUDA LocalTP grouped verifier rows match rowwise serial decode.
  *
@@ -457,6 +551,48 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHotOnly)
 {
     runMoEMTPParity(rocmOnlyExpertOverlayCase(), true);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, SerialStochasticSameSeedReplay_ROCm2TPHotOnly)
+{
+    runMoESerialStochasticSameSeedReplay(rocmOnlyStochasticBenchmarkCase());
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth1VerifierMatchesAfterClearCache_ROCm2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(rocmOnlyStochasticBenchmarkCase(), 1);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth2VerifierMatchesAfterClearCache_ROCm2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(rocmOnlyStochasticBenchmarkCase(), 2);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterClearCache_ROCm2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyStochasticBenchmarkCase(),
+        3,
+        true);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache_ROCm2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyStochasticBenchmarkCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3));
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterPrefixRestore_ROCm2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyStochasticBenchmarkCase(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        true);
 }
 
 /**

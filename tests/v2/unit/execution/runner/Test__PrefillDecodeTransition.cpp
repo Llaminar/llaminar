@@ -37,6 +37,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../mocks/MockModelContext.h"
+#include "../../../mocks/MockLocalTPContext.h"
 #include "../../../mocks/MockMPIContext.h"
 
 #include <algorithm>
@@ -664,7 +665,9 @@ namespace
 
         bool hasMTPLogitsLocal() const override
         {
-            return column_parallel_logits_ && mtp_logits_local_ != nullptr;
+            return column_parallel_logits_ &&
+                   !mirrors_localtp_mtp_head_for_verifier_ &&
+                   mtp_logits_local_ != nullptr;
         }
 
         LogitsLocalInfo getMTPLogitsLocalInfo() const override
@@ -1926,6 +1929,8 @@ namespace
             last_request_batch_outcome_inverse_sample_seeds_.clear();
             last_request_batch_outcome_inverse_sample_first_positions_.clear();
             last_request_batch_outcome_derived_thresholds_.clear();
+            last_request_batch_outcome_serial_sample_equivalent_.clear();
+            last_request_batch_outcome_sample_thresholds_.clear();
             if (!requests ||
                 request_count <= 0 ||
                 request_count > kMockResidentOutcomeRequestCapacity ||
@@ -2945,6 +2950,8 @@ namespace
             last_request_batch_outcome_inverse_sample_seeds_.clear();
             last_request_batch_outcome_inverse_sample_first_positions_.clear();
             last_request_batch_outcome_derived_thresholds_.clear();
+            last_request_batch_outcome_serial_sample_equivalent_.clear();
+            last_request_batch_outcome_sample_thresholds_.clear();
             if (!requests || request_count <= 0 || !outcomes)
                 return false;
 
@@ -2977,16 +2984,22 @@ namespace
                     request.inverse_sample_first_logical_position);
                 last_request_batch_outcome_derived_thresholds_.push_back(
                     request.derive_thresholds_from_seed);
+                last_request_batch_outcome_serial_sample_equivalent_.push_back(
+                    request.serial_sample_equivalent);
                 std::vector<int32_t> draft_tokens;
                 std::vector<float> accept_thresholds;
                 std::vector<float> residual_thresholds;
+                std::vector<float> sample_thresholds;
                 draft_tokens.reserve(static_cast<size_t>(request.row_count));
                 accept_thresholds.reserve(static_cast<size_t>(request.row_count));
                 residual_thresholds.reserve(static_cast<size_t>(request.row_count));
+                sample_thresholds.reserve(static_cast<size_t>(request.row_count));
                 for (int row = 0; row < request.row_count; ++row)
                 {
                     draft_tokens.push_back(
                         request.draft_tokens[static_cast<size_t>(row)]);
+                    sample_thresholds.push_back(
+                        request.sample_thresholds[static_cast<size_t>(row)]);
                     if (request.derive_thresholds_from_seed)
                     {
                         const int logical_position =
@@ -3023,6 +3036,8 @@ namespace
                     std::move(accept_thresholds));
                 last_request_batch_outcome_residual_thresholds_.push_back(
                     std::move(residual_thresholds));
+                last_request_batch_outcome_sample_thresholds_.push_back(
+                    std::move(sample_thresholds));
             }
 
             if (!IInferenceRunner::
@@ -3121,6 +3136,8 @@ namespace
             last_request_batch_outcome_inverse_sample_seeds_.clear();
             last_request_batch_outcome_inverse_sample_first_positions_.clear();
             last_request_batch_outcome_derived_thresholds_.clear();
+            last_request_batch_outcome_serial_sample_equivalent_.clear();
+            last_request_batch_outcome_sample_thresholds_.clear();
             if (!requests || request_count <= 0 || !out_handle)
                 return false;
             if (request_count > kMockResidentOutcomeRequestCapacity)
@@ -3155,17 +3172,23 @@ namespace
                     request.inverse_sample_first_logical_position);
                 last_request_batch_outcome_derived_thresholds_.push_back(
                     request.derive_thresholds_from_seed);
+                last_request_batch_outcome_serial_sample_equivalent_.push_back(
+                    request.serial_sample_equivalent);
 
                 std::vector<int32_t> draft_tokens;
                 std::vector<float> accept_thresholds;
                 std::vector<float> residual_thresholds;
+                std::vector<float> sample_thresholds;
                 draft_tokens.reserve(static_cast<size_t>(request.row_count));
                 accept_thresholds.reserve(static_cast<size_t>(request.row_count));
                 residual_thresholds.reserve(static_cast<size_t>(request.row_count));
+                sample_thresholds.reserve(static_cast<size_t>(request.row_count));
                 for (int row = 0; row < request.row_count; ++row)
                 {
                     draft_tokens.push_back(
                         request.draft_tokens[static_cast<size_t>(row)]);
+                    sample_thresholds.push_back(
+                        request.sample_thresholds[static_cast<size_t>(row)]);
                     if (request.derive_thresholds_from_seed)
                     {
                         const int logical_position =
@@ -3195,6 +3218,8 @@ namespace
                     std::move(accept_thresholds));
                 last_request_batch_outcome_residual_thresholds_.push_back(
                     std::move(residual_thresholds));
+                last_request_batch_outcome_sample_thresholds_.push_back(
+                    std::move(sample_thresholds));
             }
 
             std::array<DeviceSpeculativeVerifyBatchOutcome,
@@ -3294,6 +3319,115 @@ namespace
                     fallback.sampled_terminal =
                         meta[sampling_math::kSpecBatchMetaSampledTerminal] != 0;
                     outcomes[static_cast<size_t>(i)] = fallback;
+                }
+                else if (request.serial_sample_equivalent)
+                {
+                    ++device_distribution_verify_batch_count_;
+                    if (request.row_count <= 0 ||
+                        request.row_count > sampling_math::kSpeculativeBatchMaxRows ||
+                        request.bonus_target_slot < 0 ||
+                        request.token_row_offset < 0 ||
+                        request.token_row_stride <= request.row_count ||
+                        request.token_row_offset + request.token_row_stride >
+                            static_cast<int>(device_verifier_input_tokens_.size()))
+                    {
+                        return false;
+                    }
+
+                    int32_t first_token = request.first_token;
+                    if (request.first_token_from_device)
+                    {
+                        first_token =
+                            device_verifier_input_tokens_[static_cast<size_t>(
+                                request.token_row_offset)];
+                    }
+
+                    std::array<int, sampling_math::kSpeculativeBatchMaxRows>
+                        row_tokens = {-1, -1, -1, -1};
+                    std::array<int, sampling_math::kSpeculativeBatchMaxRows>
+                        row_accepted = {0, 0, 0, 0};
+                    for (int row = 0; row < request.row_count; ++row)
+                    {
+                        const auto &target =
+                            deviceDistribution(DeviceDistributionBuffer::Target,
+                                               request.first_target_slot + row);
+                        if (target.empty())
+                            return false;
+                        const int sampled_target =
+                            sampleWithThreshold(
+                                target,
+                                request.sample_thresholds[static_cast<size_t>(row)]);
+                        if (sampled_target < 0)
+                            return false;
+                        const int32_t draft_token =
+                            device_verifier_input_tokens_[static_cast<size_t>(
+                                request.token_row_offset + row + 1)];
+                        if (draft_token < 0)
+                            return false;
+                        row_tokens[static_cast<size_t>(row)] = sampled_target;
+                        row_accepted[static_cast<size_t>(row)] =
+                            sampled_target == draft_token ? 1 : 0;
+                    }
+
+                    const auto &bonus_distribution =
+                        deviceDistribution(DeviceDistributionBuffer::Target,
+                                           request.bonus_target_slot);
+                    if (bonus_distribution.empty())
+                        return false;
+                    const int bonus_ready_token =
+                        sampleWithThreshold(bonus_distribution,
+                                            request.bonus_threshold);
+                    if (bonus_ready_token < 0)
+                        return false;
+
+                    std::array<int, sampling_math::kSpeculativeBatchMaxOutputTokens>
+                        output_tokens = {-1, -1, -1, -1, -1};
+                    std::array<int, sampling_math::kSpeculativeBatchMetaCount>
+                        meta = {};
+                    sampling_math::summarize_speculative_verify_batch(
+                        first_token,
+                        row_tokens.data(),
+                        row_accepted.data(),
+                        request.row_count,
+                        request.stop_token_count > 0
+                            ? request.stop_tokens.data()
+                            : nullptr,
+                        request.stop_token_count,
+                        bonus_ready_token,
+                        /*has_bonus_ready_token=*/1,
+                        output_tokens.data(),
+                        meta.data());
+                    if (meta[sampling_math::kSpecBatchMetaOk] == 0)
+                        return false;
+
+                    DeviceSpeculativeVerifyBatchOutcome strict_outcome;
+                    strict_outcome.ok = true;
+                    for (size_t token_index = 0;
+                         token_index < strict_outcome.output_tokens.size();
+                         ++token_index)
+                    {
+                        strict_outcome.output_tokens[token_index] =
+                            output_tokens[token_index];
+                    }
+                    strict_outcome.output_token_count =
+                        meta[sampling_math::kSpecBatchMetaOutputCount];
+                    strict_outcome.accepted_speculative_prefix =
+                        meta[sampling_math::kSpecBatchMetaAcceptedSpeculativePrefix];
+                    strict_outcome.target_verifier_state_commit_count =
+                        meta[sampling_math::kSpecBatchMetaTargetVerifierStateCommitCount];
+                    strict_outcome.ready_token =
+                        meta[sampling_math::kSpecBatchMetaReadyToken];
+                    strict_outcome.rejected_verified_token =
+                        meta[sampling_math::kSpecBatchMetaRejectedVerifiedToken];
+                    strict_outcome.stopped_on_output =
+                        meta[sampling_math::kSpecBatchMetaStoppedOnOutput] != 0;
+                    strict_outcome.all_speculative_accepted =
+                        meta[sampling_math::kSpecBatchMetaAllSpeculativeAccepted] != 0;
+                    strict_outcome.consumed_verifier_rows =
+                        meta[sampling_math::kSpecBatchMetaConsumedVerifierRows];
+                    strict_outcome.sampled_terminal =
+                        meta[sampling_math::kSpecBatchMetaSampledTerminal] != 0;
+                    outcomes[static_cast<size_t>(i)] = strict_outcome;
                 }
                 else
                 {
@@ -3752,6 +3886,14 @@ namespace
         const std::vector<bool> &lastRequestBatchOutcomeDerivedThresholds() const
         {
             return last_request_batch_outcome_derived_thresholds_;
+        }
+        const std::vector<bool> &lastRequestBatchOutcomeSerialSampleEquivalent() const
+        {
+            return last_request_batch_outcome_serial_sample_equivalent_;
+        }
+        const std::vector<std::vector<float>> &lastRequestBatchOutcomeSampleThresholds() const
+        {
+            return last_request_batch_outcome_sample_thresholds_;
         }
         int forwardMTPAndSampleCount() const { return forward_mtp_and_sample_count_; }
         int forwardMTPBatchAndSampleCount() const
@@ -4964,6 +5106,8 @@ namespace
         std::vector<uint64_t> last_request_batch_outcome_inverse_sample_seeds_;
         std::vector<int> last_request_batch_outcome_inverse_sample_first_positions_;
         std::vector<bool> last_request_batch_outcome_derived_thresholds_;
+        std::vector<bool> last_request_batch_outcome_serial_sample_equivalent_;
+        std::vector<std::vector<float>> last_request_batch_outcome_sample_thresholds_;
         std::vector<std::string> publication_events_;
         std::vector<std::string> execution_events_;
         std::vector<std::pair<int, int>> forced_request_batch_rejections_;
@@ -5235,10 +5379,19 @@ namespace
             auto model_ctx = test::MockModelContext::createMinimal();
             model_ctx->setVocabSize(MockInferenceRunner::VOCAB_SIZE);
 
+            auto tp_ctx = std::make_unique<llaminar2::test::MockLocalTPContext>();
+            tp_ctx->setDevices(devices);
+            if (devices.front().isCUDA())
+                tp_ctx->setBackend(CollectiveBackendType::NCCL);
+            else if (devices.front().isROCm())
+                tp_ctx->setBackend(CollectiveBackendType::RCCL);
+            else
+                tp_ctx->setBackend(CollectiveBackendType::HOST);
+
             auto rank_runner = RankOrchestrator::createForTest(
                 std::move(model_ctx),
                 std::move(device_runners),
-                nullptr,
+                std::move(tp_ctx),
                 rank_config);
 
             OrchestrationConfig config;
@@ -5251,9 +5404,11 @@ namespace
             RankExecutionPlan runner_plan = plan_;
             runner_plan.primary_device = devices.front();
             runner_plan.local_tp_devices = devices;
-            runner_plan.local_tp_backend = devices.front().isROCm()
-                                               ? CollectiveBackendType::RCCL
-                                               : CollectiveBackendType::HOST;
+            runner_plan.local_tp_backend = devices.front().isCUDA()
+                                               ? CollectiveBackendType::NCCL
+                                               : (devices.front().isROCm()
+                                                      ? CollectiveBackendType::RCCL
+                                                      : CollectiveBackendType::HOST);
 
             auto runner = std::make_unique<OrchestrationRunner>(
                 std::move(config), std::move(runner_plan), std::move(rank_runner));
@@ -8949,6 +9104,8 @@ namespace
         mock->enableStochasticDeviceSampling();
         mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
         mock->enableMTPDeviceDraftTokenInput();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->enableMTPDeviceDraftTokenInput();
         mock->enableDeviceResidentMTPSpecStatePublication();
         mock->hideMTPSpecStatePublicationFromPolicy();
         mock->setVerifierAcceptedPrefixScript({1});
@@ -8980,7 +9137,14 @@ namespace
             << "the grouped outcome reducer must read device draft slots, not "
                "host draft-token pointers";
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
-        EXPECT_TRUE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection());
+        EXPECT_FALSE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection())
+            << "Seeded grouped stochastic MTP must use the serial-sample-equivalent "
+               "summary path, not the distribution-only vLLM rejection path.";
+        ASSERT_EQ(mock->lastRequestBatchOutcomeSerialSampleEquivalent().size(), 1u);
+        EXPECT_TRUE(mock->lastRequestBatchOutcomeSerialSampleEquivalent()[0]);
+        ASSERT_EQ(mock->lastRequestBatchOutcomeSampleThresholds().size(), 1u);
+        EXPECT_THAT(mock->lastRequestBatchOutcomeSampleThresholds()[0],
+                    SizeIs(1));
         EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
@@ -9181,7 +9345,6 @@ namespace
         mock->enableMTPSidecarPreservesMainState();
         mock->enableMTPShiftedRowReuseFromSidecar();
         mock->enableMTPSidecarLogitsStreamHandoff();
-        mock->enableMTPDeviceDraftTokenInput();
         mock->setVerifierAcceptedPrefixScript({1});
 
         SamplingParams sampling;
@@ -9202,10 +9365,10 @@ namespace
             << "The first stochastic target token should stay in a device target slot.";
         EXPECT_EQ(mock->deviceDraftTemperatureProposalDeferredCount(), 1)
             << "The sidecar draft token should stay in a device draft slot.";
-        EXPECT_EQ(mock->deviceDistributionSampleCount(), 1)
-            << "The grouped outcome still samples the bonus-ready row inside the "
-               "device batch outcome; first-token sampling is protected by the "
-               "deferred counter above.";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 0)
+            << "Strict grouped outcome sampling happens inside the resident "
+               "serial-equivalent reducer; first-token sampling is protected by "
+               "the deferred counter above.";
         EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 1);
         EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0)
             << "The grouped sidecar must consume the device target slot, not a host token.";
@@ -10426,7 +10589,7 @@ namespace
                 /*chained_mtp_support=*/false,
                 /*sidecar_sample_fusion=*/false,
                 {},
-            MTPVerifyMode::SpeculativeSampling);
+                MTPVerifyMode::SpeculativeSampling);
             mock->enableMTPSidecarPreservesMainState();
             mock->enableMTPShiftedRowReuseFromSidecar();
             mock->enableMTPSpecStatePublication();
@@ -11142,6 +11305,7 @@ namespace
             MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
         mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableMTPDeviceDraftTokenInput();
 
         SamplingParams sampling;
         sampling.temperature = 0.8f;
@@ -11168,9 +11332,9 @@ namespace
                "proposal path";
         EXPECT_EQ(mock->deviceDraftTemperatureProposalCount(), 1);
         EXPECT_EQ(mock->deviceDraftTemperatureProposalDeferredCount(), 0);
-        EXPECT_EQ(mock->deviceDistributionSampleCount(), 2)
-            << "first target token and terminal ready-token use compact sampling; "
-               "the MTP draft sample comes from the proposal path";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 1)
+            << "first target token uses the compact sampling hook; verifier and "
+               "bonus rows are sampled inside the resident serial-equivalent reducer";
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->applyMainPenaltiesCount(), 0)
@@ -11210,9 +11374,10 @@ namespace
             /*chained_mtp_support=*/false,
             /*sidecar_sample_fusion=*/false,
             {},
-            MTPVerifyMode::SpeculativeSampling);
+        MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
         mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableMTPDeviceDraftTokenInput();
         mock->requireMTPDecodeEquivalentReplay();
         mock->setDecodeArgmaxScript({
             MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -11244,7 +11409,7 @@ namespace
                "use compact distributions; MTP draft uses the proposal path";
         EXPECT_EQ(mock->deviceDraftTemperatureProposalCount(), 1);
         EXPECT_EQ(mock->deviceDraftTemperatureProposalDeferredCount(), 0);
-        EXPECT_EQ(mock->deviceDistributionSampleCount(), 2);
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 1);
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0)
             << "grouped stochastic publication must not replay shifted rows";
@@ -11281,9 +11446,10 @@ namespace
                 /*chained_mtp_support=*/false,
                 /*sidecar_sample_fusion=*/false,
                 {},
-                MTPVerifyMode::SpeculativeSampling);
+            MTPVerifyMode::SpeculativeSampling);
             mock->enableStochasticDeviceSampling();
             mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            mock->enableMTPDeviceDraftTokenInput();
             mock->enableMTPSidecarPreservesMainState();
             mock->requireMTPDecodeEquivalentReplay();
             mock->setDecodeArgmaxScript({
@@ -11418,9 +11584,10 @@ namespace
             /*chained_mtp_support=*/false,
             /*sidecar_sample_fusion=*/false,
             {},
-            MTPVerifyMode::SpeculativeSampling);
+        MTPVerifyMode::SpeculativeSampling);
         mock->enableStochasticDeviceSampling();
         mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableMTPDeviceDraftTokenInput();
 
         SamplingParams sampling;
         sampling.temperature = 0.8f;
@@ -11442,9 +11609,9 @@ namespace
                "distributions; MTP draft uses the proposal path";
         EXPECT_EQ(mock->deviceDraftTemperatureProposalCount(), 1);
         EXPECT_EQ(mock->deviceDraftTemperatureProposalDeferredCount(), 0);
-        EXPECT_EQ(mock->deviceDistributionSampleCount(), 2)
-            << "first target token and post-correction ready-token use compact "
-               "sampling; the MTP draft sample comes from the proposal path";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 1)
+            << "first target token uses compact sampling; rejection and bonus "
+               "sampling are inside the resident serial-equivalent reducer";
         EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 1);
         EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0)
             << "the first rejected row should use the batched residual-capable verifier";
@@ -11848,6 +12015,10 @@ namespace
         EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 1)
             << "Mirrored LocalTP MTP heads let each child reduce its own "
                "full-vocab verifier rows.";
+        EXPECT_EQ(harness.child0->sampleMTPLogitsToDeviceDraftSlotCount(), 1);
+        EXPECT_EQ(harness.child1->sampleMTPLogitsToDeviceDraftSlotCount(), 1)
+            << "Mirrored LocalTP sidecar logits are full-vocab child rows, "
+               "not rank-visible local shards.";
         EXPECT_EQ(harness.child0->sampleAllPositionLogitsBatchedCount(), 1);
         EXPECT_EQ(harness.child1->sampleAllPositionLogitsBatchedCount(), 1);
         EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
@@ -12102,9 +12273,10 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPSegmentedCollectivesUseMirroredResidentPath)
+    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPExplicitSegmentedCollectivesUseMirroredResidentPath)
     {
         ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
+        ScopedEnv capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0");
         ScopedEnv segmented_collectives("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
 
         auto harness = createLocalTPRunner(
@@ -12135,9 +12307,13 @@ namespace
 
         EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->sampleMTPLogitsToDeviceDraftSlotCount(), 1);
+        EXPECT_EQ(harness.child1->sampleMTPLogitsToDeviceDraftSlotCount(), 1)
+            << "Explicit segmented capture must still use mirrored child "
+               "device draft-slot sampling rather than rank-local shard logits.";
         EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 1);
         EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 1)
-            << "ROCm LocalTP with segmented collective graph capture enabled "
+            << "ROCm LocalTP with explicit segmented collective graph capture "
                "must still use child-local mirrored resident verifier summaries.";
         EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
         EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);

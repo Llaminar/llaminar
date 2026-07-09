@@ -181,23 +181,10 @@ TEST_F(Test__LocalTPContext, ConstructUnnormalizedWeights)
     EXPECT_NEAR(ctx->weights()[1], 1.0f / 3.0f, 0.0001f);
 }
 
-TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsRCCLSegmentedCollectives)
+TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsRCCLCapturedCollectivesByDefault)
 {
     ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
-    ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
-
-    std::string reason;
-    const bool supported = LocalTPContext::isLocalTPGpuGraphPolicySupported(
-        CollectiveBackendType::RCCL,
-        &reason);
-
-    EXPECT_FALSE(supported);
-    EXPECT_EQ(reason, "rccl_segmented_collectives_unsafe");
-}
-
-TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsRCCLWithoutSegmentedCollectives)
-{
-    ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1");
     ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
 
     std::string reason;
@@ -206,7 +193,52 @@ TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsRCCLWithoutSegmentedCollectives
         &reason);
 
     EXPECT_TRUE(supported);
-    EXPECT_EQ(reason, "rccl_gpu_graphs_without_segmented_collectives");
+    EXPECT_EQ(reason, "rccl_captured_collectives_enabled");
+}
+
+TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsNCCLCapturedCollectivesByDefault)
+{
+    ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1");
+    ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
+
+    std::string reason;
+    const bool supported = LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType::NCCL,
+        &reason);
+
+    EXPECT_TRUE(supported);
+    EXPECT_EQ(reason, "nccl_captured_collectives_enabled");
+}
+
+TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsExplicitRCCLSegmentedCollectivesWhenCaptureDisabled)
+{
+    ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0");
+    ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
+
+    std::string reason;
+    const bool supported = LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType::RCCL,
+        &reason);
+
+    EXPECT_TRUE(supported);
+    EXPECT_EQ(reason, "rccl_segmented_collectives_enabled");
+}
+
+TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsLocalTPWhenNoCollectiveGraphPathIsEnabled)
+{
+    ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar capture_collectives("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0");
+    ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
+
+    std::string reason;
+    const bool supported = LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType::NCCL,
+        &reason);
+
+    EXPECT_FALSE(supported);
+    EXPECT_EQ(reason, "gpu_graphs_without_collective_capture_or_segmented_replay");
 }
 
 TEST_F(Test__LocalTPContext, DebugEnvParsesSmallGpuAllreduceKnobs)

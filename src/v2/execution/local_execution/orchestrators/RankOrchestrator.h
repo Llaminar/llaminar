@@ -861,6 +861,9 @@ namespace llaminar2
          * per device, then host-side merge + softmax + top-p + sample.
          */
         int sampleOnDevice(const SamplingParams &params) override;
+        int sampleOnDeviceAtLogicalPosition(
+            const SamplingParams &params,
+            int logical_position) override;
         bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
 
         /**
@@ -1657,6 +1660,18 @@ namespace llaminar2
             int first_slot);
 
         /**
+         * @brief Broadcast the primary mirrored child draft slot to every child.
+         *
+         * Deferred stochastic LocalTP keeps MTP proposals device-resident.  With a
+         * mirrored MTP head, child 0 samples the full-vocabulary proposal once and
+         * the rank broadcasts that one INT32 mailbox slot to all other children.
+         * Each child then records the broadcast stream as the slot's producer, so
+         * chained sidecars and verifier reducers consume one common rank-owned
+         * draft token without reading it back to the host.
+         */
+        bool broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren(int slot);
+
+        /**
          * @brief Ask every child to materialize a verifier row from device slots.
          *
          * Entry zero may be a host scalar or a child target sample slot; draft
@@ -1703,15 +1718,15 @@ namespace llaminar2
             std::vector<int32_t> *out_tokens) const;
 
         /**
-         * @brief Run greedy verifier reduction independently on mirrored LocalTP children.
+         * @brief Run greedy verifier reduction on mirrored LocalTP children.
          *
-         * When every LocalTP child owns a replicated MTP verifier head, each child
-         * writes the same full-vocabulary verifier rows and can produce a native
-         * DeviceSpeculativeOutcomeHandle. The rank stores those per-child handles
-         * and returns the primary child's handle only as the response
-         * materialization representative. Publication later replays no rows and
-         * stages no rank compact metadata; it forwards each stored handle back to
-         * the child that produced it.
+         * Every child owns a replicated MTP verifier head and therefore has the
+         * local state needed to publish accepted rows.  The compact accept/reject
+         * decision, however, is a single rank-level fact: all children must publish
+         * the same accepted prefix and next-condition token.  After child-local
+         * reducers produce resident mailboxes, the rank broadcasts the primary
+         * child's compact outcome into every peer mailbox on device before any
+         * live-state publication occurs.
          */
         bool verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(
             const int32_t *draft_tokens,
@@ -1721,13 +1736,14 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle);
 
         /**
-         * @brief Run stochastic verifier reduction independently on mirrored children.
+         * @brief Run stochastic verifier reduction on mirrored children.
          *
-         * Each LocalTP child has already produced the same full-vocabulary
-         * all-position verifier logits through its replicated terminal head.  This
-         * helper asks every child to run the native resident stochastic summary for
-         * the same logical descriptors and stores the resulting handle beside the
-         * child that owns it.
+         * Stochastic MTP must be batch-invariant across the LocalTP group.  The
+         * primary child computes the authoritative compact stochastic outcome,
+         * then a device-side LocalTP broadcast copies that compact token/meta row
+         * into every child-owned resident outcome buffer.  Publication can then
+         * remain child-local for KV/GDN/terminal-hidden state while consuming one
+         * common accept/reject decision.
          */
         bool verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
             const DeviceStochasticBatchOutcomeRequest *requests,
@@ -1735,13 +1751,32 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle);
 
         /**
+         * @brief Broadcast the primary mirrored outcome into all child mailboxes.
+         *
+         * The child handles in @p child_outcomes own device-resident compact
+         * output-token and metadata buffers.  This helper validates that every
+         * handle is current, then enqueues two INT32 LocalTP broadcast sidebands
+         * on each participant stream: one for output tokens and one for metadata.
+         * No host copy or row replay is involved; NCCL/RCCL provide the device
+         * transport for homogeneous GPU LocalTP domains.
+         *
+         * @param child_outcomes Per-child resident compact outcome handles.
+         * @param context_name Short diagnostic name attached to perfstats/errors.
+         * @return true when every child mailbox now contains the primary compact
+         *         outcome and remains ordered on its own stream.
+         */
+        bool broadcastPrimaryMirroredLocalTPDeviceOutcomeToChildren(
+            std::vector<DeviceSpeculativeOutcomeHandle> &child_outcomes,
+            const char *context_name);
+
+        /**
          * @brief Publish child-resident outcomes from mirrored LocalTP verification.
          *
          * The request outcome must be the primary child handle returned by the
          * most recent mirrored greedy or stochastic verifier reduction. Each
-         * participant receives its own stored handle, preserving stream ownership
-         * and avoiding both a tiny verifier collective and rank-to-child compact
-         * metadata uploads.
+         * participant receives its own stored handle after the rank has broadcast
+         * the primary compact outcome into all child mailboxes, preserving stream
+         * ownership while guaranteeing one common accepted count.
          */
         bool publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
             const DeviceSpeculativePublicationRequest &request,

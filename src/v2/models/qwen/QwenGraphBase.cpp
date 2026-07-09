@@ -402,6 +402,70 @@ namespace llaminar2
                hasDecodeReplicatedDenseWeightSource();
     }
 
+    QwenGraphBase::FinalProjectionPolicy QwenGraphBase::resolveFinalProjectionPolicy(
+        const FinalProjectionPolicyRequest &request) const
+    {
+        FinalProjectionPolicy policy{
+            .norm_source = request.norm_source,
+            .head_policy = FinalHeadPolicy::PrimaryFullVocabulary,
+            .norm_gamma = nullptr,
+            .lm_head_weight = nullptr,
+            .lm_head_binding = nullptr,
+            .lm_head_output = nullptr,
+            .lm_head_vocab_size = 0,
+            .column_parallel = false,
+            .needs_allgather = false,
+        };
+
+        switch (request.norm_source)
+        {
+        case FinalNormSource::ModelOutputNorm:
+            policy.norm_gamma = modelFinalNorm();
+            break;
+        case FinalNormSource::MTPSidecarNorm:
+            policy.norm_gamma = request.mtp_norm;
+            break;
+        }
+
+        /*
+         * Keep the layout decision declarative and local to the policy resolver.
+         * Callers state whether a full-vocabulary head is required; this method
+         * chooses the tensor, binding, vocab width, and follow-up allgather
+         * contract as one coherent package.
+         */
+        policy.column_parallel =
+            !request.force_full_vocabulary_head &&
+            useColumnParallelLMHeadForGraph(request.column_parallel_output);
+        policy.lm_head_output =
+            policy.column_parallel
+                ? request.column_parallel_output
+                : request.full_vocab_output;
+        policy.lm_head_vocab_size =
+            policy.column_parallel ? config_.vocab_local : config_.vocab_size;
+        policy.needs_allgather = policy.column_parallel && mpi_ctx_ != nullptr;
+
+        if (policy.column_parallel)
+        {
+            policy.head_policy = FinalHeadPolicy::PrimaryColumnParallel;
+        }
+        else if (useMirroredMTPHeadWeights())
+        {
+            policy.head_policy = FinalHeadPolicy::MirroredLocalTPMTPFullVocabulary;
+        }
+        else if (useDecodeReplicatedDenseWeights())
+        {
+            policy.head_policy = FinalHeadPolicy::DecodeReplicatedFullVocabulary;
+        }
+        else
+        {
+            policy.head_policy = FinalHeadPolicy::PrimaryFullVocabulary;
+        }
+
+        policy.lm_head_weight = modelLMHeadForGraph(policy.column_parallel);
+        policy.lm_head_binding = modelLMHeadBindingForGraph(policy.column_parallel);
+        return policy;
+    }
+
     bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
     {
         const int max_decode_like_rows = config_.mtp.enabled
@@ -699,6 +763,32 @@ namespace llaminar2
 
     TensorBase *QwenGraphBase::modelFinalNorm() const
     {
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            /*
+             * A mirrored LocalTP MTP verifier head must consume the same final
+             * normalization vector on every participant before the replicated
+             * full-vocabulary projection.  Pairing a replicated LM head with a
+             * TP-local final_norm lets otherwise identical mirrored children
+             * produce different draft distributions, which breaks stochastic
+             * MTP's single-token decode equivalence contract.
+             */
+            if (!decode_replicated_dense_weight_bindings_.final_norm)
+            {
+                throw std::runtime_error(
+                    useMirroredMTPHeadWeights()
+                        ? "[QwenGraphBase] Mirrored LocalTP MTP head was requested but no replicated final_norm binding is available"
+                        : "[QwenGraphBase] Replicated dense decode was requested but no replicated final_norm binding is available");
+            }
+            TensorBase *decode_bound =
+                legacyTensor(decode_replicated_dense_weight_bindings_.final_norm);
+            if (decode_bound)
+                return decode_bound;
+            throw std::runtime_error(
+                useMirroredMTPHeadWeights()
+                    ? "[QwenGraphBase] Mirrored LocalTP MTP head final_norm binding has no tensor"
+                    : "[QwenGraphBase] Replicated dense decode final_norm binding has no tensor");
+        }
         TensorBase *bound = legacyTensor(weight_bindings_.final_norm);
         return bound ? bound : weights_.final_norm;
     }
@@ -749,6 +839,15 @@ namespace llaminar2
 
     const WeightBinding *QwenGraphBase::modelFinalNormBinding() const
     {
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            if (!decode_replicated_dense_weight_bindings_.final_norm)
+                throw std::runtime_error(
+                    useMirroredMTPHeadWeights()
+                        ? "[QwenGraphBase] Mirrored LocalTP MTP head was requested but no replicated final_norm binding is available"
+                        : "[QwenGraphBase] Replicated dense decode was requested but no replicated final_norm binding is available");
+            return decode_replicated_dense_weight_bindings_.final_norm;
+        }
         return weight_bindings_.final_norm;
     }
 
@@ -2309,12 +2408,22 @@ namespace llaminar2
                                                                 << " vocab_local=" << config_.vocab_local);
 
         ComputeGraph graph;
+        const FinalProjectionPolicy final_projection =
+            resolveFinalProjectionPolicy({
+                .norm_source = FinalNormSource::ModelOutputNorm,
+                .mtp_norm = nullptr,
+                .full_vocab_output = output_logits,
+                .column_parallel_output = logits_local,
+                .total_tokens = total_tokens,
+                .force_full_vocabulary_head = false,
+                .compute_all_positions = config_.compute_all_position_logits,
+            });
 
         // Final RMSNorm
         RMSNormStage::Params norm_params;
         norm_params.input = hidden_states;
         norm_params.output = hidden_states; // In-place norm
-        norm_params.gamma = modelFinalNorm();
+        norm_params.gamma = final_projection.norm_gamma;
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = total_tokens;
         norm_params.device_id = device;
@@ -2332,12 +2441,10 @@ namespace llaminar2
         // - AllGather collects to output_logits: [seq_len, vocab_size]
         // =================================================================
 
-        bool use_column_parallel =
-            useColumnParallelLMHeadForGraph(logits_local);
-
         // Determine output buffer and vocab size for LM head stage
-        TensorBase *lm_head_output = use_column_parallel ? logits_local : output_logits;
-        int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
+        const bool use_column_parallel = final_projection.column_parallel;
+        TensorBase *lm_head_output = final_projection.lm_head_output;
+        int lm_head_vocab_size = final_projection.lm_head_vocab_size;
 
         LOG_DEBUG("[QwenGraphBase] LM head: use_column_parallel=" << use_column_parallel
                                                                   << " lm_head_vocab_size=" << lm_head_vocab_size
@@ -2414,9 +2521,9 @@ namespace llaminar2
         // LM Head projection
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = lm_head_input;
-        lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+        lm_params.lm_head_weight = final_projection.lm_head_weight;
         lm_params.prepared_ref = preparedRefForGraphWeight(
-            modelLMHeadBindingForGraph(use_column_parallel), device);
+            final_projection.lm_head_binding, device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = lm_head_seq_len;
         lm_params.d_model = config_.d_model;
@@ -2449,7 +2556,7 @@ namespace llaminar2
         // =================================================================
         // AllGather stage for column-parallel LM head
         // =================================================================
-        if (use_column_parallel && mpi_ctx_)
+        if (final_projection.needs_allgather)
         {
             LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather: world_size=" << mpi_ctx_->world_size()
                                                                               << " total_tokens=" << total_tokens);

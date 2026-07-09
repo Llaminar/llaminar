@@ -318,38 +318,47 @@ namespace llaminar2
             return true;
         }
 
-        if (backend == CollectiveBackendType::RCCL)
+        if (backend != CollectiveBackendType::NCCL &&
+            backend != CollectiveBackendType::RCCL)
         {
-            if (exec.gpu_graph_collective_segmented)
-            {
-                if (reason_out)
-                {
-                    *reason_out = "rccl_segmented_collectives_unsafe";
-                }
-                return false;
-            }
-
             if (reason_out)
             {
-                *reason_out = "rccl_gpu_graphs_without_segmented_collectives";
+                *reason_out = "unsupported_backend";
+            }
+            return false;
+        }
+
+        /*
+         * The production LocalTP GPU path captures homogeneous NCCL/RCCL
+         * collectives directly into the decode graph.  Segmented replay is kept
+         * as an explicit compatibility mode for experiments and diagnostics,
+         * not as the ordinary requirement for GPU graph execution.
+         */
+        if (exec.gpu_graph_capture_collectives)
+        {
+            if (reason_out)
+            {
+                *reason_out = (backend == CollectiveBackendType::NCCL)
+                                  ? "nccl_captured_collectives_enabled"
+                                  : "rccl_captured_collectives_enabled";
             }
             return true;
         }
 
-        // Phase 3 support matrix: NCCL collectives under graph mode are only
-        // supported when segmented collective replay is explicitly enabled.
         if (exec.gpu_graph_collective_segmented)
         {
             if (reason_out)
             {
-                *reason_out = "gpu_graphs_segmented_collectives_enabled";
+                *reason_out = (backend == CollectiveBackendType::NCCL)
+                                  ? "nccl_segmented_collectives_enabled"
+                                  : "rccl_segmented_collectives_enabled";
             }
             return true;
         }
 
         if (reason_out)
         {
-            *reason_out = "gpu_graphs_on_without_segmented_collectives";
+            *reason_out = "gpu_graphs_without_collective_capture_or_segmented_replay";
         }
         return false;
     }
@@ -2791,10 +2800,11 @@ namespace llaminar2
                           << " count=" << effective_count);
             }
 
-            // Phase 3 runtime policy: make graph-capture support explicit.
-            // If users enable global GPU graph mode without segmented-collective
-            // support, we fail fast with a clear marker instead of attempting an
-            // undefined collective scheduling path.
+            // Runtime policy: make graph-capture support explicit.  Homogeneous
+            // LocalTP NCCL/RCCL normally uses graph-captured collectives; if
+            // that path is explicitly disabled, segmented replay must be
+            // explicitly enabled before we launch GPU-native collectives under
+            // global GPU graph mode.
             if (backend_ == CollectiveBackendType::NCCL ||
                 backend_ == CollectiveBackendType::RCCL)
             {

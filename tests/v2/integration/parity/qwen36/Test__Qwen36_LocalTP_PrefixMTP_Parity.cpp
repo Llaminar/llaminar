@@ -75,9 +75,27 @@ TEST(Qwen36CUDALocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecode
     runDenseDynamicMTPParity(cudaLocalTPCase(), false);
 }
 
-TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPVerifierMatchesAfterClearCache)
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDepth1VerifierMatchesAfterClearCache)
 {
-    runDenseStochasticMTPVerifierParity(cudaLocalTPCase());
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase(), 1);
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDepth2VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase(), 2);
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase(), 3);
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(
+        cudaLocalTPCase(),
+        3,
+        qwen36DenseStochasticDynamicDepthPolicy(3));
 }
 
 TEST(Qwen36CUDALocalTPPrefixMTPParity, PrefixCacheMTPRestore)
@@ -105,9 +123,27 @@ TEST(Qwen36ROCmLocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecode
     runDenseDynamicMTPParity(rocmLocalTPCase(), false);
 }
 
-TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPVerifierMatchesAfterClearCache)
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDepth1VerifierMatchesAfterClearCache)
 {
-    runDenseStochasticMTPVerifierParity(rocmLocalTPCase());
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase(), 1);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDepth2VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase(), 2);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase(), 3);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(
+        rocmLocalTPCase(),
+        3,
+        qwen36DenseStochasticDynamicDepthPolicy(3));
 }
 
 TEST(Qwen36ROCmLocalTPPrefixMTPParity, PrefixCacheMTPRestore)

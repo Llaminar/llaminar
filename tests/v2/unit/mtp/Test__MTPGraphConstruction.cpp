@@ -1422,6 +1422,18 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
         mirrored_fixture.input(),
         mirrored_output);
 
+    const auto *mirrored_final_norm_node = mirrored_graph.getNode("mtp0_final_norm");
+    ASSERT_NE(mirrored_final_norm_node, nullptr);
+    ASSERT_NE(mirrored_final_norm_node->stage, nullptr);
+    const StageBufferContract mirrored_final_norm_contract =
+        mirrored_final_norm_node->stage->bufferContract();
+    ASSERT_EQ(mirrored_final_norm_contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(mirrored_final_norm_contract.weight_tensors.front(),
+              static_cast<ITensor *>(mirrored_fixture.final_norm.get()))
+        << "Mirrored LocalTP MTP sidecars still consume the MTP/NextN head "
+           "normalizer; only the LM-head projection policy switches to the "
+           "replicated full-vocabulary head.";
+
     const auto *mirrored_lm_head = mirrored_graph.getNode("mtp0_lm_head");
     ASSERT_NE(mirrored_lm_head, nullptr);
     EXPECT_EQ(
@@ -2136,9 +2148,12 @@ TEST(Test__MTPGraphConstruction, PhaseSplitVerifierLMHeadUsesReplicatedFullVocab
     ModelWeights weights = fixture.modelWeights();
     graph_builder.setWeights(weights);
 
+    WeightBinding decode_final_norm;
+    decode_final_norm.tensor = weights.final_norm;
     WeightBinding decode_lm_head;
     decode_lm_head.tensor = weights.lm_head;
     ModelWeightBindings decode_bindings = makeDecodeReplicatedDenseBindingSource();
+    decode_bindings.final_norm = &decode_final_norm;
     decode_bindings.lm_head = &decode_lm_head;
     graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
 

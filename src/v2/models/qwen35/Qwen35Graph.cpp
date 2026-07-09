@@ -426,14 +426,22 @@ namespace llaminar2
             !kv_cache_only &&
             localTPMirroredMTPHeadConfigured();
         MirroredMTPHeadScope mirrored_head_scope(*this, mirror_mtp_lm_head);
-        const bool mtp_lm_head_column_parallel =
-            config_.lm_head_column_parallel &&
-            config_.vocab_local > 0 &&
-            !mirror_mtp_lm_head;
+        const FinalProjectionPolicy mtp_final_projection =
+            kv_cache_only
+                ? FinalProjectionPolicy{}
+                : resolveFinalProjectionPolicy({
+                      .norm_source = FinalNormSource::MTPSidecarNorm,
+                      .mtp_norm = weights.final_norm,
+                      .full_vocab_output = output.logits,
+                      .column_parallel_output = output.logits,
+                      .total_tokens = total_tokens,
+                      .force_full_vocabulary_head = mirror_mtp_lm_head,
+                      .compute_all_positions = true,
+                  });
 
         if (missing("embedding table", modelEmbeddingTable()) ||
             (!kv_cache_only &&
-             missing("lm head", modelLMHeadForGraph(mtp_lm_head_column_parallel))) ||
+             missing("lm head", mtp_final_projection.lm_head_weight)) ||
             (!input.draft_token_ids && !input.draft_token_ids_device &&
              missing("draft_token_ids", input.draft_token_ids)) ||
             missing("terminal_hidden", input.terminal_hidden) ||
@@ -441,7 +449,7 @@ namespace llaminar2
             missing("mtp.fc", weights.fc) ||
             missing("mtp.pre_fc_norm_hidden", weights.pre_fc_norm_hidden) ||
             missing("mtp.pre_fc_norm_embedding", weights.pre_fc_norm_embedding) ||
-            (!kv_cache_only && missing("mtp.final_norm", weights.final_norm)) ||
+            (!kv_cache_only && missing("mtp.final_norm", mtp_final_projection.norm_gamma)) ||
             missing("output.embedding", output.embedding) ||
             missing("output.norm_hidden", output.norm_hidden) ||
             missing("output.norm_embedding", output.norm_embedding) ||
@@ -697,7 +705,7 @@ namespace llaminar2
                           .device_id = device,
                           .input = output.projected,
                           .output = output.hidden,
-                          .gamma = weights.final_norm,
+                          .gamma = mtp_final_projection.norm_gamma,
                           .eps = config_.rms_norm_eps,
                           .subtract_one = config_.rms_norm_subtract_one,
                           .seq_len = total_tokens,
@@ -707,8 +715,6 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "final_norm", ffn_terminal);
 
-        const int mtp_lm_head_vocab_size =
-            mtp_lm_head_column_parallel ? config_.vocab_local : config_.vocab_size;
         const bool force_decode_equivalent_lm_head_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
@@ -720,11 +726,11 @@ namespace llaminar2
                       ComputeStageFactory::createLMHead({
                           .device_id = device,
                           .hidden_states = output.hidden,
-                          .lm_head_weight = modelLMHeadForGraph(mtp_lm_head_column_parallel),
+                          .lm_head_weight = mtp_final_projection.lm_head_weight,
                           .logits = output.logits,
                           .seq_len = total_tokens,
                           .d_model = config_.d_model,
-                          .vocab_size = mtp_lm_head_vocab_size,
+                          .vocab_size = mtp_final_projection.lm_head_vocab_size,
                           .use_prefill_replay_row_offset = false,
                           .compute_all_positions = true,
                           /*
@@ -743,7 +749,7 @@ namespace llaminar2
                           .input_buffer_id = BufferId::MTP_HIDDEN,
                           .output_buffer_id = BufferId::MTP_LOGITS,
                           .prepared_ref = preparedRefForGraphWeight(
-                              modelLMHeadBindingForGraph(mtp_lm_head_column_parallel),
+                              mtp_final_projection.lm_head_binding,
                               device),
                           .prepared_store = prepared_weight_store_,
                       }),

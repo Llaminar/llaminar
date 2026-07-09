@@ -201,6 +201,13 @@ namespace llaminar2
                 static_cast<int>(purpose));
         }
 
+        std::string formatStochasticThreshold(float threshold)
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(9) << threshold;
+            return oss.str();
+        }
+
         uint64_t mtpSpecInverseSampleSeedForThresholds(
             const SamplingParams &params,
             const float *thresholds,
@@ -4823,6 +4830,18 @@ namespace llaminar2
          * the main state and publishes the accepted rows from compact device
          * metadata.
          */
+        const bool grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint =
+            use_grouped_outcome_device_resident_publication_verifier &&
+            plan_.usesLocalTP() &&
+            !runner_->supportsMTPShiftedRowReuseFromSidecar();
+        /*
+         * LocalTP MoE grouped-outcome publication cannot reuse the first shifted
+         * MTP KV row from the sidecar: routed expert state and shifted sidecar
+         * KV must be committed from the accepted verifier row.  That initial
+         * shifted-row commit needs the verifier-base terminal hidden payload,
+         * so a token-count-only logical checkpoint is not a valid base for this
+         * lane even though the accepted-state publication itself is resident.
+         */
         const bool use_device_publication_without_rollback_checkpoint =
             (use_all_position_state_publication_verifier ||
              use_grouped_outcome_device_resident_publication_verifier) &&
@@ -4830,6 +4849,7 @@ namespace llaminar2
             runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsDeviceResidentMTPSpecStatePublication() &&
             runner_->supportsMTPSidecarPreservesMainState() &&
+            !grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint &&
             !verify_sidecar_preserves_main_state &&
             !verify_commit_replay_check;
         const bool can_synthesize_verifier_base_checkpoint =
@@ -4838,6 +4858,7 @@ namespace llaminar2
             runner_->supportsMTPSidecarPreservesMainState() &&
             (runner_->supportsLogicalMTPVerifierBaseCheckpoint() ||
              use_device_publication_without_rollback_checkpoint) &&
+            !grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint &&
             !verify_sidecar_preserves_main_state &&
             !verify_commit_replay_check;
 
@@ -4927,13 +4948,6 @@ namespace llaminar2
                 fallback_sampler,
                 logical_position,
                 StochasticDrawPurpose::Sample);
-        };
-
-        auto format_stochastic_threshold = [](float threshold) -> std::string
-        {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(9) << threshold;
-            return oss.str();
         };
 
         auto accept_threshold_for_position =
@@ -5690,7 +5704,7 @@ namespace llaminar2
                             "decode",
                             {},
                             {{"logical_position", std::to_string(first_token_logical_position)},
-                             {"threshold", format_stochastic_threshold(first_token_threshold)},
+                             {"threshold", formatStochasticThreshold(first_token_threshold)},
                              {"deferred", can_defer_stochastic_first_host_read ? "true" : "false"}});
                         if (!runner_->buildStochasticDistributionOnDevice(
                                 DeviceLogitsSource::Main,
@@ -9955,6 +9969,8 @@ namespace llaminar2
                     std::find(stop_tokens_.begin(),
                               stop_tokens_.end(),
                               first_token) != stop_tokens_.end();
+                const bool use_serial_sample_equivalent_stochastic =
+                    active_sampling_params_.seed != 0;
                 if (first_token_is_stop)
                 {
                     return fail_after_checkpoint(
@@ -10020,7 +10036,9 @@ namespace llaminar2
                 const int verifier_row_count =
                     verifier_input_plan.compact_logit_row_count;
                 const bool needs_device_verifier_tokens =
-                    first_token_deferred || has_deferred_draft_token;
+                    first_token_deferred ||
+                    has_deferred_draft_token ||
+                    use_serial_sample_equivalent_stochastic;
                 const bool can_defer_grouped_verifier_sync =
                     !active_sampling_params_.has_penalties() &&
                     !first_token_is_stop;
@@ -10224,20 +10242,32 @@ namespace llaminar2
 
                 std::vector<float> accept_thresholds;
                 std::vector<float> residual_thresholds;
+                std::vector<float> sample_thresholds;
                 accept_thresholds.reserve(static_cast<size_t>(compare_rows));
                 residual_thresholds.reserve(static_cast<size_t>(compare_rows));
+                sample_thresholds.reserve(static_cast<size_t>(compare_rows));
                 for (int row = 0; row < compare_rows; ++row)
                 {
                     const int row_logical_position =
                         transaction_base_cached_tokens + 1 + row;
-                    accept_thresholds.push_back(
-                        accept_threshold_for_position(
-                            sampler_,
-                            row_logical_position));
-                    residual_thresholds.push_back(
-                        residual_threshold_for_position(
-                            sampler_,
-                            row_logical_position));
+                    if (use_serial_sample_equivalent_stochastic)
+                    {
+                        sample_thresholds.push_back(
+                            sample_threshold_for_position(
+                                sampler_,
+                                row_logical_position));
+                    }
+                    else
+                    {
+                        accept_thresholds.push_back(
+                            accept_threshold_for_position(
+                                sampler_,
+                                row_logical_position));
+                        residual_thresholds.push_back(
+                            residual_threshold_for_position(
+                                sampler_,
+                                row_logical_position));
+                    }
                 }
 
                 Sampler bonus_sampler = sampler_;
@@ -10247,9 +10277,11 @@ namespace llaminar2
                         transaction_base_cached_tokens +
                             static_cast<int>(draft_tokens.size()));
                 const uint64_t inverse_sample_seed =
-                    inverse_sample_seed_for_thresholds(
-                        residual_thresholds.data(),
-                        residual_thresholds.size());
+                    use_serial_sample_equivalent_stochastic
+                        ? 0
+                        : inverse_sample_seed_for_thresholds(
+                              residual_thresholds.data(),
+                              residual_thresholds.size());
                 const int inverse_sample_first_logical_position =
                     transaction_base_cached_tokens + 1;
 
@@ -10263,40 +10295,78 @@ namespace llaminar2
                         {},
                         {{"policy_path", "grouped_outcome_device_resident_publication"},
                          {"rows", std::to_string(compare_rows)}});
-                    resident_outcome_ok =
-                        first_token_deferred
-                            ? runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(
-                                  /*first_target_slot=*/0,
-                                  /*first_draft_slot=*/0,
-                                  /*draft_tokens=*/nullptr,
-                                  accept_thresholds.data(),
-                                  residual_thresholds.data(),
-                                  compare_rows,
-                                  /*first_target_sample_slot=*/0,
-                                  stop_tokens_.data(),
-                                  static_cast<int>(stop_tokens_.size()),
-                                  bonus_row,
-                                  bonus_threshold,
-                                  &outcome_handle,
-                                  inverse_sample_seed,
-                                  inverse_sample_first_logical_position,
-                                  /*use_vllm_probability_rejection=*/true)
-                            : runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
-                                  /*first_target_slot=*/0,
-                                  /*first_draft_slot=*/0,
-                                  /*draft_tokens=*/nullptr,
-                                  accept_thresholds.data(),
-                                  residual_thresholds.data(),
-                                  compare_rows,
-                                  first_token,
-                                  stop_tokens_.data(),
-                                  static_cast<int>(stop_tokens_.size()),
-                                  bonus_row,
-                                  bonus_threshold,
-                                  &outcome_handle,
-                                  inverse_sample_seed,
-                                  inverse_sample_first_logical_position,
-                                  /*use_vllm_probability_rejection=*/true);
+                    if (use_serial_sample_equivalent_stochastic)
+                    {
+                        DeviceStochasticBatchOutcomeRequest request;
+                        request.request_id = 0;
+                        request.first_target_slot = 0;
+                        request.first_draft_slot = 0;
+                        request.row_count = compare_rows;
+                        request.first_token = first_token_deferred ? -1 : first_token;
+                        request.first_token_from_device = first_token_deferred;
+                        request.first_target_sample_slot =
+                            first_token_deferred ? 0 : -1;
+                        request.token_row_offset = 0;
+                        request.token_row_stride =
+                            verifier_input_plan.total_verifier_input_tokens;
+                        request.bonus_target_slot = bonus_row;
+                        request.bonus_threshold = bonus_threshold;
+                        request.serial_sample_equivalent = true;
+                        request.use_device_draft_tokens = true;
+                        request.stop_token_count =
+                            static_cast<int>(stop_tokens_.size());
+                        for (size_t i = 0; i < stop_tokens_.size(); ++i)
+                        {
+                            request.stop_tokens[i] = stop_tokens_[i];
+                        }
+                        for (int row = 0; row < compare_rows; ++row)
+                        {
+                            request.sample_thresholds[static_cast<size_t>(row)] =
+                                sample_thresholds[static_cast<size_t>(row)];
+                        }
+                        resident_outcome_ok =
+                            runner_->verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+                                &request,
+                                /*request_count=*/1,
+                                &outcome_handle);
+                    }
+                    else
+                    {
+                        resident_outcome_ok =
+                            first_token_deferred
+                                ? runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(
+                                      /*first_target_slot=*/0,
+                                      /*first_draft_slot=*/0,
+                                      /*draft_tokens=*/nullptr,
+                                      accept_thresholds.data(),
+                                      residual_thresholds.data(),
+                                      compare_rows,
+                                      /*first_target_sample_slot=*/0,
+                                      stop_tokens_.data(),
+                                      static_cast<int>(stop_tokens_.size()),
+                                      bonus_row,
+                                      bonus_threshold,
+                                      &outcome_handle,
+                                      inverse_sample_seed,
+                                      inverse_sample_first_logical_position,
+                                      /*use_vllm_probability_rejection=*/true)
+                                : runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
+                                      /*first_target_slot=*/0,
+                                      /*first_draft_slot=*/0,
+                                      /*draft_tokens=*/nullptr,
+                                      accept_thresholds.data(),
+                                      residual_thresholds.data(),
+                                      compare_rows,
+                                      first_token,
+                                      stop_tokens_.data(),
+                                      static_cast<int>(stop_tokens_.size()),
+                                      bonus_row,
+                                      bonus_threshold,
+                                      &outcome_handle,
+                                      inverse_sample_seed,
+                                      inverse_sample_first_logical_position,
+                                      /*use_vllm_probability_rejection=*/true);
+                    }
                 }
                 if (!resident_outcome_ok)
                 {
@@ -11046,14 +11116,32 @@ namespace llaminar2
                       "device_batch_outcome_device_resident_publication"},
                      {"policy_path", "grouped_outcome_device_resident_publication"},
                      {"decode_equivalent_replay_required", "false"},
-                     {"output_tokens", std::to_string(newly_emitted_token_count)},
-                     {"ready_token", std::to_string(ready_token)},
-                     {"raw_ready_token", std::to_string(raw_ready_token)},
-                     {"accepted_state_count",
-                      std::to_string(compact_accepted_state_count)},
-                     {"pending_condition_input",
-                      first_token_is_pending_condition ? "true" : "false"},
-                     {"next_pending_condition_token",
+	                     {"output_tokens", std::to_string(newly_emitted_token_count)},
+	                     {"ready_token", std::to_string(ready_token)},
+	                     {"raw_ready_token", std::to_string(raw_ready_token)},
+	                     {"transaction_base_cached_tokens",
+	                      std::to_string(transaction_base_cached_tokens)},
+	                     {"base_sidecar_position",
+	                      std::to_string(base_sidecar_position)},
+	                     {"verifier_first_logical_position",
+	                      std::to_string(inverse_sample_first_logical_position)},
+	                     {"bonus_logical_position",
+	                      std::to_string(
+	                          transaction_base_cached_tokens +
+	                          static_cast<int>(draft_tokens.size()))},
+	                     {"requested_draft_count",
+	                      std::to_string(requested_speculative_draft_count)},
+	                     {"effective_draft_count",
+	                      std::to_string(speculative_draft_count)},
+	                     {"current_depth",
+	                      mtp_depth_controller_
+	                          ? std::to_string(mtp_depth_controller_->currentDepth())
+	                          : std::string("none")},
+	                     {"accepted_state_count",
+	                      std::to_string(compact_accepted_state_count)},
+	                     {"pending_condition_input",
+	                      first_token_is_pending_condition ? "true" : "false"},
+	                     {"next_pending_condition_token",
                       next_pending_condition_token.has_value()
                           ? std::to_string(*next_pending_condition_token)
                           : std::string("none")},
@@ -12185,12 +12273,55 @@ namespace llaminar2
         int token = -1;
         bool device_sampling_attempted = false;
         bool device_penalty_application_failed = false;
+        auto current_stochastic_sample_logical_position = [&]() -> std::optional<int>
+        {
+            std::string position_error;
+            const std::optional<int> mtp_position =
+                currentMTPBaseSidecarPositionForPlanning(
+                    "stochastic main-logits sample",
+                    &position_error);
+            if (mtp_position.has_value())
+                return mtp_position;
+
+            LOG_DEBUG("[OrchestrationRunner/decodeStep] could not determine "
+                      "logical stochastic sample position: "
+                      << position_error);
+            return std::nullopt;
+        };
+
         auto sample_current_logits_on_device = [&]() -> int
         {
             device_sampling_attempted = true;
-            return active_sampling_params_.is_greedy()
-                       ? runner_->sampleGreedyOnDevice()
-                       : runner_->sampleOnDevice(active_sampling_params_);
+            if (active_sampling_params_.is_greedy())
+                return runner_->sampleGreedyOnDevice();
+
+            const std::optional<int> logical_position =
+                current_stochastic_sample_logical_position();
+            if (!logical_position.has_value())
+                return -1;
+
+            const float threshold = mtpSpecStochasticThresholdForPosition(
+                active_sampling_params_,
+                sampler_,
+                *logical_position,
+                MTPSpecStochasticDrawPurpose::Sample);
+            const int sampled_token =
+                runner_->sampleOnDeviceAtLogicalPosition(
+                    active_sampling_params_,
+                    *logical_position);
+            if (sampled_token >= 0)
+            {
+                PerfStatsCollector::addCounter(
+                    "sampling",
+                    "main_stochastic_logical_position_samples",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"logical_position", std::to_string(*logical_position)},
+                     {"threshold", formatStochasticThreshold(threshold)},
+                     {"logical_position_sampler", "true"}});
+            }
+            return sampled_token;
         };
 
         const bool mpi_sampling_collective_required =

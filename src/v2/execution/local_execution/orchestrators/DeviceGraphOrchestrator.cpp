@@ -6979,19 +6979,20 @@ namespace llaminar2
                 collectivesSupportCapturedGraph(&captured_collectives_reason);
         }
 
-        policy.collective_segmented_enabled =
-            has_collective_nodes &&
-            allow_collective_segmented &&
-            collective_segmented_backend_supported;
-
         // Capture TP collectives directly into HIP/CUDA graphs for homogeneous
         // same-rank LocalTP NCCL/RCCL domains. Unsupported or explicitly
-        // disabled domains fall back to segmented replay only when that
-        // diagnostic fallback is enabled.
+        // disabled domains may use segmented replay only when that special
+        // compatibility lane is explicitly enabled.
         policy.collectives_graph_capturable =
             has_collective_nodes &&
             env.execution.gpu_graph_capture_collectives &&
             captured_collectives_backend_supported;
+
+        policy.collective_segmented_enabled =
+            has_collective_nodes &&
+            !policy.collectives_graph_capturable &&
+            allow_collective_segmented &&
+            collective_segmented_backend_supported;
 
         const bool can_use_segmented_graph =
             !has_collective_nodes ||
@@ -11203,7 +11204,8 @@ namespace llaminar2
                       << total_rows);
             return false;
         }
-        if (external_device_condition_tokens)
+        if (external_device_condition_tokens ||
+            prepare_device_condition_tokens_from_speculative_outcome)
         {
             std::fill(sidecar_cache.token_ids.begin(), sidecar_cache.token_ids.end(), 0);
         }
@@ -23242,6 +23244,13 @@ namespace llaminar2
 
     int DeviceGraphOrchestrator::sampleOnDevice(const SamplingParams &params)
     {
+        return sampleOnDeviceAtLogicalPosition(params, get_position());
+    }
+
+    int DeviceGraphOrchestrator::sampleOnDeviceAtLogicalPosition(
+        const SamplingParams &params,
+        int logical_position)
+    {
         if (params.is_greedy())
         {
             return sampleGreedyOnDevice();
@@ -23299,12 +23308,16 @@ namespace llaminar2
         }
 
         int token = -1;
+        const bool seeded = params.seed != 0;
         const uint64_t seed =
-            params.seed != 0
-                ? static_cast<uint64_t>(params.seed)
-                : (0xD1B54A32D192ED03ull ^
-                   (session_epoch_ * 0x9E3779B97F4A7C15ull));
-        const uint64_t offset = device_sampling_counter_++;
+            seeded ? static_cast<uint64_t>(params.seed)
+                   : (0xD1B54A32D192ED03ull ^
+                      (session_epoch_ * 0x9E3779B97F4A7C15ull));
+        const uint64_t offset =
+            seeded
+                ? static_cast<uint64_t>(std::max(0, logical_position)) *
+                      sampling_math::kMTPSpecDrawPurposesPerToken
+                : device_sampling_counter_++;
         const bool ok = backend->sampleTopKTopPF32(
             static_cast<const float *>(gpu_ptr),
             static_cast<int>(cols),
@@ -23779,8 +23792,19 @@ namespace llaminar2
     {
         if (!state_.device_id.is_gpu())
             return false;
-        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        /*
+         * Ordinary column-parallel logits do not contain a full distribution on
+         * one participant, so the single-device stochastic verifier kernels
+         * must not consume them.  Mirrored LocalTP MTP heads are the explicit
+         * exception: each child binds a replicated full-vocabulary MTP head for
+         * verifier/proposal rows, while other TP projections remain sharded.
+         */
+        if (graph_builder_ &&
+            graph_builder_->config().lm_head_column_parallel &&
+            !usesMirroredLocalTPMTPHeadForVerifier())
+        {
             return false;
+        }
         return stochastic_target_token_ids_dev_ &&
                stochastic_target_probs_dev_ &&
                stochastic_draft_token_ids_dev_ &&
@@ -24824,6 +24848,71 @@ namespace llaminar2
             /*verifier_consumer_pending=*/true);
     }
 
+    DeviceStochasticDraftSampleSlotHandle
+    DeviceGraphOrchestrator::deviceStochasticDraftSampleSlot(
+        int slot,
+        bool require_ready)
+    {
+        DeviceStochasticDraftSampleSlotHandle handle;
+        handle.slot = slot;
+        handle.device = state_.device_id;
+
+        if (!state_.device_id.is_gpu() ||
+            slot < 0 ||
+            slot >= stochastic_draft_row_capacity_ ||
+            slot >= static_cast<int>(stochastic_draft_sample_ready_.size()) ||
+            !stochastic_draft_sample_tokens_dev_)
+        {
+            return {};
+        }
+
+        const auto &ready =
+            stochastic_draft_sample_ready_[static_cast<size_t>(slot)];
+        if (require_ready && (!ready.valid || !ready.event))
+        {
+            return {};
+        }
+
+        /*
+         * A ready slot must keep using the producing stream so a rank-level
+         * broadcast is naturally sequenced after the sampler kernel.  A not-yet
+         * ready destination slot still needs a real runner stream; the broadcast
+         * will become the new producer and will record a fresh event on that
+         * stream before any sidecar/verifier consumer can proceed.
+         */
+        void *stream = ready.valid
+                           ? ready.producer_stream
+                           : explicitGPUStreamForOperation(
+                                 "deviceStochasticDraftSampleSlot");
+        if (!stream)
+            return {};
+
+        handle.token_device =
+            static_cast<int32_t *>(stochastic_draft_sample_tokens_dev_) + slot;
+        handle.stream = stream;
+        return handle.valid() ? handle : DeviceStochasticDraftSampleSlotHandle{};
+    }
+
+    bool DeviceGraphOrchestrator::recordStochasticDraftSampleSlotReadyFromDevice(
+        int slot,
+        void *producer_stream,
+        bool verifier_consumer_pending)
+    {
+        if (!state_.device_id.is_gpu() ||
+            slot < 0 ||
+            slot >= stochastic_draft_row_capacity_ ||
+            !stochastic_draft_sample_tokens_dev_ ||
+            !producer_stream)
+        {
+            return false;
+        }
+
+        return recordStochasticDraftSampleReady(
+            slot,
+            producer_stream,
+            verifier_consumer_pending);
+    }
+
     bool DeviceGraphOrchestrator::stageStochasticDraftTokensForDeviceVerification(
         const int32_t *draft_tokens,
         int draft_token_count,
@@ -25480,7 +25569,8 @@ namespace llaminar2
             const bool derive_thresholds_from_seed =
                 request.derive_thresholds_from_seed &&
                 request.use_vllm_probability_rejection &&
-                request.inverse_sample_seed != 0;
+                request.inverse_sample_seed != 0 &&
+                !request.serial_sample_equivalent;
             const float *accept_thresholds =
                 derive_thresholds_from_seed
                     ? nullptr
@@ -25489,6 +25579,10 @@ namespace llaminar2
                 derive_thresholds_from_seed
                     ? nullptr
                     : request.residual_thresholds.data();
+            const float *sample_thresholds =
+                request.serial_sample_equivalent
+                    ? request.sample_thresholds.data()
+                    : nullptr;
             DeviceSpeculativeVerifyBatchOutcome ignored_host_outcome;
 
             const bool ok =
@@ -25498,6 +25592,7 @@ namespace llaminar2
                     draft_tokens,
                     accept_thresholds,
                     residual_thresholds,
+                    sample_thresholds,
                     request.row_count,
                     request.first_token,
                     request.first_target_sample_slot,
@@ -25512,6 +25607,7 @@ namespace llaminar2
                     request.inverse_sample_seed,
                     request.inverse_sample_first_logical_position,
                     request.use_vllm_probability_rejection,
+                    request.serial_sample_equivalent,
                     /*output_request_slot=*/request_idx,
                     stream,
                     /*copy_summary_to_host=*/false);
@@ -25856,6 +25952,7 @@ namespace llaminar2
         const int32_t *draft_tokens,
         const float *accept_thresholds,
         const float *residual_thresholds,
+        const float *sample_thresholds,
         int row_count,
         int32_t first_token,
         int first_target_sample_slot,
@@ -25870,6 +25967,7 @@ namespace llaminar2
         uint64_t inverse_sample_seed,
         int inverse_sample_first_logical_position,
         bool use_vllm_probability_rejection,
+        bool serial_sample_equivalent,
         int output_request_slot,
         void *stream_override,
         bool copy_summary_to_host)
@@ -25889,6 +25987,7 @@ namespace llaminar2
             inverse_sample_first_logical_position >= 0;
         const bool has_host_thresholds =
             accept_thresholds != nullptr && residual_thresholds != nullptr;
+        const bool has_sample_thresholds = sample_thresholds != nullptr;
         std::array<float, kSpeculativeBatchMaxRows> derived_accept_thresholds{};
         std::array<float, kSpeculativeBatchMaxRows> derived_residual_thresholds{};
         if (derive_thresholds_from_seed &&
@@ -25944,7 +26043,10 @@ namespace llaminar2
              bonus_target_slot >= stochastic_target_row_capacity_) ||
             output_request_slot < 0 ||
             output_request_slot >= stochastic_batch_output_request_capacity_ ||
-            (!has_host_thresholds && !derive_thresholds_from_seed))
+            ((serial_sample_equivalent && !has_sample_thresholds) ||
+             (!serial_sample_equivalent &&
+              !has_host_thresholds &&
+              !derive_thresholds_from_seed)))
         {
             return false;
         }
@@ -25981,6 +26083,8 @@ namespace llaminar2
         const bool use_processed_target_rows =
             use_vllm_probability_rejection &&
             target_row_format == StochasticRowFormat::ProcessedLogits;
+        const bool verifier_uses_one_hot_draft_tokens =
+            use_vllm_probability_rejection || serial_sample_equivalent;
         if (target_top_k <= 0 ||
             target_top_k > static_cast<int>(kStochasticDistributionMaxK))
         {
@@ -26000,7 +26104,7 @@ namespace llaminar2
                 stochastic_draft_top_k_[static_cast<size_t>(draft_slot)];
             if (stochastic_target_top_k_[static_cast<size_t>(target_slot)] != target_top_k ||
                 stochastic_target_row_formats_[static_cast<size_t>(target_slot)] != target_row_format ||
-                (!use_vllm_probability_rejection &&
+                (!verifier_uses_one_hot_draft_tokens &&
                  draft_top_k != target_top_k))
             {
                 return false;
@@ -26032,7 +26136,7 @@ namespace llaminar2
         auto *sampled_draft_tokens =
             static_cast<int *>(stochastic_draft_sample_tokens_dev_) + first_draft_slot;
         auto *sampled_draft_probs =
-            (!use_vllm_probability_rejection && stochastic_draft_sample_probs_dev_)
+            (!verifier_uses_one_hot_draft_tokens && stochastic_draft_sample_probs_dev_)
                 ? static_cast<float *>(stochastic_draft_sample_probs_dev_) + first_draft_slot
                 : nullptr;
         auto *processed_target_logits =
@@ -26055,6 +26159,30 @@ namespace llaminar2
         auto *summary_meta_dev =
             static_cast<int *>(stochastic_batch_output_meta_dev_) +
             static_cast<size_t>(output_request_slot) * kSpeculativeBatchMetaCount;
+        const int32_t *summary_draft_tokens_device = nullptr;
+        if (materialized_mtp_verifier_device_token_batch_.valid &&
+            mtp_verifier_input_tokens_dev_ &&
+            first_token_row_offset >= 0 &&
+            first_token_row_stride ==
+                materialized_mtp_verifier_device_token_batch_.padded_seq_len &&
+            first_token_row_offset <
+                materialized_mtp_verifier_device_token_batch_.total_token_capacity)
+        {
+            summary_draft_tokens_device =
+                static_cast<const int32_t *>(mtp_verifier_input_tokens_dev_) +
+                first_token_row_offset;
+        }
+        else if (materialized_mtp_verifier_device_token_row_.valid &&
+                 mtp_verifier_input_tokens_dev_)
+        {
+            summary_draft_tokens_device =
+                static_cast<const int32_t *>(mtp_verifier_input_tokens_dev_);
+        }
+        if (serial_sample_equivalent && !summary_draft_tokens_device)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Serial-equivalent stochastic MTP outcome requires a materialized verifier-token row");
+            return false;
+        }
 
         if (!waitForRequiredStochasticDraftSampleReadyRange(
                 first_draft_slot,
@@ -26091,6 +26219,131 @@ namespace llaminar2
                     return false;
                 }
             }
+        }
+
+        if (serial_sample_equivalent)
+        {
+            if (!has_bonus ||
+                target_row_format != StochasticRowFormat::CompactDistribution ||
+                !sample_thresholds ||
+                first_target_slot + row_count >= stochastic_target_row_capacity_)
+            {
+                return false;
+            }
+
+            std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens =
+                {-1, -1, -1, -1, -1, -1, -1, -1};
+            for (int i = 0; i < stop_token_count; ++i)
+                packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "stochastic_serial_equivalent_target_sample_enqueue",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"rows", std::to_string(row_count)},
+                     {"top_k", std::to_string(target_top_k)}});
+                for (int row = 0; row < row_count; ++row)
+                {
+                    const int target_slot = first_target_slot + row;
+                    auto *row_ids =
+                        static_cast<int *>(stochastic_target_token_ids_dev_) +
+                        static_cast<size_t>(target_slot) *
+                            kStochasticDistributionMaxK;
+                    auto *row_probs =
+                        static_cast<float *>(stochastic_target_probs_dev_) +
+                        static_cast<size_t>(target_slot) *
+                            kStochasticDistributionMaxK;
+                    if (!backend->enqueueSampleDistributionF32Device(
+                            row_ids,
+                            row_probs,
+                            target_top_k,
+                            sample_thresholds[row],
+                            state_.device_id.gpu_ordinal(),
+                            stream,
+                            out_token_dev + row))
+                    {
+                        return false;
+                    }
+                }
+
+                auto *bonus_ids =
+                    static_cast<int *>(stochastic_target_token_ids_dev_) +
+                    static_cast<size_t>(bonus_target_slot) *
+                        kStochasticDistributionMaxK;
+                auto *bonus_probs =
+                    static_cast<float *>(stochastic_target_probs_dev_) +
+                    static_cast<size_t>(bonus_target_slot) *
+                        kStochasticDistributionMaxK;
+                if (!backend->enqueueSampleDistributionF32Device(
+                        bonus_ids,
+                        bonus_probs,
+                        target_top_k,
+                        bonus_threshold,
+                        state_.device_id.gpu_ordinal(),
+                        stream,
+                        out_token_dev + row_count))
+                {
+                    return false;
+                }
+            }
+
+            bool summary_enqueued = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "stochastic_serial_equivalent_summary_enqueue",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"rows", std::to_string(row_count)},
+                     {"top_k", std::to_string(target_top_k)}});
+                summary_enqueued =
+                    backend->enqueueSummarizeGreedySpeculativeVerifyBatch(
+                        out_token_dev,
+                        summary_draft_tokens_device,
+                        row_count,
+                        first_token,
+                        packed_stop_tokens.data(),
+                        stop_token_count,
+                        state_.device_id.gpu_ordinal(),
+                        stream,
+                        summary_tokens_dev,
+                        summary_meta_dev);
+            }
+            if (!summary_enqueued)
+                return false;
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "stochastic_serial_equivalent_verify_batch_device_token_rows",
+                static_cast<double>(row_count),
+                "decode",
+                state_.device_id.toString(),
+                {{"top_k", std::to_string(target_top_k)}});
+
+            if (!copy_summary_to_host)
+                return true;
+
+            std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
+            std::array<int, kSpeculativeBatchMetaCount> meta{};
+            if (!backend->deviceToHostFast(output_tokens.data(),
+                                           summary_tokens_dev,
+                                           sizeof(int32_t) * output_tokens.size(),
+                                           state_.device_id.gpu_ordinal(),
+                                           stream) ||
+                !backend->deviceToHostFast(meta.data(),
+                                           summary_meta_dev,
+                                           sizeof(int) * meta.size(),
+                                           state_.device_id.gpu_ordinal(),
+                                           stream))
+            {
+                return false;
+            }
+            return fillSpeculativeVerifyOutcomeFromMeta(
+                output_tokens,
+                meta,
+                out);
         }
 
         /*

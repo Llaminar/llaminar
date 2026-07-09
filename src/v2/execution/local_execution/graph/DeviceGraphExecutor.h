@@ -641,7 +641,7 @@ namespace llaminar2
             bool allow_fast_decode = true;
             bool allow_cached_graph_replay = false;
             bool collective_segmented_enabled = false;
-            bool collectives_graph_capturable = false; ///< True only for explicit future graph-captured collective paths
+            bool collectives_graph_capturable = false; ///< True when LocalTP NCCL/RCCL collectives are captured in the replay graph
             bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
             bool defer_final_sync = false;             ///< Caller will synchronize the replay stream through a following operation.
             int max_segment_failures = 4;

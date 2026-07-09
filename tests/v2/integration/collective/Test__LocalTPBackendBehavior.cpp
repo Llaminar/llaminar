@@ -557,12 +557,12 @@ TEST_F(Test__LocalTPBackendBehavior, RCCLAllreduce_OnStreamGroupedFP16Transport_
 #endif
 
 /**
- * @test LocalTP NCCL fails fast when GPU graphs are enabled without segmented collectives
+ * @test LocalTP NCCL allows the default graph-captured collective path
  *
- * Phase 3 support policy requires segmented collective mode when running LocalTP
- * NCCL collectives under GPU graph mode.
+ * Homogeneous LocalTP NCCL collectives are the primary GPU graph path.  They
+ * must not require segmented replay to be enabled.
  */
-TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithoutSegmentedCollectives_FailsFast)
+TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_DefaultCapturedCollectives_AllowsExecution)
 {
     if (cuda_count_ < 2)
     {
@@ -570,6 +570,7 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithoutSegmentedColle
     }
 
     ScopedEnvVar graphs_guard("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar capture_guard("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1");
     ScopedEnvVar segmented_guard("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
 
     std::vector<GlobalDeviceAddress> devices = {
@@ -589,24 +590,24 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithoutSegmentedColle
     std::atomic<bool> result1{true};
 
     std::thread t0([&]()
-                   { result0.store(ctx->allreduce(tensor0.get(), "graph_policy_reject", tensor0->numel())); });
+                   { result0.store(ctx->allreduce(tensor0.get(), "graph_policy_captured", tensor0->numel())); });
     std::thread t1([&]()
-                   { result1.store(ctx->allreduce(tensor1.get(), "graph_policy_reject", tensor1->numel())); });
+                   { result1.store(ctx->allreduce(tensor1.get(), "graph_policy_captured", tensor1->numel())); });
 
     t0.join();
     t1.join();
 
-    EXPECT_FALSE(result0.load());
-    EXPECT_FALSE(result1.load());
+    EXPECT_TRUE(result0.load());
+    EXPECT_TRUE(result1.load());
 }
 
 /**
- * @test LocalTP NCCL accepts segmented collective mode when GPU graphs are enabled
+ * @test LocalTP NCCL accepts explicit segmented collective mode
  *
- * This validates the supported Phase 3 graph policy. In this mode, LocalTP should
- * proceed through normal NCCL execution.
+ * Segmented replay is retained as a special compatibility lane for cases where
+ * captured collectives are deliberately disabled.
  */
-TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithSegmentedCollectives_AllowsExecution)
+TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_ExplicitSegmentedCollectives_AllowsExecution)
 {
     if (cuda_count_ < 2)
     {
@@ -614,6 +615,7 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithSegmentedCollecti
     }
 
     ScopedEnvVar graphs_guard("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar capture_guard("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0");
     ScopedEnvVar segmented_guard("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
 
     std::vector<GlobalDeviceAddress> devices = {

@@ -1107,6 +1107,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsStageConditionTokensInAre
     EXPECT_NE(sidecar_body.find("sidecar_cache.token_ids.data()"), std::string::npos)
         << "Async host staging must source from cache-owned stable storage, not stack token arrays.";
     EXPECT_NE(executable_sidecar_body.find(
+                  "external_device_condition_tokens||prepare_device_condition_tokens_from_speculative_outcome"),
+              std::string::npos)
+        << "Resident speculative-outcome catch-up rows must not copy from nullable host draft tokens.";
+    EXPECT_NE(executable_sidecar_body.find(
+                  "std::fill(sidecar_cache.token_ids.begin(),sidecar_cache.token_ids.end(),0);"),
+              std::string::npos)
+        << "Speculative-outcome token staging must keep cache-owned host storage valid for async sidecars.";
+    EXPECT_NE(executable_sidecar_body.find(
                   "external_device_condition_tokens&&!prepare_device_condition_tokens_from_speculative_outcome&&total_rows!=1"),
               std::string::npos)
         << "Only externally supplied arbitrary device-token slots are limited to one row.";
@@ -5704,6 +5712,44 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPCatchupUsesOneGraphLifecycleContext)
         << "Sequential and batched shifted-MTP catch-up must report the same graph lifecycle lane.";
     EXPECT_EQ(source.find("\"mtp_decode_sequential_catchup_device_target\""), std::string::npos)
         << "Device-token shifted-MTP catch-up must not fork graph lifecycle diagnostics.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, LocalTPMoEGroupedOutcomeRequiresTerminalHiddenCheckpoint)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+    const auto policy_body = sliceBetween(
+        source,
+        "const bool grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint",
+        "if (use_device_publication_without_rollback_checkpoint)");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(policy_body));
+
+    EXPECT_NE(compact.find(
+                  "grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint="
+                  "use_grouped_outcome_device_resident_publication_verifier&&"
+                  "plan_.usesLocalTP()&&!runner_->supportsMTPShiftedRowReuseFromSidecar();"),
+              std::string::npos)
+        << "LocalTP MoE grouped-outcome publication must detect when the first "
+           "shifted MTP row cannot be reused from the sidecar.";
+    const size_t direct_publication_gate =
+        compact.find("use_device_publication_without_rollback_checkpoint=");
+    ASSERT_NE(direct_publication_gate, std::string::npos);
+    const size_t synthesize_gate =
+        compact.find("can_synthesize_verifier_base_checkpoint=");
+    ASSERT_NE(synthesize_gate, std::string::npos);
+    EXPECT_NE(compact.find(
+                  "&&!grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint&&",
+                  direct_publication_gate),
+              std::string::npos)
+        << "The initial direct-publication checkpoint path must not manufacture "
+           "a token-count-only base when the shifted-row commit needs terminal hidden.";
+    EXPECT_NE(compact.find(
+                  "&&!grouped_outcome_localtp_shifted_commit_needs_terminal_hidden_checkpoint&&",
+                  synthesize_gate),
+              std::string::npos)
+        << "The post-condition verifier-base checkpoint path must not synthesize "
+           "a token-count-only base for this lane either.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, LiveHybridCheckpointStorageUsesReusablePool)

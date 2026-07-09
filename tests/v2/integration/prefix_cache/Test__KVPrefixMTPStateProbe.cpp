@@ -3492,6 +3492,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
 {
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
@@ -3551,10 +3552,11 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
     EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFailsBeforeDraft)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPExplicitSegmentedCollectiveSmoke)
 {
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
@@ -3574,7 +3576,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFai
     dm.initialize(-1, false);
     if (dm.rocm_device_count() < 2)
     {
-        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalTP segmented MTP hard-fail smoke";
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalTP segmented MTP smoke";
     }
 
     OrchestrationConfig config = OrchestrationConfig::defaults();
@@ -3602,18 +3604,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFai
 
     SamplingParams greedy;
     greedy.temperature = 0.0f;
-    auto result = runner->generate(prompt, 1, greedy);
+    auto result = runner->generate(prompt, 2, greedy);
     const auto snapshot = runner->prefixStateProbe();
     runner->shutdown();
 
-    ASSERT_FALSE(result.error.empty());
-    EXPECT_NE(result.error.find("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED"), std::string::npos)
-        << result.error;
-    EXPECT_NE(result.error.find("RCCL segmented collective replay"), std::string::npos)
-        << result.error;
-    EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
-    EXPECT_EQ(snapshot.mtp_verifier_runs, 0u);
-    EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    ASSERT_FALSE(result.tokens.empty());
+    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
+    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)

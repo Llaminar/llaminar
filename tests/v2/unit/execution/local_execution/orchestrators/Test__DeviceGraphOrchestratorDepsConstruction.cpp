@@ -402,6 +402,39 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
         << "Homogeneous ROCm LocalTP collective decode should graph-capture through participant-local RCCL enqueue.";
 }
 
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturedCollectivesTakePrecedenceOverSegmentedOptIn)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx,
+        0);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_FALSE(policy.collective_segmented_enabled)
+        << "Segmented replay is an explicit compatibility lane, not the primary LocalTP graph path.";
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+}
+
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesDenseDecodeReplicatedWithCollectiveOptIn)
 {
     ScopedEnvVars env({

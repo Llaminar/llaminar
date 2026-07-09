@@ -1864,13 +1864,13 @@ TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
     TensorArena arena;
     ModelWeights weights = makeFullForwardModelWeights(arena, config);
 
-    WeightBinding decode_embedding;
-    decode_embedding.tensor = weights.embedding_table;
-    WeightBinding decode_lm_head;
-    decode_lm_head.tensor = weights.lm_head;
+    WeightBinding decode_embedding = makeTestBinding(weights.embedding_table);
+    WeightBinding decode_final_norm = makeTestBinding(weights.final_norm);
+    WeightBinding decode_lm_head = makeTestBinding(weights.lm_head);
 
     ModelWeightBindings decode_bindings = makeDecodeDenseBindingSource();
     decode_bindings.embedding_table = &decode_embedding;
+    decode_bindings.final_norm = &decode_final_norm;
     decode_bindings.lm_head = &decode_lm_head;
 
     TestableQwen35MoEGraph graph_builder(config, nullptr);

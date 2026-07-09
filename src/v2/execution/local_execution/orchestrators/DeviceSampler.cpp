@@ -8,6 +8,7 @@
 #include "DeviceSampler.h"
 #include "IInferenceRunner.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../kernels/common/SamplingMath.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/Sampler.h"
@@ -16,7 +17,6 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
-#include <random>
 #include <vector>
 
 namespace llaminar2
@@ -352,7 +352,8 @@ namespace llaminar2
 
     int DeviceSampler::sample(
         const std::vector<std::unique_ptr<IInferenceRunner>> &runners,
-        const SamplingParams &params)
+        const SamplingParams &params,
+        float threshold)
     {
         // Greedy: delegate to argmax path
         if (params.is_greedy())
@@ -446,83 +447,42 @@ namespace llaminar2
         if (all_candidates.empty())
             return -1;
 
-        // Sort all candidates by value descending
+        // Sort all candidates by value descending. Equal logits use the lower
+        // token id, matching greedy tie-breaking and keeping top-k/top-p rows
+        // independent of backend-local top-k emission order.
         std::sort(all_candidates.begin(), all_candidates.end(),
                   [](const DeviceCandidate &a, const DeviceCandidate &b)
-                  { return a.value > b.value; });
+                  {
+                      if (a.value != b.value)
+                          return a.value > b.value;
+                      return a.global_index < b.global_index;
+                  });
 
         // Keep only global top-k
         if (static_cast<int>(all_candidates.size()) > effective_k)
             all_candidates.resize(static_cast<size_t>(effective_k));
 
-        // Apply temperature scaling + softmax
-        float temperature = params.temperature;
-        if (temperature <= 0.0f)
-            temperature = 1.0f;
-
-        float max_logit = all_candidates[0].value;
-        std::vector<float> probs(all_candidates.size());
-        float sum = 0.0f;
+        std::vector<float> sorted_logits(all_candidates.size(), 0.0f);
+        std::vector<int> sorted_token_ids(all_candidates.size(), -1);
+        std::vector<float> scratch(all_candidates.size(), 0.0f);
         for (size_t i = 0; i < all_candidates.size(); ++i)
         {
-            probs[i] = std::exp((all_candidates[i].value - max_logit) / temperature);
-            sum += probs[i];
+            sorted_logits[i] = all_candidates[i].value;
+            sorted_token_ids[i] = all_candidates[i].global_index;
         }
-        for (auto &p : probs)
-            p /= sum;
-
-        // Top-p (nucleus) filtering
-        float top_p = params.top_p;
-        int nucleus_size = static_cast<int>(probs.size());
-        if (top_p < 1.0f && top_p > 0.0f)
-        {
-            float cumulative = 0.0f;
-            for (size_t i = 0; i < probs.size(); ++i)
-            {
-                cumulative += probs[i];
-                if (cumulative >= top_p)
-                {
-                    nucleus_size = static_cast<int>(i) + 1;
-                    break;
-                }
-            }
-            // Renormalize
-            float renorm_sum = 0.0f;
-            for (int i = 0; i < nucleus_size; ++i)
-                renorm_sum += probs[i];
-            for (int i = 0; i < nucleus_size; ++i)
-                probs[i] /= renorm_sum;
-        }
-
-        // Multinomial sampling
-        thread_local std::mt19937 rng{std::random_device{}()};
-        if (params.seed != 0)
-        {
-            static unsigned int last_seed = 0;
-            if (params.seed != last_seed)
-            {
-                rng.seed(params.seed);
-                last_seed = params.seed;
-            }
-        }
-
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(rng);
-        float cumulative = 0.0f;
-        int selected = all_candidates[0].global_index;
-        for (int i = 0; i < nucleus_size; ++i)
-        {
-            cumulative += probs[i];
-            if (r <= cumulative)
-            {
-                selected = all_candidates[i].global_index;
-                break;
-            }
-        }
+        const int selected =
+            sampling_math::sample_topk_topp_from_sorted_with_threshold(
+                sorted_logits.data(),
+                sorted_token_ids.data(),
+                static_cast<int>(sorted_logits.size()),
+                params.top_p,
+                params.temperature,
+                threshold,
+                scratch.data());
 
         LOG_TRACE("[DeviceSampler::sample] top-k/p selected token=" << selected
-                                                                    << " (k=" << effective_k << ", p=" << top_p
-                                                                    << ", T=" << temperature << ", nucleus=" << nucleus_size << ")");
+                                                                    << " (k=" << effective_k << ", p=" << params.top_p
+                                                                    << ", T=" << params.temperature << ")");
 
         if (!logged_once)
         {

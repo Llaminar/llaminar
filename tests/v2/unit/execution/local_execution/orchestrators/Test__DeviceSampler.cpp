@@ -271,7 +271,7 @@ TEST_F(Test__DeviceSampler, Sample_Greedy_DelegatesToSampleGreedy)
     SamplingParams params;
     params.temperature = 0.0f; // is_greedy() should be true
     // Single runner → sampleGreedy returns -1
-    EXPECT_EQ(DeviceSampler::sample(runners, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(runners, params, 0.5f), -1);
 }
 
 TEST_F(Test__DeviceSampler, Sample_EmptyRunners_ReturnsNeg1)
@@ -280,7 +280,7 @@ TEST_F(Test__DeviceSampler, Sample_EmptyRunners_ReturnsNeg1)
     SamplingParams params;
     params.temperature = 0.8f;
     params.top_k = 40;
-    EXPECT_EQ(DeviceSampler::sample(empty, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(empty, params, 0.5f), -1);
 }
 
 TEST_F(Test__DeviceSampler, Sample_SingleRunner_ReturnsNeg1)
@@ -289,7 +289,7 @@ TEST_F(Test__DeviceSampler, Sample_SingleRunner_ReturnsNeg1)
     SamplingParams params;
     params.temperature = 0.8f;
     params.top_k = 40;
-    EXPECT_EQ(DeviceSampler::sample(runners, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(runners, params, 0.5f), -1);
 }
 
 TEST_F(Test__DeviceSampler, Sample_MultiRunnerNoLogitsLocal_ReturnsNeg1)
@@ -298,5 +298,5 @@ TEST_F(Test__DeviceSampler, Sample_MultiRunnerNoLogitsLocal_ReturnsNeg1)
     SamplingParams params;
     params.temperature = 0.8f;
     params.top_k = 40;
-    EXPECT_EQ(DeviceSampler::sample(runners, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(runners, params, 0.5f), -1);
 }

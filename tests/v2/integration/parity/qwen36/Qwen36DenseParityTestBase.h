@@ -4791,8 +4791,31 @@ namespace llaminar2::test::parity::qwen36
         }
     }
 
+    /**
+     * @brief Construct the dynamic-depth policy used by stochastic MTP parity.
+     *
+     * The stochastic parity matrix intentionally uses an eager one-sample
+     * controller window so the test proves the dynamic controller is active in
+     * short integration runs instead of silently behaving like fixed-depth MTP.
+     */
+    inline MTPDepthPolicyConfig qwen36DenseStochasticDynamicDepthPolicy(
+        int max_depth = 3)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = std::max(1, max_depth);
+        depth_policy.initial_depth = depth_policy.max_depth;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        return depth_policy;
+    }
+
     inline void runDenseStochasticMTPVerifierParity(
-        const DensePrefixRestoreParityCase &test_case)
+        const DensePrefixRestoreParityCase &test_case,
+        int draft_depth = 1,
+        MTPDepthPolicyConfig depth_policy = {})
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
@@ -4814,6 +4837,9 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> expected_tokens;
         loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
 
+        const int requested_draft_depth = std::max(1, draft_depth);
+        const bool dynamic_depth =
+            depth_policy.mode == MTPDepthPolicyMode::Dynamic;
         constexpr int block_size = 2;
         constexpr int stochastic_decode_steps = 3;
         auto factory = createOrchestrationRunnerFactory();
@@ -4826,7 +4852,14 @@ namespace llaminar2::test::parity::qwen36
         stochastic.seed = 123;
 
         auto mtp_config =
-            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size, true, 1);
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                false,
+                block_size,
+                true,
+                requested_draft_depth,
+                depth_policy);
         mtp_config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
 
         auto mtp = factory->createFromOrchestrationConfig(mtp_config);
@@ -4853,6 +4886,21 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_FALSE(after_reused_mtp.mtp_bypassed) << after_reused_mtp.mtp_bypass_reason;
         EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(after_reused_mtp.mtp_request.stochastic_verify);
+        if (dynamic_depth)
+        {
+            EXPECT_TRUE(after_reused_mtp.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(after_reused_mtp.mtp_request.depth_policy_mode, "dynamic");
+            EXPECT_GE(after_reused_mtp.mtp_depth_policy_windows, 1u);
+            EXPECT_GE(after_reused_mtp.mtp_min_depth, depth_policy.min_depth);
+            EXPECT_EQ(after_reused_mtp.mtp_max_depth, depth_policy.max_depth);
+            EXPECT_GE(after_reused_mtp.mtp_current_depth, depth_policy.min_depth);
+            EXPECT_LE(after_reused_mtp.mtp_current_depth, depth_policy.max_depth);
+        }
+        else
+        {
+            EXPECT_FALSE(after_reused_mtp.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(after_reused_mtp.mtp_max_depth, requested_draft_depth);
+        }
         expectPhase138TransactionUsed(
             test_case,
             after_reused_mtp,

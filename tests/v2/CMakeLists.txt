@@ -5926,6 +5926,24 @@ if(ZLIB_FOUND)
         TIMEOUT 2400
     )
 
+    add_executable(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36MoE_NodeLocalTP_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp
+        llaminar2_core GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_NodeLocalTP
+        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CPU;NodeLocalTP;MPI;PyTorch"
+        MPI_PROCS 2
+        TIMEOUT 3600
+    )
+
     add_executable(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
         integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -7045,11 +7063,11 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSmoke
     MPI_PROCS 1
     TIMEOUT 1200
 )
-add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSegmentedHardFail
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFailsBeforeDraft
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPExplicitSegmentedSmoke
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPMTPExplicitSegmentedCollectiveSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP;Regression"
     MPI_PROCS 1
-    TIMEOUT 600
+    TIMEOUT 1200
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPPrefixSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke

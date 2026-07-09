@@ -339,6 +339,34 @@ namespace llaminar2
     };
 
     /**
+     * @brief Device-owned stochastic draft-token mailbox slot.
+     *
+     * LocalTP MTP keeps draft proposals in runner-owned device mailboxes so the
+     * next sidecar and the verifier can consume the exact same token without a
+     * host round trip.  Rank-level coordination still needs a typed way to name
+     * one child slot when broadcasting the primary mirrored-head proposal to the
+     * rest of the TP participants.  This handle is that narrow contract: it
+     * exposes only the token pointer, the explicit stream that must order the
+     * next operation, and enough ownership metadata to catch stale or cross-device
+     * use in tests.
+     */
+    struct DeviceStochasticDraftSampleSlotHandle
+    {
+        int32_t *token_device = nullptr;
+        int slot = -1;
+        DeviceId device = DeviceId::invalid();
+        void *stream = nullptr;
+
+        bool valid() const
+        {
+            return token_device != nullptr &&
+                   slot >= 0 &&
+                   device.is_valid() &&
+                   stream != nullptr;
+        }
+    };
+
+    /**
      * @brief One logical request inside a device-side stochastic MTP batch.
      *
      * The descriptor is intentionally value-owned: thresholds and stop tokens
@@ -349,6 +377,14 @@ namespace llaminar2
      * the GPU derive accept/residual thresholds from
      * @ref inverse_sample_seed and @ref inverse_sample_first_logical_position
      * instead of capturing host scalar thresholds in the verifier launch.
+     *
+     * Seeded serial-equivalent stochastic verification sets
+     * @ref serial_sample_equivalent instead. In that mode the verifier samples
+     * each target row with @ref sample_thresholds, compares those sampled target
+     * tokens against the materialized draft-token row, and summarizes with the
+     * same compact metadata ABI as greedy MTP. This is the batch-invariant path:
+     * it proves the grouped verifier would have produced the same tokens as
+     * serial stochastic decode at the same logical positions.
      */
     struct DeviceStochasticBatchOutcomeRequest
     {
@@ -367,10 +403,12 @@ namespace llaminar2
         int inverse_sample_first_logical_position = 0;
         bool use_vllm_probability_rejection = false;
         bool derive_thresholds_from_seed = false;
+        bool serial_sample_equivalent = false;
         bool use_device_draft_tokens = true; ///< Null host draft pointer when true.
         std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows> draft_tokens;
         std::array<float, sampling_math::kSpeculativeBatchMaxRows> accept_thresholds;
         std::array<float, sampling_math::kSpeculativeBatchMaxRows> residual_thresholds;
+        std::array<float, sampling_math::kSpeculativeBatchMaxRows> sample_thresholds;
         std::array<int32_t, sampling_math::kSpeculativeBatchMaxStopTokens> stop_tokens;
         int stop_token_count = 0;
 
@@ -379,6 +417,7 @@ namespace llaminar2
             draft_tokens.fill(-1);
             accept_thresholds.fill(0.0f);
             residual_thresholds.fill(0.0f);
+            sample_thresholds.fill(0.0f);
             stop_tokens.fill(-1);
         }
 
@@ -2207,6 +2246,24 @@ namespace llaminar2
         }
 
         /**
+         * @brief GPU-side sampling keyed by the logical output position.
+         *
+         * Seeded stochastic decode must use the same draw for a token whether it
+         * is sampled by ordinary serial decode or by an MTP verifier bonus row.
+         * Implementations should use @p logical_position as the draw key for the
+         * SamplingMath MTP "Sample" purpose. Returning -1 means the runner cannot
+         * provide that production sampler path.
+         */
+        virtual int sampleOnDeviceAtLogicalPosition(
+            const SamplingParams &params,
+            int logical_position)
+        {
+            (void)params;
+            (void)logical_position;
+            return -1;
+        }
+
+        /**
          * @brief Whether MPI worker ranks must enter decode sampling with rank 0.
          *
          * Some runners sample from already-gathered logits or fall back to a
@@ -2548,6 +2605,49 @@ namespace llaminar2
             (void)params;
             (void)vocab_size;
             (void)threshold;
+            return false;
+        }
+
+        /**
+         * @brief Return the runner-owned device mailbox for one draft sample slot.
+         *
+         * @param slot Draft slot index consumed by chained sidecars and verifier
+         *        token materialization.
+         * @param require_ready When true, the slot must already have a recorded
+         *        sample-ready producer event.  Rank-level mirrored LocalTP uses
+         *        this for the primary child before broadcasting its sampled token.
+         *
+         * The returned stream is the one callers must use for the next operation
+         * that reads or overwrites the slot.  Implementations must never return a
+         * null/default stream.
+         */
+        virtual DeviceStochasticDraftSampleSlotHandle
+        deviceStochasticDraftSampleSlot(
+            int slot,
+            bool require_ready = false)
+        {
+            (void)slot;
+            (void)require_ready;
+            return {};
+        }
+
+        /**
+         * @brief Record that a device operation has produced a draft sample slot.
+         *
+         * LocalTP broadcasts can overwrite a child draft slot without going through
+         * that child's sampler.  After the broadcast is enqueued on an explicit
+         * stream, the rank calls this hook so later sidecars and verifier reducers
+         * wait on the broadcast event exactly as they would wait on a native sample
+         * kernel event.
+         */
+        virtual bool recordStochasticDraftSampleSlotReadyFromDevice(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true)
+        {
+            (void)slot;
+            (void)producer_stream;
+            (void)verifier_consumer_pending;
             return false;
         }
 
@@ -3033,6 +3133,17 @@ namespace llaminar2
                         : nullptr;
                 const int32_t *draft_tokens =
                     request.hostDraftTokensOrNull();
+                if (request.serial_sample_equivalent)
+                {
+                    /*
+                     * The serial-sample-equivalent contract is device-resident:
+                     * implementations must compare sampled target tokens against
+                     * the same verifier-token row consumed by the grouped graph.
+                     * The conservative default cannot synthesize that row without
+                     * falling back to host replay, so fail loudly.
+                     */
+                    return false;
+                }
                 std::array<float, kSpeculativeBatchMaxRows>
                     derived_accept_thresholds = {};
                 std::array<float, kSpeculativeBatchMaxRows>

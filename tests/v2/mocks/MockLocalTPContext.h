@@ -19,6 +19,8 @@
 #include <atomic>
 #include <cmath>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace llaminar2::test
@@ -40,6 +42,17 @@ namespace llaminar2::test
             : tensor(t), stage_name(name), count(c) {}
         AllreduceCall(TensorBase *t, const std::string &name, size_t c, void *s, std::string p)
             : tensor(t), stage_name(name), count(c), stream(s), precision(std::move(p)) {}
+    };
+
+    /**
+     * @brief Record of one graph-stream sideband collective request.
+     */
+    struct SidebandCall
+    {
+        int device_index = -1;
+        void *stream = nullptr;
+        std::string stage_name;
+        size_t sideband_count = 0;
     };
 
     /**
@@ -93,6 +106,11 @@ namespace llaminar2::test
         void setBroadcastShouldFail(bool fail)
         {
             broadcast_should_fail_ = fail;
+        }
+
+        void setSidebandShouldFail(bool fail)
+        {
+            sideband_should_fail_ = fail;
         }
 
         void setRawAllgatherGraphCaptureSupported(bool supported)
@@ -203,6 +221,46 @@ namespace llaminar2::test
             (void)source_device_index;
             ++broadcast_call_count_;
             return !broadcast_should_fail_;
+        }
+
+        bool collectiveSidebandOnStream(
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name) override
+        {
+            if (!producer_stream)
+            {
+                throw std::invalid_argument(
+                    "MockLocalTPContext::collectiveSidebandOnStream requires a non-null stream");
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                sideband_calls_.push_back(
+                    SidebandCall{device_index,
+                                 producer_stream,
+                                 anchor_stage_name,
+                                 sidebands.size()});
+                if (device_index < 0 ||
+                    device_index >= static_cast<int>(devices_.size()))
+                {
+                    ++sideband_call_count_;
+                    return false;
+                }
+            }
+
+            for (const auto &sideband : sidebands)
+            {
+                if (!sideband.recv_buffer || sideband.element_count == 0)
+                {
+                    ++sideband_call_count_;
+                    return false;
+                }
+            }
+
+            ++sideband_call_count_;
+            return !sideband_should_fail_;
         }
 
         void synchronize() override
@@ -328,6 +386,7 @@ namespace llaminar2::test
         int gatherCallCount() const { return gather_call_count_.load(); }
         int reduceScatterCallCount() const { return reduce_scatter_call_count_.load(); }
         int broadcastCallCount() const { return broadcast_call_count_.load(); }
+        int sidebandCallCount() const { return sideband_call_count_.load(); }
         int synchronizeCallCount() const { return synchronize_call_count_.load(); }
 
         void requestAbort() override {}
@@ -339,6 +398,12 @@ namespace llaminar2::test
             return allreduce_calls_;
         }
 
+        std::vector<SidebandCall> getSidebandCalls() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return sideband_calls_;
+        }
+
         void resetCallTracking()
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -348,7 +413,9 @@ namespace llaminar2::test
             gather_call_count_ = 0;
             reduce_scatter_call_count_ = 0;
             broadcast_call_count_ = 0;
+            sideband_call_count_ = 0;
             synchronize_call_count_ = 0;
+            sideband_calls_.clear();
         }
 
     private:
@@ -412,14 +479,17 @@ namespace llaminar2::test
         }
 
         std::vector<AllreduceCall> allreduce_calls_;
+        std::vector<SidebandCall> sideband_calls_;
         std::atomic<int> allreduce_call_count_{0};
         std::atomic<int> allgather_call_count_{0};
         std::atomic<int> gather_call_count_{0};
         std::atomic<int> reduce_scatter_call_count_{0};
         std::atomic<int> broadcast_call_count_{0};
+        std::atomic<int> sideband_call_count_{0};
         std::atomic<int> synchronize_call_count_{0};
         bool allreduce_should_fail_ = false;
         bool broadcast_should_fail_ = false;
+        bool sideband_should_fail_ = false;
         bool raw_allgather_graph_capture_supported_ = false;
     };
 

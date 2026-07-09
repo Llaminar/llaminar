@@ -55,17 +55,31 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPGreedyMatchesPyTorchDecodeTokens)
     runMoEMTPParity(QWEN36_MOE_PREFIX_MTP_CASE(), false);
 }
 
-TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticSamplingVerifierRuns)
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticDepth1VerifierRuns)
 {
-    runMoEStochasticMTPVerifierParity(QWEN36_MOE_PREFIX_MTP_CASE());
+    runMoEStochasticMTPVerifierParity(QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(), 1);
 }
 
-TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticDepth3RequestStateResetAcceptsDrafts)
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticDepth2VerifierRuns)
+{
+    runMoEStochasticMTPVerifierParity(QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(), 2);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticDepth3VerifierRuns)
 {
     runMoEStochasticMTPVerifierParity(
         QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
         3,
         true);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPStochasticDynamicDepthVerifierRuns)
+{
+    runMoEStochasticMTPVerifierParity(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        3,
+        false,
+        qwen36MoEStochasticDynamicDepthPolicy(3));
 }
 
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, PrefixCacheMTPRestore)

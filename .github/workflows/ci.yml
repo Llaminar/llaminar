@@ -161,6 +161,28 @@ jobs:
                   --output-on-failure \
                   --parallel
 
+      - name: Run Qwen3.6 stochastic MTP depth matrix
+        run: |
+          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
+            --probe-image "${BUILDER_IMAGE}" \
+            --required)
+          docker run --rm \
+            "${nvidia_args[@]}" \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add video --group-add render \
+            --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit core=-1 \
+            --shm-size=16g \
+            -e MODELS_DIR="${MODELS_DIR}" \
+            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            ctest --test-dir build_v2_integration \
+                  -R '^(V2_Integration_Parity_Qwen36_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36MoE_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36_LocalTP_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfterClearCache|V2_Integration_Parity_Qwen36MoE_(ExpertOverlay|NodeLocalTP)_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfter(ClearCache|PrefixRestore).*|V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*PrefixCacheMTPRestore_(CUDA2TP|ROCm2TP)(Dynamic|LLEP)PhaseSplit)$' \
+                  --output-on-failure
+
       - name: Upload core dumps on failure
         if: failure()
         uses: actions/upload-artifact@v7
