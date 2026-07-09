@@ -94,7 +94,7 @@ build time on both CUDA and ROCm.
 - LocalTP GPU grouped path: mirrored children publish resident outcomes;
   greedy/stoch prelaunch uses rank resident mailboxes, request batches use
   device-token matrices/resident conditions, and target-slot commits fan out.
-  Stop-first commits output-only before sidecar/verifier.
+  Stop-first and ROCm segmented-env cases stay resident.
   No row replay, GPU host plans, base-cache vectors, or host materializer. Gates:
   focused units, full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,

@@ -12102,27 +12102,54 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPSegmentedCollectivesFailBeforeSidecarLaunch)
+    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPSegmentedCollectivesUseMirroredResidentPath)
     {
         ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
         ScopedEnv segmented_collectives("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
 
         auto harness = createLocalTPRunner(
             /*mtp_accept=*/true,
-            /*column_parallel_logits=*/false,
-            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+            /*column_parallel_logits=*/true,
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+            /*mtp_draft_tokens=*/1,
+            {},
+            /*spec_state_publication=*/false);
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            child->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+            child->enableMTPDeviceDraftTokenInput();
+            child->enableMTPSidecarPreservesMainState();
+            child->enableMTPShiftedRowReuseFromSidecar();
+            child->enableMirroredLocalTPMTPHeadForVerifier();
+            child->setVerifierAcceptedPrefixScript({1});
+        }
 
         std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
         ASSERT_TRUE(harness.runner->prefill(prompt));
 
         GenerationResult step = harness.runner->decodeStep();
-        EXPECT_FALSE(step.success());
-        EXPECT_NE(step.error.find("ROCm LocalTP MTP decode is incompatible"), std::string::npos)
-            << step.error;
-        EXPECT_NE(step.error.find("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED"), std::string::npos)
-            << step.error;
-        EXPECT_EQ(harness.child0->forwardMTPCount(), 0);
-        EXPECT_EQ(harness.child1->forwardMTPCount(), 0);
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_THAT(step.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->verifyGreedyAllPositionBatchOutcomeCount(), 1);
+        EXPECT_EQ(harness.child1->verifyGreedyAllPositionBatchOutcomeCount(), 1)
+            << "ROCm LocalTP with segmented collective graph capture enabled "
+               "must still use child-local mirrored resident verifier summaries.";
+        EXPECT_EQ(harness.child0->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_EQ(harness.child1->publishDeviceResidentMTPSpecStateCount(), 1);
+        EXPECT_EQ(harness.child0->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(harness.child1->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(harness.child0->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(harness.child1->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
+
+        const auto probe = harness.runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed) << probe.mtp_bypass_reason;
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, LocalTPMTPForcedRejectCountsOnceAcrossParticipants)

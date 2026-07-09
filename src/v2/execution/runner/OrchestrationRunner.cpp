@@ -4095,22 +4095,6 @@ namespace llaminar2
         {
             return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_M2_ROWS when LLAMINAR_GPU_GRAPHS=1; M=2 row-overlap launches side streams that are not graph-capture safe";
         }
-        if (debugEnv().execution.gpu_graphs &&
-            debugEnv().execution.gpu_graph_collective_segmented &&
-            plan_.usesLocalTP())
-        {
-            const bool has_rocm_participant =
-                std::any_of(plan_.local_tp_devices.begin(), plan_.local_tp_devices.end(),
-                            [](const GlobalDeviceAddress &address)
-                            {
-                                return address.toLocalDeviceId().is_rocm();
-                            });
-            if (has_rocm_participant)
-            {
-                return "ROCm LocalTP MTP decode is incompatible with LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED; RCCL segmented collective replay for MTP sidecar execution is not implemented";
-            }
-        }
-
         return {};
     }
 
