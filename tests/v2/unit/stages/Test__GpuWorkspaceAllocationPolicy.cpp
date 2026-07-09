@@ -643,22 +643,33 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     EXPECT_LT(kv_only_guard, logits_defer)
         << "KV-only sidecar replay must not use the pending-logits stream handoff; it owns shifted KV.";
 
-    const auto publish_body = sliceBetween(
+    const auto retired_host_publish_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(",
-        "std::vector<ForwardExecutionEngine::ReplayCacheObservation>");
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatch(");
+    EXPECT_NE(retired_host_publish_body.find(
+                  "GPU MTP spec-state publication from host step plans is retired"),
+              std::string::npos)
+        << "GPU publication must stay on the compact device-resident path; "
+           "the host step-plan publisher is CPU compatibility only.";
+
+    const auto publish_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatchFromDeviceOutcome(",
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(");
     const size_t publish_wait = publish_body.find("waitForPendingShiftedMTPKVReady");
-    const size_t kv_publish = publish_body.find("publishAcceptedMTPSpecKVState");
+    const size_t kv_publish = publish_body.find("publishSequenceStateFromDeviceMetadata");
     ASSERT_NE(publish_wait, std::string::npos);
     ASSERT_NE(kv_publish, std::string::npos);
     EXPECT_LT(publish_wait, kv_publish)
         << "Accepted-state publication truncates MTP KV and must wait for deferred shifted appends first.";
-    const size_t terminal_hidden_publish = publish_body.find("selectMTPTerminalHiddenRow");
+    const size_t terminal_hidden_publish =
+        publish_body.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState");
     const size_t ready_event = publish_body.find("recordAcceptedSpecPublicationReady");
     ASSERT_NE(terminal_hidden_publish, std::string::npos);
     ASSERT_NE(ready_event, std::string::npos);
     EXPECT_LT(terminal_hidden_publish, ready_event)
-        << "Publication readiness must cover the accepted verifier terminal hidden row.";
+        << "Publication readiness must cover the accepted verifier terminal hidden rows.";
     EXPECT_NE(publish_body.find("spec_state_terminal_hidden_publications"), std::string::npos)
         << "Terminal-hidden publication should be visible in perf stats.";
 
@@ -2058,14 +2069,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         source,
         "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatchFromDeviceOutcome(",
         "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(");
-    const auto single_publication_body = sliceBetween(
-        source,
-        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(",
-        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatch(");
-    const auto batch_publication_body = sliceBetween(
-        source,
-        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatch(",
-        "bool DeviceGraphOrchestrator::prepareDeviceResidentMTPSpecPublicationMetadata(");
     const auto record_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::recordLivePrefixMutationReady(",
@@ -2087,8 +2090,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     const auto compact_payload = removeAsciiWhitespace(stripCommentsAndStringLiterals(payload_body));
     const auto compact_checkpoint = removeAsciiWhitespace(stripCommentsAndStringLiterals(checkpoint_body));
     const auto compact_device_publication = removeAsciiWhitespace(stripCommentsAndStringLiterals(device_publication_body));
-    const auto compact_single_publication = removeAsciiWhitespace(stripCommentsAndStringLiterals(single_publication_body));
-    const auto compact_batch_publication = removeAsciiWhitespace(stripCommentsAndStringLiterals(batch_publication_body));
     const auto compact_record = removeAsciiWhitespace(stripCommentsAndStringLiterals(record_body));
     const auto compact_wait = removeAsciiWhitespace(stripCommentsAndStringLiterals(wait_body));
     const auto compact_observation = removeAsciiWhitespace(stripCommentsAndStringLiterals(observation_body));
@@ -2152,30 +2153,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "recordLivePrefixMutationReady(",
         "Truncate readiness must be recorded after the live-state epoch changes.");
     expectNeedleBefore(
-        compact_single_publication,
-        "handleLivePrefixReplayStateAfterMutation(",
-        "recordLivePrefixMutationReady(",
-        "Accepted spec-state publication mutates live KV/recurrent state and must publish the generic mutation handoff.");
-    expectNeedleBefore(
-        compact_single_publication,
-        "recordAcceptedSpecPublicationReady(",
-        "recordLivePrefixMutationReady(",
-        "Single-request publication consumers wait accepted-state readiness before the generic live mutation handoff.");
-    expectNeedleBefore(
-        compact_batch_publication,
-        "handleLivePrefixReplayStateAfterMutation(",
-        "recordLivePrefixMutationReady(",
-        "Batched accepted spec-state publication must publish the generic live mutation handoff.");
-    expectNeedleBefore(
-        compact_batch_publication,
-        "recordAcceptedSpecPublicationReady(",
-        "recordLivePrefixMutationReady(",
-        "Batched publication consumers wait accepted-state readiness before the generic live mutation handoff.");
-    expectNeedleBefore(
         compact_device_publication,
         "handleLivePrefixReplayStateAfterMutation(",
         "recordLivePrefixMutationReady(",
         "Device-resident accepted spec-state publication must publish the generic live mutation handoff.");
+    expectNeedleBefore(
+        compact_device_publication,
+        "recordAcceptedSpecPublicationReady(",
+        "recordLivePrefixMutationReady(",
+        "Device-resident publication consumers wait accepted-state readiness before the generic live mutation handoff.");
     expectNeedleBefore(
         compact_device_publication,
         "recordDeviceResidentLogicalSequenceStateMailbox(",
@@ -5388,11 +5374,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
     const std::string compact =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(predicate_section));
 
-    EXPECT_NE(compact.find("(candidate.is_cpu()||candidate.is_cuda()||candidate.is_rocm())"),
+    EXPECT_NE(compact.find("returncandidate.is_cpu()&&"),
               std::string::npos)
-        << "The decode-equivalent verifier lane must remain available for CPU "
-           "and any GPU topology that is not allowed to use the grouped "
-           "all-position publication path.";
+        << "The decode-equivalent verifier lane is CPU-only now. GPU verifier "
+           "rows must stay on the economical grouped publication routes instead "
+           "of drifting back toward row replay.";
     EXPECT_NE(compact.find("total_tokens>=1&&total_tokens<=4"),
               std::string::npos)
         << "M=1 verifier publication uses the explicit decode-equivalent path, "
@@ -5448,18 +5434,26 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
            "prefill path. Do not recouple this with the failed combined "
            "routed+shared shortcut.";
     EXPECT_NE(compact_shared.find(
-                  "shared_params.force_grouped_verifier_prefill_for_decode="
-                  "shared_grouped_verifier_prefill;"),
+                  "constboolshared_gpu_table_verifier_prefill="
+                  "shared_grouped_verifier_prefill&&"
+                  "(shared_device.is_cuda()||shared_device.is_rocm());"),
               std::string::npos)
-        << "The shared expert policy should still expose a named grouped route "
-           "for the promoted standalone shared-expert verifier kernel.";
+        << "CUDA and ROCm shared-expert verifier rows should use the promoted "
+           "grouped table-prefill route rather than a row-replay verifier lane.";
+    EXPECT_NE(compact_shared.find(
+                  "shared_params.force_grouped_verifier_prefill_for_decode="
+                  "shared_gpu_table_verifier_prefill;"),
+              std::string::npos)
+        << "The shared expert policy should expose the promoted GPU grouped "
+           "table route for both CUDA and ROCm.";
     EXPECT_NE(compact_shared.find(
                   "shared_params.force_decode_equivalent_verifier_prefill="
-                  "!shared_grouped_verifier_prefill&&"
-                  "forceDecodeEquivalentMoEVerifier(shared_device);"),
+                  "(!shared_gpu_table_verifier_prefill&&"
+                  "(!shared_grouped_verifier_prefill&&"
+                  "forceDecodeEquivalentMoEVerifier(shared_device)));"),
               std::string::npos)
-        << "Decode-equivalent MoE routing must not force the independent shared "
-           "expert back onto row-serial verifier replay.";
+        << "Decode-equivalent MoE routing must not force the independent GPU "
+           "shared expert back onto row-serial verifier replay.";
     EXPECT_EQ(compact_shared.find("forceDecodeEquivalentMoERouting(shared_device)"),
               std::string::npos)
         << "Routing conservatism belongs to the router/routed-expert path only; "
@@ -5473,7 +5467,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         removeAsciiWhitespace(stripCommentsAndStringLiterals(shared_dependency_section));
     EXPECT_NE(compact_shared_dependency.find(
                   "constboolshared_verifier_owns_branch_local_math="
-                  "main_verifier_rows&&shared_grouped_verifier_prefill;"),
+                  "main_verifier_rows&&(shared_gpu_table_verifier_prefill||"
+                  "shared_params.force_decode_equivalent_verifier_prefill);"),
               std::string::npos)
         << "The promoted standalone shared verifier route must stay separated "
            "from backend MoE scratch ownership so routed and shared branches can "

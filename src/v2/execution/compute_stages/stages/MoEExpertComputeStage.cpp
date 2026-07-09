@@ -974,7 +974,18 @@ namespace llaminar2
 #endif
 #if defined(HAVE_ROCM)
             if (device.is_rocm())
-                return debugEnv().rocm.shared_expert_grouped_decode;
+            {
+                /*
+                 * ROCm shared-expert decode must use the same grouped table
+                 * descriptor family as M=2..4 verifier table-prefill.  Keeping
+                 * the old opt-in dense decode path creates two valid-looking
+                 * production contracts whose FP32 reductions differ by a few
+                 * ulps; those ulps are enough to flip later MoE routing.  The
+                 * grouped table route is therefore a hard production
+                 * requirement, not a debug-advertised capability.
+                 */
+                return true;
+            }
 #endif
             return false;
 #endif
@@ -3431,9 +3442,11 @@ namespace llaminar2
             "verifier",
             params_.device_id.toString(),
             {{"stage", "routed_expert"},
-             {"route", seq_len == 1 ? "single_row_decode"
-                                     : (is_gpu ? "grouped_prefill"
-                                               : "cpu_expert_slot_grouped")},
+             {"route", seq_len == 1
+                           ? (is_gpu ? "grouped_prefill"
+                                     : "single_row_decode")
+                           : (is_gpu ? "grouped_prefill"
+                                     : "cpu_expert_slot_grouped")},
              {"layer", std::to_string(params_.layer_idx)},
              {"seq_len", std::to_string(params_.seq_len)},
              {"top_k", std::to_string(params_.top_k)}});
@@ -3471,6 +3484,13 @@ namespace llaminar2
                 params_.require_device_routing_tensor_decode,
                 params_.seq_len};
 
+            /*
+             * M=1 is the degenerate verifier bucket: there is no grouping economy
+             * to harvest, so the production contract is the backend's exact
+             * one-row decode implementation.  GPU participants still stay
+             * device-resident by requiring the explicit routing tensor path; a
+             * missing device route is a hard failure rather than a host replay.
+             */
             params_.seq_len = 1;
             params_.force_decode_equivalent_verifier_prefill = false;
             params_.force_grouped_verifier_prefill_for_decode = false;
@@ -3892,7 +3912,13 @@ namespace llaminar2
             combined_shared_up_gemm_ &&
             combined_shared_down_gemm_ &&
             combined_shared_desc_table_d_model_ == d_model &&
-            combined_shared_desc_table_intermediate_ == intermediate)
+            combined_shared_desc_table_intermediate_ == intermediate &&
+            combined_shared_gateup_desc_table_id_ >= 0 &&
+            combined_shared_gateup_desc_table_d_model_ == d_model &&
+            combined_shared_gateup_desc_table_intermediate_ == intermediate &&
+            combined_shared_down_desc_table_id_ >= 0 &&
+            combined_shared_down_desc_table_d_model_ == d_model &&
+            combined_shared_down_desc_table_intermediate_ == intermediate)
         {
             return true;
         }
@@ -3941,11 +3967,37 @@ namespace llaminar2
             return false;
         }
 
+        const int gateup_table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
+            &gate_desc, &up_desc, /*num_experts=*/1, d_model, intermediate);
+        if (gateup_table_id < 0)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Combined safe verifier failed to upload "
+                      "shared expert grouped gate/up descriptor table"
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        const int down_table_id = kernel->uploadGroupedExpertDownDescriptorTable(
+            &down_desc, /*num_experts=*/1, d_model, intermediate);
+        if (down_table_id < 0)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Combined safe verifier failed to upload "
+                      "shared expert grouped down descriptor table"
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+
         combined_shared_gate_gemm_ = shared_gate;
         combined_shared_up_gemm_ = shared_up;
         combined_shared_down_gemm_ = shared_down;
         combined_shared_desc_table_d_model_ = d_model;
         combined_shared_desc_table_intermediate_ = intermediate;
+        combined_shared_gateup_desc_table_id_ = gateup_table_id;
+        combined_shared_gateup_desc_table_d_model_ = d_model;
+        combined_shared_gateup_desc_table_intermediate_ = intermediate;
+        combined_shared_down_desc_table_id_ = down_table_id;
+        combined_shared_down_desc_table_d_model_ = d_model;
+        combined_shared_down_desc_table_intermediate_ = intermediate;
         return true;
     }
 
@@ -4144,8 +4196,8 @@ namespace llaminar2
         moe_prefill_runtime_grouping_available_ = false;
         const bool static_owner_runtime_grouping =
             params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner &&
-            hasFullLocalExpertOwnership() &&
-            expertMaskAllEnabled();
+            ((hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
+             hasFixedTopologyPrefillExpertMask());
         const bool least_loaded_runtime_grouping =
             params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
             hasFixedTopologyPrefillExpertMask();
@@ -4411,7 +4463,8 @@ namespace llaminar2
             return false;
         }
         if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
-            return hasFullLocalExpertOwnership() && expertMaskAllEnabled();
+            return (hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
+                   hasFixedTopologyPrefillExpertMask();
         if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
             return hasFixedTopologyPrefillExpertMask();
         return false;
@@ -4492,6 +4545,8 @@ namespace llaminar2
     {
         if (!kernel || grouped_gateup_desc_table_id_ < 0 ||
             grouped_down_desc_table_id_ < 0 ||
+            combined_shared_gateup_desc_table_id_ < 0 ||
+            combined_shared_down_desc_table_id_ < 0 ||
             !combined_shared_gate_gemm_ ||
             !combined_shared_up_gemm_ ||
             !combined_shared_down_gemm_)
@@ -4539,15 +4594,7 @@ namespace llaminar2
             !ensure_scratch(combined_shared_output_,
                             static_cast<size_t>(seq_len),
                             static_cast<size_t>(d_model),
-                            "shared_output") ||
-            !ensure_scratch(combined_shared_gate_scratch_,
-                            static_cast<size_t>(seq_len),
-                            static_cast<size_t>(intermediate),
-                            "shared_gate") ||
-            !ensure_scratch(combined_shared_up_scratch_,
-                            static_cast<size_t>(seq_len),
-                            static_cast<size_t>(intermediate),
-                            "shared_up"))
+                            "shared_output"))
         {
             return false;
         }
@@ -4585,40 +4632,35 @@ namespace llaminar2
         }
         markGpuTensorWritten(combined_routed_output_.get(), params_.device_id, gpuStream());
 
-        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-            {combined_shared_gate_gemm_, combined_shared_gate_scratch_.get(), intermediate, nullptr, "combined_shared_gate"},
-            {combined_shared_up_gemm_, combined_shared_up_scratch_.get(), intermediate, nullptr, "combined_shared_up"}};
+        /*
+         * The standalone shared-expert verifier path targets serial decode's
+         * grouped table-decode family by using the sibling grouped table-prefill
+         * kernels for M=2..4.  The composite path must use that same production
+         * route; otherwise it silently reintroduces the dense GEMM verifier hooks
+         * that can differ by a single FP32 ulp in layer 0 and later flip MoE
+         * routing decisions.  This is still a grouped implementation: one device
+         * grouping setup and one grouped prefill pipeline cover all verifier rows.
+         */
+        if (!kernel->prepareSharedExpertPrefillGroup(seq_len))
         {
-            auto verifier_scopes = beginVerifierDecodeEquivalentScopes(
-                {combined_shared_gate_gemm_, combined_shared_up_gemm_, combined_shared_down_gemm_});
-            if (!combined_shared_gate_gemm_->multiply_fused_verifier_rows_decode_equivalent(
-                    params_.input,
-                    projections,
-                    seq_len,
-                    d_model,
-                    nullptr,
-                    getWorkspace()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] shared gate/up verifier failed");
-                return false;
-            }
-            for (const auto &projection : projections)
-                markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
-
-            if (!combined_shared_down_gemm_->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                    combined_shared_gate_scratch_.get(),
-                    combined_shared_up_scratch_.get(),
-                    combined_shared_output_.get(),
-                    seq_len,
-                    d_model,
-                    intermediate,
-                    1.0f,
-                    0.0f,
-                    getWorkspace()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] shared SwiGLU/down verifier failed");
-                return false;
-            }
+            LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] "
+                      "shared grouped verifier setup failed");
+            return false;
+        }
+        if (!kernel->executeGroupedPrefillPipeline(
+                params_.input,
+                combined_shared_output_.get(),
+                combined_shared_gateup_desc_table_id_,
+                combined_shared_down_desc_table_id_,
+                seq_len,
+                d_model,
+                intermediate,
+                /*num_experts=*/1,
+                /*top_k=*/1))
+        {
+            LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] "
+                      "shared grouped verifier failed");
+            return false;
         }
         markGpuTensorWritten(combined_shared_output_.get(), params_.device_id, gpuStream());
 
@@ -4640,7 +4682,7 @@ namespace llaminar2
             "verifier",
             params_.device_id.toString(),
             {{"stage", "routed_plus_shared"},
-             {"route", "safe_composite"},
+             {"route", "safe_composite_grouped_table_prefill"},
              {"seq_len", std::to_string(seq_len)},
              {"routed_top_k", std::to_string(params_.top_k)},
              {"routed_experts", std::to_string(params_.num_experts)},
@@ -5174,6 +5216,8 @@ namespace llaminar2
         bool groups_prepared = false;
         if (runtime_grouping)
         {
+            const bool filter_runtime_grouping_to_local_experts =
+                params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner;
             groups_prepared = kernel->groupPrefillRoutes(
                 moe_runtime_layer_,
                 params_.routing_indices,
@@ -5181,7 +5225,8 @@ namespace llaminar2
                 seq_len,
                 seq_len,
                 num_experts,
-                top_k);
+                top_k,
+                filter_runtime_grouping_to_local_experts);
             if (groups_prepared &&
                 !trace_runtime_assignment("after_group"))
             {
@@ -6379,15 +6424,21 @@ namespace llaminar2
                params_.seq_len <= 4;
     }
 
-    bool SharedExpertFFNStage::usesCPUDecodeEquivalentVerifierPrefillForTesting() const
+    bool SharedExpertFFNStage::usesDecodeEquivalentVerifierPrefillForTesting() const
     {
         return shouldUseDecodeEquivalentVerifierPrefill();
+    }
+
+    bool SharedExpertFFNStage::usesCPUDecodeEquivalentVerifierPrefillForTesting() const
+    {
+        return usesDecodeEquivalentVerifierPrefillForTesting();
     }
 
     bool SharedExpertFFNStage::shouldUseGroupedDecodeRoute() const
     {
         return params_.device_id.is_gpu() &&
                params_.seq_len == 1 &&
+               !shouldUseDecodeEquivalentVerifierPrefill() &&
                !params_.disable_grouped_decode_shortcut &&
                shouldUseSharedExpertGroupedDecode(params_.device_id);
     }
@@ -6418,25 +6469,33 @@ namespace llaminar2
             "verifier",
             params_.device_id.toString(),
             {{"stage", "shared_expert"},
-             {"route", params_.seq_len == 1 ? "single_row_decode"
-                                             : (params_.device_id.is_gpu()
-                                                    ? "grouped_table_prefill"
-                                                    : "cpu_grouped_verifier_hooks")},
+             {"route", params_.seq_len == 1
+                           ? "single_row_decode"
+                           : ((params_.device_id.is_cuda() ||
+                               params_.device_id.is_rocm())
+                                  ? "gemm_grouped_verifier_hooks"
+                                  : "cpu_grouped_verifier_hooks")},
              {"seq_len", std::to_string(params_.seq_len)}});
 
         if (params_.seq_len == 1)
         {
             /*
-             * M=1 has no grouped dimension to exploit.  Execute the ordinary
-             * decode contract once, preserving the caller's explicit
-             * disable_grouped_decode_shortcut setting for sidecar verifier
-             * lanes that need the non-shortcut path.
+             * M=1 has no grouped dimension to exploit. Execute the ordinary
+             * production one-row GEMM decode contract once.  Verifier
+             * publication uses this row as the byte-for-byte oracle for grouped
+             * M=2..4 rows, so the ordinary shared-expert grouped-table shortcut
+             * is deliberately suppressed here even when normal decode would use
+             * it.  Otherwise the grouped side and the serial witness can choose
+             * different reduction kernels for the same TP-sharded shared expert
+             * projection, which creates tiny layer-0 drift that later flips MoE
+             * routes.
              */
             struct ScopedRuntimeDecodeSharedExpert
             {
                 SharedExpertFFNStage::Params &params;
                 bool force_grouped_verifier_prefill_for_decode;
                 bool force_decode_equivalent_verifier_prefill;
+                bool disable_grouped_decode_shortcut;
                 int seq_len;
 
                 ~ScopedRuntimeDecodeSharedExpert()
@@ -6445,50 +6504,22 @@ namespace llaminar2
                         force_grouped_verifier_prefill_for_decode;
                     params.force_decode_equivalent_verifier_prefill =
                         force_decode_equivalent_verifier_prefill;
+                    params.disable_grouped_decode_shortcut =
+                        disable_grouped_decode_shortcut;
                     params.seq_len = seq_len;
                 }
             } restore{
                 params_,
                 params_.force_grouped_verifier_prefill_for_decode,
                 params_.force_decode_equivalent_verifier_prefill,
+                params_.disable_grouped_decode_shortcut,
                 params_.seq_len};
 
             params_.seq_len = 1;
             params_.force_decode_equivalent_verifier_prefill = false;
             params_.force_grouped_verifier_prefill_for_decode = false;
+            params_.disable_grouped_decode_shortcut = true;
             return execute(ctx);
-        }
-
-        if (params_.device_id.is_gpu())
-        {
-            struct ScopedGroupedVerifierSharedExpert
-            {
-                SharedExpertFFNStage::Params &params;
-                bool force_grouped_verifier_prefill_for_decode;
-                bool force_decode_equivalent_verifier_prefill;
-
-                ~ScopedGroupedVerifierSharedExpert()
-                {
-                    params.force_grouped_verifier_prefill_for_decode =
-                        force_grouped_verifier_prefill_for_decode;
-                    params.force_decode_equivalent_verifier_prefill =
-                        force_decode_equivalent_verifier_prefill;
-                }
-            } restore{
-                params_,
-                params_.force_grouped_verifier_prefill_for_decode,
-                params_.force_decode_equivalent_verifier_prefill};
-
-            params_.force_grouped_verifier_prefill_for_decode = true;
-            params_.force_decode_equivalent_verifier_prefill = false;
-            if (!tryGroupedVerifierPrefill(kernel, d_model, intermediate))
-            {
-                LOG_ERROR("[SharedExpertFFNStage] Decode-equivalent GPU shared expert verifier "
-                          "requires grouped table prefill; row replay is not a production fallback");
-                return false;
-            }
-            markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
-            return true;
         }
 
         if (!scratch_gate_ ||
@@ -6513,6 +6544,8 @@ namespace llaminar2
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {cached_gate_gemm_, scratch_gate_.get(), intermediate, nullptr, "shared_gate"},
             {cached_up_gemm_, scratch_up_.get(), intermediate, nullptr, "shared_up"}};
+        auto verifier_scopes = beginVerifierDecodeEquivalentScopes(
+            {cached_gate_gemm_, cached_up_gemm_, cached_down_gemm_});
         if (!cached_gate_gemm_->multiply_fused_verifier_rows_decode_equivalent(
                 params_.input,
                 projections,
@@ -6521,12 +6554,14 @@ namespace llaminar2
                 nullptr,
                 getWorkspace()))
         {
-            LOG_ERROR("[SharedExpertFFNStage] CPU grouped verifier shared gate/up projection failed"
+            LOG_ERROR("[SharedExpertFFNStage] Grouped verifier shared gate/up projection failed"
                       << " m=" << params_.seq_len
                       << " d_model=" << d_model
                       << " intermediate=" << intermediate);
             return false;
         }
+        for (const auto &projection : projections)
+            markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
 
         if (!cached_down_gemm_->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 scratch_gate_.get(),
@@ -6539,21 +6574,25 @@ namespace llaminar2
                 0.0f,
                 getWorkspace()))
         {
-            LOG_ERROR("[SharedExpertFFNStage] CPU grouped verifier shared SwiGLU/down projection failed"
+            LOG_ERROR("[SharedExpertFFNStage] Grouped verifier shared SwiGLU/down projection failed"
                       << " m=" << params_.seq_len
                       << " d_model=" << d_model
                       << " intermediate=" << intermediate);
             return false;
         }
+        markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
 
         PerfStatsCollector::addCounter(
             "mtp",
             "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
             static_cast<double>(params_.seq_len),
             "verifier",
-            params_.device_id.toString(),
+             params_.device_id.toString(),
             {{"stage", "shared_expert"},
-             {"route", "cpu_grouped_verifier_hooks"}});
+             {"route", (params_.device_id.is_cuda() ||
+                         params_.device_id.is_rocm())
+                           ? "gemm_grouped_verifier_hooks"
+                           : "cpu_grouped_verifier_hooks"}});
         return true;
     }
 

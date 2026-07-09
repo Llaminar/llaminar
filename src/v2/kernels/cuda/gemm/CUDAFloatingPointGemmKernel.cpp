@@ -469,6 +469,102 @@ namespace llaminar2
                 return success;
             }
 
+            /*
+             * Decode-sized FP32 stage projections need the same treatment as
+             * FP16/BF16 above: cuBLAS is free to choose different reduction
+             * schedules for M=1 and M=2..4, which is legal GEMM behavior but
+             * not legal for MTP verifier rows that may publish live state.
+             *
+             * When a graph/stage workspace is bound, route small FP32 rows
+             * through the fixed-order grouped projection kernel even for the
+             * serial M=1 decode call.  The grouped verifier entry point below
+             * uses the same kernel, so row grouping changes launch geometry but
+             * not per-output accumulation order.  Standalone tests that call
+             * this adapter without graph workspace still exercise the ordinary
+             * cuBLAS path; production stage execution always binds workspace.
+             */
+            DeviceWorkspaceManager *effective_workspace = workspace ? workspace : bound_workspace_;
+            const bool can_use_fixed_order_fp32_decode =
+                transpose_B &&
+                alpha == 1.0f &&
+                beta == 0.0f &&
+                !d_bias &&
+                m >= 1 && m <= 4 &&
+                n > 0 &&
+                k > 0 &&
+                d_weights_ &&
+                gpu_stream_ &&
+                effective_workspace;
+            if (can_use_fixed_order_fp32_decode)
+            {
+                auto *d_A_array = static_cast<const float **>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS));
+                auto *d_B_array = static_cast<const float **>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS));
+                auto *d_C_array = static_cast<float **>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS));
+                if (!d_A_array || !d_B_array || !d_C_array)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] FP32 decode-equivalent projection missing pointer workspace");
+                    return false;
+                }
+
+                const float *a_ptrs[1] = {d_A};
+                const float *b_ptrs[1] = {static_cast<const float *>(d_weights_)};
+                float *c_ptrs[1] = {d_C};
+                if (!cudaFp32_stage_batched_projection_pointers(
+                        d_A_array,
+                        d_B_array,
+                        d_C_array,
+                        a_ptrs,
+                        b_ptrs,
+                        c_ptrs,
+                        1,
+                        cuda_device_id_,
+                        gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] FP32 decode-equivalent projection failed to stage pointers");
+                    return false;
+                }
+
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
+                bool success = cudaFp32_tiny_batched_projection(
+                    d_A_array,
+                    d_B_array,
+                    d_C_array,
+                    m,
+                    n,
+                    k,
+                    1,
+                    cuda_device_id_,
+                    gpu_stream_);
+                if (success && d_mapped_output)
+                {
+                    success = cudaQuantGemm_copyDeviceToDeviceAsync(
+                        d_mapped_output,
+                        d_C,
+                        static_cast<size_t>(m) * static_cast<size_t>(n),
+                        cuda_device_id_,
+                        gpu_stream_);
+                }
+                if (success && PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_fp32_single_verifier_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"dtype", "fp32"},
+                            {"m", std::to_string(m)},
+                            {"n", std::to_string(n)},
+                            {"k", std::to_string(k)},
+                            {"route", "fixed_order_fp32_single_projection"}});
+                }
+                return success;
+            }
+
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             if (d_bias)
             {
@@ -854,14 +950,11 @@ namespace llaminar2
                           << m);
                 return false;
             }
-            if (precision_ == Precision::FP32)
-            {
-                return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
-            }
+            (void)mpi_ctx;
 
             if (!input || projections.empty() || k <= 0)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection rejected: input="
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection rejected: input="
                           << (input != nullptr)
                           << " projections=" << projections.size()
                           << " k=" << k);
@@ -869,27 +962,27 @@ namespace llaminar2
             }
             if (input->native_type() != TensorType::FP32)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection requires FP32 activations, got "
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection requires FP32 activations, got "
                           << static_cast<int>(input->native_type()));
                 return false;
             }
             if (!gpu_stream_)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection requires an explicit CUDA stream");
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection requires an explicit CUDA stream");
                 return false;
             }
 
             DeviceWorkspaceManager *effective_workspace = workspace ? workspace : bound_workspace_;
             if (!effective_workspace)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection requires declared graph workspace");
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection requires declared graph workspace");
                 return false;
             }
 
             const float *d_input = static_cast<const float *>(input->gpu_data_ptr());
             if (!d_input)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection input has no CUDA device data");
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection input has no CUDA device data");
                 return false;
             }
 
@@ -906,12 +999,15 @@ namespace llaminar2
                 effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS) < pointer_array_bytes ||
                 effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS) < pointer_array_bytes)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection missing pointer-array workspace");
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection missing pointer-array workspace");
                 return false;
             }
 
+            const bool use_fp32_weights = precision_ == Precision::FP32;
             const int weight_dtype = (precision_ == Precision::BF16) ? 1 : 0;
-            const char *dtype_tag = (precision_ == Precision::BF16) ? "bf16" : "fp16";
+            const char *dtype_tag =
+                precision_ == Precision::FP32 ? "fp32" :
+                (precision_ == Precision::BF16 ? "bf16" : "fp16");
             std::vector<bool> completed(projections.size(), false);
 
             for (size_t seed_index = 0; seed_index < projections.size(); ++seed_index)
@@ -922,13 +1018,13 @@ namespace llaminar2
                 const auto &seed = projections[seed_index];
                 if (!seed.kernel || !seed.output || seed.bias || seed.n <= 0)
                 {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection invalid seed at "
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection invalid seed at "
                               << seed_index);
                     return false;
                 }
-                if (seed.output->native_type() != TensorType::FP32 || seed.output->isMapped())
+                if (seed.output->native_type() != TensorType::FP32)
                 {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection output must be unmapped FP32 at "
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection output must be FP32 at "
                               << seed_index);
                     return false;
                 }
@@ -952,8 +1048,14 @@ namespace llaminar2
                     std::vector<const float *> a_ptrs(group_count, d_input);
                     std::vector<const float *> b_ptrs;
                     std::vector<float *> c_ptrs;
+                    std::vector<float *> mapped_outputs(group_count, nullptr);
                     b_ptrs.reserve(group_count);
                     c_ptrs.reserve(group_count);
+
+                    float *d_redirect_base = nullptr;
+                    const size_t output_values =
+                        static_cast<size_t>(m) * static_cast<size_t>(seed.n);
+                    const size_t redirect_bytes = output_values * group_count * sizeof(float);
 
                     for (size_t local = 0; local < group_count; ++local)
                     {
@@ -967,7 +1069,7 @@ namespace llaminar2
                             projection_kernel->N_ != static_cast<size_t>(projection.n) ||
                             !projection_kernel->d_weights_)
                         {
-                            LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection incompatible kernel at "
+                            LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection incompatible kernel at "
                                       << projection_index);
                             return false;
                         }
@@ -975,10 +1077,34 @@ namespace llaminar2
                         float *d_output = static_cast<float *>(projection.output->gpu_data_ptr());
                         if (!d_output)
                         {
-                            LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection output has no CUDA data at "
+                            LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection output has no CUDA data at "
                                       << projection_index);
                             return false;
                         }
+
+                        if (projection.output->isMapped())
+                        {
+                            if (!d_redirect_base)
+                            {
+                                if (!effective_workspace->hasBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) ||
+                                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) < redirect_bytes)
+                                {
+                                    LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection mapped output "
+                                              << "requires redirect workspace bytes=" << redirect_bytes);
+                                    return false;
+                                }
+                                d_redirect_base = static_cast<float *>(
+                                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT));
+                                if (!d_redirect_base)
+                                {
+                                    LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection redirect workspace is null");
+                                    return false;
+                                }
+                            }
+                            mapped_outputs[local] = d_output;
+                            d_output = d_redirect_base + output_values * local;
+                        }
+
                         b_ptrs.push_back(reinterpret_cast<const float *>(projection_kernel->d_weights_));
                         c_ptrs.push_back(d_output);
                     }
@@ -994,24 +1120,36 @@ namespace llaminar2
                             cuda_device_id_,
                             gpu_stream_))
                     {
-                        LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection failed to stage pointers");
+                        LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection failed to stage pointers");
                         return false;
                     }
 
                     CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
-                    if (!cudaFp32x16_tiny_batched_projection(
-                            d_A_array,
-                            d_B_array,
-                            d_C_array,
-                            m,
-                            seed.n,
-                            k,
-                            static_cast<int>(group_count),
-                            weight_dtype,
-                            cuda_device_id_,
-                            gpu_stream_))
+                    const bool projection_ok = use_fp32_weights
+                                                   ? cudaFp32_tiny_batched_projection(
+                                                         d_A_array,
+                                                         d_B_array,
+                                                         d_C_array,
+                                                         m,
+                                                         seed.n,
+                                                         k,
+                                                         static_cast<int>(group_count),
+                                                         cuda_device_id_,
+                                                         gpu_stream_)
+                                                   : cudaFp32x16_tiny_batched_projection(
+                                                         d_A_array,
+                                                         d_B_array,
+                                                         d_C_array,
+                                                         m,
+                                                         seed.n,
+                                                         k,
+                                                         static_cast<int>(group_count),
+                                                         weight_dtype,
+                                                         cuda_device_id_,
+                                                         gpu_stream_);
+                    if (!projection_ok)
                     {
-                        LOG_ERROR("[CUDAFloatingPointGemmKernel] FP32x16 grouped verifier projection kernel failed"
+                        LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection kernel failed"
                                   << " dtype=" << dtype_tag
                                   << " M=" << m
                                   << " N=" << seed.n
@@ -1021,13 +1159,32 @@ namespace llaminar2
                     }
 
                     for (size_t local = 0; local < group_count; ++local)
+                    {
+                        if (!mapped_outputs[local])
+                            continue;
+                        if (!cudaQuantGemm_copyDeviceToDeviceAsync(
+                                mapped_outputs[local],
+                                c_ptrs[local],
+                                output_values,
+                                cuda_device_id_,
+                                gpu_stream_))
+                        {
+                            LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection failed "
+                                      << "to copy mapped output for local projection " << local);
+                            return false;
+                        }
+                    }
+
+                    for (size_t local = 0; local < group_count; ++local)
                         completed[group_indices[group_offset + local]] = true;
 
                     if (PerfStatsCollector::isEnabled())
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "cuda_fp32x16_grouped_verifier_projection_calls",
+                            use_fp32_weights
+                                ? "cuda_fp32_grouped_verifier_projection_calls"
+                                : "cuda_fp32x16_grouped_verifier_projection_calls",
                             1.0,
                             "gemm",
                             "cuda:" + std::to_string(cuda_device_id_),
@@ -1037,7 +1194,9 @@ namespace llaminar2
                                 {"n", std::to_string(seed.n)},
                                 {"k", std::to_string(k)},
                                 {"projections", std::to_string(group_count)},
-                                {"route", "fixed_order_fp32x16_batched_projection"}});
+                                {"route", use_fp32_weights
+                                              ? "fixed_order_fp32_batched_projection"
+                                              : "fixed_order_fp32x16_batched_projection"}});
                     }
 
                     group_offset += group_count;

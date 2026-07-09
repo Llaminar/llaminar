@@ -14,6 +14,7 @@
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "loaders/ModelContext.h"
 #include "loaders/ModelContextConfig.h"
+#include "tensors/TensorSlice.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
@@ -129,42 +130,20 @@ namespace
         std::string old_value_;
     };
 
-#ifdef HAVE_ROCM
-    /**
-     * @brief Temporarily force the live ROCm native-VNNI dispatch policy.
-     *
-     * The environment parser clamps public KB values to its documented range,
-     * so tests that intentionally exercise an unsafe internal value must use the
-     * launcher override API.  This guard resets the override on destruction so a
-     * failed assertion cannot poison later kernel tests in the same process.
-     */
-    class ScopedNativeVNNITuningOverride
-    {
-    public:
-        ScopedNativeVNNITuningOverride(int kb, int target_waves_per_cu)
-        {
-            rocmGemv_native_vnni_set_tuning_overrides(kb, target_waves_per_cu);
-        }
-
-        ~ScopedNativeVNNITuningOverride()
-        {
-            rocmGemv_native_vnni_reset_tuning_overrides();
-        }
-
-        ScopedNativeVNNITuningOverride(const ScopedNativeVNNITuningOverride &) = delete;
-        ScopedNativeVNNITuningOverride &operator=(const ScopedNativeVNNITuningOverride &) = delete;
-    };
-#endif
-
-    bool hasROCmDevice()
+    int rocmDeviceCount()
     {
 #ifdef HAVE_ROCM
         int count = 0;
         const hipError_t err = hipGetDeviceCount(&count);
-        return err == hipSuccess && count > 0;
+        return err == hipSuccess ? count : 0;
 #else
-        return false;
+        return 0;
 #endif
+    }
+
+    bool hasROCmDevice()
+    {
+        return rocmDeviceCount() > 0;
     }
 
     void cpuFP32GemmRef(const float *A, const float *W, float *C, int M, int N, int K)
@@ -1174,9 +1153,7 @@ namespace
         int M,
         int N,
         int K,
-        CreateWeights createWeights,
-        float min_cosine,
-        float max_relative_l2)
+        CreateWeights createWeights)
     {
         auto weights = createWeights(
             {static_cast<size_t>(N), static_cast<size_t>(K)},
@@ -1216,7 +1193,16 @@ namespace
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
 
-        ASSERT_TRUE(kernel.multiply_tensor(grouped_input.get(), grouped_output.get(), M, N, K));
+        /*
+         * This helper proves the verifier path, not the generic M-aware prefill
+         * route.  Keep the backend verifier scope alive only for the grouped
+         * launch so ROCm selects the serial-M1 split policy while still using
+         * the economical grouped kernel.
+         */
+        {
+            auto verifier_scope = kernel.beginVerifierDecodeEquivalentScope();
+            ASSERT_TRUE(kernel.multiply_tensor(grouped_input.get(), grouped_output.get(), M, N, K));
+        }
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
@@ -1267,10 +1253,14 @@ namespace
                                  << " cosine=" << cos
                                  << " rel_l2=" << rel_l2
                                  << " max_abs=" << max_abs);
-            EXPECT_GE(cos, min_cosine) << "row=" << row;
-            EXPECT_LE(rel_l2, max_relative_l2) << "row=" << row;
-            EXPECT_LE(max_abs, 0.5f) << "row=" << row;
         }
+
+        expectBitwiseFP32RowsEqual(
+            std::string(label) + " grouped verifier rows M=" + std::to_string(M),
+            grouped_values.data(),
+            serial_values.data(),
+            static_cast<size_t>(M) * static_cast<size_t>(N),
+            static_cast<size_t>(N));
 
 #ifdef HAVE_ROCM
         kernel.setGPUStream(nullptr);
@@ -1341,8 +1331,13 @@ namespace
         bool force_decode_equivalent,
         void *stream,
         bool graph_capture,
-        std::vector<float> &result)
+        std::vector<float> &result,
+        DeviceId device = DeviceId::rocm(0))
     {
+#ifdef HAVE_ROCM
+        if (device.is_rocm())
+            ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+#endif
         auto input = TestTensorFactory::createFP32(
             {static_cast<size_t>(M), static_cast<size_t>(K)});
         std::copy_n(input_values.data(), static_cast<size_t>(M) * static_cast<size_t>(K),
@@ -1350,11 +1345,11 @@ namespace
         auto output = TestTensorFactory::createFP32Zeros(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
-        ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(output->allocateOnDevice(device, stream));
 
         GEMMStage::Params params;
-        params.device_id = DeviceId::rocm(0);
+        params.device_id = device;
         params.A = input.get();
         params.B = weight;
         params.C = output.get();
@@ -1374,11 +1369,11 @@ namespace
 
         const WorkspaceRequirements requirements = stage.getWorkspaceRequirements(M, N, K);
         const size_t budget = requirements.total_bytes_with_alignment() + 64 * 1024 * 1024;
-        DeviceWorkspaceManager workspace(DeviceId::rocm(0), budget);
+        DeviceWorkspaceManager workspace(device, budget);
         ASSERT_TRUE(workspace.allocate(requirements));
         stage.bindWorkspace(&workspace);
 
-        ROCmDeviceContext ctx(DeviceId::rocm(0), 0);
+        ROCmDeviceContext ctx(device, device.ordinal);
         if (graph_capture)
         {
 #ifdef HAVE_ROCM
@@ -1477,10 +1472,563 @@ namespace
                                                                                    << " cosine=" << cos
                                                                                    << " rel_l2=" << rel_l2
                                                                                    << " max_abs=" << max_abs);
-            EXPECT_GE(cos, 0.9999999f) << "row=" << row;
-            EXPECT_LE(rel_l2, 1.0e-8f) << "row=" << row;
-            EXPECT_EQ(max_abs, 0.0f) << "row=" << row;
         }
+
+        expectBitwiseFP32RowsEqual(
+            std::string("real Qwen3.6 output GEMMStage grouped verifier rows M=") +
+                std::to_string(M) + " scale=" + std::to_string(input_scale),
+            grouped_values.data(),
+            serial_values.data(),
+            static_cast<size_t>(M) * static_cast<size_t>(N),
+            static_cast<size_t>(N));
+    }
+
+    /**
+     * @brief Formats that must prove LocalTP Wo reconstruction equivalence.
+     *
+     * The model-level MTP failures we are chasing appear after row-parallel
+     * attention output projection and allreduce.  A single real IQ3_S model is
+     * a useful reproducer, but it is not a complete proof.  This table sweeps
+     * every native ROCm quantized tensor format and keeps the high-risk
+     * low-bit formats nonzero enough to exercise their actual decode kernels.
+     */
+    std::vector<NativeFormatCase> localTPWoQuantizedFormatCases()
+    {
+        return {
+            {"Q4_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_0Random(shape, seed); }, 0.0f},
+            {"Q4_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_1Random(shape, seed); }, 0.0f},
+            {"Q5_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_0Random(shape, seed); }, 0.0f},
+            {"Q5_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_1Random(shape, seed); }, 0.0f},
+            {"Q6_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ6_KRandom(shape, seed); }, 0.0f},
+            {"Q3_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ3_KRandom(shape, seed); }, 0.0f},
+            {"Q2_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ2_KRandom(shape, seed); }, 0.0f},
+            {"Q4_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_KRandom(shape, seed); }, 0.0f},
+            {"Q5_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_KRandom(shape, seed); }, 0.0f},
+            {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }, 0.0f},
+            {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return createBoundedIQ4XSForGroupedMoE(shape, seed); }, 0.0f},
+            {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return createNonzeroIQ3SForGroupedMoE(shape, seed); }, 0.0f},
+            {"IQ3_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }, 0.0f},
+            {"IQ2_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }, 0.0f},
+            {"IQ2_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }, 0.0f},
+            {"IQ2_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }, 0.0f},
+            {"IQ1_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }, 0.0f},
+            {"IQ1_M", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }, 0.0f},
+            {"Q8_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ8_0Random(shape, seed); }, 0.0f},
+        };
+    }
+
+    std::vector<NativeFormatCase> localTPWoFloatingPointFormatCases()
+    {
+        return {
+            {"FP32", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createFP32Random(shape, -0.20f, 0.20f, seed); }, 0.0f},
+            {"FP16", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createFP16Random(shape, -0.20f, 0.20f, seed); }, 0.0f},
+            {"BF16", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createBF16Random(shape, -0.20f, 0.20f, seed); }, 0.0f},
+        };
+    }
+
+    struct LocalTPWoShapeCase
+    {
+        const char *label;
+        int hidden;
+        int local_attention_dim;
+        int full_attention_dim;
+    };
+
+    std::vector<LocalTPWoShapeCase> localTPWoShapeCases()
+    {
+        return {
+            /*
+             * Narrow local-attention rows cover the original synthetic LocalTP
+             * Wo regression shape.  The wider case matches Qwen3.6 MoE
+             * full-attention layers, where each of two LocalTP ranks owns a
+             * 2048-wide attention-output slice before the row-parallel Wo
+             * partials are allreduced back to the 2048-wide hidden stream.
+             */
+            {"qwen36_narrow_attention", 2048, 1024, 2048},
+            {"qwen36_moe_full_attention", 2048, 2048, 4096},
+        };
+    }
+
+    std::unique_ptr<TensorBase> wrapSyntheticInputParallelShard(
+        std::unique_ptr<TensorBase> local_weight,
+        size_t full_rows,
+        size_t full_cols,
+        int rank,
+        int world_size)
+    {
+        auto meta = SliceMetadata::forRowParallel(
+            full_rows, full_cols, rank, world_size,
+            true /* inner_is_presliced */);
+        return std::make_unique<TensorSlice>(std::move(local_weight), meta);
+    }
+
+    GpuPreparedGemm makeGpuPreparedVerifierProjection(
+        TensorBase *weight,
+        DeviceId device,
+        const std::string &canonical_name,
+        ModelContextId model_id)
+    {
+        if (!weight)
+            throw std::runtime_error("makeGpuPreparedVerifierProjection: null weight");
+        switch (weight->native_type())
+        {
+        case TensorType::FP32:
+        case TensorType::FP16:
+        case TensorType::BF16:
+            return makeGpuPreparedFloatingPointGemm(weight, device, canonical_name, model_id);
+        default:
+            return makeGpuPreparedGemm(weight, device, canonical_name, model_id);
+        }
+    }
+
+    double groupedVerifierGemmPerfCounterValue()
+    {
+        double total = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"mtp.gemm_grouped_decode_equivalent_verifier_prefill_rows"}))
+        {
+            if (record.domain == "mtp" &&
+                record.name == "gemm_grouped_decode_equivalent_verifier_prefill_rows")
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    }
+
+    struct LocalTPWoShardFixture
+    {
+        DeviceId device;
+        std::unique_ptr<TensorBase> weight;
+        GpuPreparedGemm prepared;
+        std::vector<float> input_rows;
+    };
+
+    LocalTPWoShardFixture makeLocalTPWoShardFixture(
+        const NativeFormatCase &format_case,
+        int rank,
+        int world_size,
+        int N,
+        int local_K,
+        int full_K,
+        DeviceId device,
+        uint32_t seed)
+    {
+        auto local_weight = format_case.create(
+            {static_cast<size_t>(N), static_cast<size_t>(local_K)},
+            seed + static_cast<uint32_t>(rank * 17));
+        auto wrapped_weight = wrapSyntheticInputParallelShard(
+            std::move(local_weight),
+            static_cast<size_t>(N),
+            static_cast<size_t>(full_K),
+            rank,
+            world_size);
+
+        LocalTPWoShardFixture fixture;
+        fixture.device = device;
+        fixture.weight = std::move(wrapped_weight);
+        fixture.prepared = makeGpuPreparedVerifierProjection(
+            fixture.weight.get(),
+            device,
+            std::string("test.localtp_wo.") + format_case.label + ".rank" + std::to_string(rank),
+            ModelContextId{static_cast<uint64_t>(71000 + seed + static_cast<uint32_t>(rank))});
+
+        auto input = TestTensorFactory::createFP32Random(
+            {4u, static_cast<size_t>(local_K)},
+            -0.75f,
+            0.75f,
+            seed + 500u + static_cast<uint32_t>(rank * 31));
+        fixture.input_rows.assign(
+            input->data(),
+            input->data() + static_cast<size_t>(4) * static_cast<size_t>(local_K));
+        return fixture;
+    }
+
+    struct GroupedAndSerialRows
+    {
+        std::vector<float> grouped;
+        std::vector<float> serial;
+    };
+
+    GroupedAndSerialRows runLocalTPWoShardVerifierRows(
+        LocalTPWoShardFixture &fixture,
+        int M,
+        int N,
+        int local_K,
+        void *stream)
+    {
+        std::vector<float> input(static_cast<size_t>(M) * static_cast<size_t>(local_K));
+        for (int row = 0; row < M; ++row)
+        {
+            std::copy_n(
+                fixture.input_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(local_K),
+                local_K,
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(local_K));
+        }
+
+        GroupedAndSerialRows rows;
+        runGemmStageRows(
+            fixture.weight.get(),
+            fixture.prepared,
+            input,
+            M,
+            N,
+            local_K,
+            /*force_decode_equivalent=*/true,
+            stream,
+            /*graph_capture=*/false,
+            rows.grouped,
+            fixture.device);
+
+        rows.serial.resize(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> row_input(static_cast<size_t>(local_K));
+            std::copy_n(
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(local_K),
+                local_K,
+                row_input.data());
+
+            std::vector<float> row_values;
+            runGemmStageRows(
+                fixture.weight.get(),
+                fixture.prepared,
+                row_input,
+                1,
+                N,
+                local_K,
+                /*force_decode_equivalent=*/false,
+                stream,
+                /*graph_capture=*/false,
+                row_values,
+                fixture.device);
+            if (row_values.size() != static_cast<size_t>(N))
+            {
+                ADD_FAILURE()
+                    << "serial LocalTP Wo row produced " << row_values.size()
+                    << " values, expected " << N
+                    << " device=" << fixture.device.to_string()
+                    << " row=" << row;
+                return rows;
+            }
+            std::copy_n(
+                row_values.data(),
+                N,
+                rows.serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+        }
+        return rows;
+    }
+
+    std::vector<float> sumLocalTPPartials(
+        const std::vector<GroupedAndSerialRows> &partials,
+        bool grouped,
+        int M,
+        int N)
+    {
+        std::vector<float> result(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+        for (const auto &partial : partials)
+        {
+            const std::vector<float> &values = grouped ? partial.grouped : partial.serial;
+            if (values.size() != result.size())
+            {
+                ADD_FAILURE()
+                    << "LocalTP partial size mismatch: got " << values.size()
+                    << " expected " << result.size()
+                    << " grouped=" << grouped;
+                return result;
+            }
+            for (size_t i = 0; i < result.size(); ++i)
+                result[i] += values[i];
+        }
+        return result;
+    }
+
+    void runLocalTPWoAllreduceVerifierRowsMatchSerial(
+        const NativeFormatCase &format_case,
+        const std::vector<DeviceId> &devices,
+        const LocalTPWoShapeCase &shape_case,
+        int N,
+        int local_K,
+        int full_K,
+        uint32_t seed)
+    {
+        ASSERT_EQ(devices.size(), 2u);
+#ifdef HAVE_ROCM
+        std::vector<hipStream_t> streams(devices.size(), nullptr);
+        for (size_t i = 0; i < devices.size(); ++i)
+        {
+            ASSERT_EQ(hipSetDevice(devices[i].ordinal), hipSuccess);
+            ASSERT_EQ(hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking), hipSuccess)
+                << "device=" << devices[i].to_string();
+        }
+#else
+        std::vector<void *> streams(devices.size(), nullptr);
+#endif
+
+        std::vector<LocalTPWoShardFixture> fixtures;
+        fixtures.reserve(devices.size());
+        for (size_t rank = 0; rank < devices.size(); ++rank)
+        {
+            fixtures.push_back(makeLocalTPWoShardFixture(
+                format_case,
+                static_cast<int>(rank),
+                static_cast<int>(devices.size()),
+                N,
+                local_K,
+                full_K,
+                devices[rank],
+                seed));
+        }
+
+        for (const int M : {2, 3, 4})
+        {
+            PerfStatsCollector::reset();
+            const double before = groupedVerifierGemmPerfCounterValue();
+
+            std::vector<GroupedAndSerialRows> partials;
+            partials.reserve(fixtures.size());
+            for (size_t rank = 0; rank < fixtures.size(); ++rank)
+            {
+                partials.push_back(runLocalTPWoShardVerifierRows(
+                    fixtures[rank],
+                    M,
+                    N,
+                    local_K,
+#ifdef HAVE_ROCM
+                    streams[rank]
+#else
+                    streams[rank]
+#endif
+                    ));
+            }
+
+            const auto grouped_sum = sumLocalTPPartials(partials, true, M, N);
+            const auto serial_sum = sumLocalTPPartials(partials, false, M, N);
+            const double after = groupedVerifierGemmPerfCounterValue();
+            EXPECT_GE(after - before, static_cast<double>(M * static_cast<int>(devices.size())))
+                << format_case.label << " shape=" << shape_case.label << " M=" << M
+                << " must exercise GEMMStage grouped verifier publication route\n"
+                << PerfStatsCollector::summaryString(
+                       {"mtp.gemm_grouped_decode_equivalent_verifier_prefill_rows"}, 20);
+
+            expectBitwiseFP32RowsEqual(
+                std::string("ROCm LocalTP Wo reconstructed allreduce grouped verifier rows format=") +
+                    format_case.label + " shape=" + shape_case.label + " M=" + std::to_string(M),
+                grouped_sum.data(),
+                serial_sum.data(),
+                grouped_sum.size(),
+                static_cast<size_t>(N));
+        }
+
+#ifdef HAVE_ROCM
+        for (size_t i = 0; i < streams.size(); ++i)
+        {
+            ASSERT_EQ(hipSetDevice(devices[i].ordinal), hipSuccess);
+            ASSERT_EQ(hipStreamDestroy(streams[i]), hipSuccess);
+        }
+#endif
+    }
+
+    /**
+     * @brief Production-shaped fixture for mirrored LocalTP attention Wo weights.
+     *
+     * The device-resident MTP target keeps small verifier projections local by
+     * mirroring the full Wo/MTP-head matrix on each shard.  That avoids an
+     * uneconomical allreduce for a handful of verifier rows.  The fixture below
+     * models that target state directly with a full `[hidden, full_attention_dim]`
+     * weight on one ROCm device.
+     */
+    struct ReplicatedWoFixture
+    {
+        DeviceId device;
+        std::unique_ptr<TensorBase> weight;
+        GpuPreparedGemm prepared;
+        std::vector<float> input_rows;
+    };
+
+    ReplicatedWoFixture makeReplicatedWoFixture(
+        const NativeFormatCase &format_case,
+        const LocalTPWoShapeCase &shape_case,
+        DeviceId device,
+        uint32_t seed)
+    {
+        const int N = shape_case.hidden;
+        const int K = shape_case.full_attention_dim;
+
+        ReplicatedWoFixture fixture;
+        fixture.device = device;
+        fixture.weight = format_case.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            seed);
+        fixture.prepared = makeGpuPreparedVerifierProjection(
+            fixture.weight.get(),
+            device,
+            std::string("test.replicated_wo.") + format_case.label + "." + shape_case.label,
+            ModelContextId{static_cast<uint64_t>(91000 + seed)});
+
+        auto input = TestTensorFactory::createFP32Random(
+            {4u, static_cast<size_t>(K)},
+            -0.75f,
+            0.75f,
+            seed + 700u);
+        fixture.input_rows.assign(
+            input->data(),
+            input->data() + static_cast<size_t>(4) * static_cast<size_t>(K));
+        return fixture;
+    }
+
+    GroupedAndSerialRows runReplicatedWoVerifierRows(
+        ReplicatedWoFixture &fixture,
+        int M,
+        int N,
+        int K,
+        void *stream)
+    {
+        std::vector<float> input(static_cast<size_t>(M) * static_cast<size_t>(K));
+        for (int row = 0; row < M; ++row)
+        {
+            std::copy_n(
+                fixture.input_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(K));
+        }
+
+        GroupedAndSerialRows rows;
+        runGemmStageRows(
+            fixture.weight.get(),
+            fixture.prepared,
+            input,
+            M,
+            N,
+            K,
+            /*force_decode_equivalent=*/true,
+            stream,
+            /*graph_capture=*/false,
+            rows.grouped,
+            fixture.device);
+
+        rows.serial.resize(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> row_input(static_cast<size_t>(K));
+            std::copy_n(
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_input.data());
+
+            std::vector<float> row_values;
+            runGemmStageRows(
+                fixture.weight.get(),
+                fixture.prepared,
+                row_input,
+                1,
+                N,
+                K,
+                /*force_decode_equivalent=*/false,
+                stream,
+                /*graph_capture=*/false,
+                row_values,
+                fixture.device);
+            if (row_values.size() != static_cast<size_t>(N))
+            {
+                ADD_FAILURE()
+                    << "serial ROCm replicated Wo row produced " << row_values.size()
+                    << " values, expected " << N
+                    << " device=" << fixture.device.to_string()
+                    << " row=" << row;
+                return rows;
+            }
+            std::copy_n(
+                row_values.data(),
+                N,
+                rows.serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+        }
+        return rows;
+    }
+
+    /**
+     * @brief Prove mirrored/replicated Wo grouped rows are byte-identical.
+     *
+     * This gate is intentionally separate from the LocalTP row-parallel
+     * reconstruction gate: mirrored Wo is the primary device-resident path we
+     * want for tiny verifier projections.  The perfstats assertion prevents an
+     * accidental serial-row replay from masquerading as grouped verifier work.
+     */
+    void runReplicatedWoVerifierRowsMatchSerial(
+        const NativeFormatCase &format_case,
+        DeviceId device,
+        const LocalTPWoShapeCase &shape_case,
+        uint32_t seed)
+    {
+        const int N = shape_case.hidden;
+        const int K = shape_case.full_attention_dim;
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess)
+            << "device=" << device.to_string();
+#else
+        void *stream = nullptr;
+#endif
+
+        auto fixture = makeReplicatedWoFixture(format_case, shape_case, device, seed);
+        for (const int M : {2, 3, 4})
+        {
+            PerfStatsCollector::reset();
+            const double before = groupedVerifierGemmPerfCounterValue();
+            const GroupedAndSerialRows rows = runReplicatedWoVerifierRows(
+                fixture,
+                M,
+                N,
+                K,
+#ifdef HAVE_ROCM
+                stream
+#else
+                stream
+#endif
+            );
+            const double after = groupedVerifierGemmPerfCounterValue();
+            EXPECT_GE(after - before, static_cast<double>(M))
+                << format_case.label << " shape=" << shape_case.label << " M=" << M
+                << " must exercise GEMMStage grouped verifier publication route\n"
+                << PerfStatsCollector::summaryString(
+                       {"mtp.gemm_grouped_decode_equivalent_verifier_prefill_rows"}, 20);
+
+            expectBitwiseFP32RowsEqual(
+                std::string("ROCm replicated Wo grouped verifier rows format=") +
+                    format_case.label + " shape=" + shape_case.label +
+                    " M=" + std::to_string(M),
+                rows.grouped.data(),
+                rows.serial.data(),
+                rows.grouped.size(),
+                static_cast<size_t>(N));
+        }
+
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
     }
 
     inline float swigluRef(float gate, float up)
@@ -1806,11 +2354,15 @@ namespace
                                  << " rel_l2=" << rel_l2
                                  << " symmetric_kl=" << skl
                                  << " max_abs=" << max_abs);
-            EXPECT_GE(cos, 0.9999999f) << "row=" << row;
-            EXPECT_LE(rel_l2, 1.0e-8f) << "row=" << row;
-            EXPECT_LE(skl, 1.0e-10) << "row=" << row;
-            EXPECT_LE(max_abs, 1.0e-6f) << "row=" << row;
         }
+
+        expectBitwiseFP32RowsEqual(
+            std::string(label) + " fused SwiGLU/down grouped verifier rows M=" +
+                std::to_string(M),
+            grouped_values.data(),
+            serial_values.data(),
+            static_cast<size_t>(M) * static_cast<size_t>(N),
+            static_cast<size_t>(N));
 
 #ifdef HAVE_ROCM
         if (exec)
@@ -2085,14 +2637,14 @@ namespace
                                      << " rel_l2=" << rel_l2
                                      << " symmetric_kl=" << skl
                                      << " max_abs=" << max_abs);
-                EXPECT_GE(cos, 0.9999999f)
-                    << label << " projection=" << projection.name << " row=" << row;
-                EXPECT_LE(rel_l2, 1.0e-8f)
-                    << label << " projection=" << projection.name << " row=" << row;
-                EXPECT_LE(skl, 1.0e-10)
-                    << label << " projection=" << projection.name << " row=" << row;
-                EXPECT_LE(max_abs, 1.0e-6f)
-                    << label << " projection=" << projection.name << " row=" << row;
+                expectBitwiseFP32RowsEqual(
+                    std::string(label) + " projection=" + projection.name +
+                        " grouped verifier row=" + std::to_string(row) +
+                        " M=" + std::to_string(M),
+                    grouped_row,
+                    serial_row,
+                    count,
+                    count);
             }
         }
 
@@ -2118,7 +2670,8 @@ namespace
         const std::vector<int> &Ns,
         bool graph_capture,
         bool bind_fused_to_shared_workspace = false,
-        int graph_replays = 1)
+        int graph_replays = 1,
+        bool verifier_decode_equivalent = false)
     {
         ASSERT_FALSE(Ns.empty());
         ASSERT_GE(graph_replays, 1);
@@ -2204,16 +2757,38 @@ namespace
                                      "small_m_group");
         }
 
+        /*
+         * MTP verifier graph-capture tests must go through the same production
+         * entry point as GEMMStage/GDNProjectionStage.  Calling the generic
+         * fused prefill API can be numerically close, but it does not enter the
+         * decode-equivalent grouped verifier scope or prove the publication
+         * path that serial-row parity depends on.
+         */
+        auto launch_fused_group = [&]() -> bool
+        {
+            if (verifier_decode_equivalent)
+            {
+                return kernels.front()->multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(),
+                    projections,
+                    M,
+                    K,
+                    nullptr,
+                    shared_workspace ? shared_workspace.get() : nullptr);
+            }
+            return kernels.front()->multiply_fused_tensor(input.get(), projections, M, K);
+        };
+
 #ifdef HAVE_ROCM
         hipGraph_t graph = nullptr;
         hipGraphExec_t exec = nullptr;
         if (graph_capture)
         {
-            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+            ASSERT_TRUE(launch_fused_group());
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
             ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+            ASSERT_TRUE(launch_fused_group());
             ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
             ASSERT_NE(graph, nullptr);
             ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
@@ -2237,7 +2812,7 @@ namespace
         else
 #endif
         {
-            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+            ASSERT_TRUE(launch_fused_group());
 #ifdef HAVE_ROCM
             ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 #endif
@@ -2440,7 +3015,8 @@ namespace
         float min_cosine,
         const std::vector<int> &Ns,
         bool graph_capture,
-        int graph_replays = 1)
+        int graph_replays = 1,
+        bool verifier_decode_equivalent = false)
     {
         ASSERT_FALSE(Ns.empty());
         ASSERT_EQ(createWeights.size(), Ns.size());
@@ -2520,13 +3096,28 @@ namespace
                                      "mixed_small_m_group");
         }
 
+        auto launch_fused_group = [&]() -> bool
+        {
+            if (verifier_decode_equivalent)
+            {
+                return kernels.front()->multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(),
+                    projections,
+                    M,
+                    K,
+                    nullptr,
+                    shared_workspace.get());
+            }
+            return kernels.front()->multiply_fused_tensor(input.get(), projections, M, K);
+        };
+
 #ifdef HAVE_ROCM
         hipGraph_t graph = nullptr;
         hipGraphExec_t exec = nullptr;
         if (graph_capture)
         {
             ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+            ASSERT_TRUE(launch_fused_group());
             ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
             ASSERT_NE(graph, nullptr);
             ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
@@ -2550,7 +3141,7 @@ namespace
         else
 #endif
         {
-            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+            ASSERT_TRUE(launch_fused_group());
 #ifdef HAVE_ROCM
             ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 #endif
@@ -2709,18 +3300,15 @@ namespace
                                      << " rel_l2=" << rel_l2
                                      << " symmetric_kl=" << skl
                                      << " max_abs=" << max_abs);
-                EXPECT_GE(cos, 0.9999999f)
-                    << label << " projection=" << projection_names[projection]
-                    << " row=" << row;
-                EXPECT_LE(rel_l2, 1.0e-8f)
-                    << label << " projection=" << projection_names[projection]
-                    << " row=" << row;
-                EXPECT_LE(skl, 1.0e-10)
-                    << label << " projection=" << projection_names[projection]
-                    << " row=" << row;
-                EXPECT_LE(max_abs, 1.0e-6f)
-                    << label << " projection=" << projection_names[projection]
-                    << " row=" << row;
+                expectBitwiseFP32RowsEqual(
+                    std::string(label) + " projection=" +
+                        projection_names[projection] +
+                        " grouped verifier row=" + std::to_string(row) +
+                        " M=" + std::to_string(M),
+                    grouped_row,
+                    serial_row,
+                    count,
+                    count);
             }
         }
 
@@ -2859,9 +3447,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KGroupedVerifierRowsMatchSerialDec
             N,
             K,
             [](const std::vector<size_t> &shape, uint32_t seed)
-            { return TestTensorFactory::createQ4_KRandom(shape, seed); },
-            0.99995f,
-            0.01f);
+            { return TestTensorFactory::createQ4_KRandom(shape, seed); });
     }
 }
 
@@ -2885,9 +3471,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KGroupedVerifierRowsMatchSerialDec
             N,
             K,
             [](const std::vector<size_t> &shape, uint32_t seed)
-            { return TestTensorFactory::createQ5_KRandom(shape, seed); },
-            0.99995f,
-            0.01f);
+            { return TestTensorFactory::createQ5_KRandom(shape, seed); });
     }
 }
 
@@ -2911,9 +3495,131 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ6KGroupedVerifierRowsMatchSerialDec
             N,
             K,
             [](const std::vector<size_t> &shape, uint32_t seed)
-            { return TestTensorFactory::createQ6_KRandom(shape, seed); },
-            0.99995f,
-            0.01f);
+            { return TestTensorFactory::createQ6_KRandom(shape, seed); });
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (rocmDeviceCount() < 2)
+        GTEST_SKIP() << "ROCm LocalTP Wo regression requires at least two ROCm devices";
+
+    /*
+     * Qwen3.6 MoE LocalTP splits the attention output projection along the
+     * input/head dimension and allreduces two [M, hidden] partial sums.  This
+     * sweep proves the grouped verifier projection plus reconstructed allreduce
+     * result is byte-identical to rowwise M=1 decode for every ROCm native
+     * quantized tensor format, not just the IQ3_S model file that exposed the
+     * latest full-parity drift.
+     */
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const std::vector<DeviceId> devices = {DeviceId::rocm(0), DeviceId::rocm(1)};
+
+    uint32_t seed = 8800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : localTPWoQuantizedFormatCases())
+        {
+            runLocalTPWoAllreduceVerifierRowsMatchSerial(
+                format_case,
+                devices,
+                shape_case,
+                shape_case.hidden,
+                shape_case.local_attention_dim,
+                shape_case.full_attention_dim,
+                seed);
+            seed += 101;
+        }
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, LocalTPWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (rocmDeviceCount() < 2)
+        GTEST_SKIP() << "ROCm LocalTP Wo regression requires at least two ROCm devices";
+
+    /*
+     * Floating-point prepared GEMM goes through rocBLAS/hipBLAS-style kernels
+     * rather than the native-VNNI quantized dispatch.  Keep it in the same
+     * LocalTP reconstruction gate so FP32, FP16, and BF16 verifier rows cannot
+     * silently drift from serial decode when models use floating-point weights.
+     */
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const std::vector<DeviceId> devices = {DeviceId::rocm(0), DeviceId::rocm(1)};
+
+    uint32_t seed = 10800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : localTPWoFloatingPointFormatCases())
+        {
+            runLocalTPWoAllreduceVerifierRowsMatchSerial(
+                format_case,
+                devices,
+                shape_case,
+                shape_case.hidden,
+                shape_case.local_attention_dim,
+                shape_case.full_attention_dim,
+                seed);
+            seed += 101;
+        }
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "ROCm replicated Wo regression requires a ROCm device";
+
+    /*
+     * Mirroring the complete attention Wo/MTP verifier projection on every
+     * LocalTP shard is the target economical path for tiny verifier row groups.
+     * This sweep proves that route for every ROCm native quantized format,
+     * independently of the existing row-parallel allreduce reconstruction test.
+     */
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const DeviceId device = DeviceId::rocm(0);
+
+    uint32_t seed = 12800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : localTPWoQuantizedFormatCases())
+        {
+            runReplicatedWoVerifierRowsMatchSerial(
+                format_case,
+                device,
+                shape_case,
+                seed);
+            seed += 101;
+        }
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "ROCm replicated Wo regression requires a ROCm device";
+
+    /*
+     * Floating-point mirrored Wo must also use the decode-equivalent grouped
+     * verifier implementation.  Backend GEMM libraries are free to choose
+     * shape-dependent reductions, so FP32/FP16/BF16 stay in the byte-equality
+     * matrix instead of relying on relaxed numeric tolerances.
+     */
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const DeviceId device = DeviceId::rocm(0);
+
+    uint32_t seed = 14800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : localTPWoFloatingPointFormatCases())
+        {
+            runReplicatedWoVerifierRowsMatchSerial(
+                format_case,
+                device,
+                shape_case,
+                seed);
+            seed += 101;
+        }
     }
 }
 
@@ -3274,15 +3980,13 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
 
     const int N = 896;
     const int K = 1024;
-    runDispatchSmallMMatchesReference(
+    runGroupedSmallMMatchesSerialRows(
         "Q4_K native-VNNI counter",
         2,
         N,
         K,
-        PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
-        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
-        0.985f);
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); });
 
     const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_m2_calls"});
     auto route_record = std::find_if(
@@ -3317,15 +4021,13 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KSmallMRecordsNativeRouteCounter)
     const int M = 4;
     const int N = 512;
     const int K = 1024;
-    runDispatchSmallMMatchesReference(
+    runGroupedSmallMMatchesSerialRows(
         "Q5_K native-VNNI small-M counter",
         M,
         N,
         K,
-        PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
-        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
-        0.985f);
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); });
 
     const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
     auto route_record = std::find_if(
@@ -3364,7 +4066,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ4KM2RecordsNativeRouteCounte
     const int M = 2;
     const int N = 512;
     const int K = 1024;
-    runFusedSwiGLUDownSmallMMatchesReference(
+    runFusedSwiGLUDownSmallMMatchesSerialRows(
         "Q4_K native-VNNI fused SwiGLU down counter",
         M,
         N,
@@ -3372,7 +4074,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ4KM2RecordsNativeRouteCounte
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
-        0.985f);
+        true,
+        1);
 
     const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
     auto route_record = std::find_if(
@@ -3433,7 +4136,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ5KM4RecordsNativeRouteCounte
     const int M = 4;
     const int N = 512;
     const int K = 1024;
-    runFusedSwiGLUDownSmallMMatchesReference(
+    runFusedSwiGLUDownSmallMMatchesSerialRows(
         "Q5_K native-VNNI fused SwiGLU down counter",
         M,
         N,
@@ -3441,7 +4144,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ5KM4RecordsNativeRouteCounte
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ5_KRandom(shape, seed); },
-        0.985f);
+        true,
+        1);
 
     const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
     auto route_record = std::find_if(
@@ -3482,7 +4186,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     constexpr int M = 2;
     constexpr int N = 5120;
     constexpr int K = 17408;
-    runFusedSwiGLUDownSmallMMatchesReference(
+    runFusedSwiGLUDownSmallMMatchesSerialRows(
         "Q4_K native-VNNI Qwen3.6 FFN down verifier shape",
         M,
         N,
@@ -3490,7 +4194,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
-        0.9999f,
         true,
         4);
 
@@ -3619,7 +4322,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     constexpr int M = 4;
     constexpr int N = 5120;
     constexpr int K = 17408;
-    runFusedSwiGLUDownSmallMMatchesReference(
+    runFusedSwiGLUDownSmallMMatchesSerialRows(
         "Q4_K native-VNNI Qwen3.6 FFN down shifted-prefill shape",
         M,
         N,
@@ -3627,7 +4330,6 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
-        0.9999f,
         true,
         4);
 
@@ -4033,7 +4735,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36FFNGateUpM2Matche
         {17408, 17408},
         true,
         true,
-        2);
+        2,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double batched_calls = 0.0;
@@ -4091,7 +4794,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ5KQwen36FFNGateUpM2Matche
         {17408, 17408},
         true,
         true,
-        2);
+        2,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double batched_calls = 0.0;
@@ -4199,7 +4903,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
 
-    EXPECT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K))
+    EXPECT_TRUE(kernels.front()->multiply_fused_verifier_rows_decode_equivalent(
+        input.get(), projections, M, K, nullptr, &workspace))
         << "Canonical batched split-K arena must still provide distinct per-projection partial slices";
 #ifdef HAVE_ROCM
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -4286,7 +4991,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDe
     projections.emplace_back(kernels[0].get(), gate.get(), N, nullptr, "gate");
     projections.emplace_back(kernels[1].get(), up.get(), N, nullptr, "up");
 
-    EXPECT_FALSE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K))
+    EXPECT_FALSE(kernels.front()->multiply_fused_verifier_rows_decode_equivalent(
+        input.get(), projections, M, K, nullptr, &workspace))
         << "Batched small-M split-K must reject undersized declared partial workspace before HIP launch";
 #ifdef HAVE_ROCM
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -4626,14 +5332,14 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36MoEGDNProjectionStageQ6KVerifierRowsMa
                                                                 << " rel_l2=" << rel_l2
                                                                 << " symmetric_kl=" << skl
                                                                 << " max_abs=" << max_abs);
-                EXPECT_GE(cos, 0.9999999f)
-                    << "projection=" << projection.name << " row=" << row;
-                EXPECT_LE(rel_l2, 1.0e-8f)
-                    << "projection=" << projection.name << " row=" << row;
-                EXPECT_LE(skl, 1.0e-10)
-                    << "projection=" << projection.name << " row=" << row;
-                EXPECT_LE(max_abs, 1.0e-6f)
-                    << "projection=" << projection.name << " row=" << row;
+                expectBitwiseFP32RowsEqual(
+                    std::string("Qwen3.6 MoE GDN projection=") +
+                        projection.name + " grouped verifier row=" +
+                        std::to_string(row) + " M=" + std::to_string(M),
+                    grouped_row,
+                    serial_row,
+                    count,
+                    count);
             }
         }
 
@@ -4667,7 +5373,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
         {10240, 10240, 1024, 1024},
         true,
         true,
-        4);
+        4,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double batched_calls = 0.0;
@@ -4725,7 +5432,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM4MatchesS
         {10240, 10240, 1024, 1024},
         true,
         true,
-        4);
+        4,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double batched_calls = 0.0;
@@ -4783,13 +5491,15 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         {10240, 6144},
         true,
         true,
-        4);
+        4,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double batched_calls = 0.0;
     double heterogeneous_n_bypasses = 0.0;
     double shared_quant_calls = 0.0;
     double batched_projection_calls = 0.0;
+    double graph_direct_launches = 0.0;
     double graph_atomic_launches = 0.0;
     double graph_split_reduce_launches = 0.0;
     for (const auto &record : records)
@@ -4846,10 +5556,13 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
             record.tags.count("k") != 0 &&
             record.tags.at("k") == "5120" &&
             record.tags.count("batched") != 0 &&
-            record.tags.at("batched") == "true" &&
-            record.tags.count("projections") != 0 &&
-            record.tags.at("projections") == "2")
+            record.tags.at("batched") == "true")
         {
+            if (record.tags.count("path") != 0 &&
+                record.tags.at("path") == "direct")
+            {
+                graph_direct_launches += record.value;
+            }
             if (record.tags.count("path") != 0 &&
                 record.tags.at("path") == "atomic_reduce" &&
                 record.tags.count("kb") != 0 &&
@@ -4875,8 +5588,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         << "The batched qkv/z subgroup should cover both heterogeneous-N projection payloads";
     EXPECT_EQ(graph_atomic_launches, 0.0)
         << "GPU-graph Qwen3.6 batched GDN qkv/z should not silently force atomic K-partitioning";
-    EXPECT_GE(graph_split_reduce_launches, 1.0)
-        << "GPU-graph Qwen3.6 batched GDN qkv/z should use declared workspace split/reduce by default";
+    EXPECT_GE(graph_direct_launches + graph_split_reduce_launches, 1.0)
+        << "GPU-graph Qwen3.6 batched GDN qkv/z should use a graph-native non-atomic verifier launch";
 
     PerfStatsCollector::reset();
 }
@@ -4907,7 +5620,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
         0.9999f,
         {10240, 10240, 1024, 1024},
         true,
-        4);
+        4,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double mixed_batched_calls = 0.0;
@@ -4982,7 +5696,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
         0.9999f,
         {10240, 6144},
         true,
-        4);
+        4,
+        true);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double mixed_bypasses = 0.0;
@@ -5133,142 +5848,4 @@ TEST(Test__ROCmQuantisedGemmSmallM, ROCmMoERoutedVerifierSmallM234_AllNativeCode
     }
 
     PerfStatsCollector::reset();
-}
-
-TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverride)
-{
-    if (!hasROCmDevice())
-        GTEST_SKIP() << "No ROCm device available";
-
-    ScopedNativeVNNITuningOverride force_unsafe_kb(128, -1);
-
-    constexpr int M = 2;
-    constexpr int K = 5120;
-    const std::vector<int> Ns = {10240, 10240, 1024, 1024};
-
-    std::vector<std::unique_ptr<TensorBase>> weights;
-    std::vector<ROCmPackedWeights> packed(Ns.size());
-    std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
-    weights.reserve(Ns.size());
-    kernels.reserve(Ns.size());
-
-    WorkspaceRequirements combined;
-    for (size_t i = 0; i < Ns.size(); ++i)
-    {
-        weights.push_back(TestTensorFactory::createQ4_KRandom(
-            {static_cast<size_t>(Ns[i]), static_cast<size_t>(K)},
-            static_cast<uint32_t>(300 + i)));
-        ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
-        expectPackedPath(packed[i], PackedPath::NativeVNNI);
-        kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
-        combined.merge(kernels.back()->getWorkspaceRequirements(M, Ns[i], K));
-    }
-
-    DeviceWorkspaceManager workspace(
-        DeviceId::rocm(0),
-        combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
-    ASSERT_TRUE(workspace.allocate(combined));
-    for (auto &kernel : kernels)
-        kernel->bindWorkspace(&workspace);
-
-    auto input = TestTensorFactory::createFP32Random({M, K});
-    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-
-    std::vector<std::unique_ptr<FP32Tensor>> outputs;
-    std::vector<ITensorGemm::TensorProjectionDesc> projections;
-    outputs.reserve(Ns.size());
-    projections.reserve(Ns.size());
-    for (size_t i = 0; i < Ns.size(); ++i)
-    {
-        outputs.push_back(TestTensorFactory::createFP32({M, static_cast<size_t>(Ns[i])}));
-        ASSERT_TRUE(outputs.back()->allocateOnDevice(DeviceId::rocm(0)));
-        projections.emplace_back(kernels[i].get(),
-                                 outputs.back().get(),
-                                 Ns[i],
-                                 nullptr,
-                                 "gdn_projection");
-    }
-
-    EXPECT_FALSE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K))
-        << "Unsafe small-M split-K overrides must hard-fail before launching graph-captured kernels";
-
-    for (auto &kernel : kernels)
-        kernel->unbindWorkspace();
-}
-
-TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2HonorsAtomicKBOverride)
-{
-    if (!hasROCmDevice())
-        GTEST_SKIP() << "No ROCm device available";
-
-    ScopedEnv force_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "2");
-    ScopedEnv force_graphs("LLAMINAR_GPU_GRAPHS", "1");
-    ScopedEnv force_atomic("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1");
-    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
-    PerfStatsCollector::reset();
-
-    constexpr int M = 2;
-    constexpr int K = 17408;
-    constexpr int N = 5120;
-
-    auto weights = TestTensorFactory::createQ4_KRandom({N, K}, 909);
-    ROCmPackedWeights packed;
-    ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-    expectPackedPath(packed, PackedPath::NativeVNNI);
-
-    ROCmQuantisedGemmKernel kernel(&packed, 0);
-    auto workspace = bindWorkspace(kernel, M, N, K);
-    ASSERT_NE(workspace, nullptr);
-
-    auto input = TestTensorFactory::createFP32Random({M, K});
-    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-
-    auto output = TestTensorFactory::createFP32({M, N});
-    ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
-
-    EXPECT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K))
-        << "Explicit ROCm atomic-reduce with forced KB=2 should use atomic K-partitioning";
-
-#ifdef HAVE_ROCM
-    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
-#endif
-
-    const auto records = PerfStatsCollector::snapshot({"kernel"});
-    double atomic_launches = 0.0;
-    double split_reduce_launches = 0.0;
-    for (const auto &record : records)
-    {
-        if (record.domain != "kernel" ||
-            record.name != "rocm_native_vnni_small_m_launch" ||
-            record.kind != PerfStatRecord::Kind::Counter ||
-            record.tags.count("m") == 0 ||
-            record.tags.at("m") != "2" ||
-            record.tags.count("n") == 0 ||
-            record.tags.at("n") != "5120" ||
-            record.tags.count("k") == 0 ||
-            record.tags.at("k") != "17408")
-        {
-            continue;
-        }
-        if (record.tags.count("path") != 0 &&
-            record.tags.at("path") == "atomic_reduce" &&
-            record.tags.count("kb") != 0 &&
-            record.tags.at("kb") == "2")
-        {
-            atomic_launches += record.value;
-        }
-        if (record.tags.count("path") != 0 &&
-            record.tags.at("path") == "split_reduce")
-        {
-            split_reduce_launches += record.value;
-        }
-    }
-
-    EXPECT_GE(atomic_launches, 1.0)
-        << "Explicit ROCm atomic-reduce KB override should be honored by the atomic route";
-    EXPECT_EQ(split_reduce_launches, 0.0)
-        << "Explicit ROCm atomic-reduce KB override must not re-enable split/reduce replay";
-
-    PerfStatsCollector::reset();
-    kernel.unbindWorkspace();
 }

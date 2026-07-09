@@ -4091,11 +4091,16 @@ namespace llaminar2
                 }
             }
 
-            // GEMV KPAR partials for decode/verifier reductions. The caller's
-            // declared graph shape owns the bound; dynamic-depth graph users
-            // must request their max verifier M explicitly.
-            const int gemv_workspace_m = m;
-            if (gemv_workspace_m > 0 && gemv_workspace_m <= 4)
+            /*
+             * GEMV KPAR partials are needed by public M=1 decode and by
+             * grouped MTP verifier rows even when this workspace was originally
+             * sized for a larger prefill call. Prepared kernels are cached
+             * across prefill/decode phase boundaries, so a workspace that only
+             * declares large-M prefill scratch can otherwise leave the later
+             * canonical decode GEMV with no reduction arena.
+             */
+            const int gemv_workspace_m = std::clamp(m, 1, 4);
+            if (gemv_workspace_m > 0)
             {
                 const int k_groups = (k + 31) / 32;
                 const size_t kpar_bytes =

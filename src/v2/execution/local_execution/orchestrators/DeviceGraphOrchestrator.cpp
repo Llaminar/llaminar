@@ -13645,238 +13645,6 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::recordDeviceResidentLogicalSequenceStateMailboxFromStepPlans(
-        const MTPSpecStepPlanBatch &plans,
-        int max_draft_tokens,
-        const ComputeGraph &verifier_graph,
-        void *producer_stream,
-        std::string *error)
-    {
-        auto fail = [&](std::string reason) -> bool
-        {
-            if (error)
-                *error = reason;
-            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
-            return false;
-        };
-
-        if (!plans.ok)
-            return fail("host-plan resident logical-state mailbox received an invalid plan batch: " + plans.error);
-        if (plans.request_count <= 0 ||
-            static_cast<int>(plans.steps.size()) != plans.request_count)
-        {
-            return fail("host-plan resident logical-state mailbox received inconsistent request count");
-        }
-        if (max_draft_tokens <= 0)
-            return fail("host-plan resident logical-state mailbox requires a positive verifier draft-row count");
-        if (!producer_stream)
-            return fail("host-plan resident logical-state mailbox requires an explicit producer stream");
-        if (!supportsDeviceResidentLogicalSequenceStatePublication())
-        {
-            return fail(
-                "host-plan resident logical-state mailbox requires device-resident sequence-state publication support");
-        }
-
-        IBackend *backend = getBackendFor(state_.device_id);
-        if (!backend)
-            return fail("host-plan resident logical-state mailbox could not resolve backend");
-
-        MTPSpecDecodeMetadataShape shape;
-        shape.max_requests = plans.request_count;
-        shape.max_draft_tokens = max_draft_tokens;
-
-        const MTPSpecDecodeMetadataShape current_shape =
-            mtp_spec_decode_metadata_binding_.shape();
-        const bool metadata_workspace_covers_request =
-            mtp_spec_decode_metadata_binding_.hasWorkspace() &&
-            current_shape.max_requests >= shape.max_requests &&
-            current_shape.max_draft_tokens >= shape.max_draft_tokens;
-        if (!metadata_workspace_covers_request)
-        {
-            mtp_spec_decode_metadata_binding_.setShape(shape);
-            if (!ensureDeviceWorkspaceAllocated(verifier_graph, max_draft_tokens))
-            {
-                return fail(
-                    "host-plan resident logical-state mailbox could not allocate metadata workspace");
-            }
-        }
-
-        if (!mtp_spec_decode_metadata_binding_.hasWorkspace())
-        {
-            const std::string &binding_error =
-                mtp_spec_decode_metadata_binding_.bindingError();
-            return fail(
-                binding_error.empty()
-                    ? "host-plan resident logical-state mailbox metadata workspace is not bound"
-                    : "host-plan resident logical-state mailbox metadata workspace is invalid: " +
-                          binding_error);
-        }
-
-        const MTPSpecDecodeMetadataDevicePointers &ptrs =
-            mtp_spec_decode_metadata_binding_.devicePointers();
-        if (!ptrs.target_cached_tokens ||
-            !ptrs.accepted_state_counts ||
-            !ptrs.next_condition_tokens ||
-            !ptrs.all_drafts_accepted_flags ||
-            !ptrs.stopped_flags ||
-            !ptrs.publication_ok_flags)
-        {
-            return fail(
-                "host-plan resident logical-state mailbox metadata workspace is missing required buffers");
-        }
-
-        std::vector<int32_t> target_cached_tokens(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<int32_t> accepted_state_counts(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<int32_t> next_condition_tokens(
-            static_cast<size_t>(plans.request_count),
-            kMTPSpecDecodeInvalidToken);
-        std::vector<int32_t> all_drafts_accepted_flags(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<int32_t> stopped_flags(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<int32_t> publication_ok_flags(
-            static_cast<size_t>(plans.request_count),
-            0);
-        std::vector<bool> seen_request(
-            static_cast<size_t>(plans.request_count),
-            false);
-
-        for (const MTPSpecStepPlan &step : plans.steps)
-        {
-            if (step.request_index < 0 ||
-                step.request_index >= plans.request_count)
-            {
-                return fail(
-                    "host-plan resident logical-state mailbox received an out-of-range request index");
-            }
-            const size_t idx = static_cast<size_t>(step.request_index);
-            if (seen_request[idx])
-                return fail("host-plan resident logical-state mailbox received a duplicate request index");
-            seen_request[idx] = true;
-            if (step.target_cached_tokens < 0 ||
-                step.accepted_count < 0 ||
-                step.accepted_count > step.draft_count)
-            {
-                return fail(
-                    "host-plan resident logical-state mailbox received invalid sequence counts");
-            }
-            if (step.target_cached_tokens !=
-                step.base_cached_tokens + step.accepted_count)
-            {
-                return fail(
-                    "host-plan resident logical-state mailbox target cache count drifted from base plus accepted");
-            }
-
-            target_cached_tokens[idx] = step.target_cached_tokens;
-            accepted_state_counts[idx] = step.accepted_count;
-            next_condition_tokens[idx] = step.next_condition_token;
-            all_drafts_accepted_flags[idx] =
-                step.all_drafts_accepted ? 1 : 0;
-            stopped_flags[idx] = step.stopped ? 1 : 0;
-            publication_ok_flags[idx] = 1;
-        }
-
-        for (bool seen : seen_request)
-        {
-            if (!seen)
-                return fail("host-plan resident logical-state mailbox plan is missing a request index");
-        }
-
-        auto upload = [&](int32_t *dst,
-                          const std::vector<int32_t> &src,
-                          const char *name) -> bool
-        {
-            if (!dst)
-                return fail(std::string("host-plan resident logical-state mailbox has null destination for ") + name);
-            const size_t bytes = src.size() * sizeof(int32_t);
-            if (!backend->hostToDeviceOnStream(
-                    dst,
-                    src.data(),
-                    bytes,
-                    state_.device_id.gpu_ordinal(),
-                    producer_stream))
-            {
-                return fail(std::string("host-plan resident logical-state mailbox upload failed for ") + name);
-            }
-            return true;
-        };
-
-        {
-            PerfStatsCollector::ScopedTimer upload_timer(
-                "mtp",
-                "host_plan_resident_logical_state_upload",
-                perfPhaseName(),
-                state_.device_id.toString(),
-                {{"requests", std::to_string(plans.request_count)},
-                 {"max_draft_tokens", std::to_string(max_draft_tokens)}});
-            if (!upload(
-                    ptrs.target_cached_tokens,
-                    target_cached_tokens,
-                    MTPSpecDecodeWorkspaceBuffers::TARGET_CACHED_TOKENS) ||
-                !upload(
-                    ptrs.accepted_state_counts,
-                    accepted_state_counts,
-                    MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_COUNTS) ||
-                !upload(
-                    ptrs.next_condition_tokens,
-                    next_condition_tokens,
-                    MTPSpecDecodeWorkspaceBuffers::NEXT_CONDITION_TOKENS) ||
-                !upload(
-                    ptrs.all_drafts_accepted_flags,
-                    all_drafts_accepted_flags,
-                    MTPSpecDecodeWorkspaceBuffers::ALL_DRAFTS_ACCEPTED_FLAGS) ||
-                !upload(
-                    ptrs.stopped_flags,
-                    stopped_flags,
-                    MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS) ||
-                !upload(
-                    ptrs.publication_ok_flags,
-                    publication_ok_flags,
-                    MTPSpecDecodeWorkspaceBuffers::PUBLICATION_OK_FLAGS))
-            {
-                return false;
-            }
-        }
-
-        std::string mailbox_error;
-        if (!recordDeviceResidentLogicalSequenceStateMailbox(
-                ptrs,
-                plans.request_count,
-                producer_stream,
-                &mailbox_error))
-        {
-            return fail(
-                mailbox_error.empty()
-                    ? "host-plan resident logical-state mailbox could not record readiness"
-                    : "host-plan resident logical-state mailbox could not record readiness: " +
-                          mailbox_error);
-        }
-        /*
-         * Host-plan publication has already advanced state_.positions,
-         * state_.sequence_lengths, and the host KV mirrors before this helper
-         * uploads the matching resident mailbox.  Mark this epoch as
-         * host-visible without introducing a separate adoption handoff.
-         */
-        device_resident_logical_sequence_host_mirror_epoch_ =
-            live_replay_state_epoch_;
-
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "host_plan_resident_logical_state_mailboxes",
-            1.0,
-            "decode",
-            state_.device_id.toString(),
-            {{"requests", std::to_string(plans.request_count)},
-             {"max_draft_tokens", std::to_string(max_draft_tokens)}});
-        return true;
-    }
-
     bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailbox(
         void *consumer_stream,
         const char *consumer_name)
@@ -14572,6 +14340,17 @@ namespace llaminar2
                 return false;
             }
         }
+        if (!recordAcceptedSpecPublicationReady(
+                request.outcome.stream,
+                "mtp_spec_state_publication_device_resident"))
+        {
+            if (error)
+            {
+                *error =
+                    "device-resident MTP state publication could not record accepted-publication readiness";
+            }
+            return false;
+        }
         if (!recordLivePrefixMutationReady(
                 request.outcome.stream,
                 "mtp_spec_state_publication_device_resident"))
@@ -14633,6 +14412,11 @@ namespace llaminar2
         {
             return fail("MTP spec-state publication requires an initialized forward engine");
         }
+        if (state_.device_id.is_gpu())
+        {
+            return fail(
+                "GPU MTP spec-state publication from host step plans is retired; use compact device-resident outcome publication");
+        }
 
         auto verifier_graph = forward_engine_->lastAllPositionVerifierForwardGraph();
         if (!verifier_graph || !*verifier_graph || !verifier_graph->graph)
@@ -14653,29 +14437,6 @@ namespace llaminar2
         }
 
         void *stream = verifier_graph->stream;
-        if (state_.device_id.is_gpu() && !stream)
-        {
-            stream = explicitGPUStreamForOperation("mtp_spec_state_publication");
-        }
-        if (state_.device_id.is_gpu() && !stream)
-        {
-            return fail("MTP spec-state publication could not resolve an explicit GPU stream");
-        }
-        if (plan.publish_mtp_shifted_kv &&
-            state_.device_id.is_gpu() &&
-            !waitForPendingShiftedMTPKVReady(
-                stream,
-                "mtp_spec_state_publication"))
-        {
-            return fail("MTP spec-state publication could not order after deferred shifted MTP KV append");
-        }
-        if (state_.device_id.is_gpu() &&
-            !waitForPendingAllPositionVerifierStateReady(
-                stream,
-                "mtp_spec_state_publication"))
-        {
-            return fail("MTP spec-state publication could not order after deferred all-position verifier state capture");
-        }
 
         if (!state_.kv_cache)
         {
@@ -14771,21 +14532,6 @@ namespace llaminar2
             "mtp_spec_state_publication",
             /*preserve_gpu_replay_state=*/false);
 
-        if (state_.device_id.is_gpu() &&
-            !recordAcceptedSpecPublicationReady(
-                stream,
-                "mtp_spec_state_publication"))
-        {
-            return fail("MTP spec-state publication could not record live-state readiness");
-        }
-        if (state_.device_id.is_gpu() &&
-            !recordLivePrefixMutationReady(
-                stream,
-                "mtp_spec_state_publication"))
-        {
-            return fail("MTP spec-state publication could not record live-prefix mutation readiness");
-        }
-
         PerfStatsCollector::addCounter(
             "mtp",
             "spec_state_publications",
@@ -14828,6 +14574,11 @@ namespace llaminar2
             return fail("MTP batched spec-state publication requires an MTP-enabled graph builder");
         if (!forward_engine_)
             return fail("MTP batched spec-state publication requires an initialized forward engine");
+        if (state_.device_id.is_gpu())
+        {
+            return fail(
+                "GPU MTP batched spec-state publication from host step plans is retired; use compact device-resident outcome publication");
+        }
         if (plans.request_count <= 0 ||
             static_cast<int>(plans.steps.size()) != plans.request_count)
         {
@@ -14859,8 +14610,6 @@ namespace llaminar2
         const int padded_seq_len = verifier_graph->signature.seq_len;
         if (padded_seq_len <= 0)
             return fail("MTP batched spec-state publication received an invalid verifier graph sequence length");
-        if (state_.device_id.is_gpu())
-            clearDeviceResidentLogicalSequenceStateMailbox();
 
         int max_draft_count = 0;
         std::vector<bool> seen_request(static_cast<size_t>(plans.request_count), false);
@@ -14919,31 +14668,12 @@ namespace llaminar2
         }
 
         void *stream = verifier_graph->stream;
-        if (state_.device_id.is_gpu() && !stream)
-            stream = explicitGPUStreamForOperation("mtp_spec_state_publication_batch");
-        if (state_.device_id.is_gpu() && !stream)
-            return fail("MTP batched spec-state publication could not resolve an explicit GPU stream");
-        if (any_shifted_kv_publication &&
-            state_.device_id.is_gpu() &&
-            !waitForPendingShiftedMTPKVReady(
-                stream,
-                "mtp_spec_state_publication_batch"))
-        {
-            return fail("MTP batched spec-state publication could not order after deferred shifted MTP KV append");
-        }
-        if (state_.device_id.is_gpu() &&
-            !waitForPendingAllPositionVerifierStateReady(
-                stream,
-                "mtp_spec_state_publication_batch"))
-        {
-            return fail("MTP batched spec-state publication could not order after deferred all-position verifier state capture");
-        }
         if (!state_.kv_cache)
             return fail("MTP batched spec-state publication requires an initialized main KV cache");
 
-	        int restored_stage_total = 0;
-	        int post_restore_stage_total = 0;
-	        int skipped_stage_total = 0;
+        int restored_stage_total = 0;
+        int post_restore_stage_total = 0;
+        int skipped_stage_total = 0;
         std::vector<int> terminal_rows;
         terminal_rows.resize(
             any_shifted_kv_publication ? static_cast<size_t>(plans.request_count) : 0u,
@@ -15023,39 +14753,6 @@ namespace llaminar2
             mutation_reason,
             "mtp_spec_state_publication_batch",
             /*preserve_gpu_replay_state=*/false);
-
-        if (state_.device_id.is_gpu() &&
-            !recordAcceptedSpecPublicationReady(
-                stream,
-                "mtp_spec_state_publication_batch"))
-        {
-            return fail("MTP batched spec-state publication could not record live-state readiness");
-        }
-        if (state_.device_id.is_gpu() &&
-            !recordLivePrefixMutationReady(
-                stream,
-                "mtp_spec_state_publication_batch"))
-        {
-            return fail("MTP batched spec-state publication could not record live-prefix mutation readiness");
-        }
-        if (state_.device_id.is_gpu() &&
-            supportsDeviceResidentLogicalSequenceStatePublication())
-        {
-            std::string mailbox_error;
-            if (!recordDeviceResidentLogicalSequenceStateMailboxFromStepPlans(
-                    plans,
-                    max_draft_count,
-                    *verifier_graph->graph,
-                    stream,
-                    &mailbox_error))
-            {
-                return fail(
-                    mailbox_error.empty()
-                        ? "MTP batched spec-state publication could not record resident logical-state mailbox"
-                        : "MTP batched spec-state publication could not record resident logical-state mailbox: " +
-                              mailbox_error);
-            }
-        }
 
         PerfStatsCollector::addCounter(
             "mtp",

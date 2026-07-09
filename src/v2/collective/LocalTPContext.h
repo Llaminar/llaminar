@@ -447,18 +447,18 @@ namespace llaminar2
         std::vector<size_t> fp16_scratch_counts_;
 
         // =====================================================================
-        // Experimental Small GPU Allreduce State
+        // Small GPU Allreduce State
         // =====================================================================
-        // Used only for homogeneous two-device FP32/SUM reductions when explicitly
-        // enabled. This state is separate from the blocking fallback barrier so
-        // captured decode graphs can enqueue peer-add work on each caller stream.
+        // Used for homogeneous two-device FP32/SUM reductions whose payload fits
+        // the small-reduction threshold. This state is separate from the blocking
+        // barrier and NCCL/RCCL grouped path so captured decode graphs can enqueue
+        // a deterministic peer-add kernel on each caller stream.
         mutable std::mutex small_gpu_allreduce_mutex_;
         std::condition_variable small_gpu_allreduce_cv_;
         int small_gpu_allreduce_arrivals_{0};
-        int small_gpu_allreduce_recorded_{0};
         int small_gpu_allreduce_departures_{0};
         bool small_gpu_allreduce_result_{false};
-        bool small_gpu_allreduce_events_ready_{false};
+        bool small_gpu_allreduce_state_ready_{false};
         bool small_gpu_allreduce_unavailable_{false};
         uint64_t small_gpu_allreduce_generation_{0};
         size_t small_gpu_allreduce_count_{0};
@@ -466,7 +466,8 @@ namespace llaminar2
         std::string small_gpu_allreduce_stage_name_;
         std::vector<void *> small_gpu_allreduce_buffers_;
         std::vector<void *> small_gpu_allreduce_streams_;
-        std::vector<void *> small_gpu_allreduce_ready_events_;
+        std::vector<void *> small_gpu_allreduce_peer_scratch_buffers_;
+        std::vector<size_t> small_gpu_allreduce_peer_scratch_counts_;
 
         // =====================================================================
         // Raw Device AllGather Barrier State
@@ -560,7 +561,7 @@ namespace llaminar2
                                           void *stream,
                                           const std::string &stage_name);
 
-        bool initializeSmallGpuAllreduceEventsLocked();
+        bool initializeSmallGpuAllreduceStateLocked();
         void resetSmallGpuAllreduceStateLocked();
 
         /**

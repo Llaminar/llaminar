@@ -515,6 +515,17 @@ namespace llaminar2
          */
         DeviceResidentLogicalSequenceStateHandle
         deviceResidentLogicalSequenceState() const override;
+        /**
+         * @brief Report whether rank-level host position mirrors are current.
+         *
+         * LocalTP resident MTP publication records device-owned logical state
+         * on each child runner.  The rank aggregate is only safe for ordinary
+         * host-position planning when every child reports that its host mirrors
+         * were refreshed by the same transaction.  If any participant still
+         * requires resident-mailbox planning, rank-level decode must follow that
+         * device-resident path as well.
+         */
+        bool hostLogicalStateMirrorsDeviceResidentState() const override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,

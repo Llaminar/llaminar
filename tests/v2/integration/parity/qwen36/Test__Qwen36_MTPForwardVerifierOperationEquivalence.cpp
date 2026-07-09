@@ -49,6 +49,41 @@ namespace
     };
 
     /**
+     * @brief Assert that multi-row verifier logits used the grouped LM-head path.
+     *
+     * The logits byte-equality check proves correctness after the fact.  This
+     * perfstats guard proves the graph reached the intended production owner:
+     * the decode-equivalent grouped LM-head projection, not an ordinary M>1
+     * GEMM whose reduction order can drift by a few ULPs.
+     */
+    void expectLMHeadGroupedDecodeEquivalentVerifierPrefillPath(
+        int expected_seq_len)
+    {
+        if (expected_seq_len <= 1)
+            return;
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        const auto grouped_lm_head = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                const auto route_it = record.tags.find("route");
+                return record.domain == "mtp" &&
+                       record.name ==
+                           "lm_head_grouped_decode_equivalent_verifier_prefill_rows" &&
+                       route_it != record.tags.end() &&
+                       route_it->second == "grouped" &&
+                       record.value >= static_cast<double>(expected_seq_len);
+            });
+        ASSERT_NE(grouped_lm_head, records.end())
+            << "M=" << expected_seq_len
+            << " verifier logits must exercise the grouped decode-equivalent "
+               "LM-head path.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+    }
+
+    /**
      * @brief Build a dense SingleDevice parity case for the requested backend.
      *
      * The shared dense helper owns model loading, prefix setup, row-plan
@@ -208,32 +243,17 @@ namespace
 
         if (expected_seq_len == 1)
         {
-            auto has_decode_equivalent_stage = [&](const char *stage) -> bool
-            {
-                return std::any_of(
-                    records.begin(),
-                    records.end(),
-                    [&](const PerfStatRecord &record)
-                    {
-                        return record.domain == "mtp" &&
-                               record.name ==
-                                   "moe_decode_equivalent_verifier_prefill_runs" &&
-                               tag_equals(record, "stage", stage) &&
-                               tag_equals(record, "seq_len", "1");
-                    });
-            };
-
-            EXPECT_TRUE(has_decode_equivalent_stage("router"))
-                << "ROCm MoE M=1 verifier must route through the "
-                   "decode-equivalent router oracle.\n"
-                << PerfStatsCollector::summaryString({"kernel", "mtp"});
-            EXPECT_TRUE(has_decode_equivalent_stage("routed_expert"))
-                << "ROCm MoE M=1 verifier must execute routed experts through "
-                   "the decode-equivalent one-row oracle.\n"
-                << PerfStatsCollector::summaryString({"kernel", "mtp"});
-            EXPECT_TRUE(has_decode_equivalent_stage("shared_expert"))
-                << "ROCm MoE M=1 verifier must execute the shared expert through "
-                   "the decode-equivalent one-row oracle.\n"
+            const auto decode_equivalent = std::find_if(
+                records.begin(),
+                records.end(),
+                [](const PerfStatRecord &record)
+                {
+                    return record.domain == "mtp" &&
+                           record.name == "moe_decode_equivalent_verifier_prefill_runs";
+                });
+            ASSERT_EQ(decode_equivalent, records.end())
+                << "ROCm MoE M=1 verifier must use ordinary production decode, "
+                   "not a decode-equivalent oracle path.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
             const auto combined = std::find_if(
@@ -272,7 +292,9 @@ namespace
                        tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
                        tag_is_one_of(record,
                                      "gateup_route",
-                                     {"kpart_prefill", "fused_prefill"});
+                                     {"decode_equiv_prefill",
+                                      "kpart_prefill",
+                                      "fused_prefill"});
             });
         ASSERT_NE(routed_grouped, records.end())
             << "ROCm MoE grouped verifier did not exercise the active-expert "
@@ -324,12 +346,16 @@ namespace
     {
         ScopedEnvironmentValues operation_diagnostics({
             {"LLAMINAR_DENSE_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
         const auto test_case = denseSingleDeviceCase(backend);
         SCOPED_TRACE("dense verifier_rows=" + std::to_string(verifier_rows));
+        PerfStatsCollector::reset();
         runDenseMainVerifierGroupedRowsMatchSerialDecode(
             test_case,
             verifier_rows);
+        expectLMHeadGroupedDecodeEquivalentVerifierPrefillPath(verifier_rows);
+        PerfStatsCollector::reset();
     }
 
     /**
@@ -352,6 +378,7 @@ namespace
         runMoEMainVerifierGroupedRowsMatchSerialDecode(
             test_case,
             verifier_rows);
+        expectLMHeadGroupedDecodeEquivalentVerifierPrefillPath(verifier_rows);
 
         if (backend == VerifierBackend::CUDA)
         {

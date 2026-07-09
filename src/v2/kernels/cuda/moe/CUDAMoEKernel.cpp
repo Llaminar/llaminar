@@ -366,7 +366,9 @@ namespace
         int active_expert_slots,
         int tile_m,
         int tile_n,
-        bool fuse_swiglu,
+        bool use_gateup_kpart,
+        bool fuse_swiglu_requested,
+        bool use_ordered_down_kpart,
         bool ordered_scatter)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
@@ -377,12 +379,25 @@ namespace
                 1.0, {}, {}, tags);
         }
 
-        tags["swiglu_path"] = fuse_swiglu ? "fused" : "split";
+        tags["swiglu_path"] =
+            (use_gateup_kpart || fuse_swiglu_requested) ? "fused" : "split";
+        tags["requested_fused_swiglu"] = fuse_swiglu_requested ? "true" : "false";
         if (active_expert_slots > 0)
         {
-            tags["gateup_route"] = fuse_swiglu ? "kpart_swiglu" : "kpart_prefill";
-            tags["down_route"] = "kpart_prefill";
-            tags["down_accumulation"] = "token_direct";
+            if (use_gateup_kpart)
+                tags["gateup_route"] = "kpart_prefill";
+            else
+                tags["gateup_route"] = fuse_swiglu_requested
+                                           ? "fullk_fused_swiglu_prefill"
+                                           : "fullk_prefill";
+
+            tags["down_route"] = use_ordered_down_kpart
+                                     ? "ordered_kpart_prefill"
+                                     : "grouped_prefill";
+            tags["down_accumulation"] = use_ordered_down_kpart
+                                            ? "row_ordered_kpart"
+                                            : (ordered_scatter ? "row_ordered"
+                                                               : "slot_scatter");
         }
         else if (ordered_scatter)
         {
@@ -922,6 +937,7 @@ extern "C"
         int max_slots,
         int num_experts,
         int top_k,
+        int filter_to_local_runtime_experts,
         int device_idx,
         void *stream);
 
@@ -4370,7 +4386,8 @@ namespace llaminar2
         int current_tokens,
         int max_tokens,
         int num_experts,
-        int top_k)
+        int top_k,
+        bool filter_to_local_runtime_experts)
     {
         if (!runtime_layer || !routing_indices || !routing_weights)
         {
@@ -4424,6 +4441,7 @@ namespace llaminar2
             max_tokens * top_k,
             num_experts,
             top_k,
+            filter_to_local_runtime_experts ? 1 : 0,
             device_ordinal_,
             stream);
     }
@@ -5670,7 +5688,9 @@ namespace llaminar2
             active_expert_slots,
             selected_tile_m,
             selected_tile_n,
+            use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
+            use_down_ordered_kpart,
             ordered_scatter_overwrites_output);
         return true;
     }
@@ -5735,6 +5755,29 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int active_expert_slots = std::min(total_slots, num_experts);
+        const bool use_gateup_kpart =
+            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
+            active_expert_slots > 0 &&
+            max_tokens_per_expert <= 4;
+        /*
+         * Runtime grouped verifier prefill must mirror the public M=1 runtime
+         * decode route.  CUDA serial decode uses split-K gate/up for tiny MoE
+         * rows by default, so M=2..4 publication has to use the same split-K
+         * partial ordering before it evaluates SwiGLU and quantizes the down
+         * input.  Keeping this as a grouped kernel sequence preserves the target
+         * architecture without reintroducing row replay.
+         */
+        if (use_gateup_kpart &&
+            !ensureGroupedGateUpKPartScratchCapacity(
+                total_slots,
+                debugEnv().gemm.cuda_moe_gateup_kparts,
+                intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
+                      "verifier grouped gate/up split-K scratch allocation failed");
+            return false;
+        }
         const bool use_down_ordered_kpart =
             debugEnv().gemm.cuda_moe_down_kpart_decode &&
             max_tokens_per_expert <= 4 &&
@@ -5784,7 +5827,6 @@ namespace llaminar2
         if (!d_hidden || !d_output)
             return false;
 
-        const int active_expert_slots = std::min(total_slots, num_experts);
         if (!cudaMoE_build_active_expert_list_runtime(
                 device_runtime_layer,
                 d_group_active_expert_ids_,
@@ -5836,8 +5878,8 @@ namespace llaminar2
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            nullptr,
-            nullptr,
+            use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
+            use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
             use_down_ordered_kpart ? d_grouped_down_partials_ : nullptr,
@@ -5855,7 +5897,7 @@ namespace llaminar2
             down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
-            0,
+            use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
             use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
             device_ordinal_,
             stream);
@@ -5873,7 +5915,9 @@ namespace llaminar2
             active_expert_slots,
             selectGroupedPrefillTileM(debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert),
             (active_expert_slots > 0 && max_tokens_per_expert <= 4) ? 64 : 128,
+            use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
+            use_down_ordered_kpart,
             true);
         return true;
     }

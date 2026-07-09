@@ -164,7 +164,9 @@ namespace llaminar2
             return SnapshotShardingMode::REPLICATED;
 
         // Attention norms - replicated
-        if (stage_type == "ATTENTION_NORM" || stage_type == "ATTENTION_RESIDUAL")
+        if (stage_type == "ATTENTION_NORM" ||
+            stage_type == "ATTENTION_NORM_RESIDUAL_OUT" ||
+            stage_type == "ATTENTION_RESIDUAL")
             return SnapshotShardingMode::REPLICATED;
 
         // FFN gate/up projections - column-parallel (split on d_ff)
@@ -187,7 +189,7 @@ namespace llaminar2
             return SnapshotShardingMode::REPLICATED;
 
         // FFN norm - replicated
-        if (stage_type == "FFN_NORM")
+        if (stage_type == "FFN_NORM" || stage_type == "FFN_NORM_RESIDUAL_OUT")
             return SnapshotShardingMode::REPLICATED;
 
         // Final stages

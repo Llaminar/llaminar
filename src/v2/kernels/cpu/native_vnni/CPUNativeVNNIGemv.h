@@ -3099,6 +3099,13 @@ namespace llaminar2::cpu::native_vnni
         thread_local AlignedVector<float> fused_partial_sums_tls;
         if (fused_partial_sums_tls.size() < fused_partial_sum_floats)
             fused_partial_sums_tls.resize_uninitialized(fused_partial_sum_floats);
+        /*
+         * Capture the caller thread's arena before the OpenMP region.  The arena
+         * itself is thread_local only to amortize allocations between calls; the
+         * grouped verifier work-sharing region needs one shared scratch buffer so
+         * all partial tasks and the later reduction tasks address the same layout.
+         */
+        float *fused_partial_sums_base = fused_partial_sums_tls.data();
 
         auto do_fused_rows = [&]()
         {
@@ -3135,7 +3142,7 @@ namespace llaminar2::cpu::native_vnni
                     const int k_tiles = plan.k_tiles;
                     const int k_blocks_per_tile = plan.k_blocks_per_tile;
                     float *partial_sums =
-                        fused_partial_sums_tls.data() + plan.partial_sums_offset;
+                        fused_partial_sums_base + plan.partial_sums_offset;
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
                     if (use_avx512 && M >= 2 && M <= 4)

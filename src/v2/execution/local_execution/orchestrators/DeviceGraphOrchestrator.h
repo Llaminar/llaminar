@@ -5308,25 +5308,6 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Upload a host-resolved grouped publication plan into the resident mailbox.
-         *
-         * Grouped decode-equivalent publication already commits KV, recurrent
-         * state, short-conv state, and terminal hidden rows from verifier graph
-         * rows.  The next MTP sidecar step must then consume the same logical
-         * state from device-resident metadata instead of re-reading host mirrors.
-         * This helper stages the per-request logical rows from the accepted
-         * MTPSpecStepPlanBatch into the persistent MTP metadata workspace and
-         * records the normal device-resident logical-state mailbox event on the
-         * verifier stream.
-         */
-        bool recordDeviceResidentLogicalSequenceStateMailboxFromStepPlans(
-            const MTPSpecStepPlanBatch &plans,
-            int max_draft_tokens,
-            const ComputeGraph &verifier_graph,
-            void *producer_stream,
-            std::string *error = nullptr);
-
-        /**
          * @brief Retarget the current resident mailbox after a shifted-MTP KV append.
          *
          * Resident correction commits consume the next-condition token from the

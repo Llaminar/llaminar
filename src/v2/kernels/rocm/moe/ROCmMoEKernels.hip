@@ -8656,6 +8656,119 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     }
 }
 
+/**
+ * @brief Decode-equivalent softmax/top-k for grouped MTP verifier rows.
+ *
+ * The MTP verifier is allowed to publish grouped rows into live decode state, so
+ * its routing weights must be byte-identical to running each row through the
+ * production single-token decode router.  This kernel keeps the grouped launch
+ * economical (one block per verifier row) while intentionally mirroring
+ * rocm_moe_softmax_topk_decode_runtime_wave64_kernel's probability reduction,
+ * top-k selection, and top-k renormalization order inside each block.
+ */
+__global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
+    const float *__restrict__ logits,                 // [seq_len, num_experts] input logits, left unmodified
+    int *__restrict__ expert_indices,                 // [seq_len, top_k] OUT
+    float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights)
+{
+    const int token = blockIdx.x;
+    if (!logits || !expert_indices || !expert_weights ||
+        token >= seq_len || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return;
+    }
+
+    const float *row_logits = logits + static_cast<size_t>(token) * num_experts;
+
+    __shared__ float expert_probs[kDeviceMoEMaxExperts];
+    __shared__ float shared_max[8];
+    __shared__ float shared_sum[8];
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+
+    float max_val = -FLT_MAX;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        max_val = fmaxf(max_val, row_logits[expert]);
+    }
+    max_val = rocm_moe_wave_reduce_max_f32(max_val);
+    if (lane == 0) shared_max[warp_id] = max_val;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        max_val = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
+        max_val = rocm_moe_wave_reduce_max_f32(max_val);
+        if (lane == 0) shared_max[0] = max_val;
+    }
+    __syncthreads();
+    max_val = shared_max[0];
+
+    float sum = 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        const float value = expf(row_logits[expert] - max_val);
+        expert_probs[expert] = value;
+        sum += value;
+    }
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
+    if (lane == 0) shared_sum[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
+        if (lane == 0) shared_sum[0] = sum;
+    }
+    __syncthreads();
+
+    const float inv_sum = (shared_sum[0] > 0.0f) ? 1.0f / shared_sum[0] : 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        expert_probs[expert] *= inv_sum;
+    }
+    __syncthreads();
+
+    __shared__ int selected_ids[kDeviceMoEMaxTopK];
+    __shared__ float selected_weights[kDeviceMoEMaxTopK];
+    moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+
+    if (threadIdx.x == 0)
+    {
+        if (normalize_weights)
+        {
+            float topk_sum = 0.0f;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                topk_sum += selected_weights[slot];
+            }
+            if (topk_sum > 0.0f)
+            {
+                const float inv_topk_sum = 1.0f / topk_sum;
+                for (int slot = 0; slot < top_k; ++slot)
+                {
+                    selected_weights[slot] *= inv_topk_sum;
+                }
+            }
+        }
+
+        int *out_idx = expert_indices + static_cast<size_t>(token) * top_k;
+        float *out_wt = expert_weights + static_cast<size_t>(token) * top_k;
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            out_idx[slot] = selected_ids[slot];
+            out_wt[slot] = selected_weights[slot];
+        }
+    }
+}
+
 __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
     const float *__restrict__ partials,                // [num_experts, k_partitions]
     DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -9985,6 +10098,41 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE softmax_topk_decode_runtime_wave64 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_softmax_topk_decode_equivalent_rows(
+    const float *logits,
+    int *expert_indices, float *expert_weights,
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!logits || !expert_indices || !expert_weights || !stream ||
+        seq_len <= 0 || seq_len > 4 ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts)
+    {
+        fprintf(stderr, "HIP MoE decode-equivalent rows softmax_topk invalid arguments\n");
+        return false;
+    }
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_equivalent_rows_kernel,
+        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        logits, expert_indices, expert_weights,
+        seq_len, num_experts, top_k, normalize_weights);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE decode-equivalent rows softmax_topk kernel launch failed: %s\n",
+                hipGetErrorString(err));
         return false;
     }
     return true;
@@ -11732,11 +11880,45 @@ __global__ void rocm_moe_prefill_group_clear_kernel(
     }
 }
 
+/**
+ * @brief Return whether a runtime-prefill route can be computed by this shard.
+ *
+ * StaticOwner LocalTP verifier prefill is intentionally a local partial.  The
+ * router still produces global expert ids, but this participant must group
+ * only experts whose active placement-bank descriptor is resident and marked
+ * LocalCompute.  LLEP planning does not use this predicate during its first
+ * grouping pass because it needs global route counts before assigning rows.
+ */
+__device__ __forceinline__ bool rocm_moe_prefill_static_local_ready(
+    const DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int expert_id,
+    int num_experts)
+{
+    if (!runtime ||
+        expert_id < 0 ||
+        expert_id >= num_experts ||
+        expert_id >= kDeviceMoEMaxExperts ||
+        runtime->active_bank > 1u)
+    {
+        return false;
+    }
+
+    const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+    const DeviceMoEExpertDescriptorView &desc = bank.experts[expert_id];
+    const uint32_t local_bit =
+        runtime_participant_bit(static_cast<int>(runtime->participant_id));
+    return bank.local_compute_mask[expert_id] != 0u &&
+           (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
+           desc.local_slot >= 0 &&
+           rebalance_expert_desc_ready(desc);
+}
+
 __global__ void rocm_moe_prefill_group_cast_count_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     const float *__restrict__ routing_indices,
     const float *__restrict__ routing_weights,
-    int current_slots, int max_slots, int num_experts)
+    int current_slots, int max_slots, int num_experts,
+    int filter_to_local_runtime_experts)
 {
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (!runtime || slot >= max_slots) return;
@@ -11750,7 +11932,9 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
     {
         expert_id = static_cast<int>(routing_indices[slot]);
         weight = routing_weights[slot];
-        if (expert_id < 0 || expert_id >= num_experts)
+        if (expert_id < 0 || expert_id >= num_experts ||
+            (filter_to_local_runtime_experts != 0 &&
+             !rocm_moe_prefill_static_local_ready(runtime, expert_id, num_experts)))
         {
             expert_id = -1;
             weight = 0.0f;
@@ -12928,6 +13112,7 @@ bool hipMoE_group_prefill_routes_runtime(
     const float *routing_indices, const float *routing_weights,
     void *runtime,
     int current_slots, int max_slots, int num_experts, int top_k,
+    int filter_to_local_runtime_experts,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -12962,7 +13147,8 @@ bool hipMoE_group_prefill_routes_runtime(
     hipLaunchKernelGGL(rocm_moe_prefill_group_cast_count_kernel,
         dim3(slot_blocks), dim3(threads), 0, hip_stream,
         runtime_view, routing_indices, routing_weights,
-        current_slots, max_slots, num_experts);
+        current_slots, max_slots, num_experts,
+        filter_to_local_runtime_experts);
 
     err = hipGetLastError();
     if (err != hipSuccess)

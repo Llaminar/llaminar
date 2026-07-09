@@ -553,6 +553,7 @@ namespace llaminar2
             // Standard attention stages
             {"_attn_norm", "_ATTENTION_NORM"},
             {"_attn_residual", "_ATTENTION_RESIDUAL"},
+            {"_attn_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_wo_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_wo_proj", "_ATTENTION_OUTPUT"},
             {"_q_norm", "_Q_NORM"},
@@ -665,6 +666,52 @@ namespace llaminar2
         if (stage_name.find("_attn_output_gate") != std::string::npos)
         {
             return {prefixBefore("_attn_output_gate") + "_ATTENTION_CONTEXT_GATED"};
+        }
+        if (stage_name.find("_gdn_wo_allreduce") != std::string::npos)
+        {
+            /*
+             * Filtered captures are used by the grouped-verifier parity suite to
+             * keep long-context diagnostics small.  Collective nodes publish
+             * their own post-reduction keys, so the filter must advertise those
+             * keys explicitly; otherwise the allreduce stage is skipped and the
+             * CSV jumps from a local row-parallel partial to the next replicated
+             * consumer.
+             */
+            return {prefixBefore("_gdn_wo_allreduce") + "_ATTENTION_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_wo_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_wo_allreduce") + "_ATTENTION_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_attn_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_attn_allreduce") + "_ATTENTION_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_down_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_down_allreduce") + "_FFN_DOWN_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_combined_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_moe_combined_allreduce") + "_MOE_COMBINED_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_shared_expert_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_shared_expert_allreduce") + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_expert_overlay_fast_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_moe_expert_overlay_fast_allreduce") + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_expert_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_moe_expert_allreduce") + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_sparse_return_reduce") != std::string::npos &&
+            stage_name.find("_allreduce") != std::string::npos)
+        {
+            const size_t pos = stage_name.find("_moe_sparse_return_reduce");
+            return {stage_name.substr(0, pos) + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
         }
         if (stage_name.find("_attention") != std::string::npos)
         {

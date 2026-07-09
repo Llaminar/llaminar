@@ -1350,14 +1350,23 @@ namespace llaminar2
          *
          * routing_indices and routing_weights are FP32 tensors with
          * current_tokens * top_k entries. GPU implementations should keep all
-         * route/group state device-resident in runtime_layer. The default
-         * returns false so callers can use the established host/grouping path.
+         * route/group state device-resident in runtime_layer. When
+         * filter_to_local_runtime_experts is true, routes whose expert is not
+         * local-compute ready in the active placement bank are written as
+         * inactive route slots and are omitted from the local grouped batch.
+         * That mode is the StaticOwner LocalTP contract: every participant
+         * groups only the shard it will actually compute, while the later TP
+         * reduction combines the partial MoE outputs. Dynamic/LLEP planning
+         * leaves this flag false because it first needs all routed slots before
+         * the assignment kernels choose participants. The default returns false
+         * so callers can use the established host/grouping path.
          */
         virtual bool groupPrefillRoutes(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *routing_indices, ITensor *routing_weights,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k)
+            int num_experts, int top_k,
+            bool filter_to_local_runtime_experts = false)
         {
             (void)runtime_layer;
             (void)routing_indices;
@@ -1366,6 +1375,7 @@ namespace llaminar2
             (void)max_tokens;
             (void)num_experts;
             (void)top_k;
+            (void)filter_to_local_runtime_experts;
             return false;
         }
 

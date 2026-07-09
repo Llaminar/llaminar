@@ -2601,14 +2601,14 @@ namespace llaminar2
         {
             /*
              * The main verifier compares grouped all-position rows against
-             * serial decode rows.  The expert FFN may still use the economical
-             * grouped M=2..4 path, but the router must publish the same top-k
-             * ids and weights that serial decode would have produced.  Keeping
-             * routing and expert execution as separate decisions avoids the
-             * previous ROCm drift where a correct grouped expert kernel was fed
-             * slightly different all-position prefill routes.
+             * serial decode rows.  GPU M=1 has no grouped economy to recover,
+             * so it stays on ordinary production decode routing.  GPU M=2..4
+             * still uses the decode-equivalent grouped router so the economical
+             * expert kernels receive exactly the serial top-k rows.
             */
-            return (candidate.is_cpu() || candidate.is_cuda() || candidate.is_rocm()) &&
+            const bool gpu_grouped_verifier_rows =
+                (candidate.is_cuda() || candidate.is_rocm()) && total_tokens > 1;
+            return (candidate.is_cpu() || gpu_grouped_verifier_rows) &&
                    total_tokens >= 1 &&
                    total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
@@ -2616,12 +2616,11 @@ namespace llaminar2
         };
         auto forceDecodeEquivalentMoEVerifier = [&](DeviceId candidate)
         {
-            return (candidate.is_cpu() || candidate.is_cuda() || candidate.is_rocm()) &&
+            return candidate.is_cpu() &&
                    total_tokens >= 1 &&
                    total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
-                   !mtp_sidecar_context &&
-                   !forceGpuSmallMMainVerifierPrefill(candidate);
+                   !mtp_sidecar_context;
         };
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
@@ -2773,7 +2772,7 @@ namespace llaminar2
             has_static_full_local_expert_ownership();
         const bool masked_local_tp_overlay_decode_runtime_table =
             device.is_gpu() &&
-            total_tokens == 1 &&
+            (total_tokens == 1 || forceGroupedMoEVerifierPrefill(device)) &&
             use_expert_overlay &&
             overlay_plan &&
             canUseLocalTPApportionedExpertsFastPath(*overlay_plan, device);
@@ -4398,11 +4397,10 @@ namespace llaminar2
              * Phase 9.8 production guard: the only accepted GPU verifier route
              * is split branch-local math.  Routed experts use the grouped MoE
              * verifier pipeline, while the shared expert uses its standalone
-             * decode-equivalent GEMV-many path plus the normal gate/combine
+             * grouped table-prefill verifier path plus the normal gate/combine
              * stage.  The combined routed+shared owner is intentionally kept out
-             * of the graph until a full-model cosine/L2/KL/max-abs proof passes;
-             * previous attempts diverged even when the component microbenches
-             * looked healthy.
+             * of the graph until it proves byte-identical to row-by-row serial
+             * decode across the full model, not merely close on relaxed metrics.
             */
             const bool can_combine_shared_verifier = false;
 
@@ -4566,6 +4564,10 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Qwen35 MoE graph failed to initialize masked LocalTP decode runtime table for layer " +
                             std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+                    if (total_tokens > 1 && forceGroupedMoEVerifierPrefill(device))
+                    {
+                        expert_params.use_runtime_prefill_grouping = true;
                     }
                 }
 
@@ -5207,23 +5209,25 @@ namespace llaminar2
             shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
             /*
-             * Shared-expert verifier rows are independent of top-k routing.
-             * The routed+shared single-table shortcut remains disabled, but
-             * the standalone shared expert now has a strict all-codebook
-             * M=2..4 grouped verifier proof on CUDA and ROCm.  M=1 stays on the
-             * decode-equivalent oracle because the routed grouped prefill path is
-             * numerically close but not serial-decode identical after many layers.
-             * Keep it wired through the grouped verifier route whenever the
-             * backend grouped-prefill capability is enabled, and let routing
-             * conservatism stay with the router/routed-expert stages.
+             * Shared-expert verifier rows must match ordinary serial decode,
+             * not a separate dense GEMM oracle.  GPU serial decode uses the MoE
+             * grouped table-decode helpers for the always-active shared expert,
+             * so verifier-sized GPU batches use the sibling grouped table-prefill
+             * route.  This keeps M=2..4 economical while preserving the exact
+             * descriptor family, split-K layout, and reduction order exercised
+             * by production M=1 decode.
              */
             const bool shared_grouped_verifier_prefill =
                 forceGroupedSharedMoEVerifierPrefill(shared_device);
+            const bool shared_gpu_table_verifier_prefill =
+                shared_grouped_verifier_prefill &&
+                (shared_device.is_cuda() || shared_device.is_rocm());
             shared_params.force_grouped_verifier_prefill_for_decode =
-                shared_grouped_verifier_prefill;
+                shared_gpu_table_verifier_prefill;
             shared_params.force_decode_equivalent_verifier_prefill =
-                !shared_grouped_verifier_prefill &&
-                forceDecodeEquivalentMoEVerifier(shared_device);
+                (!shared_gpu_table_verifier_prefill &&
+                 (!shared_grouped_verifier_prefill &&
+                  forceDecodeEquivalentMoEVerifier(shared_device)));
             /*
              * Phase-split MTP sidecars execute against the replicated dense-decode
              * weight view rather than the ordinary per-rank TP decode view.  The
@@ -5231,7 +5235,7 @@ namespace llaminar2
              * ordinary one-token decode path and owns a separate pointer-table
              * readiness contract.  MTP sidecar rows are verifier rows: they may
              * become live state, so their one-row shared-expert math must flow
-             * through the decode-equivalent verifier oracle unless a grouped
+             * through the decode-equivalent verifier path unless a grouped
              * shortcut has passed the same strict serial-decode proof.
              */
             shared_params.disable_grouped_decode_shortcut =
@@ -5254,15 +5258,16 @@ namespace llaminar2
                 total_tokens >= 1 &&
                 total_tokens <= 4;
             /*
-             * The accepted GPU shared-verifier route is the standalone
-             * GEMV-many path inside SharedExpertFFNStage.  It does not touch
-             * IMoEKernel grouped-prefill scratch, so it can remain a true graph
-             * sibling of the routed expert branch.  Any route that still uses
-             * row-serial replay or the backend MoE helper keeps the conservative
-             * dependency until it has its own branch-scoped workspace proof.
+             * The accepted shared-verifier routes own their branch-local math:
+             * CUDA and ROCm use the grouped table-prefill verifier route. Any route
+             * outside those explicit grouped implementations keeps the
+             * conservative dependency until it has its own branch-scoped
+             * workspace proof.
              */
             const bool shared_verifier_owns_branch_local_math =
-                main_verifier_rows && shared_grouped_verifier_prefill;
+                main_verifier_rows &&
+                (shared_gpu_table_verifier_prefill ||
+                 shared_params.force_decode_equivalent_verifier_prefill);
             if (main_verifier_rows &&
                 !shared_verifier_owns_branch_local_math &&
                 !ffn_terminal.empty())

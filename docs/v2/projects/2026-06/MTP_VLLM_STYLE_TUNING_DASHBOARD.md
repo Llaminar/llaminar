@@ -28,9 +28,10 @@ GPU all-position verifier publication now hard-fails without resident compact
 outcome publication; host `MTPSpecStepPlanBatch` publication is CPU-only.
 Focused MTP/Rank/runner gates pass; full unit `517/517` passes for this slice.
 
-Accepted MoE verifier route: routed experts use grouped verifier; shared expert
-uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
-combined routed+shared without strict L2/KLD/cosine/max_abs/token proof.
+2026-07-09 grouped verifier proof: exact precommit/CI gate
+`^V2_Integration_GroupedVerifierRows_` passed `16/16` across CPU/CUDA/ROCm.
+CPU `AllFormats` now includes fused NativeVNNI K-parallel verifier rows; CPU/CUDA
+Qwen3.6 dense+MoE operation equivalence passed `4/4`.
 
 ## Device And Topology Matrix
 

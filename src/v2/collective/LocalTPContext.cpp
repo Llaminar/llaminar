@@ -53,12 +53,8 @@ extern "C"
                                    size_t count, int ordinal, cudaStream_t stream);
     int cudaFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
     void cudaFP16ScratchFree(void *buf, int ordinal);
-    int cudaLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal);
-    void cudaLocalTPSmallFP32AllreduceDestroyEvent(void *event, int ordinal);
-    int cudaLocalTPSmallFP32AllreduceRecordEvent(void *event, int ordinal, void *stream);
-    int cudaLocalTPSmallFP32AllreduceWaitEvent(void *event, int ordinal, void *stream);
-    int cudaLocalTPSmallFP32AllreduceCanAccessPeer(int ordinal, int peer_ordinal);
-    int cudaLocalTPSmallFP32AllreduceEnablePeerAccess(int ordinal, int peer_ordinal);
+    int cudaLocalTPSmallFP32AllreduceScratchAlloc(void **buf, size_t bytes, int ordinal);
+    void cudaLocalTPSmallFP32AllreduceScratchFree(void *buf, int ordinal);
     int cudaLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,
                                             size_t count, int ordinal, void *stream);
 }
@@ -95,12 +91,8 @@ extern "C"
                            size_t count, int ordinal, void *stream);
     int rocmFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
     void rocmFP16ScratchFree(void *buf, int ordinal);
-    int rocmLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal);
-    void rocmLocalTPSmallFP32AllreduceDestroyEvent(void *event, int ordinal);
-    int rocmLocalTPSmallFP32AllreduceRecordEvent(void *event, int ordinal, void *stream);
-    int rocmLocalTPSmallFP32AllreduceWaitEvent(void *event, int ordinal, void *stream);
-    int rocmLocalTPSmallFP32AllreduceCanAccessPeer(int ordinal, int peer_ordinal);
-    int rocmLocalTPSmallFP32AllreduceEnablePeerAccess(int ordinal, int peer_ordinal);
+    int rocmLocalTPSmallFP32AllreduceScratchAlloc(void **buf, size_t bytes, int ordinal);
+    void rocmLocalTPSmallFP32AllreduceScratchFree(void *buf, int ordinal);
     int rocmLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,
                                             size_t count, int ordinal, void *stream);
 }
@@ -692,7 +684,8 @@ namespace llaminar2
         fp16_scratch_counts_.assign(devices_.size(), 0);
         small_gpu_allreduce_buffers_.assign(devices_.size(), nullptr);
         small_gpu_allreduce_streams_.assign(devices_.size(), nullptr);
-        small_gpu_allreduce_ready_events_.assign(devices_.size(), nullptr);
+        small_gpu_allreduce_peer_scratch_buffers_.assign(devices_.size(), nullptr);
+        small_gpu_allreduce_peer_scratch_counts_.assign(devices_.size(), 0);
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
@@ -750,21 +743,22 @@ namespace llaminar2
             }
         }
 
-        for (size_t i = 0; i < small_gpu_allreduce_ready_events_.size(); ++i)
+        for (size_t i = 0; i < small_gpu_allreduce_peer_scratch_buffers_.size(); ++i)
         {
-            void *event = small_gpu_allreduce_ready_events_[i];
-            if (!event)
+            void *scratch = small_gpu_allreduce_peer_scratch_buffers_[i];
+            if (!scratch)
                 continue;
             const int ordinal = devices_[i].device_ordinal;
 #ifdef HAVE_CUDA
             if (device_group_.allCUDA())
-                cudaLocalTPSmallFP32AllreduceDestroyEvent(event, ordinal);
+                cudaLocalTPSmallFP32AllreduceScratchFree(scratch, ordinal);
 #endif
 #ifdef HAVE_ROCM
             if (device_group_.allROCm())
-                rocmLocalTPSmallFP32AllreduceDestroyEvent(event, ordinal);
+                rocmLocalTPSmallFP32AllreduceScratchFree(scratch, ordinal);
 #endif
-            small_gpu_allreduce_ready_events_[i] = nullptr;
+            small_gpu_allreduce_peer_scratch_buffers_[i] = nullptr;
+            small_gpu_allreduce_peer_scratch_counts_[i] = 0;
         }
 
         const uint64_t attempts = nccl_allreduce_attempts_.load();
@@ -1001,7 +995,6 @@ namespace llaminar2
     void LocalTPContext::resetSmallGpuAllreduceStateLocked()
     {
         small_gpu_allreduce_arrivals_ = 0;
-        small_gpu_allreduce_recorded_ = 0;
         small_gpu_allreduce_departures_ = 0;
         small_gpu_allreduce_result_ = false;
         small_gpu_allreduce_count_ = 0;
@@ -1012,9 +1005,9 @@ namespace llaminar2
         ++small_gpu_allreduce_generation_;
     }
 
-    bool LocalTPContext::initializeSmallGpuAllreduceEventsLocked()
+    bool LocalTPContext::initializeSmallGpuAllreduceStateLocked()
     {
-        if (small_gpu_allreduce_events_ready_)
+        if (small_gpu_allreduce_state_ready_)
             return true;
         if (small_gpu_allreduce_unavailable_)
             return false;
@@ -1034,91 +1027,72 @@ namespace llaminar2
             return false;
         }
 
-        for (int i = 0; i < degree(); ++i)
+        if (!backend_impl_ || !backend_impl_->supportsGroupedP2PSingleDeviceOnStream())
         {
-            const int ordinal = devices_[i].device_ordinal;
-            const int peer_ordinal = devices_[1 - i].device_ordinal;
-            int can_access = 0;
-#ifdef HAVE_CUDA
-            if (is_cuda_domain)
-                can_access = cudaLocalTPSmallFP32AllreduceCanAccessPeer(ordinal, peer_ordinal);
-#endif
-#ifdef HAVE_ROCM
-            if (is_rocm_domain)
-                can_access = rocmLocalTPSmallFP32AllreduceCanAccessPeer(ordinal, peer_ordinal);
-#endif
-            if (!can_access)
-            {
-                LOG_WARN("LocalTPContext: small GPU allreduce unavailable because peer access is not available"
-                         << " from ordinal=" << ordinal << " to peer_ordinal=" << peer_ordinal);
-                small_gpu_allreduce_unavailable_ = true;
-                return false;
-            }
-
-            int enable_result = 0;
-#ifdef HAVE_CUDA
-            if (is_cuda_domain)
-                enable_result = cudaLocalTPSmallFP32AllreduceEnablePeerAccess(ordinal, peer_ordinal);
-#endif
-#ifdef HAVE_ROCM
-            if (is_rocm_domain)
-                enable_result = rocmLocalTPSmallFP32AllreduceEnablePeerAccess(ordinal, peer_ordinal);
-#endif
-            if (enable_result != 0)
-            {
-                LOG_WARN("LocalTPContext: small GPU allreduce peer access enable failed"
-                         << " ordinal=" << ordinal
-                         << " peer_ordinal=" << peer_ordinal
-                         << " error=" << enable_result);
-                small_gpu_allreduce_unavailable_ = true;
-                return false;
-            }
+            LOG_WARN("LocalTPContext: small GPU allreduce unavailable because backend P2P transport is not supported"
+                     << " backend=" << collectiveBackendTypeToString(backend_));
+            small_gpu_allreduce_unavailable_ = true;
+            return false;
         }
 
-        small_gpu_allreduce_ready_events_.assign(devices_.size(), nullptr);
+        /*
+         * Backend P2P owns the cross-device byte movement.  The receive scratch
+         * is intentionally separate from the destination activation so the only
+         * FP32 arithmetic remains the local fp32_peer_add_kernel.  That keeps the
+         * grouped MTP verifier path on the same arithmetic contract as M=1 decode
+         * without depending on CUDA/HIP peer-memory topology.
+         */
+        const size_t scratch_elements = debugEnv().localtp_small_gpu_allreduce_max_elements;
+        const size_t scratch_bytes = scratch_elements * sizeof(float);
+        small_gpu_allreduce_peer_scratch_buffers_.assign(devices_.size(), nullptr);
+        small_gpu_allreduce_peer_scratch_counts_.assign(devices_.size(), 0);
         for (int i = 0; i < degree(); ++i)
         {
             const int ordinal = devices_[i].device_ordinal;
-            void *event = nullptr;
-            int create_result = 0;
+            void *scratch = nullptr;
+            int alloc_result = 0;
 #ifdef HAVE_CUDA
             if (is_cuda_domain)
-                create_result = cudaLocalTPSmallFP32AllreduceCreateEvent(&event, ordinal);
+                alloc_result = cudaLocalTPSmallFP32AllreduceScratchAlloc(&scratch, scratch_bytes, ordinal);
 #endif
 #ifdef HAVE_ROCM
             if (is_rocm_domain)
-                create_result = rocmLocalTPSmallFP32AllreduceCreateEvent(&event, ordinal);
+                alloc_result = rocmLocalTPSmallFP32AllreduceScratchAlloc(&scratch, scratch_bytes, ordinal);
 #endif
-            if (create_result != 0 || !event)
+            if (alloc_result != 0 || !scratch)
             {
-                LOG_WARN("LocalTPContext: small GPU allreduce event creation failed"
+                LOG_WARN("LocalTPContext: small GPU allreduce peer scratch allocation failed"
                          << " slot=" << i
                          << " ordinal=" << ordinal
-                         << " error=" << create_result);
+                         << " bytes=" << scratch_bytes
+                         << " error=" << alloc_result);
                 for (int j = 0; j < i; ++j)
                 {
-                    void *created = small_gpu_allreduce_ready_events_[j];
+                    void *created = small_gpu_allreduce_peer_scratch_buffers_[j];
                     if (!created)
                         continue;
 #ifdef HAVE_CUDA
                     if (is_cuda_domain)
-                        cudaLocalTPSmallFP32AllreduceDestroyEvent(created, devices_[j].device_ordinal);
+                        cudaLocalTPSmallFP32AllreduceScratchFree(created, devices_[j].device_ordinal);
 #endif
 #ifdef HAVE_ROCM
                     if (is_rocm_domain)
-                        rocmLocalTPSmallFP32AllreduceDestroyEvent(created, devices_[j].device_ordinal);
+                        rocmLocalTPSmallFP32AllreduceScratchFree(created, devices_[j].device_ordinal);
 #endif
-                    small_gpu_allreduce_ready_events_[j] = nullptr;
+                    small_gpu_allreduce_peer_scratch_buffers_[j] = nullptr;
+                    small_gpu_allreduce_peer_scratch_counts_[j] = 0;
                 }
                 small_gpu_allreduce_unavailable_ = true;
                 return false;
             }
-            small_gpu_allreduce_ready_events_[i] = event;
+            small_gpu_allreduce_peer_scratch_buffers_[i] = scratch;
+            small_gpu_allreduce_peer_scratch_counts_[i] = scratch_elements;
         }
 
-        small_gpu_allreduce_events_ready_ = true;
-        LOG_DEBUG("LocalTPContext: enabled experimental small GPU allreduce fast path"
+        small_gpu_allreduce_state_ready_ = true;
+        LOG_DEBUG("LocalTPContext: enabled small GPU allreduce path"
                   << " backend=" << collectiveBackendTypeToString(backend_)
+                  << " transport=backend_p2p"
                   << " max_elements=" << debugEnv().localtp_small_gpu_allreduce_max_elements);
         return true;
     }
@@ -1158,8 +1132,7 @@ namespace llaminar2
         const int num_participants = degree();
         const int peer_index = 1 - device_index;
         const int ordinal = devices_[device_index].device_ordinal;
-        void *peer_buffer = nullptr;
-        void *peer_ready_event = nullptr;
+        void *peer_transport_scratch = nullptr;
 
         auto wait_with_timeout = [&](std::unique_lock<std::mutex> &lock,
                                      auto predicate,
@@ -1178,7 +1151,6 @@ namespace llaminar2
                               << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
                               << " slot=" << device_index
                               << " arrivals=" << small_gpu_allreduce_arrivals_
-                              << " recorded=" << small_gpu_allreduce_recorded_
                               << " departures=" << small_gpu_allreduce_departures_);
                     resetSmallGpuAllreduceStateLocked();
                     small_gpu_allreduce_cv_.notify_all();
@@ -1204,7 +1176,7 @@ namespace llaminar2
 
         {
             std::unique_lock<std::mutex> lock(small_gpu_allreduce_mutex_);
-            if (!initializeSmallGpuAllreduceEventsLocked())
+            if (!initializeSmallGpuAllreduceStateLocked())
             {
                 return false;
             }
@@ -1221,7 +1193,6 @@ namespace llaminar2
             if (small_gpu_allreduce_arrivals_ == 0)
             {
                 small_gpu_allreduce_result_ = true;
-                small_gpu_allreduce_recorded_ = 0;
                 small_gpu_allreduce_departures_ = 0;
                 small_gpu_allreduce_count_ = count;
                 small_gpu_allreduce_dtype_ = dtype;
@@ -1265,125 +1236,92 @@ namespace llaminar2
                 depart_locked();
                 return false;
             }
-        }
 
-        int record_result = 0;
-#ifdef HAVE_CUDA
-        if (is_cuda_domain)
-        {
-            record_result = cudaLocalTPSmallFP32AllreduceRecordEvent(
-                small_gpu_allreduce_ready_events_[static_cast<size_t>(device_index)],
-                ordinal,
-                stream);
-        }
-#endif
-#ifdef HAVE_ROCM
-        if (is_rocm_domain)
-        {
-            record_result = rocmLocalTPSmallFP32AllreduceRecordEvent(
-                small_gpu_allreduce_ready_events_[static_cast<size_t>(device_index)],
-                ordinal,
-                stream);
-        }
-#endif
-        if (record_result != 0)
-        {
-            LOG_WARN("LocalTPContext::trySmallGpuAllreduceOnStream: ready event record failed"
-                     << " slot=" << device_index
-                     << " ordinal=" << ordinal
-                     << " error=" << record_result);
-            std::lock_guard<std::mutex> lock(small_gpu_allreduce_mutex_);
-            small_gpu_allreduce_result_ = false;
-            small_gpu_allreduce_recorded_ = num_participants;
-            depart_locked();
-            small_gpu_allreduce_cv_.notify_all();
-            return false;
-        }
-
-        {
-            std::unique_lock<std::mutex> lock(small_gpu_allreduce_mutex_);
-            if (!small_gpu_allreduce_result_)
+            peer_transport_scratch =
+                small_gpu_allreduce_peer_scratch_buffers_[static_cast<size_t>(device_index)];
+            const size_t scratch_count =
+                small_gpu_allreduce_peer_scratch_counts_[static_cast<size_t>(device_index)];
+            if (!peer_transport_scratch || scratch_count < count)
             {
+                LOG_WARN("LocalTPContext::trySmallGpuAllreduceOnStream: missing peer transport scratch"
+                         << " slot=" << device_index
+                         << " scratch=" << peer_transport_scratch
+                         << " scratch_count=" << scratch_count
+                         << " count=" << count);
+                small_gpu_allreduce_result_ = false;
                 depart_locked();
-                return false;
-            }
-
-            ++small_gpu_allreduce_recorded_;
-            if (small_gpu_allreduce_recorded_ >= num_participants || !small_gpu_allreduce_result_)
-            {
                 small_gpu_allreduce_cv_.notify_all();
-            }
-            else if (!wait_with_timeout(lock,
-                                        [&]()
-                                        { return abort_requested_.load(std::memory_order_acquire) ||
-                                                 !small_gpu_allreduce_result_ ||
-                                                 small_gpu_allreduce_recorded_ >= num_participants; },
-                                        "record"))
-            {
                 return false;
             }
-
-            if (!small_gpu_allreduce_result_)
-            {
-                depart_locked();
-                return false;
-            }
-
-            peer_buffer = small_gpu_allreduce_buffers_[static_cast<size_t>(peer_index)];
-            peer_ready_event = small_gpu_allreduce_ready_events_[static_cast<size_t>(peer_index)];
             depart_locked();
         }
 
-        if (!peer_buffer || !peer_ready_event)
+        const char *transport = "backend_p2p";
+        std::vector<CollectiveP2POp> ops;
+        ops.reserve(2);
+
+        CollectiveP2POp send_op;
+        send_op.kind = CollectiveP2POpKind::Send;
+        send_op.send_buffer = buffer;
+        send_op.count = count;
+        send_op.dtype = dtype;
+        send_op.peer = peer_index;
+        ops.push_back(send_op);
+
+        CollectiveP2POp recv_op;
+        recv_op.kind = CollectiveP2POpKind::Recv;
+        recv_op.recv_buffer = peer_transport_scratch;
+        recv_op.count = count;
+        recv_op.dtype = dtype;
+        recv_op.peer = peer_index;
+        ops.push_back(recv_op);
+
+        if (!groupedP2PRawOnStream(
+                ops,
+                device_index,
+                stream,
+                stage_name.empty()
+                    ? std::string("small_gpu_allreduce_peer_exchange")
+                    : stage_name + "_small_gpu_peer_exchange"))
         {
-            LOG_WARN("LocalTPContext::trySmallGpuAllreduceOnStream: missing peer state"
+            LOG_WARN("LocalTPContext::trySmallGpuAllreduceOnStream: backend P2P peer exchange failed"
                      << " slot=" << device_index
                      << " peer_slot=" << peer_index
-                     << " peer_buffer=" << peer_buffer
-                     << " peer_event=" << peer_ready_event);
+                     << " transport=" << transport);
             return false;
         }
 
-        int wait_result = 0;
         int launch_result = 0;
 #ifdef HAVE_CUDA
         if (is_cuda_domain)
         {
-            wait_result = cudaLocalTPSmallFP32AllreduceWaitEvent(peer_ready_event, ordinal, stream);
-            if (wait_result == 0)
-            {
-                launch_result = cudaLocalTPSmallFP32AllreduceLaunch(
-                    static_cast<float *>(buffer),
-                    static_cast<const float *>(peer_buffer),
-                    count,
-                    ordinal,
-                    stream);
-            }
+            launch_result = cudaLocalTPSmallFP32AllreduceLaunch(
+                static_cast<float *>(buffer),
+                static_cast<const float *>(peer_transport_scratch),
+                count,
+                ordinal,
+                stream);
         }
 #endif
 #ifdef HAVE_ROCM
         if (is_rocm_domain)
         {
-            wait_result = rocmLocalTPSmallFP32AllreduceWaitEvent(peer_ready_event, ordinal, stream);
-            if (wait_result == 0)
-            {
-                launch_result = rocmLocalTPSmallFP32AllreduceLaunch(
-                    static_cast<float *>(buffer),
-                    static_cast<const float *>(peer_buffer),
-                    count,
-                    ordinal,
-                    stream);
-            }
+            launch_result = rocmLocalTPSmallFP32AllreduceLaunch(
+                static_cast<float *>(buffer),
+                static_cast<const float *>(peer_transport_scratch),
+                count,
+                ordinal,
+                stream);
         }
 #endif
 
-        if (wait_result != 0 || launch_result != 0)
+        if (launch_result != 0)
         {
             LOG_WARN("LocalTPContext::trySmallGpuAllreduceOnStream: peer-add launch failed"
                      << " slot=" << device_index
                      << " peer_slot=" << peer_index
-                     << " wait_error=" << wait_result
-                     << " launch_error=" << launch_result);
+                     << " launch_error=" << launch_result
+                     << " transport=" << transport);
             return false;
         }
 
@@ -1394,6 +1332,7 @@ namespace llaminar2
             {},
             devices_[device_index].toString(),
             {{"backend", collectiveBackendTypeToString(backend_)},
+             {"transport", transport},
              {"elements", std::to_string(count)}});
         PerfStatsCollector::addCounter(
             "tp_allreduce_small_gpu",
@@ -1402,6 +1341,7 @@ namespace llaminar2
             {},
             devices_[device_index].toString(),
             {{"backend", collectiveBackendTypeToString(backend_)},
+             {"transport", transport},
              {"elements", std::to_string(count)}});
 
         return true;
@@ -1726,6 +1666,49 @@ namespace llaminar2
             }
         }
 
+        /*
+         * Tiny two-device FP32 reductions are decode-publication boundaries for
+         * LocalTP MTP verifier rows.  NCCL/RCCL may choose a different kernel for
+         * 2048 elements than for 4096 or 8192 elements, which is numerically fine
+         * for throughput but not for the grouped-verifier byte-equality contract.
+         * The peer-add path performs one explicit per-element FP32 addition on
+         * each participant, so M=1 serial decode and M=2..4 grouped verifier rows
+         * share the same arithmetic.  It is also the economical path for these
+         * payload sizes because it avoids launching a tiny library collective.
+         */
+        const bool small_gpu_peer_add_candidate =
+            debugEnv().localtp_small_gpu_allreduce &&
+            effective_count > 0 &&
+            effective_count <= debugEnv().localtp_small_gpu_allreduce_max_elements &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            degree() == 2 &&
+            ((backend_ == CollectiveBackendType::NCCL && device_group_.allCUDA()) ||
+             (backend_ == CollectiveBackendType::RCCL && device_group_.allROCm()));
+
+        if (small_gpu_peer_add_candidate)
+        {
+            if (trySmallGpuAllreduceOnStream(buffer, effective_count, dtype,
+                                             CollectiveOp::ALLREDUCE_SUM,
+                                             device_index, stream, stage_name))
+            {
+                recordLocalTPRuntimeAllreduce(
+                    device_group_, backend_, devices_[device_index].toLocalDeviceId(),
+                    stage_name, static_cast<size_t>(degree()), effective_count,
+                    dtype, "on_stream_small_gpu", effective_precision);
+                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
+                return true;
+            }
+
+            LOG_ERROR("LocalTPContext::allreduceOnStream: required small two-GPU "
+                      "FP32 peer-add allreduce failed"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " elements=" << effective_count
+                      << " device_index=" << device_index);
+            requestAbort();
+            return false;
+        }
+
         // =================================================================
         // Standard FP32 allreduce path. FP16 transport failures fail fast above;
         // grouped collectives must never fall through asymmetrically.
@@ -1753,6 +1736,12 @@ namespace llaminar2
             return true;
         }
 
+        /*
+         * Non-NCCL/RCCL backends that satisfy the same tiny two-device predicate
+         * can still use the peer-add helper. Homogeneous NCCL/RCCL domains are
+         * handled above so they cannot silently fall through to a library
+         * collective after a peer-add setup failure.
+         */
         if (trySmallGpuAllreduceOnStream(buffer, effective_count, dtype,
                                          CollectiveOp::ALLREDUCE_SUM,
                                          device_index, stream, stage_name))

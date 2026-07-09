@@ -24,6 +24,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -177,32 +178,14 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
-     * @brief Return whether dense greedy MTP should publish through grouped host plans.
-     *
-     * This lane is intentionally narrow now that GPU LocalTP owns a rank-level
-     * compact verifier outcome and resident mailbox.  It remains as a guard for
-     * future distributed shapes that can publish grouped verifier rows through
-     * host-visible plans but do not yet have a compact resident outcome.
-     *
-     * @param test_case Dense parity fixture under test.
-     * @return true when the fixture is a GPU LocalTP case that should exercise
-     *         grouped host-plan MTP publication.
-     */
-    inline bool denseCaseExpectsGroupedHostMTPPublication(
-        const DensePrefixRestoreParityCase &test_case)
-    {
-        (void)test_case;
-        return false;
-    }
-
-    /**
      * @brief Return whether dense MTP should use device-resident publication.
      *
      * Single-device GPU runners own every speculative slot locally.  GPU
      * LocalTP runners now reduce verifier outcomes at RankOrchestrator scope
      * and then fan the same compact accepted-state transaction to every child.
      * CPU runners and distributed runners without that mailbox remain on
-     * explicit replay or grouped host plans.
+     * explicit decode-equivalent replay until they have their own resident
+     * publication proof.
      *
      * @param test_case Dense parity fixture under test.
      * @return true when the fixture should exercise device-resident MTP state
@@ -281,13 +264,6 @@ namespace llaminar2::test::parity::qwen36
             denseHasMTPPerfCounter(
                 records,
                 "decode_equivalent_sequential_verifier_runs");
-        const bool used_grouped_host_publication =
-            denseHasMTPPerfCounter(
-                records,
-                "grouped_outcome_host_publication_uses") &&
-            denseHasMTPPerfCounter(
-                records,
-                "grouped_outcome_host_state_publications");
         const bool used_grouped_device_publication =
             denseHasMTPPerfCounter(
                 records,
@@ -305,26 +281,6 @@ namespace llaminar2::test::parity::qwen36
             denseHasMTPPerfCounter(
                 records,
                 "grouped_decode_equivalent_greedy_verifier_runs");
-
-        if (denseCaseExpectsGroupedHostMTPPublication(test_case))
-        {
-            EXPECT_TRUE(used_grouped_host_publication)
-                << context << " should publish grouped verifier rows through "
-                   "the LocalTP host-plan lane.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_TRUE(used_grouped_verifier)
-                << context << " should run the grouped greedy verifier rows.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_serial_replay)
-                << context << " must not fall back to row-serial verifier "
-                   "replay once grouped host publication is available.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_direct_all_position_publication)
-                << context << " must not promote dense direct all-position "
-                   "publication without a continuation proof.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            return;
-        }
 
         if (denseCaseExpectsGroupedDevicePublication(test_case))
         {
@@ -346,7 +302,7 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
 
-        EXPECT_TRUE(used_serial_replay || used_grouped_host_publication)
+        EXPECT_TRUE(used_serial_replay || used_grouped_device_publication)
             << context << " should exercise an explicit decode-equivalent "
                "MTP verifier path.\n"
             << PerfStatsCollector::summaryString({"mtp"});
@@ -738,6 +694,59 @@ namespace llaminar2::test::parity::qwen36
                << ", rel_l2<=" << max_rel_l2
                << ", symmetric_kl<=" << max_symmetric_kl
                << ", max_abs_diff<=" << max_abs_diff << ")";
+    }
+
+    inline ::testing::AssertionResult denseVerifierLogitsByteIdentical(
+        const float *actual_logits,
+        const float *serial_logits,
+        int vocab_size,
+        const std::string &label)
+    {
+        const size_t count = static_cast<size_t>(vocab_size);
+        if (std::memcmp(actual_logits, serial_logits, count * sizeof(float)) == 0)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        size_t first_mismatch = 0;
+        while (first_mismatch < count &&
+               std::memcmp(actual_logits + first_mismatch,
+                           serial_logits + first_mismatch,
+                           sizeof(float)) == 0)
+        {
+            ++first_mismatch;
+        }
+
+        uint32_t actual_bits = 0;
+        uint32_t serial_bits = 0;
+        if (first_mismatch < count)
+        {
+            std::memcpy(&actual_bits,
+                        actual_logits + first_mismatch,
+                        sizeof(actual_bits));
+            std::memcpy(&serial_bits,
+                        serial_logits + first_mismatch,
+                        sizeof(serial_bits));
+        }
+
+        const DenseVerifierLogitMetrics metrics =
+            computeDenseVerifierLogitMetrics(
+                actual_logits,
+                serial_logits,
+                vocab_size);
+        return ::testing::AssertionFailure()
+               << label
+               << " must be byte-identical to serial decode"
+               << " first_mismatch=" << first_mismatch
+               << " actual=" << (first_mismatch < count ? actual_logits[first_mismatch] : 0.0f)
+               << " serial=" << (first_mismatch < count ? serial_logits[first_mismatch] : 0.0f)
+               << " actual_bits=0x" << std::hex << actual_bits
+               << " serial_bits=0x" << serial_bits << std::dec
+               << " cosine=" << metrics.cosine
+               << " rel_l2=" << metrics.rel_l2
+               << " symmetric_kl=" << metrics.symmetric_kl
+               << " max_abs_diff=" << metrics.max_abs_diff
+               << " max_abs_index=" << metrics.max_abs_index;
     }
 
     inline ::testing::AssertionResult tokenSequencesMatch(
@@ -4753,7 +4762,7 @@ namespace llaminar2::test::parity::qwen36
                     static_cast<int>(verifier_tokens.size()),
                     static_cast<int>(row));
             }
-            EXPECT_TRUE(denseVerifierLogitsNumericallyEquivalent(
+            EXPECT_TRUE(denseVerifierLogitsByteIdentical(
                 grouped_row_logits,
                 serial_logits_by_row[row].data(),
                 vocab,

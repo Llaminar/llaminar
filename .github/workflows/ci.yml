@@ -63,7 +63,7 @@ env:
 
 jobs:
   build:
-    name: Build builder image, unit tests, and focused integration tests
+    name: Build builder image, unit tests, and grouped verifier integration tests
     runs-on: [llaminar-bench]
     timeout-minutes: 120
     outputs:
@@ -138,7 +138,7 @@ jobs:
                   --output-on-failure \
                   --parallel
 
-      - name: Run focused integration tests
+      - name: Run all-format grouped verifier integration tests
         run: |
           mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
             --probe-image "${BUILDER_IMAGE}" \

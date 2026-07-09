@@ -144,72 +144,22 @@ extern "C"
         (void)hipFree(buf);
     }
 
-    int rocmLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal)
+    int rocmLocalTPSmallFP32AllreduceScratchAlloc(void **buf, size_t bytes, int ordinal)
     {
-        if (!event_out)
+        if (!buf || bytes == 0)
             return static_cast<int>(hipErrorInvalidValue);
         hipError_t err = hipSetDevice(ordinal);
         if (err != hipSuccess)
             return static_cast<int>(err);
-        hipEvent_t event;
-        err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
-        if (err != hipSuccess)
-        {
-            *event_out = nullptr;
-            return static_cast<int>(err);
-        }
-        *event_out = static_cast<void *>(event);
-        return static_cast<int>(hipSuccess);
+        return static_cast<int>(hipMalloc(buf, bytes));
     }
 
-    void rocmLocalTPSmallFP32AllreduceDestroyEvent(void *event, int ordinal)
+    void rocmLocalTPSmallFP32AllreduceScratchFree(void *buf, int ordinal)
     {
-        if (!event)
+        if (!buf)
             return;
         (void)hipSetDevice(ordinal);
-        (void)hipEventDestroy(static_cast<hipEvent_t>(event));
-    }
-
-    int rocmLocalTPSmallFP32AllreduceRecordEvent(void *event, int ordinal, void *stream)
-    {
-        if (!event || !stream)
-            return static_cast<int>(hipErrorInvalidValue);
-        hipError_t err = hipSetDevice(ordinal);
-        if (err != hipSuccess)
-            return static_cast<int>(err);
-        err = hipEventRecord(static_cast<hipEvent_t>(event), static_cast<hipStream_t>(stream));
-        return static_cast<int>(err);
-    }
-
-    int rocmLocalTPSmallFP32AllreduceWaitEvent(void *event, int ordinal, void *stream)
-    {
-        if (!event || !stream)
-            return static_cast<int>(hipErrorInvalidValue);
-        hipError_t err = hipSetDevice(ordinal);
-        if (err != hipSuccess)
-            return static_cast<int>(err);
-        err = hipStreamWaitEvent(static_cast<hipStream_t>(stream), static_cast<hipEvent_t>(event), 0);
-        return static_cast<int>(err);
-    }
-
-    int rocmLocalTPSmallFP32AllreduceCanAccessPeer(int ordinal, int peer_ordinal)
-    {
-        int can_access = 0;
-        hipError_t err = hipDeviceCanAccessPeer(&can_access, ordinal, peer_ordinal);
-        if (err != hipSuccess)
-            return 0;
-        return can_access != 0;
-    }
-
-    int rocmLocalTPSmallFP32AllreduceEnablePeerAccess(int ordinal, int peer_ordinal)
-    {
-        hipError_t err = hipSetDevice(ordinal);
-        if (err != hipSuccess)
-            return static_cast<int>(err);
-        err = hipDeviceEnablePeerAccess(peer_ordinal, 0);
-        if (err == hipErrorPeerAccessAlreadyEnabled)
-            return static_cast<int>(hipSuccess);
-        return static_cast<int>(err);
+        (void)hipFree(buf);
     }
 
     int rocmLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,

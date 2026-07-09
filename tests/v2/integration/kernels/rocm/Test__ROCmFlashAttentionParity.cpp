@@ -12,9 +12,13 @@
  * - GQA configurations (n_heads != n_kv_heads)
  *
  * **Pass Criteria**:
- * - Cosine similarity >= 0.99 (attention is numerically sensitive)
- * - No NaN/Inf in outputs
- * - Relative error < 5% for FP32
+ * - Cross-backend CPU-vs-ROCm attention parity keeps numerical gates because
+ *   independent CPU and HIP reductions are not expected to produce identical
+ *   FP32 bytes.
+ * - MTP verifier grouped-row proofs are stricter: grouped rows must be
+ *   byte-for-byte identical to running each row through the same ROCm serial
+ *   M=1 decode route. Cosine, relative-L2, and max-absolute error are printed
+ *   only to make the first drift easy to diagnose.
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  *
@@ -159,6 +163,75 @@ namespace
                 max_err = err;
         }
         return max_err;
+    }
+
+    /**
+     * @brief Assert that two same-backend FP32 rows have identical bytes.
+     *
+     * MTP verifier rows are publishable state, so the ROCm grouped verifier
+     * path is not allowed to be "close" to serial decode.  This helper keeps
+     * the pass/fail rule at raw byte equality while reporting ordinary numeric
+     * breadcrumbs for the first differing element.  The diagnostics are useful
+     * when a future kernel change alters accumulation order, KV row selection,
+     * GQA head mapping, or graph-captured attention params.
+     *
+     * @param actual Grouped verifier row produced by the production path.
+     * @param expected Serial M=1 decode row produced by the same backend.
+     * @param count Number of FP32 elements to compare.
+     * @param label Human-readable test context included in failures.
+     * @return AssertionSuccess when every byte matches, otherwise AssertionFailure.
+     */
+    ::testing::AssertionResult expectBitwiseEqualFP32Rows(
+        const float *actual,
+        const float *expected,
+        size_t count,
+        const std::string &label)
+    {
+        if (!actual || !expected)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " received a null FP32 row pointer";
+        }
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        size_t first = 0;
+        double max_abs = 0.0;
+        size_t max_index = 0;
+        for (; first < count; ++first)
+        {
+            if (std::memcmp(actual + first, expected + first, sizeof(float)) != 0)
+                break;
+        }
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double diff =
+                std::abs(static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
+            if (diff > max_abs)
+            {
+                max_abs = diff;
+                max_index = i;
+            }
+        }
+
+        uint32_t actual_bits = 0;
+        uint32_t expected_bits = 0;
+        std::memcpy(&actual_bits, actual + first, sizeof(uint32_t));
+        std::memcpy(&expected_bits, expected + first, sizeof(uint32_t));
+
+        return ::testing::AssertionFailure()
+               << label << " is not byte-identical to same-backend serial decode"
+               << " first_diff_index=" << first
+               << " actual=" << actual[first]
+               << " expected=" << expected[first]
+               << " actual_bits=0x" << std::hex << actual_bits
+               << " expected_bits=0x" << expected_bits << std::dec
+               << " max_abs_diff=" << max_abs
+               << " max_abs_index=" << max_index
+               << " cosine=" << cosineSimilarity(actual, expected, count)
+               << " rel_l2=" << relativeL2Error(actual, expected, count);
     }
 
     bool hasNaNOrInf(const float *data, size_t count)
@@ -1641,12 +1714,8 @@ void runQwen36DeviceDerivedRowsMatchSerialDecode(
                   << ", max_error=" << max_error
                   << ", count=" << q_cols
                   << std::endl;
-        EXPECT_GE(cosine, 0.999999)
-            << "ROCm Qwen3.6 M=" << seq_len << " verifier attention row " << row
-            << " diverges from serial decode attention";
-        EXPECT_LE(l2_error, 1e-5)
-            << "ROCm Qwen3.6 M=" << seq_len << " verifier attention row " << row
-            << " relative L2 differs from serial decode attention";
+        EXPECT_TRUE(expectBitwiseEqualFP32Rows(grouped_row, m1_output.data(), q_cols,
+                                               label + " row " + std::to_string(row)));
     }
 
     rocm_kernel.unbindWorkspace();
@@ -1839,11 +1908,8 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
                                   std::to_string(seq_len) +
                                   " RoPE-on-read vs M1";
         printComparisonStats(label.c_str(), cosine, l2_error, max_error, q_cols);
-        EXPECT_GE(cosine, 0.999999)
-            << "ROCm stage M=" << seq_len << " row " << row << " must match serial decode";
-        EXPECT_LE(l2_error, 1e-5)
-            << "ROCm stage M=" << seq_len << " row " << row
-            << " relative L2 differs from serial decode";
+        EXPECT_TRUE(expectBitwiseEqualFP32Rows(grouped_row, m1_output.data(), q_cols,
+                                               label + " row " + std::to_string(row)));
     }
 
     cleanupWorkspace(serial_kernel);
@@ -2120,12 +2186,9 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
             " RoPE-on-read vs M1";
         printComparisonStats(label ? label : generated_label.c_str(),
                              cosine, l2_error, max_error, q_cols);
-        EXPECT_GE(cosine, 0.999999)
-            << "ROCm captured append+attention M=" << seq_len << " row " << row
-            << " must match serial decode";
-        EXPECT_LE(l2_error, 1e-5)
-            << "ROCm captured append+attention M=" << seq_len << " row " << row
-            << " relative L2 differs from serial decode";
+        EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+            grouped_row, m1_output.data(), q_cols,
+            (label ? std::string(label) : generated_label) + " row " + std::to_string(row)));
     }
 
     cleanupWorkspace(serial_kernel);
@@ -2166,6 +2229,41 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
         "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP M2 RoPE-on-read vs M1");
 }
 
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPM3RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * M3 is the first LocalTP verifier group with two speculative draft rows
+     * plus the bonus row.  Byte equality here proves the ROCm captured append
+     * and attention path does not accidentally use prefill-style visibility
+     * across verifier rows.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP M3 RoPE-on-read vs M1");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPM4RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * M4 covers the widest grouped verifier row count in the current MTP
+     * matrix while preserving the long-context kv_len=599 regime used by the
+     * production parity failures.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP M4 RoPE-on-read vs M1");
+}
+
 TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM2RoPEOnReadRowsMatchSerialDecode)
 {
     /*
@@ -2182,6 +2280,62 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen
         /*n_kv_heads=*/1,
         /*head_dim=*/256,
         "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP M2 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM3RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Q8_1 M3 proves the converted-cache ROCm LocalTP path remains exactly
+     * serial-row equivalent once more than one speculative draft row is present.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP M3 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM4RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Q8_1 M4 is the widest converted-cache grouped verifier attention case in
+     * the focused LocalTP sweep.  The byte-exact helper below is the production
+     * publication threshold, not an approximate parity hint.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP M4 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSmallHistoryM2RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * The device-resident Qwen3.6 MoE publication parity fixture seeds the
+     * verifier with a two-token prefix, then appends two MTP rows.  That tiny
+     * KV span exercises the single-split ROCm flash-decode regime rather than
+     * the long-context split-K regime covered above.  Keep this regression
+     * byte-exact so a short-prefix LocalTP grouped verifier cannot drift from
+     * serial decode while still looking fine in long-context attention tests.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/2,
+        /*history_len=*/2,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP small-history M2 RoPE-on-read vs M1",
         ActivationPrecision::Q8_1);
 }
 
@@ -2206,6 +2360,45 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
         /*gqa_n_rep=*/16);
 }
 
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPSecondShardM3RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * The second LocalTP shard exercises a non-zero global Q-head offset.  M3
+     * makes that global GQA mapping prove itself for every publishable verifier
+     * row, not only the M2 smoke shape.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP shard1 M3 RoPE-on-read vs M1",
+        ActivationPrecision::FP16,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPSecondShardM4RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Same second-shard global-GQA proof at the maximum verifier group size
+     * used by the current long-context MTP matrix.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 ROCm LocalTP shard1 M4 RoPE-on-read vs M1",
+        ActivationPrecision::FP16,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
 TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM2RoPEOnReadRowsMatchSerialDecode)
 {
     /*
@@ -2221,6 +2414,46 @@ TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen
         /*n_kv_heads=*/1,
         /*head_dim=*/256,
         "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP shard1 M2 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM3RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Q8_1 second-shard M3 combines converted KV storage with global GQA head
+     * offsets.  Keeping this byte-exact prevents LocalTP cache conversion from
+     * hiding behind broad cosine gates.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP shard1 M3 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM4RoPEOnReadRowsMatchSerialDecode)
+{
+    /*
+     * Q8_1 second-shard M4 is the widest focused ROCm LocalTP attention
+     * verifier case: converted cache, non-zero head offset, and four grouped
+     * rows all have to line up with serial decode exactly.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        mpi_ctx_,
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 ROCm LocalTP shard1 M4 RoPE-on-read vs M1",
         ActivationPrecision::Q8_1,
         /*head_start=*/8,
         /*gqa_n_rep=*/16);

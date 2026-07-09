@@ -86,6 +86,51 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Infer the transpose flag expected by floating-point GEMM adapters.
+         *
+         * Quantized kernels in Llaminar own the `[N,K]` weight layout internally,
+         * so graph builders pass `transpose_B=false` for ordinary model
+         * projections.  The cuBLAS/hipBLAS floating-point adapters expose the
+         * lower-level BLAS convention: a row-major model weight stored as
+         * `[N,K]` must be consumed with `transpose_B=true` to compute
+         * `C[M,N] = A[M,K] * W[N,K]^T`.
+         *
+         * MTP grouped verifier publication does not carry an explicit transpose
+         * flag; the floating adapters' grouped hooks already use the `[N,K]`
+         * model-weight convention.  Serial M=1 decode must therefore make the
+         * same inference or byte-equivalence tests compare different matrix
+         * products.  If a caller truly provides a floating weight stored as
+         * `[K,N]`, its shape will not match `[n,k]` and the explicit
+         * `params.transpose_B=false` setting is preserved.
+         */
+        bool effectiveTransposeBForWeight(
+            const TensorBase *weight,
+            int n,
+            int k,
+            bool requested_transpose)
+        {
+            if (requested_transpose || !weight)
+                return requested_transpose;
+
+            const TensorType type = weight->native_type();
+            const bool floating_weight =
+                type == TensorType::FP32 ||
+                type == TensorType::FP16 ||
+                type == TensorType::BF16;
+            if (!floating_weight)
+                return requested_transpose;
+
+            const auto &shape = weight->shape();
+            if (shape.size() >= 2 &&
+                shape[0] == static_cast<size_t>(n) &&
+                shape[1] == static_cast<size_t>(k))
+            {
+                return true;
+            }
+            return requested_transpose;
+        }
+
     }
 
     // =============================================================================
@@ -296,6 +341,8 @@ namespace llaminar2
 
         // Cast weights to TensorBase for diagnostics and tensor-aware kernel calls.
         auto *B_base = requireTensorBase(params_.B, "weight B");
+        const bool effective_transpose_B =
+            effectiveTransposeBForWeight(B_base, effective_n, params_.k, params_.transpose_B);
 
         // Get kernel — use stage-level cache to avoid store lookup per call.
         llaminar2::ITensorGemm *gemm = nullptr;
@@ -392,7 +439,7 @@ namespace llaminar2
             bool success = gemm->multiply_tensor(
                 swiglu_output, C_base,
                 params_.m, effective_n, params_.k,
-                params_.transpose_B,
+                effective_transpose_B,
                 params_.alpha, params_.beta,
                 nullptr, // bias
                 params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
@@ -417,7 +464,7 @@ namespace llaminar2
             bool success = gemm->multiply_tensor(
                 A_base, C_base,
                 params_.m, effective_n, params_.k,
-                params_.transpose_B,
+                effective_transpose_B,
                 params_.alpha, params_.beta,
                 nullptr, // bias
                 params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),

@@ -47,7 +47,9 @@ extern "C" void cudaOps_rope_verify_inv_freq_cache(int head_dim, float freq_base
 
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <random>
+#include <string>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -197,6 +199,28 @@ namespace
         }
     }
 
+    void expectByteExactFP32(
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        const std::string &label)
+    {
+        ASSERT_EQ(actual.size(), expected.size()) << label;
+        const size_t bytes = actual.size() * sizeof(float);
+        if (std::memcmp(actual.data(), expected.data(), bytes) == 0)
+            return;
+
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            if (std::memcmp(&actual[i], &expected[i], sizeof(float)) != 0)
+            {
+                ADD_FAILURE() << label << " first byte mismatch at element " << i
+                              << " actual=" << actual[i]
+                              << " expected=" << expected[i];
+                return;
+            }
+        }
+    }
+
 } // namespace
 
 // ============================================================================
@@ -341,6 +365,65 @@ TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_Large)
 
     EXPECT_GE(cosine, 0.9999);
     EXPECT_LE(l2_error, 0.01);
+}
+
+TEST_F(Test__CUDAOpsParity, RMSNorm_FP32_VerifierRowsM234MatchSerialRowsByteExact)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int cols = 2048;
+    constexpr float epsilon = 1e-6f;
+
+    for (int rows : {2, 3, 4})
+    {
+        const size_t total = static_cast<size_t>(rows) * cols;
+        auto input_data = randomFP32(total);
+        auto gamma_data = randomGamma(cols);
+        std::vector<float> grouped_output(total, 0.0f);
+        std::vector<float> serial_output(total, 0.0f);
+
+        float *d_input = nullptr;
+        float *d_gamma = nullptr;
+        float *d_grouped = nullptr;
+        float *d_serial = nullptr;
+        ASSERT_EQ(cudaMalloc(&d_input, total * sizeof(float)), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&d_gamma, cols * sizeof(float)), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&d_grouped, total * sizeof(float)), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&d_serial, total * sizeof(float)), cudaSuccess);
+
+        ASSERT_EQ(cudaMemcpy(d_input, input_data.data(), total * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemset(d_grouped, 0, total * sizeof(float)), cudaSuccess);
+        ASSERT_EQ(cudaMemset(d_serial, 0, total * sizeof(float)), cudaSuccess);
+
+        llaminar2::cuda::CUDARMSNormKernelT<ActivationPrecision::FP32> cuda_kernel;
+        ASSERT_TRUE(cuda_kernel.apply_typed(d_input, d_gamma, d_grouped, rows, cols, epsilon, 0))
+            << "grouped rows=" << rows;
+
+        for (int row = 0; row < rows; ++row)
+        {
+            ASSERT_TRUE(cuda_kernel.apply_typed(
+                d_input + static_cast<size_t>(row) * cols,
+                d_gamma,
+                d_serial + static_cast<size_t>(row) * cols,
+                1, cols, epsilon, 0))
+                << "serial row=" << row << " rows=" << rows;
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        ASSERT_EQ(cudaMemcpy(grouped_output.data(), d_grouped, total * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(serial_output.data(), d_serial, total * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+
+        cudaFree(d_input);
+        cudaFree(d_gamma);
+        cudaFree(d_grouped);
+        cudaFree(d_serial);
+
+        expectByteExactFP32(
+            grouped_output,
+            serial_output,
+            "CUDA RMSNorm grouped verifier rows=" + std::to_string(rows));
+    }
 }
 
 // ============================================================================

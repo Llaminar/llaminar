@@ -141,6 +141,51 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludeFusedMoECombinedOut
     EXPECT_NE(std::find(shared_gate_keys.begin(), shared_gate_keys.end(), "layer0_MOE_COMBINED_OUTPUT"), shared_gate_keys.end());
 }
 
+TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludePostCollectiveOutputs)
+{
+    const auto gdn_wo_keys =
+        SnapshotCapture::possibleKeysForStageName("layer14_gdn_wo_allreduce");
+    EXPECT_NE(std::find(gdn_wo_keys.begin(),
+                        gdn_wo_keys.end(),
+                        "layer14_ATTENTION_OUTPUT_ALLREDUCED"),
+              gdn_wo_keys.end());
+
+    const auto fa_wo_keys =
+        SnapshotCapture::possibleKeysForStageName("layer14_wo_allreduce");
+    EXPECT_NE(std::find(fa_wo_keys.begin(),
+                        fa_wo_keys.end(),
+                        "layer14_ATTENTION_OUTPUT_ALLREDUCED"),
+              fa_wo_keys.end());
+
+    const auto down_keys =
+        SnapshotCapture::possibleKeysForStageName("layer14_down_allreduce");
+    EXPECT_NE(std::find(down_keys.begin(),
+                        down_keys.end(),
+                        "layer14_FFN_DOWN_ALLREDUCED"),
+              down_keys.end());
+
+    const auto combined_keys =
+        SnapshotCapture::possibleKeysForStageName("layer14_moe_combined_allreduce");
+    EXPECT_NE(std::find(combined_keys.begin(),
+                        combined_keys.end(),
+                        "layer14_MOE_COMBINED_OUTPUT_ALLREDUCED"),
+              combined_keys.end());
+
+    const auto shared_keys =
+        SnapshotCapture::possibleKeysForStageName("layer14_shared_expert_allreduce");
+    EXPECT_NE(std::find(shared_keys.begin(),
+                        shared_keys.end(),
+                        "layer14_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"),
+              shared_keys.end());
+
+    const auto routed_keys =
+        SnapshotCapture::possibleKeysForStageName("layer14_moe_expert_overlay_fast_allreduce");
+    EXPECT_NE(std::find(routed_keys.begin(),
+                        routed_keys.end(),
+                        "layer14_MOE_EXPERT_OUTPUT_ALLREDUCED"),
+              routed_keys.end());
+}
+
 TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
 {
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attn_norm"), "MTP0_ATTENTION_NORM");

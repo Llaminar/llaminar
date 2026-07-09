@@ -185,7 +185,8 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *routing_indices, ITensor *routing_weights,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k) override;
+            int num_experts, int top_k,
+            bool filter_to_local_runtime_experts = false) override;
 
         bool regroupPrefillRoutesFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,

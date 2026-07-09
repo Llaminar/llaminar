@@ -49,6 +49,40 @@ GPU runner cannot reach row-indexed verifier setup, all-position sampling, or
 state publication without resident publication support. Focused MTP unit gate
 passed.
 
+2026-07-08 update 3: The focused Qwen3.6 verifier-forward operation matrix now
+requires byte-identical grouped verifier logits against serial decode for
+CPU/CUDA/ROCm dense and MoE M1-M4. Tightening the real-model grouped verifier
+gate exposed that full-forward/partial-forward/unified-PP graphs were still
+building ordinary M>1 LM-head all-position projections, even though the
+standalone decode-equivalent LM-head kernels were already proven. `QwenGraphBase`
+now routes every compact MTP verifier LM-head construction through the shared
+decode-equivalent grouped prefill decision, and the focused suite asserts the
+`mtp.lm_head_grouped_decode_equivalent_verifier_prefill_rows` counter for
+multi-row verifier buckets. Evidence: direct CUDA and ROCm M1/M2 repro cells
+passed, then the full operation matrix passed `24/24` in `1053.3s`.
+
+2026-07-08 update 4: The cross-backend grouped verifier sweep now treats every
+grouped production path as a hard requirement rather than a capability fallback.
+CUDA and ROCm broad GEMM harnesses were repaired to exercise the production
+decode-equivalent wrappers/scopes for MTP verifier rows, including graph-captured
+ROCm fused gate/up and GDN projection groups. CUDA cached prepared kernels now
+declare M=1..4 GEMV KPAR scratch even when first planned for large prefill, so
+prefill/decode phase reuse cannot lose the canonical decode arena. The broad
+gate passed `19/19`:
+`GroupedVerifierRows_{CPU,CUDA,ROCm}_{AllFormats,...}`, CUDA GEMM parity, CPU
+NativeVNNI GEMV, and ROCm quantized small-M.
+
+2026-07-09 update: CPU NativeVNNI fused grouped verifier rows now share the
+caller-thread K-parallel partial-sum arena across the OpenMP team instead of
+addressing each worker's empty `thread_local` arena. The regression
+`MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows` forces
+`LLAMINAR_CPU_VNNI_K_TILES=4`, sweeps every CPU NativeVNNI format, and requires
+byte equality against serial decode plus the fused grouped verifier counter. It
+is part of `V2_Integration_GroupedVerifierRows_CPU_AllFormats`. The canonical
+precommit/CI grouped verifier gate now runs `^V2_Integration_GroupedVerifierRows_`
+after unit tests; local, tracked, and installed hooks are aligned, and the exact
+gate passed `16/16` across CPU/CUDA/ROCm.
+
 ## Why vLLM Is Fast
 
 The local vLLM source shape to port is:

@@ -176,6 +176,30 @@ namespace llaminar2
         }
 
         /**
+         * @brief Decide whether compact verifier LM-head rows need decode-equivalent grouping.
+         *
+         * MTP verifier rows are publishable live-model state, so their LM-head
+         * projection must be byte-identical to running each row through the
+         * backend's normal M=1 decode projection.  Plain small-M GEMM may choose
+         * a different reduction order and drift by a few ULPs, which is enough to
+         * break the verifier contract.  The LMHeadStage decode-equivalent route
+         * keeps the grouped API while selecting backend policies proven against
+         * serial decode for the compact verifier window.
+         */
+        bool shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+            const GraphConfig &config,
+            DeviceId device,
+            const LMHeadInputLayout &layout)
+        {
+            return (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+                   layout.compute_all_positions &&
+                   layout.seq_len > 1 &&
+                   layout.seq_len <= 4 &&
+                   config.compute_all_position_logits &&
+                   config.mtp.enabled;
+        }
+
+        /**
          * @brief Resolve and validate compact verifier source rows.
          *
          * The request-batched MTP verifier publishes a logical row plan that
@@ -1306,6 +1330,11 @@ namespace llaminar2
             lm_layout.compute_all_positions);
         lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
         lm_params.compute_all_positions = lm_layout.compute_all_positions;
+        lm_params.force_decode_equivalent_verifier_prefill =
+            shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                config_,
+                device,
+                lm_layout);
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -1658,6 +1687,11 @@ namespace llaminar2
                 lm_layout.compute_all_positions);
             lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
             lm_params.compute_all_positions = lm_layout.compute_all_positions;
+            lm_params.force_decode_equivalent_verifier_prefill =
+                shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                    config_,
+                    device,
+                    lm_layout);
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
@@ -2045,6 +2079,11 @@ namespace llaminar2
                     lm_layout.compute_all_positions);
                 lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
                 lm_params.compute_all_positions = lm_layout.compute_all_positions;
+                lm_params.force_decode_equivalent_verifier_prefill =
+                    shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                        config_,
+                        stage_device,
+                        lm_layout);
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
@@ -2391,20 +2430,16 @@ namespace llaminar2
             lm_head_compute_all_positions);
         lm_params.compute_all_positions = lm_head_compute_all_positions;
         lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
-        /*
-         * Phase 9.8 promotes compact verifier LM-head rows to the same small-M
-         * quantized GEMV/GEMM dispatch used by the rest of the grouped verifier
-         * path.  The previous GPU-only M=1 row loop was numerically safe, but it
-         * made M=2 verifier replay slower than serial decode.  Strict
-         * DenseVerifierRows and Qwen3.6 parity gates now own equivalence.
-         */
+        const LMHeadInputLayout lm_layout{
+            lm_head_seq_len,
+            lm_head_input_buffer_id,
+            lm_head_compute_all_positions,
+            lm_head_use_prefill_row_offset};
         lm_params.force_decode_equivalent_verifier_prefill =
-            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
-            lm_head_compute_all_positions &&
-            lm_head_seq_len > 1 &&
-            lm_head_seq_len <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                config_,
+                device,
+                lm_layout);
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),

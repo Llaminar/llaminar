@@ -35,6 +35,7 @@
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
+#include "execution/compute_stages/stages/GEMMStage.h"
 #include "config/TensorParallelConfig.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
@@ -69,6 +70,7 @@
 #include <numeric>
 #include <filesystem>
 #include <limits>
+#include <stdexcept>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -159,6 +161,7 @@ namespace
                 old_value_ = old;
             }
             setenv(name, value, 1);
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnv()
@@ -167,6 +170,7 @@ namespace
                 setenv(name_.c_str(), old_value_.c_str(), 1);
             else
                 unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
         }
 
         ScopedEnv(const ScopedEnv &) = delete;
@@ -278,6 +282,171 @@ namespace
         };
         return formats;
     }
+
+    struct LocalTPWoShapeCase
+    {
+        const char *label;
+        int hidden;
+        int local_attention_dim;
+        int full_attention_dim;
+    };
+
+    std::vector<LocalTPWoShapeCase> localTPWoShapeCases()
+    {
+        return {
+            /*
+             * The narrow case preserves the original synthetic LocalTP Wo
+             * coverage.  The wide case matches Qwen3.6 MoE full-attention
+             * LocalTP layers: each rank projects a 2048-wide local attention
+             * slice into the 2048-wide hidden stream before the two partials
+             * are allreduced.
+             */
+            {"qwen36_narrow_attention", 2048, 1024, 2048},
+            {"qwen36_moe_full_attention", 2048, 2048, 4096},
+        };
+    }
+
+    struct LocalTPWoFormatCase
+    {
+        const char *label;
+        std::function<std::unique_ptr<TensorBase>(
+            const std::vector<size_t> &shape,
+            uint32_t seed)>
+            create;
+    };
+
+    std::vector<LocalTPWoFormatCase> cudaLocalTPWoQuantizedFormatCases()
+    {
+        std::vector<LocalTPWoFormatCase> cases;
+        for (const auto &format : cudaSmallMNativeFormats())
+        {
+            cases.push_back(
+                {format.name,
+                 [creator = format.create](
+                     const std::vector<size_t> &shape,
+                     uint32_t /*seed*/) -> std::unique_ptr<TensorBase>
+                 {
+                     if (shape.size() != 2u)
+                         throw std::runtime_error("cudaLocalTPWoQuantizedFormatCases expects a rank-2 shape");
+                     return creator(shape[0], shape[1]);
+                 }});
+        }
+        return cases;
+    }
+
+    std::vector<LocalTPWoFormatCase> cudaLocalTPWoFloatingPointFormatCases()
+    {
+        return {
+            {"FP32", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createFP32Random(shape, -0.20f, 0.20f, seed); }},
+            {"FP16", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createFP16Random(shape, -0.20f, 0.20f, seed); }},
+            {"BF16", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createBF16Random(shape, -0.20f, 0.20f, seed); }},
+        };
+    }
+
+    std::unique_ptr<TensorBase> wrapSyntheticInputParallelShard(
+        std::unique_ptr<TensorBase> local_weight,
+        size_t full_rows,
+        size_t full_cols,
+        int rank,
+        int world_size)
+    {
+        auto meta = SliceMetadata::forRowParallel(
+            full_rows, full_cols, rank, world_size,
+            true /* inner_is_presliced */);
+        return std::make_unique<TensorSlice>(std::move(local_weight), meta);
+    }
+
+    GpuPreparedGemm makeGpuPreparedVerifierProjection(
+        TensorBase *weight,
+        DeviceId device,
+        const std::string &canonical_name,
+        ModelContextId model_id)
+    {
+        if (!weight)
+            throw std::runtime_error("makeGpuPreparedVerifierProjection: null weight");
+        switch (weight->native_type())
+        {
+        case TensorType::FP32:
+        case TensorType::FP16:
+        case TensorType::BF16:
+            return makeGpuPreparedFloatingPointGemm(weight, device, canonical_name, model_id);
+        default:
+            return makeGpuPreparedGemm(weight, device, canonical_name, model_id);
+        }
+    }
+
+    double groupedVerifierGemmPerfCounterValue()
+    {
+        double total = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"mtp.gemm_grouped_decode_equivalent_verifier_prefill_rows"}))
+        {
+            if (record.domain == "mtp" &&
+                record.name == "gemm_grouped_decode_equivalent_verifier_prefill_rows")
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    }
+
+    struct LocalTPWoShardFixture
+    {
+        DeviceId device;
+        std::unique_ptr<TensorBase> weight;
+        GpuPreparedGemm prepared;
+        std::vector<float> input_rows;
+    };
+
+    LocalTPWoShardFixture makeLocalTPWoShardFixture(
+        const LocalTPWoFormatCase &format_case,
+        int rank,
+        int world_size,
+        int N,
+        int local_K,
+        int full_K,
+        DeviceId device,
+        uint32_t seed)
+    {
+        auto local_weight = format_case.create(
+            {static_cast<size_t>(N), static_cast<size_t>(local_K)},
+            seed + static_cast<uint32_t>(rank * 17));
+        auto wrapped_weight = wrapSyntheticInputParallelShard(
+            std::move(local_weight),
+            static_cast<size_t>(N),
+            static_cast<size_t>(full_K),
+            rank,
+            world_size);
+
+        LocalTPWoShardFixture fixture;
+        fixture.device = device;
+        fixture.weight = std::move(wrapped_weight);
+        fixture.prepared = makeGpuPreparedVerifierProjection(
+            fixture.weight.get(),
+            device,
+            std::string("test.cuda.localtp_wo.") + format_case.label +
+                ".rank" + std::to_string(rank),
+            ModelContextId{static_cast<uint64_t>(81000 + seed + static_cast<uint32_t>(rank))});
+
+        auto input = TestTensorFactory::createFP32Random(
+            {4u, static_cast<size_t>(local_K)},
+            -0.75f,
+            0.75f,
+            seed + 500u + static_cast<uint32_t>(rank * 31));
+        fixture.input_rows.assign(
+            input->data(),
+            input->data() + static_cast<size_t>(4) * static_cast<size_t>(local_K));
+        return fixture;
+    }
+
+    struct GroupedAndSerialRows
+    {
+        std::vector<float> grouped;
+        std::vector<float> serial;
+    };
 
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
@@ -665,6 +834,413 @@ namespace
             std::memcpy(C_host, C_tensor->data(),
                         static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float));
         return ok;
+    }
+
+    void runCudaGemmStageRows(
+        TensorBase *weight,
+        const GpuPreparedGemm &prepared,
+        const std::vector<float> &input_values,
+        int M,
+        int N,
+        int K,
+        bool force_decode_equivalent,
+        cudaStream_t stream,
+        std::vector<float> &result,
+        DeviceId device)
+    {
+        ASSERT_EQ(cudaSetDevice(device.ordinal), cudaSuccess)
+            << "device=" << device.to_string();
+        ASSERT_EQ(
+            input_values.size(),
+            static_cast<size_t>(M) * static_cast<size_t>(K))
+            << "input size for CUDA LocalTP Wo GEMMStage rows";
+
+        auto input = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::copy_n(input_values.data(), input_values.size(), input->mutable_data());
+        auto output = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(output->allocateOnDevice(device, stream));
+
+        GEMMStage::Params params;
+        params.device_id = device;
+        params.A = input.get();
+        params.B = weight;
+        params.C = output.get();
+        params.m = M;
+        params.n = N;
+        params.k = K;
+        params.alpha = 1.0f;
+        params.beta = 0.0f;
+        params.transpose_B = false;
+        params.gemm_context = GemmContext::ATTN;
+        params.force_decode_equivalent_verifier_prefill = force_decode_equivalent;
+        params.prepared_ref = prepared.ref;
+        params.prepared_store = prepared.store.get();
+
+        GEMMStage stage(params);
+        stage.setGPUStream(static_cast<void *>(stream));
+
+        const WorkspaceRequirements requirements = stage.getWorkspaceRequirements(M, N, K);
+        const size_t budget = requirements.total_bytes_with_alignment() + 64 * 1024 * 1024;
+        DeviceWorkspaceManager workspace(device, budget);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        stage.bindWorkspace(&workspace);
+
+        CUDADeviceContext ctx(device, device.ordinal);
+        ASSERT_TRUE(stage.execute(&ctx))
+            << "CUDA LocalTP Wo GEMMStage execution failed"
+            << " M=" << M << " N=" << N << " K=" << K
+            << " device=" << device.to_string();
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess)
+            << "device=" << device.to_string();
+
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        result.assign(
+            output->data(),
+            output->data() + static_cast<size_t>(M) * static_cast<size_t>(N));
+
+        stage.unbindWorkspace();
+    }
+
+    GroupedAndSerialRows runCudaLocalTPWoShardVerifierRows(
+        LocalTPWoShardFixture &fixture,
+        int M,
+        int N,
+        int local_K,
+        cudaStream_t stream)
+    {
+        std::vector<float> input(static_cast<size_t>(M) * static_cast<size_t>(local_K));
+        for (int row = 0; row < M; ++row)
+        {
+            std::copy_n(
+                fixture.input_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(local_K),
+                local_K,
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(local_K));
+        }
+
+        GroupedAndSerialRows rows;
+        runCudaGemmStageRows(
+            fixture.weight.get(),
+            fixture.prepared,
+            input,
+            M,
+            N,
+            local_K,
+            /*force_decode_equivalent=*/true,
+            stream,
+            rows.grouped,
+            fixture.device);
+
+        rows.serial.resize(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> row_input(static_cast<size_t>(local_K));
+            std::copy_n(
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(local_K),
+                local_K,
+                row_input.data());
+
+            std::vector<float> row_values;
+            runCudaGemmStageRows(
+                fixture.weight.get(),
+                fixture.prepared,
+                row_input,
+                1,
+                N,
+                local_K,
+                /*force_decode_equivalent=*/false,
+                stream,
+                row_values,
+                fixture.device);
+            if (row_values.size() != static_cast<size_t>(N))
+            {
+                ADD_FAILURE()
+                    << "serial CUDA LocalTP Wo row produced " << row_values.size()
+                    << " values, expected " << N
+                    << " device=" << fixture.device.to_string()
+                    << " row=" << row;
+                return rows;
+            }
+            std::copy_n(
+                row_values.data(),
+                N,
+                rows.serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+        }
+        return rows;
+    }
+
+    std::vector<float> sumLocalTPPartials(
+        const std::vector<GroupedAndSerialRows> &partials,
+        bool grouped,
+        int M,
+        int N)
+    {
+        std::vector<float> result(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);
+        for (const auto &partial : partials)
+        {
+            const std::vector<float> &values = grouped ? partial.grouped : partial.serial;
+            if (values.size() != result.size())
+            {
+                ADD_FAILURE()
+                    << "CUDA LocalTP partial size mismatch: got " << values.size()
+                    << " expected " << result.size()
+                    << " grouped=" << grouped;
+                return result;
+            }
+            for (size_t i = 0; i < result.size(); ++i)
+                result[i] += values[i];
+        }
+        return result;
+    }
+
+    void runCudaLocalTPWoAllreduceVerifierRowsMatchSerial(
+        const LocalTPWoFormatCase &format_case,
+        const std::vector<DeviceId> &devices,
+        const LocalTPWoShapeCase &shape_case,
+        uint32_t seed)
+    {
+        ASSERT_EQ(devices.size(), 2u);
+        const int N = shape_case.hidden;
+        const int local_K = shape_case.local_attention_dim;
+        const int full_K = shape_case.full_attention_dim;
+
+        std::vector<cudaStream_t> streams(devices.size(), nullptr);
+        for (size_t i = 0; i < devices.size(); ++i)
+        {
+            ASSERT_EQ(cudaSetDevice(devices[i].ordinal), cudaSuccess)
+                << "device=" << devices[i].to_string();
+            ASSERT_EQ(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking), cudaSuccess)
+                << "device=" << devices[i].to_string();
+        }
+
+        std::vector<LocalTPWoShardFixture> fixtures;
+        fixtures.reserve(devices.size());
+        for (size_t rank = 0; rank < devices.size(); ++rank)
+        {
+            fixtures.push_back(makeLocalTPWoShardFixture(
+                format_case,
+                static_cast<int>(rank),
+                static_cast<int>(devices.size()),
+                N,
+                local_K,
+                full_K,
+                devices[rank],
+                seed));
+        }
+
+        for (const int M : {2, 3, 4})
+        {
+            PerfStatsCollector::reset();
+            const double before = groupedVerifierGemmPerfCounterValue();
+
+            std::vector<GroupedAndSerialRows> partials;
+            partials.reserve(fixtures.size());
+            for (size_t rank = 0; rank < fixtures.size(); ++rank)
+            {
+                partials.push_back(runCudaLocalTPWoShardVerifierRows(
+                    fixtures[rank],
+                    M,
+                    N,
+                    local_K,
+                    streams[rank]));
+            }
+
+            const auto grouped_sum = sumLocalTPPartials(partials, true, M, N);
+            const auto serial_sum = sumLocalTPPartials(partials, false, M, N);
+            const double after = groupedVerifierGemmPerfCounterValue();
+            EXPECT_GE(after - before, static_cast<double>(M * static_cast<int>(devices.size())))
+                << format_case.label << " shape=" << shape_case.label << " M=" << M
+                << " must exercise GEMMStage grouped verifier publication route\n"
+                << PerfStatsCollector::summaryString(
+                       {"mtp.gemm_grouped_decode_equivalent_verifier_prefill_rows"}, 20);
+
+            expectBitwiseEqualFloatRow(
+                (std::string("CUDA LocalTP Wo reconstructed allreduce grouped verifier rows format=") +
+                 format_case.label + " shape=" + shape_case.label + " M=" + std::to_string(M))
+                    .c_str(),
+                grouped_sum.data(),
+                serial_sum.data(),
+                grouped_sum.size());
+        }
+
+        for (size_t i = 0; i < streams.size(); ++i)
+        {
+            ASSERT_EQ(cudaSetDevice(devices[i].ordinal), cudaSuccess);
+            ASSERT_EQ(cudaStreamDestroy(streams[i]), cudaSuccess);
+        }
+    }
+
+    /**
+     * @brief Production-shaped fixture for mirrored LocalTP attention Wo weights.
+     *
+     * The LocalTP target state for MTP keeps the attention output projection
+     * mirrored on each GPU instead of sharding it and allreducing a tiny
+     * `[M, hidden]` verifier result.  This fixture models that topology directly:
+     * each device owns the complete Wo matrix `[hidden, full_attention_dim]`,
+     * and the grouped verifier path must produce exactly the same rows as
+     * repeated serial M=1 decode on that same mirrored matrix.
+     */
+    struct ReplicatedWoFixture
+    {
+        DeviceId device;
+        std::unique_ptr<TensorBase> weight;
+        GpuPreparedGemm prepared;
+        std::vector<float> input_rows;
+    };
+
+    ReplicatedWoFixture makeCudaReplicatedWoFixture(
+        const LocalTPWoFormatCase &format_case,
+        const LocalTPWoShapeCase &shape_case,
+        DeviceId device,
+        uint32_t seed)
+    {
+        const int N = shape_case.hidden;
+        const int K = shape_case.full_attention_dim;
+        ReplicatedWoFixture fixture;
+        fixture.device = device;
+        fixture.weight = format_case.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            seed);
+        fixture.prepared = makeGpuPreparedVerifierProjection(
+            fixture.weight.get(),
+            device,
+            std::string("test.cuda.replicated_wo.") + format_case.label +
+                "." + shape_case.label,
+            ModelContextId{static_cast<uint64_t>(91000 + seed)});
+
+        auto input = TestTensorFactory::createFP32Random(
+            {4u, static_cast<size_t>(K)},
+            -0.75f,
+            0.75f,
+            seed + 700u);
+        fixture.input_rows.assign(
+            input->data(),
+            input->data() + static_cast<size_t>(4) * static_cast<size_t>(K));
+        return fixture;
+    }
+
+    GroupedAndSerialRows runCudaReplicatedWoVerifierRows(
+        ReplicatedWoFixture &fixture,
+        int M,
+        int N,
+        int K,
+        cudaStream_t stream)
+    {
+        std::vector<float> input(static_cast<size_t>(M) * static_cast<size_t>(K));
+        for (int row = 0; row < M; ++row)
+        {
+            std::copy_n(
+                fixture.input_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(K));
+        }
+
+        GroupedAndSerialRows rows;
+        runCudaGemmStageRows(
+            fixture.weight.get(),
+            fixture.prepared,
+            input,
+            M,
+            N,
+            K,
+            /*force_decode_equivalent=*/true,
+            stream,
+            rows.grouped,
+            fixture.device);
+
+        rows.serial.resize(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> row_input(static_cast<size_t>(K));
+            std::copy_n(
+                input.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_input.data());
+
+            std::vector<float> row_values;
+            runCudaGemmStageRows(
+                fixture.weight.get(),
+                fixture.prepared,
+                row_input,
+                1,
+                N,
+                K,
+                /*force_decode_equivalent=*/false,
+                stream,
+                row_values,
+                fixture.device);
+            if (row_values.size() != static_cast<size_t>(N))
+            {
+                ADD_FAILURE()
+                    << "serial CUDA replicated Wo row produced " << row_values.size()
+                    << " values, expected " << N
+                    << " device=" << fixture.device.to_string()
+                    << " row=" << row;
+                return rows;
+            }
+            std::copy_n(
+                row_values.data(),
+                N,
+                rows.serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+        }
+        return rows;
+    }
+
+    /**
+     * @brief Prove mirrored/replicated Wo grouped rows are byte-identical.
+     *
+     * This is the no-fallback LocalTP path we want for device-resident MTP:
+     * keep the tiny verifier projection local to each device, avoid a small
+     * collective, and still route through GEMMStage's decode-equivalent grouped
+     * implementation rather than row replay.  The perf counter assertion makes
+     * sure the grouped production hook actually ran.
+     */
+    void runCudaReplicatedWoVerifierRowsMatchSerial(
+        const LocalTPWoFormatCase &format_case,
+        DeviceId device,
+        const LocalTPWoShapeCase &shape_case,
+        uint32_t seed)
+    {
+        const int N = shape_case.hidden;
+        const int K = shape_case.full_attention_dim;
+        ASSERT_EQ(cudaSetDevice(device.ordinal), cudaSuccess)
+            << "device=" << device.to_string();
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess)
+            << "device=" << device.to_string();
+
+        auto fixture = makeCudaReplicatedWoFixture(format_case, shape_case, device, seed);
+        for (const int M : {2, 3, 4})
+        {
+            PerfStatsCollector::reset();
+            const double before = groupedVerifierGemmPerfCounterValue();
+            const GroupedAndSerialRows rows = runCudaReplicatedWoVerifierRows(
+                fixture,
+                M,
+                N,
+                K,
+                stream);
+            const double after = groupedVerifierGemmPerfCounterValue();
+            EXPECT_GE(after - before, static_cast<double>(M))
+                << format_case.label << " shape=" << shape_case.label << " M=" << M
+                << " must exercise GEMMStage grouped verifier publication route\n"
+                << PerfStatsCollector::summaryString(
+                       {"mtp.gemm_grouped_decode_equivalent_verifier_prefill_rows"}, 20);
+
+            expectBitwiseEqualFloatRow(
+                (std::string("CUDA replicated Wo grouped verifier rows format=") +
+                 format_case.label + " shape=" + shape_case.label +
+                 " M=" + std::to_string(M))
+                    .c_str(),
+                rows.grouped.data(),
+                rows.serial.data(),
+                rows.grouped.size());
+        }
+
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     }
 
     /**
@@ -1694,7 +2270,15 @@ TEST_F(Test__CUDAGemmParity, Q4_0_SmallPrefillM4_UsesNativeSmallMRoute)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        cuda_kernel,
+        A_data.data(),
+        C_cuda.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()));
 
     auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
     result.print("Q4_0 small-prefill native GEMV route 4x896x896");
@@ -1953,7 +2537,15 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_2x896x768)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        cuda_kernel,
+        A_data.data(),
+        C_cuda.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()));
 
     auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
     result.print("Q4_K verifier-small-M 2x896x768");
@@ -2023,7 +2615,15 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        cuda_kernel,
+        A_data.data(),
+        C_cuda.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()));
 
     const auto records =
         PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls",
@@ -2078,7 +2678,15 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_M2MatchesTwoSingleRowDecodeGEMV
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     std::vector<float> C_m2(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m2.data(), M, N, K, gpu_device_))
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        cuda_kernel,
+        A_data.data(),
+        C_m2.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()))
         << "M=2 verifier GEMM failed";
 
     for (int row = 0; row < M; ++row)
@@ -2095,13 +2703,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_M2MatchesTwoSingleRowDecodeGEMV
             << "M=1 decode GEMV failed for row " << row;
 
         const float *verifier_row = C_m2.data() + static_cast<size_t>(row) * N;
-        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
-        EXPECT_FALSE(result.has_nan_inf)
-            << "M=2 verifier row " << row << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << "M=2 verifier row " << row << " diverges from single-row decode GEMV";
-        EXPECT_LE(result.relative_l2_error, 1e-5)
-            << "M=2 verifier row " << row << " relative L2 differs from single-row decode GEMV";
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K verifier small-M M=2 row=") + std::to_string(row))
+                .c_str(),
+            verifier_row,
+            C_m1.data(),
+            C_m1.size());
     }
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
@@ -2124,7 +2731,15 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m4.data(), M, N, K, gpu_device_))
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        cuda_kernel,
+        A_data.data(),
+        C_m4.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()))
         << "M=4 Qwen3.6 GDN output projection GEMM failed";
 
     for (int row = 0; row < M; ++row)
@@ -2141,16 +2756,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs
             << "M=1 Qwen3.6 GDN output projection GEMV failed for row " << row;
 
         const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
-        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
-        EXPECT_FALSE(result.has_nan_inf)
-            << "M=4 Qwen3.6 GDN output projection row " << row
-            << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 GDN output projection row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_LE(result.relative_l2_error, 1e-5)
-            << "M=4 Qwen3.6 GDN output projection row " << row
-            << " relative L2 differs from single-row decode GEMV";
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 GDN out M=4 row=") + std::to_string(row))
+                .c_str(),
+            verifier_row,
+            C_m1.data(),
+            C_m1.size());
     }
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
@@ -2211,30 +2822,152 @@ TEST_F(Test__CUDAGemmParity, Q6_K_Qwen36MoEGDNOutLocalTP_M234MatchesSerialDecode
 
             const float *grouped_row =
                 C_grouped.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
-            const auto result = checkParity(
+            expectBitwiseEqualFloatRow(
+                (std::string("Q6_K Qwen36 MoE LocalTP GDN out M=") +
+                 std::to_string(M) + " row=" + std::to_string(row))
+                    .c_str(),
                 grouped_row,
                 C_m1.data(),
-                C_m1.size(),
-                0.999999,
-                1.0e-5);
-            EXPECT_FALSE(result.has_nan_inf)
-                << "M=" << M << " Qwen3.6 MoE GDN output row " << row
-                << " produced non-finite output";
-            EXPECT_GE(result.cosine_similarity, 0.999999)
-                << "M=" << M << " Qwen3.6 MoE GDN output row " << row
-                << " diverges from single-row decode GEMV"
-                << " rel_l2=" << result.relative_l2_error
-                << " max_abs=" << result.max_abs_error
-                << " symmetric_kl=" << result.symmetric_kl;
-            EXPECT_LE(result.relative_l2_error, 1.0e-5)
-                << "M=" << M << " Qwen3.6 MoE GDN output row " << row
-                << " relative L2 differs from single-row decode GEMV";
+                C_m1.size());
         }
 
         cleanupWorkspaceIfNeeded(cuda_kernel);
     }
 
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @brief Prove CUDA LocalTP Wo grouped verifier rows for every native format.
+ *
+ * The model-level grouped verifier drift investigation showed that synthetic
+ * single-format GEMM tests are too narrow.  This matrix exercises the same
+ * row-parallel attention output projection shape used by LocalTP Wo, then
+ * reconstructs the two-rank allreduce result and compares it byte-for-byte
+ * against repeated serial M=1 decode rows.  The shape sweep includes both the
+ * older narrow attention case and Qwen3.6 MoE full-attention layers, whose
+ * local attention slice is twice as wide.
+ */
+TEST_F(Test__CUDAGemmParity, LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    SKIP_IF_NO_CUDA();
+    int cuda_devices = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&cuda_devices), cudaSuccess);
+    if (cuda_devices < 2)
+        GTEST_SKIP() << "CUDA LocalTP Wo regression requires at least two CUDA devices";
+
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+
+    uint32_t seed = 18800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : cudaLocalTPWoQuantizedFormatCases())
+        {
+            runCudaLocalTPWoAllreduceVerifierRowsMatchSerial(
+                format_case,
+                devices,
+                shape_case,
+                seed);
+            seed += 101;
+        }
+    }
+}
+
+/**
+ * @brief Prove CUDA LocalTP Wo grouped verifier rows for floating weights.
+ *
+ * Floating-point Wo weights use CUDA's FP GEMM implementation rather than the
+ * native-VNNI quantized path.  Keeping FP32, FP16, and BF16 in the same LocalTP
+ * reconstruction matrix prevents a future model or loader setting from escaping
+ * the strict grouped-verifier serial-row contract.
+ */
+TEST_F(Test__CUDAGemmParity, LocalTPWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    SKIP_IF_NO_CUDA();
+    int cuda_devices = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&cuda_devices), cudaSuccess);
+    if (cuda_devices < 2)
+        GTEST_SKIP() << "CUDA LocalTP Wo regression requires at least two CUDA devices";
+
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+
+    uint32_t seed = 20800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : cudaLocalTPWoFloatingPointFormatCases())
+        {
+            runCudaLocalTPWoAllreduceVerifierRowsMatchSerial(
+                format_case,
+                devices,
+                shape_case,
+                seed);
+            seed += 101;
+        }
+    }
+}
+
+/**
+ * @brief Prove CUDA mirrored LocalTP Wo for every quantized native format.
+ *
+ * The row-parallel LocalTP Wo matrix above reconstructs the existing sharded
+ * allreduce path.  This test covers the target MTP architecture where each
+ * shard keeps a full mirrored attention Wo/MTP verifier projection locally and
+ * therefore does not participate in a tiny verifier allreduce.  The grouped
+ * implementation still has to be economical and byte-identical to serial M=1
+ * decode for every native quantized format.
+ */
+TEST_F(Test__CUDAGemmParity, ReplicatedWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    SKIP_IF_NO_CUDA();
+
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const DeviceId device = DeviceId::cuda(0);
+
+    uint32_t seed = 22800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : cudaLocalTPWoQuantizedFormatCases())
+        {
+            runCudaReplicatedWoVerifierRowsMatchSerial(
+                format_case,
+                device,
+                shape_case,
+                seed);
+            seed += 101;
+        }
+    }
+}
+
+/**
+ * @brief Prove CUDA mirrored LocalTP Wo for FP32/FP16/BF16 weights.
+ *
+ * Floating-point mirrored Wo is especially important for the target
+ * device-resident MTP path because a backend library may choose different
+ * reductions for M=1 and M>1.  This gate forces the grouped verifier path to
+ * use the same decode-equivalent small-M contract as serial decode.
+ */
+TEST_F(Test__CUDAGemmParity, ReplicatedWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    SKIP_IF_NO_CUDA();
+
+    ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+    const DeviceId device = DeviceId::cuda(0);
+
+    uint32_t seed = 24800;
+    for (const auto &shape_case : localTPWoShapeCases())
+    {
+        for (const auto &format_case : cudaLocalTPWoFloatingPointFormatCases())
+        {
+            runCudaReplicatedWoVerifierRowsMatchSerial(
+                format_case,
+                device,
+                shape_case,
+                seed);
+            seed += 101;
+        }
+    }
 }
 
 /**
@@ -2263,7 +2996,15 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKV_M4MatchesFourSingleRowDecodeGEMVs
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m4.data(), M, N, K, gpu_device_))
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        cuda_kernel,
+        A_data.data(),
+        C_m4.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()))
         << "M=4 Qwen3.6 GDN QKV projection GEMM failed";
 
     for (int row = 0; row < M; ++row)
@@ -2280,20 +3021,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKV_M4MatchesFourSingleRowDecodeGEMVs
             << "M=1 Qwen3.6 GDN QKV projection GEMV failed for row " << row;
 
         const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
-        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
-        EXPECT_FALSE(result.has_nan_inf)
-            << "M=4 Qwen3.6 GDN QKV projection row " << row
-            << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 GDN QKV projection row " << row
-            << " diverges from single-row decode GEMV"
-            << " rel_l2=" << result.relative_l2_error
-            << " max_abs=" << result.max_abs_error;
-        EXPECT_LE(result.relative_l2_error, 1e-5)
-            << "M=4 Qwen3.6 GDN QKV projection row " << row
-            << " relative L2 differs from single-row decode GEMV"
-            << " cosine=" << result.cosine_similarity
-            << " max_abs=" << result.max_abs_error;
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 GDN QKV M=4 row=") + std::to_string(row))
+                .c_str(),
+            verifier_row,
+            C_m1.data(),
+            C_m1.size());
     }
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
@@ -2353,7 +3086,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSing
                 {qkv_m4.get(), z_m4.get()},
                 [&]
                 {
-                    return cuda_qkv->multiply_fused_tensor(A_m4.get(), m4_projections, M, K);
+                    return cuda_qkv->multiply_fused_verifier_rows_decode_equivalent(
+                        A_m4.get(), m4_projections, M, K, nullptr, workspace_.get());
                 });
         }))
         << "M=4 Qwen3.6 GDN qkv+z fused verifier projection failed";
@@ -2391,35 +3125,20 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSing
 
         const float *qkv_row = qkv_m4->data() + static_cast<size_t>(row) * N_QKV;
         const float *z_row = z_m4->data() + static_cast<size_t>(row) * N_Z;
-        const auto qkv_result =
-            checkParity(qkv_row, qkv_m1->data(), static_cast<size_t>(N_QKV), 0.999999, 1.0e-5);
-        const auto z_result =
-            checkParity(z_row, z_m1->data(), static_cast<size_t>(N_Z), 0.999999, 1.0e-5);
-
-        EXPECT_FALSE(qkv_result.has_nan_inf)
-            << "M=4 Qwen3.6 GDN qkv row " << row << " produced non-finite output";
-        EXPECT_FALSE(z_result.has_nan_inf)
-            << "M=4 Qwen3.6 GDN z row " << row << " produced non-finite output";
-        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 GDN qkv row " << row
-            << " diverges from single-row fused decode"
-            << " rel_l2=" << qkv_result.relative_l2_error
-            << " max_abs=" << qkv_result.max_abs_error;
-        EXPECT_GE(z_result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 GDN z row " << row
-            << " diverges from single-row fused decode"
-            << " rel_l2=" << z_result.relative_l2_error
-            << " max_abs=" << z_result.max_abs_error;
-        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
-            << "M=4 Qwen3.6 GDN qkv row " << row
-            << " relative L2 differs from single-row fused decode"
-            << " cosine=" << qkv_result.cosine_similarity
-            << " max_abs=" << qkv_result.max_abs_error;
-        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
-            << "M=4 Qwen3.6 GDN z row " << row
-            << " relative L2 differs from single-row fused decode"
-            << " cosine=" << z_result.cosine_similarity
-            << " max_abs=" << z_result.max_abs_error;
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 fused GDN qkv M=4 row=") +
+             std::to_string(row))
+                .c_str(),
+            qkv_row,
+            qkv_m1->data(),
+            static_cast<size_t>(N_QKV));
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 fused GDN z M=4 row=") +
+             std::to_string(row))
+                .c_str(),
+            z_row,
+            z_m1->data(),
+            static_cast<size_t>(N_Z));
     }
 
     cleanupSharedWorkspace({cuda_qkv, cuda_z});
@@ -2480,7 +3199,8 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
                 {qkv_m4.get(), z_m4.get()},
                 [&]
                 {
-                    return cuda_qkv->multiply_fused_tensor(A_m4.get(), m4_projections, M, K);
+                    return cuda_qkv->multiply_fused_verifier_rows_decode_equivalent(
+                        A_m4.get(), m4_projections, M, K, nullptr, workspace_.get());
                 });
         }))
         << "M=4 mixed Q5_K/Q4_K Qwen3.6 GDN qkv+z verifier projection failed";
@@ -2518,35 +3238,20 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
 
         const float *qkv_row = qkv_m4->data() + static_cast<size_t>(row) * N_QKV;
         const float *z_row = z_m4->data() + static_cast<size_t>(row) * N_Z;
-        const auto qkv_result =
-            checkParity(qkv_row, qkv_m1->data(), static_cast<size_t>(N_QKV), 0.999999, 1.0e-5);
-        const auto z_result =
-            checkParity(z_row, z_m1->data(), static_cast<size_t>(N_Z), 0.999999, 1.0e-5);
-
-        EXPECT_FALSE(qkv_result.has_nan_inf)
-            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row << " produced non-finite output";
-        EXPECT_FALSE(z_result.has_nan_inf)
-            << "M=4 mixed Q5_K/Q4_K GDN z row " << row << " produced non-finite output";
-        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
-            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row
-            << " diverges from single-row fused decode"
-            << " rel_l2=" << qkv_result.relative_l2_error
-            << " max_abs=" << qkv_result.max_abs_error;
-        EXPECT_GE(z_result.cosine_similarity, 0.999999)
-            << "M=4 mixed Q5_K/Q4_K GDN z row " << row
-            << " diverges from single-row fused decode"
-            << " rel_l2=" << z_result.relative_l2_error
-            << " max_abs=" << z_result.max_abs_error;
-        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
-            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row
-            << " relative L2 differs from single-row fused decode"
-            << " cosine=" << qkv_result.cosine_similarity
-            << " max_abs=" << qkv_result.max_abs_error;
-        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
-            << "M=4 mixed Q5_K/Q4_K GDN z row " << row
-            << " relative L2 differs from single-row fused decode"
-            << " cosine=" << z_result.cosine_similarity
-            << " max_abs=" << z_result.max_abs_error;
+        expectBitwiseEqualFloatRow(
+            (std::string("Q5_K/Q4_K Qwen36 fused GDN qkv M=4 row=") +
+             std::to_string(row))
+                .c_str(),
+            qkv_row,
+            qkv_m1->data(),
+            static_cast<size_t>(N_QKV));
+        expectBitwiseEqualFloatRow(
+            (std::string("Q5_K/Q4_K Qwen36 fused GDN z M=4 row=") +
+             std::to_string(row))
+                .c_str(),
+            z_row,
+            z_m1->data(),
+            static_cast<size_t>(N_Z));
     }
 
     cleanupSharedWorkspace({cuda_qkv, cuda_z});
@@ -2859,23 +3564,24 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         << "CUDA qkv+z GDN subgroup should execute the graph-native small-M fused projection kernel";
 
     const auto fp32_fused_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_fp32_batched_fused_projection_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_fp32_grouped_verifier_projection_calls"});
     const auto fp32_fused_record = std::find_if(
         fp32_fused_records.begin(),
         fp32_fused_records.end(),
         [&](const PerfStatRecord &record)
         {
             return record.domain == "kernel" &&
-                   record.name == "cuda_fp32_batched_fused_projection_calls" &&
+                   record.name == "cuda_fp32_grouped_verifier_projection_calls" &&
                    record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("dtype") == "fp32" &&
                    record.tags.at("m") == std::to_string(M) &&
                    record.tags.at("k") == std::to_string(K) &&
                    record.tags.at("n") == std::to_string(N_ALPHA) &&
                    record.tags.at("projections") == "2" &&
-                   record.tags.at("route") == "small_n_fp32_batched_projection";
+                   record.tags.at("route") == "fixed_order_fp32_batched_projection";
         });
     ASSERT_NE(fp32_fused_record, fp32_fused_records.end())
-        << "CUDA alpha+beta GDN subgroup should execute the deterministic small-N FP32 projection route";
+        << "CUDA alpha+beta GDN subgroup should execute the fixed-order FP32 verifier projection route";
 
     const auto alpha_result =
         checkParity(output_alpha->data(), alpha_cpu.data(), alpha_cpu.size(), 0.9999, 0.01);
@@ -3025,59 +3731,34 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MixedCodebooks_M4MatchesFo
         StageOutputs serial = make_outputs(1);
         run_stage(1, input_data.data() + static_cast<size_t>(row) * K, &serial);
 
-        const auto qkv_result = checkParity(
+        expectBitwiseEqualFloatRow(
+            (std::string("GDNProjectionStage qkv M=") + std::to_string(M) +
+             " row=" + std::to_string(row))
+                .c_str(),
             grouped.qkv->data() + static_cast<size_t>(row) * N_QKV,
             serial.qkv->data(),
-            static_cast<size_t>(N_QKV),
-            0.999999,
-            1.0e-5);
-        const auto z_result = checkParity(
+            static_cast<size_t>(N_QKV));
+        expectBitwiseEqualFloatRow(
+            (std::string("GDNProjectionStage z M=") + std::to_string(M) +
+             " row=" + std::to_string(row))
+                .c_str(),
             grouped.z->data() + static_cast<size_t>(row) * N_Z,
             serial.z->data(),
-            static_cast<size_t>(N_Z),
-            0.999999,
-            1.0e-5);
-        const auto alpha_result = checkParity(
+            static_cast<size_t>(N_Z));
+        expectBitwiseEqualFloatRow(
+            (std::string("GDNProjectionStage alpha M=") + std::to_string(M) +
+             " row=" + std::to_string(row))
+                .c_str(),
             grouped.alpha->data() + static_cast<size_t>(row) * N_ALPHA,
             serial.alpha->data(),
-            static_cast<size_t>(N_ALPHA),
-            0.999999,
-            1.0e-5);
-        const auto beta_result = checkParity(
+            static_cast<size_t>(N_ALPHA));
+        expectBitwiseEqualFloatRow(
+            (std::string("GDNProjectionStage beta M=") + std::to_string(M) +
+             " row=" + std::to_string(row))
+                .c_str(),
             grouped.beta->data() + static_cast<size_t>(row) * N_BETA,
             serial.beta->data(),
-            static_cast<size_t>(N_BETA),
-            0.999999,
-            1.0e-5);
-
-        EXPECT_FALSE(qkv_result.has_nan_inf);
-        EXPECT_FALSE(z_result.has_nan_inf);
-        EXPECT_FALSE(alpha_result.has_nan_inf);
-        EXPECT_FALSE(beta_result.has_nan_inf);
-        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
-            << "stage qkv row " << row << " rel_l2=" << qkv_result.relative_l2_error
-            << " max_abs=" << qkv_result.max_abs_error;
-        EXPECT_GE(z_result.cosine_similarity, 0.999999)
-            << "stage z row " << row << " rel_l2=" << z_result.relative_l2_error
-            << " max_abs=" << z_result.max_abs_error;
-        EXPECT_GE(alpha_result.cosine_similarity, 0.999999)
-            << "stage alpha row " << row << " rel_l2=" << alpha_result.relative_l2_error
-            << " max_abs=" << alpha_result.max_abs_error;
-        EXPECT_GE(beta_result.cosine_similarity, 0.999999)
-            << "stage beta row " << row << " rel_l2=" << beta_result.relative_l2_error
-            << " max_abs=" << beta_result.max_abs_error;
-        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
-            << "stage qkv row " << row << " cosine=" << qkv_result.cosine_similarity
-            << " max_abs=" << qkv_result.max_abs_error;
-        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
-            << "stage z row " << row << " cosine=" << z_result.cosine_similarity
-            << " max_abs=" << z_result.max_abs_error;
-        EXPECT_LE(alpha_result.relative_l2_error, 1.0e-5)
-            << "stage alpha row " << row << " cosine=" << alpha_result.cosine_similarity
-            << " max_abs=" << alpha_result.max_abs_error;
-        EXPECT_LE(beta_result.relative_l2_error, 1.0e-5)
-            << "stage beta row " << row << " cosine=" << beta_result.cosine_similarity
-            << " max_abs=" << beta_result.max_abs_error;
+            static_cast<size_t>(N_BETA));
     }
 
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
@@ -3208,37 +3889,6 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialSt
         kernel_beta->resetDynamicState();
     };
 
-    auto expect_strict_row = [](
-        const ParityResult &result,
-        const char *label,
-        int m,
-        int row,
-        double max_symmetric_kl = 1.0e-8)
-    {
-        EXPECT_FALSE(result.has_nan_inf)
-            << label << " M=" << m << " row=" << row << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << label << " M=" << m << " row=" << row
-            << " cosine drift rel_l2=" << result.relative_l2_error
-            << " symmetric_kl=" << result.symmetric_kl
-            << " max_abs=" << result.max_abs_error;
-        EXPECT_LE(result.relative_l2_error, 1.0e-5)
-            << label << " M=" << m << " row=" << row
-            << " relative-L2 drift cosine=" << result.cosine_similarity
-            << " symmetric_kl=" << result.symmetric_kl
-            << " max_abs=" << result.max_abs_error;
-        EXPECT_LE(result.symmetric_kl, max_symmetric_kl)
-            << label << " M=" << m << " row=" << row
-            << " softmax distribution drift cosine=" << result.cosine_similarity
-            << " rel_l2=" << result.relative_l2_error
-            << " max_abs=" << result.max_abs_error;
-        EXPECT_LE(result.max_abs_error, 3.0e-4f)
-            << label << " M=" << m << " row=" << row
-            << " max-absolute drift cosine=" << result.cosine_similarity
-            << " rel_l2=" << result.relative_l2_error
-            << " symmetric_kl=" << result.symmetric_kl;
-    };
-
     for (int M : kVerifierRows)
     {
         const auto input_data = randomFP32(static_cast<size_t>(M) * kK);
@@ -3250,48 +3900,34 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialSt
             StageOutputs serial = make_outputs(1);
             run_stage(1, input_data.data() + static_cast<size_t>(row) * kK, &serial);
 
-            expect_strict_row(
-                checkParity(
-                    grouped.qkv->data() + static_cast<size_t>(row) * kNQKV,
-                    serial.qkv->data(),
-                    static_cast<size_t>(kNQKV),
-                    0.999999,
-                    1.0e-5),
-                "qkv",
-                M,
-                row);
-            expect_strict_row(
-                checkParity(
-                    grouped.z->data() + static_cast<size_t>(row) * kNZ,
-                    serial.z->data(),
-                    static_cast<size_t>(kNZ),
-                    0.999999,
-                    1.0e-5),
-                "z",
-                M,
-                row);
-            expect_strict_row(
-                checkParity(
-                    grouped.alpha->data() + static_cast<size_t>(row) * kNAlpha,
-                    serial.alpha->data(),
-                    static_cast<size_t>(kNAlpha),
-                    0.999999,
-                    1.0e-5),
-                "alpha",
-                M,
-                row,
-                1.0e-10);
-            expect_strict_row(
-                checkParity(
-                    grouped.beta->data() + static_cast<size_t>(row) * kNBeta,
-                    serial.beta->data(),
-                    static_cast<size_t>(kNBeta),
-                    0.999999,
-                    1.0e-5),
-                "beta",
-                M,
-                row,
-                1.0e-10);
+            expectBitwiseEqualFloatRow(
+                (std::string("Qwen36 MoE GDN qkv M=") + std::to_string(M) +
+                 " row=" + std::to_string(row))
+                    .c_str(),
+                grouped.qkv->data() + static_cast<size_t>(row) * kNQKV,
+                serial.qkv->data(),
+                static_cast<size_t>(kNQKV));
+            expectBitwiseEqualFloatRow(
+                (std::string("Qwen36 MoE GDN z M=") + std::to_string(M) +
+                 " row=" + std::to_string(row))
+                    .c_str(),
+                grouped.z->data() + static_cast<size_t>(row) * kNZ,
+                serial.z->data(),
+                static_cast<size_t>(kNZ));
+            expectBitwiseEqualFloatRow(
+                (std::string("Qwen36 MoE GDN alpha M=") + std::to_string(M) +
+                 " row=" + std::to_string(row))
+                    .c_str(),
+                grouped.alpha->data() + static_cast<size_t>(row) * kNAlpha,
+                serial.alpha->data(),
+                static_cast<size_t>(kNAlpha));
+            expectBitwiseEqualFloatRow(
+                (std::string("Qwen36 MoE GDN beta M=") + std::to_string(M) +
+                 " row=" + std::to_string(row))
+                    .c_str(),
+                grouped.beta->data() + static_cast<size_t>(row) * kNBeta,
+                serial.beta->data(),
+                static_cast<size_t>(kNBeta));
         }
     }
 
@@ -3424,18 +4060,14 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_M234Mat
                                  int m,
                                  int row)
     {
-        const auto result = checkParity(grouped, serial, count, 0.999999, 1.0e-5);
-        EXPECT_FALSE(result.has_nan_inf)
-            << name << " M=" << m << " row=" << row << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << name << " M=" << m << " row=" << row
-            << " cosine drift rel_l2=" << result.relative_l2_error
-            << " max_abs=" << result.max_abs_error
-            << " symmetric_kl=" << result.symmetric_kl;
-        EXPECT_LE(result.relative_l2_error, 1.0e-5)
-            << name << " M=" << m << " row=" << row
-            << " relative-L2 drift cosine=" << result.cosine_similarity
-            << " max_abs=" << result.max_abs_error;
+        expectBitwiseEqualFloatRow(
+            (std::string("Qwen36 MoE LocalTP GDN ") + name +
+             " M=" + std::to_string(m) +
+             " row=" + std::to_string(row))
+                .c_str(),
+            grouped,
+            serial,
+            count);
     };
 
     for (const int M : {2, 3, 4})
@@ -3562,19 +4194,15 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
                                  int m,
                                  int row)
     {
-        const auto result = checkParity(grouped, serial, count, 0.999999, 1.0e-5);
-        EXPECT_FALSE(result.has_nan_inf)
-            << name << " rank=" << rank << " M=" << m << " row=" << row
-            << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << name << " rank=" << rank << " M=" << m << " row=" << row
-            << " cosine drift rel_l2=" << result.relative_l2_error
-            << " max_abs=" << result.max_abs_error
-            << " symmetric_kl=" << result.symmetric_kl;
-        EXPECT_LE(result.relative_l2_error, 1.0e-5)
-            << name << " rank=" << rank << " M=" << m << " row=" << row
-            << " relative-L2 drift cosine=" << result.cosine_similarity
-            << " max_abs=" << result.max_abs_error;
+        expectBitwiseEqualFloatRow(
+            (std::string("real Qwen36 MoE LocalTP rank=") +
+             std::to_string(rank) + " GDN " + name +
+             " M=" + std::to_string(m) +
+             " row=" + std::to_string(row))
+                .c_str(),
+            grouped,
+            serial,
+            count);
     };
 
     for (int rank = 0; rank < 2; ++rank)
@@ -3813,33 +4441,13 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDe
 
             const float *grouped_row =
                 grouped.data() + static_cast<size_t>(row) * static_cast<size_t>(N);
-            const auto result = checkParity(
+            expectBitwiseEqualFloatRow(
+                (std::string("real Qwen36 MoE LM-head M=") +
+                 std::to_string(M) + " row=" + std::to_string(row))
+                    .c_str(),
                 grouped_row,
                 serial.data(),
-                serial.size(),
-                0.999999,
-                1.0e-5);
-            EXPECT_FALSE(result.has_nan_inf)
-                << "real Qwen3.6 MoE LM-head grouped M=" << M
-                << " row=" << row << " produced non-finite logits";
-            EXPECT_GE(result.cosine_similarity, 0.999999)
-                << "real Qwen3.6 MoE LM-head grouped M=" << M
-                << " row=" << row << " cosine drift rel_l2="
-                << result.relative_l2_error << " max_abs="
-                << result.max_abs_error << " symmetric_kl="
-                << result.symmetric_kl;
-            EXPECT_LE(result.relative_l2_error, 1.0e-5)
-                << "real Qwen3.6 MoE LM-head grouped M=" << M
-                << " row=" << row << " relative-L2 drift cosine="
-                << result.cosine_similarity << " max_abs="
-                << result.max_abs_error << " symmetric_kl="
-                << result.symmetric_kl;
-            EXPECT_LE(result.symmetric_kl, 1.0e-8)
-                << "real Qwen3.6 MoE LM-head grouped M=" << M
-                << " row=" << row << " softmax distribution drift cosine="
-                << result.cosine_similarity << " rel_l2="
-                << result.relative_l2_error << " max_abs="
-                << result.max_abs_error;
+                serial.size());
         }
 
         cleanupWorkspaceIfNeeded(prepared.kernel);
@@ -4167,14 +4775,15 @@ TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_M234MatchesSerialDe
     }
 
     const auto records =
-        PerfStatsCollector::snapshot({"kernel.cuda_fp32_batched_fused_projection_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_fp32_grouped_verifier_projection_calls"});
     uint64_t grouped_small_n_calls = 0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "cuda_fp32_batched_fused_projection_calls" &&
+            record.name == "cuda_fp32_grouped_verifier_projection_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
-            record.tags.at("route") == "small_n_fp32_batched_projection" &&
+            record.tags.at("dtype") == "fp32" &&
+            record.tags.at("route") == "fixed_order_fp32_batched_projection" &&
             record.tags.at("n") == std::to_string(N) &&
             record.tags.at("k") == std::to_string(K) &&
             record.tags.at("projections") == "2")
@@ -4185,7 +4794,7 @@ TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_M234MatchesSerialDe
         }
     }
     EXPECT_EQ(grouped_small_n_calls, verifier_rows.size())
-        << "CUDA FP32 verifier rows must use the small-N grouped batched projection route for M=2/3/4";
+        << "CUDA FP32 verifier rows must use the fixed-order grouped verifier projection route for M=2/3/4";
 
     cleanupSharedWorkspace({cuda_alpha, cuda_beta});
     PerfStatsCollector::reset();
@@ -4941,6 +5550,8 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
              * ROWPAR.  The two checked launches below then consume identical
              * quantized activations and identical prepared weights.
              */
+            ScopedCudaNativeVNNIDecodeEquivalentM1Policy verifier_scope;
+
             if (!cudaNativeVNNIGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
@@ -5539,37 +6150,27 @@ TEST_F(Test__CUDAGemmParity, IQ3S_Qwen36MoESharedExpert_M234MatchesSingleRowDeco
             const float *grouped_down_row =
                 down_m->data() + static_cast<size_t>(row) * d_model;
 
-            const auto gate_result = checkParity(
-                grouped_gate_row, gate_row->data(), static_cast<size_t>(intermediate),
-                0.99999999, 1.0e-7);
-            const auto up_result = checkParity(
-                grouped_up_row, up_row->data(), static_cast<size_t>(intermediate),
-                0.99999999, 1.0e-7);
-            const auto down_result = checkParity(
-                grouped_down_row, down_row->data(), static_cast<size_t>(d_model),
-                0.99999999, 1.0e-7);
-
-            EXPECT_FALSE(gate_result.has_nan_inf);
-            EXPECT_FALSE(up_result.has_nan_inf);
-            EXPECT_FALSE(down_result.has_nan_inf);
-            EXPECT_EQ(gate_result.max_abs_error, 0.0f)
-                << "M=" << M << " row=" << row
-                << " shared gate grouped verifier row is not bitwise decode-equivalent";
-            EXPECT_EQ(up_result.max_abs_error, 0.0f)
-                << "M=" << M << " row=" << row
-                << " shared up grouped verifier row is not bitwise decode-equivalent";
-            EXPECT_EQ(down_result.max_abs_error, 0.0f)
-                << "M=" << M << " row=" << row
-                << " shared down grouped verifier row is not bitwise decode-equivalent";
-            EXPECT_EQ(gate_result.relative_l2_error, 0.0)
-                << "M=" << M << " row=" << row
-                << " shared gate rel-L2 drift";
-            EXPECT_EQ(up_result.relative_l2_error, 0.0)
-                << "M=" << M << " row=" << row
-                << " shared up rel-L2 drift";
-            EXPECT_EQ(down_result.relative_l2_error, 0.0)
-                << "M=" << M << " row=" << row
-                << " shared down rel-L2 drift";
+            expectBitwiseEqualFloatRow(
+                (std::string("IQ3_S Qwen36 shared gate M=") +
+                 std::to_string(M) + " row=" + std::to_string(row))
+                    .c_str(),
+                grouped_gate_row,
+                gate_row->data(),
+                static_cast<size_t>(intermediate));
+            expectBitwiseEqualFloatRow(
+                (std::string("IQ3_S Qwen36 shared up M=") +
+                 std::to_string(M) + " row=" + std::to_string(row))
+                    .c_str(),
+                grouped_up_row,
+                up_row->data(),
+                static_cast<size_t>(intermediate));
+            expectBitwiseEqualFloatRow(
+                (std::string("IQ3_S Qwen36 shared down M=") +
+                 std::to_string(M) + " row=" + std::to_string(row))
+                    .c_str(),
+                grouped_down_row,
+                down_row->data(),
+                static_cast<size_t>(d_model));
         }
     }
 
@@ -5662,8 +6263,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M4FusedProjectionMatchesFourSi
                 {gate_m4.get(), up_m4.get()},
                 [&]
                 {
-                    return cuda_gate->multiply_fused_tensor(
-                        A_m4.get(), m4_projections, M, K);
+                    return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
+                        A_m4.get(), m4_projections, M, K, nullptr, workspace_.get());
                 });
         }))
         << "M=4 Qwen3.6 FFN gate/up fused projection failed";
@@ -5704,28 +6305,18 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M4FusedProjectionMatchesFourSi
             gate_m4->data() + static_cast<size_t>(row) * N;
         const float *up_row =
             up_m4->data() + static_cast<size_t>(row) * N;
-        const auto gate_result =
-            checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-        const auto up_result =
-            checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-        EXPECT_FALSE(gate_result.has_nan_inf)
-            << "M=4 Qwen3.6 FFN gate row " << row
-            << " produced non-finite output";
-        EXPECT_FALSE(up_result.has_nan_inf)
-            << "M=4 Qwen3.6 FFN up row " << row
-            << " produced non-finite output";
-        EXPECT_GE(gate_result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 FFN gate row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_GE(up_result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 FFN up row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
-            << "M=4 Qwen3.6 FFN gate row " << row
-            << " relative L2 differs from single-row decode GEMV";
-        EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
-            << "M=4 Qwen3.6 FFN up row " << row
-            << " relative L2 differs from single-row decode GEMV";
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 FFN gate M=4 row=") + std::to_string(row))
+                .c_str(),
+            gate_row,
+            gate_m1->data(),
+            static_cast<size_t>(N));
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 FFN up M=4 row=") + std::to_string(row))
+                .c_str(),
+            up_row,
+            up_m1->data(),
+            static_cast<size_t>(N));
     }
 
     cleanupSharedWorkspace({cuda_gate, cuda_up});
@@ -5802,8 +6393,8 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M4FusedProjectionMatchesFo
                     {gate_m4.get(), up_m4.get()},
                     [&]
                     {
-                        return cuda_gate->multiply_fused_tensor(
-                            A_m4.get(), m4_projections, M, K);
+                        return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
+                            A_m4.get(), m4_projections, M, K, nullptr, workspace_.get());
                     });
             }))
             << fmt.name << " M=4 Qwen3.6 FFN gate/up fused projection failed";
@@ -5844,28 +6435,20 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M4FusedProjectionMatchesFo
                 gate_m4->data() + static_cast<size_t>(row) * N;
             const float *up_row =
                 up_m4->data() + static_cast<size_t>(row) * N;
-            const auto gate_result =
-                checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-            const auto up_result =
-                checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-            EXPECT_FALSE(gate_result.has_nan_inf)
-                << fmt.name << " M=4 Qwen3.6 FFN gate row " << row
-                << " produced non-finite output";
-            EXPECT_FALSE(up_result.has_nan_inf)
-                << fmt.name << " M=4 Qwen3.6 FFN up row " << row
-                << " produced non-finite output";
-            EXPECT_GE(gate_result.cosine_similarity, 0.999999)
-                << fmt.name << " M=4 Qwen3.6 FFN gate row " << row
-                << " diverges from single-row decode GEMV";
-            EXPECT_GE(up_result.cosine_similarity, 0.999999)
-                << fmt.name << " M=4 Qwen3.6 FFN up row " << row
-                << " diverges from single-row decode GEMV";
-            EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
-                << fmt.name << " M=4 Qwen3.6 FFN gate row " << row
-                << " relative L2 differs from single-row decode GEMV";
-            EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
-                << fmt.name << " M=4 Qwen3.6 FFN up row " << row
-                << " relative L2 differs from single-row decode GEMV";
+            expectBitwiseEqualFloatRow(
+                (std::string(fmt.name) + " Qwen36 FFN gate M=4 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                gate_row,
+                gate_m1->data(),
+                static_cast<size_t>(N));
+            expectBitwiseEqualFloatRow(
+                (std::string(fmt.name) + " Qwen36 FFN up M=4 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                up_row,
+                up_m1->data(),
+                static_cast<size_t>(N));
         }
 
         const auto route_records =
@@ -5965,8 +6548,8 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTw
                     {gate_m2.get(), up_m2.get()},
                     [&]
                     {
-                        return cuda_gate->multiply_fused_tensor(
-                            A_m2.get(), m2_projections, M, K);
+                        return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
+                            A_m2.get(), m2_projections, M, K, nullptr, workspace_.get());
                     });
             }))
             << fmt.name << " M=2 Qwen3.6 FFN gate/up fused projection failed";
@@ -6007,28 +6590,20 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTw
                 gate_m2->data() + static_cast<size_t>(row) * N;
             const float *up_row =
                 up_m2->data() + static_cast<size_t>(row) * N;
-            const auto gate_result =
-                checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-            const auto up_result =
-                checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-            EXPECT_FALSE(gate_result.has_nan_inf)
-                << fmt.name << " M=2 Qwen3.6 FFN gate row " << row
-                << " produced non-finite output";
-            EXPECT_FALSE(up_result.has_nan_inf)
-                << fmt.name << " M=2 Qwen3.6 FFN up row " << row
-                << " produced non-finite output";
-            EXPECT_GE(gate_result.cosine_similarity, 0.999999)
-                << fmt.name << " M=2 Qwen3.6 FFN gate row " << row
-                << " diverges from single-row decode GEMV";
-            EXPECT_GE(up_result.cosine_similarity, 0.999999)
-                << fmt.name << " M=2 Qwen3.6 FFN up row " << row
-                << " diverges from single-row decode GEMV";
-            EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
-                << fmt.name << " M=2 Qwen3.6 FFN gate row " << row
-                << " relative L2 differs from single-row decode GEMV";
-            EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
-                << fmt.name << " M=2 Qwen3.6 FFN up row " << row
-                << " relative L2 differs from single-row decode GEMV";
+            expectBitwiseEqualFloatRow(
+                (std::string(fmt.name) + " Qwen36 FFN gate M=2 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                gate_row,
+                gate_m1->data(),
+                static_cast<size_t>(N));
+            expectBitwiseEqualFloatRow(
+                (std::string(fmt.name) + " Qwen36 FFN up M=2 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                up_row,
+                up_m1->data(),
+                static_cast<size_t>(N));
         }
 
         const auto route_records =
@@ -6103,8 +6678,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
                 {gate_m2.get(), up_m2.get()},
                 [&]
                 {
-                    return cuda_gate->multiply_fused_tensor(
-                        A_m2.get(), m2_projections, M, K);
+                    return cuda_gate->multiply_fused_verifier_rows_decode_equivalent(
+                        A_m2.get(), m2_projections, M, K, nullptr, workspace_.get());
                 });
         }))
         << "Q4_K M=2 Qwen3.6 FFN gate/up fused projection failed";
@@ -6145,28 +6720,18 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSin
             gate_m2->data() + static_cast<size_t>(row) * N;
         const float *up_row =
             up_m2->data() + static_cast<size_t>(row) * N;
-        const auto gate_result =
-            checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-        const auto up_result =
-            checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
-        EXPECT_FALSE(gate_result.has_nan_inf)
-            << "Q4_K M=2 Qwen3.6 FFN gate row " << row
-            << " produced non-finite output";
-        EXPECT_FALSE(up_result.has_nan_inf)
-            << "Q4_K M=2 Qwen3.6 FFN up row " << row
-            << " produced non-finite output";
-        EXPECT_GE(gate_result.cosine_similarity, 0.999999)
-            << "Q4_K M=2 Qwen3.6 FFN gate row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_GE(up_result.cosine_similarity, 0.999999)
-            << "Q4_K M=2 Qwen3.6 FFN up row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
-            << "Q4_K M=2 Qwen3.6 FFN gate row " << row
-            << " relative L2 differs from single-row decode GEMV";
-        EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
-            << "Q4_K M=2 Qwen3.6 FFN up row " << row
-            << " relative L2 differs from single-row decode GEMV";
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 FFN gate M=2 row=") + std::to_string(row))
+                .c_str(),
+            gate_row,
+            gate_m1->data(),
+            static_cast<size_t>(N));
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 FFN up M=2 row=") + std::to_string(row))
+                .c_str(),
+            up_row,
+            up_m1->data(),
+            static_cast<size_t>(N));
     }
 
     const auto route_records =
@@ -6267,18 +6832,16 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         }))
         << "Q4_K deterministic M=1 canonical gate/up projection failed";
 
-    const auto gate_result =
-        checkParity(gate_m2->data(), gate_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
-    const auto up_result =
-        checkParity(up_m2->data(), up_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
-    EXPECT_FALSE(gate_result.has_nan_inf);
-    EXPECT_FALSE(up_result.has_nan_inf);
-    EXPECT_LE(gate_result.max_abs_error, 1.0e-6f)
-        << "Deterministic M=1 Q4_K gate path must match canonical M=2 row 0";
-    EXPECT_LE(up_result.max_abs_error, 1.0e-6f)
-        << "Deterministic M=1 Q4_K up path must match canonical M=2 row 0";
-    EXPECT_LE(gate_result.relative_l2_error, 1.0e-7);
-    EXPECT_LE(up_result.relative_l2_error, 1.0e-7);
+    expectBitwiseEqualFloatRow(
+        "deterministic Q4_K gate M=2 row0 vs M=1 canonical decode",
+        gate_m2->data(),
+        gate_m1->data(),
+        static_cast<size_t>(N));
+    expectBitwiseEqualFloatRow(
+        "deterministic Q4_K up M=2 row0 vs M=1 canonical decode",
+        up_m2->data(),
+        up_m1->data(),
+        static_cast<size_t>(N));
 
     const auto route_records =
         PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
@@ -6379,18 +6942,16 @@ TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalDe
         }))
         << "Q5_K deterministic M=1 canonical gate/up projection failed";
 
-    const auto gate_result =
-        checkParity(gate_m2->data(), gate_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
-    const auto up_result =
-        checkParity(up_m2->data(), up_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
-    EXPECT_FALSE(gate_result.has_nan_inf);
-    EXPECT_FALSE(up_result.has_nan_inf);
-    EXPECT_LE(gate_result.max_abs_error, 1.0e-6f)
-        << "Deterministic M=1 Q5_K gate path must match canonical M=2 row 0";
-    EXPECT_LE(up_result.max_abs_error, 1.0e-6f)
-        << "Deterministic M=1 Q5_K up path must match canonical M=2 row 0";
-    EXPECT_LE(gate_result.relative_l2_error, 1.0e-7);
-    EXPECT_LE(up_result.relative_l2_error, 1.0e-7);
+    expectBitwiseEqualFloatRow(
+        "deterministic Q5_K gate M=2 row0 vs M=1 canonical decode",
+        gate_m2->data(),
+        gate_m1->data(),
+        static_cast<size_t>(N));
+    expectBitwiseEqualFloatRow(
+        "deterministic Q5_K up M=2 row0 vs M=1 canonical decode",
+        up_m2->data(),
+        up_m1->data(),
+        static_cast<size_t>(N));
 
     const auto route_records =
         PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_decode_calls"});
@@ -6465,16 +7026,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRo
             << "M=1 Qwen3.6 fused-SwiGLU down projection failed for row " << row;
 
         const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
-        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
-        EXPECT_FALSE(result.has_nan_inf)
-            << "M=4 Qwen3.6 fused-SwiGLU down row " << row
-            << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.999999)
-            << "M=4 Qwen3.6 fused-SwiGLU down row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_LE(result.relative_l2_error, 1e-5)
-            << "M=4 Qwen3.6 fused-SwiGLU down row " << row
-            << " relative L2 differs from single-row decode GEMV";
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 FFN down M=4 row=") + std::to_string(row))
+                .c_str(),
+            verifier_row,
+            C_m1.data(),
+            C_m1.size());
     }
 
     const auto route_records =
@@ -6549,16 +7106,12 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNati
             << "M=1 Qwen3.6 fused-SwiGLU down projection failed for row " << row;
 
         const float *verifier_row = C_m2.data() + static_cast<size_t>(row) * N;
-        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.9999995, 1e-6);
-        EXPECT_FALSE(result.has_nan_inf)
-            << "M=2 Qwen3.6 fused-SwiGLU down row " << row
-            << " produced non-finite output";
-        EXPECT_GE(result.cosine_similarity, 0.9999995)
-            << "M=2 Qwen3.6 fused-SwiGLU down row " << row
-            << " diverges from single-row decode GEMV";
-        EXPECT_LE(result.relative_l2_error, 1e-6)
-            << "M=2 Qwen3.6 fused-SwiGLU down row " << row
-            << " relative L2 differs from single-row decode GEMV";
+        expectBitwiseEqualFloatRow(
+            (std::string("Q4_K Qwen36 FFN down M=2 row=") + std::to_string(row))
+                .c_str(),
+            verifier_row,
+            C_m1.data(),
+            C_m1.size());
     }
 
     const auto route_records =
@@ -6761,17 +7314,13 @@ TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSing
                 << fmt.name << " M=1 Qwen3.6 fused-SwiGLU down projection failed for row " << row;
 
             const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
-            const auto result =
-                checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
-            EXPECT_FALSE(result.has_nan_inf)
-                << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down row " << row
-                << " produced non-finite output";
-            EXPECT_GE(result.cosine_similarity, 0.999999)
-                << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down row " << row
-                << " diverges from single-row decode GEMV";
-            EXPECT_LE(result.relative_l2_error, 1e-5)
-                << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down row " << row
-                << " relative L2 differs from single-row decode GEMV";
+            expectBitwiseEqualFloatRow(
+                (std::string(fmt.name) + " Qwen36 FFN down M=4 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                verifier_row,
+                C_m1.data(),
+                C_m1.size());
         }
 
         cleanupWorkspaceIfNeeded(cuda_kernel);
@@ -7230,15 +7779,20 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Use with_gpu_coherence for automatic input/output coherence management
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input_tensor.get()}, // inputs
-        {output_cuda.get()},  // outputs (will be marked dirty after kernel)
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel},
         [&]
         {
-            return cuda_kernel->multiply_tensor(
-                input_tensor.get(), output_cuda.get(),
-                M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+            return with_gpu_coherence(
+                gpu_device_,
+                {input_tensor.get()}, // inputs
+                {output_cuda.get()},  // outputs (will be marked dirty after kernel)
+                [&]
+                {
+                    return cuda_kernel->multiply_tensor(
+                        input_tensor.get(), output_cuda.get(),
+                        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                });
         }));
 
     // Clean up workspace
@@ -7365,21 +7919,26 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
 
     // ===== SEPARATE PATH: 3x multiply_tensor() =====
     std::cout << "Running SEPARATE path (3x multiply_tensor)...\n";
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input_tensor.get()},
-        {output_q_separate.get(), output_k_separate.get(), output_v_separate.get()},
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         [&]
         {
-            return cuda_kernel_q->multiply_tensor(
-                       input_tensor.get(), output_q_separate.get(),
-                       M, N_q, K, true, 1.0f, 0.0f, nullptr, nullptr, -1) &&
-                   cuda_kernel_k->multiply_tensor(
-                       input_tensor.get(), output_k_separate.get(),
-                       M, N_k, K, true, 1.0f, 0.0f, nullptr, nullptr, -1) &&
-                   cuda_kernel_v->multiply_tensor(
-                       input_tensor.get(), output_v_separate.get(),
-                       M, N_v, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+            return with_gpu_coherence(
+                gpu_device_,
+                {input_tensor.get()},
+                {output_q_separate.get(), output_k_separate.get(), output_v_separate.get()},
+                [&]
+                {
+                    return cuda_kernel_q->multiply_tensor(
+                               input_tensor.get(), output_q_separate.get(),
+                               M, N_q, K, true, 1.0f, 0.0f, nullptr, nullptr, -1) &&
+                           cuda_kernel_k->multiply_tensor(
+                               input_tensor.get(), output_k_separate.get(),
+                               M, N_k, K, true, 1.0f, 0.0f, nullptr, nullptr, -1) &&
+                           cuda_kernel_v->multiply_tensor(
+                               input_tensor.get(), output_v_separate.get(),
+                               M, N_v, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                });
         }));
 
     // ===== FUSED PATH: multiply_fused_tensor() =====
@@ -7395,14 +7954,19 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
                              nullptr, "V");
 
     // Call fused method with coherence wrapper
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input_tensor.get()},
-        {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         [&]
         {
-            return cuda_kernel_q->multiply_fused_tensor(
-                input_tensor.get(), projections, M, K, nullptr);
+            return with_gpu_coherence(
+                gpu_device_,
+                {input_tensor.get()},
+                {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+                [&]
+                {
+                    return cuda_kernel_q->multiply_fused_tensor(
+                        input_tensor.get(), projections, M, K, nullptr);
+                });
         }));
 
     // ===== COMPARE: Fused vs Separate =====
@@ -7563,14 +8127,19 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     projections.emplace_back(cuda_kernel_v, output_v_fused.get(), N_v,
                              nullptr, "V");
 
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input_tensor.get()},
-        {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         [&]
         {
-            return cuda_kernel_q->multiply_fused_tensor(
-                input_tensor.get(), projections, M, K, nullptr);
+            return with_gpu_coherence(
+                gpu_device_,
+                {input_tensor.get()},
+                {output_q_fused.get(), output_k_fused.get(), output_v_fused.get()},
+                [&]
+                {
+                    return cuda_kernel_q->multiply_fused_tensor(
+                        input_tensor.get(), projections, M, K, nullptr);
+                });
         }));
 
     // Compare against CPU
@@ -7683,26 +8252,36 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     }
 
     // Run kernel twice — should produce identical results
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input_tensor.get()},
-        {output_a.get()},
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel},
         [&]
         {
-            return cuda_kernel->multiply_tensor(
-                input_tensor.get(), output_a.get(),
-                M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+            return with_gpu_coherence(
+                gpu_device_,
+                {input_tensor.get()},
+                {output_a.get()},
+                [&]
+                {
+                    return cuda_kernel->multiply_tensor(
+                        input_tensor.get(), output_a.get(),
+                        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                });
         }));
 
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input_tensor.get()},
-        {output_b.get()},
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel},
         [&]
         {
-            return cuda_kernel->multiply_tensor(
-                input_tensor.get(), output_b.get(),
-                M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+            return with_gpu_coherence(
+                gpu_device_,
+                {input_tensor.get()},
+                {output_b.get()},
+                [&]
+                {
+                    return cuda_kernel->multiply_tensor(
+                        input_tensor.get(), output_b.get(),
+                        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                });
         }));
 
     // Compare: should be EXACTLY the same (same kernel, same weights, same input)
@@ -7781,15 +8360,20 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
             std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
         // Use with_gpu_coherence for clean coherence handling
-        ASSERT_TRUE(with_gpu_coherence(
-            gpu_device_,
-            {input.get()},
-            {output.get()},
+        ASSERT_TRUE(withExplicitCudaGemmStream(
+            {kernel},
             [&]
             {
-                return kernel->multiply_tensor(
-                    input.get(), output.get(),
-                    M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                return with_gpu_coherence(
+                    gpu_device_,
+                    {input.get()},
+                    {output.get()},
+                    [&]
+                    {
+                        return kernel->multiply_tensor(
+                            input.get(), output.get(),
+                            M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                    });
             }));
 
         outputs[run].resize(M * N);
@@ -7883,15 +8467,20 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
             std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
         // Use with_gpu_coherence for clean coherence handling
-        ASSERT_TRUE(with_gpu_coherence(
-            gpu_device_,
-            {input.get()},
-            {output_cuda.get()},
+        ASSERT_TRUE(withExplicitCudaGemmStream(
+            {kernel},
             [&]
             {
-                return kernel->multiply_tensor(
-                    input.get(), output_cuda.get(),
-                    M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                return with_gpu_coherence(
+                    gpu_device_,
+                    {input.get()},
+                    {output_cuda.get()},
+                    [&]
+                    {
+                        return kernel->multiply_tensor(
+                            input.get(), output_cuda.get(),
+                            M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                    });
             }));
 
         // CPU reference
@@ -8036,13 +8625,20 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     projections.emplace_back(cuda_kernel_v, output_v.get(), N_v,
                              bias_v.get(), "V");
 
-    ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
-        input.get(), projections, M, K, nullptr));
-
-    // Mark outputs as device-dirty (tests bypass DeviceGraphExecutor auto-coherence)
-    output_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    output_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_TRUE(withExplicitCudaGemmStream(
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
+        [&]
+        {
+            return with_gpu_coherence(
+                gpu_device_,
+                {input.get()},
+                {output_q.get(), output_k.get(), output_v.get()},
+                [&]
+                {
+                    return cuda_kernel_q->multiply_fused_tensor(
+                        input.get(), projections, M, K, nullptr);
+                });
+        }));
 
     // ===== CPU reference (GEMM + manual bias add) =====
     auto cpu_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
@@ -8228,13 +8824,20 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
         projections.emplace_back(kernel_v, out_v.get(), N_v,
                                  nullptr, "V");
 
-        ASSERT_TRUE(kernel_q->multiply_fused_tensor(
-            input.get(), projections, M, K, nullptr));
-
-        // Mark outputs as device-dirty (tests bypass DeviceGraphExecutor auto-coherence)
-        out_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        out_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        out_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ASSERT_TRUE(withExplicitCudaGemmStream(
+            {kernel_q, kernel_k, kernel_v},
+            [&]
+            {
+                return with_gpu_coherence(
+                    gpu_device_,
+                    {input.get()},
+                    {out_q.get(), out_k.get(), out_v.get()},
+                    [&]
+                    {
+                        return kernel_q->multiply_fused_tensor(
+                            input.get(), projections, M, K, nullptr);
+                    });
+            }));
 
         // CPU reference
         std::vector<float> q_cpu(M * N_q), k_cpu(M * N_k), v_cpu(M * N_v);

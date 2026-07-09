@@ -379,16 +379,16 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_CUDA2
 }
 
 /**
- * @brief Proves CUDA grouped-host publication handles a rejected correction row.
+ * @brief Proves CUDA resident publication handles a rejected correction row.
  *
  * The full prefix-cache MTP cell once exposed a mismatch where the grouped
  * verifier published one accepted state row, emitted a correction token, and then
- * continued from a state that was not bitwise-equivalent to serial decode.  This
- * focused regression forces that shape directly: row 0 is accepted state, row 1 is
- * an intentionally wrong draft, and the grouped-host publisher must match serial
- * continuation after the correction token is consumed.
+ * continued from a state that was not bitwise-equivalent to serial decode. This
+ * focused regression forces that shape directly: row 0 is accepted state, row 1
+ * is an intentionally wrong draft, and compact device-resident publication must
+ * match serial continuation after the correction token is consumed.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedHostRejectPublicationMatchesSerial_CUDA2TPHotOnly)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatchesSerial_CUDA2TPHotOnly)
 {
     ScopedEnvironmentValues perf_stats_enabled({
         {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
@@ -404,9 +404,8 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedHostRejectPublicationMatchesS
         /*use_deferred_verifier_sync=*/true,
         /*verify_published_state_continuation=*/true,
         /*verifier_row_count=*/2,
-        /*verify_device_resident_publication=*/false,
+        /*verify_device_resident_publication=*/true,
         /*expect_grouped_moe_verifier_prefill=*/false,
-        /*verify_grouped_host_publication=*/true,
         /*force_first_speculative_rejection=*/true);
     PerfStatsCollector::reset();
 }
@@ -476,7 +475,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_ROCm2
 }
 
 /**
- * @brief Proves ROCm grouped-host publication handles a rejected correction row.
+ * @brief Proves ROCm resident publication handles a rejected correction row.
  *
  * ROCm uses separate grouped MoE kernels and RCCL-backed LocalTP publication.
  * Keeping this rejected-correction proof next to the hot-only prefix-cache cell
@@ -485,7 +484,7 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedVerifierRowsMatchSerial_ROCm2
  * token must produce the same continuation as serial decode from the verifier
  * base.
  */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedHostRejectPublicationMatchesSerial_ROCm2TPHotOnly)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, DeviceResidentRejectPublicationMatchesSerial_ROCm2TPHotOnly)
 {
     ScopedEnvironmentValues perf_stats_enabled({
         {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
@@ -501,9 +500,8 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, GroupedHostRejectPublicationMatchesS
         /*use_deferred_verifier_sync=*/true,
         /*verify_published_state_continuation=*/true,
         /*verifier_row_count=*/2,
-        /*verify_device_resident_publication=*/false,
+        /*verify_device_resident_publication=*/true,
         /*expect_grouped_moe_verifier_prefill=*/false,
-        /*verify_grouped_host_publication=*/true,
         /*force_first_speculative_rejection=*/true);
     PerfStatsCollector::reset();
 }

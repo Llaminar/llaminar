@@ -222,69 +222,6 @@ __host__ __device__ inline int rocm_moe_select_grouped_prefill_tile_m(
     return 8;
 }
 
-// IQ4_NL codebook (must match GEMV file)
-__device__ __constant__ int8_t k_iq4_pf_codebook_i8[16] = {
-    -127, -104, -83, -65,
-    -49, -35, -22, -10,
-    1, 13, 25, 38,
-    53, 69, 89, 113};
-
-// Byte-pair LUT for IQ4_NL: low nibble -> low byte, high nibble -> high byte.
-// This preserves the exact codebook math while halving variable codebook
-// lookups in the verifier-sized grouped prefill kernels.
-__device__ __constant__ uint16_t k_iq4_pf_pair_i16[256] = {
-    0x8181, 0x8198, 0x81ad, 0x81bf, 0x81cf, 0x81dd, 0x81ea, 0x81f6,
-    0x8101, 0x810d, 0x8119, 0x8126, 0x8135, 0x8145, 0x8159, 0x8171,
-    0x9881, 0x9898, 0x98ad, 0x98bf, 0x98cf, 0x98dd, 0x98ea, 0x98f6,
-    0x9801, 0x980d, 0x9819, 0x9826, 0x9835, 0x9845, 0x9859, 0x9871,
-    0xad81, 0xad98, 0xadad, 0xadbf, 0xadcf, 0xaddd, 0xadea, 0xadf6,
-    0xad01, 0xad0d, 0xad19, 0xad26, 0xad35, 0xad45, 0xad59, 0xad71,
-    0xbf81, 0xbf98, 0xbfad, 0xbfbf, 0xbfcf, 0xbfdd, 0xbfea, 0xbff6,
-    0xbf01, 0xbf0d, 0xbf19, 0xbf26, 0xbf35, 0xbf45, 0xbf59, 0xbf71,
-    0xcf81, 0xcf98, 0xcfad, 0xcfbf, 0xcfcf, 0xcfdd, 0xcfea, 0xcff6,
-    0xcf01, 0xcf0d, 0xcf19, 0xcf26, 0xcf35, 0xcf45, 0xcf59, 0xcf71,
-    0xdd81, 0xdd98, 0xddad, 0xddbf, 0xddcf, 0xdddd, 0xddea, 0xddf6,
-    0xdd01, 0xdd0d, 0xdd19, 0xdd26, 0xdd35, 0xdd45, 0xdd59, 0xdd71,
-    0xea81, 0xea98, 0xeaad, 0xeabf, 0xeacf, 0xeadd, 0xeaea, 0xeaf6,
-    0xea01, 0xea0d, 0xea19, 0xea26, 0xea35, 0xea45, 0xea59, 0xea71,
-    0xf681, 0xf698, 0xf6ad, 0xf6bf, 0xf6cf, 0xf6dd, 0xf6ea, 0xf6f6,
-    0xf601, 0xf60d, 0xf619, 0xf626, 0xf635, 0xf645, 0xf659, 0xf671,
-    0x0181, 0x0198, 0x01ad, 0x01bf, 0x01cf, 0x01dd, 0x01ea, 0x01f6,
-    0x0101, 0x010d, 0x0119, 0x0126, 0x0135, 0x0145, 0x0159, 0x0171,
-    0x0d81, 0x0d98, 0x0dad, 0x0dbf, 0x0dcf, 0x0ddd, 0x0dea, 0x0df6,
-    0x0d01, 0x0d0d, 0x0d19, 0x0d26, 0x0d35, 0x0d45, 0x0d59, 0x0d71,
-    0x1981, 0x1998, 0x19ad, 0x19bf, 0x19cf, 0x19dd, 0x19ea, 0x19f6,
-    0x1901, 0x190d, 0x1919, 0x1926, 0x1935, 0x1945, 0x1959, 0x1971,
-    0x2681, 0x2698, 0x26ad, 0x26bf, 0x26cf, 0x26dd, 0x26ea, 0x26f6,
-    0x2601, 0x260d, 0x2619, 0x2626, 0x2635, 0x2645, 0x2659, 0x2671,
-    0x3581, 0x3598, 0x35ad, 0x35bf, 0x35cf, 0x35dd, 0x35ea, 0x35f6,
-    0x3501, 0x350d, 0x3519, 0x3526, 0x3535, 0x3545, 0x3559, 0x3571,
-    0x4581, 0x4598, 0x45ad, 0x45bf, 0x45cf, 0x45dd, 0x45ea, 0x45f6,
-    0x4501, 0x450d, 0x4519, 0x4526, 0x4535, 0x4545, 0x4559, 0x4571,
-    0x5981, 0x5998, 0x59ad, 0x59bf, 0x59cf, 0x59dd, 0x59ea, 0x59f6,
-    0x5901, 0x590d, 0x5919, 0x5926, 0x5935, 0x5945, 0x5959, 0x5971,
-    0x7181, 0x7198, 0x71ad, 0x71bf, 0x71cf, 0x71dd, 0x71ea, 0x71f6,
-    0x7101, 0x710d, 0x7119, 0x7126, 0x7135, 0x7145, 0x7159, 0x7171
-};
-
-__device__ __forceinline__ void pf_iq4_decode_raw_pair(uint32_t raw, int32_t &lo, int32_t &hi)
-{
-    const uint32_t p0 = k_iq4_pf_pair_i16[raw & 0xffu];
-    const uint32_t p1 = k_iq4_pf_pair_i16[(raw >> 8) & 0xffu];
-    const uint32_t p2 = k_iq4_pf_pair_i16[(raw >> 16) & 0xffu];
-    const uint32_t p3 = k_iq4_pf_pair_i16[(raw >> 24) & 0xffu];
-    lo = static_cast<int32_t>(
-        (p0 & 0x00ffu) |
-        ((p1 & 0x00ffu) << 8) |
-        ((p2 & 0x00ffu) << 16) |
-        ((p3 & 0x00ffu) << 24));
-    hi = static_cast<int32_t>(
-        ((p0 >> 8) & 0x00ffu) |
-        (p1 & 0xff00u) |
-        ((p2 & 0xff00u) << 8) |
-        ((p3 & 0xff00u) << 16));
-}
-
 // IQ grid lookup tables (separate copies for this TU — initialized via
 // rocmInitIQGridTables_moe_prefill, same data as GEMV/GEMM TUs)
 __device__ __constant__ uint32_t d_pf_iq3s_grid[512];
@@ -637,12 +574,37 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
         }
     }
     else if constexpr (FMT == NVNNI_PF_IQ4_NL) {
-        // IQ4_NL: byte-pair LUT decode. Each payload byte contains two
-        // nibbles; the pair table returns both codebook values at once.
+        /*
+         * IQ4_NL / IQ4_XS verifier prefill must follow the same v_perm decode
+         * expression as the M=1 MoE row-decode helper.  The removed pair-LUT
+         * produced the intended int8 values, but it gave this translation unit
+         * a different expression tree and shifted FP32 verifier rows by ULPs.
+         */
+        constexpr uint32_t CB_LO_A = 0xBFAD9881u;
+        constexpr uint32_t CB_LO_B = 0xF6EADDCFu;
+        constexpr uint32_t CB_HI_A = 0x26190D01u;
+        constexpr uint32_t CB_HI_B = 0x71594535u;
+        constexpr uint32_t MUX_IDENTITY = 0x03020100u;
+        constexpr uint32_t MUX_BIT3_MASK = 0x04040404u;
         #pragma unroll
         for (int g = 0; g < 4; ++g) {
             const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-            pf_iq4_decode_raw_pair(raw, packed_groups[g], packed_groups[g + 4]);
+
+            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+            const uint32_t lo_sel = lo_nibs & 0x07070707u;
+            const uint32_t lo_r0 = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, lo_sel);
+            const uint32_t lo_r1 = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, lo_sel);
+            const uint32_t lo_mux = MUX_IDENTITY | ((lo_nibs >> 1) & MUX_BIT3_MASK);
+            packed_groups[g] =
+                static_cast<int32_t>(__builtin_amdgcn_perm(lo_r1, lo_r0, lo_mux));
+
+            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
+            const uint32_t hi_sel = hi_nibs & 0x07070707u;
+            const uint32_t hi_r0 = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, hi_sel);
+            const uint32_t hi_r1 = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, hi_sel);
+            const uint32_t hi_mux = MUX_IDENTITY | ((hi_nibs >> 1) & MUX_BIT3_MASK);
+            packed_groups[g + 4] =
+                static_cast<int32_t>(__builtin_amdgcn_perm(hi_r1, hi_r0, hi_mux));
         }
     }
     else if constexpr (Traits::center_4bit == 8) {
@@ -708,7 +670,6 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
     float acc = 0.0f;
 
-#pragma unroll 1
     for (int b = b_start; b < b_end; ++b)
     {
         const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) +
@@ -1891,8 +1852,9 @@ bool rocmMoE_grouped_prefill_pipeline(
         max_tokens_per_expert <= 4 &&
         d_scratch_gate &&
         d_scratch_up;
-    const bool verifier_decode_equivalent_down =
+    const bool verifier_decode_equivalent_ordered_down =
         verifier_decode_equivalent_gateup &&
+        !original_slot_atomic_scatter &&
         d_original_to_grouped &&
         (d_original_expert_ids || num_experts == 1);
     const bool use_gateup_kpart =
@@ -2066,7 +2028,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     // =========================================================================
     // Kernel 3: Down GEMM (same TILE_M bucket as gate/up)
     // =========================================================================
-    if (!original_slot_atomic_scatter && !verifier_decode_equivalent_down)
+    if (!original_slot_atomic_scatter && !verifier_decode_equivalent_ordered_down)
     {
         /*
          * CUDA's verifier path uses narrower down tiles for tiny active-expert
@@ -2152,7 +2114,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         dim3 block(TILE_N);
         if (d_original_to_grouped)
         {
-            if (verifier_decode_equivalent_down)
+            if (verifier_decode_equivalent_ordered_down)
             {
                 /*
                  * Verifier rows need the grouped path to be exactly comparable

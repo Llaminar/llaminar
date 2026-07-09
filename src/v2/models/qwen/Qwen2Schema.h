@@ -521,7 +521,9 @@ namespace llaminar2
 
                 // Norms - replicated
                 {"ATTENTION_NORM", SnapshotShardingMode::REPLICATED},
+                {"ATTENTION_NORM_RESIDUAL_OUT", SnapshotShardingMode::REPLICATED},
                 {"FFN_NORM", SnapshotShardingMode::REPLICATED},
+                {"FFN_NORM_RESIDUAL_OUT", SnapshotShardingMode::REPLICATED},
                 {"FINAL_NORM", SnapshotShardingMode::REPLICATED},
 
                 // FFN - column-parallel for gate/up, row-parallel for down

@@ -486,6 +486,13 @@ extern "C"
         uint32_t rebalance_command_buffer_count,
         int device_idx, void *stream);
 
+    bool hipMoE_softmax_topk_decode_equivalent_rows(
+        const float *logits,
+        int *expert_indices, float *expert_weights,
+        int seq_len, int num_experts, int top_k,
+        bool normalize_weights,
+        int device_idx, void *stream);
+
     bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         const float *partials,
         void *runtime,
@@ -873,6 +880,7 @@ extern "C"
         const float *routing_indices, const float *routing_weights,
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
+        int filter_to_local_runtime_experts,
         int device_idx, void *stream);
 
     bool hipMoE_regroup_prefill_routes_runtime_assignments(
@@ -3669,16 +3677,16 @@ namespace llaminar2
             return false;
         }
 
-        if (!hipMoE_softmax_topk(d_route_logits_,
-                                 d_route_indices_,
-                                 d_route_weights_,
-                                 seq_len,
-                                 num_experts,
-                                 top_k,
-                                 normalize_weights,
-                                 device_ordinal_,
-                                 getStream(),
-                                 nullptr))
+        if (!hipMoE_softmax_topk_decode_equivalent_rows(
+                d_route_logits_,
+                d_route_indices_,
+                d_route_weights_,
+                seq_len,
+                num_experts,
+                top_k,
+                normalize_weights,
+                device_ordinal_,
+                getStream()))
         {
             LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
             return false;
@@ -5930,7 +5938,19 @@ namespace llaminar2
         }
 
         const int k_partitions = debugEnv().rocm.moe_gateup_kparts;
-        const bool use_kpart_gateup = debugEnv().rocm.moe_gateup_kpart_decode;
+        /*
+         * Masked explicit-routing decode is the M=1 production contract for
+         * LocalTP / ExpertParallel verifier rows.  Non-local route slots are
+         * represented as -1 entries, and the grouped M=2..4 verifier publisher
+         * must be byte-identical to this path before its partial output is
+         * allreduced with peer shards.  Split-K gate/up changes the FP32 reduction
+         * tree, so masked verifier decode stays on the single-reduction grouped
+         * kernel even when the ordinary ROCm decode tuning knob is enabled.
+         */
+        const bool masked_decode_equivalent_routing = (expert_mask != nullptr);
+        const bool use_kpart_gateup =
+            !masked_decode_equivalent_routing &&
+            debugEnv().rocm.moe_gateup_kpart_decode;
         if (use_kpart_gateup && !groupedDecodeSupportsCodebook(table.codebook_id))
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] "
@@ -6277,7 +6297,16 @@ namespace llaminar2
         }
 
         const int gateup_k_partitions = debugEnv().rocm.moe_gateup_kparts;
-        const bool use_gateup_kpart = debugEnv().rocm.moe_gateup_kpart_decode;
+        /*
+         * Runtime grouped decode is the serial-row oracle for MTP verifier
+         * publication.  ROCm split-K gate/up reductions are fast, but they do
+         * not produce the same FP32 byte stream as the grouped verifier
+         * prefill kernels for IQ2/IQ4-style expert weights.  Keep this
+         * production decode entry point on the deterministic single-reduction
+         * gate/up path until a generated split-K policy is proven
+         * byte-identical for every codebook in the verifier sweep.
+         */
+        const bool use_gateup_kpart = false;
         if (use_gateup_kpart && !groupedDecodeSupportsCodebook(gateup_table.codebook_id))
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
@@ -6306,7 +6335,15 @@ namespace llaminar2
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
         const bool use_runtime_descriptors =
             descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
-        const bool use_parallel_down = debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+        /*
+         * Parallel down publishes route contributions with atomics.  Even when
+         * the numerical delta is only a few ULPs, the operation is not
+         * batch-invariant against grouped verifier rows because the atomic
+         * arrival order is not the serial top-k accumulation order.  Use the
+         * ordered serial-down publication in runtime decode so M=1 serial rows
+         * and grouped M=1..4 verifier rows share one byte-stable contract.
+         */
+        const bool use_parallel_down = false;
         if (use_parallel_down && !groupedDecodeSupportsCodebook(down_table.codebook_id))
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
@@ -6779,7 +6816,17 @@ namespace llaminar2
             return false;
         }
 
-        const bool use_parallel_down = debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+        /*
+         * LocalTP masked decode has to publish resident expert contributions in
+         * original top-k order and skip non-local slots deterministically.  The
+         * parallel down kernel uses atomic adds and therefore cannot define the
+         * byte-stable M=1 oracle for grouped verifier rows.
+         */
+        const bool masked_decode_equivalent_routing = (expert_mask != nullptr);
+        const bool use_parallel_down =
+            !masked_decode_equivalent_routing &&
+            debugEnv().rocm.moe_parallel_down_decode &&
+            top_k > 1;
         if (use_parallel_down && !groupedDecodeSupportsCodebook(table.codebook_id))
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] "
@@ -7067,7 +7114,8 @@ namespace llaminar2
         DeviceMoELayerRuntime *runtime_layer,
         ITensor *routing_indices, ITensor *routing_weights,
         int current_tokens, int max_tokens,
-        int num_experts, int top_k)
+        int num_experts, int top_k,
+        bool filter_to_local_runtime_experts)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -7105,6 +7153,7 @@ namespace llaminar2
             max_tokens * top_k,
             num_experts,
             top_k,
+            filter_to_local_runtime_experts ? 1 : 0,
             device_ordinal_,
             getStream());
     }
@@ -8277,25 +8326,42 @@ namespace llaminar2
 
         /*
          * Ordered scatter writes every output element exactly once and matches
-         * serial non-parallel decode.  When ROCm serial decode uses parallel
-         * down, the verifier must publish with the same route-slot atomic-add
-         * semantics; that mode accumulates into a pre-zeroed output just like
-         * the legacy atomic scatter fallback.
+         * the byte-stable serial top-k decode contract.  Non-verifier prefill
+         * may still opt into route-slot atomics below, but verifier-sized
+         * batches keep the deterministic ordered publisher even when the global
+         * ROCm parallel-down toggle is enabled.
          */
         const bool original_slot_atomic_scatter =
-            debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+            !verifier_decode_equivalent_gateup &&
+            debugEnv().rocm.moe_parallel_down_decode &&
+            top_k > 1;
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
         const bool shared_singleton_expert = (num_experts == 1 && top_k == 1);
-        const bool verifier_decode_equivalent_down =
+        /*
+         * Small-M verifier prefill has two decode-equivalent publication
+         * contracts:
+         *
+         * 1. Non-verifier prefill may still request the original route-slot
+         *    atomic grid when ROCm parallel down is enabled.  MTP verifier rows
+         *    deliberately do not: atomics make route contribution order depend
+         *    on scheduler arrival, which breaks byte equality against the
+         *    serial top-k decode contract.
+         *
+         * 2. ROCm serial decode without parallel down accumulates routes in
+         *    top-k order for each token/column.  In that mode ordered publish
+         *    overwrites every output element exactly once and avoids atomics.
+         */
+        const bool verifier_decode_equivalent_ordered_down =
             verifier_decode_equivalent_gateup &&
             ordered_scatter_overwrites_output &&
+            !original_slot_atomic_scatter &&
             (shared_singleton_expert || d_group_int_indices_ != nullptr);
         const bool scatter_overwrites_output =
             ordered_scatter_overwrites_output &&
-            (verifier_decode_equivalent_down || !original_slot_atomic_scatter);
+            (verifier_decode_equivalent_ordered_down || !original_slot_atomic_scatter);
         const int *d_original_expert_ids_for_pipeline =
-            (verifier_decode_equivalent_down || original_slot_atomic_scatter)
+            (verifier_decode_equivalent_ordered_down || original_slot_atomic_scatter)
                 ? (shared_singleton_expert ? nullptr : d_group_int_indices_)
                 : nullptr;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -8384,7 +8450,7 @@ namespace llaminar2
                          ? "decode_equiv_prefill"
                          : (pipeline_use_gateup_kpart ? "kpart_prefill" : "fused_prefill")},
                     {"down_route",
-                     verifier_decode_equivalent_down
+                     verifier_decode_equivalent_ordered_down
                          ? "decode_equiv_ordered_publish"
                          : (original_slot_atomic_scatter
                                 ? "original_slot_atomic"
@@ -8542,16 +8608,31 @@ namespace llaminar2
             return false;
         }
 
-        const bool original_slot_atomic_scatter =
-            debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
-        const bool verifier_decode_equivalent_down =
+        const bool verifier_decode_equivalent_gateup =
             active_expert_slots > 0 &&
             max_tokens_per_expert <= 4 &&
             d_prefill_gate_ != nullptr &&
-            d_prefill_up_ != nullptr &&
+            d_prefill_up_ != nullptr;
+        /*
+         * Runtime-table verifier prefill is the production MTP path for ROCm
+         * LLEP / ExpertParallel.  Keep it on the same batch-invariant contract
+         * as the direct grouped path: every output element is owned by one
+         * token/column worker, and that worker accumulates original top-k
+         * routes in serial decode order.  The global parallel-down toggle can
+         * still select original-slot atomics for larger non-verifier prefill,
+         * but atomics are not a valid verifier publication strategy because
+         * scheduler arrival order is not bitwise stable.
+         */
+        const bool original_slot_atomic_scatter =
+            !verifier_decode_equivalent_gateup &&
+            debugEnv().rocm.moe_parallel_down_decode &&
+            top_k > 1;
+        const bool verifier_decode_equivalent_ordered_down =
+            verifier_decode_equivalent_gateup &&
             d_group_original_to_grouped_ != nullptr &&
+            !original_slot_atomic_scatter &&
             runtime_host_layer.route_expert_ids != nullptr;
-        if (original_slot_atomic_scatter && !verifier_decode_equivalent_down)
+        if (original_slot_atomic_scatter)
         {
             hipError_t memset_err = hipMemsetAsync(
                 d_output,
@@ -8575,7 +8656,7 @@ namespace llaminar2
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
             d_group_original_to_grouped_,
-            (verifier_decode_equivalent_down || original_slot_atomic_scatter)
+            (verifier_decode_equivalent_ordered_down || original_slot_atomic_scatter)
                 ? runtime_host_layer.route_expert_ids
                 : nullptr,
             runtime_host_layer.grouped_route_weights,
@@ -8615,6 +8696,37 @@ namespace llaminar2
 
         output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
                              DeviceId::rocm(device_ordinal_));
+        if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
+        {
+            const int selected_tile_m =
+                selectGroupedPrefillTileM(debugEnv().rocm.moe_prefill_tile_m,
+                                          max_tokens_per_expert);
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_grouped_prefill_active_expert_grid_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                PerfStatsCollector::Tags{
+                    {"seq_len", std::to_string(seq_len)},
+                    {"top_k", std::to_string(top_k)},
+                    {"total_slots", std::to_string(total_slots)},
+                    {"active_expert_slots", std::to_string(active_expert_slots)},
+                    {"num_experts", std::to_string(num_experts)},
+                    {"tile_m", std::to_string(selected_tile_m)},
+                    {"gateup_route",
+                     verifier_decode_equivalent_gateup
+                         ? "decode_equiv_prefill"
+                         : "fused_prefill"},
+                    {"down_route",
+                     verifier_decode_equivalent_ordered_down
+                         ? "decode_equiv_ordered_publish"
+                         : (original_slot_atomic_scatter
+                                ? "original_slot_atomic"
+                                : "ordered_scatter")},
+                    {"gateup_kparts", "0"},
+                    {"grouping", "runtime"}});
+        }
         return true;
     }
 

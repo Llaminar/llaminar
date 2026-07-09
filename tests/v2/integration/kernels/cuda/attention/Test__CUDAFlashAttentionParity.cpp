@@ -47,6 +47,8 @@
 #include "../../../../utils/CUDATestUtils.h"
 #include "../../../../utils/TestTensorFactory.h"
 
+#include <cstdint>
+#include <cstring>
 #include <vector>
 #include <cmath>
 #include <random>
@@ -109,6 +111,74 @@ namespace
                 max_err = err;
         }
         return max_err;
+    }
+
+    /**
+     * @brief Assert that grouped verifier output is byte-identical to serial decode.
+     *
+     * MTP verifier rows are not ordinary approximate attention outputs: every
+     * row is eligible to be published into live speculative state.  For those
+     * rows, "close enough" would let grouped decode drift from the canonical
+     * serial M=1 path and eventually poison KV publication, logits, and token
+     * acceptance.  This helper therefore compares the raw FP32 bytes and only
+     * uses cosine/L2/max-error numbers as diagnostics when equality fails.
+     *
+     * @param actual Grouped verifier row produced by the production CUDA path.
+     * @param expected Serial M=1 decode row produced by the same CUDA kernel.
+     * @param count Number of FP32 elements in the row.
+     * @param label Human-readable context included in the assertion failure.
+     * @return AssertionSuccess when every byte matches, otherwise AssertionFailure.
+     */
+    ::testing::AssertionResult expectBitwiseEqualFP32Rows(
+        const float *actual,
+        const float *expected,
+        size_t count,
+        const std::string &label)
+    {
+        if (!actual || !expected)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " received a null FP32 row pointer";
+        }
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        size_t first = 0;
+        for (; first < count; ++first)
+        {
+            if (std::memcmp(actual + first, expected + first, sizeof(float)) != 0)
+                break;
+        }
+
+        double max_abs = 0.0;
+        size_t max_index = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double diff =
+                std::abs(static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
+            if (diff > max_abs)
+            {
+                max_abs = diff;
+                max_index = i;
+            }
+        }
+
+        uint32_t actual_bits = 0;
+        uint32_t expected_bits = 0;
+        std::memcpy(&actual_bits, actual + first, sizeof(uint32_t));
+        std::memcpy(&expected_bits, expected + first, sizeof(uint32_t));
+
+        return ::testing::AssertionFailure()
+               << label << " is not byte-identical to same-backend serial decode"
+               << " first_diff_index=" << first
+               << " actual=" << actual[first]
+               << " expected=" << expected[first]
+               << " actual_bits=0x" << std::hex << actual_bits
+               << " expected_bits=0x" << expected_bits << std::dec
+               << " max_abs=" << max_abs
+               << " max_index=" << max_index;
     }
 
     /**
@@ -702,10 +772,11 @@ protected:
             const double l2_error = relativeL2Error(grouped_row, serial_output.data(), q_cols);
             const double max_error = maxAbsError(grouped_row, serial_output.data(), q_cols);
             printComparisonStats(label, cosine, l2_error, max_error, q_cols);
-            EXPECT_GE(cosine, 0.999999)
-                << label << " row " << row << " must match serial decode";
-            EXPECT_LE(l2_error, 1e-5)
-                << label << " row " << row << " relative L2 differs from serial decode";
+            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                grouped_row,
+                serial_output.data(),
+                q_cols,
+                std::string(label) + " row " + std::to_string(row)));
         }
 
         cudaGraphExecDestroy(graph_exec);
@@ -1735,6 +1806,43 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
         "Captured append+attention FP16 cache Qwen3.6 LocalTP M2 RoPE-on-read vs M1");
 }
 
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPM3RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * M3 is the first verifier depth where two speculative rows precede the
+     * bonus row.  LocalTP must still evaluate each row with the exact serial
+     * KV length and GQA mapping, otherwise accepted-state publication can
+     * diverge even though the M2 smoke test remains green.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 LocalTP M3 RoPE-on-read vs M1");
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPM4RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * M4 covers the maximum grouped verifier row count currently used by the
+     * focused MTP sweeps.  Keeping the history+rows total fixed at 599 mirrors
+     * the long-context attention regime that exposed drift in the full model.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 LocalTP M4 RoPE-on-read vs M1");
+}
+
 TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM2RoPEOnReadRowsMatchSerialDecode)
 {
     SKIP_IF_NO_CUDA();
@@ -1752,6 +1860,44 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen
         /*n_kv_heads=*/1,
         /*head_dim=*/256,
         "Captured append+attention Q8_1 cache Qwen3.6 LocalTP M2 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM3RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * Production CUDA MTP generally consumes Q8_1 KV storage through a converted
+     * FP16 RoPE-on-read shadow.  This M3 case proves the converted-cache path is
+     * still byte-equivalent row-by-row once more than one draft token is present.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 LocalTP M3 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPM4RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * Q8_1 M4 combines the widest current verifier group with cache conversion.
+     * It is intentionally byte-exact because approximate agreement is not a
+     * sufficient proof for publishable grouped decode state.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 LocalTP M4 RoPE-on-read vs M1",
         ActivationPrecision::Q8_1);
 }
 
@@ -1777,6 +1923,47 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
         /*gqa_n_rep=*/16);
 }
 
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPSecondShardM3RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * The non-zero head offset is where local-vs-global GQA mistakes usually
+     * hide.  Exercise M3 so the second TP shard proves every grouped row uses
+     * the same KV head that serial decode would select.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 LocalTP shard1 M3 RoPE-on-read vs M1",
+        ActivationPrecision::FP16,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwen36LocalTPSecondShardM4RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * Same second-shard proof at M4, matching the maximum verifier group used
+     * by the current long-context MTP integration cells.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention FP16 cache Qwen3.6 LocalTP shard1 M4 RoPE-on-read vs M1",
+        ActivationPrecision::FP16,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
 TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM2RoPEOnReadRowsMatchSerialDecode)
 {
     SKIP_IF_NO_CUDA();
@@ -1794,6 +1981,47 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen
         /*n_kv_heads=*/1,
         /*head_dim=*/256,
         "Captured append+attention Q8_1 cache Qwen3.6 LocalTP shard1 M2 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM3RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * Q8_1 second-shard M3 keeps the converted-cache and global-GQA dimensions
+     * under the same strict decode-equivalence gate as the first shard.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/3,
+        /*history_len=*/596,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 LocalTP shard1 M3 RoPE-on-read vs M1",
+        ActivationPrecision::Q8_1,
+        /*head_start=*/8,
+        /*gqa_n_rep=*/16);
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_Q81Cache_Qwen36LocalTPSecondShardM4RoPEOnReadRowsMatchSerialDecode)
+{
+    SKIP_IF_NO_CUDA();
+
+    /*
+     * Q8_1 second-shard M4 is the highest-risk attention verifier shape in the
+     * focused LocalTP matrix: global head offsets, converted KV, and four
+     * publishable verifier rows all meet in one captured graph.
+     */
+    runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+        /*seq_len=*/4,
+        /*history_len=*/595,
+        /*n_heads=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/256,
+        "Captured append+attention Q8_1 cache Qwen3.6 LocalTP shard1 M4 RoPE-on-read vs M1",
         ActivationPrecision::Q8_1,
         /*head_start=*/8,
         /*gqa_n_rep=*/16);

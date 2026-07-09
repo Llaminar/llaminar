@@ -4125,6 +4125,48 @@ namespace llaminar2
         return handle;
     }
 
+    bool RankOrchestrator::hostLogicalStateMirrorsDeviceResidentState() const
+    {
+        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->hostLogicalStateMirrorsDeviceResidentState();
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->hostLogicalStateMirrorsDeviceResidentState();
+        }
+        if (device_runners_.size() < 2 ||
+            rank_resident_child_logical_state_handles_.size() !=
+                device_runners_.size())
+        {
+            return true;
+        }
+
+        /*
+         * The rank-owned mailbox is an identity token for LocalTP dispatch; the
+         * real logical rows live in child metadata buffers.  Treat the rank host
+         * mirrors as current only when every participant with a resident mailbox
+         * can make the same claim.  This keeps decode planning on the
+         * device-resident route after mirrored child publication.
+         */
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            const auto &child_handle =
+                rank_resident_child_logical_state_handles_[i];
+            if (!child_handle.valid())
+                return true;
+            if (!device_runners_[i])
+                return true;
+            if (!device_runners_[i]
+                     ->hostLogicalStateMirrorsDeviceResidentState())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,
@@ -11059,8 +11101,14 @@ namespace llaminar2
 
     bool RankOrchestrator::phaseSplitReplicatedDecodeSnapshotsActive() const
     {
-        if (current_padded_seq_len_ != 1)
+        const int max_decode_like_rows = config_.mtp.enabled
+                                             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+                                             : 1;
+        if (current_padded_seq_len_ <= 0 ||
+            current_padded_seq_len_ > max_decode_like_rows)
+        {
             return false;
+        }
 
         const auto &plan = config_.moe_expert_parallel_plan;
         if (!plan || !plan->isTieredOverlay())

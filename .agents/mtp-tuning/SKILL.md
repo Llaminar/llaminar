@@ -122,9 +122,44 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_.*MTP|^V2_Integration_
 ctest --test-dir build_v2_integration -R "^V2_Integration_.*VerifierRows|^V2_Integration_.*QuantisedGemmSmallM|^V2_Integration_.*NativeVNNI" --output-on-failure --parallel
 ```
 
+### Mandatory all-format grouped verifier sweeps
+
+These integration suites are the first line of defense for grouped verifier
+decode. They prove that production grouped rows are byte-identical to serial
+decode across the backend's advertised tensor/codebook formats. Run them after
+any change to MTP verifier rows, NativeVNNI/GEMV dispatch, MoE routed/shared
+expert kernels, LocalTP verifier output projection, attention, RMSNorm, or GDN
+projection. A failure here is a production grouped implementation bug; do not
+paper over it with serial row replay, relaxed thresholds, or a backend-specific
+format exception.
+
+Treat these sweeps as mandatory architecture proof, not ordinary smoke tests.
+Grouped decode is publishable only when every production grouped implementation
+is both byte-exact against serial M=1 decode and genuinely grouped/economical
+for every format that backend can load. If a new grouped verifier operation,
+codebook family, floating-point tensor format, or backend lane is added, extend
+the corresponding sweep in the same slice before tuning or claiming the lane is
+complete.
+
+```bash
+ctest --test-dir build_v2_integration -R "^(V2_Integration_GroupedVerifierRows_CPU_AllFormats|V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths)$" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^(V2_Integration_GroupedVerifierRows_CUDA_AllFormats|V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths|V2_Integration_GroupedVerifierRows_CUDA_LocalTPWo|V2_Integration_GroupedVerifierRows_CUDA_RMSNorm|V2_Integration_GroupedVerifierRows_CUDA_Attention)$" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^(V2_Integration_GroupedVerifierRows_ROCm_AllFormats|V2_Integration_GroupedVerifierRows_ROCm_MoEAllCodegroups|V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths|V2_Integration_GroupedVerifierRows_ROCm_LocalTPWo|V2_Integration_GroupedVerifierRows_ROCm_DenseQKV|V2_Integration_GroupedVerifierRows_ROCm_GDNProjection|V2_Integration_GroupedVerifierRows_ROCm_RMSNorm|V2_Integration_GroupedVerifierRows_ROCm_Attention)$" --output-on-failure --parallel
+```
+
+Use the backend-specific all-format sweep as the minimum acceptance gate for a
+narrow kernel edit, then run the full backend group before claiming that grouped
+decode is proven for that backend. Model-level prefix/MTP parity and
+`Qwen36_MTPForwardVerifierOperationEquivalence` remain required because they
+catch cross-stage amplification, but they do not replace the all-format sweeps.
+
 Do not run only the easy backend. If CUDA has a deep PyTorch or layer-by-layer
 test, ROCm and CPU need the same semantic coverage unless the plan explicitly
 marks the lane as not implemented.
+
+Refresh the canonical list with `ctest --test-dir build_v2_integration -N -R
+"GroupedVerifierRows"` when adding tests, then update this section so the skill
+continues to enumerate the blocking CPU, CUDA, and ROCm gates directly.
 
 ## Performance Methodology
 

@@ -444,12 +444,15 @@ namespace
             return selection;
         }
 
-        if (llaminar2::debugEnv().gemm.deterministic)
+        if (!rocm_env.fa_decode_autotune || llaminar2::debugEnv().gemm.deterministic)
         {
-            // Deterministic parity runs require a stable launch policy across
-            // fresh runners.  The autotuner is performance state, not model
-            // state, so rotating through trial TPB values can make two identical
-            // requests execute different kernels in one process.
+            // MTP verifier decode requires the grouped row path and the serial
+            // M=1 row path to use the same reduction shape. Online autotune
+            // trial rotation is useful during deliberate profiling, but it is
+            // process-local performance state rather than model state. If it is
+            // active in production, two identical decode requests can execute
+            // different split/TPB candidates and become only numerically close
+            // instead of byte-for-byte identical.
             return selection;
         }
 

@@ -2657,6 +2657,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_TRACE_COHERENCE=1` - Enable detailed coherence timing logs
      * - `LLAMINAR_ROCM_TRACE_KERNELS=1` - Enable per-kernel timing breakdown
      * - `LLAMINAR_ROCM_SYNC_AFTER_KERNEL=1` - Force hipDeviceSynchronize after each kernel
+     * - `LLAMINAR_ROCM_FA_DECODE_AUTOTUNE=1` - Enable ROCm flash-decode online launch-policy trial rotation for profiling only
      * - `LLAMINAR_ROCM_GEMV_LAYOUT=vnni` - Use VNNI-packed weights for GEMV when available
      * - `LLAMINAR_ROCM_PACK_VNNI_ONLY=1` - Prefer VNNI-only host packed buffers (drop row-major host copy when safe)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR=1` - Enable INT8 prefill grid-kpar split-K variant
@@ -2688,7 +2689,6 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` - Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (default: off)
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
-     * - `LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE=1` - Enable experimental shared-expert decode through MoE grouped FFN kernels (default: off)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
      * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
      * - `LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE=0` - Disable K-partitioned grouped MoE gate/up decode projection
@@ -2713,6 +2713,7 @@ namespace llaminar2
         bool trace_coherence = false;              ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
         bool trace_kernels = false;                ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
         bool sync_after_kernel = false;            ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+        bool fa_decode_autotune = false;           ///< Enable ROCm flash-decode online trial rotation for explicit profiling only.
         bool fa_decode_num_splits_present = false; ///< True when LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS is present, even if empty.
         std::optional<int> fa_decode_num_splits;   ///< Raw requested ROCm flash decode split count; dynamic call sites clamp it.
         std::optional<int> fa_decode_tpb;          ///< Raw requested ROCm flash decode TPB; dynamic call sites clamp it to 64..256.
@@ -2767,7 +2768,6 @@ namespace llaminar2
         bool concurrent_decode = false;            ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
         bool concurrent_m2_rows = false;           ///< Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (LLAMINAR_ROCM_CONCURRENT_M2_ROWS)
         bool gdn_concurrent_decode = true;         ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        bool shared_expert_grouped_decode = false; ///< Enable shared-expert decode through grouped MoE FFN kernels (LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE)
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
         bool moe_grouped_decode_router = true;     ///< Enable grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
@@ -2799,6 +2799,7 @@ namespace llaminar2
             trace_coherence = false;
             trace_kernels = false;
             sync_after_kernel = false;
+            fa_decode_autotune = false;
             fa_decode_num_splits_present = false;
             fa_decode_num_splits.reset();
             fa_decode_tpb.reset();
@@ -2853,7 +2854,6 @@ namespace llaminar2
             concurrent_decode = false;
             concurrent_m2_rows = false;
             gdn_concurrent_decode = true;
-            shared_expert_grouped_decode = false;
             moe_grouped_decode = true;
             moe_grouped_decode_router = true;
             moe_router_q8 = true;
@@ -2890,6 +2890,9 @@ namespace llaminar2
             {
                 sync_after_kernel = (std::atoi(sync_env) != 0);
             }
+
+            const char *fa_decode_autotune_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_AUTOTUNE");
+            fa_decode_autotune = fa_decode_autotune_env && std::atoi(fa_decode_autotune_env) != 0;
 
             const char *fa_decode_splits_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS");
             fa_decode_num_splits_present = fa_decode_splits_env != nullptr;
@@ -3213,11 +3216,6 @@ namespace llaminar2
                 gdn_concurrent_decode = (std::atoi(gdn_concurrent_decode_env) != 0);
             }
 
-            const char *shared_expert_grouped_decode_env = std::getenv("LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE");
-            if (shared_expert_grouped_decode_env)
-            {
-                shared_expert_grouped_decode = (std::atoi(shared_expert_grouped_decode_env) != 0);
-            }
 
             const char *moe_grouped_decode_env = std::getenv("LLAMINAR_ROCM_MOE_GROUPED_DECODE");
             if (moe_grouped_decode_env)
@@ -3719,12 +3717,14 @@ namespace llaminar2
         /// cost more than the bandwidth savings.
         size_t allreduce_fp16_min_elements = 8192;
 
-        /// Experimental LocalTP fast path for tiny two-GPU FP32/SUM allreduces.
-        /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE, default: disabled)
-        /// When enabled, homogeneous two-card CUDA/ROCm LocalTP domains can use
-        /// a graph-capturable peer-add kernel instead of NCCL/RCCL for small decode
-        /// reductions where library collective launch overhead dominates payload cost.
-        bool localtp_small_gpu_allreduce = false;
+        /// Production LocalTP fast path for tiny two-GPU FP32/SUM allreduces.
+        /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE, default: enabled)
+        /// Homogeneous two-card CUDA/ROCm LocalTP domains use a graph-capturable
+        /// peer-add kernel instead of NCCL/RCCL for small decode reductions.  This
+        /// is both an economy path (tiny library collectives are expensive) and a
+        /// decode-equivalence path: MTP verifier M=2..4 row reductions perform the
+        /// same per-element FP32 add as serial M=1 decode.
+        bool localtp_small_gpu_allreduce = true;
 
         /// Maximum element count for the small peer-add allreduce fast path.
         /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS, default: 8192)
@@ -3874,7 +3874,8 @@ namespace llaminar2
             allreduce_fp16_min_elements = 8192;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
-            localtp_small_gpu_allreduce = isTruthyEnvValue(std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"));
+            if (const char *small_ar = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"))
+                localtp_small_gpu_allreduce = isTruthyEnvValue(small_ar);
             localtp_small_gpu_allreduce_max_elements = 8192;
             if (const char *small_ar_max = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS"))
                 localtp_small_gpu_allreduce_max_elements = static_cast<size_t>(std::max(0, std::atoi(small_ar_max)));
@@ -4057,7 +4058,8 @@ namespace llaminar2
             allreduce_fp16_min_elements = 8192;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
-            localtp_small_gpu_allreduce = isTruthyEnvValue(std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"));
+            if (const char *small_ar = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"))
+                localtp_small_gpu_allreduce = isTruthyEnvValue(small_ar);
             localtp_small_gpu_allreduce_max_elements = 8192;
             if (const char *small_ar_max = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS"))
                 localtp_small_gpu_allreduce_max_elements = static_cast<size_t>(std::max(0, std::atoi(small_ar_max)));

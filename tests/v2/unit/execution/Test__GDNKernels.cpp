@@ -460,20 +460,6 @@ TEST(GDNROCmConfig, ConcurrentDecodeFlagDefaultsOnAndParsesEnv)
     EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
 }
 
-TEST(GDNROCmConfig, SharedExpertGroupedDecodeFlagDefaultsOffAndParsesEnv)
-{
-    ScopedEnvVar flag("LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE");
-
-    flag.clear();
-    EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
-
-    flag.set("1");
-    EXPECT_TRUE(debugEnv().rocm.shared_expert_grouped_decode);
-
-    flag.set("0");
-    EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
-}
-
 TEST(GDNROCmConfig, MoERouterQ8DefaultsOnAndParsesEnv)
 {
     ScopedEnvVar flag("LLAMINAR_ROCM_MOE_ROUTER_Q8");

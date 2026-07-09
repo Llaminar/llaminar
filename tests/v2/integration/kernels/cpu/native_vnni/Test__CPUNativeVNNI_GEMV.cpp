@@ -36,6 +36,7 @@
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 #include "fort.hpp"
@@ -91,6 +92,44 @@ namespace
 
     static auto *g_mpi_env [[maybe_unused]] =
         ::testing::AddGlobalTestEnvironment(new MPIEnvironment);
+
+    /**
+     * @brief Temporarily override one environment variable and reload CPU VNNI knobs.
+     *
+     * The NativeVNNI tile selector reads `LLAMINAR_CPU_VNNI_*` through DebugEnv,
+     * so tests that force a dispatch lane must update both the process
+     * environment and the cached debug-env snapshot.  Restoring in the destructor
+     * keeps later all-format sweeps on the production auto-selected policy.
+     */
+    class ScopedCPUVNNIEnv
+    {
+    public:
+        ScopedCPUVNNIEnv(const char *name, const char *value)
+            : name_(name),
+              had_old_(std::getenv(name) != nullptr),
+              old_value_(had_old_ ? std::getenv(name) : "")
+        {
+            setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().cpu_vnni.reload();
+        }
+
+        ~ScopedCPUVNNIEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().cpu_vnni.reload();
+        }
+
+        ScopedCPUVNNIEnv(const ScopedCPUVNNIEnv &) = delete;
+        ScopedCPUVNNIEnv &operator=(const ScopedCPUVNNIEnv &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_;
+        std::string old_value_;
+    };
 
     // =========================================================================
     // FP32 CPU reference GEMV (double-precision accumulation)
@@ -1212,6 +1251,127 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+    TEST_F(CPUNativeVNNIGemvTest, MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows)
+    {
+        constexpr int K = 4096;
+        constexpr int N0 = 384;
+        constexpr int N1 = 320;
+        const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+        ScopedCPUVNNIEnv force_k_tiles("LLAMINAR_CPU_VNNI_K_TILES", "4");
+        setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_native_vnni_kparallel_grouped_verifier.json", 1);
+        PerfStatsCollector::reset();
+        ASSERT_EQ(debugEnv().cpu_vnni.k_tiles, 4)
+            << "This regression must force the CPU NativeVNNI K-parallel "
+               "grouped verifier lane";
+
+        for (const auto &fmt : ALL_FORMATS)
+        {
+            SCOPED_TRACE(fmt.name);
+
+            auto weights0 = createWeightsForFormat(fmt.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << fmt.name << " projection0 weights";
+            ASSERT_NE(weights1, nullptr) << fmt.name << " projection1 weights";
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt.name << " projection0 pack";
+            ASSERT_TRUE(kernel1.isValid()) << fmt.name << " projection1 pack";
+
+            for (int M : verifier_rows)
+            {
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -0.75f,
+                    0.75f,
+                    static_cast<uint32_t>(5100 + M * 17 + fmt.name.size() * 131));
+                ASSERT_NE(input, nullptr);
+
+                FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &grouped0, N0, nullptr, "mtp_verifier_kparallel_projection0"},
+                    {&kernel1, &grouped1, N1, nullptr, "mtp_verifier_kparallel_projection1"}};
+
+                ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(),
+                    projections,
+                    M,
+                    K))
+                    << fmt.name << " K-parallel grouped verifier projections failed";
+
+                std::vector<float> serial0(
+                    static_cast<size_t>(M) * static_cast<size_t>(N0),
+                    0.0f);
+                std::vector<float> serial1(
+                    static_cast<size_t>(M) * static_cast<size_t>(N1),
+                    0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel0,
+                        input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
+                        1,
+                        N0,
+                        K))
+                        << fmt.name << " projection0 serial decode failed at M=" << M
+                        << " row=" << row;
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel1,
+                        input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
+                        1,
+                        N1,
+                        K))
+                        << fmt.name << " projection1 serial decode failed at M=" << M
+                        << " row=" << row;
+                }
+
+                expectBitwiseEqualFloatRows(
+                    fmt.name + std::string(" CPU K-parallel grouped verifier projection0 M=") +
+                        std::to_string(M),
+                    grouped0.data(),
+                    serial0.data(),
+                    serial0.size(),
+                    static_cast<size_t>(N0));
+                expectBitwiseEqualFloatRows(
+                    fmt.name + std::string(" CPU K-parallel grouped verifier projection1 M=") +
+                        std::to_string(M),
+                    grouped1.data(),
+                    serial1.data(),
+                    serial1.size(),
+                    static_cast<size_t>(N1));
+            }
+        }
+
+        const auto records = PerfStatsCollector::snapshot({
+            "kernel.cpu_native_vnni_fused_grouped_verifier_projection_calls"});
+        uint64_t fused_grouped_verifier_calls = 0;
+        for (const auto &record : records)
+        {
+            if (record.domain == "kernel" &&
+                record.name == "cpu_native_vnni_fused_grouped_verifier_projection_calls" &&
+                record.kind == PerfStatRecord::Kind::Counter)
+            {
+                EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+                EXPECT_EQ(record.tags.at("projections"), "2");
+                fused_grouped_verifier_calls += record.count;
+            }
+        }
+        EXPECT_EQ(
+            fused_grouped_verifier_calls,
+            ALL_FORMATS.size() * verifier_rows.size())
+            << "Every CPU NativeVNNI format and M=2/3/4 shape must enter the "
+               "fused grouped verifier route under forced K-parallel tiling";
+
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+
 #ifdef HAVE_ONEDNN
     TEST_F(CPUNativeVNNIGemvTest, MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters)
     {
@@ -1695,8 +1855,12 @@ namespace
         }
 
         const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
-        EXPECT_GE(cosineSimilarity(batched.data(), serial.data(), count), 0.999999f);
-        EXPECT_LE(maxAbsError(batched.data(), serial.data(), count), 1e-5f);
+        expectBitwiseEqualFloatRows(
+            "CPU Q4_K untrained-shape verifier rows must match pairwise serial decode",
+            batched.data(),
+            serial.data(),
+            count,
+            static_cast<size_t>(N));
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
@@ -1761,21 +1925,18 @@ namespace
                 static_cast<size_t>(N1) * sizeof(float));
         }
 
-        const size_t count0 = static_cast<size_t>(M) * static_cast<size_t>(N0);
-        const size_t count1 = static_cast<size_t>(M) * static_cast<size_t>(N1);
-        const float cos0 = cosineSimilarity(grouped0.data(), serial0.data(), count0);
-        const float cos1 = cosineSimilarity(grouped1.data(), serial1.data(), count1);
-        const float err0 = maxAbsError(grouped0.data(), serial0.data(), count0);
-        const float err1 = maxAbsError(grouped1.data(), serial1.data(), count1);
-
-        EXPECT_GE(cos0, 0.999999f)
-            << "Grouped rotated projection 0 must equal serial decode rows";
-        EXPECT_GE(cos1, 0.999999f)
-            << "Grouped rotated projection 1 must equal serial decode rows";
-        EXPECT_LE(err0, 1e-5f)
-            << "Grouped rotated projection 0 max error";
-        EXPECT_LE(err1, 1e-5f)
-            << "Grouped rotated projection 1 max error";
+        expectBitwiseEqualFloatRows(
+            "CPU rotated grouped verifier projection 0",
+            grouped0.data(),
+            serial0.data(),
+            static_cast<size_t>(M) * static_cast<size_t>(N0),
+            static_cast<size_t>(N0));
+        expectBitwiseEqualFloatRows(
+            "CPU rotated grouped verifier projection 1",
+            grouped1.data(),
+            serial1.data(),
+            static_cast<size_t>(M) * static_cast<size_t>(N1),
+            static_cast<size_t>(N1));
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_Qwen36ShapesMatchSerialDecodeRows)
@@ -1849,13 +2010,13 @@ namespace
                         << shape.name << " serial decode GEMV failed at row=" << row;
                 }
 
-                const size_t count = static_cast<size_t>(M) * static_cast<size_t>(shape.N);
-                const float cos = cosineSimilarity(batched.data(), serial.data(), count);
-                const float max_err = maxAbsError(batched.data(), serial.data(), count);
-                EXPECT_GE(cos, 0.999999f)
-                    << shape.name << " grouped verifier hook differs from serial decode rows";
-                EXPECT_LE(max_err, 1e-5f)
-                    << shape.name << " grouped verifier hook max error differs from serial decode rows";
+                expectBitwiseEqualFloatRows(
+                    std::string(shape.name) + " CPU grouped verifier rows M=" +
+                        std::to_string(M),
+                    batched.data(),
+                    serial.data(),
+                    static_cast<size_t>(M) * static_cast<size_t>(shape.N),
+                    static_cast<size_t>(shape.N));
             }
         }
     }
@@ -1945,13 +2106,13 @@ namespace
                             << tensor_name << " serial decode GEMV failed at row=" << row;
                     }
 
-                    const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
-                    const float cos = cosineSimilarity(grouped.data(), serial.data(), count);
-                    const float max_err = maxAbsError(grouped.data(), serial.data(), count);
-                    EXPECT_GE(cos, 0.999999f)
-                        << tensor_name << " real-weight grouped verifier output drifted from serial decode";
-                    EXPECT_LE(max_err, 1e-5f)
-                        << tensor_name << " real-weight grouped verifier max error";
+                    expectBitwiseEqualFloatRows(
+                        std::string(tensor_name) + " CPU real-weight grouped verifier rows M=" +
+                            std::to_string(M) + " activation=" + activation_case.label,
+                        grouped.data(),
+                        serial.data(),
+                        static_cast<size_t>(M) * static_cast<size_t>(N),
+                        static_cast<size_t>(N));
                 }
             }
         }

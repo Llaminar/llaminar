@@ -126,75 +126,22 @@ extern "C"
         cudaFree(buf);
     }
 
-    int cudaLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal)
+    int cudaLocalTPSmallFP32AllreduceScratchAlloc(void **buf, size_t bytes, int ordinal)
     {
-        if (!event_out)
+        if (!buf || bytes == 0)
             return static_cast<int>(cudaErrorInvalidValue);
         cudaError_t err = cudaSetDevice(ordinal);
         if (err != cudaSuccess)
             return static_cast<int>(err);
-        cudaEvent_t event;
-        err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            *event_out = nullptr;
-            return static_cast<int>(err);
-        }
-        *event_out = static_cast<void *>(event);
-        return static_cast<int>(cudaSuccess);
+        return static_cast<int>(cudaMalloc(buf, bytes));
     }
 
-    void cudaLocalTPSmallFP32AllreduceDestroyEvent(void *event, int ordinal)
+    void cudaLocalTPSmallFP32AllreduceScratchFree(void *buf, int ordinal)
     {
-        if (!event)
+        if (!buf)
             return;
         (void)cudaSetDevice(ordinal);
-        (void)cudaEventDestroy(static_cast<cudaEvent_t>(event));
-    }
-
-    int cudaLocalTPSmallFP32AllreduceRecordEvent(void *event, int ordinal, void *stream)
-    {
-        if (!event || !stream)
-            return static_cast<int>(cudaErrorInvalidValue);
-        cudaError_t err = cudaSetDevice(ordinal);
-        if (err != cudaSuccess)
-            return static_cast<int>(err);
-        err = cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream));
-        return static_cast<int>(err);
-    }
-
-    int cudaLocalTPSmallFP32AllreduceWaitEvent(void *event, int ordinal, void *stream)
-    {
-        if (!event || !stream)
-            return static_cast<int>(cudaErrorInvalidValue);
-        cudaError_t err = cudaSetDevice(ordinal);
-        if (err != cudaSuccess)
-            return static_cast<int>(err);
-        err = cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(event), 0);
-        return static_cast<int>(err);
-    }
-
-    int cudaLocalTPSmallFP32AllreduceCanAccessPeer(int ordinal, int peer_ordinal)
-    {
-        int can_access = 0;
-        cudaError_t err = cudaDeviceCanAccessPeer(&can_access, ordinal, peer_ordinal);
-        if (err != cudaSuccess)
-            return 0;
-        return can_access != 0;
-    }
-
-    int cudaLocalTPSmallFP32AllreduceEnablePeerAccess(int ordinal, int peer_ordinal)
-    {
-        cudaError_t err = cudaSetDevice(ordinal);
-        if (err != cudaSuccess)
-            return static_cast<int>(err);
-        err = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
-        if (err == cudaErrorPeerAccessAlreadyEnabled)
-        {
-            (void)cudaGetLastError();
-            return static_cast<int>(cudaSuccess);
-        }
-        return static_cast<int>(err);
+        (void)cudaFree(buf);
     }
 
     int cudaLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,

@@ -446,6 +446,14 @@ namespace llaminar2
             grouped_down_desc_table_d_model_ = 0;
             grouped_down_desc_table_intermediate_ = 0;
             grouped_down_desc_table_dirty_ = false;
+            combined_shared_gateup_desc_table_id_ = -1;
+            combined_shared_gateup_desc_table_d_model_ = 0;
+            combined_shared_gateup_desc_table_intermediate_ = 0;
+            combined_shared_down_desc_table_id_ = -1;
+            combined_shared_down_desc_table_d_model_ = 0;
+            combined_shared_down_desc_table_intermediate_ = 0;
+            combined_shared_desc_table_d_model_ = 0;
+            combined_shared_desc_table_intermediate_ = 0;
             runtime_grouped_decode_warmed_ = false;
         }
 
@@ -677,8 +685,9 @@ namespace llaminar2
          * The rejected shortcut treated the shared expert as an extra routed expert
          * in one MoE prefill table.  This predicate guards the replacement design:
          * routed experts use the proven grouped verifier pipeline, shared expert
-         * rows use decode-equivalent GEMV-many projections, and the stage combines
-         * those two branch outputs with the normal shared-gate add kernel.
+         * rows use the same grouped table-prefill route as standalone shared
+         * verifier rows, and the stage combines those two branch outputs with
+         * the normal shared-gate add kernel.
          */
         bool canUseSafeCombinedSharedVerifierComposite() const;
         TensorBase *effectiveSafeCompositeSharedGateInput() const;
@@ -722,6 +731,12 @@ namespace llaminar2
 
         mutable int combined_shared_desc_table_d_model_ = 0;
         mutable int combined_shared_desc_table_intermediate_ = 0;
+        mutable int combined_shared_gateup_desc_table_id_ = -1;
+        mutable int combined_shared_gateup_desc_table_d_model_ = 0;
+        mutable int combined_shared_gateup_desc_table_intermediate_ = 0;
+        mutable int combined_shared_down_desc_table_id_ = -1;
+        mutable int combined_shared_down_desc_table_d_model_ = 0;
+        mutable int combined_shared_down_desc_table_intermediate_ = 0;
         mutable std::shared_ptr<FP32Tensor> combined_shared_gate_inp_fp32_;
         mutable TensorBase *combined_shared_gate_inp_source_ = nullptr;
         mutable ITensorGemm *combined_shared_gate_gemm_ = nullptr;
@@ -846,6 +861,7 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         bool usesGroupedVerifierPrefillRouteForTesting() const;
+        bool usesDecodeEquivalentVerifierPrefillForTesting() const;
         bool usesCPUDecodeEquivalentVerifierPrefillForTesting() const;
         bool usesGroupedDecodeForTesting() const;
 

@@ -28,9 +28,12 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -560,6 +563,98 @@ protected:
                 << label << " row=" << row;
         }
     }
+
+    static void expectRowsByteEqual(
+        const float *actual,
+        const float *reference,
+        int rows,
+        int cols,
+        const std::string &label)
+    {
+        const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        if (std::memcmp(actual, reference, total * sizeof(float)) == 0)
+            return;
+
+        size_t first = 0;
+        while (first < total && actual[first] == reference[first])
+            ++first;
+
+        uint32_t actual_bits = 0;
+        uint32_t reference_bits = 0;
+        if (first < total)
+        {
+            std::memcpy(&actual_bits, actual + first, sizeof(actual_bits));
+            std::memcpy(&reference_bits, reference + first, sizeof(reference_bits));
+        }
+
+        const size_t safe_cols = cols > 0 ? static_cast<size_t>(cols) : total;
+        ADD_FAILURE()
+            << label
+            << " first_mismatch=" << first
+            << " row=" << (first / safe_cols)
+            << " col=" << (first % safe_cols)
+            << " actual=" << (first < total ? actual[first] : 0.0f)
+            << " reference=" << (first < total ? reference[first] : 0.0f)
+            << " actual_bits=0x" << std::hex << actual_bits
+            << " reference_bits=0x" << reference_bits << std::dec
+            << " relative_l2=" << relativeL2(actual, reference, total)
+            << " max_abs=" << maxAbsDiff(actual, reference, total);
+    }
+
+    using CPUVerifierWeightCreator = std::function<std::unique_ptr<TensorBase>(
+        const std::vector<size_t> &shape,
+        int seed)>;
+
+    struct CPUVerifierFormatCase
+    {
+        const char *label;
+        CPUVerifierWeightCreator create;
+    };
+
+    std::vector<CPUVerifierFormatCase> cpuVerifierNativeFormats()
+    {
+        return {
+            {"Q4_0", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_0Random(shape, seed); }},
+            {"IQ4_NL", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
+            {"IQ4_XS", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
+            {"Q4_1", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_1Random(shape, seed); }},
+            {"Q4_K", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_KRandom(shape, seed); }},
+            {"Q5_0", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_0Random(shape, seed); }},
+            {"Q5_1", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_1Random(shape, seed); }},
+            {"Q5_K", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_KRandom(shape, seed); }},
+            {"Q6_K", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ6_KRandom(shape, seed); }},
+            {"Q3_K", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ3_KRandom(shape, seed); }},
+            {"Q2_K", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ2_KRandom(shape, seed); }},
+            {"IQ3_S", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ3_SRandom(shape, seed); }},
+            {"IQ3_XXS", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }},
+            {"IQ2_S", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }},
+            {"IQ2_XS", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }},
+            {"IQ2_XXS", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }},
+            {"IQ1_S", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }},
+            {"IQ1_M", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }},
+            {"Q8_0", [](const std::vector<size_t> &shape, int seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ8_0Random(shape, seed); }},
+        };
+    }
+
     /// Compute routing results and return as FP32 tensors for MoEExpertComputeStage input.
     /// Runs IMoEKernel::route() directly, converts indices to float.
     struct RoutingResult
@@ -1192,7 +1287,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     }
 }
 
-TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierMatchesSerialDecode)
+TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierAllNativeFormatsMatchSerialDecodeByteExact)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     PerfStatsCollector::reset();
@@ -1200,85 +1295,113 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierMatchesSerialDecode)
     const int d = 256;
     const int inter = 256;
 
-    auto gate_w = TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(inter), static_cast<size_t>(d)}, 701);
-    auto up_w = TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(inter), static_cast<size_t>(d)}, 702);
-    auto down_w = TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(d), static_cast<size_t>(inter)}, 703);
-
-    auto run_shared = [&](TensorBase *run_input, TensorBase *run_output, int run_seq, int layer)
+    const auto formats = cpuVerifierNativeFormats();
+    for (size_t format_index = 0; format_index < formats.size(); ++format_index)
     {
-        auto prepared = makePreparedFFNFixture(
-            gate_w.get(), up_w.get(), down_w.get(), DeviceId::cpu(), layer, "ffn_shexp");
+        const auto &format = formats[format_index];
+        SCOPED_TRACE(format.label);
+        PerfStatsCollector::reset();
 
-        SharedExpertFFNStage::Params params;
-        params.device_id = DeviceId::cpu();
-        params.input = run_input;
-        params.gate_w = gate_w.get();
-        params.up_w = up_w.get();
-        params.down_w = down_w.get();
-        params.output = run_output;
-        params.seq_len = run_seq;
-        params.d_model = d;
-        params.intermediate = inter;
-        params.prepared_ref_gate = prepared.gate_ref;
-        params.prepared_ref_up = prepared.up_ref;
-        params.prepared_ref_down = prepared.down_ref;
-        params.prepared_store = prepared.store.get();
-        params.force_decode_equivalent_verifier_prefill = run_seq > 1;
+        auto gate_w = format.create(
+            {static_cast<size_t>(inter), static_cast<size_t>(d)},
+            static_cast<int>(701 + 10 * format_index));
+        auto up_w = format.create(
+            {static_cast<size_t>(inter), static_cast<size_t>(d)},
+            static_cast<int>(702 + 10 * format_index));
+        auto down_w = format.create(
+            {static_cast<size_t>(d), static_cast<size_t>(inter)},
+            static_cast<int>(703 + 10 * format_index));
 
-        SharedExpertFFNStage stage(params);
-        if (run_seq > 1)
-            EXPECT_TRUE(stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
-        return stage.execute(cpu_ctx_.get());
-    };
-
-    for (const int seq : std::array<int, 3>{2, 3, 4})
-    {
-        SCOPED_TRACE("seq=" + std::to_string(seq));
-        auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(seq), static_cast<size_t>(d)}, -0.5f, 0.5f, 700 + seq);
-        auto multi_output = TestTensorFactory::createFP32({static_cast<size_t>(seq), static_cast<size_t>(d)});
-        auto serial_output = TestTensorFactory::createFP32({static_cast<size_t>(seq), static_cast<size_t>(d)});
-
-        ASSERT_TRUE(run_shared(input.get(), multi_output.get(), seq, 10 + seq));
-
-        for (int row = 0; row < seq; ++row)
+        auto run_shared = [&](TensorBase *run_input, TensorBase *run_output, int run_seq, int layer)
         {
-            FP32Tensor row_input({1, static_cast<size_t>(d)});
-            FP32Tensor row_output({1, static_cast<size_t>(d)});
-            std::copy_n(input->data() + static_cast<size_t>(row) * d,
-                        d,
-                        row_input.mutable_data());
-            ASSERT_TRUE(run_shared(&row_input, &row_output, 1, 20 + seq * 10 + row));
-            std::copy_n(row_output.data(),
-                        d,
-                        serial_output->mutable_data() + static_cast<size_t>(row) * d);
+            auto prepared = makePreparedFFNFixture(
+                gate_w.get(), up_w.get(), down_w.get(), DeviceId::cpu(), layer, "ffn_shexp");
+
+            SharedExpertFFNStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.input = run_input;
+            params.gate_w = gate_w.get();
+            params.up_w = up_w.get();
+            params.down_w = down_w.get();
+            params.output = run_output;
+            params.seq_len = run_seq;
+            params.d_model = d;
+            params.intermediate = inter;
+            params.prepared_ref_gate = prepared.gate_ref;
+            params.prepared_ref_up = prepared.up_ref;
+            params.prepared_ref_down = prepared.down_ref;
+            params.prepared_store = prepared.store.get();
+            params.force_decode_equivalent_verifier_prefill = run_seq > 1;
+
+            SharedExpertFFNStage stage(params);
+            if (run_seq > 1)
+                EXPECT_TRUE(stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
+            return stage.execute(cpu_ctx_.get());
+        };
+
+        for (const int seq : std::array<int, 3>{2, 3, 4})
+        {
+            SCOPED_TRACE("seq=" + std::to_string(seq));
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(seq), static_cast<size_t>(d)},
+                -0.5f,
+                0.5f,
+                700 + seq);
+            auto multi_output = TestTensorFactory::createFP32({static_cast<size_t>(seq), static_cast<size_t>(d)});
+            auto serial_output = TestTensorFactory::createFP32({static_cast<size_t>(seq), static_cast<size_t>(d)});
+
+            ASSERT_TRUE(run_shared(
+                input.get(),
+                multi_output.get(),
+                seq,
+                static_cast<int>(1000 + 100 * format_index + seq)));
+
+            for (int row = 0; row < seq; ++row)
+            {
+                FP32Tensor row_input({1, static_cast<size_t>(d)});
+                FP32Tensor row_output({1, static_cast<size_t>(d)});
+                std::copy_n(input->data() + static_cast<size_t>(row) * d,
+                            d,
+                            row_input.mutable_data());
+                ASSERT_TRUE(run_shared(
+                    &row_input,
+                    &row_output,
+                    1,
+                    static_cast<int>(2000 + 100 * format_index + seq * 10 + row)));
+                std::copy_n(row_output.data(),
+                            d,
+                            serial_output->mutable_data() + static_cast<size_t>(row) * d);
+            }
+
+            expectRowsByteEqual(
+                multi_output->data(),
+                serial_output->data(),
+                seq,
+                d,
+                std::string("shared expert verifier format=") + format.label);
         }
 
-        expectStrictRowsClose(
-            multi_output->data(),
-            serial_output->data(),
-            seq,
-            d,
-            "shared expert verifier");
+        const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
+        EXPECT_TRUE(hasPerfCounterWithRoute(
+            records,
+            "mtp",
+            "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
+            "cpu_grouped_verifier_hooks"))
+            << "CPU shared expert verifier must use grouped verifier hooks, not row replay for "
+            << format.label << ".\n"
+            << PerfStatsCollector::summaryString({"mtp", "kernel"});
+        EXPECT_TRUE(std::any_of(
+            records.begin(),
+            records.end(),
+            [](const PerfStatRecord &record)
+            {
+                return record.domain == "kernel" &&
+                       record.name == "cpu_native_vnni_grouped_verifier_swiglu_down_calls";
+            }))
+            << "CPU shared expert verifier must exercise the grouped SwiGLU/down kernel for "
+            << format.label << ".\n"
+            << PerfStatsCollector::summaryString({"mtp", "kernel"});
     }
-
-    const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
-    EXPECT_TRUE(hasPerfCounterWithRoute(
-        records,
-        "mtp",
-        "moe_shared_grouped_decode_equivalent_verifier_prefill_rows",
-        "cpu_grouped_verifier_hooks"))
-        << "CPU shared expert verifier must use grouped verifier hooks, not row replay.\n"
-        << PerfStatsCollector::summaryString({"mtp", "kernel"});
-    EXPECT_TRUE(std::any_of(
-        records.begin(),
-        records.end(),
-        [](const PerfStatRecord &record)
-        {
-            return record.domain == "kernel" &&
-                   record.name == "cpu_native_vnni_grouped_verifier_swiglu_down_calls";
-        }))
-        << "CPU shared expert verifier must exercise the grouped SwiGLU/down kernel.\n"
-        << PerfStatsCollector::summaryString({"mtp", "kernel"});
     PerfStatsCollector::reset();
 }
 
