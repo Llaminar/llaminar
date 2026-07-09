@@ -92,10 +92,10 @@ build time on both CUDA and ROCm.
   sidecar graph invalidation.
 - CUDA attention guard rejects `cudaMallocHost` / `cudaFreeHost` regression.
 - LocalTP GPU grouped path: mirrored children publish resident outcomes;
-  greedy/stoch prelaunch from rank resident mailboxes before the response
-  bridge, request-batch rows use device-token matrices/resident conditions, and
-  target-slot shifted commits fan out. No row replay, GPU host plans/base-cache
-  vectors, or host-plan outcome materializer. Gates:
+  greedy/stoch prelaunch uses rank resident mailboxes, request batches use
+  device-token matrices/resident conditions, and target-slot commits fan out.
+  Stop-first commits output-only before sidecar/verifier.
+  No row replay, GPU host plans, base-cache vectors, or host materializer. Gates:
   focused units, full unit `517/517`; Qwen3.6 LocalTP parity `13/13` prior.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,
   CPU MTP thinking `27/27`, dense Qwen3.6 E2E `261/261`.

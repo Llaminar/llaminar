@@ -6026,6 +6026,50 @@ namespace llaminar2
         bool first_token_is_stop =
             first_token != kDeferredMTPFirstTokenShadow &&
             std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end();
+        if (first_token_is_stop && !first_token_is_pending_condition)
+        {
+            /*
+             * A host-visible stop token selected from the current target row is
+             * already the serial decode answer.  No speculative sidecar row or
+             * grouped verifier row may become part of live state, and running
+             * them would only add work after the request is known complete.
+             * Deferred device-token lanes still flow through the compact
+             * outcome reducer because the host cannot inspect the token here.
+             */
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "first_token_stop_direct_completes",
+                1.0,
+                "decode",
+                {},
+                {{"requested_draft_tokens",
+                  std::to_string(requested_speculative_draft_count)},
+                 {"stochastic_verify", stochastic_verify ? "true" : "false"},
+                 {"policy_path",
+                  use_grouped_outcome_device_resident_publication_verifier
+                      ? "grouped_outcome_device_resident_publication"
+                      : (use_all_position_state_publication_verifier
+                             ? "all_position_state_publication"
+                             : "sequential_verifier")}});
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "output_tokens",
+                1.0,
+                "decode");
+            if (auto commit_error = commit_mtp_transaction_outputs(
+                    "first_token_stop_direct",
+                    verifier_base_checkpoint,
+                    std::vector<int32_t>{first_token},
+                    std::nullopt,
+                    /*terminal_logits_ready=*/false,
+                    /*is_complete=*/true,
+                    PrefixStateProvenance::DecodeEquivalent,
+                    /*state_advanced=*/false))
+            {
+                return fail_after_checkpoint(*commit_error);
+            }
+            return result;
+        }
         std::vector<int32_t> draft_tokens;
         draft_tokens.reserve(static_cast<size_t>(speculative_draft_count) + 1);
         draft_tokens.push_back(first_token);

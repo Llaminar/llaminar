@@ -9039,6 +9039,119 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, GroupedOutcomeDeviceResidentPublicationStopsOnFirstTokenBeforeSidecar)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() /
+            "llaminar_mtp_grouped_outcome_first_stop_unit.json";
+        ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+        PerfStatsCollector::reset();
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+        runner->setStopTokens({MockInferenceRunner::PREFILL_ARGMAX_TOKEN});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const int forward_count_after_prefill = mock->forwardCallCount();
+
+        GenerationResult step = runner->decodeStep();
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_TRUE(step.is_complete);
+        EXPECT_THAT(step.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+
+        EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill)
+            << "Once the first target token is a stop token, serial decode is "
+               "complete and no sidecar or verifier graph should run.";
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(mock->forwardMTPForDeviceSamplingCount(), 0);
+        EXPECT_EQ(mock->forwardMTPFromDeviceTargetForDeviceSamplingCount(), 0);
+        EXPECT_EQ(mock->setAllPositionCount(), 0);
+        EXPECT_EQ(mock->setRowIndexedAllPositionCount(), 0);
+        EXPECT_EQ(mock->verifyStochasticRequestBatchOutcomeCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionVerifyBatchCount(), 0);
+        EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
+        EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(mock->publishGroupedDecodeEquivalentMTPSpecStateBatchCount(), 0);
+        EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 0);
+        EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionBuildCount(), 1)
+            << "The only GPU work needed is the first-token target distribution.";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 1);
+        EXPECT_EQ(mock->deviceDistributionSampleDeferredCount(), 0)
+            << "Penalties make the first token host-visible so the stop test "
+               "can complete before verifier row planning.";
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 0u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 0u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 0u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
+        EXPECT_EQ(probe.mtp_transaction_commits, 1u);
+        EXPECT_EQ(probe.mtp_transaction_validation_failures, 0u);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        ASSERT_NE(findPerfRecordWithTags(
+                      records,
+                      PerfStatRecord::Kind::Counter,
+                      "first_token_stop_direct_completes",
+                      {{"policy_path",
+                        "grouped_outcome_device_resident_publication"},
+                       {"stochastic_verify", "true"}}),
+                  nullptr);
+        ASSERT_NE(findPerfRecordWithTags(
+                      records,
+                      PerfStatRecord::Kind::Counter,
+                      "transaction_commits",
+                      {{"path", "first_token_stop_direct"},
+                       {"complete", "true"},
+                       {"state_advanced", "false"}}),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Timer,
+                                 "sidecar_forward"),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Timer,
+                                 "grouped_outcome_stochastic_verifier_forward"),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Timer,
+                                 "grouped_outcome_publish_accepted_state_device_resident"),
+                  nullptr);
+        EXPECT_EQ(findPerfRecord(records,
+                                 PerfStatRecord::Kind::Timer,
+                                 "grouped_outcome_stochastic_device_outcome_host_bridge"),
+                  nullptr);
+
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, GroupedOutcomeDeviceResidentPublicationDefersFirstTokenAndDraftHostReads)
     {
         const std::filesystem::path export_path =
