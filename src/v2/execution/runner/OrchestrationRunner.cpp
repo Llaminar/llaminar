@@ -11514,34 +11514,11 @@ namespace llaminar2
                     runner_->supportsMTPSidecarPreservesMainState() &&
                     requested_speculative_draft_count > 0;
 
-                {
-                    /*
-                     * State has already been committed from compact device
-                     * metadata.  This bridge is only the compatibility mirror
-                     * for response tokens and host transaction bookkeeping.
-                     */
-                    PerfStatsCollector::ScopedTimer bridge_timer(
-                        "mtp",
-                        "grouped_outcome_greedy_device_outcome_host_bridge",
-                        "decode",
-                        {},
-                        {{"policy_path", "grouped_outcome_device_resident_publication"}});
-                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
-                            outcome_handle,
-                            &device_outcome))
-                    {
-                        return fail_after_checkpoint(
-                            "Grouped-outcome greedy MTP resident outcome materialization failed");
-                    }
-                }
                 /*
-                 * Keep compatibility response materialization as the first
-                 * host-visible boundary after verifier outcome reduction.  A
-                 * previous pre-bridge prelaunch could make ROCm's response
-                 * bridge wait behind speculative next-step sidecar work.  The
-                 * sidecar is still prelaunched for reuse by the following
-                 * decode step, but only after emitted response tokens are
-                 * already materialized.
+                 * State has already been committed from compact device
+                 * metadata.  Queue the next first-sidecar from the resident
+                 * logical-state mailbox before the response-only host bridge so
+                 * continuation work can overlap compact token materialization.
                  */
                 if (can_prelaunch_next_first_sidecar)
                 {
@@ -11562,7 +11539,7 @@ namespace llaminar2
                               "grouped_outcome_device_resident_publication"},
                              {"resident_state_kind",
                               "device_publication_mailbox"},
-                             {"prelaunch_timing", "post_bridge"},
+                             {"prelaunch_timing", "pre_bridge"},
                              {"sampling", "greedy"}});
                         if (!runner_->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
                                 handle,
@@ -11585,10 +11562,33 @@ namespace llaminar2
                          {"path", "grouped_outcome_device_resident_publication"},
                          {"resident_state_kind",
                           "device_publication_mailbox"},
-                         {"prelaunch_timing", "post_bridge"},
+                         {"prelaunch_timing", "pre_bridge"},
                          {"sampling", "greedy"},
                          {"stop_tokens",
                           std::to_string(stop_tokens_.size())}});
+                }
+
+                {
+                    /*
+                     * The compatibility bridge is only the mirror for response
+                     * tokens and host transaction bookkeeping.  It waits on the
+                     * compact response-ready event, not on the publication or
+                     * prelaunched sidecar stream.
+                     */
+                    PerfStatsCollector::ScopedTimer bridge_timer(
+                        "mtp",
+                        "grouped_outcome_greedy_device_outcome_host_bridge",
+                        "decode",
+                        {},
+                        {{"policy_path", "grouped_outcome_device_resident_publication"},
+                         {"timing", "post_publication_response_bridge"}});
+                    if (!runner_->materializeDeviceSpeculativeOutcomesForHostResponse(
+                            outcome_handle,
+                            &device_outcome))
+                    {
+                        return fail_after_checkpoint(
+                            "Grouped-outcome greedy MTP resident outcome materialization failed");
+                    }
                 }
 
                 if (!catchup.ok)

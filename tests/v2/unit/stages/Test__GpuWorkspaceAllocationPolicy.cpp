@@ -2593,6 +2593,53 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPResidentPublicationPrelaunchesBefore
            "before host-visible response materialization.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, GroupedGreedyResidentPublicationPrelaunchesBeforeHostBridge)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+    const auto body = sliceBetween(
+        source,
+        "if (!stochastic_verify && grouped_outcome_device_resident_publication)",
+        "if (!catchup.ok)\n                {");
+    const auto compact = removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
+    const auto compact_raw = removeAsciiWhitespace(body);
+
+    const size_t direct_publish =
+        compact.find("publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
+    const size_t prelaunch_gate =
+        compact.find("constboolcan_prelaunch_next_first_sidecar=");
+    const size_t mailbox =
+        compact.find("runner_->deviceResidentLogicalSequenceState()", prelaunch_gate);
+    const size_t prelaunch_enqueue =
+        compact.find("forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(",
+                     prelaunch_gate);
+    const size_t host_response_materialize =
+        compact.find("materializeDeviceSpeculativeOutcomesForHostResponse(");
+
+    ASSERT_NE(direct_publish, std::string::npos);
+    ASSERT_NE(prelaunch_gate, std::string::npos);
+    ASSERT_NE(mailbox, std::string::npos);
+    ASSERT_NE(prelaunch_enqueue, std::string::npos);
+    ASSERT_NE(host_response_materialize, std::string::npos);
+    EXPECT_LT(direct_publish, prelaunch_gate)
+        << "Grouped greedy prelaunch must wait until accepted state has been "
+           "published from compact device metadata.";
+    EXPECT_LT(prelaunch_gate, mailbox);
+    EXPECT_LT(mailbox, prelaunch_enqueue);
+    EXPECT_LT(prelaunch_enqueue, host_response_materialize)
+        << "Grouped greedy should queue the resident continuation before the "
+           "response-only D2H bridge.";
+    EXPECT_NE(compact_raw.find("\"prelaunch_timing\",\"pre_bridge\""),
+              std::string::npos);
+    EXPECT_EQ(compact_raw.find("\"prelaunch_timing\",\"post_bridge\""),
+              std::string::npos)
+        << "The grouped greedy resident continuation should not wait for "
+           "host-response materialization.";
+    EXPECT_NE(compact_raw.find("\"timing\",\"post_publication_response_bridge\""),
+              std::string::npos)
+        << "The bridge must remain explicitly response-only after publication.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnResponseReadyEvent)
 {
     const auto interface_source =

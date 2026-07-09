@@ -7942,9 +7942,10 @@ namespace
             EXPECT_THAT(mock->publicationEvents(),
                         ElementsAre("device_outcome_publish",
                                     "host_outcome_bridge"));
-            EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 0)
-                << "Grouped greedy response materialization should not wait "
-                   "behind speculative next-step sidecar prelaunch work.";
+            EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 1)
+                << "Grouped greedy should queue the resident continuation "
+                   "before response materialization, and the response bridge "
+                   "must wait only on compact outcome readiness.";
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             EXPECT_EQ(findPerfRecord(records,
@@ -8011,7 +8012,7 @@ namespace
                           "stochastic_first_sidecar_prelaunches",
                           {{"path", "grouped_outcome_device_resident_publication"},
                            {"resident_state_kind", "device_publication_mailbox"},
-                           {"prelaunch_timing", "post_bridge"},
+                           {"prelaunch_timing", "pre_bridge"},
                            {"sampling", "greedy"}}),
                       nullptr);
         }
@@ -8267,7 +8268,7 @@ namespace
             GenerationResult step1 = runner->decodeStep();
             ASSERT_TRUE(step1.success()) << step1.error;
             ASSERT_THAT(step1.tokens, SizeIs(3));
-            EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 0);
+            EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 1);
 
             const int resident_sidecar_count_after_step1 =
                 mock->forwardMTPFromResidentLogicalStateForDeviceSamplingCount();
