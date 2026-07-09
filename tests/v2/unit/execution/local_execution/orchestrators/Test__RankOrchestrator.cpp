@@ -756,6 +756,35 @@ public:
     }
 
     /**
+     * @brief Record device-target shifted-row commits for LocalTP fanout tests.
+     *
+     * Production LocalTP resolves the target token into a child-owned device
+     * sample slot before the shifted MTP KV append.  The mock captures the slot
+     * and publication boundary metadata so tests can prove the rank asks every
+     * participant to run the real device-slot commit instead of stopping at a
+     * rank-level unsupported path.
+     */
+    bool commitMTPShiftedRowFromDeviceTargetSample(
+        int target_sample_slot,
+        int already_appended_tokens,
+        bool allow_speculative_discard = false,
+        int position_offset_override = -1) override
+    {
+        ++commit_mtp_device_target_sample_calls_;
+        last_commit_mtp_device_target_sample_slot_ = target_sample_slot;
+        last_commit_mtp_already_appended_ = already_appended_tokens;
+        last_commit_mtp_main_forward_token_count_ = 0;
+        last_commit_mtp_allow_speculative_discard_ =
+            allow_speculative_discard;
+        last_commit_mtp_position_offset_override_ =
+            position_offset_override;
+        last_commit_mtp_tokens_.clear();
+        return commit_mtp_shifted_rows_ok_ &&
+               target_sample_slot >= 0 &&
+               already_appended_tokens >= 0;
+    }
+
+    /**
      * @brief Record checkpoint-backed shifted-row repairs for LocalTP fanout tests.
      *
      * The production LocalTP path uses this method when grouped verifier
@@ -2006,6 +2035,14 @@ public:
     int last_device_draft_sample_slot() const { return last_device_draft_sample_slot_; }
     int last_device_target_sample_slot() const { return last_device_target_sample_slot_; }
     int last_device_token_sidecar_position_id() const { return last_device_token_sidecar_position_id_; }
+    size_t commit_mtp_device_target_sample_call_count() const
+    {
+        return commit_mtp_device_target_sample_calls_;
+    }
+    int last_commit_mtp_device_target_sample_slot() const
+    {
+        return last_commit_mtp_device_target_sample_slot_;
+    }
     int last_commit_mtp_already_appended() const { return last_commit_mtp_already_appended_; }
     int last_commit_mtp_main_forward_token_count() const { return last_commit_mtp_main_forward_token_count_; }
     bool last_commit_mtp_allow_speculative_discard() const { return last_commit_mtp_allow_speculative_discard_; }
@@ -2289,9 +2326,11 @@ private:
     int last_chained_mtp_position_id_ = -1;
     size_t forward_mtp_from_device_draft_calls_ = 0;
     size_t forward_mtp_from_device_target_calls_ = 0;
+    size_t commit_mtp_device_target_sample_calls_ = 0;
     int last_device_draft_sample_slot_ = -1;
     int last_device_target_sample_slot_ = -1;
     int last_device_token_sidecar_position_id_ = -1;
+    int last_commit_mtp_device_target_sample_slot_ = -1;
     int last_commit_mtp_already_appended_ = 0;
     int last_commit_mtp_main_forward_token_count_ = 0;
     int last_commit_mtp_position_offset_override_ = -1;
@@ -5315,6 +5354,46 @@ TEST_F(Test__RankOrchestrator, ChainedMTPFailureStillAttemptsEveryLocalTPChild)
     EXPECT_EQ(runner1_ptr->last_chained_mtp_position_id(), 125);
 }
 
+TEST_F(Test__RankOrchestrator, DeviceTargetShiftedCommitRunsOnEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_supports_mtp_device_draft_token_input(true);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_supports_mtp_device_draft_token_input(true);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->commitMTPShiftedRowFromDeviceTargetSample(
+        /*target_sample_slot=*/3,
+        /*already_appended_tokens=*/1,
+        /*allow_speculative_discard=*/true,
+        /*position_offset_override=*/64));
+
+    EXPECT_EQ(runner0_ptr->commit_mtp_device_target_sample_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->commit_mtp_device_target_sample_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_commit_mtp_device_target_sample_slot(), 3);
+    EXPECT_EQ(runner1_ptr->last_commit_mtp_device_target_sample_slot(), 3);
+    EXPECT_EQ(runner0_ptr->last_commit_mtp_already_appended(), 1);
+    EXPECT_EQ(runner1_ptr->last_commit_mtp_already_appended(), 1);
+    EXPECT_TRUE(runner0_ptr->last_commit_mtp_allow_speculative_discard());
+    EXPECT_TRUE(runner1_ptr->last_commit_mtp_allow_speculative_discard());
+    EXPECT_EQ(runner0_ptr->last_commit_mtp_position_offset_override(), 64);
+    EXPECT_EQ(runner1_ptr->last_commit_mtp_position_offset_override(), 64);
+}
+
 TEST_F(Test__RankOrchestrator, LocalTPAllPositionRowBatchSamplingConsumesVerifierStreamsOnce)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
@@ -5632,8 +5711,16 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomePublishesChildResiden
     DeviceResidentLogicalSequenceStateHandle resident_state =
         orchestrator->deviceResidentLogicalSequenceState();
     EXPECT_TRUE(resident_state.valid());
-    EXPECT_EQ(runner0_ptr->forward_mtp_from_resident_logical_state_call_count(), 0u);
-    EXPECT_EQ(runner1_ptr->forward_mtp_from_resident_logical_state_call_count(), 0u);
+    EXPECT_TRUE(orchestrator->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+        resident_state,
+        /*request_index=*/0))
+        << "Mirrored LocalTP publication should expose a rank-owned mailbox "
+           "that fans the next first-sidecar prelaunch to child-resident "
+           "logical-state handles before the host response bridge.";
+    EXPECT_EQ(runner0_ptr->forward_mtp_from_resident_logical_state_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_from_resident_logical_state_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_resident_logical_state_request_index(), 0);
+    EXPECT_EQ(runner1_ptr->last_resident_logical_state_request_index(), 0);
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferredRankSlots)
@@ -5918,6 +6005,17 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomePublishesChildRes
     EXPECT_EQ(runner1_ptr->stage_stochastic_target_token_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->last_staged_target_sample_slot(), 0);
     EXPECT_EQ(runner1_ptr->last_staged_target_sample_slot(), 0);
+
+    DeviceResidentLogicalSequenceStateHandle resident_state =
+        orchestrator->deviceResidentLogicalSequenceState();
+    EXPECT_TRUE(resident_state.valid());
+    EXPECT_TRUE(orchestrator->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+        resident_state,
+        /*request_index=*/0));
+    EXPECT_EQ(runner0_ptr->forward_mtp_from_resident_logical_state_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_from_resident_logical_state_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_resident_logical_state_request_index(), 0);
+    EXPECT_EQ(runner1_ptr->last_resident_logical_state_request_index(), 0);
 }
 
 TEST_F(Test__RankOrchestrator, SpecStatePublicationRequiresEveryLocalTPChildSupport)

@@ -4411,16 +4411,114 @@ namespace llaminar2
                 allow_speculative_discard,
                 position_offset_override);
         }
-        if (device_runners_.size() != 1 || !device_runners_[0])
+        if (device_runners_.empty())
         {
-            LOG_ERROR("[RankOrchestrator] Device-target shifted MTP commit is not enabled for multi-participant TP domains yet");
             return false;
         }
-        return device_runners_[0]->commitMTPShiftedRowFromDeviceTargetSample(
-            target_sample_slot,
-            already_appended_tokens,
-            allow_speculative_discard,
-            position_offset_override);
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0] &&
+                   device_runners_[0]->commitMTPShiftedRowFromDeviceTargetSample(
+                       target_sample_slot,
+                       already_appended_tokens,
+                       allow_speculative_discard,
+                       position_offset_override);
+        }
+
+        /*
+         * LocalTP resolves the first stochastic/greedy target token once at rank
+         * scope and stages that token into the same device slot on every child.
+         * The shifted MTP KV row must therefore be rebuilt on every participant
+         * from that child-owned slot.  This is not a fallback: each child runs
+         * its normal device-resident KV-only sidecar commit against its own MTP
+         * cache, preserving the symmetric collective order used by the rest of
+         * the grouped verifier transaction.
+         */
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] device-target shifted commit failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        tp_worker_pool_->dispatch(
+            [this,
+             target_sample_slot,
+             already_appended_tokens,
+             allow_speculative_discard,
+             position_offset_override,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t i) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                if (i >= device_runners_.size() || !device_runners_[i])
+                    return false;
+                auto device_id = device_runners_[i]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                return device_runners_[i]->commitMTPShiftedRowFromDeviceTargetSample(
+                           target_sample_slot,
+                           already_appended_tokens,
+                           allow_speculative_discard,
+                           position_offset_override);
+            });
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        auto results =
+            tp_worker_pool_->collectAll(effectiveTPWorkerJoinTimeoutMs());
+        for (auto &r : results)
+        {
+            if (!r.completed || !r.success)
+                all_success = false;
+            if (r.exception && !first_exception)
+            {
+                first_exception = r.exception;
+                first_exception_device = r.worker_index;
+                all_success = false;
+            }
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("[RankOrchestrator] Device-target shifted commit rethrowing exception from participant "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+        if (all_success)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_device_target_shifted_commits",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"target_slot", std::to_string(target_sample_slot)},
+                 {"already_appended", std::to_string(already_appended_tokens)}});
+        }
+        return all_success;
     }
 
     bool RankOrchestrator::commitMTPShiftedRowFromDeviceResidentLogicalState(
