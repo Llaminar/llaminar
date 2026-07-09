@@ -2613,6 +2613,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
         "bool DeviceGraphOrchestrator::verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(");
     const auto compact_handle =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(handle_body));
+    const auto compact_interface =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(interface_source));
     const auto compact_verify =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(resident_verify_body));
     const auto compact_bridge =
@@ -2624,6 +2626,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StochasticOutcomeHostBridgeWaitsOnRespo
     EXPECT_NE(compact_handle.find("response_ready_event!=nullptr"),
               std::string::npos)
         << "A handle without a response-ready event must not be considered valid.";
+    EXPECT_EQ(compact_interface.find("materializeDeviceSpeculativeOutcomesForHostPlan("),
+              std::string::npos)
+        << "Resident MTP outcomes should have one host materialization surface: "
+           "the response-only bridge. A host-plan bridge invites state "
+           "publication to depend on D2H metadata again.";
+    EXPECT_NE(compact_interface.find(
+                  "returncopyDeviceSpeculativeOutcomesToHost(handle,outcomes);"),
+              std::string::npos)
+        << "The response-only materializer should delegate directly to the "
+           "low-level compact D2H hook, not through a host-plan adapter.";
     EXPECT_NE(compact_verify.find("backend->createEvent("),
               std::string::npos);
     EXPECT_NE(compact_verify.find(

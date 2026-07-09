@@ -96,9 +96,10 @@ namespace llaminar2
      * This is the first-class handoff object for the vLLM-style path where the
      * verifier summary remains on GPU.  The pointed-to buffers are owned by the
      * runner and are valid until the runner stages another stochastic outcome
-     * request.  Future publication code can consume these buffers directly and
-     * avoid the per-step D2H boundary; current compatibility callers can pass
-     * the handle to materializeDeviceSpeculativeOutcomesForHostResponse().
+     * request.  Device-resident publication consumes these buffers directly and
+     * avoids the per-step D2H state-publication boundary; response code may pass
+     * the handle to materializeDeviceSpeculativeOutcomesForHostResponse() only
+     * after live state has been published.
      */
     struct DeviceSpeculativeOutcomeHandle
     {
@@ -3144,29 +3145,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Materialize resident stochastic outcomes for legacy host plans.
-         *
-         * Prefer materializeDeviceSpeculativeOutcomesForHostResponse() for new
-         * code.  This compatibility entry point remains for older tests and
-         * host-plan adapters that have not yet been split into response-only and
-         * diagnostic consumers.
-         *
-         * The default delegates to the historical host-copy hook so existing
-         * runners and tests keep one implementation.  Overrides should preserve
-         * the same ordering: wait on `handle.response_ready_event` from an
-         * explicit response bridge stream, enqueue compact D2H copies on that
-         * bridge stream, then synchronize that stream exactly once at the
-         * response/planning boundary.  Synchronizing `handle.stream` here is a
-         * performance bug because later state-publication work may share it.
-         */
-        virtual bool materializeDeviceSpeculativeOutcomesForHostPlan(
-            const DeviceSpeculativeOutcomeHandle &handle,
-            DeviceSpeculativeVerifyBatchOutcome *outcomes)
-        {
-            return copyDeviceSpeculativeOutcomesToHost(handle, outcomes);
-        }
-
-        /**
          * @brief Materialize resident outcomes only for host-visible response data.
          *
          * Device-resident publication must already have consumed @p handle
@@ -3179,9 +3157,7 @@ namespace llaminar2
             const DeviceSpeculativeOutcomeHandle &handle,
             DeviceSpeculativeVerifyBatchOutcome *outcomes)
         {
-            return materializeDeviceSpeculativeOutcomesForHostPlan(
-                handle,
-                outcomes);
+            return copyDeviceSpeculativeOutcomesToHost(handle, outcomes);
         }
 
         /**
