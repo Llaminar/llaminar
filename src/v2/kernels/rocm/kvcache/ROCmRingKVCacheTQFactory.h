@@ -35,4 +35,17 @@ namespace llaminar2
         const TurboQuantContext *tq_ctx,
         int device_id);
 
+    /**
+     * @brief Create a LocalTP shard of the ROCm asymmetric TQ cache.
+     *
+     * @param n_kv_heads Global KV-head count.
+     * @param local_n_kv_heads Heads resident on this device.
+     * @param kv_head_start First global KV head represented by the shard.
+     */
+    std::unique_ptr<IKVCache> createShardedROCmRingKVCacheTQ(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, const TurboQuantContext *tq_ctx,
+        int device_id);
+
 } // namespace llaminar2

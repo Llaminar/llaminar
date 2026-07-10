@@ -86,6 +86,22 @@ namespace llaminar2
         bool require_captured_stage = false);
 
     /**
+     * @brief Publish a CPU request batch from host-selected verifier rows.
+     *
+     * Capturing stages receive the complete row vector exactly once and copy
+     * each accepted row into request-owned live state.  This replaces the
+     * obsolete scalar loop that repeatedly overwrote one stage state and
+     * cleared capture bindings after the first request.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRows(
+        const MTPSpecStepPlanBatch &plans,
+        const int *host_verifier_restore_rows,
+        const std::vector<IComputeStage *> &state_stages,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
      * @brief Publish verifier state from a row index stored in device memory.
      *
      * Phase 10 device-resident stochastic publication derives the accepted
@@ -164,6 +180,17 @@ namespace llaminar2
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRow(
         const MTPSpecStepPlan &plan,
         int verifier_restore_row,
+        ComputeGraph &graph,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
+     * @brief Graph-order CPU batch variant of host verifier-row publication.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRows(
+        const MTPSpecStepPlanBatch &plans,
+        const int *host_verifier_restore_rows,
         ComputeGraph &graph,
         DeviceId device,
         void *stream,

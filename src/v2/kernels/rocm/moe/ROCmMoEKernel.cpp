@@ -1161,6 +1161,8 @@ extern "C"
 
     bool rocmMoE_grouped_prefill_pipeline(
         const float *d_hidden,
+        const int8_t *d_prequantized_hidden,
+        const float *d_prequantized_hidden_scales,
         const void *d_gate_desc_table,
         const void *d_up_desc_table,
         const void *d_down_desc_table,
@@ -1428,6 +1430,67 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::bindGroupedDescriptorTableSlot(
+        const char *buffer_name,
+        std::size_t slot,
+        int num_experts,
+        DeviceNativeVNNIMatrixDesc **device_descs,
+        const char *context)
+    {
+        if (!buffer_name || !device_descs || num_experts <= 0 ||
+            slot >= static_cast<std::size_t>(
+                        MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+        {
+            return false;
+        }
+
+        void *base = nullptr;
+        if (!bindWorkspaceBuffer(
+                &base,
+                buffer_name,
+                sizeof(DeviceNativeVNNIMatrixDesc),
+                context))
+        {
+            return false;
+        }
+
+        const std::size_t available = workspace_->getBufferSize(buffer_name);
+        const std::size_t slot_bytes =
+            available /
+            static_cast<std::size_t>(
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+        const std::size_t descriptor_stride =
+            slot_bytes / sizeof(DeviceNativeVNNIMatrixDesc);
+        if (descriptor_stride < static_cast<std::size_t>(num_experts))
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                           << " descriptor slot is too narrow in '"
+                                           << buffer_name << "': slot=" << slot
+                                           << " stride=" << descriptor_stride
+                                           << " requested_experts=" << num_experts
+                                           << " workspace_bytes=" << available);
+            return false;
+        }
+
+        const std::size_t descriptor_offset = slot * descriptor_stride;
+        const std::size_t descriptor_capacity =
+            available / sizeof(DeviceNativeVNNIMatrixDesc);
+        if (descriptor_offset + static_cast<std::size_t>(num_experts) >
+            descriptor_capacity)
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                           << " descriptor slot exceeds workspace capacity in '"
+                                           << buffer_name << "': offset=" << descriptor_offset
+                                           << " requested_experts=" << num_experts
+                                           << " capacity=" << descriptor_capacity);
+            return false;
+        }
+
+        *device_descs =
+            static_cast<DeviceNativeVNNIMatrixDesc *>(base) + descriptor_offset;
+        return true;
+    }
+
     void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
         d_histogram_ = nullptr;
@@ -1454,8 +1517,7 @@ namespace llaminar2
         d_route_logits_partials_ = nullptr;
         d_router_q8_hidden_ = nullptr;
         d_router_q8_hidden_scales_ = nullptr;
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         d_route_indices_ = nullptr;
         d_route_weights_ = nullptr;
         d_group_int_indices_ = nullptr;
@@ -1494,8 +1556,7 @@ namespace llaminar2
         route_logits_partials_capacity_ = 0;
         router_q8_hidden_d_model_cap_ = 0;
         router_q8_hidden_blocks_cap_ = 0;
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         group_active_expert_slots_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
@@ -1557,20 +1618,17 @@ namespace llaminar2
             }
             const size_t desc_bytes =
                 static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-            void *base = nullptr;
-            const size_t table_bytes =
-                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
-            if (!bindWorkspaceBuffer(&base,
-                                     MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
-                                     table_bytes,
-                                     "ROCm grouped down descriptor table rebind"))
+            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
+                    slot,
+                    table.num_experts,
+                    &device_descs,
+                    "ROCm grouped down descriptor table rebind"))
             {
                 table.device_descs = nullptr;
                 return false;
             }
-            auto *device_descs =
-                static_cast<DeviceNativeVNNIMatrixDesc *>(base) +
-                slot * static_cast<std::size_t>(table.num_experts);
             const hipError_t err = hipMemcpyAsync(device_descs,
                                                   table.host_descs.data(),
                                                   desc_bytes,
@@ -1606,29 +1664,25 @@ namespace llaminar2
             }
             const size_t desc_bytes =
                 static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-            const size_t table_bytes =
-                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
-            void *gate_base = nullptr;
-            void *up_base = nullptr;
-            if (!bindWorkspaceBuffer(&gate_base,
-                                     MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
-                                     table_bytes,
-                                     "ROCm grouped gate descriptor table rebind") ||
-                !bindWorkspaceBuffer(&up_base,
-                                     MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
-                                     table_bytes,
-                                     "ROCm grouped up descriptor table rebind"))
+            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
+                    slot,
+                    table.num_experts,
+                    &device_gate_descs,
+                    "ROCm grouped gate descriptor table rebind") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
+                    slot,
+                    table.num_experts,
+                    &device_up_descs,
+                    "ROCm grouped up descriptor table rebind"))
             {
                 table.device_gate_descs = nullptr;
                 table.device_up_descs = nullptr;
                 return false;
             }
-            auto *device_gate_descs =
-                static_cast<DeviceNativeVNNIMatrixDesc *>(gate_base) +
-                slot * static_cast<std::size_t>(table.num_experts);
-            auto *device_up_descs =
-                static_cast<DeviceNativeVNNIMatrixDesc *>(up_base) +
-                slot * static_cast<std::size_t>(table.num_experts);
             hipError_t err = hipMemcpyAsync(device_gate_descs,
                                             table.host_gate_descs.data(),
                                             desc_bytes,
@@ -1804,6 +1858,60 @@ namespace llaminar2
         router_q8_hidden_d_model_cap_ = d_model;
         router_q8_hidden_blocks_cap_ = blocks_per_row;
         return true;
+    }
+
+    void ROCmMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
+    {
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_rows_ = 0;
+        router_q8_hidden_valid_ = false;
+        router_q8_hidden_capture_recorded_ = false;
+    }
+
+    void ROCmMoEKernel::publishRouterQ8Hidden(
+        const float *source,
+        int rows,
+        bool recorded_during_capture) noexcept
+    {
+        if (!source || rows <= 0 ||
+            rows > static_cast<int>(MoEWorkspaceBuffers::kMaxVerifierRows) ||
+            !d_router_q8_hidden_ || !d_router_q8_hidden_scales_)
+        {
+            invalidateRouterQ8HiddenPublication();
+            return;
+        }
+
+        router_q8_hidden_source_ = source;
+        router_q8_hidden_rows_ = rows;
+        router_q8_hidden_valid_ = true;
+        router_q8_hidden_capture_recorded_ = recorded_during_capture;
+    }
+
+    bool ROCmMoEKernel::canReuseRouterQ8Hidden(
+        const float *source,
+        int rows,
+        int d_model) const noexcept
+    {
+        if (!debugEnv().rocm.moe_reuse_router_q8_hidden ||
+            !router_q8_hidden_valid_ ||
+            router_q8_hidden_source_ != source ||
+            router_q8_hidden_rows_ < rows ||
+            rows <= 0 ||
+            d_model <= 0 ||
+            router_q8_hidden_d_model_cap_ < d_model ||
+            router_q8_hidden_blocks_cap_ < ((d_model + 31) / 32) ||
+            !d_router_q8_hidden_ || !d_router_q8_hidden_scales_)
+        {
+            return false;
+        }
+
+        /*
+         * A capture producer and consumer are ordered correctly on the same
+         * HIP stream even though neither has run yet.  Outside capture, those
+         * recorded kernels have not materialized bytes, so only an eager
+         * publication may be reused by eager expert decode.
+         */
+        return !router_q8_hidden_capture_recorded_ || isDecodeGraphCaptureActive();
     }
 
     const ROCmMoEKernel::RouterQ8GateCacheEntry *ROCmMoEKernel::getOrCreateQ8RouterGateCache(
@@ -3547,6 +3655,7 @@ namespace llaminar2
 
         bool used_q8_grouped_router = false;
         bool used_fp16_grouped_router = false;
+        invalidateRouterQ8HiddenPublication();
         if (q8_router_requested)
         {
             if (!ensureRouterQ8HiddenScratchCapacity(d_model))
@@ -3579,23 +3688,10 @@ namespace llaminar2
                 return false;
             }
             used_q8_grouped_router = true;
-
-            /*
-             * M=1 remains ordinary decode and can reuse the hidden Q8 scratch
-             * for the following gate/up path.  M>1 lays scratch out as
-             * [rows,d_model], so keep the one-row reuse marker invalid until
-             * grouped expert decode has an explicit row-slice reuse contract.
-             */
-            if (seq_len == 1 && !isDecodeGraphCaptureActive())
-            {
-                router_q8_hidden_source_ = d_hidden;
-                router_q8_hidden_valid_ = true;
-            }
-            else
-            {
-                router_q8_hidden_source_ = nullptr;
-                router_q8_hidden_valid_ = false;
-            }
+            publishRouterQ8Hidden(
+                d_hidden,
+                seq_len,
+                isDecodeGraphCaptureActive());
         }
         else if (gate_is_fp32)
         {
@@ -3802,8 +3898,7 @@ namespace llaminar2
         bool runtime_ready = false;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
         if (q8_router_requested && (d_model % 32) != 0)
         {
@@ -3839,16 +3934,10 @@ namespace llaminar2
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router logits kernel failed");
                 return false;
             }
-            /*
-             * In graph capture this launch is recorded, not completed. Keep the
-             * router-hidden reuse marker invalid until an eager/Phase-2 execution
-             * has actually produced the scratch bytes.
-             */
-            if (!isDecodeGraphCaptureActive())
-            {
-                router_q8_hidden_source_ = h;
-                router_q8_hidden_valid_ = true;
-            }
+            publishRouterQ8Hidden(
+                h,
+                /*rows=*/1,
+                isDecodeGraphCaptureActive());
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -4090,8 +4179,7 @@ namespace llaminar2
         bool runtime_ready = false;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
         if (q8_router_requested && (d_model % 32) != 0)
         {
@@ -4127,16 +4215,10 @@ namespace llaminar2
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router logits kernel failed");
                 return false;
             }
-            /*
-             * In graph capture this launch is recorded, not completed. Keep the
-             * router-hidden reuse marker invalid until an eager/Phase-2 execution
-             * has actually produced the scratch bytes.
-             */
-            if (!isDecodeGraphCaptureActive())
-            {
-                router_q8_hidden_source_ = h;
-                router_q8_hidden_valid_ = true;
-            }
+            publishRouterQ8Hidden(
+                h,
+                /*rows=*/1,
+                isDecodeGraphCaptureActive());
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -5350,22 +5432,17 @@ namespace llaminar2
                       << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
             return -1;
         }
-        void *device_desc_base = nullptr;
-        const size_t table_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+        DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
         hipError_t err = hipSuccess;
-        if (!bindWorkspaceBuffer(&device_desc_base,
-                                 MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
-                                 table_bytes,
-                                 "ROCm grouped down descriptor tables"))
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
+                slot,
+                num_experts,
+                &device_descs,
+                "ROCm grouped down descriptor tables"))
         {
             err = hipErrorInvalidValue;
         }
-        DeviceNativeVNNIMatrixDesc *device_descs =
-            err == hipSuccess
-                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_desc_base) +
-                      slot * static_cast<std::size_t>(num_experts)
-                : nullptr;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         if (err == hipSuccess)
@@ -5490,32 +5567,24 @@ namespace llaminar2
                       << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
             return -1;
         }
-        void *device_gate_desc_base = nullptr;
-        void *device_up_desc_base = nullptr;
-        const size_t table_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+        DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
         hipError_t err = hipSuccess;
-        if (!bindWorkspaceBuffer(&device_gate_desc_base,
-                                 MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
-                                 table_bytes,
-                                 "ROCm grouped gate descriptor tables") ||
-            !bindWorkspaceBuffer(&device_up_desc_base,
-                                 MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
-                                 table_bytes,
-                                 "ROCm grouped up descriptor tables"))
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
+                slot,
+                num_experts,
+                &device_gate_descs,
+                "ROCm grouped gate descriptor tables") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
+                slot,
+                num_experts,
+                &device_up_descs,
+                "ROCm grouped up descriptor tables"))
         {
             err = hipErrorInvalidValue;
         }
-        DeviceNativeVNNIMatrixDesc *device_gate_descs =
-            err == hipSuccess
-                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_gate_desc_base) +
-                      slot * static_cast<std::size_t>(num_experts)
-                : nullptr;
-        DeviceNativeVNNIMatrixDesc *device_up_descs =
-            err == hipSuccess
-                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_up_desc_base) +
-                      slot * static_cast<std::size_t>(num_experts)
-                : nullptr;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         if (err == hipSuccess)
@@ -6111,14 +6180,7 @@ namespace llaminar2
         }
         const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
-            debugEnv().rocm.moe_reuse_router_q8_hidden &&
-            !capture_active &&
-            router_q8_hidden_valid_ &&
-            router_q8_hidden_source_ == d_hidden &&
-            router_q8_hidden_d_model_cap_ >= d_model &&
-            router_q8_hidden_blocks_cap_ >= ((d_model + 31) / 32) &&
-            d_router_q8_hidden_ &&
-            d_router_q8_hidden_scales_;
+            canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
 
@@ -6323,14 +6385,7 @@ namespace llaminar2
         }
         const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
-            debugEnv().rocm.moe_reuse_router_q8_hidden &&
-            !capture_active &&
-            router_q8_hidden_valid_ &&
-            router_q8_hidden_source_ == d_hidden &&
-            router_q8_hidden_d_model_cap_ >= d_model &&
-            router_q8_hidden_blocks_cap_ >= ((d_model + 31) / 32) &&
-            d_router_q8_hidden_ &&
-            d_router_q8_hidden_scales_;
+            canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
         const bool use_runtime_descriptors =
@@ -7928,10 +7983,12 @@ namespace llaminar2
         }
 
         uint64_t mask_hash = 1469598103934665603ull;
+        int mask_active_experts = 0;
         for (int i = 0; i < num_experts; ++i)
         {
             mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
             mask_hash *= 1099511628211ull;
+            mask_active_experts += expert_mask[i] != 0u ? 1 : 0;
         }
         mask_hash ^= static_cast<uint64_t>(num_experts);
         mask_hash *= 1099511628211ull;
@@ -7992,7 +8049,13 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] groupTokensByExpertDevice failed");
             return false;
         }
-        group_active_expert_slots_ = std::min(total_slots, num_experts);
+        /*
+         * Masked LocalTP grouping emits a compact active-id prefix followed by
+         * -1 padding.  Bound the stable grouped grid by the number of experts
+         * this participant can own instead of launching planes for every global
+         * expert.  This mirrors CUDA and keeps masked publication economical.
+         */
+        group_active_expert_slots_ = std::min(total_slots, mask_active_experts);
 
         if (!hipMoE_max_expert_count(d_group_counts_, d_group_max_tokens_,
                                      num_experts, device_ordinal_, getStream()))
@@ -8002,6 +8065,13 @@ namespace llaminar2
         }
 
         prepared_num_experts_ = num_experts;
+        PerfStatsCollector::addCounter(
+            "kernel", "rocm_moe_masked_prefill_grouping_calls", 1.0, {}, {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"num_experts", std::to_string(num_experts)},
+             {"mask_active_experts", std::to_string(mask_active_experts)},
+             {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
         return true;
     }
 
@@ -8323,6 +8393,9 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] null device pointers during graph capture");
             return false;
         }
+        const bool reuse_router_q8_hidden =
+            verifier_decode_equivalent_gateup &&
+            canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
 
         /*
          * Ordered scatter writes every output element exactly once and matches
@@ -8379,6 +8452,8 @@ namespace llaminar2
         // Call the fully-grouped pipeline (5 kernel launches, zero sync)
         const bool ok = rocmMoE_grouped_prefill_pipeline(
             d_hidden,
+            reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
+            reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : nullptr,
             gateup_table.device_gate_descs,
             gateup_table.device_up_descs,
             down_table.device_descs,
@@ -8423,6 +8498,19 @@ namespace llaminar2
             return false;
         }
 
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_grouped_prefill_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "static_table"}});
+        }
+
         output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
                              DeviceId::rocm(device_ordinal_));
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
@@ -8447,7 +8535,9 @@ namespace llaminar2
                     {"tile_m", std::to_string(selected_tile_m)},
                     {"gateup_route",
                      verifier_decode_equivalent_gateup
-                         ? "decode_equiv_prefill"
+                         ? (reuse_router_q8_hidden
+                                ? "decode_equiv_router_q8"
+                                : "decode_equiv_prefill")
                          : (pipeline_use_gateup_kpart ? "kpart_prefill" : "fused_prefill")},
                     {"down_route",
                      verifier_decode_equivalent_ordered_down
@@ -8613,6 +8703,9 @@ namespace llaminar2
             max_tokens_per_expert <= 4 &&
             d_prefill_gate_ != nullptr &&
             d_prefill_up_ != nullptr;
+        const bool reuse_router_q8_hidden =
+            verifier_decode_equivalent_gateup &&
+            canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
         /*
          * Runtime-table verifier prefill is the production MTP path for ROCm
          * LLEP / ExpertParallel.  Keep it on the same batch-invariant contract
@@ -8649,6 +8742,8 @@ namespace llaminar2
 
         const bool ok = rocmMoE_grouped_prefill_pipeline(
             d_hidden,
+            reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
+            reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : nullptr,
             d_runtime_prefill_gate_descs_,
             d_runtime_prefill_up_descs_,
             d_runtime_prefill_down_descs_,
@@ -8692,6 +8787,19 @@ namespace llaminar2
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] grouped ROCm pipeline failed");
             return false;
+        }
+
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_grouped_prefill_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "runtime_table"}});
         }
 
         output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,

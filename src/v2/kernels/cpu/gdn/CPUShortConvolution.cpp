@@ -16,10 +16,12 @@
 #include "CPUShortConvolution.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
@@ -67,6 +69,51 @@ namespace llaminar2
             state[state_len - 1] = current_input;
 
         return sum;
+    }
+
+    void CPUShortConvolution::resetGPUState()
+    {
+        request_state_bank_.clear();
+        request_state_size_ = 0;
+        request_state_capacity_ = 0;
+        request_input_copy_.clear();
+        owned_speculative_state_work_.clear();
+    }
+
+    bool CPUShortConvolution::ensureRequestStateBank(
+        int request_count,
+        int state_floats,
+        const float *request_zero_state)
+    {
+        if (request_count <= 0 || state_floats <= 0 || !request_zero_state)
+            return false;
+
+        if (request_state_size_ != state_floats)
+        {
+            request_state_bank_.assign(
+                static_cast<size_t>(request_count) * state_floats,
+                0.0f);
+            request_state_size_ = state_floats;
+            request_state_capacity_ = request_count;
+        }
+        else if (request_state_capacity_ < request_count)
+        {
+            request_state_bank_.resize(
+                static_cast<size_t>(request_count) * state_floats,
+                0.0f);
+            request_state_capacity_ = request_count;
+        }
+
+        /*
+         * Request zero retains the public host-state ABI used by prefix-cache
+         * import/export.  Re-adopting it at each grouped call also makes an
+         * external prefix restore immediately visible without a second mirror.
+         */
+        std::memcpy(
+            request_state_bank_.data(),
+            request_zero_state,
+            static_cast<size_t>(state_floats) * sizeof(float));
+        return true;
     }
 
     /**
@@ -140,6 +187,69 @@ namespace llaminar2
             verifier_state_capture_size_,
             verifier_state_capture_size_,
             stream);
+    }
+
+    bool CPUShortConvolution::restoreVerifierStateCaptureRows(
+        float *dst_state,
+        const int *host_row_indices,
+        int request_count,
+        void *stream)
+    {
+        (void)stream;
+        if (!dst_state || !host_row_indices || request_count <= 0 ||
+            request_count > request_state_capacity_ ||
+            request_state_size_ <= 0 || !verifier_state_capture_ ||
+            verifier_state_capture_size_ < request_state_size_)
+        {
+            return false;
+        }
+
+        /*
+         * Validate the complete publication vector before changing any live
+         * request slot.  A malformed later row must not leave earlier requests
+         * committed to a new speculative timeline while the caller observes a
+         * failed transaction.
+         */
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int row = host_row_indices[request];
+            if (row >= verifier_state_capture_rows_)
+                return false;
+        }
+
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int row = host_row_indices[request];
+            if (row < 0)
+                continue;
+            float *destination =
+                request_state_bank_.data() +
+                static_cast<size_t>(request) * request_state_size_;
+            const float *source =
+                verifier_state_capture_ +
+                static_cast<size_t>(row) * verifier_state_capture_size_;
+            std::memcpy(
+                destination,
+                source,
+                static_cast<size_t>(request_state_size_) * sizeof(float));
+            if (request == 0)
+            {
+                std::memcpy(
+                    dst_state,
+                    destination,
+                    static_cast<size_t>(request_state_size_) * sizeof(float));
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_shortconv_request_batched_state_publications",
+            1.0,
+            "decode",
+            "cpu",
+            {{"request_count", std::to_string(request_count)},
+             {"publication_policy", "request_bank_snapshot_copy"}});
+        return true;
     }
 
     float *CPUShortConvolution::prepareSpeculativeState(float *live_state, int state_floats)
@@ -244,6 +354,18 @@ namespace llaminar2
         if (state_len <= 0 || snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
             return false;
 
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_shortconv_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            "cpu",
+            {{"verifier_rows", std::to_string(seq_len)},
+             {"channels", std::to_string(channels)},
+             {"kernel_size", std::to_string(kernel_size)},
+             {"snapshot_rows", std::to_string(std::min(seq_len, max_snapshot_rows))},
+             {"execution_policy", "channel_block_grouped"}});
+
         std::vector<float> raw_input_copy;
         const float *raw_input = input;
         if (input == output)
@@ -322,6 +444,199 @@ namespace llaminar2
             }
         };
         OMP_WORKSHARE_REGION(grouped_decode_equivalent);
+        return true;
+    }
+
+    bool CPUShortConvolution::forwardBatchedRequestsWithHostSeqLens(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *conv_state,
+        int seq_len, int request_count, int request_seq_len,
+        int channels, int kernel_size,
+        const int *host_request_seq_lens,
+        bool apply_silu)
+    {
+        if (!input || !weight || !output || !conv_state ||
+            !host_request_seq_lens || seq_len <= 0 || request_count <= 0 ||
+            request_seq_len <= 0 || channels <= 0 || kernel_size <= 1 ||
+            request_seq_len > std::numeric_limits<int>::max() / request_count ||
+            seq_len != request_count * request_seq_len)
+        {
+            return false;
+        }
+
+        const int state_len = kernel_size - 1;
+        const size_t state_floats_wide =
+            static_cast<size_t>(channels) * static_cast<size_t>(state_len);
+        if (state_floats_wide == 0 ||
+            state_floats_wide >
+                static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            state_floats_wide >
+                static_cast<size_t>(std::numeric_limits<int>::max()) /
+                    static_cast<size_t>(request_count))
+        {
+            return false;
+        }
+        const int state_floats = static_cast<int>(state_floats_wide);
+        const int total_state_floats = request_count * state_floats;
+        if (!ensureRequestStateBank(request_count, state_floats, conv_state))
+        {
+            return false;
+        }
+
+        const bool capture_active =
+            verifier_state_capture_ != nullptr &&
+            verifier_state_capture_rows_ >= seq_len &&
+            verifier_state_capture_size_ >= state_floats;
+        float *effective_states = request_state_bank_.data();
+        if (capture_active)
+        {
+            if (speculative_state_work_)
+            {
+                if (speculative_state_work_size_ < total_state_floats)
+                    return false;
+                effective_states = speculative_state_work_;
+            }
+            else
+            {
+                owned_speculative_state_work_.resize(
+                    static_cast<size_t>(total_state_floats));
+                effective_states = owned_speculative_state_work_.data();
+            }
+            std::memcpy(
+                effective_states,
+                request_state_bank_.data(),
+                static_cast<size_t>(total_state_floats) * sizeof(float));
+        }
+
+        const float *raw_input = input;
+        if (input == output)
+        {
+            const size_t input_floats =
+                static_cast<size_t>(seq_len) * static_cast<size_t>(channels);
+            request_input_copy_.resize(input_floats);
+            std::memcpy(
+                request_input_copy_.data(), input,
+                input_floats * sizeof(float));
+            raw_input = request_input_copy_.data();
+        }
+
+        int channel_block_width = 1;
+#if defined(__AVX512F__)
+        if (activeISALevel() == ISALevel::AVX512)
+            channel_block_width = 16;
+        else
+#endif
+#if defined(__AVX2__)
+        if (activeISALevel() == ISALevel::AVX2)
+            channel_block_width = 8;
+#endif
+
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_shortconv_request_batched_grouped_calls",
+            1.0,
+            "prefill",
+            "cpu",
+            {{"request_count", std::to_string(request_count)},
+             {"request_row_width", std::to_string(request_seq_len)},
+             {"channels", std::to_string(channels)},
+             {"execution_policy", "request_channel_block_grouped"}});
+
+        const int blocks_per_request =
+            ((channels - 1) / channel_block_width) + 1;
+        if (blocks_per_request <= 0 ||
+            blocks_per_request >
+                std::numeric_limits<int>::max() / request_count)
+        {
+            return false;
+        }
+        auto grouped_requests = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int work = 0;
+                 work < request_count * blocks_per_request;
+                 ++work)
+            {
+                const int request = work / blocks_per_request;
+                const int block = work % blocks_per_request;
+                const int c_start = block * channel_block_width;
+                const int c_width =
+                    std::min(channel_block_width, channels - c_start);
+                const int real_rows = std::clamp(
+                    host_request_seq_lens[request], 0, request_seq_len);
+                float *request_state =
+                    effective_states +
+                    static_cast<size_t>(request) * state_floats;
+                alignas(64) float sums[16];
+
+                for (int row = 0; row < real_rows; ++row)
+                {
+                    const int flat_row = request * request_seq_len + row;
+                    const float *input_row =
+                        raw_input + static_cast<size_t>(flat_row) * channels;
+                    for (int ci = 0; ci < c_width; ++ci)
+                    {
+                        const int channel = c_start + ci;
+                        sums[ci] = shortconv_decode_sum_and_update_channel(
+                            input_row, weight, bias, request_state,
+                            channel, kernel_size);
+                    }
+                    shortconv_store_decode_block(
+                        sums,
+                        output + static_cast<size_t>(flat_row) * channels + c_start,
+                        c_width,
+                        apply_silu);
+
+                    if (capture_active)
+                    {
+                        for (int ci = 0; ci < c_width; ++ci)
+                        {
+                            const int channel = c_start + ci;
+                            const float *source =
+                                request_state + static_cast<size_t>(channel) * state_len;
+                            float *destination =
+                                verifier_state_capture_ +
+                                static_cast<size_t>(flat_row) * verifier_state_capture_size_ +
+                                static_cast<size_t>(channel) * state_len;
+                            std::memcpy(
+                                destination, source,
+                                static_cast<size_t>(state_len) * sizeof(float));
+                        }
+                    }
+                }
+
+                for (int row = real_rows; row < request_seq_len; ++row)
+                {
+                    const int flat_row = request * request_seq_len + row;
+                    std::memset(
+                        output + static_cast<size_t>(flat_row) * channels + c_start,
+                        0,
+                        static_cast<size_t>(c_width) * sizeof(float));
+                    if (capture_active)
+                    {
+                        for (int ci = 0; ci < c_width; ++ci)
+                        {
+                            const int channel = c_start + ci;
+                            std::memset(
+                                verifier_state_capture_ +
+                                    static_cast<size_t>(flat_row) * verifier_state_capture_size_ +
+                                    static_cast<size_t>(channel) * state_len,
+                                0,
+                                static_cast<size_t>(state_len) * sizeof(float));
+                        }
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(grouped_requests);
+
+        if (!capture_active)
+        {
+            std::memcpy(
+                conv_state,
+                request_state_bank_.data(),
+                static_cast<size_t>(state_floats) * sizeof(float));
+        }
         return true;
     }
 

@@ -2198,7 +2198,8 @@ static int rocblas_prefill_impl(
 /**
  * @brief Dequantize interleaved FP16 KV to FP32
  *
- * Layout: [kv_len, n_kv_heads * head_dim] — one element per thread.
+ * Layout: [batch_size, kv_len, n_kv_heads * head_dim] flattened into one
+ * contiguous row span — one element per thread.
  * Each FP16 value is converted in-place to FP32 in the output buffer,
  * preserving the interleaved head layout for rocBLAS.
  */
@@ -2217,7 +2218,8 @@ __global__ void dequant_fp16_to_fp32_kernel(
  * @brief Dequantize interleaved Q8_1 KV to FP32
  *
  * Layout: K/V are stored as Q8_1Blocks in interleaved head layout:
- *   [kv_len, n_kv_heads, blocks_per_head] where blocks_per_head = head_dim / 32
+ *   [batch_size, kv_len, n_kv_heads, blocks_per_head] where
+ *   blocks_per_head = head_dim / 32
  *
  * Each thread processes one Q8_1Block (32 elements): scale × int8 → float.
  * Output is written to the matching position in FP32 interleaved layout.
@@ -2235,7 +2237,9 @@ __global__ void dequant_q8_1_to_fp32_kernel(
     constexpr int BLOCK_SIZE = 32;  // Q8_1Block::BLOCK_SIZE
     const int blocks_per_head = head_dim / BLOCK_SIZE;
 
-    // Decode block position in [kv_pos, kv_head, block_within_head]
+    // Decode the flattened [batch, kv_pos, kv_head, block_within_head]
+    // position. Batch and KV position can remain flattened because both the
+    // source and the rocBLAS destination use contiguous request-major rows.
     const int blocks_per_row = n_kv_heads * blocks_per_head;
     const int kv_pos = block_idx / blocks_per_row;
     const int rem = block_idx % blocks_per_row;
@@ -2246,7 +2250,7 @@ __global__ void dequant_q8_1_to_fp32_kernel(
     // FP16 scale → FP32
     float scale = __half2float(*reinterpret_cast<const half*>(&block.d));
 
-    // Output offset in FP32 interleaved layout: [kv_pos, kv_head * head_dim + blk * 32]
+    // Output offset in FP32 request-major interleaved layout.
     int dst_base = kv_pos * (n_kv_heads * head_dim) + kv_head * head_dim + blk * BLOCK_SIZE;
 
     #pragma unroll
@@ -2302,8 +2306,20 @@ static int rocblas_prefill_fp16_impl(
     int device_id = 0;
     (void)hipGetDevice(&device_id);
 
-    // Dequant buffer: space for both K and V as FP32
-    const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    // The rocBLAS consumer advances by one complete KV span per request. The
+    // conversion allocation and launch must therefore include every request,
+    // not merely the first request's kv_len rows.
+    const size_t kv_rows =
+        static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
+    const size_t kv_elements =
+        kv_rows * static_cast<size_t>(n_kv_heads) *
+        static_cast<size_t>(head_dim);
+    if (kv_elements > static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        printf("[rocblas_prefill_fp16] Batched KV conversion exceeds kernel index range: %zu elements\n",
+               kv_elements);
+        return -1;
+    }
     const size_t dequant_bytes = 2 * kv_elements * sizeof(float);  // K + V
     float* dequant_buf = get_dequant_buffer(device_id, dequant_bytes);
     if (!dequant_buf) return -1;
@@ -2313,15 +2329,17 @@ static int rocblas_prefill_fp16_impl(
 
     // Launch dequant kernels (can overlap on same stream since K and V are independent outputs)
     constexpr int DEQUANT_BLOCK = 256;
-    int dequant_grid = (kv_elements + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;
+    const int dequant_elements = static_cast<int>(kv_elements);
+    int dequant_grid =
+        (dequant_elements + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;
 
     hipLaunchKernelGGL(dequant_fp16_to_fp32_kernel,
         dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const half*>(K_fp16), K_fp32, static_cast<int>(kv_elements));
+        static_cast<const half*>(K_fp16), K_fp32, dequant_elements);
 
     hipLaunchKernelGGL(dequant_fp16_to_fp32_kernel,
         dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const half*>(V_fp16), V_fp32, static_cast<int>(kv_elements));
+        static_cast<const half*>(V_fp16), V_fp32, dequant_elements);
 
     // Delegate to FP32 rocBLAS path
     return rocblas_prefill_impl(
@@ -2352,7 +2370,11 @@ static int rocblas_prefill_q8_1_impl(
     int device_id = 0;
     (void)hipGetDevice(&device_id);
 
-    const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t kv_rows =
+        static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
+    const size_t kv_elements =
+        kv_rows * static_cast<size_t>(n_kv_heads) *
+        static_cast<size_t>(head_dim);
     const size_t dequant_bytes = 2 * kv_elements * sizeof(float);
     float* dequant_buf = get_dequant_buffer(device_id, dequant_bytes);
     if (!dequant_buf) return -1;
@@ -2362,7 +2384,17 @@ static int rocblas_prefill_q8_1_impl(
 
     // Total Q8_1 blocks for one K or V tensor
     const int blocks_per_head = head_dim / 32;
-    const int total_blocks = kv_len * n_kv_heads * blocks_per_head;
+    const size_t total_blocks_size =
+        kv_rows * static_cast<size_t>(n_kv_heads) *
+        static_cast<size_t>(blocks_per_head);
+    if (total_blocks_size >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        printf("[rocblas_prefill_q8_1] Batched KV conversion exceeds kernel index range: %zu blocks\n",
+               total_blocks_size);
+        return -1;
+    }
+    const int total_blocks = static_cast<int>(total_blocks_size);
 
     constexpr int DEQUANT_BLOCK = 256;
     int dequant_grid = (total_blocks + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;

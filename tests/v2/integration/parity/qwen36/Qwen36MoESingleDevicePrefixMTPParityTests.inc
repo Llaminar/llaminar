@@ -246,9 +246,9 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierPublishedStateMatchesSerialContinu
         true);
 }
 #else
-TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported)
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierUsesGroupedDecodeEquivalentPublication)
 {
-    runMoEMainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported(
+    runMoEMainVerifierUsesGroupedDecodeEquivalentPublication(
         QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE());
 }
 #endif

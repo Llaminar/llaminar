@@ -6,10 +6,11 @@
  * tensor. This is used by MTP verifier paths to feed one batched LM-head GEMM
  * instead of either projecting every verifier row or looping one-row helpers.
  *
- * Lifecycle: replay setters update host-side intent only. GPU row-index uploads
- * happen from executeGPU(), after DeviceGraphExecutor has rebound the current
- * workspace manager and an explicit non-null stream. This avoids stale workspace
- * handoff bugs when cached graph objects outlive a previous workspace manager.
+ * GPU row ownership is explicit. Ordinary compact graphs upload a stage-owned
+ * row plan, verifier graphs consume an externally produced device plan, and
+ * request-batched prefill derives terminal rows directly from resident request
+ * lengths. Every mode uses a stable device address and an explicit stream, so a
+ * captured graph never adopts mutable host row state.
  */
 
 #pragma once
@@ -41,6 +42,23 @@ namespace llaminar2
     public:
         static constexpr const char *WS_SELECTED_ROWS_ARRAY = "hidden_rows_select_selected_rows_array";
 
+        /**
+         * @brief Selects the authoritative source of GPU row indices.
+         *
+         * The source is part of the graph contract rather than a runtime
+         * fallback. `StageOwnedIndices` is useful for fixed plans and focused
+         * replay tools. `ExternalDeviceIndices` lets a preceding device metadata
+         * kernel publish arbitrary verifier rows. `RequestTerminalLengths`
+         * computes one terminal row per padded request directly in the copy
+         * kernel, preserving full device ownership of request-batched prefill.
+         */
+        enum class DeviceRowIndexSource
+        {
+            StageOwnedIndices,
+            ExternalDeviceIndices,
+            RequestTerminalLengths,
+        };
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -54,9 +72,11 @@ namespace llaminar2
 
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_buffer_id;
-            std::string workspace_buffer_name;
-            bool declare_selected_rows_workspace = true; ///< Declare row-index workspace when this stage owns it.
-            bool upload_selected_rows_to_workspace = true; ///< Upload host row indices; false means an external metadata producer owns contents.
+            DeviceRowIndexSource device_row_index_source =
+                DeviceRowIndexSource::StageOwnedIndices; ///< Authoritative GPU row-index policy.
+            std::string workspace_buffer_name; ///< Stable row-index workspace for stage-owned or external-device plans.
+            const int32_t *request_sequence_lengths_device = nullptr; ///< Resident request lengths for RequestTerminalLengths.
+            int request_row_stride = 0; ///< Padded source-row stride between requests.
         };
 
         explicit HiddenStateRowsSelectStage(Params params);

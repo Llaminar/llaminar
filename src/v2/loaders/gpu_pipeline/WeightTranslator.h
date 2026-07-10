@@ -13,7 +13,7 @@
  *    separated arrays. Direct H2D memcpy (no repack kernel needed).
  *
  * 3. **reverseRepackOnDevice()** — GPU separated → raw GGUF blocks on device.
- *    Only supports reversible per-block formats (Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, Q8_0).
+ *    Supports every reversible format, including Q8_1 and raw-INT8 Q8_K.
  *    Used when converting GPU weights back for CPU packing.
  *
  * 4. **forwardRepackOnDevice()** — Raw GGUF blocks on device → GPU separated arrays.
@@ -48,7 +48,7 @@ namespace llaminar2 {
 /**
  * @brief Raw GGUF block sizes for reversible formats.
  *
- * Returns sizeof(block struct) for per-block formats, 0 for unsupported.
+ * Returns sizeof(block struct) for reversible formats, 0 for unsupported.
  */
 inline size_t rawBlockSizeBytes(RepackFormat format)
 {
@@ -59,6 +59,8 @@ inline size_t rawBlockSizeBytes(RepackFormat format)
     case RepackFormat::Q5_0:    return 22;  // Q5_0Block
     case RepackFormat::Q5_1:    return 24;  // Q5_1Block
     case RepackFormat::Q8_0:    return 34;  // Q8_0Block
+    case RepackFormat::Q8_1:    return 36;  // Q8_1Block
+    case RepackFormat::Q8_K:    return 288; // Q8_KBlock
     default:                    return 0;   // Not supported for reverse repack
     }
 }
@@ -75,7 +77,10 @@ inline size_t rawBlockBufferSize(RepackFormat format, int N, int K)
 {
     size_t block_bytes = rawBlockSizeBytes(format);
     if (block_bytes == 0) return 0;
-    return static_cast<size_t>(N) * (K / 32) * block_bytes;
+    const size_t blocks_per_row = format == RepackFormat::Q8_K
+                                      ? static_cast<size_t>((K + 255) / 256)
+                                      : static_cast<size_t>((K + 31) / 32);
+    return static_cast<size_t>(N) * blocks_per_row * block_bytes;
 }
 
 class WeightTranslator {

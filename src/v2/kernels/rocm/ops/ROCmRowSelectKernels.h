@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace llaminar2::rocm
 {
 
@@ -74,6 +76,34 @@ namespace llaminar2::rocm
         int seq_len,
         int d_model,
         int selected_row_count,
+        void *stream);
+
+    /**
+     * @brief Pack one terminal hidden row per padded request from resident lengths.
+     *
+     * For request `r`, the HIP kernel reads
+     * `r * request_row_stride + request_sequence_lengths[r] - 1`. This makes
+     * unequal request geometry a graph-resident input instead of a host replay
+     * parameter or a stale verifier-workspace alias.
+     *
+     * @param input Device pointer to flattened [requests * stride, d_model] rows.
+     * @param output Device pointer to compact [request_count, d_model] rows.
+     * @param request_sequence_lengths Device INT32 array with one real length per request.
+     * @param seq_len Total number of flattened source rows.
+     * @param request_row_stride Padded number of rows reserved for each request.
+     * @param d_model Number of FP32 columns in each hidden row.
+     * @param request_count Number of terminal rows to pack.
+     * @param stream Explicit non-null HIP stream.
+     * @return true when the graph-capturable kernel launch succeeds.
+     */
+    bool launchRequestTerminalRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *request_sequence_lengths,
+        int seq_len,
+        int request_row_stride,
+        int d_model,
+        int request_count,
         void *stream);
 
     /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */

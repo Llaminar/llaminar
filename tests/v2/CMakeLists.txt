@@ -2669,6 +2669,41 @@ add_v2_test(V2_Unit_CPURMSNormKernelT
     LABELS "V2;Unit;Kernels;RMSNorm;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
     MPI_PROCS 1  # CPURMSNormKernelT tests are CPU-only, single rank
 )
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_RMSNorm
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_typed_kernel>
+            --gtest_filter=CPURMSNormKernelTTest.GroupedVerifierRowsAllActivationFormatsMatchSerialDecodeByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;RMSNorm;FP32;BF16;FP16;Q8_1;Q16_1;AllFormats;Regression"
+    MPI_PROCS 1
+)
+
+# Canonical CPU grouped residual-add proof. This integration target exercises
+# the production tensor API and one flat workshare over every M-row span.
+add_executable(v2_integration_cpu_residual_add_grouped_verifier
+    integration/kernels/cpu/Test__CPUResidualAddGroupedVerifier.cpp)
+target_include_directories(v2_integration_cpu_residual_add_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cpu_residual_add_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_ResidualAdd
+    COMMAND $<TARGET_FILE:v2_integration_cpu_residual_add_grouped_verifier>
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;BatchInvariant;Regression"
+    MPI_PROCS 1
+)
+
+# Canonical CPU grouped proof for the graph's fused residual-plus-normalization
+# stage. Both in-place residual and normalized outputs are native-byte oracles.
+add_executable(v2_integration_cpu_fused_residual_norm_grouped_verifier
+    integration/kernels/cpu/Test__CPUFusedResidualNormGroupedVerifier.cpp)
+target_include_directories(v2_integration_cpu_fused_residual_norm_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cpu_fused_residual_norm_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_FusedResidualNorm
+    COMMAND $<TARGET_FILE:v2_integration_cpu_fused_residual_norm_grouped_verifier>
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;FusedResidualNorm;ResidualAdd;RMSNorm;FP32;BF16;FP16;AllFormats;BatchInvariant;Regression"
+    MPI_PROCS 1
+)
 
 # Test: CPURoPEKernelT (typed RoPE with fused precision conversion)
 add_executable(v2_test_rope_typed_kernel unit/kernels/cpu/ops/Test__CPURoPEKernelT.cpp)
@@ -2681,6 +2716,13 @@ add_v2_test(V2_Unit_CPURoPEKernelT
     COMMAND $<TARGET_FILE:v2_test_rope_typed_kernel>
     LABELS "V2;Unit;Kernels;RoPE;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
     MPI_PROCS 1  # CPURoPEKernelT tests are CPU-only, single rank
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_RoPE
+    COMMAND $<TARGET_FILE:v2_test_rope_typed_kernel>
+            --gtest_filter=CPURoPEKernelTTest.GroupedVerifierRowsAllNativeFormatsMatchSerialDecodeByteExact:CPURoPEKernelTTest.FP32_grouped_verifier_partial_rope_matches_serial_decode_contract
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;RoPE;FP32;BF16;FP16;Q8_1;Q16_1;AllFormats;AllCodebooks;Regression"
+    MPI_PROCS 1
 )
 
 # Test: CPURoPEKernelT<Q16_1> with variable block sizes (32, 64, 128, 192)
@@ -2734,6 +2776,13 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     LABELS "V2;Unit;Kernels;Attention;FlashAttention;FP32;VNNI;CPU;Accuracy;GQA;TensorParallel"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_FP32
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+            --gtest_filter=Test__CPUFlashAttentionKernelT.GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_M2ToM4
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;FP32;Regression"
+    MPI_PROCS 1
+)
 
 # Test: CPU attention padding parity for Phase 6 prefill bucket safety
 add_executable(v2_test_attention_padding_parity unit/kernels/cpu/attention/Test__AttentionPaddingParity.cpp)
@@ -2758,6 +2807,13 @@ target_link_libraries(v2_test_q16_decode_head_major
 add_v2_test(V2_Unit_Q16DecodeHeadMajor
     COMMAND $<TARGET_FILE:v2_test_q16_decode_head_major>
     LABELS "V2;Unit;Kernels;Attention;Q16_1;HeadMajor;KVCache;Regression;CPU"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_Q16
+    COMMAND $<TARGET_FILE:v2_test_q16_decode_head_major>
+            --gtest_filter=Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_M2ToM4:Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_M2ToM4
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;Q16_1;HeadMajor;Regression"
     MPI_PROCS 1
 )
 
@@ -2959,6 +3015,20 @@ target_link_libraries(v2_test_cpu_swiglu_kernel_typed
 add_v2_test(V2_Unit_CPUSwiGLUKernelT_Precision
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu_kernel_typed>
     LABELS "V2;Unit;Kernels;SwiGLU;TypedPrecision;FP32;BF16;FP16;Q8_1;CPU"
+    MPI_PROCS 1
+)
+
+# Canonical CPU grouped standalone SwiGLU proof. Q8_1 is included alongside all
+# floating activation formats, with an odd native block count to expose row drift.
+add_executable(v2_integration_cpu_swiglu_grouped_verifier
+    integration/kernels/cpu/Test__CPUSwiGLUGroupedVerifier.cpp)
+target_include_directories(v2_integration_cpu_swiglu_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cpu_swiglu_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_SwiGLU
+    COMMAND $<TARGET_FILE:v2_integration_cpu_swiglu_grouped_verifier>
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;SwiGLU;FP32;BF16;FP16;Q8_1;AllFormats;BatchInvariant;Regression"
     MPI_PROCS 1
 )
 
@@ -3339,6 +3409,13 @@ target_link_libraries(v2_test_ikv_cache_logical_block_io
 add_v2_test(V2_Unit_IKVCacheLogicalBlockIO
     COMMAND $<TARGET_FILE:v2_test_ikv_cache_logical_block_io>
     LABELS "V2;Unit;KVCache;PrefixCache;LogicalBlockIO;CPU;Q16_1;TQ"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_KVCacheAppend
+    COMMAND $<TARGET_FILE:v2_test_ikv_cache_logical_block_io>
+            --gtest_filter=Test__IKVCacheLogicalBlockIO.AllCPUFormatsGroupedVerifierAppendM234MatchesSerialDecodeBytes
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;FP32;BF16;FP16;Q8_1;Q16_1;TQ4;TQ8;Regression"
     MPI_PROCS 1
 )
 
@@ -4773,9 +4850,9 @@ add_v2_test(V2_Integration_CUDAGemmParity
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_SmallM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
+            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_SmallM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_M234MatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_M234MatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_M234MatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;FP32;FP16;BF16;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_LocalTPWo
@@ -4807,12 +4884,38 @@ add_v2_test(V2_Integration_CUDAMoEKernel
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_AllNativeFormats_M234MatchRowByRowDecode:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
+            --gtest_filter=Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_M234MatchRowByRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;Regression"
+    LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;Regression"
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added CUDA MoE kernel integration tests")
+endif()
+
+# CUDA prepared embedding grouped-verifier integration suite. This target owns
+# real CUDA work and therefore must never be folded into a unit-test binary.
+if(HAVE_CUDA)
+add_executable(v2_integration_cuda_embedding_grouped_verifier
+    integration/kernels/cuda/Test__CUDAEmbeddingGroupedVerifier.cpp
+)
+target_link_libraries(v2_integration_cuda_embedding_grouped_verifier
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    CUDA::cudart
+)
+add_v2_test(V2_Integration_CUDAEmbeddingGroupedVerifier
+    COMMAND $<TARGET_FILE:v2_integration_cuda_embedding_grouped_verifier>
+    LABELS "V2;Integration;CUDA;Embedding;MTP;PreparedWeights;DeviceResident;AllFormats;BatchInvariant"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Embedding
+    COMMAND $<TARGET_FILE:v2_integration_cuda_embedding_grouped_verifier>
+            --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensM234MatchSerialDecodeBytes:Test__CUDAEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;Regression"
+    MPI_PROCS 1
+)
 endif()
 
 # Test: CUDA Ops Parity (RMSNorm, SwiGLU, RoPE)
@@ -4825,11 +4928,61 @@ add_v2_test(V2_Integration_CUDAOpsParity
     LABELS "V2;Integration;CUDA;Parity;RMSNorm;SwiGLU;RoPE;FP32;BF16;FP16;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
+
+# Canonical CUDA grouped standalone SwiGLU proof. This explicit binary avoids
+# treating the fused GEMM+SwiGLU-down sweep as coverage for the activation API.
+add_executable(v2_integration_cuda_swiglu_grouped_verifier
+    integration/kernels/cuda/ops/Test__CUDASwiGLUGroupedVerifier.cpp)
+target_include_directories(v2_integration_cuda_swiglu_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_swiglu_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_SwiGLU
+    COMMAND $<TARGET_FILE:v2_integration_cuda_swiglu_grouped_verifier>
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;SwiGLU;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
+    MPI_PROCS 1
+)
+
+# Canonical CUDA MTP RMSNorm proof. The dedicated binary enters the real
+# tensor-aware API and covers all native formats plus both reduction launch
+# widths; the older parity binary remains a broad CPU-reference tolerance suite.
+add_executable(v2_integration_cuda_rmsnorm_grouped_verifier
+    integration/kernels/cuda/ops/Test__CUDARMSNormGroupedVerifier.cpp)
+target_include_directories(v2_integration_cuda_rmsnorm_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_rmsnorm_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_RMSNorm
-    COMMAND $<TARGET_FILE:v2_integration_cuda_ops_parity>
-            --gtest_filter=Test__CUDAOpsParity.RMSNorm_FP32_VerifierRowsM234MatchSerialRowsByteExact
-            --gtest_brief=1
-    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;RMSNorm;FP32;Regression"
+    COMMAND $<TARGET_FILE:v2_integration_cuda_rmsnorm_grouped_verifier>
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;RMSNorm;FP32;BF16;FP16;AllFormats;NarrowWideReduction;DeviceResident;ExplicitStream;BatchInvariant;Regression"
+    MPI_PROCS 1
+)
+
+# Canonical CUDA proof for the graph's real fused residual-plus-normalization
+# stage, including both device-published outputs and native format dispatch.
+add_executable(v2_integration_cuda_fused_residual_norm_grouped_verifier
+    integration/kernels/cuda/ops/Test__CUDAFusedResidualNormGroupedVerifier.cpp)
+target_include_directories(v2_integration_cuda_fused_residual_norm_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_fused_residual_norm_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_FusedResidualNorm
+    COMMAND $<TARGET_FILE:v2_integration_cuda_fused_residual_norm_grouped_verifier>
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;FusedResidualNorm;ResidualAdd;RMSNorm;FP32;BF16;FP16;AllFormats;NarrowWideReduction;DeviceResident;ExplicitStream;BatchInvariant;Regression"
+    MPI_PROCS 1
+)
+
+# Canonical CUDA MTP RoPE proof. The dedicated binary keeps the byte-exact
+# all-format matrix independent from the older CPU-reference tolerance suite.
+add_executable(v2_integration_cuda_rope_grouped_verifier
+    integration/kernels/cuda/ops/Test__CUDARoPEGroupedVerifier.cpp)
+target_include_directories(v2_integration_cuda_rope_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_rope_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_RoPE
+    COMMAND $<TARGET_FILE:v2_integration_cuda_rope_grouped_verifier>
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;RoPE;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
 )
 
@@ -4844,13 +4997,27 @@ add_v2_test(V2_Integration_CUDAResidualAddParity
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
 
+# Canonical CUDA grouped residual-add proof. This explicit suite requires
+# device-only pointers, a non-default stream, native bytes, and one flat launch.
+add_executable(v2_integration_cuda_residual_add_grouped_verifier
+    integration/kernels/cuda/ops/Test__CUDAResidualAddGroupedVerifier.cpp)
+target_include_directories(v2_integration_cuda_residual_add_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_residual_add_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ResidualAdd
+    COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_grouped_verifier>
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
+    MPI_PROCS 1
+)
+
 # Test: CUDA HiddenStateRowSelectStage graph capture/replay
 # Verifies bucketed-prefill LM-head row selection can update real length across graph replays.
 add_executable(v2_integration_cuda_hidden_state_row_select_stage integration/kernels/cuda/ops/Test__CUDAHiddenStateRowSelectStage.cpp)
 target_link_libraries(v2_integration_cuda_hidden_state_row_select_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAHiddenStateRowSelectStage
     COMMAND $<TARGET_FILE:v2_integration_cuda_hidden_state_row_select_stage>
-    LABELS "V2;Integration;CUDA;GraphCapture;RowSelect;LMHead;Phase6;FP32"
+    LABELS "V2;Integration;CUDA;GraphCapture;RowSelect;LMHead;MTP;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression;Phase6;FP32"
     MPI_PROCS 1
 )
 
@@ -4909,6 +5076,13 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Attention
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;LocalTP;FP16;Q8_1;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CUDARequestBatchResidentKVAttention
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+            --gtest_filter=Test__CUDAFlashAttentionParity.CapturedRequestBatchFP16CacheMatchesIsolatedPrefillByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;Attention;KVCache;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;FP16;Regression"
+    MPI_PROCS 1
+)
 
 # Test: CUDA attention padding parity for Phase 6 prefill bucket safety
 # Verifies causal real-row outputs are unchanged by hostile bucket-tail padding
@@ -4928,6 +5102,27 @@ target_link_libraries(v2_integration_cuda_gdn_padded_real_length llaminar2_core 
 add_v2_test(V2_Integration_CUDAGDNPaddedRealLength
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
     LABELS "V2;Integration;CUDA;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ShortConv
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.RequestBatchedUnequalLengthsPreserveByteExactContinuation
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;ShortConv;RequestBatch;VariableLength;StatePublication;FP32;Regression"
     MPI_PROCS 1
 )
 endif()
@@ -4977,6 +5172,28 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     LABELS "V2;Integration;CUDA;Parity;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;BF16"
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
+add_v2_test(V2_Integration_CUDARequestBatchUnequalKVContinuation
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_parity>
+            --gtest_filter=Test__CUDARingKVCache.CapturedUnequalRequestLengthsPreserveContinuationAllFormats
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;KVCache;GraphCapture;DeviceResident;RequestBatch;UnequalLengths;Continuation;BatchInvariant;AllFormats;FP32;FP16;BF16;Q8_1;Regression"
+    MPI_PROCS 1
+)
+
+# Canonical MTP KV-publication proof.  This is intentionally a separate,
+# focused binary so the grouped verifier gate does not inherit unrelated ring
+# cache cases or silently skip its production graph-captured matrix.
+add_executable(v2_integration_cuda_kv_cache_grouped_verifier
+    integration/kernels/cuda/Test__CUDAKVCacheGroupedVerifier.cpp)
+target_include_directories(v2_integration_cuda_kv_cache_grouped_verifier
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_kv_cache_grouped_verifier
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCacheAppend
+    COMMAND $<TARGET_FILE:v2_integration_cuda_kv_cache_grouped_verifier>
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;FP32;BF16;FP16;Q8_1;TQ8;TQ4;GraphCapture;LocalTP;DeviceResident;Regression"
+    MPI_PROCS 1
+)
 
 # Integration Test: CUDA Ring Buffer KV Cache Sharding (Tensor Parallelism)
 # Tests sharded KV cache for tensor-parallel inference: per-rank metadata,
@@ -4997,6 +5214,27 @@ target_link_libraries(v2_integration_cuda_ring_kv_cache_tq llaminar2_core GTest:
 add_v2_test(V2_Integration_CUDARingKVCacheTQ
     COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_tq>
     LABELS "V2;Integration;CUDA;KVCache;TurboQuant;TQ8;TQ4;RoPE;Quantization"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDARequestBatchResidentTurboQuantKV
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_tq>
+            --gtest_filter=Test__CUDARingKVCacheTQ.CapturedResidentRequestBatchMatchesScalarDequantBytes
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;KVCache;TurboQuant;TQ8;TQ4;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;AllFormats;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDARequestBatchUnequalTurboQuantKVContinuation
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_tq>
+            --gtest_filter=Test__CUDARingKVCacheTQ.CapturedUnequalRequestLengthsPreserveContinuationBytes
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;KVCache;TurboQuant;TQ8;TQ4;GraphCapture;DeviceResident;RequestBatch;UnequalLengths;Continuation;BatchInvariant;AllFormats;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDADeviceResidentTurboQuantIncrementalDequant
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_tq>
+            --gtest_filter=Test__CUDARingKVCacheTQ.CapturedIncrementalDequantReadsPostAppendDeviceState
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MTP;KVCache;TurboQuant;TQ8;TQ4;GraphCapture;DeviceResident;IncrementalDequant;RoPE;ByteExact;BatchInvariant;Regression"
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added CUDA TurboQuant KV Cache integration tests")
@@ -7015,6 +7253,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke
     MPI_PROCS 1
     TIMEOUT 600
 )
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmRequestBatchResidentPrefill
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPRequestBatchResidentPrefill
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Sampling;RequestBatch;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticClearCacheRepeatabilityLong
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepeatabilityLong
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Sampling;Regression"
@@ -7024,6 +7268,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticClearCach
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;Sampling;Regression"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDARequestBatchResidentPrefill
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAMTPRequestBatchResidentPrefill
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;Sampling;RequestBatch;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression"
     MPI_PROCS 1
     TIMEOUT 600
 )
@@ -7331,6 +7581,23 @@ target_link_libraries(v2_test_multi_device_orchestrator llaminar2_core GTest::gt
 add_v2_test(V2_Unit_RankOrchestrator
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
     LABELS "V2;Unit;LocalTP;MultiDevice;IRankOrchestrator;TensorParallelism;Execution"
+    MPI_PROCS 1
+)
+
+# Test: persistent LocalTP worker fan-out generation ownership.
+# This is deliberately a host-only unit target; GPU child work and collective
+# execution remain in the LocalTP integration suites.
+add_executable(v2_unit_tp_worker_pool
+    unit/execution/local_execution/orchestrators/Test__TPWorkerPool.cpp
+)
+target_link_libraries(v2_unit_tp_worker_pool
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TPWorkerPool
+    COMMAND $<TARGET_FILE:v2_unit_tp_worker_pool>
+    LABELS "V2;Unit;LocalTP;Concurrency;TensorParallelism;Execution"
     MPI_PROCS 1
 )
 
@@ -9832,10 +10099,17 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;LocalTP;Wo;ReplicatedWo;AllFormats;Regression"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_FloatingFormats
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.FloatingProjectionAllFormatsGroupedVerifierRowsMatchSerialDecodeStrict:Test__ROCmQuantisedGemmSmallM.FloatingSwiGLUDownAllFormatsGroupedVerifierRowsMatchSerialDecodeStrict
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;FP32;FP16;BF16;SwiGLU;Regression"
+        MPI_PROCS 1
+    )
     message(STATUS "V2 Tests: Added focused ROCm small-M GEMM integration tests")
 
     # Unit Test: Native-VNNI Packing (CPU-only)
-    # Validates packNativeVNNI() output for all 16 supported quantization formats.
+    # Validates packNativeVNNI() output for every supported quantization format.
     # Tests codebook_id, payload/scales/mins sizes, FP16 scale validity, dimension sweeps.
     add_executable(v2_unit_native_vnni_packing
         unit/kernels/rocm/Test__NativeVNNI_Packing.cpp
@@ -9853,7 +10127,7 @@ if(HAVE_ROCM)
     message(STATUS "V2 Tests: Added native-VNNI packing unit tests (16 formats)")
 
     # Integration Test: Native-VNNI GEMV Accuracy
-    # Runs M=1 GEMV on GPU for all 16 native-VNNI formats and compares output
+    # Runs M=1 GEMV on GPU for every native-VNNI format and compares output
     # against CPU FP32 reference (dequantized weights × FP32 input).
     add_executable(v2_integration_rocm_native_vnni_gemv
         integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
@@ -9869,10 +10143,10 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_AllFormats
-        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
-                --gtest_filter=NativeVNNIGEMVTest.SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.ProductionPreparedAllQuantizedFormatsM234MatchSerialDecodeBytes
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;Regression"
+        LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;NativeVNNI;Regression"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added native-VNNI GEMV integration tests (16 formats)")
@@ -10326,6 +10600,26 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;gfx906"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_ROCmRequestBatchUnequalKVContinuation
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache>
+                --gtest_filter=Test__ROCmRingKVCache.CapturedUnequalRequestLengthsPreserveContinuationAllFormats
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;KVCache;GraphCapture;DeviceResident;RequestBatch;UnequalLengths;Continuation;BatchInvariant;AllFormats;FP32;FP16;BF16;Q8_1;Regression;gfx906"
+        MPI_PROCS 1
+    )
+
+    # Explicit ROCm mirror of the canonical CUDA grouped publication proof.
+    add_executable(v2_integration_rocm_kv_cache_grouped_verifier
+        integration/kernels/rocm/Test__ROCmKVCacheGroupedVerifier.cpp)
+    target_include_directories(v2_integration_rocm_kv_cache_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_kv_cache_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_KVCacheAppend
+        COMMAND $<TARGET_FILE:v2_integration_rocm_kv_cache_grouped_verifier>
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;FP32;BF16;FP16;Q8_1;TQ8;TQ4;GraphCapture;LocalTP;DeviceResident;Regression;gfx906"
+        MPI_PROCS 1
+    )
     message(STATUS "V2 Tests: Added ROCm Ring KV Cache integration tests")
 
     # Integration Test: ROCm Ring Buffer KV Cache Sharding
@@ -10412,6 +10706,20 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32;gfx906"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNRecurrence
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM4Qwen36DenseShapeVerifierCaptureIsolatesLiveState
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_ShortConv
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression;gfx906"
+        MPI_PROCS 1
+    )
     message(STATUS "V2 Tests: Added ROCm padded GDN real-length integration tests")
 
     # Integration Test: ROCm TurboQuant KV Cache
@@ -10427,6 +10735,27 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmRingKVCacheTQ
         COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_tq>
         LABELS "V2;Integration;ROCm;KVCache;TurboQuant;TQ8;TQ4;RoPE;Quantization;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCmRequestBatchResidentTurboQuantKV
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_tq>
+                --gtest_filter=Test__ROCmRingKVCacheTQ.CapturedResidentRequestBatchMatchesScalarDequantBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;KVCache;TurboQuant;TQ8;TQ4;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;AllFormats;Regression;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCmRequestBatchUnequalTurboQuantKVContinuation
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_tq>
+                --gtest_filter=Test__ROCmRingKVCacheTQ.CapturedUnequalRequestLengthsPreserveContinuationBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;KVCache;TurboQuant;TQ8;TQ4;GraphCapture;DeviceResident;RequestBatch;UnequalLengths;Continuation;BatchInvariant;AllFormats;Regression;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCmDeviceResidentTurboQuantIncrementalDequant
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_tq>
+                --gtest_filter=Test__ROCmRingKVCacheTQ.CapturedIncrementalDequantReadsPostAppendDeviceState
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;KVCache;TurboQuant;TQ8;TQ4;GraphCapture;DeviceResident;IncrementalDequant;RoPE;ByteExact;BatchInvariant;Regression;gfx906"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm TurboQuant KV Cache integration tests")
@@ -10451,6 +10780,20 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;Parity;SwiGLU;FP32;BF16;FP16;CosineSimilarity;gfx906"
         MPI_PROCS 1
     )
+
+    # Canonical ROCm grouped standalone SwiGLU proof, including the BF16
+    # explicit-stream regression that the older raw-pointer suite cannot cover.
+    add_executable(v2_integration_rocm_swiglu_grouped_verifier
+        integration/kernels/rocm/Test__ROCmSwiGLUGroupedVerifier.cpp)
+    target_include_directories(v2_integration_rocm_swiglu_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_swiglu_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_SwiGLU
+        COMMAND $<TARGET_FILE:v2_integration_rocm_swiglu_grouped_verifier>
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;SwiGLU;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression;gfx906"
+        MPI_PROCS 1
+    )
     message(STATUS "V2 Tests: Added ROCm SwiGLU parity tests")
 
     # ROCm RoPE Parity Tests
@@ -10470,6 +10813,19 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmRoPEParity
         COMMAND $<TARGET_FILE:v2_integration_rocm_rope_parity>
         LABELS "V2;Integration;ROCm;Parity;RoPE;FP32;BF16;FP16;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+
+    # Canonical ROCm MTP RoPE proof, symmetric with the explicit CUDA suite.
+    add_executable(v2_integration_rocm_rope_grouped_verifier
+        integration/kernels/rocm/Test__ROCmRoPEGroupedVerifier.cpp)
+    target_include_directories(v2_integration_rocm_rope_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_rope_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_RoPE
+        COMMAND $<TARGET_FILE:v2_integration_rocm_rope_grouped_verifier>
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;RoPE;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression;gfx906"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm RoPE parity tests")
@@ -10493,11 +10849,32 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;Parity;RMSNorm;FP32;BF16;FP16;CosineSimilarity;gfx906"
         MPI_PROCS 1
     )
+
+    # Canonical ROCm MTP RMSNorm proof, symmetric with the explicit CUDA suite.
+    # It verifies native bytes and the one-workgroup-per-row grouped route.
+    add_executable(v2_integration_rocm_rmsnorm_grouped_verifier
+        integration/kernels/rocm/Test__ROCmRMSNormGroupedVerifier.cpp)
+    target_include_directories(v2_integration_rocm_rmsnorm_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_rmsnorm_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_RMSNorm
-        COMMAND $<TARGET_FILE:v2_integration_rocm_rmsnorm_parity>
-                --gtest_filter=Test__ROCmRMSNormParity.RMSNorm_FP32_VerifierRowsM234MatchSerialRowsByteExact
-                --gtest_brief=1
-        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;RMSNorm;FP32;Regression;gfx906"
+        COMMAND $<TARGET_FILE:v2_integration_rocm_rmsnorm_grouped_verifier>
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;RMSNorm;FP32;BF16;FP16;AllFormats;NarrowWideReduction;DeviceResident;ExplicitStream;BatchInvariant;Regression;gfx906"
+        MPI_PROCS 1
+    )
+
+    # Canonical ROCm proof for the graph's real fused residual-plus-normalization
+    # stage. This remains symmetric with the CUDA matrix and stream contract.
+    add_executable(v2_integration_rocm_fused_residual_norm_grouped_verifier
+        integration/kernels/rocm/Test__ROCmFusedResidualNormGroupedVerifier.cpp)
+    target_include_directories(v2_integration_rocm_fused_residual_norm_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_fused_residual_norm_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_FusedResidualNorm
+        COMMAND $<TARGET_FILE:v2_integration_rocm_fused_residual_norm_grouped_verifier>
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;FusedResidualNorm;ResidualAdd;RMSNorm;FP32;BF16;FP16;AllFormats;NarrowWideReduction;DeviceResident;ExplicitStream;BatchInvariant;Regression;gfx906"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm RMSNorm parity tests")
@@ -10523,6 +10900,29 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm Embedding parity tests")
 
+    # Explicit prepared/device-owned ROCm embedding grouped-verifier suite.
+    # Real HIP work remains in Integration, never in a unit-test target.
+    add_executable(v2_integration_rocm_embedding_grouped_verifier
+        integration/kernels/rocm/Test__ROCmEmbeddingGroupedVerifier.cpp
+    )
+    target_link_libraries(v2_integration_rocm_embedding_grouped_verifier
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmEmbeddingGroupedVerifier
+        COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_grouped_verifier>
+        LABELS "V2;Integration;ROCm;Embedding;MTP;PreparedWeights;DeviceResident;AllFormats;BatchInvariant;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Embedding
+        COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_grouped_verifier>
+                --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensM234MatchSerialDecodeBytes:Test__ROCmEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;Regression;gfx906"
+        MPI_PROCS 1
+    )
+
     # ROCm Flash Attention Parity Tests
     # =============================================================================
 
@@ -10547,6 +10947,13 @@ if(HAVE_ROCM)
                 --gtest_filter=Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_*Qwen36LocalTP*RoPEOnReadRowsMatchSerialDecode
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;LocalTP;FP16;Q8_1;Regression;gfx906"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCmRequestBatchResidentKVAttention
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedRequestBatchAllStandardKVFormatsMatchIsolatedPrefillBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;Attention;KVCache;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;AllFormats;FP32;FP16;BF16;Q8_1;Regression;gfx906"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_ROCmFlashAttentionExternalMask
@@ -10585,7 +10992,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_ROCmHiddenStateRowSelectStage
         COMMAND $<TARGET_FILE:v2_integration_rocm_hidden_state_row_select_stage>
-        LABELS "V2;Integration;ROCm;GraphCapture;RowSelect;LMHead;Phase6;FP32;gfx906"
+        LABELS "V2;Integration;ROCm;GraphCapture;RowSelect;LMHead;MTP;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression;Phase6;FP32;gfx906"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm hidden-state row-select graph replay tests")
@@ -10627,6 +11034,20 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmResidualAddParity
         COMMAND $<TARGET_FILE:v2_integration_rocm_residual_add_parity>
         LABELS "V2;Integration;ROCm;Parity;ResidualAdd;FP32;BF16;FP16;CosineSimilarity;gfx906"
+        MPI_PROCS 1
+    )
+
+    # Canonical ROCm grouped residual-add proof, symmetric with CUDA and covering
+    # the BF16 stream-binding regression in the production adapter.
+    add_executable(v2_integration_rocm_residual_add_grouped_verifier
+        integration/kernels/rocm/Test__ROCmResidualAddGroupedVerifier.cpp)
+    target_include_directories(v2_integration_rocm_residual_add_grouped_verifier
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_residual_add_grouped_verifier
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_ResidualAdd
+        COMMAND $<TARGET_FILE:v2_integration_rocm_residual_add_grouped_verifier>
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression;gfx906"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm ResidualAdd parity tests")
@@ -10728,9 +11149,9 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoEKernel.SharedExpertGateVerifierRowsM234MatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_M234MatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchSerialStageDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.MaskedLocalTPVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
+                --gtest_filter=Test__ROCmMoEKernel.SharedExpertGateVerifierRowsM234MatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_M234MatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchSerialStageDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.MaskedLocalTPVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer3RealWeights_M3MatchesRuntimeDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer27RealWeights_M3MatchesRuntimeDecode
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;Regression"
+        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;RealModel;Regression"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm MoE kernel integration tests")
@@ -11663,6 +12084,13 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;Execution;GraphCapture;PrefillGraphCache;Buckets;ROCm"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNRequestBatch
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.RequestBatchedUnequalLengthsPreserveByteExactContinuation
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;ShortConv;RequestBatch;VariableLength;StatePublication;FP32;Regression;gfx906"
+        MPI_PROCS 1
+    )
 endif()
 
 if(HAVE_CUDA)
@@ -11787,12 +12215,35 @@ if(HAVE_CUDA OR HAVE_ROCM)
             GTest::gtest_main
         )
     endif()
-    add_v2_test(V2_Integration_GPUSamplingKernels
-        COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-        LABELS "V2;Integration;Backend;GPU;CUDA;ROCm;Sampling;Argmax;TopK"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added GPU Sampling Kernels integration tests")
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_GPUSamplingKernels_CUDA
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*/*CUDA
+            LABELS "V2;Integration;Backend;GPU;CUDA;Sampling;Argmax;TopK;MTP"
+            MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_StochasticResidentDraws
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*CUDA
+            LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
+    endif()
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_GPUSamplingKernels_ROCm
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*/*ROCm
+            LABELS "V2;Integration;Backend;GPU;ROCm;Sampling;Argmax;TopK;MTP"
+            MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_StochasticResidentDraws
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*CompactTargetSerialSamplesUseResidentPositionAndMatchSerialDecodeByteExact*ROCm
+            LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GroupedVerifierRows;Sampling;Stochastic;BatchInvariant;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+        )
+    endif()
+    message(STATUS "V2 Tests: Added explicit CUDA/ROCm GPU Sampling Kernels integration tests")
 endif()
 
 # =============================================================================
@@ -12185,7 +12636,26 @@ target_link_libraries(v2_test_gdn_kernels
 )
 add_v2_test(V2_Unit_GDNKernels
     COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+            --gtest_filter=-*ROCm*:*CUDA*
     LABELS "V2;Unit;GDNKernels;GDN;PhaseC"
+    MPI_PROCS 1
+)
+if(HAVE_ROCM)
+    # Real HIP execution belongs exclusively to the integration gate.  The
+    # source is shared with CPU fixture helpers, but the unit registration above
+    # explicitly excludes every ROCm/CUDA case.
+    add_v2_test(V2_Integration_ROCmGDNKernelParity
+        COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+                --gtest_filter=Test__GDNKernels.ROCm*
+        LABELS "V2;Integration;ROCm;GatedDeltaNet;ShortConv;Projection;Parity;FP32;Regression;gfx906"
+        MPI_PROCS 1
+    )
+endif()
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_GDNRecurrence
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+            --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeM2ToM4
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
     MPI_PROCS 1
 )
 
@@ -12202,6 +12672,13 @@ target_link_libraries(v2_test_gdn_mathematical_correctness
 add_v2_test(V2_Unit_GDNMathematicalCorrectness
     COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
     LABELS "V2;Unit;GDNKernels;GDN;MathCorrectness"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_ShortConv
+    COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
+            --gtest_filter=Test__GDNMathematicalCorrectness.ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeM2ToM4
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression"
     MPI_PROCS 1
 )
 
@@ -12388,16 +12865,23 @@ add_v2_test(V2_Unit_WeightManagerCpuHostRelease
     MPI_PROCS 1
 )
 
-# Test: EmbeddingKernelPreparedPath — Embedding kernel workspace requirements and
-# prepared vs fallback path selection. GPU tests skip if no CUDA/ROCm available.
-add_executable(v2_test_embedding_kernel_prepared_path unit/kernels/Test__EmbeddingKernelPreparedPath.cpp)
-target_link_libraries(v2_test_embedding_kernel_prepared_path llaminar2_core GTest::gtest GTest::gtest_main)
-target_include_directories(v2_test_embedding_kernel_prepared_path PRIVATE
+# Test: CPUEmbeddingGroupedVerifier — CPU-only all-codebook and all-output
+# native-byte equivalence for compact MTP verifier rows.
+add_executable(v2_test_cpu_embedding_grouped_verifier unit/kernels/Test__CPUEmbeddingGroupedVerifier.cpp)
+target_link_libraries(v2_test_cpu_embedding_grouped_verifier llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_cpu_embedding_grouped_verifier PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ include path
 )
-add_v2_test(V2_Unit_EmbeddingKernelPreparedPath
-    COMMAND $<TARGET_FILE:v2_test_embedding_kernel_prepared_path>
-    LABELS "V2;Unit;Kernels;Embedding;Workspace;PreparedWeights"
+add_v2_test(V2_Unit_CPUEmbeddingGroupedVerifier
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+    LABELS "V2;Unit;CPU;Kernels;Embedding;MTP;AllFormats;BatchInvariant"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Embedding
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+            --gtest_filter=Test__CPUEmbeddingGroupedVerifier.AllWeightAndOutputFormatsM234MatchSerialDecodeBytes:Test__CPUEmbeddingGroupedVerifier.CanonicalQuantizedRegistryMatchesTensorAndDevicePackingContracts:Test__CPUEmbeddingGroupedVerifier.Q6KHighVocabularyRowIsByteIdenticalAtM1AndM2
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;FP32;BF16;FP16;Q8_1;Regression"
     MPI_PROCS 1
 )
 
@@ -12602,7 +13086,15 @@ target_include_directories(v2_test_prefill_graph_capture_dynamic_params PRIVATE 
 target_link_libraries(v2_test_prefill_graph_capture_dynamic_params llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_PrefillGraphCaptureDynamicParams
     COMMAND $<TARGET_FILE:v2_test_prefill_graph_capture_dynamic_params>
+        --gtest_filter=-Test__PrefillGraphCaptureDynamicParams.EmbeddingReadiness_ROCm_ReturnsTrue:Test__PrefillGraphCaptureDynamicParams.PrelaunchTokenUpload_SucceedsUnderCapture:Test__PrefillGraphCaptureDynamicParams.NoPreload_FailsUnderCapture
     LABELS "V2;Unit;Embedding;KVCache;Stages;GraphCapture"
+    MPI_PROCS 1
+)
+
+add_v2_test(V2_Integration_PrefillGraphCaptureDynamicParams_ROCm
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capture_dynamic_params>
+        --gtest_filter=Test__PrefillGraphCaptureDynamicParams.EmbeddingReadiness_ROCm_ReturnsTrue:Test__PrefillGraphCaptureDynamicParams.PrelaunchTokenUpload_SucceedsUnderCapture:Test__PrefillGraphCaptureDynamicParams.NoPreload_FailsUnderCapture
+    LABELS "V2;Integration;ROCm;Embedding;GraphCapture;DeviceResident"
     MPI_PROCS 1
 )
 
@@ -12781,12 +13273,23 @@ if(HAVE_CUDA OR HAVE_ROCM)
             GTest::gtest_main
         )
     endif()
-    add_v2_test(V2_Integration_VnniUnpackKernels
-        COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
-        LABELS "V2;Integration;WeightLoading;GpuPipeline;GPU;CUDA;ROCm;Repack"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added VNNI unpack (reverse repack) integration tests")
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_CUDAVnniUnpackKernels
+            COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
+                    --gtest_filter=*CUDA
+            LABELS "V2;Integration;WeightLoading;GpuPipeline;GPU;CUDA;Repack;AllFormats"
+            MPI_PROCS 1
+        )
+    endif()
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ROCmVnniUnpackKernels
+            COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
+                    --gtest_filter=*ROCm
+            LABELS "V2;Integration;WeightLoading;GpuPipeline;GPU;ROCm;Repack;AllFormats"
+            MPI_PROCS 1
+        )
+    endif()
+    message(STATUS "V2 Tests: Added explicit CUDA/ROCm VNNI unpack integration suites")
 endif()
 
 # GPU Weight Loading Pipeline - Phase 3 Pipeline Integration

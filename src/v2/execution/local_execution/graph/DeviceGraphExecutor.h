@@ -386,7 +386,10 @@ namespace llaminar2
             ComputeGraph &graph,
             int terminal_row,
             void *producer_stream_override = nullptr,
-            const char *context = nullptr);
+            const char *context = nullptr,
+            const int *device_request_seq_lens = nullptr,
+            int request_count = 1,
+            int request_row_width = 0);
 
         /**
          * @brief Pre-register graph-stable snapshot buffers before GPU graph capture.

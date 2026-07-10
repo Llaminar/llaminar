@@ -27,9 +27,19 @@ namespace llaminar2
     {
     public:
         bool supportsPaddedPrefillRealLength() const override { return true; }
+        bool supportsRequestLiveStateBank(int request_count, int state_size) const override
+        {
+            return request_count > 0 && state_size > 0;
+        }
+        void resetGPUState() override;
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
         void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
+        bool restoreVerifierStateCaptureRows(
+            float *dst_state,
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override;
 
         bool chunk_forward(
             const float *Q, const float *K, const float *V,
@@ -58,6 +68,26 @@ namespace llaminar2
             int global_v_head_offset, int chunk_size, bool use_qk_l2norm,
             float *state_snapshots, int snapshot_stride_floats,
             int max_snapshot_rows) override;
+
+        bool chunkForwardBatchedRequestsWithHostSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *host_request_seq_lens) override;
+
+        bool chunkForwardBatchedMergedQKVWithHostSeqLens(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, bool use_qk_l2norm,
+            const int *host_request_seq_lens) override;
 
         bool restoreStateFromSnapshot(
             float *state, const float *state_snapshots,
@@ -138,7 +168,29 @@ namespace llaminar2
             float *state_snapshots, int snapshot_stride_floats,
             int max_snapshot_rows);
 
+        /**
+         * @brief Shared grouped request recurrence over arbitrary row layouts.
+         *
+         * One OpenMP work item owns a `(request, head)` pair for every real
+         * row.  That preserves the exact `recurrent_step()` arithmetic order
+         * while exposing all independent request/head work to the CPU pool.
+         */
+        template <typename RowAccessor>
+        bool chunkForwardBatchedDecodeEquivalentRows(
+            RowAccessor &&row_accessor,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            bool use_qk_l2norm,
+            const int *host_request_seq_lens);
+
         float *prepareSpeculativeState(float *live_state, int state_floats);
+        bool ensureRequestStateBank(
+            int request_count,
+            int state_floats,
+            const float *request_zero_state);
 
         // Reusable scratch buffers (grow-only, never shrink during lifetime)
         std::vector<float> q_scratch_;        ///< Preprocessed Q buffer
@@ -151,6 +203,9 @@ namespace llaminar2
         float *speculative_state_work_ = nullptr;
         int speculative_state_work_size_ = 0;
         std::vector<float> owned_speculative_state_work_;
+        std::vector<float> request_state_bank_;
+        int request_state_size_ = 0;
+        int request_state_capacity_ = 0;
     };
 
 } // namespace llaminar2

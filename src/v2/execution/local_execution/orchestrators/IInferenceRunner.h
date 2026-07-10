@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <cstdint>
@@ -91,6 +92,99 @@ namespace llaminar2
         MTPDeviceRejectionBatchOutcome;
 
     /**
+     * @brief Shared device-owned state for one request-scoped MTP transaction.
+     *
+     * GPU MTP shifted KV caches already own their live sequence metadata in
+     * stable device allocations.  This object does not duplicate that state;
+     * it names the canonical per-depth cached-token rows and carries the latest
+     * stream/event ordering edge for mutations to those rows.  The object is
+     * created for one runner request session and survives sidecar appends,
+     * verifier publication, correction commits, and prefix restore.  Only a
+     * request reset or cache replacement retires it.
+     *
+     * The state is shared because LocalTP keeps one outcome handle per child.
+     * Publication may advance a child's fence after the rank has copied the
+     * handle, and every copy must observe that newer fence without rebuilding
+     * an ambient mailbox or retargeting a live-state epoch.
+     */
+    struct DeviceResidentMTPTransactionState
+    {
+        DeviceId device = DeviceId::invalid();
+        int request_count = 0;
+        std::vector<const int *> shifted_cached_tokens_device_by_depth;
+        void *producer_stream = nullptr;
+        std::shared_ptr<void> ready_event;
+        uint64_t session_epoch = 0;
+        uint64_t mutation_generation = 0;
+
+        /**
+         * @brief Return whether the transaction owns a canonical count row for a depth.
+         */
+        bool coversDepth(int depth) const
+        {
+            return depth >= 0 &&
+                   depth < static_cast<int>(
+                               shifted_cached_tokens_device_by_depth.size()) &&
+                   shifted_cached_tokens_device_by_depth[
+                       static_cast<size_t>(depth)] != nullptr;
+        }
+
+        /**
+         * @brief Return the first request entry for one shifted-cache depth.
+         */
+        const int *cachedTokensForDepth(int depth) const
+        {
+            return coversDepth(depth)
+                       ? shifted_cached_tokens_device_by_depth[
+                             static_cast<size_t>(depth)]
+                       : nullptr;
+        }
+
+        /**
+         * @brief Return whether the transaction has complete ownership and ordering data.
+         */
+        bool valid() const
+        {
+            return device.is_gpu() &&
+                   request_count > 0 &&
+                   !shifted_cached_tokens_device_by_depth.empty() &&
+                   std::all_of(
+                       shifted_cached_tokens_device_by_depth.begin(),
+                       shifted_cached_tokens_device_by_depth.end(),
+                       [](const int *ptr) { return ptr != nullptr; }) &&
+                   producer_stream != nullptr &&
+                   ready_event != nullptr &&
+                   mutation_generation > 0;
+        }
+    };
+
+    /**
+     * @brief Copyable child-local lease for a device-resident MTP transaction.
+     *
+     * A lease travels with compact verifier outcomes and resident logical-state
+     * handles.  Consumers validate pointer identity against their owning
+     * runner, then wait on the current fence stored in the shared state.  This
+     * makes ownership explicit across RankOrchestrator fan-out while allowing
+     * the transaction fence to advance after each canonical cache mutation.
+     */
+    struct DeviceResidentMTPTransactionLease
+    {
+        std::shared_ptr<DeviceResidentMTPTransactionState> state;
+
+        bool valid() const
+        {
+            return state && state->valid();
+        }
+
+        bool coversRequest(int request_index) const
+        {
+            return valid() &&
+                   request_index >= 0 &&
+                   request_index < state->request_count;
+        }
+    };
+
+    /**
      * @brief Device-resident compact outcome buffers for stochastic MTP.
      *
      * This is the first-class handoff object for the vLLM-style path where the
@@ -131,6 +225,15 @@ namespace llaminar2
         std::shared_ptr<void> producer_start_timing_event;
         /// Optional timing event recorded immediately after compact reduction.
         std::shared_ptr<void> producer_stop_timing_event;
+        /**
+         * @brief Child-local ownership lease for shifted MTP KV state.
+         *
+         * Rank-level mirrored outcome broadcast replaces compact token/meta
+         * contents on every participant, but it must preserve this lease from
+         * each child.  Initial/suffix shifted-row commits therefore consume the
+         * same cache owner that produced the child verifier outcome.
+         */
+        DeviceResidentMTPTransactionLease mtp_transaction;
 
         bool valid() const
         {
@@ -145,44 +248,27 @@ namespace llaminar2
     };
 
     /**
-     * @brief Host-known shape data for publishing from a device outcome row.
+     * @brief Static graph shape for publication from a device outcome row.
      *
-     * The compact verifier outcome tells the backend how many speculative rows
-     * were accepted and which tokens should be exposed.  It does not carry the
-     * structural invariants that are already known to the runner: request count
-     * and padded verifier width.  The pre-verifier cache length is normally
-     * snapshotted into device metadata before verifier replay; callers should
-     * pass @ref base_cached_tokens_device only when they already own an
-     * equivalent compact device array.
+     * Dynamic positions, cache lengths, accepted counts, and shifted-cache
+     * ownership all come from resident device state. The caller supplies only
+     * capture geometry and policy; there is intentionally no host position or
+     * alternate cache-count payload in this request.
      */
     struct DeviceSpeculativePublicationRequest
     {
         DeviceSpeculativeOutcomeHandle outcome;
         int request_count = 0;
         int max_draft_tokens = 0;
-        /**
-         * @brief Optional compact device array of pre-verifier cache lengths.
-         *
-         * Most single-device callers let the runner snapshot its live KV count
-         * into the persistent metadata workspace immediately before verifier
-         * graph replay.  Future batched or TP callers may pass an already-owned
-         * device array here.  Implementations must not upload
-         * @ref base_cached_tokens during resident publication; the host vector is
-         * retained only for legacy diagnostics and should be empty on the GPU
-         * hot path.
-         */
-        const int32_t *base_cached_tokens_device = nullptr;
-        std::vector<int32_t> base_cached_tokens;
-        int base_sidecar_position = 0;
         bool publish_mtp_shifted_kv = true;
 
         bool valid() const
         {
             return outcome.valid() &&
+                   outcome.mtp_transaction.valid() &&
                    request_count > 0 &&
                    outcome.request_count == request_count &&
-                   max_draft_tokens > 0 &&
-                   base_sidecar_position >= 0;
+                   max_draft_tokens > 0;
         }
     };
 
@@ -218,6 +304,8 @@ namespace llaminar2
         void *stream = nullptr;
         void *ready_event = nullptr;
         uint64_t live_state_epoch = 0;
+        /// Child-local shifted-cache transaction consumed by correction sidecars.
+        DeviceResidentMTPTransactionLease mtp_transaction;
 
         bool valid() const
         {
@@ -278,7 +366,8 @@ namespace llaminar2
                    device == other.device &&
                    stream == other.stream &&
                    ready_event == other.ready_event &&
-                   live_state_epoch == other.live_state_epoch;
+                   live_state_epoch == other.live_state_epoch &&
+                   mtp_transaction.state == other.mtp_transaction.state;
         }
 
         /// Device row containing the next logical position for one request.
@@ -367,6 +456,26 @@ namespace llaminar2
     };
 
     /**
+     * @brief Authority that supplies logical positions for seeded GPU MTP draws.
+     *
+     * Seeded speculative sampling is batch invariant only when every draw is
+     * keyed by the logical output position that serial decode would use.  This
+     * enum makes the owner of that position explicit; in particular, a GPU
+     * request cannot accidentally carry both a host scalar and a device pointer.
+     */
+    enum class DeviceStochasticDrawPositionSource : uint8_t
+    {
+        /** The descriptor carries explicit threshold arrays; no position is read. */
+        ExplicitThresholds,
+        /** The descriptor carries inverse_sample_first_logical_position. */
+        HostLogicalPosition,
+        /** Read the request row from DeviceResidentLogicalSequenceStateHandle. */
+        ResidentLogicalState,
+        /** Read the pre-verifier device-to-device KV base-count snapshot. */
+        VerifierBaseSnapshot,
+    };
+
+    /**
      * @brief One logical request inside a device-side stochastic MTP batch.
      *
      * The descriptor is intentionally value-owned: thresholds and stop tokens
@@ -374,17 +483,19 @@ namespace llaminar2
      * request-batch handoff atomic and avoids dangling pointers when the caller
      * builds several requests before a GPU reducer consumes them.  Seeded
      * vLLM-style verification can set @ref derive_thresholds_from_seed to let
-     * the GPU derive accept/residual thresholds from
-     * @ref inverse_sample_seed and @ref inverse_sample_first_logical_position
-     * instead of capturing host scalar thresholds in the verifier launch.
+     * the GPU derive accept, residual, target-sample, and bonus-sample draws
+     * from @ref inverse_sample_seed and the authority selected by
+     * @ref draw_position_source.  Device position sources are read by kernels
+     * on the explicit verifier stream; no host threshold array is populated.
      *
      * Seeded serial-equivalent stochastic verification sets
      * @ref serial_sample_equivalent instead. In that mode the verifier samples
-     * each target row with @ref sample_thresholds, compares those sampled target
-     * tokens against the materialized draft-token row, and summarizes with the
-     * same compact metadata ABI as greedy MTP. This is the batch-invariant path:
-     * it proves the grouped verifier would have produced the same tokens as
-     * serial stochastic decode at the same logical positions.
+     * each target row with either an explicit @ref sample_thresholds entry or a
+     * seed-derived device-position draw, compares those sampled target tokens
+     * against the materialized draft-token row, and summarizes with the same
+     * compact metadata ABI as greedy MTP. This is the batch-invariant path: it
+     * proves the grouped verifier produced the same tokens as serial stochastic
+     * decode at the same logical positions.
      */
     struct DeviceStochasticBatchOutcomeRequest
     {
@@ -398,11 +509,13 @@ namespace llaminar2
         int token_row_offset = -1;            ///< Prepared verifier-token row entry 0.
         int token_row_stride = 0;             ///< Prepared verifier-token row stride.
         int bonus_target_slot = -1;           ///< Bonus row slot, or -1.
-        float bonus_threshold = 0.0f;         ///< RNG draw for bonus sampling.
-        uint64_t inverse_sample_seed = 0;     ///< vLLM rejection inverse RNG seed.
+        float bonus_threshold = 0.0f;         ///< Explicit bonus draw; ignored for seeded device-position draws.
+        uint64_t inverse_sample_seed = 0;     ///< Shared seed for verifier draws and rejection inverse sampling.
         int inverse_sample_first_logical_position = 0;
         bool use_vllm_probability_rejection = false;
         bool derive_thresholds_from_seed = false;
+        DeviceStochasticDrawPositionSource draw_position_source =
+            DeviceStochasticDrawPositionSource::ExplicitThresholds;
         bool serial_sample_equivalent = false;
         bool use_device_draft_tokens = true; ///< Null host draft pointer when true.
         std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows> draft_tokens;
@@ -1261,38 +1374,28 @@ namespace llaminar2
         }
 
         /**
-         * @brief Run first-depth batched MTP and write sampled drafts to device slots.
+         * @brief Run first-depth request-batched MTP from resident logical state.
          *
-         * This is the request-batched, vLLM-style companion to
-         * forwardMTPBatchAndSampleGreedy().  Implementations enqueue one true
-         * batched sidecar graph (`batch_size=request_batch, seq_len=1`) and
-         * write the greedy proposal token for request `i` into
-         * `STOCHASTIC_DRAFT_SAMPLE_TOKENS[first_draft_slot + i * slot_stride]`
-         * on an explicit stream.  Depth-one callers pass `slot_stride=1`;
-         * deeper request batches pass the draft depth so slots stay
-         * request-major for the verifier.  `out_tokens` is an optional host
-         * shadow for metadata paths
-         * that have not yet been promoted to fully device-resident publication;
-         * verifier execution must consume the device slots, not re-upload this
-         * shadow.
+         * GPU request batching starts from a publication-owned condition-token
+         * and position row. Implementations must consume both arrays through
+         * @p logical_state, execute one true grouped sidecar, and write proposal
+         * `i` to `first_draft_slot + i * slot_stride`. No host token or position
+         * shadow is accepted by this contract, so a caller cannot accidentally
+         * turn device publication into a D2H/H2D planning loop.
          *
-         * The default hard-fails so callers cannot silently replace a batched
-         * device-token path with host token staging.
+         * The default hard-fails. CPU request batching uses the separate
+         * forwardMTPBatchAndSampleGreedy() host contract.
          */
-        virtual bool forwardMTPBatchAndSampleGreedyToDeviceDraftSlots(
-            const int32_t *draft_condition_tokens,
-            const int *position_ids,
+        virtual bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
             int first_draft_slot,
-            int slot_stride,
-            int32_t *out_tokens)
+            int slot_stride)
         {
-            (void)draft_condition_tokens;
-            (void)position_ids;
+            (void)logical_state;
             (void)request_batch;
             (void)first_draft_slot;
             (void)slot_stride;
-            (void)out_tokens;
             return false;
         }
 
@@ -1320,28 +1423,38 @@ namespace llaminar2
         }
 
         /**
-         * @brief Run a chained batched MTP row and write proposals to device slots.
+         * @brief Chain a grouped MTP sidecar directly from device draft slots.
          *
-         * This is the depth>1 companion to
-         * forwardMTPBatchAndSampleGreedyToDeviceDraftSlots().  It consumes the
-         * previous batched MTP hidden rows and writes request `i` to
-         * `first_draft_slot + i * slot_stride`, preserving the request-major
-         * verifier slot layout without a host-to-device staging pass.
+         * Proposal tokens remain in the request-major device matrix written by
+         * the previous depth. Implementations gather the strided source column,
+         * add @p position_offset to the resident base-position row, execute one
+         * grouped sidecar, and publish the next proposal column. Every operation
+         * is stream ordered on device; there is deliberately no host-token output.
+         *
+         * @param logical_state Live resident mailbox that owns base positions.
+         * @param request_batch Number of request rows in the grouped sidecar.
+         * @param first_condition_slot Previous depth's first request slot.
+         * @param condition_slot_stride Element stride between request inputs.
+         * @param position_offset Offset from the mailbox base position for this depth.
+         * @param first_draft_slot Destination slot for request zero.
+         * @param draft_slot_stride Element stride between request outputs.
          */
-        virtual bool forwardMTPBatchFromLastDraftAndSampleGreedyToDeviceDraftSlots(
-            const int32_t *draft_condition_tokens,
-            const int *position_ids,
+        virtual bool forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
+            int first_condition_slot,
+            int condition_slot_stride,
+            int position_offset,
             int first_draft_slot,
-            int slot_stride,
-            int32_t *out_tokens)
+            int draft_slot_stride)
         {
-            (void)draft_condition_tokens;
-            (void)position_ids;
+            (void)logical_state;
             (void)request_batch;
+            (void)first_condition_slot;
+            (void)condition_slot_stride;
+            (void)position_offset;
             (void)first_draft_slot;
-            (void)slot_stride;
-            (void)out_tokens;
+            (void)draft_slot_stride;
             return false;
         }
 
@@ -1626,24 +1739,22 @@ namespace llaminar2
          *        after the sidecar append; pass the grouped verifier row count.
          * @param allow_speculative_discard Whether stale speculative shifted rows
          *        may be truncated before appending row zero.
-         * @param position_offset_override Expected verifier-base cached-token
-         *        count. GPU implementations must reject stale or mismatched
-         *        offsets instead of deriving from host mirrors.
+         * The verifier-base position must come from the same resident metadata
+         * workspace captured before verifier replay. A host scalar position is
+         * not part of this API.
          */
         virtual bool commitMTPInitialShiftedRowFromDeviceOutcome(
             const PrefixStateSnapshot &checkpoint,
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1)
+            bool allow_speculative_discard = false)
         {
             (void)checkpoint;
             (void)outcome;
             (void)request_index;
             (void)main_forward_token_count;
             (void)allow_speculative_discard;
-            (void)position_offset_override;
             return false;
         }
 
@@ -1679,24 +1790,22 @@ namespace llaminar2
          * validate ownership, wait on the mailbox readiness event using an
          * explicit stream, and fail hard for stale handles.
          *
-         * GPU implementations must also treat @p position_offset_override as
-         * part of the resident-state handoff.  If it is negative, the method
-         * must fail instead of deriving a position from get_position() or
-         * sequence_lengths(), because device-resident MTP publication may leave
-         * host mirrors stale by design.
+         * The target position is part of @p logical_state and must be consumed
+         * directly on the device. Implementations must never request a scalar
+         * host position override or derive one from get_position() /
+         * sequence_lengths(); doing so would split one resident transaction
+         * across two independently advancing owners.
          */
         virtual bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1)
+            bool allow_speculative_discard = false)
         {
             (void)logical_state;
             (void)request_index;
             (void)already_appended_tokens;
             (void)allow_speculative_discard;
-            (void)position_offset_override;
             return false;
         }
 
@@ -1723,10 +1832,8 @@ namespace llaminar2
          *        suffix row selection.
          * @param allow_speculative_discard Whether stale speculative shifted rows
          *        may be truncated before appending the bounded suffix.
-         * @param position_offset_override Device-derived verifier-base position.
-         * @param already_appended_shifted_kv_tokens Shifted-cache resident row
-         *        count at the serial boundary, or -1 to match
-         *        @p already_appended_tokens.
+         * The shifted cache's resident row count is read from its canonical
+         * device metadata; callers do not supply a host count shadow.
          */
         virtual bool commitMTPShiftedRowsFromDeviceOutcome(
             const DeviceSpeculativeOutcomeHandle &outcome,
@@ -1734,9 +1841,7 @@ namespace llaminar2
             int already_appended_tokens,
             int max_state_commit_rows,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1,
-            int already_appended_shifted_kv_tokens = -1)
+            bool allow_speculative_discard = false)
         {
             (void)outcome;
             (void)request_index;
@@ -1744,8 +1849,6 @@ namespace llaminar2
             (void)max_state_commit_rows;
             (void)main_forward_token_count;
             (void)allow_speculative_discard;
-            (void)position_offset_override;
-            (void)already_appended_shifted_kv_tokens;
             return false;
         }
 
@@ -2127,22 +2230,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Return whether host logical getters mirror any resident mailbox.
-         *
-         * A valid deviceResidentLogicalSequenceState() means a runner has
-         * staged logical positions/sequence lengths on device.  Host getters are
-         * only planning-safe when the runner can prove they were advanced by the
-         * same transaction that produced the resident mailbox.  Otherwise
-         * get_position() and sequence_lengths() may be stale and must not drive
-         * speculative planning.  Runners without resident state can keep the
-         * default true result.
-         */
-        virtual bool hostLogicalStateMirrorsDeviceResidentState() const
-        {
-            return true;
-        }
-
-        /**
          * @brief Get vocabulary size
          */
         virtual int vocab_size() const = 0;
@@ -2292,24 +2379,23 @@ namespace llaminar2
          * @param request_count Number of active request rows to sample.
          * @param params Sampling parameters for all rows.
          * @param out_tokens Host output buffer [request_count].
-         * @param stochastic_thresholds Optional host thresholds
-         *        [request_count] for non-greedy sampling.  vLLM-style MTP
-         *        keys stochastic draws by logical output position, so callers
-         *        that request stochastic device sampling must provide the
-         *        exact per-request thresholds instead of letting the runner
-         *        advance a backend-local RNG counter.
+         * @param stochastic_position_seeds Optional immutable request seeds
+         *        [request_count] for non-greedy sampling. The runner combines
+         *        each seed with its device-resident logical position; callers
+         *        must never compute or pass host threshold values. A non-greedy
+         *        request requires one non-zero seed per row.
          * @return true when every row was sampled on the runner device.
          */
         virtual bool sampleMainLogitsBatchRowsOnDevice(
             int request_count,
             const SamplingParams &params,
             int32_t *out_tokens,
-            const float *stochastic_thresholds = nullptr)
+            const uint64_t *stochastic_position_seeds = nullptr)
         {
             (void)request_count;
             (void)params;
             (void)out_tokens;
-            (void)stochastic_thresholds;
+            (void)stochastic_position_seeds;
             return false;
         }
 
@@ -2976,6 +3062,10 @@ namespace llaminar2
             request.use_vllm_probability_rejection =
                 use_vllm_probability_rejection;
             request.derive_thresholds_from_seed = derive_thresholds_from_seed;
+            request.draw_position_source =
+                derive_thresholds_from_seed
+                    ? DeviceStochasticDrawPositionSource::HostLogicalPosition
+                    : DeviceStochasticDrawPositionSource::ExplicitThresholds;
             request.use_device_draft_tokens = draft_tokens == nullptr;
 
             for (int row = 0; row < row_count; ++row)
@@ -3066,6 +3156,10 @@ namespace llaminar2
             request.use_vllm_probability_rejection =
                 use_vllm_probability_rejection;
             request.derive_thresholds_from_seed = derive_thresholds_from_seed;
+            request.draw_position_source =
+                derive_thresholds_from_seed
+                    ? DeviceStochasticDrawPositionSource::HostLogicalPosition
+                    : DeviceStochasticDrawPositionSource::ExplicitThresholds;
             request.use_device_draft_tokens = draft_tokens == nullptr;
 
             for (int row = 0; row < row_count; ++row)
@@ -3141,6 +3235,18 @@ namespace llaminar2
                      * the same verifier-token row consumed by the grouped graph.
                      * The conservative default cannot synthesize that row without
                      * falling back to host replay, so fail loudly.
+                     */
+                    return false;
+                }
+                if (request.derive_thresholds_from_seed &&
+                    request.draw_position_source !=
+                        DeviceStochasticDrawPositionSource::HostLogicalPosition)
+                {
+                    /*
+                     * A generic runner has no device-position authority.  It
+                     * must never turn a resident-position descriptor back into
+                     * host scalar arrays; concrete GPU runners consume those
+                     * descriptors directly on their explicit streams.
                      */
                     return false;
                 }

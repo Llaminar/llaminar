@@ -445,10 +445,14 @@ namespace llaminar2
 
         if (!executeFastDecode(graph, ctx, collective_nodes))
             return false;
-        return publishSnapshotsAfterGraphExecution(
-            graph,
-            gpu_stream,
-            "decode_fast_path");
+        /*
+         * executeFastDecode() publishes eager snapshots at each producer.  A
+         * second post-graph pass is both redundant and incorrect for aliased
+         * CPU buffers.  Post-graph publication remains mandatory above for a
+         * real captured replay because only its recorded D2D copies preserve
+         * every intermediate until host materialization.
+         */
+        return true;
     }
 
     // =========================================================================

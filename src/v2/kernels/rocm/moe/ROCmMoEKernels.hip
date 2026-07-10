@@ -7609,6 +7609,31 @@ __global__ void rocm_moe_fp32_to_fp16_kernel(
     output[idx] = __float2half(input[idx]);
 }
 
+/**
+ * @brief Quantize one FP32 value with the canonical serial-decode Q8 arithmetic.
+ *
+ * The ordinary NativeVNNI M=1 decoder computes a reciprocal once per 32-value
+ * block and multiplies each value by that reciprocal.  Writing the equivalent
+ * expression as `value / scale` changes FP32 rounding for values near an integer
+ * half-way point; `rintf` can then select a different int8 byte.  Router-owned Q8
+ * hidden rows are consumed directly by grouped MTP expert kernels, so they must
+ * preserve the serial decoder's operation order, not merely its real-number
+ * formula.  Router gate-weight caching is a separate approximation shared by
+ * serial and grouped routing and deliberately keeps its established arithmetic.
+ *
+ * @param value FP32 source value from the hidden activation row.
+ * @param scale Positive block scale, or the canonical all-zero scale of 1.
+ * @return Signed Q8 byte using round-to-nearest-even after saturation.
+ */
+__device__ __forceinline__ int8_t
+rocm_moe_quantize_q8_decode_equivalent(float value, float scale)
+{
+    const float inv_scale = 1.0f / scale;
+    const float q_value = value * inv_scale;
+    return static_cast<int8_t>(
+        rintf(fminf(127.0f, fmaxf(-127.0f, q_value))));
+}
+
 __global__ void rocm_moe_router_gate_quantize_q8_kernel(
     const float *__restrict__ gate_weights, // [num_experts, d_model]
     int8_t *__restrict__ gate_weights_q8,   // [num_experts, blocks_per_row, 32]
@@ -7670,9 +7695,7 @@ __global__ void rocm_moe_router_hidden_quantize_q8_kernel(
         hidden_scales[block_idx] = scale;
     }
 
-    const float q_value = value / scale;
-    hidden_q8[k] = static_cast<int8_t>(
-        rintf(fminf(127.0f, fmaxf(-127.0f, q_value))));
+    hidden_q8[k] = rocm_moe_quantize_q8_decode_equivalent(value, scale);
 }
 
 __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
@@ -7760,9 +7783,8 @@ __global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
         hidden_scales[static_cast<size_t>(row) * blocks_per_row + block_idx] = scale;
     }
 
-    const float q_value = value / scale;
-    hidden_q8[row_offset + k] = static_cast<int8_t>(
-        rintf(fminf(127.0f, fmaxf(-127.0f, q_value))));
+    hidden_q8[row_offset + k] =
+        rocm_moe_quantize_q8_decode_equivalent(value, scale);
 }
 
 /**

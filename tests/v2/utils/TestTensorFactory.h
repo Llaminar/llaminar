@@ -296,6 +296,50 @@ namespace llaminar2::test
         }
 
         /**
+         * @brief Create a native Q8_K tensor with deterministic random blocks.
+         *
+         * Q8_K stores 256 signed bytes plus sixteen 16-element partial sums per
+         * super-block. Populating the sums as well as the payload keeps this
+         * fixture valid for embedding, GEMM, and future all-format consumers.
+         *
+         * @param shape Tensor dimensions [rows, cols]; cols must be block aligned.
+         * @param seed Random seed.
+         */
+        static std::unique_ptr<Q8_KTensor> createQ8_KRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = Q8_KBlock::BLOCK_SIZE;
+            const size_t rows = shape[0];
+            const size_t cols = shape[1];
+            const size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            const size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::uniform_int_distribution<int> dist(-127, 127);
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q8_KBlock));
+            auto *blocks = reinterpret_cast<Q8_KBlock *>(raw_data.data());
+
+            for (size_t block_index = 0; block_index < total_blocks; ++block_index)
+            {
+                auto &block = blocks[block_index];
+                for (size_t partial = 0; partial < 16; ++partial)
+                {
+                    int32_t sum = 0;
+                    for (size_t element = 0; element < 16; ++element)
+                    {
+                        const size_t index = partial * 16 + element;
+                        block.qs[index] = static_cast<int8_t>(dist(rng));
+                        sum += block.qs[index];
+                    }
+                    block.bsums[partial] = static_cast<int16_t>(sum);
+                }
+            }
+
+            return std::make_unique<Q8_KTensor>(shape, raw_data);
+        }
+
+        /**
          * @brief Create Q4_0 tensor with random quantized data
          */
         static std::unique_ptr<Q4_0Tensor> createQ4_0Random(

@@ -80,8 +80,27 @@ addressing each worker's empty `thread_local` arena. The regression
 byte equality against serial decode plus the fused grouped verifier counter. It
 is part of `V2_Integration_GroupedVerifierRows_CPU_AllFormats`. The canonical
 precommit/CI grouped verifier gate now runs `^V2_Integration_GroupedVerifierRows_`
-after unit tests; local, tracked, and installed hooks are aligned, and the exact
+ after unit tests; local, tracked, and installed hooks are aligned, and the exact
 gate passed `16/16` across CPU/CUDA/ROCm.
+
+2026-07-10 update: The intermittent ROCm Qwen3.6 MoE M=2 verifier failure was a
+real router-to-expert Q8 publication bug. The router hidden quantizer used
+`value / scale`, while ordinary NativeVNNI M=1 expert decode computes one
+reciprocal per block and multiplies by it. Those FP32 expressions differ at
+half-way rounding boundaries, so router-owned Q8 rows could differ by one int8
+byte from serial decode. ROCm router-hidden M=1 and grouped M=2..4 publication
+now use the serial reciprocal-multiply order; router gate-weight caching retains
+its established arithmetic. The graph also declares the hidden dependency from
+shared-expert FFN to MoE routing, preventing stale router publication under a
+different topological order. The backend-neutral layer-31 activation fixture
+drives the production router -> routed experts -> shared expert chain through
+eager and graph-captured execution for every format. CUDA required no arithmetic
+change because its MoE quantizers already share one expression, but its sweep
+now proves the same full transaction and reuse counters. Evidence: 20 fresh
+ROCm M=2 model processes passed; CPU/CUDA/ROCm MoE operation equivalence passed
+M=1..4; and the complete discovered
+`^V2_Integration_GroupedVerifierRows_` matrix passed `43/43` in `306.44s`
+(13 CPU, 13 CUDA, 17 ROCm).
 
 ## Why vLLM Is Fast
 
@@ -1302,9 +1321,9 @@ Exit gate:
 - CPU/CUDA/ROCm sampler parity passes on synthetic and Qwen3.6 real-logit-style
   fixtures for greedy, top-k/top-p, temperature, residual sampling, and seeded
   RNG.
-- Dense stochastic MTP no longer emits the retired
-  `decode_equivalent_stochastic_verifier_runs` counter in accepted lanes; parity
-  and prefix-cache MTP probes assert the all-position publication path instead.
+- Dense stochastic MTP now uses grouped decode-equivalent stochastic verifier
+  counters in accepted lanes; parity and prefix-cache MTP probes assert grouped
+  publication or the stronger all-position publication path explicitly.
 - Bounded stochastic dense benchmarks are speed-positive on each backend at
   least one fixed/dynamic lane, with ROCm d2/d3 documented as
   acceptance-limited rather than contract failures.
@@ -3063,7 +3082,7 @@ Focused correctness gate:
 ```bash
 cmake --build build_v2_integration --parallel
 ctest --test-dir build_v2_integration \
-  -R '^(V2_Integration_Parity_Qwen36.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*MainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported|V2_Integration_GPUSamplingKernels|V2_Integration_CUDAMoEKernel|V2_Integration_ROCmMoEKernel)$' \
+  -R '^(V2_Integration_Parity_Qwen36.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*MainVerifierUsesGroupedDecodeEquivalentPublication|V2_Integration_GPUSamplingKernels|V2_Integration_CUDAMoEKernel|V2_Integration_ROCmMoEKernel)$' \
   --output-on-failure --parallel
 ```
 
@@ -3565,8 +3584,8 @@ Current status:
   state. `OrchestrationRunner` direct-publication callsites also reject the
   contract before backend publication. Focused gate passed:
   `V2_Unit_(MTPSpecStateContract|MTPVerifierForwardExecutor)` plus the CUDA/ROCm
-  Qwen3.6 MoE replay guards
-  `Qwen36MoE(CUDA|ROCm)SingleDevicePrefixMTPParity.MainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported`.
+  Qwen3.6 MoE grouped-publication guards
+  `Qwen36MoE(CUDA|ROCm)SingleDevicePrefixMTPParity.MainVerifierUsesGroupedDecodeEquivalentPublication`.
 - [x] CUDA/ROCm MoE d1 Prefix+MTP parity is green on the shared
   decode-equivalent publication contract. A CUDA regression had allowed
   host-visible positions to advance past shifted sidecar KV because direct
@@ -4902,6 +4921,26 @@ Current status:
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.
+
+- GPU request-batched stochastic continuation no longer reconstructs mutable
+  RNG positions on the host. Each request resolves one immutable non-zero seed
+  at admission (including one-time entropy resolution for API seed zero), while
+  CUDA/ROCm compact and processed verifiers read the current target position
+  directly from `DeviceResidentLogicalSequenceStateHandle`. Accept, residual,
+  inverse-recovery, and lazy bonus draws all use that same ordered mailbox
+  scalar. The resident descriptor carries `inverse_sample_first_logical_position
+  = -1`, leaves host threshold arrays untouched, and records
+  `stochastic_request_batch_resident_position_threshold_rows` so served runs
+  prove the route. Focused real-GPU tests graph-capture scalar-position and
+  resident-position launches and require byte equality for tokens, acceptance,
+  probabilities, thresholds, and both compact/processed bonus samples on CUDA
+  and ROCm. Validation: transition `125/125`, GPU ownership policy `96/96`,
+  explicit CUDA and ROCm sampling suites, full Integration build `935/935`, and
+  canonical grouped verifier `43/43` substantive lanes. Current architecture
+  estimate: LocalTP 86%, ExpertParallel 73%. Remaining ownership work includes
+  host-computed stochastic prefill draws, rank-level request batching, and
+  stable recurrent live-state indirection so accepted publication can keep GPU
+  graph executables warm without risking stale verifier-scratch bindings.
 
 ## Iteration Gates
 

@@ -129,6 +129,8 @@ namespace llaminar2
         bool layer_trace = false;             ///< Emit temporary per-layer residual trace when LLAMINAR_LAYER_TRACE is present.
         bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
         bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
+        bool mtp_publication_diagnostics = false; ///< Emit opt-in device-owned MTP/KV publication diagnostics.
+        bool cuda_gdn_pointer_trace = false;      ///< Emit CUDA GDN grouped-row pointer diagnostics.
         bool allow_numa_bind_fallback = false; ///< Allow requested NUMA bind failures to continue when explicitly enabled.
         bool stage_checksum_trace = false;     ///< Emit per-stage checksum traces when LLAMINAR_STAGE_CHECKSUM_TRACE is truthy.
         std::string stage_checksum_filter;     ///< Optional substring filter for stage checksum traces.
@@ -155,6 +157,10 @@ namespace llaminar2
             trace_generated_tokens = readTruthy("LLAMINAR_TRACE_GENERATED_TOKENS");
             moe_grouped_verifier_snapshot_diagnostic =
                 readTruthy("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC");
+            mtp_publication_diagnostics =
+                readTruthy("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS");
+            cuda_gdn_pointer_trace =
+                readTruthy("LLAMINAR_CUDA_GDN_PTR_TRACE");
             allow_numa_bind_fallback = readTruthy("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK");
             stage_checksum_trace = readTruthy("LLAMINAR_STAGE_CHECKSUM_TRACE");
             stage_checksum_filter = readString("LLAMINAR_STAGE_CHECKSUM_FILTER");

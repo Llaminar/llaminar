@@ -86,6 +86,23 @@ namespace llaminar2
             int seq_len = 0;
             int request_count = 1;   ///< Number of independent requests in the flattened verifier tensor.
             int request_seq_len = 0; ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
+            /**
+             * @brief Host-owned real row counts for native CPU request grouping.
+             *
+             * GPU graph replay deliberately ignores this mirror and consumes
+             * `request_seq_lens_device`; CPU execution uses the stable host
+             * vector without staging or per-request scalar dispatch.
+             */
+            const std::vector<int> *request_seq_lens_host = nullptr;
+            /**
+             * @brief Device-owned real row count for each request.
+             *
+             * The stable arena pointer is the sole GPU owner for padded
+             * request-batched recurrence. It is consumed directly by the
+             * grouped kernel during graph capture/replay and is never adopted
+             * into a host scalar.
+             */
+            const int32_t *request_seq_lens_device = nullptr;
             int n_heads = 0;     ///< Value head count (recurrence operates with this)
             int n_k_heads = 0;   ///< Key head count (for QKV split; 0 = same as n_heads)
             int d_k = 0;         ///< Key head dimension
@@ -143,11 +160,20 @@ namespace llaminar2
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
-        void updateDynamicParams(int pos_offset, int seq_len) override
-        {
-            (void)pos_offset; // GDN layers don't use position offsets
-            params_.seq_len = seq_len;
-        }
+        /**
+         * @brief Refresh the logical row geometry for the next graph execution.
+         *
+         * @param pos_offset Unused by GDN recurrence because logical history is
+         *        represented by each request's recurrent state.
+         * @param seq_len Number of rows contributed by one request.  The GDN
+         *        grouped kernel sees `request_count * seq_len` flattened rows.
+         *
+         * Request-batched graph inputs describe their dynamic width per
+         * request, while `Params::seq_len` describes the complete flattened
+         * tensor passed to the backend.  Updating both fields here preserves
+         * that distinction across cold execution, graph capture, and replay.
+         */
+        void updateDynamicParams(int pos_offset, int seq_len) override;
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
@@ -202,6 +228,10 @@ namespace llaminar2
             return verifierStateCaptureWorkspaceRequired();
         }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream = nullptr) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;
@@ -218,6 +248,21 @@ namespace llaminar2
             int request_count,
             int row_index_stride,
             void *stream) override;
+        /**
+         * @brief Publish every request's real terminal recurrence state on device.
+         *
+         * No host row list is materialized: the backend combines resident real
+         * lengths with the fixed request row width inside one grouped launch.
+         */
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override;
+        bool requestBatchedTerminalStateCommittedDuringExecution(
+            int request_count,
+            int request_row_width) const override;
+        void clearVerifierStateCaptureBindingAfterPublication() override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         /// @brief Allows cold GPU prefill graph preflight before warmup allocates recurrence state.

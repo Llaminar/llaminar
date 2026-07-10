@@ -5123,10 +5123,11 @@ namespace llaminar2
             auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
             if (!repack_fmt)
             {
-                LOG_WARN("[WeightManager] GPU pipeline: unsupported format for " << name
-                                                                                 << " (codebook=" << static_cast<int>(vnni->codebook_id)
-                                                                                 << ", superblock=" << vnni->is_superblock << ")");
-                continue;
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline has no repack implementation for " +
+                    name + " (codebook=" +
+                    std::to_string(static_cast<int>(vnni->codebook_id)) +
+                    ", superblock=" + std::to_string(vnni->is_superblock) + ")");
             }
 
 #ifdef HAVE_ROCM
@@ -5180,9 +5181,11 @@ namespace llaminar2
             auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
             if (!repack_fmt)
             {
-                LOG_WARN("[WeightManager] GPU pipeline: unsupported MoE format for "
-                         << moe_jobs[i].slot_name);
-                continue;
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline has no MoE repack implementation for " +
+                    moe_jobs[i].slot_name + " (codebook=" +
+                    std::to_string(static_cast<int>(vnni->codebook_id)) +
+                    ", superblock=" + std::to_string(vnni->is_superblock) + ")");
             }
 
 #ifdef HAVE_ROCM
@@ -5397,7 +5400,7 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        vnni->codebook_id, blocks_per_row,
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                         orchestrator); // lifetime owner: keeps VRAM pool alive
                 }
 #endif
@@ -5411,7 +5414,7 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        vnni->codebook_id, blocks_per_row,
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                         orchestrator); // lifetime owner: keeps VRAM pool alive
                 }
 #endif
@@ -5522,7 +5525,7 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        vnni->codebook_id, blocks_per_row,
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                         orchestrator);
                 }
 #endif
@@ -5536,7 +5539,7 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        vnni->codebook_id, blocks_per_row,
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                         orchestrator);
                 }
 #endif

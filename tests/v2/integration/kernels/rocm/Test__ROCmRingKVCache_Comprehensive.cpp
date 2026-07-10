@@ -254,7 +254,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_ClampedToSize)
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }
 
-TEST(Test__ROCmRingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperations)
+TEST(Test__ROCmRingKVCache_Comprehensive, Evict_SequenceCountTracksAcrossOperations)
 {
     if (!hasROCm())
         GTEST_SKIP() << "ROCm not available";
@@ -268,16 +268,13 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperatio
     HipBuffer d_K(h_K), d_V(h_V);
 
     cache->append(0, 0, d_K.ptr, d_V.ptr, 20, 0);
-    EXPECT_EQ(cache->get_total_evicted(), 0);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 20);
 
     cache->evict_oldest(0, 0, 5);
-    EXPECT_EQ(cache->get_total_evicted(), 5);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 15);
 
     cache->evict_oldest(0, 0, 3);
-    EXPECT_EQ(cache->get_total_evicted(), 8);
-
-    cache->reset_eviction_counter();
-    EXPECT_EQ(cache->get_total_evicted(), 0);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 12);
 }
 
 TEST(Test__ROCmRingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
@@ -630,8 +627,6 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq);
     // Note: filling to exact capacity wraps the head pointer to position 0,
     // so is_wrapped() returns true. This is by design in the ring buffer.
-    EXPECT_EQ(cache->get_total_evicted(), 0);
-
     // Retrieve and verify data integrity despite head-pointer wrap
     const void *dk, *dv;
     int len;

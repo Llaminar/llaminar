@@ -1762,51 +1762,27 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixRestoresHybridStateBanksForS
     const auto include_device_pos =
         import_body.find("desc.include_device_state = handle.layout.hybrid_device_state_bytes > 0");
     ASSERT_NE(include_device_pos, std::string::npos)
-        << "Partial prefix restore should hydrate the captured full/largest GDN "
-           "bank when the portable payload contains one. The next graph may "
-           "legitimately select either the full or local bank.";
-
-    const auto device_bank_source_pos =
-        import_body.find("host_payload_hydrates_device_bank");
-    ASSERT_NE(device_bank_source_pos, std::string::npos)
-        << "GPU suffix-prefill restore must treat the portable logical payload "
-           "as a source for the device bank, not as a live host-mirror update.";
-
-    const auto preserve_host_mirror_pos =
-        import_body.find("!host_payload_hydrates_device_bank", device_bank_source_pos);
-    ASSERT_NE(preserve_host_mirror_pos, std::string::npos)
-        << "Partial prefix restore must leave the host mirror in its normal split-prefill meaning "
-           "when the host payload is only hydrating GPU recurrent banks.";
-
-    const auto hydrate_local_bank_pos =
-        import_body.find("desc.import_host_state_into_device_state =");
-    ASSERT_NE(hydrate_local_bank_pos, std::string::npos)
-        << "Partial prefix restore must also hydrate the suffix-prefill/local "
-           "device state bank from the logical host payload.";
-
-    const auto derive_from_host_pos =
-        import_body.find("desc.import_device_state_from_host_state =");
-    ASSERT_NE(derive_from_host_pos, std::string::npos);
-    const auto no_device_payload_guard =
-        import_body.find("handle.layout.hybrid_device_state_bytes == 0", derive_from_host_pos);
-    ASSERT_NE(no_device_payload_guard, std::string::npos)
-        << "Host-derived device restore is only valid for blocks without a captured device-state payload.";
-    EXPECT_LT(include_device_pos, hydrate_local_bank_pos);
-    EXPECT_LT(hydrate_local_bank_pos, derive_from_host_pos);
+        << "Suffix-prefill restore must import the complete serialized GPU bank set.";
+    EXPECT_NE(
+        import_body.find(
+            "desc.include_host_state = handle.layout.hybrid_host_state_bytes > 0"),
+        std::string::npos)
+        << "CPU-owned recurrent vectors remain an independent payload section.";
+    EXPECT_EQ(import_body.find("host_payload_hydrates_device_bank"), std::string::npos);
+    EXPECT_EQ(import_body.find("import_host_state_into_device_state"), std::string::npos);
+    EXPECT_EQ(import_body.find("import_device_state_from_host_state"), std::string::npos)
+        << "GPU restore must consume a serialized device-bank payload directly; "
+           "there is no live host mirror to hydrate from.";
 }
 
 /**
- * @brief Guard the LocalTP live-checkpoint contract used by MTP rollback.
+ * @brief Guard device-only GPU recurrent-state rollback checkpoints.
  *
- * Non-replicated dense LocalTP keeps each participant's GDN state in a
- * TP-local GPU bank.  The full mirrored bank is created only by the optional
- * decode-replicated handoff stage, so live MTP rollback checkpoints must not
- * require that full bank.  This regression pins the two sides of the contract:
- * capture records a host-sized local payload, and restore imports that payload
- * back into the local GPU kernels instead of treating it as a passive host
- * mirror.
+ * CUDA and ROCm kernels preallocate both participant-local and mirrored full
+ * banks. A live MTP rollback handle therefore serializes only device-owned
+ * banks and never changes policy according to LocalTP sharding mode.
  */
-TEST_F(Test__DeviceGraphOrchestrator, LocalTPLiveCheckpointUsesHostOnlyHybridPayloadAndHydratesLocalGpuBank)
+TEST_F(Test__DeviceGraphOrchestrator, GpuLiveCheckpointUsesDeviceOnlyHybridPayload)
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
@@ -1821,71 +1797,35 @@ TEST_F(Test__DeviceGraphOrchestrator, LocalTPLiveCheckpointUsesHostOnlyHybridPay
     ASSERT_NE(restore_pos, std::string::npos);
     const std::string checkpoint_body = source.substr(checkpoint_pos, restore_pos - checkpoint_pos);
 
-    const auto host_only_helper_pos =
-        source.find("bool denseLocalTPHybridStateRequiresHostOnlyPayload");
-    const auto apply_host_only_helper_pos =
-        source.find("void applyDenseLocalTPHostOnlyHybridPayloadLayout", host_only_helper_pos);
-    ASSERT_NE(host_only_helper_pos, std::string::npos);
-    ASSERT_NE(apply_host_only_helper_pos, std::string::npos);
-    const std::string host_only_helper_body =
-        source.substr(host_only_helper_pos, apply_host_only_helper_pos - host_only_helper_pos);
-    EXPECT_NE(host_only_helper_body.find("graph_config.dense_tp_enabled"),
+    EXPECT_EQ(source.find("denseLocalTPHybridStateRequiresHostOnlyPayload"),
               std::string::npos);
-    EXPECT_NE(host_only_helper_body.find("graph_config.qkv_column_parallel"),
-              std::string::npos);
-    EXPECT_NE(host_only_helper_body.find("!graph_config.dense_tp_decode_replicated"),
-              std::string::npos);
-    EXPECT_NE(host_only_helper_body.find("sharded_query_heads || sharded_kv_heads"),
+    EXPECT_EQ(source.find("applyDenseLocalTPHostOnlyHybridPayloadLayout"),
               std::string::npos);
 
-    const auto local_tp_flag_pos =
-        checkpoint_body.find("const bool local_tp_hybrid_checkpoint");
-    ASSERT_NE(local_tp_flag_pos, std::string::npos)
-        << "Live MTP checkpoints need an explicit LocalTP host-only hybrid state lane.";
-    EXPECT_NE(checkpoint_body.find("denseLocalTPHybridStateRequiresHostOnlyPayload", local_tp_flag_pos),
-              std::string::npos)
-        << "Checkpoint capture must use the same topology predicate as portable prefix-cache layout.";
-
+    const auto device_only_pos =
+        checkpoint_body.find("const bool device_only_checkpoint = state_.device_id.is_gpu()");
+    ASSERT_NE(device_only_pos, std::string::npos)
+        << "GPU rollback checkpoints must select device-only recurrent payloads explicitly.";
     const auto layout_call_pos =
-        checkpoint_body.find("liveHybridCheckpointLayout", local_tp_flag_pos);
+        checkpoint_body.find("liveHybridCheckpointLayout", device_only_pos);
     ASSERT_NE(layout_call_pos, std::string::npos);
-    EXPECT_NE(checkpoint_body.find("local_tp_hybrid_checkpoint", layout_call_pos),
+    EXPECT_NE(checkpoint_body.find("device_only_checkpoint", layout_call_pos),
               std::string::npos)
-        << "The capture layout must pass the LocalTP host-only decision into "
-           "the payload layout builder.";
-    EXPECT_NE(checkpoint_body.find("live_prefix_checkpoint_hybrid_local_tp_captures", layout_call_pos),
+        << "The layout helper must receive the GPU ownership decision.";
+    EXPECT_NE(checkpoint_body.find("live_prefix_checkpoint_hybrid_device_only_captures", layout_call_pos),
               std::string::npos)
-        << "The host-only LocalTP checkpoint lane should stay visible in perfstats.";
-
-    const auto import_pos = source.find("bool importHybridPrefixPayload(");
-    const auto reset_pos = source.find("void resetHybridPrefixPayloadState", import_pos);
-    ASSERT_NE(import_pos, std::string::npos);
-    ASSERT_NE(reset_pos, std::string::npos);
-    const std::string import_body = source.substr(import_pos, reset_pos - import_pos);
-
-    const auto host_only_restore_pos =
-        import_body.find("host_only_checkpoint_hydrates_local_device_bank");
-    ASSERT_NE(host_only_restore_pos, std::string::npos)
-        << "A host-only live checkpoint must be imported into the local GPU bank.";
-    EXPECT_NE(import_body.find("desc.include_host_state = true", host_only_restore_pos),
-              std::string::npos);
-    EXPECT_NE(import_body.find("desc.include_device_state = false", host_only_restore_pos),
-              std::string::npos);
-    EXPECT_NE(import_body.find("desc.import_device_state_from_host_state = true", host_only_restore_pos),
-              std::string::npos);
+        << "Perfstats must expose the device-only checkpoint lane.";
+    EXPECT_EQ(checkpoint_body.find("local_tp_hybrid_checkpoint"), std::string::npos);
 }
 
 /**
- * @brief Guard payload-checkpoint LocalTP hybrid state used by MTP replay checks.
+ * @brief Guard device storage for full payload checkpoints.
  *
- * `captureLivePrefixState()` is the fallback checkpoint used when a logical
- * truncate cannot represent the current speculative transaction.  It also backs
- * the commit-replay verifier.  Non-replicated LocalTP must not serialize the
- * optional full GDN device bank here: restore would prefer that stale full-bank
- * payload over the current TP-local host payload and make the replay check
- * diverge from serial decode.
+ * `captureLivePrefixState()` is the replay/rollback checkpoint used when a
+ * logical truncate cannot represent the transaction. GPU recurrent state must
+ * stay in device storage while this handle is live.
  */
-TEST_F(Test__DeviceGraphOrchestrator, LocalTPPayloadCheckpointUsesHostOnlyHybridPayload)
+TEST_F(Test__DeviceGraphOrchestrator, GpuPayloadCheckpointAllocatesDeviceHybridStorage)
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
@@ -1902,62 +1842,40 @@ TEST_F(Test__DeviceGraphOrchestrator, LocalTPPayloadCheckpointUsesHostOnlyHybrid
 
     const auto layout_pos =
         payload_body.find("PrefixPayloadLayout layout = buildDensePrefixPayloadLayout");
-    const auto local_tp_flag_pos =
-        payload_body.find("const bool local_tp_hybrid_checkpoint", layout_pos);
-    const auto full_device_bytes_pos =
-        payload_body.find("const size_t full_hybrid_device_bytes", local_tp_flag_pos);
-    const auto apply_host_only_pos =
-        payload_body.find("applyDenseLocalTPHostOnlyHybridPayloadLayout", full_device_bytes_pos);
     const auto storage_alloc_pos =
-        payload_body.find("PrefixBlockHandle handle", apply_host_only_pos);
+        payload_body.find("allocateDeviceByteStorage(layout.hybrid_device_state_bytes", layout_pos);
 
     ASSERT_NE(layout_pos, std::string::npos);
-    ASSERT_NE(local_tp_flag_pos, std::string::npos)
-        << "Payload checkpoints need the same explicit LocalTP hybrid-state decision as logical checkpoints.";
-    ASSERT_NE(full_device_bytes_pos, std::string::npos)
-        << "Perfstats should report the full device lane suppressed by the LocalTP payload layout.";
-    ASSERT_NE(apply_host_only_pos, std::string::npos)
-        << "Payload checkpoint capture must suppress the missing full-device GDN bank before storage allocation.";
-    ASSERT_NE(storage_alloc_pos, std::string::npos);
-    EXPECT_LT(layout_pos, local_tp_flag_pos);
-    EXPECT_LT(local_tp_flag_pos, full_device_bytes_pos);
-    EXPECT_LT(full_device_bytes_pos, apply_host_only_pos);
-    EXPECT_LT(apply_host_only_pos, storage_alloc_pos);
-
-    EXPECT_NE(payload_body.find("live_prefix_payload_checkpoint_hybrid_local_tp_captures", apply_host_only_pos),
-              std::string::npos)
-        << "The payload-checkpoint LocalTP lane must stay visible in perfstats matrix validation.";
+    ASSERT_NE(storage_alloc_pos, std::string::npos)
+        << "GPU payload checkpoints must allocate device storage for serialized recurrent banks.";
+    EXPECT_LT(layout_pos, storage_alloc_pos);
+    EXPECT_EQ(payload_body.find("applyDenseLocalTPHostOnlyHybridPayloadLayout"),
+              std::string::npos);
+    EXPECT_EQ(payload_body.find("local_tp_hybrid_checkpoint"), std::string::npos);
 }
 
 /**
- * @brief Guard LocalTP portable prefix-cache hybrid payloads.
+ * @brief Guard LocalTP prefix layouts against reintroducing a host-state lane.
  *
- * Prefix-cache harvest and live rollback checkpoints hit the same dense
- * LocalTP hardware fact: non-replicated participants own only TP-local GPU
- * recurrent banks.  Portable prefix-cache blocks must therefore store the
- * device-derived host-sized hybrid payload, not a full mirrored decode bank,
- * while restore must hydrate the local GPU kernels from that host payload.
+ * Local and mirrored full GPU banks are both represented by
+ * `hybrid_device_state_bytes`. Prefix initialization and live-layout refresh
+ * must preserve that cache-reported ownership without topology-specific
+ * rewriting.
  */
-TEST_F(Test__DeviceGraphOrchestrator, LocalTPPrefixCacheUsesHostOnlyHybridPayloadAndHydratesLocalGpuBank)
+TEST_F(Test__DeviceGraphOrchestrator, LocalTPPrefixCachePreservesDeviceOwnedHybridLayout)
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
             "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
-    const auto apply_pos =
-        source.find("void applyDenseLocalTPHostOnlyHybridPayloadLayout");
-    const auto checkpoint_layout_pos =
-        source.find("PrefixPayloadLayout liveHybridCheckpointLayout", apply_pos);
-    ASSERT_NE(apply_pos, std::string::npos);
-    ASSERT_NE(checkpoint_layout_pos, std::string::npos);
-    const std::string apply_body = source.substr(apply_pos, checkpoint_layout_pos - apply_pos);
-
-    const auto device_zero_pos =
-        apply_body.find("layout.hybrid_device_state_bytes = 0");
-    ASSERT_NE(device_zero_pos, std::string::npos)
-        << "LocalTP prefix-cache layout must not advertise a missing full device bank.";
-    EXPECT_NE(apply_body.find("layout.hybrid_state_bytes = layout.hybrid_host_state_bytes", device_zero_pos),
+    EXPECT_EQ(source.find("applyDenseLocalTPHostOnlyHybridPayloadLayout"),
+              std::string::npos);
+    EXPECT_EQ(source.find("denseLocalTPHybridStateRequiresHostOnlyPayload"),
+              std::string::npos);
+    EXPECT_EQ(source.find("import_host_state_into_device_state"),
+              std::string::npos);
+    EXPECT_EQ(source.find("import_device_state_from_host_state"),
               std::string::npos);
 
     const auto ensure_pos =
@@ -1970,16 +1888,13 @@ TEST_F(Test__DeviceGraphOrchestrator, LocalTPPrefixCacheUsesHostOnlyHybridPayloa
 
     const auto initial_layout_pos =
         ensure_body.find("prefix_layout_ = buildDensePrefixPayloadLayout");
-    const auto initial_host_only_pos =
-        ensure_body.find("applyDenseLocalTPHostOnlyHybridPayloadLayout", initial_layout_pos);
     const auto mtp_attach_pos =
-        ensure_body.find("attachMTPPayloadLayout", initial_host_only_pos);
+        ensure_body.find("attachMTPPayloadLayout", initial_layout_pos);
     ASSERT_NE(initial_layout_pos, std::string::npos);
-    ASSERT_NE(initial_host_only_pos, std::string::npos)
-        << "Initial prefix-cache layout must suppress the full-device hybrid lane on LocalTP.";
     ASSERT_NE(mtp_attach_pos, std::string::npos);
-    EXPECT_LT(initial_layout_pos, initial_host_only_pos);
-    EXPECT_LT(initial_host_only_pos, mtp_attach_pos);
+    EXPECT_LT(initial_layout_pos, mtp_attach_pos);
+    EXPECT_EQ(ensure_body.find("hybrid_device_state_bytes = 0", initial_layout_pos),
+              std::string::npos);
 
     const auto harvest_pos =
         source.find("bool DeviceGraphOrchestrator::harvestPrefix(", refresh_pos);
@@ -1987,24 +1902,10 @@ TEST_F(Test__DeviceGraphOrchestrator, LocalTPPrefixCacheUsesHostOnlyHybridPayloa
     const std::string refresh_body = source.substr(refresh_pos, harvest_pos - refresh_pos);
     const auto live_layout_pos =
         refresh_body.find("PrefixPayloadLayout live_layout = buildDensePrefixPayloadLayout");
-    const auto live_host_only_pos =
-        refresh_body.find("applyDenseLocalTPHostOnlyHybridPayloadLayout", live_layout_pos);
     ASSERT_NE(live_layout_pos, std::string::npos);
-    ASSERT_NE(live_host_only_pos, std::string::npos)
-        << "Live prefix-cache layout refresh must keep LocalTP host-only hybrid payloads stable.";
-    EXPECT_LT(live_layout_pos, live_host_only_pos);
-
-    const auto import_pos = source.find("bool importHybridPrefixPayload(");
-    const auto reset_pos = source.find("void resetHybridPrefixPayloadState", import_pos);
-    ASSERT_NE(import_pos, std::string::npos);
-    ASSERT_NE(reset_pos, std::string::npos);
-    const std::string import_body = source.substr(import_pos, reset_pos - import_pos);
-    const auto host_payload_pos =
-        import_body.find("host_payload_hydrates_device_bank");
-    ASSERT_NE(host_payload_pos, std::string::npos);
-    EXPECT_NE(import_body.find("desc.import_device_state_from_host_state", host_payload_pos),
+    EXPECT_EQ(refresh_body.find("hybrid_device_state_bytes = 0", live_layout_pos),
               std::string::npos)
-        << "Host-only LocalTP prefix blocks must hydrate the local GPU recurrent bank on restore.";
+        << "Live layout refresh must preserve all kernel-owned GPU banks.";
 }
 
 /**

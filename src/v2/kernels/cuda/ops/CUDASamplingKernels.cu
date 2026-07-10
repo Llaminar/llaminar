@@ -1457,14 +1457,31 @@ __global__ void cuda_sample_distribution_f32_kernel(
     const float *__restrict__ probs,
     int k,
     float threshold,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     float *__restrict__ out_probability)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
+
+    /*
+     * Request-batched GPU MTP keeps the mutable logical position in its
+     * publication mailbox. Reading that scalar here makes the random draw and
+     * the state it describes part of one ordered device stream. The ordinary
+     * scalar-threshold API remains available for nonresident callers.
+     */
+    const float effective_threshold =
+        threshold_position
+            ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                  threshold_seed,
+                  *threshold_position + threshold_position_offset,
+                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+            : threshold;
     *out_token =
         llaminar2::sampling_math::sample_distribution_with_threshold_and_probability(
-            token_ids, probs, k, threshold, out_probability);
+            token_ids, probs, k, effective_threshold, out_probability);
 }
 
 __global__ void cuda_speculative_verify_distribution_kernel(
@@ -1604,10 +1621,11 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
  * @brief Batched verifier variant whose draft tokens are already on device.
  *
  * This is the first device-resident-token step toward vLLM-style speculative
- * sampling. Each row may either receive host-generated thresholds as kernel
- * arguments or derive deterministic seeded thresholds directly on device.  The
- * accepted draft-token sequence is read from arena scratch produced by the
- * draft sampler instead of from host scalar arguments.
+ * sampling. Each row may receive explicit thresholds, derive seeded thresholds
+ * from a compatibility host position, or read the mutable base position from
+ * the device-resident publication mailbox. The accepted draft-token sequence
+ * is read from arena scratch produced by the draft sampler instead of from host
+ * scalar arguments.
  */
 __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tokens_kernel(
     const int *__restrict__ target_token_ids,
@@ -1633,6 +1651,8 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
     unsigned long long threshold_seed,
     int threshold_first_logical_position,
     int thresholds_from_seed,
+    const int *__restrict__ threshold_base_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -1660,18 +1680,26 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
         residual_threshold = residual_threshold3;
     }
 
+    const int threshold_logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : threshold_first_logical_position + row;
+    const int inverse_sample_logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : inverse_sample_first_logical_position + row;
+
     if (thresholds_from_seed)
     {
-        const int logical_position = threshold_first_logical_position + row;
         accept_threshold =
             llaminar2::sampling_math::mtp_spec_threshold_from_seed(
                 threshold_seed,
-                logical_position,
+                threshold_logical_position,
                 1 /* MTPSpecStochasticDrawPurpose::Accept */);
         residual_threshold =
             llaminar2::sampling_math::mtp_spec_threshold_from_seed(
                 threshold_seed,
-                logical_position,
+                threshold_logical_position,
                 2 /* MTPSpecStochasticDrawPurpose::Residual */);
     }
 
@@ -1688,7 +1716,7 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
                 sampled_draft_tokens[row],
                 accept_threshold,
                 inverse_sample_seed,
-                inverse_sample_first_logical_position + row,
+                inverse_sample_logical_position,
                 out_token + row,
                 out_accepted + row,
                 out_accept_probability ? out_accept_probability + row : nullptr,
@@ -2431,6 +2459,9 @@ __global__ void cuda_sample_processed_logits_if_speculative_batch_needs_bonus_f3
     int vocab_size,
     int row_stride,
     float threshold,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
     const int *__restrict__ verify_tokens,
     const int *__restrict__ verify_accepted,
     int row_count,
@@ -2494,6 +2525,14 @@ __global__ void cuda_sample_processed_logits_if_speculative_batch_needs_bonus_f3
     if (!should_sample_bonus)
         return;
 
+    const float effective_threshold =
+        threshold_position
+            ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                  threshold_seed,
+                  *threshold_position + threshold_position_offset,
+                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+            : threshold;
+
     cuda_processed_logit_row_stats_block<PROCESSED_LOGIT_VERIFY_THREADS>(
         logits,
         vocab_size,
@@ -2509,7 +2548,7 @@ __global__ void cuda_sample_processed_logits_if_speculative_batch_needs_bonus_f3
         max_logit,
         exp_sum,
         argmax_token,
-        threshold,
+        effective_threshold,
         scratch_vals,
         &selected_token);
 
@@ -3018,6 +3057,9 @@ __global__ void cuda_speculative_verify_processed_target_draft_probabilities_thr
     float accept_threshold3,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
+    int thresholds_from_seed,
+    const int *__restrict__ threshold_base_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -3060,6 +3102,19 @@ __global__ void cuda_speculative_verify_processed_target_draft_probabilities_thr
         accept_threshold = accept_threshold2;
     else if (row == 3)
         accept_threshold = accept_threshold3;
+
+    const int logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : inverse_sample_first_logical_position + row;
+    if (thresholds_from_seed)
+    {
+        accept_threshold =
+            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                logical_position,
+                1 /* MTPSpecStochasticDrawPurpose::Accept */);
+    }
 
     if (tid == 0)
     {
@@ -3107,7 +3162,7 @@ __global__ void cuda_speculative_verify_processed_target_draft_probabilities_thr
                 target_sum,
                 draft_token,
                 inverse_sample_seed,
-                inverse_sample_first_logical_position + row,
+                logical_position,
                 no_draft_probabilities != 0,
                 scratch_vals,
                 scratch_idxs);
@@ -3633,11 +3688,15 @@ __global__ void cuda_derive_shifted_speculative_publication_metadata_kernel(
 }
 
 /**
- * @brief Prepare shifted-MTP suffix condition tokens from compact metadata.
+ * @brief Prepare shifted-MTP suffix tokens and absolute positions from compact metadata.
  *
  * A single CUDA thread is enough for the four-row MTP verifier bound.  Keeping
  * this as a kernel still matters because the accepted-state count stays
  * device-resident; the CPU never decides how many suffix rows are publishable.
+ * The same lane expands the request's canonical verifier-base position into the
+ * contiguous position row consumed by the captured KV-only sidecar. Fusing
+ * these stores avoids a second launch and keeps both dynamic graph inputs under
+ * one stream-ordered device owner.
  */
 __global__ void cuda_prepare_speculative_shifted_kv_tokens_kernel(
     const int *__restrict__ meta,
@@ -3648,7 +3707,10 @@ __global__ void cuda_prepare_speculative_shifted_kv_tokens_kernel(
     int first_output_token_index,
     int row_count,
     int32_t filler_token,
-    int32_t *__restrict__ out_tokens)
+    int32_t *__restrict__ out_tokens,
+    const int32_t *__restrict__ base_positions,
+    int position_offset,
+    int32_t *__restrict__ out_position_ids)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3663,6 +3725,75 @@ __global__ void cuda_prepare_speculative_shifted_kv_tokens_kernel(
         row_count,
         filler_token,
         out_tokens);
+
+    const int32_t first_position =
+        base_positions[request_index] + position_offset;
+    for (int row = 0; row < row_count; ++row)
+        out_position_ids[row] = first_position + row;
+}
+
+/**
+ * @brief Gather strided MTP draft slots and derive grouped sidecar positions.
+ *
+ * Request-batched drafting lays proposal tokens out request-major so the final
+ * verifier can consume each request row contiguously. At an intermediate depth,
+ * adjacent requests are therefore separated by the configured draft depth. One
+ * thread per request gathers that token and adds the current depth to the
+ * device-resident logical position. The output arrays are stable arena buffers
+ * captured by the next MTP sidecar graph.
+ */
+__global__ void cuda_prepare_mtp_batched_sidecar_inputs_kernel(
+    const int32_t *__restrict__ condition_tokens,
+    int condition_token_stride,
+    const int32_t *__restrict__ base_positions,
+    int position_offset,
+    int request_count,
+    int32_t *__restrict__ out_condition_tokens,
+    int32_t *__restrict__ out_position_ids)
+{
+    const int request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request >= request_count)
+        return;
+
+    out_condition_tokens[request] =
+        condition_tokens[request * condition_token_stride];
+    out_position_ids[request] = base_positions[request] + position_offset;
+}
+
+/**
+ * @brief Publish the first device-owned logical rows from terminal prefill samples.
+ *
+ * Request admission has already copied prompt positions into persistent device
+ * metadata, and the sampler has written token identities into device slots. One
+ * thread loads both device-owned values and publishes every mailbox field for one
+ * request, making the initialized row self-consistent at the event recorded after
+ * this launch. `target_positions` may alias `out_target_positions`; consequently
+ * those two parameters intentionally do not use `__restrict__`.
+ */
+__global__ void cuda_initialize_mtp_device_logical_state_kernel(
+    const int32_t *__restrict__ sampled_tokens,
+    const int32_t *target_positions,
+    int request_count,
+    int32_t *__restrict__ out_base_cached_tokens,
+    int32_t *out_target_positions,
+    int32_t *__restrict__ out_accepted_state_counts,
+    int32_t *__restrict__ out_next_condition_tokens,
+    int32_t *__restrict__ out_all_drafts_accepted_flags,
+    int32_t *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_publication_ok_flags)
+{
+    const int request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request >= request_count)
+        return;
+
+    const int position = target_positions[request];
+    out_base_cached_tokens[request] = position;
+    out_target_positions[request] = position;
+    out_accepted_state_counts[request] = 0;
+    out_next_condition_tokens[request] = sampled_tokens[request];
+    out_all_drafts_accepted_flags[request] = 0;
+    out_stopped_flags[request] = 0;
+    out_publication_ok_flags[request] = 1;
 }
 
 // ============================================================================
@@ -4308,10 +4439,14 @@ extern "C"
         float threshold,
         int *out_token,
         float *out_probability,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
         int device_idx,
         void *stream)
     {
-        if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token || !stream)
+        if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token ||
+            !stream || (threshold_position && threshold_seed == 0))
             return false;
 
         cudaSetDevice(device_idx);
@@ -4321,6 +4456,9 @@ extern "C"
             probs,
             k,
             threshold,
+            threshold_seed,
+            threshold_position,
+            threshold_position_offset,
             out_token,
             out_probability);
 
@@ -4394,6 +4532,9 @@ extern "C"
         int stop_token_count,
         int *out_token,
         float *out_probability,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
         int device_idx,
         void *stream)
     {
@@ -4404,7 +4545,8 @@ extern "C"
             (first_token < 0 && !first_token_device) ||
             stop_token_count < 0 ||
             stop_token_count >
-                llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens)
+                llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
+            (threshold_position && threshold_seed == 0))
         {
             return false;
         }
@@ -4419,6 +4561,9 @@ extern "C"
             vocab_size,
             row_stride,
             threshold,
+            threshold_seed,
+            threshold_position,
+            threshold_position_offset,
             verify_tokens,
             verify_accepted,
             row_count,
@@ -4764,6 +4909,8 @@ extern "C"
         unsigned long long threshold_seed,
         int threshold_first_logical_position,
         int thresholds_from_seed,
+        const int *threshold_base_position,
+        int threshold_position_offset,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -4781,6 +4928,7 @@ extern "C"
             !target_token_ids || !target_probs ||
             (!has_draft_distribution && !has_one_hot_draft_distribution) ||
             !sampled_draft_tokens ||
+            (threshold_base_position && !thresholds_from_seed) ||
             !out_token || !out_accepted || !stream)
         {
             return false;
@@ -4812,6 +4960,8 @@ extern "C"
             threshold_seed,
             threshold_first_logical_position,
             thresholds_from_seed,
+            threshold_base_position,
+            threshold_position_offset,
             out_token,
             out_accepted,
             out_accept_probability,
@@ -4913,6 +5063,9 @@ extern "C"
         float accept_threshold3,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
+        int thresholds_from_seed,
+        const int *threshold_base_position,
+        int threshold_position_offset,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -4929,7 +5082,8 @@ extern "C"
             row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
-            (!no_draft_probabilities && draft_row_stride < vocab_size))
+            (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+            (threshold_base_position && !thresholds_from_seed))
         {
             return false;
         }
@@ -4953,6 +5107,9 @@ extern "C"
             accept_threshold3,
             inverse_sample_seed,
             inverse_sample_first_logical_position,
+            thresholds_from_seed,
+            threshold_base_position,
+            threshold_position_offset,
             out_token,
             out_accepted,
             out_accept_probability,
@@ -5428,12 +5585,17 @@ extern "C"
         int row_count,
         int32_t filler_token,
         int32_t *out_tokens,
+        const int32_t *base_positions,
+        int position_offset,
+        int32_t *out_position_ids,
         int device_idx,
         void *stream)
     {
         if (!meta ||
             !output_tokens ||
             !out_tokens ||
+            !base_positions ||
+            !out_position_ids ||
             !stream ||
             meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
             output_token_stride <
@@ -5460,12 +5622,128 @@ extern "C"
             first_output_token_index,
             row_count,
             filler_token,
-            out_tokens);
+            out_tokens,
+            base_positions,
+            position_offset,
+            out_position_ids);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Speculative Shifted KV Token Prep kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue device-resident preparation for one grouped MTP sidecar.
+     */
+    bool cudaOps_prepare_mtp_batched_sidecar_inputs(
+        const int32_t *condition_tokens,
+        int condition_token_stride,
+        const int32_t *base_positions,
+        int position_offset,
+        int request_count,
+        int32_t *out_condition_tokens,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream)
+    {
+        if (!condition_tokens ||
+            condition_token_stride <= 0 ||
+            !base_positions ||
+            request_count <= 0 ||
+            request_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            !out_condition_tokens ||
+            !out_position_ids ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        cuda_prepare_mtp_batched_sidecar_inputs_kernel<<<
+            1,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            condition_tokens,
+            condition_token_stride,
+            base_positions,
+            position_offset,
+            request_count,
+            out_condition_tokens,
+            out_position_ids);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA batched MTP sidecar input preparation failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue first-publication metadata from request-batched prefill.
+     */
+    bool cudaOps_initialize_mtp_device_logical_state(
+        const int32_t *sampled_tokens,
+        const int32_t *target_positions,
+        int request_count,
+        int32_t *out_base_cached_tokens,
+        int32_t *out_target_positions,
+        int32_t *out_accepted_state_counts,
+        int32_t *out_next_condition_tokens,
+        int32_t *out_all_drafts_accepted_flags,
+        int32_t *out_stopped_flags,
+        int32_t *out_publication_ok_flags,
+        int device_idx,
+        void *stream)
+    {
+        if (!sampled_tokens ||
+            !target_positions ||
+            request_count <= 0 ||
+            request_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            !out_base_cached_tokens ||
+            !out_target_positions ||
+            !out_accepted_state_counts ||
+            !out_next_condition_tokens ||
+            !out_all_drafts_accepted_flags ||
+            !out_stopped_flags ||
+            !out_publication_ok_flags ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_initialize_mtp_device_logical_state_kernel<<<
+            1,
+            32,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            sampled_tokens,
+            target_positions,
+            request_count,
+            out_base_cached_tokens,
+            out_target_positions,
+            out_accepted_state_counts,
+            out_next_condition_tokens,
+            out_all_drafts_accepted_flags,
+            out_stopped_flags,
+            out_publication_ok_flags);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA MTP device logical-state initialization failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

@@ -9,8 +9,10 @@
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -86,6 +88,38 @@ namespace llaminar2
             }
 
             return repacked;
+        }
+
+        /**
+         * @brief Publish proof that a compact verifier lookup used one grouped API call.
+         *
+         * Embedding rows are independent, so the economical grouped CPU path is a
+         * single loop over M token IDs. M=1 calls are the serial oracle and do not
+         * emit this counter.
+         */
+        void recordCPUGroupedEmbeddingCall(
+            const TensorBase *embed_table,
+            const TensorBase *output,
+            int num_tokens,
+            int d_model,
+            const char *weight_route)
+        {
+            if (num_tokens < 2 || num_tokens > 4)
+                return;
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_embedding_grouped_verifier_rows_calls",
+                1.0,
+                "verifier",
+                DeviceId::cpu().to_string(),
+                {{"weight_format", tensorTypeName(embed_table->native_type())},
+                 {"output_format", tensorTypeName(output->native_type())},
+                 {"verifier_rows", std::to_string(num_tokens)},
+                 {"d_model", std::to_string(d_model)},
+                 {"weight_route", weight_route},
+                 {"token_source", "host"},
+                 {"invocation_policy", "single_grouped_call"}});
         }
     } // namespace
 
@@ -309,7 +343,7 @@ namespace llaminar2
         int device_idx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);
-        if (!embed_table || !token_ids || !output)
+        if (!embed_table || !token_ids || !output || num_tokens <= 0 || d_model <= 0)
         {
             return false;
         }
@@ -332,7 +366,9 @@ namespace llaminar2
                 vocab_offset_ = mpi_ctx->rank() * local_vocab_size_;
             }
         }
-        vocab_parallel_ = vocab_offset_ != 0 ||
+        vocab_parallel_ = explicit_vocab_range_ ||
+                          (mpi_ctx && mpi_ctx->world_size() > 1) ||
+                          vocab_offset_ != 0 ||
                           local_vocab_size_ < static_cast<int>(embed_table->rows());
 
         // =====================================================================
@@ -348,8 +384,11 @@ namespace llaminar2
             {
                 if (output->native_type() != TensorType::FP32)
                     return false;
-                return apply(embed_data, token_ids, num_tokens, d_model,
-                             output->mutable_data(), mpi_ctx, device_idx);
+                const bool ok = apply(embed_data, token_ids, num_tokens, d_model,
+                                      output->mutable_data(), mpi_ctx, device_idx);
+                if (ok)
+                    recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "direct_fp32");
+                return ok;
             }
             else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
             {
@@ -358,8 +397,11 @@ namespace llaminar2
                 auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
                 if (!bf16_output)
                     return false;
-                return apply_bf16(embed_data, token_ids, num_tokens, d_model,
-                                  bf16_output->mutable_typed_data(), mpi_ctx, device_idx);
+                const bool ok = apply_bf16(embed_data, token_ids, num_tokens, d_model,
+                                           bf16_output->mutable_typed_data(), mpi_ctx, device_idx);
+                if (ok)
+                    recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "direct_fp32");
+                return ok;
             }
             else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
             {
@@ -368,8 +410,11 @@ namespace llaminar2
                 auto *fp16_output = dynamic_cast<FP16Tensor *>(output);
                 if (!fp16_output)
                     return false;
-                return apply_fp16(embed_data, token_ids, num_tokens, d_model,
-                                  fp16_output->mutable_typed_data(), mpi_ctx, device_idx);
+                const bool ok = apply_fp16(embed_data, token_ids, num_tokens, d_model,
+                                           fp16_output->mutable_typed_data(), mpi_ctx, device_idx);
+                if (ok)
+                    recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "direct_fp32");
+                return ok;
             }
             else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
             {
@@ -378,13 +423,105 @@ namespace llaminar2
                 auto *q8_output = dynamic_cast<Q8_1Tensor *>(output);
                 if (!q8_output)
                     return false;
-                return apply_q8_1(embed_data, token_ids, num_tokens, d_model,
-                                  q8_output->mutable_typed_data(), mpi_ctx, device_idx);
+                const bool ok = apply_q8_1(embed_data, token_ids, num_tokens, d_model,
+                                           q8_output->mutable_typed_data(), mpi_ctx, device_idx);
+                if (ok)
+                    recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "direct_fp32");
+                return ok;
             }
             else
             {
                 return false;
             }
+        }
+
+        // =====================================================================
+        // Native floating path: preserve FP16/BF16 table precision exactly
+        // =====================================================================
+        if (embed_table->native_type() == TensorType::FP16 ||
+            embed_table->native_type() == TensorType::BF16)
+        {
+            constexpr int kMaxStackEmbeddingWidth = 8192;
+            if (d_model > kMaxStackEmbeddingWidth)
+            {
+                LOG_ERROR("[CPUEmbeddingKernelT] Floating embedding width " << d_model
+                                                                            << " exceeds supported stack row width "
+                                                                            << kMaxStackEmbeddingWidth);
+                return false;
+            }
+
+            if constexpr (std::is_same_v<TensorT, FP32Tensor>)
+            {
+                if (output->native_type() != TensorType::FP32)
+                    return false;
+            }
+            else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
+            {
+                if (output->native_type() != TensorType::BF16)
+                    return false;
+            }
+            else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
+            {
+                if (output->native_type() != TensorType::FP16)
+                    return false;
+            }
+            else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
+            {
+                if (output->native_type() != TensorType::Q8_1 || d_model % 32 != 0)
+                    return false;
+            }
+            else
+            {
+                return false;
+            }
+
+            alignas(64) float row_buffer[kMaxStackEmbeddingWidth];
+            auto *output_bytes = static_cast<uint8_t *>(output->raw_mutable_data());
+            const size_t row_bytes = output->size_bytes() / static_cast<size_t>(num_tokens);
+
+            for (int row = 0; row < num_tokens; ++row)
+            {
+                const int local_id = token_ids[row] - vocab_offset_;
+                auto *destination = output_bytes + static_cast<size_t>(row) * row_bytes;
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    std::memset(destination, 0, row_bytes);
+                    continue;
+                }
+
+                embed_table->to_fp32_row(static_cast<size_t>(local_id), row_buffer);
+                if constexpr (std::is_same_v<TensorT, FP32Tensor>)
+                {
+                    std::memcpy(destination, row_buffer, static_cast<size_t>(d_model) * sizeof(float));
+                }
+                else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
+                {
+                    auto *typed_destination = reinterpret_cast<uint16_t *>(destination);
+                    for (int column = 0; column < d_model; ++column)
+                        typed_destination[column] = simd::fp32_to_bf16(row_buffer[column]);
+                }
+                else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
+                {
+                    auto *typed_destination = reinterpret_cast<uint16_t *>(destination);
+                    for (int column = 0; column < d_model; ++column)
+                        typed_destination[column] = simd::fp32_to_fp16(row_buffer[column]);
+                }
+                else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
+                {
+                    simd::quantize_fp32_to_q8_1_blocks(
+                        row_buffer,
+                        reinterpret_cast<Q8_1Block *>(destination),
+                        d_model);
+                }
+            }
+
+            recordCPUGroupedEmbeddingCall(
+                embed_table,
+                output,
+                num_tokens,
+                d_model,
+                embed_table->native_type() == TensorType::FP16 ? "native_fp16" : "native_bf16");
+            return true;
         }
 
         // =====================================================================
@@ -438,6 +575,7 @@ namespace llaminar2
                         out_row[base + j] = static_cast<float>(blk.qs[j]) * scale + min_val;
                 }
             }
+            recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "cached_embed_q8");
             return true;
         }
         else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
@@ -475,6 +613,7 @@ namespace llaminar2
                     }
                 }
             }
+            recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "cached_embed_q8");
             return true;
         }
         else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
@@ -512,6 +651,7 @@ namespace llaminar2
                     }
                 }
             }
+            recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "cached_embed_q8");
             return true;
         }
         else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
@@ -557,6 +697,7 @@ namespace llaminar2
                 simd::quantize_fp32_to_q8_1_blocks(
                     row_buf, out_blocks, d_model);
             }
+            recordCPUGroupedEmbeddingCall(embed_table, output, num_tokens, d_model, "cached_embed_q8");
             return true;
         }
         else

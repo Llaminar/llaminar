@@ -77,6 +77,26 @@ extern "C"
         int head_start,
         int gqa_n_rep);
 
+    /**
+     * @brief Launch all compact verifier rows through one FP16-KV decode grid.
+     *
+     * Unlike an ordinary decode batch, every verifier row reads the same cache
+     * allocation but has its own device-resident logical KV length. The kernel
+     * preserves the exact split sizing and reduction order of independent M=1
+     * decode while amortizing launch overhead across M=2..4.
+     */
+    int cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
+        const float *Q, const void *K_cache_fp16, const void *V_cache_fp16, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
+
     // Flash Decoding with Q8_1 KV cache — fused inline dequant, no workspace
     int cudaFlashAttn_decode_q8_1(
         const float *Q, const void *K_cache_q8, const void *V_cache_q8, float *O,
@@ -949,36 +969,48 @@ namespace llaminar2
                         return false;
                     }
 
-                    const size_t row_stride =
-                        static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
-                    for (int row = 0; row < seq_len; ++row)
+                    /*
+                     * Launch one phase-1 grid and one reduction grid for the
+                     * complete verifier span. Each grid-z row reads its own
+                     * AttentionDeviceParams entry but shares the same K/V cache.
+                     * The launcher derives that row's split count with the same
+                     * policy used by serial decode, so block partitioning and
+                     * FP32 merge order remain byte-identical to M=1.
+                     */
+                    const int max_num_splits =
+                        computeNumSplitsForDevice(kv_len, n_heads, dev);
+                    int result;
                     {
-                        const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
-                        const int num_splits = computeNumSplitsForDevice(row_kv_len, n_heads, dev);
-                        const attention::AttentionDeviceParams *row_params =
-                            d_attn_params ? (d_attn_params + row) : nullptr;
-
-                        int result;
-                        {
-                            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
-                            result = cudaFlashAttn_decode_fp16kv(
-                                Q_ptr + static_cast<size_t>(row) * row_stride,
-                                K_fp16_ptr, V_fp16_ptr,
-                                output_ptr + static_cast<size_t>(row) * row_stride,
-                                O_partial, m_partial, l_partial,
-                                1, row_kv_len,
-                                n_heads, n_kv_heads, head_dim,
-                                num_splits, row_params, stream_, dev,
-                                head_start, gqa_n_rep);
-                        }
-                        if (result != 0)
-                        {
-                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode failed"
-                                      << " row=" << row
-                                      << " row_kv_len=" << row_kv_len
-                                      << " num_splits=" << num_splits);
-                            return false;
-                        }
+                        CUDA_KERNEL_PROFILE_SCOPE_STREAM(
+                            CUDAKernelType::FLASH_ATTN_DECODE,
+                            stream_);
+                        result = cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
+                            Q_ptr,
+                            K_fp16_ptr,
+                            V_fp16_ptr,
+                            output_ptr,
+                            O_partial,
+                            m_partial,
+                            l_partial,
+                            seq_len,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_num_splits,
+                            d_attn_params,
+                            stream_,
+                            dev,
+                            head_start,
+                            gqa_n_rep);
+                    }
+                    if (result != 0)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Grouped small-M FP16KV decode failed"
+                                  << " rows=" << seq_len
+                                  << " max_kv_len=" << kv_len
+                                  << " max_num_splits=" << max_num_splits);
+                        return false;
                     }
                     return true;
                 }

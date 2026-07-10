@@ -25,10 +25,13 @@
 #include "CPUGatedDeltaNet.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -127,6 +130,46 @@ static inline __m256 avx2_fast_sigmoid(__m256 vx)
 
 namespace llaminar2
 {
+    void CPUGatedDeltaNet::resetGPUState()
+    {
+        request_state_bank_.clear();
+        request_state_size_ = 0;
+        request_state_capacity_ = 0;
+        owned_speculative_state_work_.clear();
+    }
+
+    bool CPUGatedDeltaNet::ensureRequestStateBank(
+        int request_count,
+        int state_floats,
+        const float *request_zero_state)
+    {
+        if (request_count <= 0 || state_floats <= 0 || !request_zero_state)
+            return false;
+
+        if (request_state_size_ != state_floats)
+        {
+            request_state_bank_.assign(
+                static_cast<size_t>(request_count) * state_floats,
+                0.0f);
+            request_state_size_ = state_floats;
+            request_state_capacity_ = request_count;
+        }
+        else if (request_state_capacity_ < request_count)
+        {
+            request_state_bank_.resize(
+                static_cast<size_t>(request_count) * state_floats,
+                0.0f);
+            request_state_capacity_ = request_count;
+        }
+
+        /* Request zero remains the public host prefix-state representation. */
+        std::memcpy(
+            request_state_bank_.data(),
+            request_zero_state,
+            static_cast<size_t>(state_floats) * sizeof(float));
+        return true;
+    }
+
     void CPUGatedDeltaNet::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
     {
         verifier_state_capture_ = workspace;
@@ -151,6 +194,68 @@ namespace llaminar2
             verifier_state_capture_size_,
             verifier_state_capture_size_,
             stream);
+    }
+
+    bool CPUGatedDeltaNet::restoreVerifierStateCaptureRows(
+        float *dst_state,
+        const int *host_row_indices,
+        int request_count,
+        void *stream)
+    {
+        (void)stream;
+        if (!dst_state || !host_row_indices || request_count <= 0 ||
+            request_count > request_state_capacity_ ||
+            request_state_size_ <= 0 || !verifier_state_capture_ ||
+            verifier_state_capture_size_ < request_state_size_)
+        {
+            return false;
+        }
+
+        /*
+         * Publication is one logical transaction across the request bank.
+         * Reject every invalid row before copying any slot so callers never
+         * inherit a partially committed speculative timeline.
+         */
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int row = host_row_indices[request];
+            if (row >= verifier_state_capture_rows_)
+                return false;
+        }
+
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int row = host_row_indices[request];
+            if (row < 0)
+                continue;
+            float *destination =
+                request_state_bank_.data() +
+                static_cast<size_t>(request) * request_state_size_;
+            const float *source =
+                verifier_state_capture_ +
+                static_cast<size_t>(row) * verifier_state_capture_size_;
+            std::memcpy(
+                destination,
+                source,
+                static_cast<size_t>(request_state_size_) * sizeof(float));
+            if (request == 0)
+            {
+                std::memcpy(
+                    dst_state,
+                    destination,
+                    static_cast<size_t>(request_state_size_) * sizeof(float));
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_gdn_request_batched_state_publications",
+            1.0,
+            "decode",
+            "cpu",
+            {{"request_count", std::to_string(request_count)},
+             {"publication_policy", "request_bank_snapshot_copy"}});
+        return true;
     }
 
     float *CPUGatedDeltaNet::prepareSpeculativeState(float *live_state, int state_floats)
@@ -1012,6 +1117,19 @@ namespace llaminar2
             return false;
         }
 
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_gdn_grouped_verifier_recurrence_calls",
+            1.0,
+            "verifier",
+            "cpu",
+            {{"verifier_rows", std::to_string(seq_len)},
+             {"n_heads", std::to_string(n_heads)},
+             {"d_k", std::to_string(d_k)},
+             {"d_v", std::to_string(d_v)},
+             {"snapshot_rows", std::to_string(std::min(seq_len, max_snapshot_rows))},
+             {"execution_policy", "head_grouped_recurrence"}});
+
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
         constexpr float l2_eps = 1e-6f;
         const int v_stride = n_heads * d_v;
@@ -1154,6 +1272,276 @@ namespace llaminar2
             alpha, beta_raw, A_log, dt_bias, output, state_for_compute,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+    }
+
+    template <typename RowAccessor>
+    bool CPUGatedDeltaNet::chunkForwardBatchedDecodeEquivalentRows(
+        RowAccessor &&row_accessor,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *host_request_seq_lens)
+    {
+        if (!alpha || !beta_raw || !A_log || !dt_bias || !output || !state ||
+            !host_request_seq_lens || seq_len <= 0 || request_count <= 0 ||
+            request_seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            request_seq_len > std::numeric_limits<int>::max() / request_count ||
+            seq_len != request_count * request_seq_len ||
+            d_k > 512 || d_v > 512)
+        {
+            return false;
+        }
+
+        const size_t state_floats_wide =
+            static_cast<size_t>(n_heads) * d_k * d_v;
+        if (state_floats_wide > static_cast<size_t>(std::numeric_limits<int>::max()))
+            return false;
+        const int state_floats = static_cast<int>(state_floats_wide);
+        if (state_floats <= 0 ||
+            state_floats > std::numeric_limits<int>::max() / request_count ||
+            n_heads > std::numeric_limits<int>::max() / request_count)
+        {
+            return false;
+        }
+        const int total_state_floats = request_count * state_floats;
+        if (!ensureRequestStateBank(request_count, state_floats, state))
+            return false;
+
+        const bool capture_active =
+            verifier_state_capture_ != nullptr &&
+            verifier_state_capture_rows_ >= seq_len &&
+            verifier_state_capture_size_ >= state_floats;
+        float *effective_states = request_state_bank_.data();
+        if (capture_active)
+        {
+            if (speculative_state_work_)
+            {
+                if (speculative_state_work_size_ < total_state_floats)
+                    return false;
+                effective_states = speculative_state_work_;
+            }
+            else
+            {
+                owned_speculative_state_work_.resize(
+                    static_cast<size_t>(total_state_floats));
+                effective_states = owned_speculative_state_work_.data();
+            }
+            std::memcpy(
+                effective_states,
+                request_state_bank_.data(),
+                static_cast<size_t>(total_state_floats) * sizeof(float));
+        }
+
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_gdn_request_batched_grouped_calls",
+            1.0,
+            "prefill",
+            "cpu",
+            {{"request_count", std::to_string(request_count)},
+             {"request_row_width", std::to_string(request_seq_len)},
+             {"n_heads", std::to_string(n_heads)},
+             {"execution_policy", "request_head_grouped_recurrence"}});
+
+        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
+        constexpr float l2_eps = 1e-6f;
+        const int v_stride = n_heads * d_v;
+        const size_t head_state_floats =
+            static_cast<size_t>(d_k) * d_v;
+        std::atomic<bool> row_binding_failed{false};
+
+        auto grouped_requests = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int work = 0; work < request_count * n_heads; ++work)
+            {
+                const int request = work / n_heads;
+                const int head = work % n_heads;
+                const int real_rows = std::clamp(
+                    host_request_seq_lens[request], 0, request_seq_len);
+                float *S =
+                    effective_states +
+                    static_cast<size_t>(request) * state_floats +
+                    static_cast<size_t>(head) * head_state_floats;
+                alignas(64) float q_local[512];
+                alignas(64) float k_local[512];
+
+                for (int row = 0; row < real_rows; ++row)
+                {
+                    const int flat_row = request * request_seq_len + row;
+                    const float *q_row = nullptr;
+                    const float *k_row = nullptr;
+                    const float *v_row = nullptr;
+                    row_accessor(request, row, head, q_row, k_row, v_row);
+                    if (!q_row || !k_row || !v_row)
+                    {
+                        /*
+                         * Accessors are private, shape-checked production
+                         * adapters.  Keep this fail-closed guard nevertheless:
+                         * silently skipping one head would publish plausible
+                         * but mathematically incomplete verifier state.
+                         */
+                        row_binding_failed.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+
+                    if (use_qk_l2norm)
+                    {
+                        gdn_preprocess_qk_l2norm(
+                            q_row, k_row, q_local, k_local,
+                            d_k, scale_val, l2_eps);
+                    }
+                    else
+                    {
+                        gdn_preprocess_qk_scale(
+                            q_row, k_row, q_local, k_local,
+                            d_k, scale_val);
+                    }
+
+                    const size_t gate_index =
+                        static_cast<size_t>(flat_row) * n_heads + head;
+                    const float x = alpha[gate_index] + dt_bias[head];
+                    const float softplus =
+                        x > 20.0f ? x : std::log1p(std::exp(x));
+                    const float decay = std::exp(A_log[head] * softplus);
+                    const float beta =
+                        1.0f / (1.0f + std::exp(-beta_raw[gate_index]));
+                    float *output_row =
+                        output + static_cast<size_t>(flat_row) * v_stride +
+                        head * d_v;
+                    gdn_delta_recurrence(
+                        S, q_local, k_local, v_row, output_row,
+                        decay, beta, d_k, d_v);
+
+                    if (capture_active)
+                    {
+                        float *snapshot =
+                            verifier_state_capture_ +
+                            static_cast<size_t>(flat_row) * verifier_state_capture_size_ +
+                            static_cast<size_t>(head) * head_state_floats;
+                        std::memcpy(
+                            snapshot, S,
+                            head_state_floats * sizeof(float));
+                    }
+                }
+
+                for (int row = real_rows; row < request_seq_len; ++row)
+                {
+                    const int flat_row = request * request_seq_len + row;
+                    std::memset(
+                        output + static_cast<size_t>(flat_row) * v_stride +
+                            head * d_v,
+                        0,
+                        static_cast<size_t>(d_v) * sizeof(float));
+                    if (capture_active)
+                    {
+                        std::memset(
+                            verifier_state_capture_ +
+                                static_cast<size_t>(flat_row) * verifier_state_capture_size_ +
+                                static_cast<size_t>(head) * head_state_floats,
+                            0,
+                            head_state_floats * sizeof(float));
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(grouped_requests);
+
+        if (row_binding_failed.load(std::memory_order_relaxed))
+            return false;
+
+        if (!capture_active)
+        {
+            std::memcpy(
+                state,
+                request_state_bank_.data(),
+                static_cast<size_t>(state_floats) * sizeof(float));
+        }
+        return true;
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardBatchedRequestsWithHostSeqLens(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        int chunk_size, bool use_qk_l2norm,
+        const int *host_request_seq_lens)
+    {
+        (void)chunk_size;
+        if (!Q || !K || !V)
+            return false;
+
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        auto contiguous_rows =
+            [=](int request, int row, int head,
+                const float *&q_row,
+                const float *&k_row,
+                const float *&v_row)
+        {
+            const int flat_row = request * request_seq_len + row;
+            q_row = Q + static_cast<size_t>(flat_row) * qk_stride + head * d_k;
+            k_row = K + static_cast<size_t>(flat_row) * qk_stride + head * d_k;
+            v_row = V + static_cast<size_t>(flat_row) * v_stride + head * d_v;
+        };
+        return chunkForwardBatchedDecodeEquivalentRows(
+            contiguous_rows,
+            alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, request_count, request_seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            host_request_seq_lens);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardBatchedMergedQKVWithHostSeqLens(
+        const float *merged_qkv, int qkv_stride,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_k_heads, int n_heads, int d_k, int d_v,
+        int global_v_head_offset, bool use_qk_l2norm,
+        const int *host_request_seq_lens)
+    {
+        if (!merged_qkv || n_k_heads <= 0 || n_heads <= 0 ||
+            d_k <= 0 || d_v <= 0)
+        {
+            return false;
+        }
+        const int q_src_dim = n_k_heads * d_k;
+        const int k_src_dim = n_k_heads * d_k;
+        const int v_dim = n_heads * d_v;
+        if (qkv_stride < q_src_dim + k_src_dim + v_dim)
+            return false;
+
+        auto merged_rows =
+            [=](int request, int row, int head,
+                const float *&q_row,
+                const float *&k_row,
+                const float *&v_row)
+        {
+            int qk_head = (head + global_v_head_offset) % n_k_heads;
+            if (qk_head < 0)
+                qk_head += n_k_heads;
+            const int flat_row = request * request_seq_len + row;
+            const float *source =
+                merged_qkv + static_cast<size_t>(flat_row) * qkv_stride;
+            q_row = source + static_cast<size_t>(qk_head) * d_k;
+            k_row = source + q_src_dim + static_cast<size_t>(qk_head) * d_k;
+            v_row = source + q_src_dim + k_src_dim +
+                    static_cast<size_t>(head) * d_v;
+        };
+        return chunkForwardBatchedDecodeEquivalentRows(
+            merged_rows,
+            alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, request_count, request_seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            host_request_seq_lens);
     }
 
     bool CPUGatedDeltaNet::chunkForwardImpl(

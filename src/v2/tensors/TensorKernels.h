@@ -1638,6 +1638,65 @@ namespace llaminar2
         }
 
         /**
+         * @brief Compute independent request-batched decode rows from per-request KV views.
+         *
+         * A request batch does not share one contiguous KV history: request
+         * `r` owns `K_by_request[r]`, `V_by_request[r]`, and `kv_lens[r]`.
+         * Implementations must consume the whole descriptor set through one
+         * grouped API and preserve each request's ordinary serial-decode math.
+         * Calling `compute_tensor()` once per request at the stage layer is not
+         * a valid implementation because it turns the production graph into a
+         * row-replay loop and repeatedly crosses the polymorphic dispatch path.
+         *
+         * CPU implementations may share their internal tiled decode primitive
+         * across requests. GPU backends use their resident, fixed-stride cache
+         * views and do not currently need this host descriptor contract.
+         *
+         * @param Q Row-major query tensor `[request_count * query_rows, q_dim]`.
+         * @param K_by_request One logical K history tensor per request.
+         * @param V_by_request One logical V history tensor per request.
+         * @param kv_lens Logical KV row count for each request tensor.
+         * @param output Row-major output tensor matching @p Q.
+         * @return true only when the grouped implementation executed.
+         */
+        virtual bool compute_request_batch_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *const *K_by_request,
+            const ITensor *const *V_by_request,
+            const int *kv_lens,
+            ITensor *output,
+            int request_count,
+            int query_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0)
+        {
+            (void)Q;
+            (void)K_by_request;
+            (void)V_by_request;
+            (void)kv_lens;
+            (void)output;
+            (void)request_count;
+            (void)query_rows;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)head_start;
+            (void)gqa_n_rep;
+            return false;
+        }
+
+        /**
          * @brief Update attention device params stored in pinned host memory for graph replay
          *
          * Graph-captured attention reads AttentionDeviceParams from device memory.
@@ -2846,9 +2905,11 @@ namespace llaminar2
         /**
          * @brief Provide a model-owned prepared embedding handle for execution.
          *
-         * Graph-built model paths resolve this through PreparedWeightStore.
-         * Implementations may keep using their legacy lookup/fallback path when
-         * no handle is provided (for direct kernel tests and non-model callers).
+         * Graph-built GPU paths resolve quantized embedding weights through
+         * PreparedWeightStore before graph construction. GPU implementations
+         * must reject a missing or mismatched handle instead of repacking host
+         * weights in the execution path. FP32 tables may execute directly when
+         * the source tensor is already resident on the target device.
          */
         virtual void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle)
         {
@@ -3154,6 +3215,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore host-selected snapshot rows into CPU request state.
+         *
+         * Implementations copy each non-negative flat snapshot row into the
+         * corresponding request-owned live-state slot. Request zero also
+         * refreshes @p dst_state, preserving the public host-state ABI.
+         */
+        virtual bool restoreVerifierStateCaptureRows(
+            float *dst_state,
+            const int *host_row_indices,
+            int request_count,
+            void *stream)
+        {
+            (void)dst_state;
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Restore a captured verifier-row conv state by device row index.
          *
          * GPU MTP publication uses compact device metadata to choose the
@@ -3200,6 +3281,29 @@ namespace llaminar2
             (void)device_row_indices;
             (void)request_count;
             (void)row_index_stride;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Publish one captured terminal conv state per padded request.
+         *
+         * @p device_request_seq_lens stores real rows per request, not flat
+         * snapshot indices. The backend computes
+         * `request * request_row_width + real_length - 1` on device and copies
+         * all request states in one grouped launch.
+         */
+        virtual bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream)
+        {
+            (void)dst_states;
+            (void)device_request_seq_lens;
+            (void)request_count;
+            (void)request_row_width;
             (void)stream;
             return false;
         }
@@ -3389,6 +3493,71 @@ namespace llaminar2
             (void)apply_silu;
             return false;
         }
+
+        /**
+         * @brief Native CPU request-batched forward with host-owned real lengths.
+         *
+         * CPU serving already owns immutable request lengths in ordinary host
+         * memory.  A conforming implementation must process the flattened
+         * request matrix as grouped work, preserve one live state slot per
+         * request, and zero padded rows.  Calling `forward()` once per request
+         * is not a grouped implementation.
+         */
+        virtual bool forwardBatchedRequestsWithHostSeqLens(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            const int *host_request_seq_lens,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)host_request_seq_lens;
+            (void)apply_silu;
+            return false;
+        }
+
+        /**
+         * @brief Native request-batched forward with device-owned real lengths.
+         *
+         * This is the production variable-length GPU entry point. The backend
+         * must launch the request matrix as grouped work, read one real length
+         * per request from @p device_request_seq_lens, zero padded output rows,
+         * and commit each request's live state at its own terminal real row.
+         * Implementations must not copy lengths to the host or replay requests
+         * through the scalar `forward()` API.
+         */
+        virtual bool forwardBatchedRequestsWithDeviceSeqLens(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            const int *device_request_seq_lens,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)device_request_seq_lens;
+            (void)apply_silu;
+            return false;
+        }
     };
 
     /**
@@ -3535,6 +3704,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore host-selected recurrence snapshots by request.
+         *
+         * This is the CPU counterpart of device-indexed grouped publication;
+         * it updates request-owned live-state slots directly and never replays
+         * a scalar recurrence row.
+         */
+        virtual bool restoreVerifierStateCaptureRows(
+            float *dst_state,
+            const int *host_row_indices,
+            int request_count,
+            void *stream)
+        {
+            (void)dst_state;
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Restore a captured verifier-row recurrence state by device row index.
          *
          * This is the device-resident companion to restoreVerifierStateCaptureRow().
@@ -3580,6 +3769,28 @@ namespace llaminar2
             (void)device_row_indices;
             (void)request_count;
             (void)row_index_stride;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Publish one captured terminal recurrence state per request.
+         *
+         * Real request lengths remain device-resident. The backend derives flat
+         * terminal snapshot rows and copies the complete request state bank in
+         * one launch, without host-visible row indices.
+         */
+        virtual bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream)
+        {
+            (void)dst_states;
+            (void)device_request_seq_lens;
+            (void)request_count;
+            (void)request_row_width;
             (void)stream;
             return false;
         }
@@ -3852,6 +4063,124 @@ namespace llaminar2
             (void)d_v;
             (void)chunk_size;
             (void)use_qk_l2norm;
+            return false;
+        }
+
+        /**
+         * @brief Native CPU request-batched recurrence with host real lengths.
+         *
+         * The backend must own one recurrence state per request and schedule
+         * independent `(request, head)` work in one grouped region while each
+         * head preserves serial timestep order.  Padded rows are inert and
+         * produce zero output.
+         */
+        virtual bool chunkForwardBatchedRequestsWithHostSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *host_request_seq_lens)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)host_request_seq_lens;
+            return false;
+        }
+
+        /**
+         * @brief Grouped CPU recurrence directly over merged Q/K/V rows.
+         *
+         * Qwen GDN stores each row as
+         * `[Q(n_k_heads*d_k), K(n_k_heads*d_k), V(n_heads*d_v)]`.
+         * This contract combines request isolation with the modular Q/K head
+         * mapping so production CPU batching does not first materialize three
+         * temporary tensors.
+         */
+        virtual bool chunkForwardBatchedMergedQKVWithHostSeqLens(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, bool use_qk_l2norm,
+            const int *host_request_seq_lens)
+        {
+            (void)merged_qkv;
+            (void)qkv_stride;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_k_heads;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)global_v_head_offset;
+            (void)use_qk_l2norm;
+            (void)host_request_seq_lens;
+            return false;
+        }
+
+        /**
+         * @brief Native request-batched recurrence with device-owned real lengths.
+         *
+         * The grouped backend reads @p device_request_seq_lens directly, keeps
+         * every request on its own recurrent-state slot, emits zeroes for padded
+         * rows, and commits state after the last real row. A host request loop or
+         * scalar-row replay is not a conforming production implementation.
+         */
+        virtual bool chunkForwardBatchedRequestsWithDeviceSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_request_seq_lens)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)device_request_seq_lens;
             return false;
         }
 

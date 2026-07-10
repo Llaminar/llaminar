@@ -130,6 +130,18 @@ namespace llaminar2
         /// prevent cross-sequence attention in batched execution.
         const std::vector<int> *sequence_lengths = nullptr;
 
+        /**
+         * @brief Device owner for per-request valid row counts in a padded batch.
+         *
+         * The serving boundary uploads `sequence_lengths` once before GPU graph
+         * execution. Stateful graph stages such as short convolution and GDN
+         * recurrence consume this stable arena pointer directly, so graph
+         * capture never records an H2D copy and padded rows cannot advance live
+         * request state. CPU graphs leave this pointer null and read the host
+         * vector above.
+         */
+        const int32_t *sequence_lengths_device = nullptr;
+
         /// Batched input (alternative to token_ids)
         struct Batch
         {
@@ -182,6 +194,8 @@ namespace llaminar2
         IKVCache *kv_cache = nullptr;      ///< KV cache
         /// Sequence lengths for variable-length batching (nullptr = all equal)
         const std::vector<int> *sequence_lengths = nullptr;
+        /// Device-owned counterpart used by GPU request-batched recurrent stages.
+        const int32_t *sequence_lengths_device = nullptr;
     };
 
     // =========================================================================
@@ -479,7 +493,8 @@ namespace llaminar2
             const int *position_ids,
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr,
-            const void *position_ids_device = nullptr)
+            const void *position_ids_device = nullptr,
+            const int32_t *sequence_lengths_device = nullptr)
         {
             (void)layer;
             (void)buffers;
@@ -491,6 +506,7 @@ namespace llaminar2
             (void)position_ids_device;
             (void)device;
             (void)sequence_lengths;
+            (void)sequence_lengths_device;
             return {};
         }
 

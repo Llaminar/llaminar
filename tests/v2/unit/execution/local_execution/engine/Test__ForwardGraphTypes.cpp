@@ -457,6 +457,24 @@ TEST(Test__ForwardGraphSignature, DifferentDeviceTokenSourceNotEqual)
               ForwardGraphSignatureHash{}(device_tokens));
 }
 
+TEST(Test__ForwardGraphSignature, DifferentDeviceSequenceLengthSourceNotEqual)
+{
+    ForwardGraphSignature external_rows{
+        .seq_len = 16,
+        .batch_size = 2,
+        .all_position_logits = true,
+        .all_position_logit_rows = 2,
+        .uses_device_sequence_lengths = false};
+    ForwardGraphSignature resident_request_lengths = external_rows;
+    resident_request_lengths.uses_device_sequence_lengths = true;
+
+    EXPECT_NE(external_rows, resident_request_lengths)
+        << "Verifier-row and request-length-owned graphs must never share a cached executable";
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(external_rows),
+        ForwardGraphSignatureHash{}(resident_request_lengths));
+}
+
 TEST(Test__ForwardGraphSignature, DifferentPPFieldsNotEqual)
 {
     ForwardGraphSignature a{.pp_stage_enabled = true, .pp_first_layer = 0, .pp_last_layer = 13};
@@ -715,6 +733,33 @@ TEST(Test__ForwardGraphCache, ReplayHostPositionIdsDoNotMaskDeviceResidentRows)
     input.seq_len = static_cast<int>(host_shadow.size());
 
     EXPECT_EQ(selectForwardReplayHostPositionIds(cache, input), nullptr);
+}
+
+/**
+ * @brief Explicit position tables own every flattened request row.
+ */
+TEST(Test__ForwardGraphCache, PositionRowCountIncludesBatchDimension)
+{
+    ForwardInput input;
+    input.batch_size = 2;
+    input.seq_len = 16;
+
+    EXPECT_EQ(forwardPositionRowCount(input), 32);
+}
+
+/**
+ * @brief Invalid position geometry cannot wrap into a small RoPE launch.
+ */
+TEST(Test__ForwardGraphCache, PositionRowCountRejectsInvalidAndOverflowingGeometry)
+{
+    ForwardInput input;
+    input.batch_size = 0;
+    input.seq_len = 16;
+    EXPECT_EQ(forwardPositionRowCount(input), 0);
+
+    input.batch_size = 2;
+    input.seq_len = std::numeric_limits<int>::max();
+    EXPECT_EQ(forwardPositionRowCount(input), 0);
 }
 
 TEST(Test__DeviceGraphExecutor, CapturedTerminalStatePublishesCapturedStages)

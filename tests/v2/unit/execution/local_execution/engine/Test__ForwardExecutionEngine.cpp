@@ -2036,6 +2036,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"result", "miss"},
         {"uses_device_token_ids", "false"},
         {"uses_device_position_ids", "false"},
+        {"uses_device_sequence_lengths", "false"},
         {"seq_len", "2"}};
     const PerfStatsCollector::Tags hit_tags = {
         {"all_position_logits", "true"},
@@ -2046,6 +2047,7 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"result", "hit"},
         {"uses_device_token_ids", "false"},
         {"uses_device_position_ids", "false"},
+        {"uses_device_sequence_lengths", "false"},
         {"seq_len", "2"}};
 
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "forward_cache_lookup", miss_tags), 1.0);

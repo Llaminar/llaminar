@@ -9,11 +9,16 @@
 
 #pragma once
 
+#include "../../../backends/DeviceId.h"
 #include "../../../backends/IWorkerGPUContext.h"
+#include "../../../execution/config/RuntimeConfig.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
+#include <string>
 #include <stdexcept>
 
 // Forward declarations for CUDA kernels
@@ -26,6 +31,55 @@ extern "C"
 
 namespace llaminar2::cuda
 {
+
+    namespace residual_add_detail
+    {
+        /**
+         * @brief Recover active verifier rows from the flat element contract.
+         *
+         * ResidualAdd is semantically flat, but production tensors retain a
+         * logical column width. Dividing the active span by that width recovers
+         * M even when a graph buffer reserves capacity for four rows.
+         */
+        inline int activeRows(
+            const TensorBase *input,
+            size_t num_elements)
+        {
+            if (!input || input->cols() == 0 || num_elements % input->cols() != 0)
+                return 0;
+            return static_cast<int>(num_elements / input->cols());
+        }
+
+        /**
+         * @brief Record one successful device-owned CUDA grouped launch.
+         *
+         * The production implementation launches one flat elementwise grid for
+         * all M rows. Serial M=1 witnesses intentionally emit no record, making
+         * hidden row replay visible to the grouped regression gate.
+         */
+        inline void recordCUDAGroupedCall(
+            const TensorBase *input,
+            size_t num_elements,
+            int device)
+        {
+            const int rows = activeRows(input, num_elements);
+            if (rows < 2 || rows > 4)
+                return;
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_residual_add_grouped_verifier_rows_calls",
+                1.0,
+                "verifier",
+                DeviceId::cuda(device).to_string(),
+                {{"tensor_format", tensorTypeName(input->native_type())},
+                 {"verifier_rows", std::to_string(rows)},
+                 {"cols", std::to_string(input->cols())},
+                 {"active_elements", std::to_string(num_elements)},
+                 {"capture_mode", isGraphCaptureActive() ? "graph_capture" : "direct"},
+                 {"invocation_policy", "single_flat_launch"}});
+        }
+    } // namespace residual_add_detail
 
     // ==========================================================================
     // FP32 Specialization
@@ -92,18 +146,29 @@ namespace llaminar2::cuda
         {
             if (!input || !residual || !output)
                 return false;
-            if (input->native_type() != TensorType::FP32)
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAResidualAddKernelT::FP32] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
+            if (input->native_type() != TensorType::FP32 ||
+                residual->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32)
                 return false;
 
-            // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
-            // (consistent with BF16/FP16 specializations)
-            return apply(
-                static_cast<const float *>(input->active_data_ptr()),
-                static_cast<const float *>(residual->active_data_ptr()),
-                static_cast<float *>(output->active_mutable_data_ptr()),
+            // Graph execution owns residency. Never adopt a host-visible active
+            // pointer for a GPU stage; all three operands must remain device-owned.
+            const bool ok = apply(
+                static_cast<const float *>(input->gpu_data_ptr()),
+                static_cast<const float *>(residual->gpu_data_ptr()),
+                static_cast<float *>(output->gpu_data_ptr()),
                 num_elements,
                 mpi_ctx,
                 device_idx);
+            const int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            if (ok)
+                residual_add_detail::recordCUDAGroupedCall(input, num_elements, dev);
+            return ok;
         }
 
     private:
@@ -185,17 +250,27 @@ namespace llaminar2::cuda
         {
             if (!input || !residual || !output)
                 return false;
-            if (input->native_type() != TensorType::BF16)
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAResidualAddKernelT::BF16] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
+            if (input->native_type() != TensorType::BF16 ||
+                residual->native_type() != TensorType::BF16 ||
+                output->native_type() != TensorType::BF16)
                 return false;
 
-            // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
-            return apply_bf16(
-                static_cast<const uint16_t *>(input->active_data_ptr()),
-                static_cast<const uint16_t *>(residual->active_data_ptr()),
-                static_cast<uint16_t *>(output->active_mutable_data_ptr()),
+            const bool ok = apply_bf16(
+                static_cast<const uint16_t *>(input->gpu_data_ptr()),
+                static_cast<const uint16_t *>(residual->gpu_data_ptr()),
+                static_cast<uint16_t *>(output->gpu_data_ptr()),
                 num_elements,
                 mpi_ctx,
                 device_idx);
+            const int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            if (ok)
+                residual_add_detail::recordCUDAGroupedCall(input, num_elements, dev);
+            return ok;
         }
 
     private:
@@ -277,17 +352,27 @@ namespace llaminar2::cuda
         {
             if (!input || !residual || !output)
                 return false;
-            if (input->native_type() != TensorType::FP16)
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAResidualAddKernelT::FP16] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
+            if (input->native_type() != TensorType::FP16 ||
+                residual->native_type() != TensorType::FP16 ||
+                output->native_type() != TensorType::FP16)
                 return false;
 
-            // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
-            return apply_fp16(
-                static_cast<const uint16_t *>(input->active_data_ptr()),
-                static_cast<const uint16_t *>(residual->active_data_ptr()),
-                static_cast<uint16_t *>(output->active_mutable_data_ptr()),
+            const bool ok = apply_fp16(
+                static_cast<const uint16_t *>(input->gpu_data_ptr()),
+                static_cast<const uint16_t *>(residual->gpu_data_ptr()),
+                static_cast<uint16_t *>(output->gpu_data_ptr()),
                 num_elements,
                 mpi_ctx,
                 device_idx);
+            const int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            if (ok)
+                residual_add_detail::recordCUDAGroupedCall(input, num_elements, dev);
+            return ok;
         }
 
     private:

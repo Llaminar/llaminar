@@ -8,16 +8,74 @@
 
 #pragma once
 
+#include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../CPUKernelBase.h"
+
+#include <string>
 
 namespace llaminar2
 {
+
+    namespace residual_add_detail
+    {
+        /**
+         * @brief Derive the active verifier-row count from a flat element span.
+         *
+         * ResidualAdd's interface is intentionally flat because row boundaries
+         * do not affect elementwise arithmetic. Production activation tensors
+         * still expose their logical row width, allowing telemetry to recover
+         * M from the active element count even when the backing tensor reserves
+         * capacity for more rows.
+         *
+         * @param input Production input tensor carrying the logical row width.
+         * @param num_elements Number of active values passed to the kernel.
+         * @return M when the span is row-aligned, otherwise zero.
+         */
+        inline int activeRows(
+            const TensorBase *input,
+            size_t num_elements)
+        {
+            if (!input || input->cols() == 0 || num_elements % input->cols() != 0)
+                return 0;
+            return static_cast<int>(num_elements / input->cols());
+        }
+
+        /**
+         * @brief Publish one economical CPU grouped residual-add invocation.
+         *
+         * A grouped residual add is one contiguous OpenMP workshare over the
+         * complete M-row span. No row replay is needed or allowed. M=1 serial
+         * witnesses are omitted so focused integration tests can require one
+         * and only one grouped production record.
+         */
+        inline void recordCPUGroupedCall(
+            const TensorBase *input,
+            size_t num_elements)
+        {
+            const int rows = activeRows(input, num_elements);
+            if (rows < 2 || rows > 4)
+                return;
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_residual_add_grouped_verifier_rows_calls",
+                1.0,
+                "verifier",
+                "cpu",
+                {{"tensor_format", tensorTypeName(input->native_type())},
+                 {"verifier_rows", std::to_string(rows)},
+                 {"cols", std::to_string(input->cols())},
+                 {"active_elements", std::to_string(num_elements)},
+                 {"invocation_policy", "single_flat_workshare"}});
+        }
+    } // namespace residual_add_detail
 
     // ==========================================================================
     // FP32 Specialization
@@ -71,16 +129,21 @@ namespace llaminar2
             KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
             if (!input || !residual || !output)
                 return false;
-            if (input->native_type() != TensorType::FP32)
+            if (input->native_type() != TensorType::FP32 ||
+                residual->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32)
                 return false;
 
-            return apply(
+            const bool ok = apply(
                 input->data(),
                 residual->data(),
                 output->mutable_data(),
                 num_elements,
                 mpi_ctx,
                 device_idx);
+            if (ok)
+                residual_add_detail::recordCPUGroupedCall(input, num_elements);
+            return ok;
         }
     };
 
@@ -150,16 +213,21 @@ namespace llaminar2
             KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
             if (!input || !residual || !output)
                 return false;
-            if (input->native_type() != TensorType::BF16)
+            if (input->native_type() != TensorType::BF16 ||
+                residual->native_type() != TensorType::BF16 ||
+                output->native_type() != TensorType::BF16)
                 return false;
 
-            return apply_bf16(
+            const bool ok = apply_bf16(
                 static_cast<const uint16_t *>(input->raw_data()),
                 static_cast<const uint16_t *>(residual->raw_data()),
                 static_cast<uint16_t *>(output->raw_mutable_data()),
                 num_elements,
                 mpi_ctx,
                 device_idx);
+            if (ok)
+                residual_add_detail::recordCPUGroupedCall(input, num_elements);
+            return ok;
         }
     };
 
@@ -229,16 +297,21 @@ namespace llaminar2
             KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
             if (!input || !residual || !output)
                 return false;
-            if (input->native_type() != TensorType::FP16)
+            if (input->native_type() != TensorType::FP16 ||
+                residual->native_type() != TensorType::FP16 ||
+                output->native_type() != TensorType::FP16)
                 return false;
 
-            return apply_fp16(
+            const bool ok = apply_fp16(
                 static_cast<const uint16_t *>(input->raw_data()),
                 static_cast<const uint16_t *>(residual->raw_data()),
                 static_cast<uint16_t *>(output->raw_mutable_data()),
                 num_elements,
                 mpi_ctx,
                 device_idx);
+            if (ok)
+                residual_add_detail::recordCPUGroupedCall(input, num_elements);
+            return ok;
         }
     };
 

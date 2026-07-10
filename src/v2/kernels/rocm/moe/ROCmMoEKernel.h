@@ -704,7 +704,70 @@ namespace llaminar2
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
         bool ensureRouteLogitsPartialsCapacity(size_t partial_count);
         bool ensureRouterQ8HiddenScratchCapacity(int d_model);
+        /**
+         * @brief Invalidate the router-to-expert Q8 hidden publication.
+         *
+         * The ROCm MoE kernel is shared by router and expert stages.  Any route
+         * that does not produce Q8 hidden rows must revoke the previous
+         * publication before an expert stage can inspect it; matching only the
+         * arena pointer is insufficient because graph buffers are deliberately
+         * reused across layers and decode steps.
+         */
+        void invalidateRouterQ8HiddenPublication() noexcept;
+
+        /**
+         * @brief Publish Q8 hidden rows produced by the immediately preceding router.
+         *
+         * @param source FP32 device row base that was quantized by the router.
+         * @param rows Number of contiguous source rows in the Q8 scratch.
+         * @param recorded_during_capture True when the producer launch was
+         *        recorded into the currently active HIP graph rather than run
+         *        eagerly.
+         */
+        void publishRouterQ8Hidden(
+            const float *source,
+            int rows,
+            bool recorded_during_capture) noexcept;
+
+        /**
+         * @brief Test whether grouped gate/up may consume the router Q8 rows.
+         *
+         * A capture-recorded publication is valid only while that same capture
+         * is active.  Once capture ends, its kernels have not executed yet and
+         * host-side eager code must not mistake old scratch bytes for the
+         * recorded producer's output.
+         */
+        bool canReuseRouterQ8Hidden(
+            const float *source,
+            int rows,
+            int d_model) const noexcept;
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
+
+        /**
+         * @brief Resolve one fixed-stride grouped descriptor-table slot.
+         *
+         * The graph stores routed tables with one descriptor per model expert
+         * beside singleton shared-expert tables.  Slot addresses therefore
+         * cannot use the current table's width: doing so places a one-expert
+         * table inside a previously published routed table.  This helper
+         * derives the maximum-expert stride from the graph-owned workspace and
+         * validates the requested table width before returning its device
+         * address.
+         *
+         * @param buffer_name Workspace buffer containing one descriptor role.
+         * @param slot Stable descriptor-table slot selected by the registry.
+         * @param num_experts Number of live descriptors in this table.
+         * @param device_descs Receives the beginning of the isolated slot.
+         * @param context Diagnostic operation name used on validation failure.
+         * @return True when the complete table fits in an isolated slot.
+         */
+        bool bindGroupedDescriptorTableSlot(
+            const char *buffer_name,
+            std::size_t slot,
+            int num_experts,
+            DeviceNativeVNNIMatrixDesc **device_descs,
+            const char *context);
+
         void clearWorkspaceScratchBindings() noexcept;
         bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
         struct RouterQ8GateCacheEntry;
@@ -875,10 +938,12 @@ namespace llaminar2
         int *d_route_indices_ = nullptr;             ///< [route_topk_capacity_] ints on device
         float *d_route_weights_ = nullptr;           ///< [route_topk_capacity_] floats on device
         float *d_route_logits_partials_ = nullptr;   ///< [route_logits_partials_capacity_] floats on device
-        int8_t *d_router_q8_hidden_ = nullptr;       ///< [router_q8_hidden_d_model_cap_] int8 values on device
-        float *d_router_q8_hidden_scales_ = nullptr; ///< [router_q8_hidden_blocks_cap_] floats on device
-        const float *router_q8_hidden_source_ = nullptr; ///< Input row that produced d_router_q8_hidden_ for the current layer
-        bool router_q8_hidden_valid_ = false;
+        int8_t *d_router_q8_hidden_ = nullptr;       ///< [kMaxVerifierRows, router_q8_hidden_d_model_cap_] device rows
+        float *d_router_q8_hidden_scales_ = nullptr; ///< [kMaxVerifierRows, router_q8_hidden_blocks_cap_] device scales
+        const float *router_q8_hidden_source_ = nullptr; ///< FP32 row base that produced the published Q8 rows
+        int router_q8_hidden_rows_ = 0; ///< Number of contiguous valid rows in the publication
+        bool router_q8_hidden_valid_ = false; ///< True only after a Q8 router producer has been issued
+        bool router_q8_hidden_capture_recorded_ = false; ///< Producer exists only inside the current graph capture
         size_t route_logits_capacity_ = 0;
         size_t route_topk_capacity_ = 0;
         size_t route_logits_partials_capacity_ = 0;

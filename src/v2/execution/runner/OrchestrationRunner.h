@@ -712,6 +712,15 @@ namespace llaminar2
         {
             int32_t last_token = 0;
             int logical_tokens = 0;
+            /**
+             * @brief Immutable position-keyed stochastic seed for this request.
+             *
+             * Explicit user seeds remain unchanged so RB=N and RB=1 produce the
+             * same draws. A seed of zero is resolved once at request creation;
+             * subsequent GPU draws are derived from this seed and resident
+             * logical positions instead of advancing host RNG state.
+             */
+            uint64_t stochastic_position_seed = 0;
             bool prefill_logits_ready = false;
             std::optional<int32_t> ready_sampled_token;
             std::optional<SamplingParams> ready_sampled_params;

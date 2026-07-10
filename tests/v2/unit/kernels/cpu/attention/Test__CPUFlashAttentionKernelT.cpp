@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
@@ -29,8 +31,101 @@
 #include "v2/utils/CPUFeatures.h"
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
+#include "v2/utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
+
+namespace
+{
+    /**
+     * @brief Enable perfstats for one focused production-path assertion.
+     *
+     * The grouped verifier tests treat route telemetry as part of correctness:
+     * byte equality is insufficient when an implementation could accidentally
+     * call ordinary prefill or replay one-token decode. Reloading DebugEnv here
+     * keeps the helper independent of test order in the larger unit binary.
+     */
+    class ScopedPerfStats
+    {
+    public:
+        ScopedPerfStats()
+        {
+            const char *old_value = std::getenv("LLAMINAR_PERF_STATS_SUMMARY");
+            if (old_value)
+            {
+                had_old_value_ = true;
+                old_value_ = old_value;
+            }
+            setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+        ~ScopedPerfStats()
+        {
+            if (had_old_value_)
+                setenv("LLAMINAR_PERF_STATS_SUMMARY", old_value_.c_str(), 1);
+            else
+                unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+    private:
+        bool had_old_value_ = false;
+        std::string old_value_;
+    };
+
+    /** @brief Report the first FP32 bit mismatch between grouped and serial rows. */
+    void expectByteExactFP32(const float *actual,
+                             const float *expected,
+                             size_t count,
+                             const std::string &context)
+    {
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
+
+        for (size_t index = 0; index < count; ++index)
+        {
+            uint32_t actual_bits = 0;
+            uint32_t expected_bits = 0;
+            std::memcpy(&actual_bits, actual + index, sizeof(actual_bits));
+            std::memcpy(&expected_bits, expected + index, sizeof(expected_bits));
+            if (actual_bits != expected_bits)
+            {
+                ADD_FAILURE() << context << " first byte mismatch at element " << index
+                              << " actual=" << actual[index]
+                              << " expected=" << expected[index]
+                              << " actual_bits=" << actual_bits
+                              << " expected_bits=" << expected_bits;
+                return;
+            }
+        }
+    }
+
+    /** @brief Assert that the explicit grouped FP32 attention route executed. */
+    void expectGroupedAttentionCounter(int verifier_rows, int kv_len)
+    {
+        bool found = false;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_attention_grouped_verifier_rows_calls"}))
+        {
+            const auto format = record.tags.find("cache_format");
+            const auto rows = record.tags.find("verifier_rows");
+            const auto length = record.tags.find("kv_len");
+            const auto policy = record.tags.find("tile_policy");
+            found = found ||
+                    (format != record.tags.end() && format->second == "fp32" &&
+                     rows != record.tags.end() && rows->second == std::to_string(verifier_rows) &&
+                     length != record.tags.end() && length->second == std::to_string(kv_len) &&
+                     policy != record.tags.end() && policy->second == "serial_decode_equivalent");
+        }
+        EXPECT_TRUE(found)
+            << "Grouped FP32 verifier attention did not publish its production route counter\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cpu_attention_grouped_verifier_rows_calls"}, 20);
+    }
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Scalar reference implementation
@@ -408,6 +503,8 @@ TEST_F(Test__CPUFlashAttentionKernelT, Decode_HeadDim128)
 
 TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_M2ToM4)
 {
+    ScopedPerfStats perfstats;
+
     /*
      * MTP verifier attention appends several speculative KV rows, but row r
      * must be numerically equivalent to a normal one-token decode that can see
@@ -451,6 +548,7 @@ TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen
                       grouped_output->mutable_data() + q_size,
                       0.0f);
 
+            PerfStatsCollector::reset();
             ASSERT_TRUE(kernel_.compute_verifier_rows_decode_equivalent(
                 Q_tensor.get(),
                 K_tensor.get(),
@@ -467,6 +565,7 @@ TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen
                 /*device_idx=*/-1))
                 << "grouped verifier attention failed for M=" << verifier_rows
                 << " base_kv_len=" << base_kv_len;
+            expectGroupedAttentionCounter(verifier_rows, kv_len);
 
             std::vector<float> serial_output(q_size, 0.0f);
             for (int row = 0; row < verifier_rows; ++row)
@@ -498,19 +597,12 @@ TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen
                 << "serial output has NaN/Inf for M=" << verifier_rows
                 << " base_kv_len=" << base_kv_len;
 
-            const float mae = max_abs_error(grouped, serial_output.data(), q_size);
-            const float cos = cosine_similarity(grouped, serial_output.data(), q_size);
-            EXPECT_LE(mae, 1e-6f)
-                << "grouped verifier rows must match serial decode exactly enough"
-                << " for M=" << verifier_rows
-                << " base_kv_len=" << base_kv_len
-                << " mae=" << mae
-                << " cosine=" << cos;
-            EXPECT_GE(cos, 0.999999f)
-                << "grouped verifier cosine drift for M=" << verifier_rows
-                << " base_kv_len=" << base_kv_len
-                << " mae=" << mae
-                << " cosine=" << cos;
+            expectByteExactFP32(
+                grouped,
+                serial_output.data(),
+                q_size,
+                "FP32 grouped verifier attention M=" + std::to_string(verifier_rows) +
+                    " base_kv_len=" + std::to_string(base_kv_len));
         }
     }
 }

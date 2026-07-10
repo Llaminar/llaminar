@@ -29,6 +29,10 @@ namespace llaminar2
                 return "Q5_1";
             case RepackFormat::Q8_0:
                 return "Q8_0";
+            case RepackFormat::Q8_1:
+                return "Q8_1";
+            case RepackFormat::Q8_K:
+                return "Q8_K";
             case RepackFormat::Q4_K:
                 return "Q4_K";
             case RepackFormat::Q5_K:

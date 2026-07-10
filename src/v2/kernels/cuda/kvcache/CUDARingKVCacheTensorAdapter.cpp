@@ -638,12 +638,18 @@ namespace llaminar2
         }
 
         const EntryT &entry = entries_[layer][seq_idx];
-        if (!entry.d_K || !entry.d_V || token_count < entry.count)
+        KVCacheSequenceState state;
+        if (!entry.d_K || !entry.d_V ||
+            !observeDeviceSequenceState(layer, seq_idx, &state) ||
+            token_count < state.cached_tokens)
             return false;
 
-        if (entry.count > 0 && entry.tail(max_seq_len_) != 0)
+        const int tail =
+            (state.implementation_head - state.cached_tokens + max_seq_len_) %
+            max_seq_len_;
+        if (state.cached_tokens > 0 && tail != 0)
             return false;
-        if (entry.head != entry.count)
+        if (state.implementation_head != state.cached_tokens)
             return false;
 
         constexpr TensorType tensor_type = []() constexpr
@@ -785,9 +791,6 @@ namespace llaminar2
             const size_t buf_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(__half);
             cudaMalloc(&shadow.d_K, buf_bytes);
             cudaMalloc(&shadow.d_V, buf_bytes);
-            shadow.converted_count = 0;
-            shadow.last_head = -1;
-            shadow.rope_applied = false;
         }
     }
 
@@ -800,9 +803,6 @@ namespace llaminar2
             return;
 
         auto &shadow = rope_shadows_[layer][seq_idx];
-        shadow.converted_count = 0;
-        shadow.last_head = -1;
-        shadow.rope_applied = false;
         shadow.k_view.reset();
         shadow.v_view.reset();
     }
@@ -817,26 +817,39 @@ namespace llaminar2
     {
         (void)target; // We always produce FP16 on GPU
 
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Scalar conversion is forbidden during graph capture; use get_kv_batched_converted_device_view");
+            return false;
+        }
 
         const auto &entry = entries_[layer][seq_idx];
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return false;
         const int requested_token_count =
             rope && rope->requested_token_count > 0
                 ? rope->requested_token_count
                 : 0;
-        const bool read_past_host_count =
-            requested_token_count > entry.count;
-        if (entry.count == 0 && !read_past_host_count)
+        if (requested_token_count > 0 &&
+            requested_token_count != state.cached_tokens)
         {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return true;
+            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Requested scalar span does not match canonical device count"
+                      << " requested=" << requested_token_count
+                      << " device_count=" << state.cached_tokens);
+            return false;
         }
+        const int read_count = state.cached_tokens;
+        if (read_count == 0)
+            return true;
 
         // If no RoPE is requested, the raw cache tensors already have the
         // required representation.
@@ -845,15 +858,7 @@ namespace llaminar2
         // has already been remapped by the hybrid override of get_kv_converted().
         const bool want_rope = (rope && rope->rope_theta > 0.0f);
         if (!want_rope)
-        {
-            if (read_past_host_count)
-            {
-                return CUDARingKVCache::get_kv_snapshot_view(
-                    layer, seq_idx, requested_token_count,
-                    out_k, out_v, out_kv_len);
-            }
             return CUDARingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
-        }
 
         cudaSetDevice(device_id_);
         const cudaStream_t stream = getEffectiveStream(
@@ -861,387 +866,118 @@ namespace llaminar2
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];
-        const int read_count =
-            requested_token_count > 0 ? requested_token_count : entry.count;
-        if (read_count <= 0 || read_count > max_seq_len_)
+        if (!shadow.d_K || !shadow.d_V || read_count > max_seq_len_)
         {
-            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Invalid requested token count "
-                      << read_count << " for max_seq_len=" << max_seq_len_);
+            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Scalar conversion storage is unavailable");
             return false;
         }
 
-        if (read_past_host_count)
-        {
-            /*
-             * Captured MTP verifier graphs append rows on device, then read the
-             * same cache before host entry.count has advanced.  The graph can
-             * still build a correct RoPE-on-read shadow when the logical span is
-             * a direct physical prefix: the preceding append kernel writes rows
-             * [entry.count, read_count) and this copy/convert node is ordered
-             * after it on the same stream.
-             */
-            if ((entry.count > 0 && entry.tail(max_seq_len_) != 0) ||
-                entry.head != entry.count)
-            {
-                LOG_ERROR("[CUDARingKVCache::get_kv_converted] Requested post-append RoPE shadow is not physically contiguous"
-                          << " layer=" << layer
-                          << " seq=" << seq_idx
-                          << " host_count=" << entry.count
-                          << " head=" << entry.head
-                          << " requested=" << read_count);
-                return false;
-            }
-
-            if constexpr (Precision == ActivationPrecision::FP16)
-            {
-                const size_t bytes =
-                    static_cast<size_t>(read_count) *
-                    static_cast<size_t>(kv_dim_) *
-                    sizeof(__half);
-                cudaError_t err = cudaMemcpyAsync(
-                    shadow.d_K, entry.d_K, bytes,
-                    cudaMemcpyDeviceToDevice, stream);
-                if (err == cudaSuccess)
-                {
-                    err = cudaMemcpyAsync(
-                        shadow.d_V, entry.d_V, bytes,
-                        cudaMemcpyDeviceToDevice, stream);
-                }
-                if (err != cudaSuccess)
-                {
-                    LOG_ERROR("[CUDARingKVCache::get_kv_converted] Post-append FP16 shadow copy failed: "
-                              << cudaGetErrorString(err));
-                    return false;
-                }
-                if (!cuda_rope_apply_fp16(shadow.d_K, read_count, n_kv_heads_, head_dim_,
-                                          rope->rope_theta, rope->position_start, stream,
-                                          rope->rope_dim))
-                {
-                    LOG_ERROR("[CUDARingKVCache::get_kv_converted] Post-append FP16 RoPE application failed");
-                    return false;
-                }
-            }
-            else if constexpr (Precision == ActivationPrecision::FP32)
-            {
-                const size_t bytes =
-                    static_cast<size_t>(read_count) *
-                    static_cast<size_t>(kv_dim_) *
-                    sizeof(float);
-                if (!ensureConvScratch(bytes))
-                    return false;
-
-                auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
-                auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
-                cudaError_t err = cudaMemcpyAsync(
-                    d_temp_k, entry.d_K, bytes,
-                    cudaMemcpyDeviceToDevice, stream);
-                if (err == cudaSuccess)
-                {
-                    err = cudaMemcpyAsync(
-                        d_temp_v, entry.d_V, bytes,
-                        cudaMemcpyDeviceToDevice, stream);
-                }
-                if (err != cudaSuccess)
-                {
-                    LOG_ERROR("[CUDARingKVCache::get_kv_converted] Post-append FP32 scratch copy failed: "
-                              << cudaGetErrorString(err));
-                    return false;
-                }
-                if (!cuda_rope_apply_fp32(d_temp_k, read_count, n_kv_heads_, head_dim_,
-                                          rope->rope_theta, rope->position_start, stream,
-                                          rope->rope_dim) ||
-                    !cuda_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
-                                                 reinterpret_cast<uint16_t *>(shadow.d_K),
-                                                 read_count * kv_dim_, stream) ||
-                    !cuda_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
-                                                 reinterpret_cast<uint16_t *>(shadow.d_V),
-                                                 read_count * kv_dim_, stream))
-                {
-                    LOG_ERROR("[CUDARingKVCache::get_kv_converted] Post-append FP32 RoPE/convert failed");
-                    return false;
-                }
-            }
-            else if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                if (!cuda_convert_tensor_to_fp16(entry.d_K, TensorType::Q8_1,
-                                                 reinterpret_cast<uint16_t *>(shadow.d_K),
-                                                 read_count * kv_dim_, stream) ||
-                    !cuda_convert_tensor_to_fp16(entry.d_V, TensorType::Q8_1,
-                                                 reinterpret_cast<uint16_t *>(shadow.d_V),
-                                                 read_count * kv_dim_, stream) ||
-                    !cuda_rope_apply_fp16(shadow.d_K, read_count, n_kv_heads_, head_dim_,
-                                          rope->rope_theta, rope->position_start, stream,
-                                          rope->rope_dim))
-                {
-                    LOG_ERROR("[CUDARingKVCache::get_kv_converted] Post-append Q8_1 RoPE/convert failed");
-                    return false;
-                }
-            }
-            else if constexpr (Precision == ActivationPrecision::BF16)
-            {
-                if (!cuda_convert_tensor_to_fp16(entry.d_K, TensorType::BF16,
-                                                 reinterpret_cast<uint16_t *>(shadow.d_K),
-                                                 read_count * kv_dim_, stream) ||
-                    !cuda_convert_tensor_to_fp16(entry.d_V, TensorType::BF16,
-                                                 reinterpret_cast<uint16_t *>(shadow.d_V),
-                                                 read_count * kv_dim_, stream) ||
-                    !cuda_rope_apply_fp16(shadow.d_K, read_count, n_kv_heads_, head_dim_,
-                                          rope->rope_theta, rope->position_start, stream,
-                                          rope->rope_dim))
-                {
-                    LOG_ERROR("[CUDARingKVCache::get_kv_converted] Post-append BF16 RoPE/convert failed");
-                    return false;
-                }
-            }
-
-            shadow.converted_count = read_count;
-            shadow.last_head = read_count;
-            shadow.rope_applied = true;
-
-            if (!shadow.k_view ||
-                shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
-            {
-                shadow.k_view = std::make_unique<GpuTensorView>(
-                    shadow.d_K, shadow.converted_count, kv_dim_,
-                    TensorType::FP16, device_id_);
-            }
-            if (!shadow.v_view ||
-                shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
-            {
-                shadow.v_view = std::make_unique<GpuTensorView>(
-                    shadow.d_V, shadow.converted_count, kv_dim_,
-                    TensorType::FP16, device_id_);
-            }
-
-            if (out_k)
-                *out_k = shadow.k_view.get();
-            if (out_v)
-                *out_v = shadow.v_view.get();
-            if (out_kv_len)
-                *out_kv_len = shadow.converted_count;
-            return true;
-        }
-
-        // Incremental update: only process new tokens since last call.
-        // Detect whether we can do an incremental update or need a full rebuild.
-        // Full rebuild if: first call, eviction happened (count shrunk), or ring reset.
-        const int new_tokens = entry.count - shadow.converted_count;
-        const bool need_full_rebuild = (shadow.converted_count == 0 ||
-                                        new_tokens < 0 ||
-                                        shadow.converted_count > entry.count);
-
+        /*
+         * This API is deliberately a complete observation-boundary rebuild.
+         * Incremental validity cannot be inferred from host counters once graph
+         * replay owns append/publication. The production grouped API performs
+         * its fixed-shape conversion directly from canonical device metadata.
+         */
         if constexpr (Precision == ActivationPrecision::FP16)
         {
-            if (need_full_rebuild)
-            {
-                // Full rebuild: linearize all K/V to shadow + apply RoPE to all K
-                int kv_len = 0;
-                // Qualified call avoids virtual dispatch — prevents CUDAHybridRingKVCache
-                // from double-remapping the already-remapped layer index.
-                if (!CUDARingKVCache::linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
-                    return false;
-
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-
-                shadow.converted_count = kv_len;
-            }
-            else if (new_tokens > 0)
-            {
-                // Incremental: linearize all data from ring buffer into shadow.
-                // IMPORTANT: linearize_to overwrites the ENTIRE shadow with fresh
-                // (non-RoPE'd) data from the ring buffer. Unlike FP32/Q8_1/BF16
-                // paths which use a separate scratch buffer and only copy new tokens
-                // to the shadow, the FP16 path writes directly to the shadow.
-                // Therefore we must re-apply RoPE to ALL tokens, not just the new ones.
-                int kv_len = 0;
-                if (!CUDARingKVCache::linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
-                    return false;
-
-                // Apply RoPE to all tokens (linearize overwrote previously RoPE'd data)
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-
-                shadow.converted_count = kv_len;
-            }
-            // else: new_tokens == 0, shadow is already up-to-date
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                shadow.d_K, shadow.d_V, stream);
+            if (!cuda_rope_apply_fp16(
+                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
+                return false;
         }
         else if constexpr (Precision == ActivationPrecision::FP32)
         {
-            // FP32 cache → linearize to scratch, apply RoPE, convert to FP16 shadow
             const size_t row_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
-            const size_t total_bytes = static_cast<size_t>(entry.count) * row_bytes;
-
+            const size_t total_bytes = static_cast<size_t>(read_count) * row_bytes;
             if (!ensureConvScratch(total_bytes))
                 return false;
-
             auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
             auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!cuda_rope_apply_fp32(
+                    d_temp_k, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::FP32,
+                    reinterpret_cast<uint16_t *>(shadow.d_K),
+                    read_count * kv_dim_, stream) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::FP32,
+                    reinterpret_cast<uint16_t *>(shadow.d_V),
+                    read_count * kv_dim_, stream))
                 return false;
-
-            if (need_full_rebuild)
-            {
-                cuda_rope_apply_fp32(d_temp_k, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-
-                cuda_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow.d_K),
-                                            kv_len * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow.d_V),
-                                            kv_len * kv_dim_, stream);
-            }
-            else if (new_tokens > 0)
-            {
-                // RoPE only new tokens in scratch, convert only new tokens to shadow
-                const int old_count = shadow.converted_count;
-                float *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
-                float *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_rope_apply_fp32(new_k_start, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start + old_count, stream,
-                                     rope->rope_dim);
-
-                __half *shadow_k_new = reinterpret_cast<__half *>(shadow.d_K) + static_cast<size_t>(old_count) * kv_dim_;
-                __half *shadow_v_new = reinterpret_cast<__half *>(shadow.d_V) + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_convert_tensor_to_fp16(new_k_start, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow_k_new),
-                                            new_tokens * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(new_v_start, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow_v_new),
-                                            new_tokens * kv_dim_, stream);
-            }
-
-            shadow.converted_count = kv_len;
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
-            // Q8_1 cache → linearize to scratch, dequant to FP16 shadow, RoPE
             const size_t q8_row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(Q8_1Block);
-            const size_t q8_total = static_cast<size_t>(entry.count) * q8_row_bytes;
-
+            const size_t q8_total = static_cast<size_t>(read_count) * q8_row_bytes;
             if (!ensureConvScratch(q8_total))
                 return false;
-
             auto *d_temp_k = static_cast<Q8_1Block *>(conv_scratch_k_);
             auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!cuda_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::Q8_1,
+                    reinterpret_cast<uint16_t *>(shadow.d_K),
+                    read_count * kv_dim_, stream) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::Q8_1,
+                    reinterpret_cast<uint16_t *>(shadow.d_V),
+                    read_count * kv_dim_, stream) ||
+                !cuda_rope_apply_fp16(
+                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
                 return false;
-
-            if (need_full_rebuild)
-            {
-                cuda_convert_tensor_to_fp16(d_temp_k, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow.d_K),
-                                            kv_len * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(d_temp_v, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow.d_V),
-                                            kv_len * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-            }
-            else if (new_tokens > 0)
-            {
-                // Dequant only new tokens, RoPE only new tokens
-                const int old_count = shadow.converted_count;
-                Q8_1Block *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_storage_dim_;
-                Q8_1Block *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_storage_dim_;
-
-                __half *shadow_k_new = shadow.d_K + static_cast<size_t>(old_count) * kv_dim_;
-                __half *shadow_v_new = shadow.d_V + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_convert_tensor_to_fp16(new_k_start, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow_k_new),
-                                            new_tokens * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(new_v_start, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow_v_new),
-                                            new_tokens * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow_k_new, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta,
-                                     rope->position_start + old_count, stream,
-                                     rope->rope_dim);
-            }
-
-            shadow.converted_count = kv_len;
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
-            // BF16 → linearize to scratch, convert to FP16 shadow, RoPE
-            const size_t bf16_bytes = static_cast<size_t>(entry.count) * kv_dim_ * sizeof(__nv_bfloat16);
-
+            const size_t bf16_bytes = static_cast<size_t>(read_count) * kv_dim_ * sizeof(__nv_bfloat16);
             if (!ensureConvScratch(bf16_bytes))
                 return false;
-
             auto *d_temp_k = static_cast<__nv_bfloat16 *>(conv_scratch_k_);
             auto *d_temp_v = static_cast<__nv_bfloat16 *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!cuda_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::BF16,
+                    reinterpret_cast<uint16_t *>(shadow.d_K),
+                    read_count * kv_dim_, stream) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::BF16,
+                    reinterpret_cast<uint16_t *>(shadow.d_V),
+                    read_count * kv_dim_, stream) ||
+                !cuda_rope_apply_fp16(
+                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
                 return false;
-
-            if (need_full_rebuild)
-            {
-                cuda_convert_tensor_to_fp16(d_temp_k, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow.d_K),
-                                            kv_len * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(d_temp_v, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow.d_V),
-                                            kv_len * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-            }
-            else if (new_tokens > 0)
-            {
-                const int old_count = shadow.converted_count;
-                __nv_bfloat16 *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
-                __nv_bfloat16 *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                __half *shadow_k_new = shadow.d_K + static_cast<size_t>(old_count) * kv_dim_;
-                __half *shadow_v_new = shadow.d_V + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_convert_tensor_to_fp16(new_k_start, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow_k_new),
-                                            new_tokens * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(new_v_start, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow_v_new),
-                                            new_tokens * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow_k_new, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta,
-                                     rope->position_start + old_count, stream,
-                                     rope->rope_dim);
-            }
-
-            shadow.converted_count = kv_len;
         }
 
-        shadow.last_head = entry.head;
-        shadow.rope_applied = true;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
 
         // Create/update GpuTensorViews
-        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.k_view = std::make_unique<GpuTensorView>(
-                shadow.d_K, shadow.converted_count, kv_dim_,
+                shadow.d_K, read_count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
-        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.v_view = std::make_unique<GpuTensorView>(
-                shadow.d_V, shadow.converted_count, kv_dim_,
+                shadow.d_V, read_count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
 
@@ -1250,7 +986,7 @@ namespace llaminar2
         if (out_v)
             *out_v = shadow.v_view.get();
         if (out_kv_len)
-            *out_kv_len = shadow.converted_count;
+            *out_kv_len = read_count;
 
         return true;
     }

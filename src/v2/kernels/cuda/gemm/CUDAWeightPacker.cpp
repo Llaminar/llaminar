@@ -5,6 +5,7 @@
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorType.h"
 #include "tensors/VnniPackContext.h"
+#include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
@@ -82,7 +83,7 @@ namespace llaminar2::cuda
             {
                 out.native_emins.assign(static_cast<size_t>(blocks_per_row) * N, uint32_t{0});
             }
-            out.native_codebook_id = info->codebook_id;
+            out.native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
             out.native_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
 
             VnniPackContext ctx{};
@@ -346,7 +347,7 @@ namespace llaminar2::cuda
         batch->rows_per_expert = rows_per_expert;
         batch->K = K;
         batch->blocks_per_row = blocks_per_row;
-        batch->codebook_id = info->codebook_id;
+        batch->codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
 
         // Per-expert sizes
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;

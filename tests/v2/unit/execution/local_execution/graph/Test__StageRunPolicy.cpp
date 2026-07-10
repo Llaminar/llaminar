@@ -373,7 +373,7 @@ TEST_F(Test__UnifiedExecution, FullPolicy_InvokesSnapshotCallback)
     EXPECT_EQ(callback_stages[2], "stage_2");
 }
 
-TEST_F(Test__UnifiedExecution, FastDecodePolicy_SkipsSnapshotCallback)
+TEST_F(Test__UnifiedExecution, FastDecodeWithSnapshotDiagnosticsInvokesCallbackAtEachStage)
 {
     int callback_count = 0;
 
@@ -389,8 +389,13 @@ TEST_F(Test__UnifiedExecution, FastDecodePolicy_SkipsSnapshotCallback)
     graph.buildFastSchedule();
     executor_->executeFastDecode(graph, cpu_ctx_.get());
 
-    // Fast decode policy has snapshot_callback=false, so callback should NOT fire
-    EXPECT_EQ(callback_count, 0);
+    /*
+     * StageRunPolicy::fastDecode() remains callback-free by default, but the
+     * eager executor promotes callbacks when a diagnostic sink is explicitly
+     * armed. Publishing at each producer boundary is required because arena
+     * aliasing can overwrite an early stage before a post-graph drain.
+     */
+    EXPECT_EQ(callback_count, 3);
 }
 
 // =============================================================================

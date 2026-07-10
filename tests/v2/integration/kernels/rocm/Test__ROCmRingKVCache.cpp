@@ -15,6 +15,9 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
+#include <cstdint>
+#include <memory>
 #include <vector>
 #include <random>
 #include <cmath>
@@ -25,6 +28,7 @@
 #include <hip/hip_bfloat16.h>
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -181,18 +185,16 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
 }
 
 /**
- * @brief Device publication advances GPU KV metadata while host mirrors stay stale.
+ * @brief Device publication leaves GPU KV metadata as the sole owner.
  *
- * The vLLM-style MTP path publishes accepted KV sequence state from GPU
- * metadata and only later adopts host mirrors for diagnostics and graph
- * signatures.  This regression locks down that ordering for ROCm: device
- * count/head pointers change first, and get_cached_tokens()/ring_head() do not
- * catch up until adoptSequenceStateFromHostMetadata() is called.  Publication
- * must preserve the ring tail and clamp to the accepted target length; it must
- * not advance the head by accepted_state_count, because the verifier may have
- * already appended rejected rows.
+ * The vLLM-style MTP path publishes accepted sequence state directly into the
+ * canonical ROCm count/head rows. Host getters remain diagnostic shadows and
+ * no production adoption API exists. Publication must preserve the ring tail
+ * and clamp to the accepted target length; it must not advance the head by
+ * accepted_state_count because the verifier may already have appended rejected
+ * rows.
  */
-TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirrorStaleUntilAdoption)
+TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationRemainsDeviceOwned)
 {
     if (!hasROCm())
     {
@@ -239,9 +241,9 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirro
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, initial_tokens, stream.stream()));
     stream.synchronize();
 
-    const int host_count_before = cache->get_cached_tokens(0, 0);
-    const int host_head_before = cache->ring_head(0, 0);
-    ASSERT_EQ(host_count_before, initial_tokens);
+    const int initial_count = cache->get_cached_tokens(0, 0);
+    const int initial_head = cache->ring_head(0, 0);
+    ASSERT_EQ(initial_count, initial_tokens);
 
     int32_t *d_target = nullptr;
     int32_t *d_accepted = nullptr;
@@ -268,10 +270,10 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirro
         << device_error;
     stream.synchronize();
 
-    const int host_tail_before =
-        (host_head_before - host_count_before + max_seq_len) % max_seq_len;
+    const int initial_tail =
+        (initial_head - initial_count + max_seq_len) % max_seq_len;
     const int expected_device_head =
-        (host_tail_before + target_cached_tokens) % max_seq_len;
+        (initial_tail + target_cached_tokens) % max_seq_len;
     int device_count = -1;
     int device_head = -1;
     ASSERT_NE(cache->deviceCachedTokenCountPtr(0, 0), nullptr);
@@ -292,22 +294,10 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirro
 
     EXPECT_EQ(device_count, target_cached_tokens);
     EXPECT_EQ(device_head, expected_device_head);
-    EXPECT_EQ(cache->get_cached_tokens(0, 0), host_count_before)
-        << "Device publication must not silently adopt host KV mirrors.";
-    EXPECT_EQ(cache->ring_head(0, 0), host_head_before)
-        << "Host ring-head mirrors are stale until adoption is explicit.";
-
-    IKVCache::HostSequenceStatePublicationRequest host_request;
-    host_request.request_count = 1;
-    host_request.first_seq_idx = 0;
-    host_request.target_cached_tokens = {target_cached_tokens};
-    host_request.accepted_state_counts = {accepted_state_count};
-    host_request.publication_ok_flags = {1};
-    std::string host_error;
-    ASSERT_TRUE(cache->adoptSequenceStateFromHostMetadata(host_request, &host_error))
-        << host_error;
-    EXPECT_EQ(cache->get_cached_tokens(0, 0), target_cached_tokens);
-    EXPECT_EQ(cache->ring_head(0, 0), expected_device_head);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), target_cached_tokens)
+        << "Diagnostic observation must read the canonical device count.";
+    EXPECT_EQ(cache->ring_head(0, 0), expected_device_head)
+        << "Diagnostic observation must read the canonical device ring head.";
 
     (void)hipFree(d_ok);
     (void)hipFree(d_accepted);
@@ -382,9 +372,6 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     EXPECT_EQ(max_err_K, 0.0f);
     EXPECT_EQ(max_err_V, 0.0f);
 
-    // Verify eviction counter
-    EXPECT_EQ(cache->get_total_evicted(), 4);
-
     // Cleanup
     (void)hipFree(d_K);
     (void)hipFree(d_V);
@@ -453,8 +440,6 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
 
     EXPECT_EQ(max_err_K, 0.0f) << "K values should exactly match tokens 8-15";
     EXPECT_EQ(max_err_V, 0.0f) << "V values should exactly match tokens 8-15";
-    EXPECT_EQ(cache->get_total_evicted(), 8) << "Should have evicted exactly 8 tokens";
-
     (void)hipFree(d_K);
     (void)hipFree(d_V);
 
@@ -519,8 +504,6 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
 
     EXPECT_EQ(max_err_K, 0.0f) << "K values should exactly match tokens 1-8";
     EXPECT_EQ(max_err_V, 0.0f) << "V values should exactly match tokens 1-8";
-    EXPECT_EQ(cache->get_total_evicted(), 1) << "Should have evicted exactly 1 token";
-
     (void)hipFree(d_K);
     (void)hipFree(d_V);
 
@@ -584,8 +567,6 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
 
     EXPECT_EQ(max_err_K, 0.0f) << "K values should exactly match tokens 16-23";
     EXPECT_EQ(max_err_V, 0.0f) << "V values should exactly match tokens 16-23";
-    EXPECT_EQ(cache->get_total_evicted(), 16) << "Should have evicted exactly 16 tokens";
-
     (void)hipFree(d_K);
     (void)hipFree(d_V);
 
@@ -631,7 +612,6 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     // Evict 3 oldest tokens
     cache->evict_oldest(0, 0, 3);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 7);
-    EXPECT_EQ(cache->get_total_evicted(), 3);
 
     // Retrieve and verify we have the LAST 7 tokens
     const void *d_K_out, *d_V_out;
@@ -785,7 +765,14 @@ TEST(Test__ROCmRingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 }
 
-TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendRequiresBoundConversionScratch)
+/**
+ * @brief Proves captured FP32-to-FP16 append uses the fused no-scratch kernel.
+ *
+ * The production append stage publishes head/count/real-row metadata before
+ * capture. Conversion then happens in-register inside the HIP ring append
+ * kernel, avoiding a temporary FP16 tensor and its extra device-memory traffic.
+ */
+TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendUsesFusedConversionWithoutWorkspace)
 {
     if (!hasROCm())
     {
@@ -822,15 +809,32 @@ TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendRequiresBoundConversion
     ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
     stream.synchronize();
 
-    GraphCaptureGuard guard;
-    EXPECT_FALSE(cache->appendWithStream(0, 0,
-                                         static_cast<const ITensor *>(K_tensor.get()),
-                                         static_cast<const ITensor *>(V_tensor.get()),
-                                         num_tokens, stream.opaque()))
-        << "Graph-captured FP32->FP16 append must not allocate conversion scratch ad hoc";
+    ASSERT_TRUE(cache->bindGraphAppendCountSource(
+        0, 0, nullptr, num_tokens, stream.opaque()));
+    stream.synchronize();
+    {
+        GraphCaptureGuard guard;
+        EXPECT_TRUE(cache->appendWithStream(
+            0, 0,
+            static_cast<const ITensor *>(K_tensor.get()),
+            static_cast<const ITensor *>(V_tensor.get()),
+            num_tokens,
+            stream.opaque()))
+            << "The fused converted append must be graph-capturable without conversion scratch";
+    }
+    stream.synchronize();
+    EXPECT_FALSE(workspace_consumer->hasWorkspace())
+        << "Fused converted append must not allocate or bind an implicit workspace";
 }
 
-TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWorkspaceScratch)
+/**
+ * @brief Replays fused FP32-to-FP16 append after a cache reset.
+ *
+ * The captured graph reads and advances canonical device sequence metadata.
+ * Rebinding the exact captured width after clear must not upload or adopt a
+ * host sequence-state copy.
+ */
+TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16FusedAppendReplaysAfterClear)
 {
     if (!hasROCm())
     {
@@ -872,7 +876,8 @@ TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWo
     ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
     stream.synchronize();
 
-    cache->setDynamicHead(0, 0, stream.opaque());
+    ASSERT_TRUE(cache->bindGraphAppendCountSource(
+        0, 0, nullptr, num_tokens, stream.opaque()));
     stream.synchronize();
 
     hipGraph_t graph = nullptr;
@@ -894,23 +899,31 @@ TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWo
 
     cache->clear();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
-    cache->setDynamicHead(0, 0, stream.opaque());
+    ASSERT_TRUE(cache->bindGraphAppendCountSource(
+        0, 0, nullptr, num_tokens, stream.opaque()));
     stream.synchronize();
 
     ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
     stream.synchronize();
-    cache->advanceHead(0, 0, num_tokens);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
-    const void *d_K_out = nullptr;
-    const void *d_V_out = nullptr;
+    ITensor *K_out = nullptr;
+    ITensor *V_out = nullptr;
     int kv_len = 0;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
+    ASSERT_TRUE(cache->get_kv_snapshot_view(
+        0, 0, num_tokens, &K_out, &V_out, &kv_len));
     ASSERT_EQ(kv_len, num_tokens);
+    ASSERT_NE(K_out, nullptr);
+    ASSERT_NE(V_out, nullptr);
 
     std::vector<_Float16> h_K_out(static_cast<size_t>(num_tokens) * kv_dim);
-    ASSERT_EQ(hipMemcpyAsync(h_K_out.data(), d_K_out,
+    std::vector<_Float16> h_V_out(static_cast<size_t>(num_tokens) * kv_dim);
+    ASSERT_EQ(hipMemcpyAsync(h_K_out.data(), K_out->gpu_data_ptr(),
                              h_K_out.size() * sizeof(_Float16),
+                             hipMemcpyDeviceToHost, stream.stream()),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(h_V_out.data(), V_out->gpu_data_ptr(),
+                             h_V_out.size() * sizeof(_Float16),
                              hipMemcpyDeviceToHost, stream.stream()),
               hipSuccess);
     stream.synchronize();
@@ -918,6 +931,7 @@ TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWo
     for (size_t i = 0; i < h_K_out.size(); ++i)
     {
         EXPECT_NEAR(static_cast<float>(h_K_out[i]), K_tensor->data()[i], 0.001f) << "i=" << i;
+        EXPECT_NEAR(static_cast<float>(h_V_out[i]), V_tensor->data()[i], 0.001f) << "i=" << i;
     }
 
     EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
@@ -1135,7 +1149,6 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
 
     // Initial stats
     EXPECT_EQ(cache->get_linearization_count(), 0);
-    EXPECT_EQ(cache->get_total_evicted(), 0);
 
     // Append 12 tokens to force wrap
     const int num_tokens = 12;
@@ -1150,7 +1163,7 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_TRUE(cache->is_wrapped(0, 0));
-    EXPECT_EQ(cache->get_total_evicted(), 4); // 12 - 8 = 4 evicted
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
 
     // Get K/V should trigger linearization
     const void *d_K_out, *d_V_out;
@@ -1165,9 +1178,7 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
 
     // Reset counters
     cache->reset_linearization_counter();
-    cache->reset_eviction_counter();
     EXPECT_EQ(cache->get_linearization_count(), 0);
-    EXPECT_EQ(cache->get_total_evicted(), 0);
 
     // Cleanup
     (void)hipFree(d_K);
@@ -1222,13 +1233,10 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
     // After 100 steps with window=32, should have exactly 32 tokens
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 32);
 
-    // 100 appends with window=32 means 68 evicted
-    EXPECT_EQ(cache->get_total_evicted(), 68);
-
     (void)hipFree(d_K);
     (void)hipFree(d_V);
 
-    LOG_INFO("[SlidingWindow] PASSED - evicted=" << cache->get_total_evicted());
+    LOG_INFO("[SlidingWindow] PASSED - retained=" << max_seq_len);
 }
 
 // =============================================================================
@@ -1261,6 +1269,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     float *d_K, *d_V;
     (void)hipMalloc(&d_K, 30 * kv_dim * sizeof(float));
     (void)hipMalloc(&d_V, 30 * kv_dim * sizeof(float));
+    ScopedHipStream stream;
 
     for (int seq = 0; seq < batch_size; ++seq)
     {
@@ -1270,7 +1279,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
         (void)hipMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
         (void)hipMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq], 0));
+        ASSERT_TRUE(cache->append(
+            0, seq, d_K, d_V, seq_lens[seq], stream.stream()));
     }
 
     // Verify individual sequence lengths
@@ -1294,7 +1304,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len, 0);
+                                              kv_lens.data(), max_kv_len,
+                                              stream.stream());
 
     EXPECT_EQ(actual_max, 25); // Max across sequences
 
@@ -1361,6 +1372,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
     Q8_1Block *d_V = nullptr;
     (void)hipMalloc(&d_K, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
     (void)hipMalloc(&d_V, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
+    ScopedHipStream stream;
 
     for (int seq = 0; seq < batch_size; ++seq)
     {
@@ -1383,7 +1395,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
 
         (void)hipMemcpy(d_K, h_K[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
         (void)hipMemcpy(d_V, h_V[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
-        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq], 0));
+        ASSERT_TRUE(cache->append(
+            0, seq, d_K, d_V, seq_lens[seq], stream.stream()));
     }
 
     auto reqs = cache->getWorkspaceRequirements(batch_size, 0, 0);
@@ -1400,7 +1413,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len, 0);
+                                              kv_lens.data(), max_kv_len,
+                                              stream.stream());
 
     EXPECT_EQ(actual_max, 7);
     for (int seq = 0; seq < batch_size; ++seq)
@@ -1694,7 +1708,6 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
-    EXPECT_EQ(cache->get_total_evicted(), total_tokens - max_seq_len);
 
     const void *d_K_out = nullptr;
     const void *d_V_out = nullptr;
@@ -1718,6 +1731,556 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     (void)hipFree(d_V);
 
     LOG_INFO("[WrapAround_Q81] PASSED");
+}
+
+namespace
+{
+    /**
+     * @brief Prove native request-batched gathering is byte exact for one KV format.
+     *
+     * Request zero wraps its ring and then exposes only the newest six rows;
+     * request one owns three rows followed by hostile-capable zero padding.  A
+     * nonzero layer catches pointer tables that accidentally publish only the
+     * first compressed layer.  Comparison is over native bytes so floating and
+     * quantized formats share the same exactness contract.
+     */
+    template <ActivationPrecision Precision>
+    void runDeviceResidentBatchedGatherByteExact(const char *format_name)
+    {
+        SCOPED_TRACE(format_name);
+
+        using Cache = ROCmRingKVCache<Precision>;
+        using DataT = typename Cache::DataT;
+
+        constexpr int n_layers = 2;
+        constexpr int layer = 1;
+        constexpr int batch_size = 2;
+        constexpr int max_seq_len = 8;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 32;
+        constexpr int kv_dim = n_kv_heads * head_dim;
+        constexpr int long_rows = 10;
+        constexpr int short_rows = 3;
+        constexpr int max_kv_len = 6;
+
+        Cache cache(
+            n_layers, batch_size, max_seq_len,
+            n_kv_heads, head_dim, /*device_id=*/0);
+        const int storage_dim = Precision == ActivationPrecision::Q8_1
+                                    ? kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE)
+                                    : kv_dim;
+        ASSERT_GT(storage_dim, 0);
+
+        auto make_rows = [storage_dim](int rows, uint8_t salt)
+        {
+            std::vector<DataT> values(
+                static_cast<size_t>(rows) * static_cast<size_t>(storage_dim));
+            auto *bytes = reinterpret_cast<uint8_t *>(values.data());
+            const size_t byte_count = values.size() * sizeof(DataT);
+            for (size_t i = 0; i < byte_count; ++i)
+            {
+                bytes[i] = static_cast<uint8_t>(
+                    1u + ((static_cast<unsigned int>(salt) +
+                           static_cast<unsigned int>(i * 37u)) %
+                          251u));
+            }
+            return values;
+        };
+
+        const auto long_k = make_rows(long_rows, 17);
+        const auto long_v = make_rows(long_rows, 71);
+        const auto short_k = make_rows(short_rows, 131);
+        const auto short_v = make_rows(short_rows, 193);
+
+        const auto requirements =
+            cache.getWorkspaceRequirements(max_kv_len, batch_size, 0);
+        DeviceWorkspaceManager workspace(
+            DeviceId::rocm(0),
+            requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        cache.bindWorkspace(&workspace);
+        ASSERT_TRUE(cache.hasWorkspace());
+
+        ScopedHipStream stream;
+        DataT *d_long_k = nullptr;
+        DataT *d_long_v = nullptr;
+        DataT *d_short_k = nullptr;
+        DataT *d_short_v = nullptr;
+        const size_t long_bytes = long_k.size() * sizeof(DataT);
+        const size_t short_bytes = short_k.size() * sizeof(DataT);
+        ASSERT_EQ(hipMalloc(&d_long_k, long_bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&d_long_v, long_bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&d_short_k, short_bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&d_short_v, short_bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(
+                      d_long_k, long_k.data(), long_bytes,
+                      hipMemcpyHostToDevice, stream.stream()),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(
+                      d_long_v, long_v.data(), long_bytes,
+                      hipMemcpyHostToDevice, stream.stream()),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(
+                      d_short_k, short_k.data(), short_bytes,
+                      hipMemcpyHostToDevice, stream.stream()),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(
+                      d_short_v, short_v.data(), short_bytes,
+                      hipMemcpyHostToDevice, stream.stream()),
+                  hipSuccess);
+
+        /* Two appends force request zero through a real wrapped-ring head. */
+        constexpr int first_long_append = 7;
+        ASSERT_TRUE(cache.append(
+            layer, 0, d_long_k, d_long_v,
+            first_long_append, stream.stream()));
+        ASSERT_TRUE(cache.append(
+            layer, 0,
+            d_long_k + static_cast<size_t>(first_long_append) * storage_dim,
+            d_long_v + static_cast<size_t>(first_long_append) * storage_dim,
+            long_rows - first_long_append,
+            stream.stream()));
+        ASSERT_TRUE(cache.append(
+            layer, 1, d_short_k, d_short_v,
+            short_rows, stream.stream()));
+
+        ITensor *batched_k = nullptr;
+        ITensor *batched_v = nullptr;
+        ASSERT_TRUE(cache.get_kv_batched_device_view(
+            layer, /*first_seq_idx=*/0, batch_size, max_kv_len,
+            &batched_k, &batched_v, stream.opaque()));
+        ASSERT_NE(batched_k, nullptr);
+        ASSERT_NE(batched_v, nullptr);
+        stream.synchronize();
+
+        const size_t output_elements =
+            static_cast<size_t>(batch_size) * max_kv_len * storage_dim;
+        std::vector<DataT> actual_k(output_elements);
+        std::vector<DataT> actual_v(output_elements);
+        ASSERT_EQ(hipMemcpy(
+                      actual_k.data(), batched_k->gpu_data_ptr(),
+                      output_elements * sizeof(DataT), hipMemcpyDeviceToHost),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpy(
+                      actual_v.data(), batched_v->gpu_data_ptr(),
+                      output_elements * sizeof(DataT), hipMemcpyDeviceToHost),
+                  hipSuccess);
+
+        std::vector<DataT> expected_k(output_elements, DataT{});
+        std::vector<DataT> expected_v(output_elements, DataT{});
+        const size_t row_bytes = static_cast<size_t>(storage_dim) * sizeof(DataT);
+        const int first_visible_long_row = long_rows - max_kv_len;
+        for (int row = 0; row < max_kv_len; ++row)
+        {
+            std::memcpy(
+                expected_k.data() + static_cast<size_t>(row) * storage_dim,
+                long_k.data() +
+                    static_cast<size_t>(first_visible_long_row + row) * storage_dim,
+                row_bytes);
+            std::memcpy(
+                expected_v.data() + static_cast<size_t>(row) * storage_dim,
+                long_v.data() +
+                    static_cast<size_t>(first_visible_long_row + row) * storage_dim,
+                row_bytes);
+        }
+        const size_t short_output_base =
+            static_cast<size_t>(max_kv_len) * storage_dim;
+        std::memcpy(
+            expected_k.data() + short_output_base,
+            short_k.data(), short_bytes);
+        std::memcpy(
+            expected_v.data() + short_output_base,
+            short_v.data(), short_bytes);
+
+        EXPECT_EQ(std::memcmp(
+                      actual_k.data(), expected_k.data(),
+                      output_elements * sizeof(DataT)),
+                  0)
+            << "Native device-state K gather changed bytes for " << format_name;
+        EXPECT_EQ(std::memcmp(
+                      actual_v.data(), expected_v.data(),
+                      output_elements * sizeof(DataT)),
+                  0)
+            << "Native device-state V gather changed bytes for " << format_name;
+
+        cache.unbindWorkspace();
+        EXPECT_EQ(hipFree(d_long_k), hipSuccess);
+        EXPECT_EQ(hipFree(d_long_v), hipSuccess);
+        EXPECT_EQ(hipFree(d_short_k), hipSuccess);
+        EXPECT_EQ(hipFree(d_short_v), hipSuccess);
+    }
+} // namespace
+
+/**
+ * @brief Every standard ROCm KV storage format obeys the native grouped contract.
+ */
+TEST(Test__ROCmRingKVCache, DeviceResidentBatchedGatherAllFormatsIsByteExact)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    runDeviceResidentBatchedGatherByteExact<ActivationPrecision::FP32>("FP32");
+    runDeviceResidentBatchedGatherByteExact<ActivationPrecision::FP16>("FP16");
+    runDeviceResidentBatchedGatherByteExact<ActivationPrecision::BF16>("BF16");
+    runDeviceResidentBatchedGatherByteExact<ActivationPrecision::Q8_1>("Q8_1");
+}
+
+/**
+ * @brief Proves captured request-local append counts govern metadata and payload writes.
+ *
+ * The graph records an eight-row append for both requests while resident
+ * request metadata publishes logical lengths `{8, 5}`.  It is then replayed
+ * with `{1, 1}` against a ten-row ring.  Any padded write wraps into live
+ * history, so byte-comparing the old prefix catches payload kernels that ignore
+ * the resident count even when the count/head advancement kernel is correct.
+ *
+ * Every standard ROCm KV format enters through KVCacheAppendStage, covering the
+ * same request slicing and D2D append-count mailbox used by production prefill.
+ */
+TEST(Test__ROCmRingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAllFormats)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    constexpr int batch_size = 2;
+    constexpr int captured_rows = 8;
+    constexpr int max_seq_len = 10;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr std::array<int, batch_size> initial_counts{captured_rows, 5};
+    constexpr std::array<int, batch_size> final_counts{captured_rows + 1, 6};
+
+    struct FormatCase
+    {
+        ActivationPrecision precision;
+        const char *name;
+    };
+    constexpr std::array<FormatCase, 4> formats{{
+        {ActivationPrecision::FP32, "FP32"},
+        {ActivationPrecision::FP16, "FP16"},
+        {ActivationPrecision::BF16, "BF16"},
+        {ActivationPrecision::Q8_1, "Q8_1"},
+    }};
+
+    const size_t source_elements =
+        static_cast<size_t>(batch_size) * captured_rows * kv_dim;
+    auto k_fp32 = generateRandomFP32(source_elements, 701);
+    auto v_fp32 = generateRandomFP32(source_elements, 907);
+    for (int request = 0; request < batch_size; ++request)
+    {
+        const size_t request_begin =
+            static_cast<size_t>(request) * captured_rows * kv_dim;
+        for (size_t index = 0;
+             index < static_cast<size_t>(captured_rows) * kv_dim;
+             ++index)
+        {
+            k_fp32[request_begin + index] += 0.5f * request;
+            v_fp32[request_begin + index] -= 0.375f * request;
+        }
+    }
+
+    auto makeNativeTensor = [](
+                                const std::vector<float> &values,
+                                ActivationPrecision precision)
+        -> std::shared_ptr<TensorBase>
+    {
+        const std::vector<size_t> shape{
+            static_cast<size_t>(batch_size * captured_rows),
+            static_cast<size_t>(kv_dim)};
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case ActivationPrecision::FP16:
+        {
+            std::vector<uint16_t> encoded(values.size());
+            for (size_t index = 0; index < values.size(); ++index)
+                encoded[index] = fp32_to_fp16(values[index]);
+            return std::make_shared<FP16Tensor>(shape, encoded);
+        }
+        case ActivationPrecision::BF16:
+        {
+            auto tensor = std::make_shared<BF16Tensor>(shape);
+            tensor->from_fp32(values.data(), values.size());
+            return tensor;
+        }
+        case ActivationPrecision::Q8_1:
+            return Q8_1Tensor::quantize_from_fp32(values.data(), shape);
+        default:
+            return nullptr;
+        }
+    };
+
+    auto rowBytes = [](ActivationPrecision precision) -> size_t
+    {
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+            return static_cast<size_t>(kv_dim) * sizeof(float);
+        case ActivationPrecision::FP16:
+        case ActivationPrecision::BF16:
+            return static_cast<size_t>(kv_dim) * sizeof(uint16_t);
+        case ActivationPrecision::Q8_1:
+            return static_cast<size_t>(kv_dim / Q8_1Block::BLOCK_SIZE) *
+                   sizeof(Q8_1Block);
+        default:
+            return 0;
+        }
+    };
+
+    for (const FormatCase &format : formats)
+    {
+        SCOPED_TRACE(format.name);
+        ScopedHipStream stream;
+        auto cache = createROCmRingKVCache(
+            format.precision,
+            /*n_layers=*/1,
+            batch_size,
+            max_seq_len,
+            n_kv_heads,
+            head_dim,
+            /*device_id=*/0);
+        ASSERT_NE(cache, nullptr);
+
+        auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        const WorkspaceRequirements requirements =
+            workspace_consumer->getWorkspaceRequirements(
+                captured_rows, batch_size, head_dim);
+        DeviceWorkspaceManager workspace(
+            DeviceId::rocm(0),
+            requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        workspace_consumer->bindWorkspace(&workspace);
+        ASSERT_TRUE(workspace_consumer->hasWorkspace());
+
+        auto k_tensor = makeNativeTensor(k_fp32, format.precision);
+        auto v_tensor = makeNativeTensor(v_fp32, format.precision);
+        ASSERT_NE(k_tensor, nullptr);
+        ASSERT_NE(v_tensor, nullptr);
+        ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+
+        int32_t *device_lengths = nullptr;
+        ASSERT_EQ(
+            hipMalloc(&device_lengths, batch_size * sizeof(int32_t)),
+            hipSuccess);
+        const std::array<int32_t, batch_size> first_device_lengths{
+            initial_counts[0], initial_counts[1]};
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_lengths,
+                first_device_lengths.data(),
+                batch_size * sizeof(int32_t),
+                hipMemcpyHostToDevice,
+                stream.stream()),
+            hipSuccess);
+
+        KVCacheAppendStage append_stage({
+            .device_id = DeviceId::rocm(0),
+            .K = k_tensor.get(),
+            .V = v_tensor.get(),
+            .kv_cache = cache.get(),
+            .layer_idx = 0,
+            .seq_idx = 0,
+            .num_tokens = batch_size * captured_rows,
+            .batch_size = batch_size,
+            .seq_len = captured_rows,
+            .request_sequence_lengths_device = device_lengths,
+            .head_dim = head_dim,
+        });
+        append_stage.setGPUStream(stream.opaque());
+        append_stage.updateDynamicParams(/*pos_offset=*/0, captured_rows);
+        stream.synchronize();
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream.stream(), hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok = append_stage.execute(nullptr);
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream.stream(), &graph), hipSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+
+        std::array<std::vector<uint8_t>, batch_size> initial_k;
+        std::array<std::vector<uint8_t>, batch_size> initial_v;
+        const size_t row_bytes = rowBytes(format.precision);
+        ASSERT_GT(row_bytes, 0u);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            SCOPED_TRACE("initial request=" + std::to_string(request));
+            int device_count = -1;
+            int device_head = -1;
+            ASSERT_NE(cache->deviceCachedTokenCountPtr(0, request), nullptr);
+            ASSERT_NE(cache->deviceRingHeadPtr(0, request), nullptr);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    &device_count,
+                    cache->deviceCachedTokenCountPtr(0, request),
+                    sizeof(int), hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    &device_head,
+                    cache->deviceRingHeadPtr(0, request),
+                    sizeof(int), hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+
+            ITensor *cache_k = nullptr;
+            ITensor *cache_v = nullptr;
+            int cache_rows = 0;
+            ASSERT_TRUE(cache->get_kv_snapshot_view(
+                0, request, initial_counts[request],
+                &cache_k, &cache_v, &cache_rows));
+            ASSERT_EQ(cache_rows, initial_counts[request]);
+            ASSERT_NE(cache_k, nullptr);
+            ASSERT_NE(cache_v, nullptr);
+            const size_t live_bytes =
+                static_cast<size_t>(cache_rows) * row_bytes;
+            initial_k[request].resize(live_bytes);
+            initial_v[request].resize(live_bytes);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    initial_k[request].data(), cache_k->gpu_data_ptr(),
+                    live_bytes, hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    initial_v[request].data(), cache_v->gpu_data_ptr(),
+                    live_bytes, hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            stream.synchronize();
+            EXPECT_EQ(device_count, initial_counts[request]);
+            EXPECT_EQ(device_head, initial_counts[request]);
+        }
+
+        constexpr std::array<int32_t, batch_size> continuation_lengths{1, 1};
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_lengths,
+                continuation_lengths.data(),
+                batch_size * sizeof(int32_t),
+                hipMemcpyHostToDevice,
+                stream.stream()),
+            hipSuccess);
+        append_stage.updateDynamicParams(
+            /*pos_offset=*/captured_rows,
+            /*seq_len=*/captured_rows);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+        for (int request = 0; request < batch_size; ++request)
+        {
+            SCOPED_TRACE("continuation request=" + std::to_string(request));
+            int device_count = -1;
+            int device_head = -1;
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    &device_count,
+                    cache->deviceCachedTokenCountPtr(0, request),
+                    sizeof(int), hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    &device_head,
+                    cache->deviceRingHeadPtr(0, request),
+                    sizeof(int), hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+
+            ITensor *cache_k = nullptr;
+            ITensor *cache_v = nullptr;
+            int cache_rows = 0;
+            ASSERT_TRUE(cache->get_kv(
+                0, request, &cache_k, &cache_v, &cache_rows));
+            ASSERT_EQ(cache_rows, final_counts[request]);
+            const size_t final_bytes =
+                static_cast<size_t>(cache_rows) * row_bytes;
+            std::vector<uint8_t> final_k(final_bytes);
+            std::vector<uint8_t> final_v(final_bytes);
+            std::vector<uint8_t> source_k(row_bytes);
+            std::vector<uint8_t> source_v(row_bytes);
+            const size_t source_offset =
+                static_cast<size_t>(request) * captured_rows * row_bytes;
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    final_k.data(), cache_k->gpu_data_ptr(), final_bytes,
+                    hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    final_v.data(), cache_v->gpu_data_ptr(), final_bytes,
+                    hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    source_k.data(),
+                    static_cast<const uint8_t *>(k_tensor->gpu_data_ptr()) + source_offset,
+                    row_bytes, hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    source_v.data(),
+                    static_cast<const uint8_t *>(v_tensor->gpu_data_ptr()) + source_offset,
+                    row_bytes, hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            stream.synchronize();
+
+            EXPECT_EQ(device_count, final_counts[request]);
+            EXPECT_EQ(device_head, final_counts[request]);
+            EXPECT_EQ(
+                std::memcmp(
+                    final_k.data(), initial_k[request].data(),
+                    initial_k[request].size()),
+                0)
+                << "captured padded K rows overwrote live " << format.name
+                << " history for request " << request;
+            EXPECT_EQ(
+                std::memcmp(
+                    final_v.data(), initial_v[request].data(),
+                    initial_v[request].size()),
+                0)
+                << "captured padded V rows overwrote live " << format.name
+                << " history for request " << request;
+            EXPECT_EQ(
+                std::memcmp(
+                    final_k.data() + initial_k[request].size(),
+                    source_k.data(), row_bytes),
+                0)
+                << "real continuation K row was not published for " << format.name
+                << " request " << request;
+            EXPECT_EQ(
+                std::memcmp(
+                    final_v.data() + initial_v[request].size(),
+                    source_v.data(), row_bytes),
+                0)
+                << "real continuation V row was not published for " << format.name
+                << " request " << request;
+        }
+
+        EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        EXPECT_EQ(hipFree(device_lengths), hipSuccess);
+    }
 }
 
 #endif // HAVE_ROCM

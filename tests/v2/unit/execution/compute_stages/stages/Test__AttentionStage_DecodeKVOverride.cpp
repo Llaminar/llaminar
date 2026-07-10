@@ -166,9 +166,9 @@ namespace llaminar2
             void clear_layer(int) override {}
             void evict_oldest(int) override {}
             void evict_oldest_from_sequence(int, int) override {}
-            DeviceId get_layer_device(int) const override { return DeviceId::cpu(); }
             int get_total_evicted() const override { return 0; }
             void reset_eviction_counter() override {}
+            DeviceId get_layer_device(int) const override { return DeviceId::cpu(); }
             int gather_kv_batched(int, int, TensorBase *, TensorBase *, std::vector<int> &) override { return 0; }
             bool is_sharded() const override { return false; }
             int n_kv_heads() const override { return kv_dim_ / 32; }

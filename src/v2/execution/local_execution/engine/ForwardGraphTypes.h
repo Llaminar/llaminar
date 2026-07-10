@@ -17,6 +17,7 @@
 #include "PrefillGraphCache.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -86,6 +87,7 @@ namespace llaminar2
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
+        bool uses_device_sequence_lengths = false; ///< True when stages derive request geometry from a stable device row.
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
@@ -107,6 +109,7 @@ namespace llaminar2
                    all_position_logit_rows == other.all_position_logit_rows &&
                    uses_device_token_ids == other.uses_device_token_ids &&
                    uses_device_position_ids == other.uses_device_position_ids &&
+                   uses_device_sequence_lengths == other.uses_device_sequence_lengths &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
@@ -132,6 +135,7 @@ namespace llaminar2
             h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.uses_device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -698,6 +702,29 @@ namespace llaminar2
             pp_needs_copy = false;
         }
     };
+
+    /**
+     * @brief Return the flattened row count owned by explicit position IDs.
+     *
+     * ForwardInput::seq_len is the padded row width of one request, while host
+     * and device position arrays are laid out as `[batch_size * seq_len]`.
+     * Dynamic RoPE updates must consume the flattened count or later requests
+     * remain unrotated.  Returning zero for malformed or overflowing geometry
+     * gives cache-miss and replay callers one shared validation contract.
+     *
+     * @param input Current forward invocation and its request geometry.
+     * @return Positive flattened position-row count, or zero when invalid.
+     */
+    inline int forwardPositionRowCount(const ForwardInput &input)
+    {
+        if (input.batch_size <= 0 || input.seq_len <= 0 ||
+            input.seq_len >
+                std::numeric_limits<int>::max() / input.batch_size)
+        {
+            return 0;
+        }
+        return input.batch_size * input.seq_len;
+    }
 
     /**
      * @brief Select the host position rows that should refresh a cached forward replay.

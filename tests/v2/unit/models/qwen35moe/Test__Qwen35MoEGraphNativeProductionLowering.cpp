@@ -360,6 +360,33 @@ namespace llaminar2::test
             }
         }
 
+        void registerCompleteDeviceExpertLayer(
+            ExpertGemmRegistry &registry,
+            DeviceId device,
+            int layer_idx)
+        {
+            for (int expert = 0; expert < kNumExperts; ++expert)
+            {
+                for (const ExpertRole role : {
+                         ExpertRole::GATE,
+                         ExpertRole::UP,
+                         ExpertRole::DOWN,
+                     })
+                {
+                    const int tag =
+                        100 * expert + static_cast<int>(role) + 1;
+                    auto engine = std::make_shared<TestExpertGemm>(tag, role);
+                    registry.registerEngine(
+                        device,
+                        layer_idx,
+                        expert,
+                        role,
+                        engine.get(),
+                        engine);
+                }
+            }
+        }
+
         std::shared_ptr<ModelContext> makeTestingModelContextWithHotDomainExperts(int layer_count = 1)
         {
             auto model_ctx = ModelContext::createForTesting(
@@ -408,6 +435,20 @@ namespace llaminar2::test
                     ++count;
             }
             return count;
+        }
+
+        bool hasDependency(
+            const ComputeGraph &graph,
+            const std::string &node_name,
+            const std::string &dependency)
+        {
+            const auto *node = graph.getNode(node_name);
+            if (!node)
+                return false;
+            return std::find(
+                       node->dependencies.begin(),
+                       node->dependencies.end(),
+                       dependency) != node->dependencies.end();
         }
 
         std::vector<std::string> stageNamesOfType(const ComputeGraph &graph, ComputeStageType type)
@@ -573,6 +614,86 @@ namespace llaminar2::test
         EXPECT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
             << "Graph-local owner subsets must be rejoined through the continuation TP domain";
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
+    }
+
+    /**
+     * @brief GPU shared-verifier nodes wait for their router-owned Q8 input rows.
+     *
+     * The production grouped router publishes a device-resident Q8 copy of each
+     * normalized verifier row.  Both the routed experts and the always-active
+     * shared expert reuse that publication.  NORMALIZED alone therefore does not
+     * describe the shared stage's complete dependency set: without an edge from
+     * `moe_routing`, graph topological ordering may run the shared sibling first
+     * and consume a stale publication left by an earlier layer.
+     *
+     * This fixture supplies the same prepared expert-engine registry required by
+     * production GPU lowering, but it deliberately creates no device context,
+     * allocates no GPU memory, and executes no GPU work.  Unit coverage therefore
+     * proves the CUDA and ROCm graph contract without violating the integration-
+     * only rule for GPU execution.
+     */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         GPUGroupedSharedVerifierDependsOnRouterQ8Producer)
+    {
+        auto model_ctx = ModelContext::createForTesting(
+            "test.gguf",
+            nullptr,
+            /*layer_count=*/1,
+            /*with_weight_manager=*/true);
+        ASSERT_NE(model_ctx, nullptr);
+        ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
+
+        auto &registry = model_ctx->concreteWeightManager()->expertGemmRegistry();
+        for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            registerCompleteDeviceExpertLayer(registry, device, /*layer_idx=*/0);
+
+        for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE("device=" + device.to_string());
+
+            GraphConfig config = makeConfig(nullptr);
+            config.default_device = device;
+            config.compute_all_position_logits = true;
+            config.moe.has_shared_expert = true;
+            config.moe.shared_intermediate_size = kIntermediate;
+
+            TensorArena weight_arena;
+            auto layer = makeLayerWeights(weight_arena);
+            layer.shared_expert_gate =
+                weight_arena.fp32({kIntermediate, kDModel});
+            layer.shared_expert_up =
+                weight_arena.fp32({kIntermediate, kDModel});
+            layer.shared_expert_down =
+                weight_arena.fp32({kDModel, kIntermediate});
+
+            TensorArena activation_arena;
+            auto buffers = makeActivationBuffers(activation_arena);
+
+            Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+            ComputeGraph graph = graph_builder.buildFFNGraph(
+                layer,
+                buffers,
+                /*layer_idx=*/0,
+                /*seq_len=*/2,
+                kBatchSize,
+                device);
+
+            ASSERT_NE(graph.getNode("layer0_moe_routing"), nullptr);
+            const auto *shared_node =
+                graph.getNode("layer0_shared_expert_ffn");
+            ASSERT_NE(shared_node, nullptr);
+            const auto *shared_stage =
+                dynamic_cast<const SharedExpertFFNStage *>(
+                    shared_node->stage.get());
+            ASSERT_NE(shared_stage, nullptr);
+            EXPECT_TRUE(
+                shared_stage->usesGroupedVerifierPrefillRouteForTesting());
+            EXPECT_TRUE(hasDependency(
+                graph,
+                "layer0_shared_expert_ffn",
+                "layer0_moe_routing"))
+                << "The grouped shared verifier consumes the router's device Q8 publication";
+        }
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

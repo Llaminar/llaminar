@@ -55,7 +55,8 @@ namespace llaminar2
     ROCmTurboQuantRotations hip_tq_create_rotations(
         int n_layers, int n_kv_heads, int head_dim,
         uint64_t rotation_seed, int device_id,
-        hipStream_t stream);
+        hipStream_t stream,
+        int kv_head_start = 0);
 
     void hip_tq_free_rotations(ROCmTurboQuantRotations &rotations);
 
@@ -70,6 +71,62 @@ namespace llaminar2
     extern "C" bool hip_tq4_quantize(
         const float *d_input, const float *d_rotations, void *d_output,
         int num_tokens, int n_kv_heads, int head_dim, hipStream_t stream);
+
+    /**
+     * @brief Quantize grouped FP32 verifier rows directly into TQ8/TQ4 ring storage.
+     *
+     * A single HIP grid covers every verifier row, local KV head, and K/V
+     * phase.  Within each block the arithmetic order matches serial decode.
+     */
+    extern "C" bool hip_tq_quantize_grouped_ring(
+        const float *d_k_input, const float *d_v_input,
+        const float *d_rotations,
+        void *d_k_ring, void *d_v_ring,
+        int ring_head, int max_seq_len,
+        int verifier_rows, int n_kv_heads, int head_dim,
+        bool k_head_major, bool v_head_major,
+        hipStream_t stream);
+
+    /**
+     * @brief Device-head variant for fully graph-captured grouped publication.
+     *
+     * @p d_row_count optionally limits fixed bucket geometry to the request's
+     * real resident row count.
+     */
+    extern "C" bool hip_tq_quantize_grouped_ring_dynamic(
+        const float *d_k_input, const float *d_v_input,
+        const float *d_rotations,
+        void *d_k_ring, void *d_v_ring,
+        const int *d_ring_head, const int *d_row_count, int max_seq_len,
+        int verifier_rows, int n_kv_heads, int head_dim,
+        bool k_head_major, bool v_head_major,
+        hipStream_t stream);
+
+    /** @brief Publish prepared device TQ8-K/TQ4-V rows in one D2D kernel. */
+    extern "C" bool hip_tq_copy_prepared_rows_ring(
+        const void *source_k, const void *source_v,
+        void *ring_k, void *ring_v,
+        int ring_head, int max_seq_len, int rows,
+        size_t k_row_bytes, size_t v_row_bytes,
+        bool k_head_major, bool v_head_major,
+        int n_kv_heads,
+        hipStream_t stream);
+
+    /**
+     * @brief Device-head graph-capture variant of prepared TQ row publication.
+     *
+     * @p d_row_count optionally limits fixed bucket geometry to the request's
+     * real resident row count.
+     */
+    extern "C" bool hip_tq_copy_prepared_rows_ring_dynamic(
+        const void *source_k, const void *source_v,
+        void *ring_k, void *ring_v,
+        const int *d_ring_head, const int *d_row_count,
+        int max_seq_len, int rows,
+        size_t k_row_bytes, size_t v_row_bytes,
+        bool k_head_major, bool v_head_major,
+        int n_kv_heads,
+        hipStream_t stream);
 
     // =========================================================================
     // TQ8/TQ4 Dequantize to FP32
@@ -90,14 +147,6 @@ namespace llaminar2
     // =========================================================================
     // Ring Buffer TQ Operations
     // =========================================================================
-
-    extern "C" bool hip_tq_ring_append(
-        void *d_K_cache, void *d_V_cache,
-        const float *d_K_new, const float *d_V_new,
-        const float *d_K_rotations, const float *d_V_rotations,
-        int head, int max_seq_len,
-        int n_kv_heads, int head_dim, int num_tokens,
-        hipStream_t stream);
 
     extern "C" bool hip_tq_ring_linearize_dequant(
         float *d_K_out, float *d_V_out,
@@ -124,6 +173,36 @@ namespace llaminar2
         float rope_theta, int position_start,
         hipStream_t stream, int rope_dim = 0);
 
+    extern "C" bool hip_rope_apply_batched_fp16_device_state(
+        _Float16 *d_K,
+        const int *d_counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        hipStream_t stream);
+
+    extern "C" bool hip_rope_apply_batched_fp32_ring_to_fp16_device_state(
+        _Float16 *d_K_out,
+        const float *const *d_K_entry_table,
+        const int *d_heads,
+        const int *d_counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        hipStream_t stream);
+
     // =========================================================================
     // RoPE Frequency Precomputation
     // =========================================================================
@@ -138,25 +217,6 @@ namespace llaminar2
     void hip_tq_upload_rope_freqs(float rope_theta, int head_dim, hipStream_t stream);
 
     // =========================================================================
-    // Dynamic Params for Graph-Capturable Incremental Dequant
-    // =========================================================================
-
-    /**
-     * @brief Device-side dynamic parameters for TQ incremental dequant.
-     *
-     * During HIP graph capture, kernel arguments are baked into the graph.
-     * This struct lives in device memory; the kernel reads from it at runtime.
-     * Between graph replays, host code uploads new values to that device buffer
-     * before graph launch on the explicit stage stream.
-     */
-    struct HIPTQDequantDynamicParams
-    {
-        int ring_pos;         ///< Ring buffer position of the new token
-        int out_offset_elems; ///< Element offset into scratch (position × kv_dim)
-        int rope_position;    ///< Absolute position for RoPE (0 if no RoPE)
-    };
-
-    // =========================================================================
     // FP16 Linearize + Dequant (full sequence, for prefill)
     // =========================================================================
 
@@ -167,7 +227,33 @@ namespace llaminar2
         const float *d_K_rotations, const float *d_V_rotations,
         int tail, int count, int max_seq_len,
         int n_kv_heads, int head_dim,
-        float rope_theta, int position_start, hipStream_t stream);
+        float rope_theta, int position_start, int rope_dim,
+        hipStream_t stream);
+
+    /**
+     * @brief Group-dequantize request-local TQ rings from resident ring state.
+     *
+     * The grouped TQ8 and TQ4 grids retain the serial ROCm FP16 arithmetic and
+     * write zero padding after each request's live device count.
+     */
+    extern "C" bool hip_tq_batched_ring_dequant_fp16_device_state(
+        _Float16 *d_K_out,
+        _Float16 *d_V_out,
+        const void *const *d_K_entry_table,
+        const void *const *d_V_entry_table,
+        const int *d_heads,
+        const int *d_counts,
+        const float *d_rotations,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        hipStream_t stream);
 
     // =========================================================================
     // FP16 Fused Incremental Dequant (single position, for decode)
@@ -187,13 +273,18 @@ namespace llaminar2
         hipStream_t stream);
 
     /**
-     * @brief Graph-capturable variant: reads dynamic params from device memory.
+     * @brief Graph-capturable incremental dequant driven by device ring state.
+     *
+     * The fused kernel reads the canonical post-append head/count and derives
+     * its source row, scratch destination, and optional RoPE position without
+     * a pinned-host parameter upload between HIP graph replays.
      */
     extern "C" bool hip_tq_incremental_single_fp16_dynamic(
         _Float16 *d_K_base, _Float16 *d_V_base,
         const void *d_K_cache, const void *d_V_cache,
         const float *d_K_rotation, const float *d_V_rotation,
-        const HIPTQDequantDynamicParams *d_params,
+        const int *d_ring_head, const int *d_cached_count,
+        int max_seq_len, int kv_dim, int position_start,
         int n_kv_heads, int head_dim,
         float rope_theta,
         hipStream_t stream);

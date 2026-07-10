@@ -199,6 +199,9 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
+            // GPU stream for graph capture and device-owned execution support.
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // ===== ITensorSwiGLU interface =====
             bool apply(
                 const float *gate, const float *up, float *output,

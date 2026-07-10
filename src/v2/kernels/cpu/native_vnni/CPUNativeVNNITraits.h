@@ -348,6 +348,8 @@ namespace llaminar2::cpu::native_vnni
             return {19, 32, false, false, false}; // Q8_0
         case 20:
             return {20, 32, false, false, false}; // Q8_1
+        case 21:
+            return {21, 32, false, true, false}; // Q8_K source normalized to INT8 blocks
         default:
             return {codebook_id, 0, false, false, false};
         }

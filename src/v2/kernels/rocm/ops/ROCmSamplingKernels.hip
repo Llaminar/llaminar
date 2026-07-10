@@ -1276,14 +1276,30 @@ __global__ void rocm_sample_distribution_f32_kernel(
     const float *__restrict__ probs,
     int k,
     float threshold,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     float *__restrict__ out_probability)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
+
+    /*
+     * The request-batched resident lane reads its mutable logical position
+     * directly from the publication mailbox. This keeps the draw and the state
+     * it describes ordered on one HIP stream without adopting a host shadow.
+     */
+    const float effective_threshold =
+        threshold_position
+            ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                  threshold_seed,
+                  *threshold_position + threshold_position_offset,
+                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+            : threshold;
     *out_token =
         llaminar2::sampling_math::sample_distribution_with_threshold_and_probability(
-            token_ids, probs, k, threshold, out_probability);
+            token_ids, probs, k, effective_threshold, out_probability);
 }
 
 __global__ void rocm_speculative_verify_distribution_kernel(
@@ -1423,9 +1439,10 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_kernel(
  * @brief Batched verifier variant whose draft tokens are already on device.
  *
  * ROCm mirrors the CUDA entry point so the orchestrator can use one
- * backend-neutral device-token verifier contract. Thresholds are still scalar
- * host RNG outputs for now; sampled draft tokens come from arena-owned device
- * scratch produced by the compact draft sampler.
+ * backend-neutral device-token verifier contract. Thresholds may be explicit,
+ * seeded from a compatibility scalar position, or derived from the mutable
+ * device-resident publication mailbox. Sampled draft tokens remain in
+ * arena-owned device scratch produced by the compact draft sampler.
  */
 __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tokens_kernel(
     const int *__restrict__ target_token_ids,
@@ -1451,6 +1468,8 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
     unsigned long long threshold_seed,
     int threshold_first_logical_position,
     int thresholds_from_seed,
+    const int *__restrict__ threshold_base_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -1478,18 +1497,26 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
         residual_threshold = residual_threshold3;
     }
 
+    const int threshold_logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : threshold_first_logical_position + row;
+    const int inverse_sample_logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : inverse_sample_first_logical_position + row;
+
     if (thresholds_from_seed)
     {
-        const int logical_position = threshold_first_logical_position + row;
         accept_threshold =
             llaminar2::sampling_math::mtp_spec_threshold_from_seed(
                 threshold_seed,
-                logical_position,
+                threshold_logical_position,
                 1 /* MTPSpecStochasticDrawPurpose::Accept */);
         residual_threshold =
             llaminar2::sampling_math::mtp_spec_threshold_from_seed(
                 threshold_seed,
-                logical_position,
+                threshold_logical_position,
                 2 /* MTPSpecStochasticDrawPurpose::Residual */);
     }
 
@@ -1506,7 +1533,7 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
                 sampled_draft_tokens[row],
                 accept_threshold,
                 inverse_sample_seed,
-                inverse_sample_first_logical_position + row,
+                inverse_sample_logical_position,
                 out_token + row,
                 out_accepted + row,
                 out_accept_probability ? out_accept_probability + row : nullptr,
@@ -2246,6 +2273,9 @@ __global__ void rocm_sample_processed_logits_if_speculative_batch_needs_bonus_f3
     int vocab_size,
     int row_stride,
     float threshold,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
     const int *__restrict__ verify_tokens,
     const int *__restrict__ verify_accepted,
     int row_count,
@@ -2309,6 +2339,14 @@ __global__ void rocm_sample_processed_logits_if_speculative_batch_needs_bonus_f3
     if (!should_sample_bonus)
         return;
 
+    const float effective_threshold =
+        threshold_position
+            ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                  threshold_seed,
+                  *threshold_position + threshold_position_offset,
+                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+            : threshold;
+
     rocm_processed_logit_row_stats_block<PROCESSED_LOGIT_VERIFY_THREADS>(
         logits,
         vocab_size,
@@ -2324,7 +2362,7 @@ __global__ void rocm_sample_processed_logits_if_speculative_batch_needs_bonus_f3
         max_logit,
         exp_sum,
         argmax_token,
-        threshold,
+        effective_threshold,
         scratch_vals,
         &selected_token);
 
@@ -2831,6 +2869,9 @@ __global__ void rocm_speculative_verify_processed_target_draft_probabilities_thr
     float accept_threshold3,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
+    int thresholds_from_seed,
+    const int *__restrict__ threshold_base_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -2873,6 +2914,19 @@ __global__ void rocm_speculative_verify_processed_target_draft_probabilities_thr
         accept_threshold = accept_threshold2;
     else if (row == 3)
         accept_threshold = accept_threshold3;
+
+    const int logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : inverse_sample_first_logical_position + row;
+    if (thresholds_from_seed)
+    {
+        accept_threshold =
+            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                logical_position,
+                1 /* MTPSpecStochasticDrawPurpose::Accept */);
+    }
 
     if (tid == 0)
     {
@@ -2920,7 +2974,7 @@ __global__ void rocm_speculative_verify_processed_target_draft_probabilities_thr
                 target_sum,
                 draft_token,
                 inverse_sample_seed,
-                inverse_sample_first_logical_position + row,
+                logical_position,
                 no_draft_probabilities != 0,
                 scratch_vals,
                 scratch_idxs);
@@ -3441,12 +3495,14 @@ __global__ void rocm_derive_shifted_speculative_publication_metadata_kernel(
 }
 
 /**
- * @brief Prepare shifted-MTP suffix condition tokens from compact metadata.
+ * @brief Prepare shifted-MTP suffix tokens and absolute positions from compact metadata.
  *
  * One HIP thread handles the bounded MTP suffix.  Rows beyond the compact
  * accepted-state count receive a valid filler token and are removed by the
  * later shifted-KV publication count, preserving device-resident ownership of
- * the accepted-prefix decision.
+ * the accepted-prefix decision. The same lane expands the device-owned
+ * verifier-base position into the contiguous RoPE/KV position row used by the
+ * captured sidecar, preserving one bounded launch for both dynamic inputs.
  */
 __global__ void rocm_prepare_speculative_shifted_kv_tokens_kernel(
     const int *__restrict__ meta,
@@ -3457,7 +3513,10 @@ __global__ void rocm_prepare_speculative_shifted_kv_tokens_kernel(
     int first_output_token_index,
     int row_count,
     int32_t filler_token,
-    int32_t *__restrict__ out_tokens)
+    int32_t *__restrict__ out_tokens,
+    const int32_t *__restrict__ base_positions,
+    int position_offset,
+    int32_t *__restrict__ out_position_ids)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3472,6 +3531,71 @@ __global__ void rocm_prepare_speculative_shifted_kv_tokens_kernel(
         row_count,
         filler_token,
         out_tokens);
+
+    const int32_t first_position =
+        base_positions[request_index] + position_offset;
+    for (int row = 0; row < row_count; ++row)
+        out_position_ids[row] = first_position + row;
+}
+
+/**
+ * @brief Gather strided MTP draft slots and derive grouped sidecar positions.
+ *
+ * The request-major draft matrix is ideal for the verifier but one speculative
+ * depth forms a strided column. This bounded kernel gathers that column and adds
+ * the current depth to each device-resident base position. Its contiguous output
+ * buffers are the stable token and RoPE inputs captured by the grouped sidecar.
+ */
+__global__ void rocm_prepare_mtp_batched_sidecar_inputs_kernel(
+    const int32_t *__restrict__ condition_tokens,
+    int condition_token_stride,
+    const int32_t *__restrict__ base_positions,
+    int position_offset,
+    int request_count,
+    int32_t *__restrict__ out_condition_tokens,
+    int32_t *__restrict__ out_position_ids)
+{
+    const int request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request >= request_count)
+        return;
+
+    out_condition_tokens[request] =
+        condition_tokens[request * condition_token_stride];
+    out_position_ids[request] = base_positions[request] + position_offset;
+}
+
+/**
+ * @brief Publish the first device-owned logical rows from terminal prefill samples.
+ *
+ * Request admission and sampling have already published prompt positions and
+ * token identities to device memory. One lane reads those authoritative rows and
+ * fills every first-publication field. `target_positions` may alias
+ * `out_target_positions`, so neither parameter is restrict-qualified.
+ */
+__global__ void rocm_initialize_mtp_device_logical_state_kernel(
+    const int32_t *__restrict__ sampled_tokens,
+    const int32_t *target_positions,
+    int request_count,
+    int32_t *__restrict__ out_base_cached_tokens,
+    int32_t *out_target_positions,
+    int32_t *__restrict__ out_accepted_state_counts,
+    int32_t *__restrict__ out_next_condition_tokens,
+    int32_t *__restrict__ out_all_drafts_accepted_flags,
+    int32_t *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_publication_ok_flags)
+{
+    const int request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request >= request_count)
+        return;
+
+    const int position = target_positions[request];
+    out_base_cached_tokens[request] = position;
+    out_target_positions[request] = position;
+    out_accepted_state_counts[request] = 0;
+    out_next_condition_tokens[request] = sampled_tokens[request];
+    out_all_drafts_accepted_flags[request] = 0;
+    out_stopped_flags[request] = 0;
+    out_publication_ok_flags[request] = 1;
 }
 
 // ============================================================================
@@ -4002,10 +4126,14 @@ bool rocmOps_sample_distribution_f32(
     float threshold,
     int *out_token,
     float *out_probability,
+    unsigned long long threshold_seed,
+    const int *threshold_position,
+    int threshold_position_offset,
     int device_idx,
     void *stream)
 {
-    if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token || !stream)
+    if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token ||
+        !stream || (threshold_position && threshold_seed == 0))
         return false;
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -4017,6 +4145,9 @@ bool rocmOps_sample_distribution_f32(
         probs,
         k,
         threshold,
+        threshold_seed,
+        threshold_position,
+        threshold_position_offset,
         out_token,
         out_probability);
 
@@ -4091,6 +4222,9 @@ bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
     int stop_token_count,
     int *out_token,
     float *out_probability,
+    unsigned long long threshold_seed,
+    const int *threshold_position,
+    int threshold_position_offset,
     int device_idx,
     void *stream)
 {
@@ -4101,7 +4235,8 @@ bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
         (first_token < 0 && !first_token_device) ||
         stop_token_count < 0 ||
         stop_token_count >
-            llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens)
+            llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
+        (threshold_position && threshold_seed == 0))
     {
         return false;
     }
@@ -4117,6 +4252,9 @@ bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
         vocab_size,
         row_stride,
         threshold,
+        threshold_seed,
+        threshold_position,
+        threshold_position_offset,
         verify_tokens,
         verify_accepted,
         row_count,
@@ -4470,6 +4608,8 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
     unsigned long long threshold_seed,
     int threshold_first_logical_position,
     int thresholds_from_seed,
+    const int *threshold_base_position,
+    int threshold_position_offset,
     int *out_token,
     int *out_accepted,
     float *out_accept_probability,
@@ -4487,6 +4627,7 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
         !target_token_ids || !target_probs ||
         (!has_draft_distribution && !has_one_hot_draft_distribution) ||
         !sampled_draft_tokens ||
+        (threshold_base_position && !thresholds_from_seed) ||
         !out_token || !out_accepted || !stream)
     {
         return false;
@@ -4520,6 +4661,8 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
         threshold_seed,
         threshold_first_logical_position,
         thresholds_from_seed,
+        threshold_base_position,
+        threshold_position_offset,
         out_token,
         out_accepted,
         out_accept_probability,
@@ -4622,6 +4765,9 @@ bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_
     float accept_threshold3,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
+    int thresholds_from_seed,
+    const int *threshold_base_position,
+    int threshold_position_offset,
     int *out_token,
     int *out_accepted,
     float *out_accept_probability,
@@ -4638,7 +4784,8 @@ bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_
         row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         vocab_size <= 0 ||
         target_row_stride < vocab_size ||
-        (!no_draft_probabilities && draft_row_stride < vocab_size))
+        (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+        (threshold_base_position && !thresholds_from_seed))
     {
         return false;
     }
@@ -4663,6 +4810,9 @@ bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_
         accept_threshold3,
         inverse_sample_seed,
         inverse_sample_first_logical_position,
+        thresholds_from_seed,
+        threshold_base_position,
+        threshold_position_offset,
         out_token,
         out_accepted,
         out_accept_probability,
@@ -5147,12 +5297,17 @@ bool rocmOps_prepare_speculative_shifted_kv_tokens(
     int row_count,
     int32_t filler_token,
     int32_t *out_tokens,
+    const int32_t *base_positions,
+    int position_offset,
+    int32_t *out_position_ids,
     int device_idx,
     void *stream)
 {
     if (!meta ||
         !output_tokens ||
         !out_tokens ||
+        !base_positions ||
+        !out_position_ids ||
         !stream ||
         meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
         output_token_stride <
@@ -5178,12 +5333,126 @@ bool rocmOps_prepare_speculative_shifted_kv_tokens(
         first_output_token_index,
         row_count,
         filler_token,
-        out_tokens);
+        out_tokens,
+        base_positions,
+        position_offset,
+        out_position_ids);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Speculative Shifted KV Token Prep kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Enqueue device-resident preparation for one grouped MTP sidecar.
+ */
+bool rocmOps_prepare_mtp_batched_sidecar_inputs(
+    const int32_t *condition_tokens,
+    int condition_token_stride,
+    const int32_t *base_positions,
+    int position_offset,
+    int request_count,
+    int32_t *out_condition_tokens,
+    int32_t *out_position_ids,
+    int device_idx,
+    void *stream)
+{
+    if (!condition_tokens ||
+        condition_token_stride <= 0 ||
+        !base_positions ||
+        request_count <= 0 ||
+        request_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+        !out_condition_tokens ||
+        !out_position_ids ||
+        !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads_per_block = 64;
+    hipLaunchKernelGGL(
+        rocm_prepare_mtp_batched_sidecar_inputs_kernel,
+        dim3(1), dim3(threads_per_block), 0,
+        static_cast<hipStream_t>(stream),
+        condition_tokens,
+        condition_token_stride,
+        base_positions,
+        position_offset,
+        request_count,
+        out_condition_tokens,
+        out_position_ids);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm batched MTP sidecar input preparation failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Enqueue first-publication metadata from request-batched prefill.
+ */
+bool rocmOps_initialize_mtp_device_logical_state(
+    const int32_t *sampled_tokens,
+    const int32_t *target_positions,
+    int request_count,
+    int32_t *out_base_cached_tokens,
+    int32_t *out_target_positions,
+    int32_t *out_accepted_state_counts,
+    int32_t *out_next_condition_tokens,
+    int32_t *out_all_drafts_accepted_flags,
+    int32_t *out_stopped_flags,
+    int32_t *out_publication_ok_flags,
+    int device_idx,
+    void *stream)
+{
+    if (!sampled_tokens ||
+        !target_positions ||
+        request_count <= 0 ||
+        request_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+        !out_base_cached_tokens ||
+        !out_target_positions ||
+        !out_accepted_state_counts ||
+        !out_next_condition_tokens ||
+        !out_all_drafts_accepted_flags ||
+        !out_stopped_flags ||
+        !out_publication_ok_flags ||
+        !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_initialize_mtp_device_logical_state_kernel,
+        dim3(1), dim3(64), 0,
+        static_cast<hipStream_t>(stream),
+        sampled_tokens,
+        target_positions,
+        request_count,
+        out_base_cached_tokens,
+        out_target_positions,
+        out_accepted_state_counts,
+        out_next_condition_tokens,
+        out_all_drafts_accepted_flags,
+        out_stopped_flags,
+        out_publication_ok_flags);
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm MTP device logical-state initialization failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

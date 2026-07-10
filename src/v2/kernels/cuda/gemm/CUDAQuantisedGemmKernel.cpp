@@ -33,6 +33,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h" // isGraphCaptureActive()
+#include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
 #include "utils/DebugEnv.h"
@@ -4050,7 +4051,7 @@ namespace llaminar2
                 {
                     if (const auto *info = unpackable->vnniFormatInfo())
                     {
-                        native_codebook_id = info->codebook_id;
+                        native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
                         has_native_codebook = true;
                     }
                 }

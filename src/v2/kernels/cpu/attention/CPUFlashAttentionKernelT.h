@@ -59,6 +59,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../primitives/ActivationTraits.h"
 #include "../turboquant/TurboQuantRotation.h"
 #include "../turboquant/TurboQuantContext.h"
@@ -849,14 +850,119 @@ namespace llaminar2
         }
 
         /**
+         * @brief Group independent CPU request histories without stage-level replay.
+         *
+         * Each request receives the exact `compute_flash_fp32()` arithmetic used
+         * by ordinary M=1 decode, but descriptor validation and dispatch happen
+         * once for the group. The cache conversion layer keeps K/V shadows
+         * incremental, while the flash primitive parallelizes each long history
+         * over query heads. This avoids a stage/executor replay loop and keeps
+         * request-local causal horizons explicit.
+         */
+        bool compute_request_batch_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *const *K_by_request,
+            const ITensor *const *V_by_request,
+            const int *kv_lens,
+            ITensor *output,
+            int request_count,
+            int query_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0) override
+        {
+            (void)mpi_ctx;
+            (void)device_idx;
+
+            if constexpr (!std::is_same_v<ElementType, float>)
+            {
+                return false;
+            }
+
+            if (!Q || !K_by_request || !V_by_request || !kv_lens || !output ||
+                request_count <= 1 || query_rows <= 0 ||
+                n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+            {
+                return false;
+            }
+
+            const auto *q_tensor = dynamic_cast<const TensorBase *>(Q);
+            auto *output_tensor = dynamic_cast<TensorBase *>(output);
+            const float *q = q_tensor ? q_tensor->fp32_data() : nullptr;
+            float *out = output_tensor ? output_tensor->mutable_data() : nullptr;
+            if (!q || !out || Q->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32)
+            {
+                return false;
+            }
+
+            const size_t query_stride =
+                static_cast<size_t>(query_rows) *
+                static_cast<size_t>(n_heads) *
+                static_cast<size_t>(head_dim);
+            for (int request = 0; request < request_count; ++request)
+            {
+                const auto *k_tensor =
+                    dynamic_cast<const TensorBase *>(K_by_request[request]);
+                const auto *v_tensor =
+                    dynamic_cast<const TensorBase *>(V_by_request[request]);
+                const float *k = k_tensor ? k_tensor->fp32_data() : nullptr;
+                const float *v = v_tensor ? v_tensor->fp32_data() : nullptr;
+                const int kv_len = kv_lens[request];
+                if (!k || !v || kv_len < query_rows)
+                    return false;
+
+                if (!compute_flash_fp32(
+                        q + static_cast<size_t>(request) * query_stride,
+                        k,
+                        v,
+                        out + static_cast<size_t>(request) * query_stride,
+                        query_rows,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal,
+                        window_size,
+                        std::max(0, kv_len - query_rows),
+                        /*mask=*/nullptr,
+                        head_start,
+                        gqa_n_rep,
+                        /*force_decode_tile_policy=*/query_rows > 1))
+                {
+                    return false;
+                }
+            }
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_attention_grouped_request_decode_calls",
+                1.0,
+                "decode",
+                "cpu",
+                {{"requests", std::to_string(request_count)},
+                 {"query_rows", std::to_string(query_rows)},
+                 {"cache_view", "per_request_fp32_shadow"},
+                 {"math", "serial_decode_equivalent"}});
+            return true;
+        }
+
+        /**
          * @brief Grouped CPU verifier attention for compact MTP rows.
          *
          * This is the CPU implementation of the Phase 9.8 verifier contract:
          * compute all compact verifier rows in one grouped attention call while
          * preserving the causal visibility of serial one-token decode.  The
-         * promoted Qwen3.6 CPU lane stores hybrid KV cache rows as Q16_1, so the
-         * first production implementation handles Q16_1 K/V directly and fails
-         * closed for other cache formats until their grouped kernels are added.
+         * promoted Qwen3.6 CPU lane stores hybrid KV cache rows as Q16_1, while
+         * the unquantized CPU lane uses FP32 K/V.  Both formats run one grouped
+         * attention invocation with a row-local decode tile policy; unsupported
+         * cache formats fail closed instead of silently replaying serial rows.
          */
         bool compute_verifier_rows_decode_equivalent(
             const ITensor *Q,
@@ -953,7 +1059,7 @@ namespace llaminar2
             const int base_position_offset = kv_len - verifier_rows;
             if (K_q16 && V_q16)
             {
-                return compute_prefill_q16kv(
+                const bool success = compute_prefill_q16kv(
                     q_rows,
                     K_q16,
                     V_q16,
@@ -969,13 +1075,30 @@ namespace llaminar2
                     head_start,
                     gqa_n_rep,
                     /*force_decode_tile_policy=*/true);
+                if (success)
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cpu_attention_grouped_verifier_rows_calls",
+                        1.0,
+                        "verifier",
+                        "cpu",
+                        {{"cache_format", "q16_1"},
+                         {"verifier_rows", std::to_string(verifier_rows)},
+                         {"kv_len", std::to_string(kv_len)},
+                         {"n_heads", std::to_string(n_heads)},
+                         {"n_kv_heads", std::to_string(n_kv_heads)},
+                         {"head_dim", std::to_string(head_dim)},
+                         {"tile_policy", "serial_decode_equivalent"}});
+                }
+                return success;
             }
 
             const float *k_fp32 = K_base->fp32_data();
             const float *v_fp32 = V_base->fp32_data();
             if (k_fp32 && v_fp32)
             {
-                return compute_flash_fp32(
+                const bool success = compute_flash_fp32(
                     q_rows,
                     k_fp32,
                     v_fp32,
@@ -992,6 +1115,23 @@ namespace llaminar2
                     head_start,
                     gqa_n_rep,
                     /*force_decode_tile_policy=*/true);
+                if (success)
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cpu_attention_grouped_verifier_rows_calls",
+                        1.0,
+                        "verifier",
+                        "cpu",
+                        {{"cache_format", "fp32"},
+                         {"verifier_rows", std::to_string(verifier_rows)},
+                         {"kv_len", std::to_string(kv_len)},
+                         {"n_heads", std::to_string(n_heads)},
+                         {"n_kv_heads", std::to_string(n_kv_heads)},
+                         {"head_dim", std::to_string(head_dim)},
+                         {"tile_policy", "serial_decode_equivalent"}});
+                }
+                return success;
             }
 
             return false;

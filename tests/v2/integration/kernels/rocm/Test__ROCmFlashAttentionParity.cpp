@@ -51,6 +51,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <cmath>
 #include <random>
@@ -2113,7 +2114,7 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
     bool capture_ok = false;
     {
-        GraphCaptureGuard guard(/*host_bookkeeping=*/true);
+        GraphCaptureGuard guard;
         capture_ok = append_stage.execute(nullptr) && attn_stage.execute(nullptr);
     }
     ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
@@ -3122,6 +3123,552 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen35LongPrefill
     EXPECT_GE(worst_cosine, 0.998);
     EXPECT_LE(worst_l2, 0.02);
     EXPECT_LE(worst_max_error, 0.03);
+}
+
+/**
+ * @brief Prove request-batched ROCm prefill is byte-identical to isolated requests.
+ *
+ * The rocBLAS prefill implementation consumes request-major Q/K/V spans.  Its
+ * FP16 and Q8_1 routes first convert the native KV cache into an FP32 workspace,
+ * so the conversion span must include the batch dimension too.  A one-request
+ * test cannot detect a missing batch factor: request zero remains valid while
+ * request one reads beyond the temporary allocation and can hard-fault the GPU.
+ *
+ * This regression uses the exact dense Qwen 3.6 attention geometry that exposed
+ * the defect and sweeps every production prefill storage route.  Each request
+ * contains different values and is compared against the same ROCm backend run
+ * with batch size one.  Raw FP32 byte equality is required because changing the
+ * request batch must not change the per-request forward pass.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    FlashAttn2_RequestBatchedPrefillAllKVFormatsMatchesIsolatedRequestsByteExact)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int batch_size = 2;
+    constexpr int seq_len = 16;
+    constexpr int n_heads = 24;
+    constexpr int n_kv_heads = 4;
+    constexpr int head_dim = 256;
+    constexpr int q_width = n_heads * head_dim;
+    constexpr int kv_width = n_kv_heads * head_dim;
+    constexpr int total_rows = batch_size * seq_len;
+    constexpr std::array<int, batch_size> request_lengths{seq_len, 11};
+    const size_t q_elements = static_cast<size_t>(total_rows) * q_width;
+    const size_t kv_elements = static_cast<size_t>(total_rows) * kv_width;
+    const size_t request_output_elements =
+        static_cast<size_t>(seq_len) * q_width;
+
+    std::vector<float> q_data = randomFP32Scaled(q_elements, 0.25f);
+    std::vector<float> k_data = randomFP32Scaled(kv_elements, 0.25f);
+    std::vector<float> v_data = randomFP32Scaled(kv_elements, 0.25f);
+    for (int row = request_lengths[1]; row < seq_len; ++row)
+    {
+        const size_t q_row =
+            static_cast<size_t>(seq_len + row) * q_width;
+        const size_t kv_row =
+            static_cast<size_t>(seq_len + row) * kv_width;
+        std::fill_n(
+            q_data.begin() + static_cast<std::ptrdiff_t>(q_row),
+            q_width,
+            700.0f + static_cast<float>(row));
+        std::fill_n(
+            k_data.begin() + static_cast<std::ptrdiff_t>(kv_row),
+            kv_width,
+            -800.0f - static_cast<float>(row));
+        std::fill_n(
+            v_data.begin() + static_cast<std::ptrdiff_t>(kv_row),
+            kv_width,
+            900.0f + static_cast<float>(row));
+    }
+    const DeviceId gpu_device = DeviceId::rocm(0);
+
+    auto makeFP32 = [](const std::vector<float> &values, int rows, int width)
+        -> std::shared_ptr<TensorBase>
+    {
+        auto tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows),
+                                static_cast<size_t>(width)});
+        std::copy(values.begin(), values.end(), tensor->mutable_data());
+        return tensor;
+    };
+
+    auto makeKV = [](
+                      const std::vector<float> &values,
+                      int rows,
+                      int width,
+                      ActivationPrecision precision)
+        -> std::shared_ptr<TensorBase>
+    {
+        const std::vector<size_t> shape{
+            static_cast<size_t>(rows), static_cast<size_t>(width)};
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case ActivationPrecision::FP16:
+        {
+            std::vector<uint16_t> fp16(values.size());
+            quantizeToFP16(values.data(), fp16.data(), values.size());
+            return std::make_shared<FP16Tensor>(shape, std::move(fp16));
+        }
+        case ActivationPrecision::Q8_1:
+            return Q8_1Tensor::quantize_from_fp32(values.data(), shape);
+        default:
+            return nullptr;
+        }
+    };
+
+    const std::vector<ActivationPrecision> precisions{
+        ActivationPrecision::FP32,
+        ActivationPrecision::FP16,
+        ActivationPrecision::Q8_1,
+    };
+    for (const ActivationPrecision precision : precisions)
+    {
+        const char *format_name =
+            precision == ActivationPrecision::FP32
+                ? "FP32"
+                : (precision == ActivationPrecision::FP16 ? "FP16" : "Q8_1");
+        SCOPED_TRACE(format_name);
+
+        auto q_batch = makeFP32(q_data, total_rows, q_width);
+        auto k_batch = makeKV(k_data, total_rows, kv_width, precision);
+        auto v_batch = makeKV(v_data, total_rows, kv_width, precision);
+        auto output_batch = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(total_rows),
+                                static_cast<size_t>(q_width)});
+        ASSERT_NE(k_batch, nullptr);
+        ASSERT_NE(v_batch, nullptr);
+
+        llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
+            batch_kernel(0);
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device,
+            {q_batch.get(), k_batch.get(), v_batch.get()},
+            {output_batch.get()},
+            [&]
+            {
+                return batch_kernel.compute_tensor(
+                    q_batch.get(), k_batch.get(), v_batch.get(),
+                    output_batch.get(),
+                    batch_size, seq_len, seq_len,
+                    n_heads, n_kv_heads, head_dim,
+                    /*causal=*/true, /*window_size=*/-1,
+                    /*workspace_scores=*/nullptr,
+                    /*workspace_mask=*/nullptr,
+                    &mpi_ctx_, /*device_idx=*/0);
+            }));
+
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const int request_seq_len = request_lengths[request];
+            const size_t q_begin =
+                static_cast<size_t>(request) * request_output_elements;
+            const size_t kv_begin =
+                static_cast<size_t>(request) *
+                static_cast<size_t>(seq_len) * kv_width;
+            const std::vector<float> q_request(
+                q_data.begin() + static_cast<std::ptrdiff_t>(q_begin),
+                q_data.begin() + static_cast<std::ptrdiff_t>(
+                                     q_begin +
+                                     static_cast<size_t>(request_seq_len) *
+                                         q_width));
+            const std::vector<float> k_request(
+                k_data.begin() + static_cast<std::ptrdiff_t>(kv_begin),
+                k_data.begin() + static_cast<std::ptrdiff_t>(
+                                     kv_begin +
+                                     static_cast<size_t>(request_seq_len) *
+                                         kv_width));
+            const std::vector<float> v_request(
+                v_data.begin() + static_cast<std::ptrdiff_t>(kv_begin),
+                v_data.begin() + static_cast<std::ptrdiff_t>(
+                                     kv_begin +
+                                     static_cast<size_t>(request_seq_len) *
+                                         kv_width));
+
+            auto q_single = makeFP32(q_request, request_seq_len, q_width);
+            auto k_single = makeKV(
+                k_request, request_seq_len, kv_width, precision);
+            auto v_single = makeKV(
+                v_request, request_seq_len, kv_width, precision);
+            auto output_single = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(request_seq_len),
+                                    static_cast<size_t>(q_width)});
+            ASSERT_NE(k_single, nullptr);
+            ASSERT_NE(v_single, nullptr);
+
+            llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
+                single_kernel(0);
+            ASSERT_TRUE(with_gpu_coherence(
+                gpu_device,
+                {q_single.get(), k_single.get(), v_single.get()},
+                {output_single.get()},
+                [&]
+                {
+                    return single_kernel.compute_tensor(
+                        q_single.get(), k_single.get(), v_single.get(),
+                        output_single.get(),
+                        /*batch_size=*/1,
+                        request_seq_len,
+                        request_seq_len,
+                        n_heads, n_kv_heads, head_dim,
+                        /*causal=*/true, /*window_size=*/-1,
+                        /*workspace_scores=*/nullptr,
+                        /*workspace_mask=*/nullptr,
+                        &mpi_ctx_, /*device_idx=*/0);
+                }));
+
+            ASSERT_TRUE(expectBitwiseEqualFP32Rows(
+                output_batch->data() + q_begin,
+                output_single->data(),
+                static_cast<size_t>(request_seq_len) * q_width,
+                std::string("ROCm request-batched prefill ") + format_name +
+                    " request=" + std::to_string(request)));
+        }
+    }
+}
+
+/**
+ * @brief Prove captured request-batch cache publication reads every ROCm ring.
+ *
+ * A direct batched-attention test cannot catch cache-topology defects because
+ * it starts with an already-contiguous K/V tensor. Production prefill first
+ * appends each request into an independent ring allocation, then asks the cache
+ * to materialize a compact request-major view for attention. The original
+ * broken implementation either published metadata only for request zero or
+ * treated request zero's allocation as if all request rings followed it in
+ * memory. In a two-cache worker, storing immutable entry pointers in shared
+ * named workspace could also let the MTP cache overwrite the main cache's
+ * topology before graph capture.
+ *
+ * This regression captures the actual `KVCacheAppendStage -> resident cache
+ * gather -> AttentionComputeStage` chain. Request-specific K/V offsets make
+ * sequence-zero substitution immediately visible. Every ordinary ROCm ring
+ * storage type is exercised, and each request's FP32 output must be byte-for-
+ * byte identical to an isolated batch-one invocation of the same production
+ * attention kernel over the same native cache bytes.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    CapturedRequestBatchAllStandardKVFormatsMatchIsolatedPrefillBytes)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int batch_size = 2;
+    constexpr int seq_len = 8;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+    const size_t request_q_elements = static_cast<size_t>(seq_len) * q_cols;
+    const size_t request_kv_elements = static_cast<size_t>(seq_len) * kv_cols;
+    const size_t q_elements = static_cast<size_t>(batch_size) * request_q_elements;
+    const size_t kv_elements = static_cast<size_t>(batch_size) * request_kv_elements;
+    const DeviceId device = DeviceId::rocm(0);
+
+    std::vector<float> q_host = randomFP32Scaled(q_elements, 0.25f);
+    std::vector<float> k_host = randomFP32Scaled(kv_elements, 0.25f);
+    std::vector<float> v_host = randomFP32Scaled(kv_elements, 0.25f);
+    for (int request = 0; request < batch_size; ++request)
+    {
+        const size_t begin = static_cast<size_t>(request) * request_kv_elements;
+        for (size_t index = 0; index < request_kv_elements; ++index)
+        {
+            // Deliberately separate the two requests even if the seeded random
+            // vectors happen to contain locally similar values.
+            k_host[begin + index] += 0.25f * static_cast<float>(request);
+            v_host[begin + index] -= 0.35f * static_cast<float>(request);
+        }
+    }
+
+    auto makeFP32 = [](const std::vector<float> &values, size_t rows, size_t cols)
+        -> std::shared_ptr<TensorBase>
+    {
+        auto tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{rows, cols});
+        std::copy(values.begin(), values.end(), tensor->mutable_data());
+        return tensor;
+    };
+    auto makeNativeKV = [](
+                            const std::vector<float> &values,
+                            size_t rows,
+                            size_t cols,
+                            ActivationPrecision precision)
+        -> std::shared_ptr<TensorBase>
+    {
+        const std::vector<size_t> shape{rows, cols};
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case ActivationPrecision::FP16:
+        {
+            std::vector<uint16_t> fp16(values.size());
+            quantizeToFP16(values.data(), fp16.data(), values.size());
+            return std::make_shared<FP16Tensor>(shape, fp16);
+        }
+        case ActivationPrecision::BF16:
+        {
+            auto tensor = std::make_shared<BF16Tensor>(shape);
+            tensor->from_fp32(values.data(), values.size());
+            return tensor;
+        }
+        case ActivationPrecision::Q8_1:
+            return Q8_1Tensor::quantize_from_fp32(values.data(), shape);
+        default:
+            return nullptr;
+        }
+    };
+
+    struct FormatCase
+    {
+        ActivationPrecision precision;
+        const char *name;
+    };
+    constexpr std::array<FormatCase, 4> formats{{
+        {ActivationPrecision::FP32, "FP32"},
+        {ActivationPrecision::FP16, "FP16"},
+        {ActivationPrecision::BF16, "BF16"},
+        {ActivationPrecision::Q8_1, "Q8_1"},
+    }};
+
+    auto &transfer = TransferEngine::instance();
+    for (const FormatCase &format : formats)
+    {
+        SCOPED_TRACE(format.name);
+        auto q_tensor = makeFP32(q_host, batch_size * seq_len, q_cols);
+        auto k_tensor = makeNativeKV(
+            k_host, batch_size * seq_len, kv_cols, format.precision);
+        auto v_tensor = makeNativeKV(
+            v_host, batch_size * seq_len, kv_cols, format.precision);
+        auto batch_output = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(batch_size * seq_len), q_cols});
+        ASSERT_NE(k_tensor, nullptr);
+        ASSERT_NE(v_tensor, nullptr);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_TRUE(transfer.uploadFull(q_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(k_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(v_tensor.get(), device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(batch_output.get(), device, stream).success);
+
+        llaminar::v2::kernels::KVCacheConfig cache_config;
+        cache_config.precision = format.precision;
+        cache_config.device = device;
+        cache_config.num_layers = 1;
+        cache_config.batch_size = batch_size;
+        cache_config.max_seq_len = seq_len + 8;
+        cache_config.n_kv_heads = n_kv_heads;
+        cache_config.head_dim = head_dim;
+        auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(cache_config);
+        ASSERT_NE(kv_cache, nullptr);
+
+        auto *kv_workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kv_cache.get());
+        ASSERT_NE(kv_workspace_consumer, nullptr);
+        const WorkspaceRequirements kv_requirements =
+            kv_workspace_consumer->getWorkspaceRequirements(
+                /*m=*/seq_len,
+                /*n=*/batch_size,
+                /*k=*/head_dim);
+        DeviceWorkspaceManager kv_workspace(
+            device, kv_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(kv_workspace.allocate(kv_requirements));
+        kv_workspace_consumer->bindWorkspace(&kv_workspace);
+
+        KVCacheAppendStage append_stage({
+            .device_id = device,
+            .K = k_tensor.get(),
+            .V = v_tensor.get(),
+            .kv_cache = kv_cache.get(),
+            .layer_idx = 0,
+            .seq_idx = 0,
+            .num_tokens = batch_size * seq_len,
+            .batch_size = batch_size,
+            .seq_len = seq_len,
+            .head_dim = head_dim,
+        });
+        AttentionComputeStage attention_stage({
+            .device_id = device,
+            .mpi_ctx = &mpi_ctx_,
+            .Q = q_tensor.get(),
+            .K = k_tensor.get(),
+            .V = v_tensor.get(),
+            .output = batch_output.get(),
+            .batch_size = batch_size,
+            .seq_len = seq_len,
+            .kv_len = seq_len,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .causal = true,
+            .auto_detect_mode = true,
+            .kv_cache = kv_cache.get(),
+            .layer_idx = 0,
+            .read_kv_from_cache = true,
+        });
+        append_stage.setGPUStream(stream);
+        attention_stage.setGPUStream(stream);
+
+        const WorkspaceRequirements attention_requirements =
+            attention_stage.getWorkspaceRequirements(
+                /*m=*/batch_size * seq_len,
+                /*n=*/n_heads,
+                /*k=*/head_dim);
+        DeviceWorkspaceManager attention_workspace(
+            device, attention_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(attention_workspace.allocate(attention_requirements));
+        attention_stage.bindWorkspace(&attention_workspace);
+
+        append_stage.updateDynamicParams(/*pos_offset=*/0, seq_len);
+        attention_stage.updateDynamicParams(/*pos_offset=*/0, seq_len);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        /*
+         * ROCm's rocBLAS prefill implementation owns a persistent stream pool,
+         * hipBLAS handles, events, and score buffers. Production graph planning
+         * initializes those resources before capture because HIP forbids their
+         * lazy allocation while a global capture is active. Reading an empty
+         * cache is sufficient for that one-time planning launch and leaves all
+         * ring metadata untouched; the append and the cache read being proved
+         * remain wholly inside the graph below.
+         */
+        ASSERT_TRUE(attention_stage.execute(nullptr));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok =
+                append_stage.execute(nullptr) && attention_stage.execute(nullptr);
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+        ASSERT_NE(graph_exec, nullptr);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        EXPECT_EQ(kv_cache->get_cached_tokens(0, 0), seq_len);
+        EXPECT_EQ(kv_cache->get_cached_tokens(0, 1), seq_len);
+
+        std::vector<float> actual(q_elements, 0.0f);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                actual.data(), batch_output->gpu_data_ptr(),
+                q_elements * sizeof(float), hipMemcpyDeviceToHost, stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
+            serial_kernel(0);
+        serial_kernel.setGPUStream(stream);
+        const WorkspaceRequirements serial_requirements =
+            serial_kernel.getWorkspaceRequirements(
+                /*m=*/1, /*n=*/n_heads, /*k=*/head_dim);
+        DeviceWorkspaceManager serial_workspace(
+            device, serial_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(serial_workspace.allocate(serial_requirements));
+        serial_kernel.bindWorkspace(&serial_workspace);
+
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const size_t q_begin =
+                static_cast<size_t>(request) * request_q_elements;
+            const size_t kv_begin =
+                static_cast<size_t>(request) * request_kv_elements;
+            const std::vector<float> q_request(
+                q_host.begin() + static_cast<std::ptrdiff_t>(q_begin),
+                q_host.begin() + static_cast<std::ptrdiff_t>(
+                                     q_begin + request_q_elements));
+            const std::vector<float> k_request(
+                k_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
+                k_host.begin() + static_cast<std::ptrdiff_t>(
+                                     kv_begin + request_kv_elements));
+            const std::vector<float> v_request(
+                v_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
+                v_host.begin() + static_cast<std::ptrdiff_t>(
+                                     kv_begin + request_kv_elements));
+            auto q_single = makeFP32(q_request, seq_len, q_cols);
+            auto k_single = makeNativeKV(
+                k_request, seq_len, kv_cols, format.precision);
+            auto v_single = makeNativeKV(
+                v_request, seq_len, kv_cols, format.precision);
+            auto output_single = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+            ASSERT_NE(k_single, nullptr);
+            ASSERT_NE(v_single, nullptr);
+            ASSERT_TRUE(transfer.uploadFull(q_single.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(k_single.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(v_single.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(output_single.get(), device, stream).success);
+
+            ASSERT_TRUE(serial_kernel.compute_tensor(
+                q_single.get(), k_single.get(), v_single.get(),
+                output_single.get(),
+                /*batch_size=*/1,
+                seq_len,
+                seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                /*causal=*/true,
+                /*window_size=*/-1,
+                /*workspace_scores=*/nullptr,
+                /*workspace_mask=*/nullptr,
+                &mpi_ctx_,
+                /*device_idx=*/0,
+                /*head_start=*/0,
+                /*local_n_heads=*/n_heads,
+                /*local_n_kv_heads=*/n_kv_heads,
+                /*gqa_n_rep=*/n_heads / n_kv_heads));
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            std::vector<float> expected(request_q_elements, 0.0f);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    expected.data(), output_single->gpu_data_ptr(),
+                    request_q_elements * sizeof(float),
+                    hipMemcpyDeviceToHost, stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                actual.data() + q_begin,
+                expected.data(),
+                request_q_elements,
+                std::string("captured ROCm request-batch cache ") +
+                    format.name + " request=" + std::to_string(request)));
+        }
+
+        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    }
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen2ScaleStress)

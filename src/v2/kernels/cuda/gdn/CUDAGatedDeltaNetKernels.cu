@@ -20,8 +20,10 @@
  */
 
 #include "../ops/CUDAHelpers.cuh"
+#include "../../../utils/DebugEnv.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 
 namespace
 { // anonymous namespace to avoid symbol conflicts with ROCm kernels
@@ -40,6 +42,23 @@ namespace
     //      (was 16 blocks / 108 SMs, now 32+ blocks)
     // =========================================================================
 
+    /**
+     * @brief Advance one or more request-local GDN rows with scalar-decode arithmetic.
+     *
+     * The temporal recurrence is inherently serial.  Grouped MTP verification
+     * therefore gains useful work by keeping a block resident for M=2..4 rows,
+     * not by partitioning the `d_k` dot products and changing their reduction
+     * tree.  Scalar decode calls this exact kernel with `request_seq_len == 1`;
+     * grouped verification calls it with a small larger value.  Both routes
+     * consequently execute the same preprocessing, the same `j=0..d_k-1`
+     * accumulation order, and the same state update expressions.
+     *
+     * Request identity is flattened into grid X while grid Y owns independent
+     * value-column tiles.  A block processes its request rows in order and
+     * optionally snapshots the complete post-row state.  There is one kernel
+     * launch for the whole request matrix and no host or launch-level row
+     * replay.
+     */
     __global__ void cuda_gdn_recurrent_step_kernel(
         const float *__restrict__ q,        // [n_heads * d_k]
         const float *__restrict__ k,        // [n_heads * d_k]
@@ -50,13 +69,19 @@ namespace
         const float *__restrict__ dt_bias,  // [n_heads]
         float *__restrict__ output,         // [n_heads * d_v]
         float *__restrict__ state,          // [n_heads, d_k, d_v]
+        int request_count, int request_seq_len,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *__restrict__ effective_seq_len_ptr,
-        int effective_row_idx)
+        int effective_row_idx,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows)
     {
-        const int h = blockIdx.x;
-        if (h >= n_heads)
+        const int request_head = blockIdx.x;
+        const int request = request_head / n_heads;
+        const int h = request_head - request * n_heads;
+        if (request >= request_count || h >= n_heads)
             return;
 
         const int tid = threadIdx.x;
@@ -65,141 +90,167 @@ namespace
         // Column this thread handles (2D grid: blockIdx.y selects column tile)
         const int vi = blockIdx.y * block_size + tid;
 
-        // Pointers for this head
-        const float *q_head = q + h * d_k;
-        const float *k_head = k + h * d_k;
-        const float *v_head = v + h * d_v;
-        float *S = state + (size_t)h * d_k * d_v;
-        float *o_head = output + h * d_v;
-
-        if (effective_seq_len_ptr && effective_row_idx >= *effective_seq_len_ptr)
-        {
-            if (vi < d_v)
-                o_head[vi] = 0.0f;
-            return;
-        }
+        // Request-local state persists across every row processed by this block.
+        const size_t request_qk_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(d_k);
+        const size_t request_v_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(d_v);
+        const size_t request_state_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) *
+            static_cast<size_t>(d_v);
+        float *S =
+            state + static_cast<size_t>(request) * request_state_stride +
+            static_cast<size_t>(h) * d_k * d_v;
 
         // Shared memory for preprocessed Q and K
         extern __shared__ float smem[];
         float *q_local = smem;       // [d_k]
         float *k_local = smem + d_k; // [d_k]
 
-        // ── Step 0: Preprocessing ──
         const float scale = rsqrtf((float)d_k);
-
-        // Load Q and K into shared memory
-        for (int i = tid; i < d_k; i += block_size)
-        {
-            q_local[i] = q_head[i];
-            k_local[i] = k_head[i];
-        }
-        __syncthreads();
-
-        // L2 normalize Q and K if requested
-        if (use_qk_l2norm)
-        {
-            // Compute Q norm
-            float q_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
-                q_sum += q_local[i] * q_local[i];
-
-            // Warp-level reduction
-            for (int offset = 16; offset > 0; offset >>= 1)
-                q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
-
-            // Cross-warp reduction via shared memory
-            __shared__ float warp_sums[8]; // max 256 threads = 8 warps
-            int warp_id = tid / 32;
-            int lane_id = tid % 32;
-            if (lane_id == 0)
-                warp_sums[warp_id] = q_sum;
-            __syncthreads();
-            if (tid == 0)
-            {
-                float total = 0.0f;
-                int num_warps = (block_size + 31) / 32;
-                for (int w = 0; w < num_warps; w++)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
-            }
-            __syncthreads();
-            float q_norm_sq = warp_sums[0];
-            float q_inv = scale / fmaxf(sqrtf(q_norm_sq), 1e-6f);
-
-            // Apply Q scale
-            for (int i = tid; i < d_k; i += block_size)
-                q_local[i] *= q_inv;
-            __syncthreads();
-
-            // Compute K norm
-            float k_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
-                k_sum += k_local[i] * k_local[i];
-            for (int offset = 16; offset > 0; offset >>= 1)
-                k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
-            if (lane_id == 0)
-                warp_sums[warp_id] = k_sum;
-            __syncthreads();
-            if (tid == 0)
-            {
-                float total = 0.0f;
-                int num_warps = (block_size + 31) / 32;
-                for (int w = 0; w < num_warps; w++)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
-            }
-            __syncthreads();
-            float k_norm_sq = warp_sums[0];
-            float k_inv = 1.0f / fmaxf(sqrtf(k_norm_sq), 1e-6f);
-
-            for (int i = tid; i < d_k; i += block_size)
-                k_local[i] *= k_inv;
-            __syncthreads();
-        }
-        else
-        {
-            // Just scale Q
-            for (int i = tid; i < d_k; i += block_size)
-                q_local[i] *= scale;
-            __syncthreads();
-        }
-
-        // Compute gate and beta (single thread, broadcast via shared mem)
+        __shared__ float warp_sums[8]; // At most two warps on this kernel route.
         __shared__ float decay_shared;
         __shared__ float beta_shared;
-        if (tid == 0)
-        {
-            float x = alpha[h] + dt_bias[h];
-            float sp = (x > 20.0f) ? x : log1pf(expf(x));
-            decay_shared = expf(A_log[h] * sp);
-            beta_shared = 1.0f / (1.0f + expf(-beta_raw[h]));
-        }
-        __syncthreads();
-        float decay = decay_shared;
-        float beta_h = beta_shared;
+        const int warp_id = tid / 32;
+        const int lane_id = tid % 32;
+        const int num_warps = (block_size + 31) / 32;
 
-        // Fused per-column processing — NO separate decay pass
-        if (vi < d_v)
+        for (int request_row = 0; request_row < request_seq_len; ++request_row)
         {
-            // Pass 1: Fused decay + kv dot product (read-only, no write-back)
-            float kv = 0.0f;
-            for (int j = 0; j < d_k; j++)
+            const int flat_row = request * request_seq_len + request_row;
+            const float *q_head =
+                q + static_cast<size_t>(flat_row) * request_qk_stride +
+                static_cast<size_t>(h) * d_k;
+            const float *k_head =
+                k + static_cast<size_t>(flat_row) * request_qk_stride +
+                static_cast<size_t>(h) * d_k;
+            const float *v_head =
+                v + static_cast<size_t>(flat_row) * request_v_stride +
+                static_cast<size_t>(h) * d_v;
+            float *o_head =
+                output + static_cast<size_t>(flat_row) * request_v_stride +
+                static_cast<size_t>(h) * d_v;
+
+            const int logical_row = effective_row_idx + request_row;
+            if (effective_seq_len_ptr &&
+                logical_row >= effective_seq_len_ptr[request])
             {
-                float s_decayed = S[j * d_v + vi] * decay;
-                kv += s_decayed * k_local[j];
+                if (vi < d_v)
+                    o_head[vi] = 0.0f;
+                __syncthreads();
+                continue;
             }
 
-            float delta = (v_head[vi] - kv) * beta_h;
-
-            // Pass 2: Fused decay + delta update + output (read-modify-write)
-            float out_vi = 0.0f;
-            for (int j = 0; j < d_k; j++)
+            // Load and preprocess Q/K exactly as the M=1 scalar route does.
+            for (int i = tid; i < d_k; i += block_size)
             {
-                float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-                S[j * d_v + vi] = s_new;
-                out_vi += s_new * q_local[j];
+                q_local[i] = q_head[i];
+                k_local[i] = k_head[i];
             }
-            o_head[vi] = out_vi;
+            __syncthreads();
+
+            if (use_qk_l2norm)
+            {
+                float q_sum = 0.0f;
+                for (int i = tid; i < d_k; i += block_size)
+                    q_sum += q_local[i] * q_local[i];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
+                if (lane_id == 0)
+                    warp_sums[warp_id] = q_sum;
+                __syncthreads();
+                if (tid == 0)
+                {
+                    float total = 0.0f;
+                    for (int w = 0; w < num_warps; ++w)
+                        total += warp_sums[w];
+                    warp_sums[0] = total;
+                }
+                __syncthreads();
+                const float q_inv =
+                    scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                for (int i = tid; i < d_k; i += block_size)
+                    q_local[i] *= q_inv;
+                __syncthreads();
+
+                float k_sum = 0.0f;
+                for (int i = tid; i < d_k; i += block_size)
+                    k_sum += k_local[i] * k_local[i];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
+                if (lane_id == 0)
+                    warp_sums[warp_id] = k_sum;
+                __syncthreads();
+                if (tid == 0)
+                {
+                    float total = 0.0f;
+                    for (int w = 0; w < num_warps; ++w)
+                        total += warp_sums[w];
+                    warp_sums[0] = total;
+                }
+                __syncthreads();
+                const float k_inv =
+                    1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                for (int i = tid; i < d_k; i += block_size)
+                    k_local[i] *= k_inv;
+                __syncthreads();
+            }
+            else
+            {
+                for (int i = tid; i < d_k; i += block_size)
+                    q_local[i] *= scale;
+                __syncthreads();
+            }
+
+            if (tid == 0)
+            {
+                const size_t gate_index =
+                    static_cast<size_t>(flat_row) *
+                        static_cast<size_t>(n_heads) +
+                    h;
+                const float x = alpha[gate_index] + dt_bias[h];
+                const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+                decay_shared = expf(A_log[h] * sp);
+                beta_shared =
+                    1.0f / (1.0f + expf(-beta_raw[gate_index]));
+            }
+            __syncthreads();
+            const float decay = decay_shared;
+            const float beta_h = beta_shared;
+
+            if (vi < d_v)
+            {
+                float kv = 0.0f;
+                for (int j = 0; j < d_k; ++j)
+                {
+                    const float s_decayed = S[j * d_v + vi] * decay;
+                    kv += s_decayed * k_local[j];
+                }
+
+                const float delta = (v_head[vi] - kv) * beta_h;
+                float out_vi = 0.0f;
+                float *snapshot =
+                    state_snapshots && flat_row < max_snapshot_rows
+                        ? state_snapshots +
+                              static_cast<size_t>(flat_row) *
+                                  static_cast<size_t>(snapshot_stride_floats) +
+                              static_cast<size_t>(h) * d_k * d_v
+                        : nullptr;
+                for (int j = 0; j < d_k; ++j)
+                {
+                    const float s_new =
+                        S[j * d_v + vi] * decay + k_local[j] * delta;
+                    S[j * d_v + vi] = s_new;
+                    if (snapshot)
+                        snapshot[j * d_v + vi] = s_new;
+                    out_vi += s_new * q_local[j];
+                }
+                o_head[vi] = out_vi;
+            }
+
+            // No thread may overwrite shared Q/K for the next row while a
+            // sibling is still consuming the current row.
+            __syncthreads();
         }
     }
 
@@ -231,12 +282,14 @@ namespace
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
         int max_snapshot_rows,
-        int seq_len, int n_heads, int d_k, int d_v,
+        int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         bool inputs_preprocessed)
     {
+        const int request = blockIdx.z;
         const int h = blockIdx.x;
-        if (h >= n_heads)
+        if (request >= request_count || h >= n_heads)
             return;
 
         const int tid = threadIdx.x;
@@ -256,7 +309,12 @@ namespace
         const int v_stride = n_heads * d_v;
         const float scale = rsqrtf((float)d_k);
 
-        float *S = state + (size_t)h * d_k * d_v;
+        const int request_row_base = request * request_seq_len;
+        const size_t request_state_stride =
+            static_cast<size_t>(n_heads) * d_k * d_v;
+        float *S = state +
+                   static_cast<size_t>(request) * request_state_stride +
+                   static_cast<size_t>(h) * d_k * d_v;
 
         extern __shared__ float smem[];
         float *q_local = smem;       // [d_k]
@@ -282,11 +340,15 @@ namespace
             __syncthreads();
         }
 
-        int effective_seq_len = seq_len;
+        int effective_seq_len = request_seq_len;
         if (effective_seq_len_ptr)
         {
-            const int raw_effective = *effective_seq_len_ptr;
-            effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+            const int raw_effective = effective_seq_len_ptr[request];
+            effective_seq_len = raw_effective < 0
+                                    ? 0
+                                    : (raw_effective > request_seq_len
+                                           ? request_seq_len
+                                           : raw_effective);
         }
 
         // Keep this thread's recurrence-state slice resident across the entire
@@ -310,12 +372,13 @@ namespace
         }
 
         // Process each timestep sequentially (inherent to recurrence)
-        for (int t = 0; t < seq_len; t++)
+        for (int t = 0; t < request_seq_len; t++)
         {
-            const float *q_src = Q + t * qk_stride + h * d_k;
-            const float *k_src = K + t * qk_stride + h * d_k;
-            const float *v_src = V + t * v_stride + h * d_v;
-            float *o_dst = output + t * v_stride + h * d_v;
+            const int row = request_row_base + t;
+            const float *q_src = Q + row * qk_stride + h * d_k;
+            const float *k_src = K + row * qk_stride + h * d_k;
+            const float *v_src = V + row * v_stride + h * d_v;
+            float *o_dst = output + row * v_stride + h * d_v;
 
             if (t >= effective_seq_len)
             {
@@ -397,7 +460,7 @@ namespace
             float decay, beta_h;
             if (inputs_preprocessed)
             {
-                const int gate_idx = t * n_heads + h;
+                const int gate_idx = row * n_heads + h;
                 decay = alpha[gate_idx];
                 beta_h = beta_raw[gate_idx];
             }
@@ -405,10 +468,10 @@ namespace
             {
                 if (tid == 0)
                 {
-                    float x = alpha[t * n_heads + h] + dt_bias_h;
+                    float x = alpha[row * n_heads + h] + dt_bias_h;
                     float sp = (x > 20.0f) ? x : log1pf(expf(x));
                     warp_sums[0] = expf(A_log_h * sp);
-                    warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
+                    warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[row * n_heads + h]));
                 }
                 __syncthreads();
                 decay = warp_sums[0];
@@ -458,11 +521,14 @@ namespace
                 o_dst[vi] = out_vi;
             }
 
-            if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows && vi < d_v)
+            if (state_snapshots &&
+                t < effective_seq_len &&
+                row < max_snapshot_rows &&
+                vi < d_v)
             {
                 float *snapshot =
                     state_snapshots +
-                    static_cast<size_t>(t) * static_cast<size_t>(snapshot_stride_floats) +
+                    static_cast<size_t>(row) * static_cast<size_t>(snapshot_stride_floats) +
                     static_cast<size_t>(h) * static_cast<size_t>(d_k) * static_cast<size_t>(d_v);
 #pragma unroll
                 for (int j = 0; j < ROWS_PER_SPLIT; ++j)
@@ -486,12 +552,31 @@ namespace
         float *__restrict__ beta_raw,
         const float *__restrict__ A_log,
         const float *__restrict__ dt_bias,
-        int seq_len, int n_heads, int d_k,
+        const int *__restrict__ effective_seq_lens,
+        int request_count, int request_seq_len,
+        int n_heads, int d_k,
         bool use_qk_l2norm)
     {
-        const int h = blockIdx.x;
-        const int t = blockIdx.y;
-        if (h >= n_heads || t >= seq_len)
+        const int work = blockIdx.x;
+        const int h = work % n_heads;
+        const int row = work / n_heads;
+        const int request = row / request_seq_len;
+        const int request_row = row - request * request_seq_len;
+        if (request >= request_count || h >= n_heads)
+            return;
+        if (effective_seq_lens)
+        {
+            const int raw_effective = effective_seq_lens[request];
+            const int effective = raw_effective < 0
+                                      ? 0
+                                      : (raw_effective > request_seq_len
+                                             ? request_seq_len
+                                             : raw_effective);
+            if (request_row >= effective)
+                return;
+        }
+
+        if (row >= request_count * request_seq_len)
             return;
 
         const int tid = threadIdx.x;
@@ -499,8 +584,8 @@ namespace
         const int qk_stride = n_heads * d_k;
         const float scale = rsqrtf(static_cast<float>(d_k));
 
-        float *q_head = Q + t * qk_stride + h * d_k;
-        float *k_head = K + t * qk_stride + h * d_k;
+        float *q_head = Q + row * qk_stride + h * d_k;
+        float *k_head = K + row * qk_stride + h * d_k;
 
         __shared__ float warp_sums[8];
         const int warp_id = tid / 32;
@@ -564,7 +649,7 @@ namespace
 
         if (tid == 0)
         {
-            const int gate_idx = t * n_heads + h;
+            const int gate_idx = row * n_heads + h;
             const float x = alpha[gate_idx] + dt_bias[h];
             const float sp = (x > 20.0f) ? x : log1pf(expf(x));
             alpha[gate_idx] = expf(A_log[h] * sp);
@@ -823,6 +908,247 @@ namespace
         }
     }
 
+    /**
+     * @brief Grouped short-conv for small request-local row groups.
+     *
+     * One lane owns one `(request, channel)` pair and advances that channel in
+     * row order. This preserves the scalar decode accumulation order while a
+     * single launch covers the entire request matrix. Padded rows are zeroed,
+     * and each request commits state after its own device-resident real length.
+     */
+    __global__ void cuda_short_conv1d_batched_small_m_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ weight,
+        const float *__restrict__ bias,
+        float *__restrict__ output,
+        float *__restrict__ request_states,
+        const int *__restrict__ request_seq_lens,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int request_count,
+        int request_seq_len,
+        int channels,
+        int kernel_size,
+        bool apply_silu)
+    {
+        const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+        const int request = blockIdx.y;
+        if (ch >= channels || request >= request_count)
+            return;
+
+        const int ks_minus1 = kernel_size - 1;
+        if (ks_minus1 <= 0)
+            return;
+
+        const int raw_real_len = request_seq_lens[request];
+        const int real_len =
+            raw_real_len < 0 ? 0 :
+            (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+        const size_t row_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(request_seq_len);
+        const size_t element_base = row_base * static_cast<size_t>(channels);
+        const size_t state_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(channels) *
+            static_cast<size_t>(ks_minus1);
+        float *channel_state =
+            request_states + state_base +
+            static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+        const float *channel_weight =
+            weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
+
+        for (int t = 0; t < request_seq_len; ++t)
+        {
+            float sum = 0.0f;
+            if (t < real_len)
+            {
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    const int src_t = t - ks_minus1 + k;
+                    const float value =
+                        src_t >= 0
+                            ? input[element_base +
+                                    static_cast<size_t>(src_t) * channels + ch]
+                            : channel_state[ks_minus1 + src_t];
+                    sum += value * channel_weight[k];
+                }
+                if (bias)
+                    sum += bias[ch];
+                if (apply_silu)
+                    sum = sum / (1.0f + expf(-sum));
+            }
+            output[element_base + static_cast<size_t>(t) * channels + ch] = sum;
+
+            const int snapshot_row =
+                request * request_seq_len + t;
+            if (state_snapshots &&
+                t < real_len &&
+                snapshot_row < max_snapshot_rows)
+            {
+                float *snapshot =
+                    state_snapshots +
+                    static_cast<size_t>(snapshot_row) *
+                        static_cast<size_t>(snapshot_stride_floats) +
+                    static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+                for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+                {
+                    const int src_t = t - ks_minus1 + 1 + state_idx;
+                    snapshot[state_idx] =
+                        src_t >= 0
+                            ? input[element_base +
+                                    static_cast<size_t>(src_t) * channels + ch]
+                            : channel_state[ks_minus1 + src_t];
+                }
+            }
+        }
+
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        {
+            const int src_t = real_len - ks_minus1 + state_idx;
+            channel_state[state_idx] =
+                src_t >= 0 && src_t < real_len
+                    ? input[element_base +
+                            static_cast<size_t>(src_t) * channels + ch]
+                    : channel_state[ks_minus1 + src_t];
+        }
+    }
+
+    /**
+     * @brief Grouped long-prefill convolution over flattened request rows.
+     *
+     * Every thread computes one `(request, row, channel)` output. Request-local
+     * indexing prevents padding or a neighboring request from entering the
+     * causal window. State publication is performed by the companion grouped
+     * commit kernel after all outputs have stopped reading initial state.
+     */
+    __global__ void cuda_short_conv1d_batched_prefill_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ weight,
+        const float *__restrict__ bias,
+        float *__restrict__ output,
+        const float *__restrict__ request_states,
+        const int *__restrict__ request_seq_lens,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int request_count,
+        int request_seq_len,
+        int channels,
+        int kernel_size,
+        bool apply_silu)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int request_elements = request_seq_len * channels;
+        const int total = request_count * request_elements;
+        if (idx >= total)
+            return;
+
+        const int request = idx / request_elements;
+        const int request_element = idx - request * request_elements;
+        const int t = request_element / channels;
+        const int ch = request_element - t * channels;
+        const int ks_minus1 = kernel_size - 1;
+        const int raw_real_len = request_seq_lens[request];
+        const int real_len =
+            raw_real_len < 0 ? 0 :
+            (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+        const size_t row_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(request_seq_len);
+        const size_t element_base = row_base * static_cast<size_t>(channels);
+        const float *channel_state =
+            request_states +
+            static_cast<size_t>(request) * channels * ks_minus1 +
+            static_cast<size_t>(ch) * ks_minus1;
+
+        float sum = 0.0f;
+        if (t < real_len)
+        {
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                const int src_t = t - ks_minus1 + k;
+                const float value =
+                    src_t >= 0
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_state[ks_minus1 + src_t];
+                sum += value * weight[ch * kernel_size + k];
+            }
+            if (bias)
+                sum += bias[ch];
+            if (apply_silu)
+                sum = sum / (1.0f + expf(-sum));
+        }
+        output[element_base + static_cast<size_t>(t) * channels + ch] = sum;
+
+        const int snapshot_row = request * request_seq_len + t;
+        if (state_snapshots &&
+            t < real_len &&
+            snapshot_row < max_snapshot_rows)
+        {
+            float *snapshot =
+                state_snapshots +
+                static_cast<size_t>(snapshot_row) *
+                    static_cast<size_t>(snapshot_stride_floats) +
+                static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = t - ks_minus1 + 1 + state_idx;
+                snapshot[state_idx] =
+                    src_t >= 0
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_state[ks_minus1 + src_t];
+            }
+        }
+    }
+
+    /** @brief Commit each request's terminal real-row convolution state. */
+    __global__ void cuda_short_conv1d_batched_state_update_kernel(
+        const float *__restrict__ input,
+        float *__restrict__ request_states,
+        const int *__restrict__ request_seq_lens,
+        int request_count,
+        int request_seq_len,
+        int channels,
+        int kernel_size)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = request_count * channels;
+        if (idx >= total)
+            return;
+
+        const int request = idx / channels;
+        const int ch = idx - request * channels;
+        const int ks_minus1 = kernel_size - 1;
+        if (ks_minus1 <= 0)
+            return;
+        const int raw_real_len = request_seq_lens[request];
+        const int real_len =
+            raw_real_len < 0 ? 0 :
+            (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+        const size_t element_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(request_seq_len) *
+            static_cast<size_t>(channels);
+        float *channel_state =
+            request_states +
+            static_cast<size_t>(request) * channels * ks_minus1 +
+            static_cast<size_t>(ch) * ks_minus1;
+
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        {
+            const int src_t = real_len - ks_minus1 + state_idx;
+            channel_state[state_idx] =
+                src_t >= 0 && src_t < real_len
+                    ? input[element_base +
+                            static_cast<size_t>(src_t) * channels + ch]
+                    : channel_state[ks_minus1 + src_t];
+        }
+    }
+
     // =========================================================================
     // GatedRMSNorm Kernel
     //
@@ -1071,6 +1397,7 @@ namespace
         const int *__restrict__ row_indices,
         int request_count,
         int row_index_stride,
+        int request_row_width,
         int rows,
         int state_size)
     {
@@ -1089,7 +1416,11 @@ namespace
         {
             const int request = linear / state_size;
             const int state_offset = linear - request * state_size;
-            const int row = row_indices[request * row_index_stride];
+            const int metadata_value = row_indices[request * row_index_stride];
+            const int row =
+                request_row_width > 0
+                    ? request * request_row_width + metadata_value - 1
+                    : metadata_value;
             if (row < 0 || row >= rows)
                 continue;
             dst[linear] =
@@ -1347,6 +1678,7 @@ extern "C"
             device_row_indices,
             request_count,
             row_index_stride,
+            /*request_row_width=*/0,
             rows,
             state_size);
         cudaError_t err = cudaGetLastError();
@@ -1355,6 +1687,53 @@ extern "C"
             fprintf(stderr,
                     "[cudaGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
                     cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+        float *dst,
+        const float *capture,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream)
+    {
+        if (!dst || !capture || !device_request_seq_lens ||
+            request_count <= 0 || request_row_width <= 0 ||
+            rows < request_count * request_row_width ||
+            state_size <= 0 || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads = 256;
+        int blocks = ((request_count * state_size) + threads - 1) / threads;
+        blocks = std::max(1, std::min(blocks, 1024));
+        cuda_gdn_copy_capture_rows_from_device_indices_kernel<<<
+            blocks,
+            threads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            dst,
+            capture,
+            device_request_seq_lens,
+            request_count,
+            /*row_index_stride=*/1,
+            request_row_width,
+            rows,
+            state_size);
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths] %s\n",
+                    cudaGetErrorString(error));
             return false;
         }
         return true;
@@ -1607,9 +1986,13 @@ extern "C"
         cuda_gdn_recurrent_step_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             q, k, v, alpha, beta_raw, A_log, dt_bias,
             output, state,
+            /*request_count=*/1, /*request_seq_len=*/1,
             n_heads, d_k, d_v, use_qk_l2norm,
             nullptr,
-            -1);
+            -1,
+            /*state_snapshots=*/nullptr,
+            /*snapshot_stride_floats=*/0,
+            /*max_snapshot_rows=*/0);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -1643,14 +2026,149 @@ extern "C"
         cuda_gdn_recurrent_step_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             q, k, v, alpha, beta_raw, A_log, dt_bias,
             output, state,
+            /*request_count=*/1, /*request_seq_len=*/1,
             n_heads, d_k, d_v, use_qk_l2norm,
             device_effective_seq_len,
-            row_idx);
+            row_idx,
+            /*state_snapshots=*/nullptr,
+            /*snapshot_stride_floats=*/0,
+            /*max_snapshot_rows=*/0);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[cudaGDN_recurrent_step_effective_row] %s\n", cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaGDN_chunk_forward_batched_kernel_route(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        const int *device_effective_seq_len,
+        int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+            !output || !state || !stream ||
+            seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+            seq_len != request_count * request_seq_len ||
+            n_heads <= 0 || d_k <= 0 || d_v <= 0)
+        {
+            return false;
+        }
+
+        /*
+         * MTP verifier groups contain at most four rows, while request-batched
+         * execution may pad the same real rows into a slightly wider matrix.
+         * Keep widths through eight on the exact scalar recurrent-step kernel
+         * with `(request, head)` packed into grid X. M=1 continuation, M=2..4
+         * verification, and small padded batches therefore share one compiled
+         * arithmetic path and one launch.
+         */
+        if (request_seq_len <= 8)
+        {
+            if (llaminar2::debugEnv().runtime_debug.cuda_gdn_pointer_trace)
+            {
+                fprintf(
+                    stderr,
+                    "[cudaGDN_recurrent_step_batched] requests=%d heads=%d d_k=%d d_v=%d state=%p output=%p lengths=%p\n",
+                    request_count,
+                    n_heads,
+                    d_k,
+                    d_v,
+                    static_cast<void *>(state),
+                    static_cast<void *>(output),
+                    static_cast<const void *>(device_effective_seq_len));
+            }
+            int col_threads = 32;
+            if (d_v > 128)
+                col_threads = 64;
+            const int num_col_blocks =
+                (d_v + col_threads - 1) / col_threads;
+            const int smem_size =
+                2 * d_k * sizeof(float) + 8 * sizeof(float);
+
+            const dim3 grid(request_count * n_heads, num_col_blocks);
+            cuda_gdn_recurrent_step_kernel<<<
+                grid,
+                col_threads,
+                smem_size,
+                static_cast<cudaStream_t>(stream)>>>(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, state,
+                request_count, request_seq_len,
+                n_heads, d_k, d_v, use_qk_l2norm,
+                device_effective_seq_len,
+                /*effective_row_idx=*/0,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr,
+                        "[cudaGDN_recurrent_step_batched] %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+            return true;
+        }
+
+        // Row-split: 256 threads per block, 8 threads per column = 32 cols/block.
+        // More column blocks keep Ampere GPUs occupied during the sequential recurrence.
+        int col_threads = 256;
+        int cols_per_block = col_threads / 8; // 32 columns per block
+        if (d_v <= 64)
+        {
+            col_threads = 128;
+            cols_per_block = col_threads / 8; // 16 columns per block
+        }
+        int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+        // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
+        int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+
+        const int preprocess_blocks = seq_len * n_heads;
+        cuda_gdn_prefill_preprocess_kernel<<<preprocess_blocks, 64, 0, (cudaStream_t)stream>>>(
+            const_cast<float *>(Q), const_cast<float *>(K),
+            const_cast<float *>(alpha), const_cast<float *>(beta_raw),
+            A_log, dt_bias,
+            device_effective_seq_len,
+            request_count, request_seq_len,
+            n_heads, d_k, use_qk_l2norm);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[cudaGDN_prefill_preprocess] %s\n", cudaGetErrorString(err));
+            return false;
+        }
+
+        dim3 grid(n_heads, num_col_blocks, request_count);
+        cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            request_count, request_seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            true);
+
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[cudaGDN_chunk_forward] %s\n", cudaGetErrorString(err));
             return false;
         }
         return true;
@@ -1669,51 +2187,16 @@ extern "C"
         const int *device_effective_seq_len,
         int device_idx, void *stream)
     {
-        cudaSetDevice(device_idx);
-
-        // Row-split: 256 threads per block, 8 threads per column = 32 cols/block.
-        // More column blocks keep Ampere GPUs occupied during the sequential recurrence.
-        int col_threads = 256;
-        int cols_per_block = col_threads / 8; // 32 columns per block
-        if (d_v <= 64)
-        {
-            col_threads = 128;
-            cols_per_block = col_threads / 8; // 16 columns per block
-        }
-        int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-        // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
-        int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
-
-        cuda_gdn_prefill_preprocess_kernel<<<dim3(n_heads, seq_len), 64, 0, (cudaStream_t)stream>>>(
-            const_cast<float *>(Q), const_cast<float *>(K),
-            const_cast<float *>(alpha), const_cast<float *>(beta_raw),
-            A_log, dt_bias,
-            seq_len, n_heads, d_k, use_qk_l2norm);
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_prefill_preprocess] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+        return cudaGDN_chunk_forward_batched_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
-            device_effective_seq_len,
+            seq_len, /*request_count=*/1, /*request_seq_len=*/seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
             max_snapshot_rows,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-            true);
-
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_chunk_forward] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+            device_effective_seq_len,
+            device_idx, stream);
     }
 
     bool cudaGDN_chunk_forward(
@@ -1772,6 +2255,42 @@ extern "C"
             device_effective_seq_len,
             device_idx, stream);
         return ok;
+    }
+
+    /**
+     * @brief Launch one request-grouped recurrence over a padded row matrix.
+     *
+     * The grid's Z dimension owns requests while X/Y retain the production
+     * head/column tiling. Each block reads its request's real length directly
+     * from device memory, so no host loop or scalar replay sits between graph
+     * capture and the recurrent state bank.
+     */
+    bool cudaGDN_chunk_forward_batched_effective(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *device_effective_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream)
+    {
+        if (!device_effective_seq_lens)
+            return false;
+        return cudaGDN_chunk_forward_batched_kernel_route(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, state,
+            seq_len, request_count, request_seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            device_effective_seq_lens,
+            device_idx, stream);
     }
 
     bool cudaGDN_short_conv1d(
@@ -1888,6 +2407,90 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[cudaGDN_short_conv1d_effective] %s\n", cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Launch native grouped request-batched short convolution.
+     *
+     * The request dimension is encoded in the launch geometry, so this wrapper
+     * performs no host request loop. Small verifier/decode groups require one
+     * launch; longer prefill uses one output launch plus one race-free grouped
+     * state commit, matching the scalar long-prefill algorithm.
+     */
+    bool cudaGDN_short_conv1d_batched(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *request_states,
+        int request_count, int request_seq_len,
+        int channels, int kernel_size,
+        bool apply_silu,
+        const int *device_request_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        if (!input || !weight || !output || !request_states ||
+            !device_request_seq_lens || !stream ||
+            request_count <= 0 || request_seq_len <= 0 ||
+            channels <= 0 || kernel_size <= 1)
+        {
+            return false;
+        }
+
+        constexpr int threads = 256;
+        if (request_seq_len <= 4)
+        {
+            const int channel_blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_batched_small_m_kernel<<<
+                dim3(channel_blocks, request_count),
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                input, weight, bias, output, request_states,
+                device_request_seq_lens,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+                request_count, request_seq_len,
+                channels, kernel_size, apply_silu);
+        }
+        else
+        {
+            const int output_elements =
+                request_count * request_seq_len * channels;
+            const int output_blocks =
+                (output_elements + threads - 1) / threads;
+            cuda_short_conv1d_batched_prefill_kernel<<<
+                output_blocks,
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                input, weight, bias, output, request_states,
+                device_request_seq_lens,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+                request_count, request_seq_len,
+                channels, kernel_size, apply_silu);
+
+            const int state_elements = request_count * channels;
+            const int state_blocks =
+                (state_elements + threads - 1) / threads;
+            cuda_short_conv1d_batched_state_update_kernel<<<
+                state_blocks,
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                input, request_states, device_request_seq_lens,
+                request_count, request_seq_len, channels, kernel_size);
+        }
+
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_short_conv1d_batched] %s\n",
+                    cudaGetErrorString(error));
             return false;
         }
         return true;

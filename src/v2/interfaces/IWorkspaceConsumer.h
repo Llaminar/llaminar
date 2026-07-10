@@ -208,8 +208,7 @@ namespace llaminar2
      */
     namespace EmbeddingWorkspaceBuffers
     {
-        constexpr const char *TOKEN_IDS = "embed_token_ids";    ///< [max_seq_len] INT32 token IDs
-        constexpr const char *EMBED_TABLE = "embed_table_temp"; ///< [vocab_size × d_model] FP32 temp for non-GPU embed tables
+        constexpr const char *TOKEN_IDS = "embed_token_ids"; ///< [max_seq_len] INT32 token IDs
     }
 
     /**

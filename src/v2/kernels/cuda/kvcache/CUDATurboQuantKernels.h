@@ -38,25 +38,6 @@ namespace llaminar2
     void cuda_tq_upload_codebooks(cudaStream_t stream);
 
     // =========================================================================
-    // Dynamic Params for Graph-Capturable Incremental Dequant
-    // =========================================================================
-
-    /**
-     * @brief Device-side dynamic parameters for TQ incremental dequant.
-     *
-     * During CUDA graph capture, kernel arguments are baked into the graph.
-     * This struct lives in device memory; the kernel reads from it at runtime.
-     * Between graph replays, host code uploads new values to that device buffer
-     * before graph launch on the explicit stage stream.
-     */
-    struct TQDequantDynamicParams
-    {
-        int ring_pos;         ///< Ring buffer position of the new token
-        int out_offset_elems; ///< Element offset into scratch (position × kv_dim)
-        int rope_position;    ///< Absolute position for RoPE (0 if no RoPE)
-    };
-
-    // =========================================================================
     // Rotation Matrix Management
     // =========================================================================
 
@@ -110,7 +91,8 @@ namespace llaminar2
     CUDATurboQuantRotations cuda_tq_create_rotations(
         int n_layers, int n_kv_heads, int head_dim,
         uint64_t rotation_seed, int device_id,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        int kv_head_start = 0);
 
     /**
      * @brief Free GPU rotation matrices.
@@ -172,39 +154,80 @@ namespace llaminar2
         cudaStream_t stream);
 
     /**
-     * @brief Fused quantize K(TQ8) + V(TQ4) directly into ring buffer.
-     *        Single kernel launch for decode (1 token). Eliminates temp buffer
-     *        and D2D memcpy overhead.
+     * @brief Quantize all MTP verifier rows directly into their TQ ring slots.
      *
-     * @param d_K_input    FP32 K projections: [n_kv_heads * head_dim]
-     * @param d_V_input    FP32 V projections: [n_kv_heads * head_dim]
-     * @param d_rotations  Rotation matrix Π: [n_kv_heads * head_dim * head_dim]
-     * @param d_K_ring     K ring buffer (TQ8 blocks)
-     * @param d_V_ring     V ring buffer (TQ4 blocks)
-     * @param ring_pos     Ring buffer write position
-     * @param n_kv_heads   Number of KV heads
-     * @param head_dim     Head dimension (64 or 128)
-     * @param stream       CUDA stream
+     * One grid covers K/TQ8 and V/TQ4 for every `(verifier row, KV head)`
+     * pair.  Each block uses the exact same reduction and rotation order as
+     * the serial fused decode kernel, preserving byte identity while avoiding
+     * temporary quantized buffers and per-row device copies.
+     *
+     * @param d_K_input Device-resident FP32 K rows.
+     * @param d_V_input Device-resident FP32 V rows.
+     * @param d_rotations Device-resident local-head rotation matrices.
+     * @param d_K_ring Destination TQ8 K ring.
+     * @param d_V_ring Destination TQ4 V ring.
+     * @param ring_head Static first destination ring row.
+     * @param max_seq_len Ring capacity used for wraparound.
+     * @param verifier_rows Number of grouped rows, in `[1,4]`.
+     * @param n_kv_heads Number of local KV heads.
+     * @param head_dim Per-head width, either 64 or 128.
+     * @param k_head_major Whether K uses `[head][row][dim]` layout.
+     * @param v_head_major Whether V uses `[head][row][dim]` layout.
+     * @param stream Mandatory explicit CUDA stream.
      */
-    extern "C" bool cuda_tq_quantize_fused_ring(
+    extern "C" bool cuda_tq_quantize_grouped_ring(
         const float *d_K_input, const float *d_V_input,
         const float *d_rotations,
         void *d_K_ring, void *d_V_ring,
-        int ring_pos, int n_kv_heads, int head_dim,
+        int ring_head, int max_seq_len,
+        int verifier_rows, int n_kv_heads, int head_dim,
+        bool k_head_major, bool v_head_major,
         cudaStream_t stream);
 
     /**
-     * @brief Graph-capturable variant: reads ring_pos from device memory.
+     * @brief Graph-capturable grouped TQ verifier publication.
      *
-     * Same as cuda_tq_quantize_fused_ring but ring_pos is read from a
-     * device pointer, enabling CUDA graph capture. Between replays,
-     * host code uploads the new scalar before graph launch.
+     * This is the device-owned counterpart of
+     * `cuda_tq_quantize_grouped_ring()`: the first destination row is read
+     * from a persistent device scalar on every graph replay. When
+     * @p d_row_count is non-null, rows at or beyond that resident count no-op;
+     * this preserves fixed bucket launch geometry for unequal request batches.
      */
-    extern "C" bool cuda_tq_quantize_fused_ring_dynamic(
+    extern "C" bool cuda_tq_quantize_grouped_ring_dynamic(
         const float *d_K_input, const float *d_V_input,
         const float *d_rotations,
         void *d_K_ring, void *d_V_ring,
-        const int *d_ring_pos, int n_kv_heads, int head_dim,
+        const int *d_ring_head, const int *d_row_count, int max_seq_len,
+        int verifier_rows, int n_kv_heads, int head_dim,
+        bool k_head_major, bool v_head_major,
+        cudaStream_t stream);
+
+    /**
+     * @brief Publish prepared device TQ8-K/TQ4-V rows in one D2D kernel.
+     */
+    extern "C" bool cuda_tq_copy_prepared_rows_ring(
+        const void *source_k, const void *source_v,
+        void *ring_k, void *ring_v,
+        int ring_head, int max_seq_len, int rows,
+        size_t k_row_bytes, size_t v_row_bytes,
+        bool k_head_major, bool v_head_major,
+        int n_kv_heads,
+        cudaStream_t stream);
+
+    /**
+     * @brief Device-head graph-capture variant of prepared TQ row publication.
+     *
+     * @p d_row_count optionally limits a fixed bucket launch to the request's
+     * real resident row count.
+     */
+    extern "C" bool cuda_tq_copy_prepared_rows_ring_dynamic(
+        const void *source_k, const void *source_v,
+        void *ring_k, void *ring_v,
+        const int *d_ring_head, const int *d_row_count,
+        int max_seq_len, int rows,
+        size_t k_row_bytes, size_t v_row_bytes,
+        bool k_head_major, bool v_head_major,
+        int n_kv_heads,
         cudaStream_t stream);
 
     // =========================================================================
@@ -268,36 +291,6 @@ namespace llaminar2
         cudaStream_t stream);
 
     // =========================================================================
-    // Ring Buffer TQ Append (fused quantize + ring write)
-    // =========================================================================
-
-    /**
-     * @brief Append FP32 K/V to TQ ring buffer (fused quantize + ring write).
-     *
-     * K is quantized to TQ8, V to TQ4, both written at ring head position.
-     *
-     * @param d_K_cache    TQ8 K ring buffer: [max_seq_len * n_kv_heads] TQ8Blocks
-     * @param d_V_cache    TQ4 V ring buffer: [max_seq_len * n_kv_heads] TQ4Blocks
-     * @param d_K_new      FP32 K input: [num_tokens, n_kv_heads * head_dim]
-     * @param d_V_new      FP32 V input: [num_tokens, n_kv_heads * head_dim]
-     * @param d_K_rotations Rotation matrices for K: [n_kv_heads * head_dim * head_dim]
-     * @param d_V_rotations Rotation matrices for V: [n_kv_heads * head_dim * head_dim]
-     * @param head         Current ring buffer head position
-     * @param max_seq_len  Ring buffer capacity
-     * @param n_kv_heads   Number of KV heads
-     * @param head_dim     Head dimension
-     * @param num_tokens   Number of tokens to append
-     * @param stream       CUDA stream
-     */
-    extern "C" bool cuda_tq_ring_append(
-        void *d_K_cache, void *d_V_cache,
-        const float *d_K_new, const float *d_V_new,
-        const float *d_K_rotations, const float *d_V_rotations,
-        int head, int max_seq_len,
-        int n_kv_heads, int head_dim, int num_tokens,
-        cudaStream_t stream);
-
-    // =========================================================================
     // Ring Buffer Linearize + Dequant + RoPE (for attention read)
     // =========================================================================
 
@@ -347,7 +340,33 @@ namespace llaminar2
         const float *d_K_rotations, const float *d_V_rotations,
         int tail, int count, int max_seq_len,
         int n_kv_heads, int head_dim,
-        float rope_theta, int position_start,
+        float rope_theta, int position_start, int rope_dim,
+        cudaStream_t stream);
+
+    /**
+     * @brief Group-dequantize request-local TQ rings using resident ring state.
+     *
+     * Separate grouped TQ8 and TQ4 grids preserve the established serial
+     * dequant arithmetic while amortizing launch work across all requests.
+     * Padded rows beyond each device count are explicitly zeroed.
+     */
+    extern "C" bool cuda_tq_batched_ring_dequant_fp16_device_state(
+        __half *d_K_out,
+        __half *d_V_out,
+        const void *const *d_K_entry_table,
+        const void *const *d_V_entry_table,
+        const int *d_heads,
+        const int *d_counts,
+        const float *d_rotations,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
         cudaStream_t stream);
 
     // =========================================================================
@@ -420,18 +439,19 @@ namespace llaminar2
         cudaStream_t stream);
 
     /**
-     * @brief Graph-capturable variant: reads dynamic params from device memory.
+     * @brief Graph-capturable incremental dequant driven by device ring state.
      *
-     * Outputs are BASE pointers (no pre-applied offset). The kernel reads
-     * ring_pos, out_offset_elems, and rope_position from d_params, enabling
-     * CUDA graph capture. Between replays, host code uploads new params before
-     * graph launch.
+     * Outputs are base pointers. The fused kernel reads the cache's canonical
+     * post-append head/count and derives its compressed source row, scratch
+     * destination row, and optional RoPE position in-register. No host-owned
+     * dequant parameter mailbox is uploaded between graph replays.
      */
     extern "C" bool cuda_tq_incremental_single_fp16_dynamic(
         __half *d_K_base, __half *d_V_base,
         const void *d_K_cache, const void *d_V_cache,
         const float *d_K_rotation, const float *d_V_rotation,
-        const TQDequantDynamicParams *d_params,
+        const int *d_ring_head, const int *d_cached_count,
+        int max_seq_len, int kv_dim, int position_start,
         int n_kv_heads, int head_dim,
         float rope_theta,
         cudaStream_t stream);
@@ -469,5 +489,49 @@ namespace llaminar2
         int n_kv_heads, int head_dim,
         float rope_theta, int position_start,
         cudaStream_t stream, int rope_dim = 0);
+
+    /**
+     * @brief Apply canonical serial RoPE arithmetic to a fixed-stride request batch.
+     *
+     * The request-major buffer has shape `[request_count, max_kv_len, kv_dim]`.
+     * Canonical device counts mask padded rows, so they retain exact positive-zero
+     * bits and never enter trigonometric arithmetic.
+     */
+    extern "C" bool cuda_rope_apply_batched_fp16_device_state(
+        __half *d_K,
+        const int *d_counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        cudaStream_t stream);
+
+    /**
+     * @brief Rotate FP32 ring rows and publish FP16 request-major output.
+     *
+     * This fused read keeps the same FP32 RoPE result and FP16 rounding as the
+     * serial `cuda_rope_apply_fp32()` plus conversion sequence while avoiding an
+     * intermediate request-batched FP32 allocation.
+     */
+    extern "C" bool cuda_rope_apply_batched_fp32_ring_to_fp16_device_state(
+        __half *d_K_out,
+        const float *const *d_K_entry_table,
+        const int *d_heads,
+        const int *d_counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        cudaStream_t stream);
 
 } // namespace llaminar2

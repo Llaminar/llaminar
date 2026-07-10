@@ -3517,7 +3517,12 @@ namespace llaminar
                 if (!tensor)
                     throw std::runtime_error("prepareEmbeddingHandleLocal: null tensor");
 
-                if (!isVnniPackableTensor(tensor))
+                // Embedding preparation needs the format-neutral unpacking
+                // contract, not GEMM's NativeVNNI capability metadata. Q8_K is
+                // intentionally a legacy INT8-VNNI GEMM format and therefore
+                // has no NativeVnniFormatInfo, but it still provides complete
+                // IINT8Unpackable rows for the universal EmbedQ8 representation.
+                if (!dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor))
                     return nullptr;
 
                 const size_t shard_rows = tensor->rows();
@@ -3866,6 +3871,14 @@ namespace llaminar
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int cuda_device = config.device.cuda_ordinal();
+                        if (config.is_sharded())
+                        {
+                            return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
+                                config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim,
+                                config.turboquant_ctx, cuda_device);
+                        }
                         return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
                             config.num_layers, config.batch_size, config.max_seq_len,
                             config.n_kv_heads, config.head_dim,
@@ -3885,6 +3898,14 @@ namespace llaminar
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int rocm_device = config.device.rocm_ordinal();
+                        if (config.is_sharded())
+                        {
+                            return llaminar2::createShardedROCmRingKVCacheTQ(
+                                config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim,
+                                config.turboquant_ctx, rocm_device);
+                        }
                         return llaminar2::createROCmRingKVCacheTQ(
                             config.num_layers, config.batch_size, config.max_seq_len,
                             config.n_kv_heads, config.head_dim,
@@ -4384,9 +4405,9 @@ namespace llaminar
                                              config.device.to_string());
                 }
 
-                // Post-creation: initialize GDN kernel instances in each GDN layer's state.
-                // This must happen after cache construction since initHybrid() only allocates
-                // host-side state buffers — kernel creation requires KernelFactory access.
+                // Post-creation: initialize GDN kernel instances in each GDN layer's resources.
+                // Cache construction records local/full state shapes. CPU caches also allocate
+                // their host-owned live vectors; GPU caches deliberately do not.
                 auto *hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(cache.get());
                 if (hybrid)
                 {
@@ -4406,16 +4427,40 @@ namespace llaminar
                         gdn_state->conv_kernel = createShortConvolution(dev_type, dev_ordinal);
                         gdn_state->rec_kernel = createGatedDeltaNet(dev_type, dev_ordinal);
 
-                        // Allocate device-resident state buffers for GPU kernels
-                        // (no-op for CPU via virtual dispatch)
+                        // Allocate the participant-local bank before any graph is captured.
+                        // This is a no-op for CPU kernels, whose live state is the cache vector.
                         gdn_state->conv_kernel->allocateGPUState(
-                            static_cast<int>(gdn_state->conv_state.size()));
+                            gdn_state->local_conv_state_size);
                         // In-place prefill scratch is supplied by ShortConv1dStage
                         // through DeviceWorkspaceManager. Keeping it out of the
                         // per-layer KV-cache state avoids one persistent
                         // max_seq_len * qkv_dim allocation for every GDN layer.
                         gdn_state->rec_kernel->allocateGPUState(
-                            static_cast<int>(gdn_state->recurrence_state.size()));
+                            gdn_state->local_recurrence_state_size);
+
+                        /*
+                         * GPU LocalTP may use a TP-local bank for suffix prefill and a
+                         * full mirrored bank for decode/MTP. Preallocating both banks
+                         * here makes their addresses stable before graph capture and
+                         * removes the former host-only checkpoint escape hatch. The
+                         * backend keeps one active and one secondary bank and selects
+                         * the required shape at each grouped invocation.
+                         */
+                        if (config.device.is_gpu())
+                        {
+                            if (gdn_state->full_conv_state_size !=
+                                gdn_state->local_conv_state_size)
+                            {
+                                gdn_state->conv_kernel->allocateGPUState(
+                                    gdn_state->full_conv_state_size);
+                            }
+                            if (gdn_state->full_recurrence_state_size !=
+                                gdn_state->local_recurrence_state_size)
+                            {
+                                gdn_state->rec_kernel->allocateGPUState(
+                                    gdn_state->full_recurrence_state_size);
+                            }
+                        }
                     }
 
                     LOG_DEBUG("[KernelFactory] Initialized GDN kernels for "

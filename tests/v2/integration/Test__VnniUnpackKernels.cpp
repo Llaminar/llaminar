@@ -5,7 +5,7 @@
  * Tests two things:
  *
  * 1. **Round-trip repack**: For each reversible format (Q4_0, IQ4_NL, Q4_1,
- *    Q5_0, Q5_1, Q8_0), creates synthetic GGUF blocks, runs forward repack
+ *    Q5_0, Q5_1, Q8_0, Q8_1, Q8_K), creates synthetic GGUF blocks, runs forward repack
  *    on GPU (raw → separated), then reverse repack (separated → raw), and
  *    compares with the original blocks byte-for-byte.
  *
@@ -90,6 +90,33 @@ void fill_q8_0_blocks(Q8_0Block* blocks, int count) {
     }
 }
 
+void fill_q8_1_blocks(Q8_1Block* blocks, int count) {
+    for (int i = 0; i < count; ++i) {
+        blocks[i].d = static_cast<uint16_t>(0x3000 + (i & 0x3F));
+        int sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            blocks[i].qs[j] = static_cast<int8_t>(((i * 37 + j * 11) % 255) - 127);
+            sum += blocks[i].qs[j];
+        }
+        blocks[i].sum_qs = static_cast<int16_t>(sum);
+    }
+}
+
+void fill_q8_k_blocks(Q8_KBlock* blocks, int count) {
+    for (int i = 0; i < count; ++i) {
+        for (int partial = 0; partial < 16; ++partial) {
+            int sum = 0;
+            for (int lane = 0; lane < 16; ++lane) {
+                const int index = partial * 16 + lane;
+                blocks[i].qs[index] = static_cast<int8_t>(
+                    ((i * 53 + partial * 17 + lane * 7) % 255) - 127);
+                sum += blocks[i].qs[index];
+            }
+            blocks[i].bsums[partial] = static_cast<int16_t>(sum);
+        }
+    }
+}
+
 // ============================================================================
 // Test fixture — parameterized over backend name
 // ============================================================================
@@ -99,6 +126,7 @@ protected:
     IBackend* backend_ = nullptr;
     int device_id_ = 0;
     DeviceType device_type_ = DeviceType::CPU;
+    void* stream_ = nullptr;
 
     void SetUp() override {
         const auto& backend_name = GetParam();
@@ -121,6 +149,18 @@ protected:
 #endif
         } else {
             FAIL() << "Unknown backend: " << backend_name;
+        }
+
+        ASSERT_NE(backend_, nullptr);
+        stream_ = backend_->createStream(device_id_);
+        ASSERT_NE(stream_, nullptr) << backend_name << " explicit non-blocking stream";
+    }
+
+    void TearDown() override {
+        if (backend_ && stream_) {
+            EXPECT_TRUE(backend_->synchronizeStream(stream_, device_id_));
+            backend_->destroyStream(stream_, device_id_);
+            stream_ = nullptr;
         }
     }
 
@@ -149,7 +189,7 @@ protected:
                        int N, int K) {
         return WeightTranslator::forwardRepackOnDevice(
             format, d_raw, d_payload, d_scales, d_mins, nullptr,
-            N, K, device_type_, nullptr);
+            N, K, device_type_, stream_);
     }
 
     // ========================================================================
@@ -160,7 +200,7 @@ protected:
                        void* d_raw, int N, int K) {
         return WeightTranslator::reverseRepackOnDevice(
             format, d_payload, d_scales, d_mins, d_raw, N, K,
-            device_type_, nullptr);
+            device_type_, stream_);
     }
 
     // ========================================================================
@@ -171,9 +211,12 @@ protected:
                        void (*filler)(BlockT*, int),
                        int payload_bytes,
                        bool is_asymmetric,
-                       int N, int K) {
+                       int N, int K,
+                       int source_block_elements = 32) {
         const int blocks_per_row = K / 32;
-        const int total_blocks = N * blocks_per_row;
+        const int source_blocks_per_row =
+            (K + source_block_elements - 1) / source_block_elements;
+        const int total_blocks = N * source_blocks_per_row;
         const size_t total_output = static_cast<size_t>(blocks_per_row) * N;
 
         // 1. Create and fill host blocks
@@ -196,26 +239,27 @@ protected:
         // 3. Upload original blocks
         ASSERT_TRUE(backend_->hostToDevice(d_raw_in.ptr, host_blocks.data(),
                                            total_blocks * sizeof(BlockT),
-                                           device_id_));
+                                           device_id_, stream_));
 
         // 4. Forward repack: raw → separated
         ASSERT_TRUE(forwardRepack(format, d_raw_in.ptr,
                                   d_payload.u8(), d_scales.u16(),
                                   is_asymmetric ? d_mins.u16() : nullptr,
                                   N, K));
-        backend_->streamSynchronize(device_id_);
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
         // 5. Reverse repack: separated → raw
         ASSERT_TRUE(reverseRepack(format, d_payload.u8(), d_scales.u16(),
                                   is_asymmetric ? d_mins.u16() : nullptr,
                                   d_raw_out.ptr, N, K));
-        backend_->streamSynchronize(device_id_);
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
         // 6. Download recovered blocks
         std::vector<BlockT> recovered(total_blocks);
         ASSERT_TRUE(backend_->deviceToHost(recovered.data(), d_raw_out.ptr,
                                            total_blocks * sizeof(BlockT),
-                                           device_id_));
+                                           device_id_, stream_));
+        ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
         // 7. Byte-for-byte comparison
         for (int i = 0; i < total_blocks; ++i) {
@@ -277,6 +321,19 @@ TEST_P(VnniUnpackTest, RoundTrip_Q8_0) {
                              /*N=*/64, /*K=*/128);
 }
 
+TEST_P(VnniUnpackTest, RoundTrip_Q8_1) {
+    roundTripTest<Q8_1Block>(RepackFormat::Q8_1, fill_q8_1_blocks,
+                             /*payload_bytes=*/32, /*asymmetric=*/false,
+                             /*N=*/64, /*K=*/128);
+}
+
+TEST_P(VnniUnpackTest, RoundTrip_Q8_K) {
+    roundTripTest<Q8_KBlock>(RepackFormat::Q8_K, fill_q8_k_blocks,
+                             /*payload_bytes=*/32, /*asymmetric=*/false,
+                             /*N=*/64, /*K=*/512,
+                             /*source_block_elements=*/256);
+}
+
 // ============================================================================
 // Larger matrix sizes (stress test alignment and boundary conditions)
 // ============================================================================
@@ -319,13 +376,15 @@ TEST_P(VnniUnpackTest, RejectsNonReversibleFormat) {
     EXPECT_TRUE(isReversibleFormat(RepackFormat::Q5_0));
     EXPECT_TRUE(isReversibleFormat(RepackFormat::Q5_1));
     EXPECT_TRUE(isReversibleFormat(RepackFormat::Q8_0));
+    EXPECT_TRUE(isReversibleFormat(RepackFormat::Q8_1));
+    EXPECT_TRUE(isReversibleFormat(RepackFormat::Q8_K));
 }
 
 TEST_P(VnniUnpackTest, ReverseRepackReturnsFailOnSuperblock) {
     // reverseRepackOnDevice should return false for non-reversible formats
     EXPECT_FALSE(WeightTranslator::reverseRepackOnDevice(
         RepackFormat::Q4_K, nullptr, nullptr, nullptr, nullptr,
-        64, 128, device_type_, nullptr));
+        64, 128, device_type_, stream_));
 }
 
 // ============================================================================
@@ -339,6 +398,8 @@ TEST_P(VnniUnpackTest, RawBlockSizeBytes) {
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q5_0),   22u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q5_1),   24u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_0),   34u);
+    EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_1),   36u);
+    EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_K),  288u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q4_K),   0u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q6_K),   0u);
 }
@@ -348,6 +409,10 @@ TEST_P(VnniUnpackTest, RawBlockBufferSize) {
     EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q4_0, 64, 128), 4608u);
     // Q8_0: N=64, K=128 → 64 * 4 * 34 = 8704
     EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_0, 64, 128), 8704u);
+    // Q8_1: N=64, K=128 -> 64 * 4 * 36 = 9216
+    EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_1, 64, 128), 9216u);
+    // Q8_K: N=64, K=512 -> 64 * 2 * 288 = 36864
+    EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_K, 64, 512), 36864u);
     // Non-reversible → 0
     EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q4_K, 64, 128), 0u);
 }
@@ -374,11 +439,11 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_0) {
 
     ASSERT_TRUE(backend_->hostToDevice(d_raw.ptr, host_blocks.data(),
                                        total_blocks * sizeof(Q4_0Block),
-                                       device_id_));
+                                       device_id_, stream_));
     ASSERT_TRUE(forwardRepack(RepackFormat::Q4_0, d_raw.ptr,
                               d_payload.u8(), d_scales.u16(), nullptr,
                               N, K));
-    backend_->streamSynchronize(device_id_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 2. Pack GPU → host buffer via WeightTranslator
     auto header = buildGpuPackedHeader(
@@ -391,7 +456,8 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_0) {
     auto packed_buf = WeightTranslator::packGpuWeightsForTransfer(
         *backend_, device_id_,
         d_payload.u8(), d_scales.u16(), nullptr, nullptr,
-        header);
+        header, stream_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     ASSERT_EQ(packed_buf.size(), gpuPackedTotalSize(header));
 
@@ -412,8 +478,8 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_0) {
 
     ASSERT_TRUE(WeightTranslator::uploadGpuPackedWeights(
         *backend_, device_id_, view,
-        d_payload2.u8(), d_scales2.u16(), nullptr, nullptr));
-    backend_->streamSynchronize(device_id_);
+        d_payload2.u8(), d_scales2.u16(), nullptr, nullptr, stream_));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 5. Download both sets and compare byte-for-byte
     std::vector<uint8_t> orig_payload(total_output * payload_bytes);
@@ -422,15 +488,16 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_0) {
     std::vector<uint16_t> recv_scales(total_output);
 
     ASSERT_TRUE(backend_->deviceToHost(orig_payload.data(), d_payload.ptr,
-                                       orig_payload.size(), device_id_));
+                                       orig_payload.size(), device_id_, stream_));
     ASSERT_TRUE(backend_->deviceToHost(recv_payload.data(), d_payload2.ptr,
-                                       recv_payload.size(), device_id_));
+                                       recv_payload.size(), device_id_, stream_));
     ASSERT_TRUE(backend_->deviceToHost(orig_scales.data(), d_scales.ptr,
                                        orig_scales.size() * sizeof(uint16_t),
-                                       device_id_));
+                                       device_id_, stream_));
     ASSERT_TRUE(backend_->deviceToHost(recv_scales.data(), d_scales2.ptr,
                                        recv_scales.size() * sizeof(uint16_t),
-                                       device_id_));
+                                       device_id_, stream_));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     EXPECT_EQ(orig_payload, recv_payload) << "Payload mismatch after pack/upload";
     EXPECT_EQ(orig_scales, recv_scales) << "Scales mismatch after pack/upload";
@@ -455,11 +522,11 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_1_Asymmetric) {
 
     ASSERT_TRUE(backend_->hostToDevice(d_raw.ptr, host_blocks.data(),
                                        total_blocks * sizeof(Q4_1Block),
-                                       device_id_));
+                                       device_id_, stream_));
     ASSERT_TRUE(forwardRepack(RepackFormat::Q4_1, d_raw.ptr,
                               d_payload.u8(), d_scales.u16(), d_mins.u16(),
                               N, K));
-    backend_->streamSynchronize(device_id_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 2. Pack → parse → upload
     auto header = buildGpuPackedHeader(
@@ -471,7 +538,8 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_1_Asymmetric) {
     auto packed_buf = WeightTranslator::packGpuWeightsForTransfer(
         *backend_, device_id_,
         d_payload.u8(), d_scales.u16(), d_mins.u16(), nullptr,
-        header);
+        header, stream_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
     ASSERT_EQ(packed_buf.size(), gpuPackedTotalSize(header));
 
     GpuPackedWeightsView view;
@@ -484,17 +552,18 @@ TEST_P(VnniUnpackTest, PackUploadRoundTrip_Q4_1_Asymmetric) {
 
     ASSERT_TRUE(WeightTranslator::uploadGpuPackedWeights(
         *backend_, device_id_, view,
-        d_payload2.u8(), d_scales2.u16(), d_mins2.u16(), nullptr));
-    backend_->streamSynchronize(device_id_);
+        d_payload2.u8(), d_scales2.u16(), d_mins2.u16(), nullptr, stream_));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 3. Compare
     std::vector<uint16_t> orig_mins(total_output), recv_mins(total_output);
     ASSERT_TRUE(backend_->deviceToHost(orig_mins.data(), d_mins.ptr,
                                        orig_mins.size() * sizeof(uint16_t),
-                                       device_id_));
+                                       device_id_, stream_));
     ASSERT_TRUE(backend_->deviceToHost(recv_mins.data(), d_mins2.ptr,
                                        recv_mins.size() * sizeof(uint16_t),
-                                       device_id_));
+                                       device_id_, stream_));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
     EXPECT_EQ(orig_mins, recv_mins) << "Mins mismatch after pack/upload";
 }
 
@@ -567,11 +636,11 @@ TEST_P(VnniUnpackTest, FullPipeline_Q4_0) {
 
     ASSERT_TRUE(backend_->hostToDevice(d_raw1.ptr, original.data(),
                                        total_blocks * sizeof(Q4_0Block),
-                                       device_id_));
+                                       device_id_, stream_));
     ASSERT_TRUE(forwardRepack(RepackFormat::Q4_0, d_raw1.ptr,
                               d_payload1.u8(), d_scales1.u16(), nullptr,
                               N, K));
-    backend_->streamSynchronize(device_id_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 3. Pack → host buffer
     auto header = buildGpuPackedHeader(
@@ -579,7 +648,8 @@ TEST_P(VnniUnpackTest, FullPipeline_Q4_0) {
         false, false, false, N, K);
     auto packed = WeightTranslator::packGpuWeightsForTransfer(
         *backend_, device_id_,
-        d_payload1.u8(), d_scales1.u16(), nullptr, nullptr, header);
+        d_payload1.u8(), d_scales1.u16(), nullptr, nullptr, header, stream_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 4. Parse and upload to fresh GPU buffers
     GpuPackedWeightsView view;
@@ -589,20 +659,21 @@ TEST_P(VnniUnpackTest, FullPipeline_Q4_0) {
     GpuMem d_scales2(backend_, device_id_, total_output * sizeof(uint16_t));
     ASSERT_TRUE(WeightTranslator::uploadGpuPackedWeights(
         *backend_, device_id_, view,
-        d_payload2.u8(), d_scales2.u16(), nullptr, nullptr));
-    backend_->streamSynchronize(device_id_);
+        d_payload2.u8(), d_scales2.u16(), nullptr, nullptr, stream_));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 5. Reverse repack back to raw blocks
     GpuMem d_raw2(backend_, device_id_, total_blocks * sizeof(Q4_0Block));
     ASSERT_TRUE(reverseRepack(RepackFormat::Q4_0, d_payload2.u8(),
                               d_scales2.u16(), nullptr, d_raw2.ptr, N, K));
-    backend_->streamSynchronize(device_id_);
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     // 6. Download and compare with original
     std::vector<Q4_0Block> recovered(total_blocks);
     ASSERT_TRUE(backend_->deviceToHost(recovered.data(), d_raw2.ptr,
                                        total_blocks * sizeof(Q4_0Block),
-                                       device_id_));
+                                       device_id_, stream_));
+    ASSERT_TRUE(backend_->synchronizeStream(stream_, device_id_));
 
     for (int i = 0; i < total_blocks; ++i) {
         ASSERT_EQ(std::memcmp(&original[i], &recovered[i], sizeof(Q4_0Block)), 0)

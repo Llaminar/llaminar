@@ -5252,6 +5252,24 @@ namespace llaminar2
                           ComputeStageFactory::createSharedExpertFFN(shared_params),
                           shared_device);
             graph.addDependency(prefix + "shared_expert_ffn", prefix + "ffn_norm");
+            if (shared_gpu_table_verifier_prefill)
+            {
+                /*
+                 * The GPU router quantizes the normalized verifier rows once and
+                 * publishes those device-resident Q8 rows for both the routed and
+                 * shared grouped pipelines.  The shared stage therefore consumes
+                 * router-owned state even though its visible tensor input is still
+                 * NORMALIZED.  Encode that hidden producer/consumer relationship in
+                 * the graph: relying on the incidental insertion order of sibling
+                 * nodes can let the shared stage reuse the previous layer's Q8
+                 * publication when a fresh graph receives a different topological
+                 * ordering.  This edge applies equally to main-verifier and MTP
+                 * sidecar graphs, and remains valid during whole-graph capture.
+                 */
+                graph.addDependency(
+                    prefix + "shared_expert_ffn",
+                    prefix + "moe_routing");
+            }
             const bool main_verifier_rows =
                 !mtp_sidecar_context &&
                 config_.compute_all_position_logits &&

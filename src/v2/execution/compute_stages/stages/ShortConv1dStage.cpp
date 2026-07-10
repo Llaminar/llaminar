@@ -17,6 +17,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 
 #ifdef HAVE_CUDA
@@ -34,6 +35,36 @@
 
 namespace llaminar2
 {
+
+    void ShortConv1dStage::updateDynamicParams(int pos_offset, int seq_len)
+    {
+        (void)pos_offset;
+
+        /*
+         * ForwardInput::seq_len is the width of one request.  The short-conv
+         * backend consumes a flattened [request, row] tensor, so preserve the
+         * per-request width separately and reconstruct the total row count.
+         * request_count is fixed by graph construction and is always positive
+         * for a valid stage.
+         */
+        params_.request_seq_len = seq_len;
+        if (seq_len <= 0 ||
+            params_.request_count <= 0 ||
+            seq_len > std::numeric_limits<int>::max() / params_.request_count)
+        {
+            /*
+             * `updateDynamicParams()` cannot return an error.  Publish an
+             * unmistakably invalid total so execute() rejects the stage rather
+             * than wrapping a positive request matrix into unrelated storage.
+             */
+            LOG_ERROR("[ShortConv1dStage] Invalid request-batched dynamic geometry: "
+                      << "request_count=" << params_.request_count
+                      << " request_seq_len=" << seq_len);
+            params_.seq_len = 0;
+            return;
+        }
+        params_.seq_len = params_.request_count * seq_len;
+    }
     namespace
     {
         std::atomic<uint32_t> g_shortconv_workspace_slice_counter{0};
@@ -68,7 +99,16 @@ namespace llaminar2
         if (params_.channels <= 0)
             return reqs;
 
-        const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        /*
+         * Workspace planners pass `m` in rows per request, while this stage's
+         * tensors are flattened across requests. `params_.seq_len` already
+         * carries that flattened graph shape, so it is the minimum safe row
+         * capacity even when a dynamic planner supplies a smaller per-request
+         * value.
+         */
+        const int max_seq_len = std::max(
+            1,
+            std::max(params_.seq_len, m > 0 ? m : 0));
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows > 0 && params_.kernel_size > 1)
         {
@@ -317,6 +357,14 @@ namespace llaminar2
 
     bool ShortConv1dStage::supportsPaddedPrefillRealLengthContract() const
     {
+        if (params_.request_count > 1)
+        {
+            return params_.kernel &&
+                   params_.request_seq_lens_device != nullptr &&
+                   params_.kernel->supportsRequestLiveStateBank(
+                       params_.request_count,
+                       params_.channels * std::max(0, params_.kernel_size - 1));
+        }
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
 
@@ -324,7 +372,7 @@ namespace llaminar2
     {
         return params_.kernel &&
                verifierStateCaptureWorkspaceRequired() &&
-               params_.conv_state != nullptr;
+               (params_.device_id.is_gpu() || params_.conv_state != nullptr);
     }
 
     bool ShortConv1dStage::verifierStateCaptureWorkspaceRequired() const
@@ -416,21 +464,32 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
-        /*
-         * GPU publication must restore only the backend-owned live state here.
-         * LocalTP workers can run this method concurrently on different devices,
-         * and the hybrid cache mirror behind params_.conv_state is not part of
-         * the stream-ordered GPU mutation contract.  Passing it into the CUDA or
-         * HIP backend makes the backend enqueue a D2H refresh and synchronize
-         * the verifier stream, which is both too expensive for the MTP hot path
-         * and unsafe when the mirror is not host-addressable in a replicated
-         * device-state lane.  Prefix-cache export and diagnostics refresh host
-         * mirrors through explicit adoption/observation paths instead.
-         */
+        // GPU publication restores the kernel-owned live bank on the verifier
+        // stream. GPU graph params deliberately contain no host state pointer.
         return params_.kernel->restoreVerifierStateCaptureRow(
             nullptr,
             row,
             stream ? stream : gpuStream());
+    }
+
+    bool ShortConv1dStage::restoreVerifierStateCaptureRows(
+        const int *host_row_indices,
+        int request_count,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || params_.device_id.is_gpu() ||
+            !host_row_indices || request_count <= 0 || !params_.kernel)
+        {
+            return false;
+        }
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRows(
+            params_.conv_state,
+            host_row_indices,
+            request_count,
+            stream);
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -444,13 +503,17 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
-        /*
-         * Keep resident MTP publication entirely device-owned. The accepted
-         * row index lives in GPU metadata, and the short-conv kernel restores
-         * its implementation-owned live state on this stream. Passing the host
-         * conv-state mirror would make the backend perform a D2H refresh and
-         * synchronize the stream, which is not allowed in the hot path.
-         */
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS"))
+        {
+            LOG_INFO("[MTPPublicationDiagnostics] phase=shortconv_restore_device_row"
+                     << " layer=" << params_.layer_idx
+                     << " device=" << params_.device_id.toString()
+                     << " capture_rows=" << verifier_capture_rows_bound_
+                     << " state_size=" << verifier_capture_state_size_bound_
+                     << " stream=" << stream
+                     << " row_ptr=" << static_cast<const void *>(device_row_index));
+        }
+        // The accepted row index and destination live bank are both resident.
         return params_.kernel->restoreVerifierStateCaptureRowFromDeviceIndex(
             nullptr,
             device_row_index,
@@ -474,11 +537,11 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
         {
             /*
-             * CPU short-conv currently stores one live state vector per layer.
-             * A batched restore needs request-owned conv-state slots before it
-             * can publish multiple requests safely.
+             * CPU request banks consume host row indices through
+             * restoreVerifierStateCaptureRows(). Device pointers are never
+             * adopted into the host publication path.
              */
-            LOG_ERROR("[ShortConv1dStage] Batched verifier-state restore requires request-owned CPU conv-state banks");
+            LOG_ERROR("[ShortConv1dStage] Device-indexed batch restore is GPU-only; CPU publication requires host rows");
             return false;
         }
 
@@ -488,6 +551,18 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS"))
+        {
+            LOG_INFO("[MTPPublicationDiagnostics] phase=shortconv_restore_device_rows"
+                     << " layer=" << params_.layer_idx
+                     << " device=" << params_.device_id.toString()
+                     << " request_count=" << request_count
+                     << " row_index_stride=" << row_index_stride
+                     << " capture_rows=" << verifier_capture_rows_bound_
+                     << " state_size=" << verifier_capture_state_size_bound_
+                     << " stream=" << stream
+                     << " row_ptr=" << static_cast<const void *>(device_row_indices));
+        }
 
         return params_.kernel->restoreVerifierStateCaptureRowsFromDeviceIndices(
             nullptr,
@@ -496,6 +571,68 @@ namespace llaminar2
             request_count,
             row_index_stride,
             stream);
+    }
+
+    bool ShortConv1dStage::restoreVerifierStateCaptureRequestTerminalRows(
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() ||
+            !params_.device_id.is_gpu() ||
+            !device_request_seq_lens ||
+            request_count <= 0 ||
+            request_row_width <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRequestTerminalRows(
+            /*dst_states=*/nullptr,
+            device_request_seq_lens,
+            request_count,
+            request_row_width,
+            stream);
+    }
+
+    bool ShortConv1dStage::requestBatchedTerminalStateCommittedDuringExecution(
+        int request_count,
+        int request_row_width) const
+    {
+        if (!params_.device_id.is_gpu() ||
+            !params_.kernel ||
+            request_count <= 1 ||
+            request_row_width <= 0 ||
+            params_.request_count != request_count ||
+            params_.request_seq_len != request_row_width)
+        {
+            return false;
+        }
+        const int state_size =
+            params_.channels * std::max(0, params_.kernel_size - 1);
+        return params_.kernel->supportsRequestLiveStateBank(
+                   request_count,
+                   state_size) &&
+               verifier_capture_rows_bound_ < request_count * request_row_width;
+    }
+
+    void ShortConv1dStage::clearVerifierStateCaptureBindingAfterPublication()
+    {
+        if (!params_.device_id.is_gpu())
+            return;
+
+        /*
+         * The accepted short-conv state is now live in the backend-owned GPU
+         * state vector.  Clear only the verifier capture/work binding so normal
+         * decode continues from that live vector instead of treating the next row
+         * as another speculative verifier row.
+         */
+        clearKernelVerifierStateWorkspace();
     }
 
     void ShortConv1dStage::onGraphReplayed()
@@ -692,17 +829,6 @@ namespace llaminar2
                     d_bias = static_cast<const float *>(bias_base->gpu_data_ptr());
             }
 
-            const int effective_seq_len = effectivePrefillSeqLen();
-            const bool padded_effective_len =
-                params_.seq_len > 1 && prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
-            const bool use_real_length_contract = shouldUseRealLengthContract();
-            if (padded_effective_len && !use_real_length_contract)
-            {
-                LOG_ERROR("[ShortConv1dStage] Padded prefill requires a backend real-length contract");
-                return false;
-            }
-
-            bool ok = false;
             const bool request_batched =
                 params_.request_count > 1 &&
                 params_.request_seq_len > 0 &&
@@ -716,14 +842,44 @@ namespace llaminar2
                           << ", request_seq_len=" << params_.request_seq_len << ")");
                 return false;
             }
-            if (use_real_length_contract)
+            const int effective_seq_len = effectivePrefillSeqLen();
+            const bool padded_effective_len =
+                !request_batched &&
+                params_.seq_len > 1 &&
+                prefill_replay_params_set_ &&
+                effective_seq_len < params_.seq_len;
+            const bool use_real_length_contract = shouldUseRealLengthContract();
+            if (padded_effective_len && !use_real_length_contract)
             {
-                if (request_batched)
+                LOG_ERROR("[ShortConv1dStage] Padded prefill requires a backend real-length contract");
+                return false;
+            }
+
+            bool ok = false;
+            if (request_batched)
+            {
+                const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
+                if (!params_.request_seq_lens_device)
                 {
-                    LOG_ERROR("[ShortConv1dStage] Request-batched short-conv verifier does not support "
-                              "the scalar padded-prefill real-length contract");
+                    LOG_ERROR("[ShortConv1dStage] Request-batched GPU short-conv requires device-owned request lengths");
                     return false;
                 }
+                if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
+                {
+                    LOG_ERROR("[ShortConv1dStage] Backend lacks request-owned live conv-state bank for "
+                              << params_.request_count << " requests");
+                    return false;
+                }
+                ok = params_.kernel->forwardBatchedRequestsWithDeviceSeqLens(
+                    d_input, d_weight, d_bias,
+                    d_output, params_.conv_state,
+                    params_.seq_len, params_.request_count, params_.request_seq_len,
+                    params_.channels, params_.kernel_size,
+                    params_.request_seq_lens_device,
+                    /*apply_silu=*/true);
+            }
+            else if (use_real_length_contract)
+            {
                 if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
                 {
                     LOG_ERROR("[ShortConv1dStage] Failed to update GPU effective length scalar");
@@ -734,22 +890,6 @@ namespace llaminar2
                     d_output, params_.conv_state,
                     params_.seq_len, params_.channels, params_.kernel_size,
                     gpu_effective_seq_len_state_->device_effective_seq_len,
-                    /*apply_silu=*/true);
-            }
-            else if (request_batched)
-            {
-                const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
-                if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
-                {
-                    LOG_ERROR("[ShortConv1dStage] Backend lacks request-owned live conv-state bank for "
-                              << params_.request_count << " requests");
-                    return false;
-                }
-                ok = params_.kernel->forwardBatchedRequests(
-                    d_input, d_weight, d_bias,
-                    d_output, params_.conv_state,
-                    params_.seq_len, params_.request_count, params_.request_seq_len,
-                    params_.channels, params_.kernel_size,
                     /*apply_silu=*/true);
             }
             else
@@ -794,6 +934,50 @@ namespace llaminar2
         {
             LOG_ERROR("[ShortConv1dStage] Null data pointer");
             return false;
+        }
+
+        const bool request_batched =
+            params_.request_count > 1 &&
+            params_.request_seq_len > 0 &&
+            params_.seq_len == params_.request_count * params_.request_seq_len;
+        if (params_.request_count > 1 && !request_batched)
+        {
+            LOG_ERROR("[ShortConv1dStage] Request-batched CPU short-conv requires flattened "
+                      "seq_len == request_count * request_seq_len");
+            return false;
+        }
+        if (request_batched)
+        {
+            if (!params_.request_seq_lens_host ||
+                static_cast<int>(params_.request_seq_lens_host->size()) <
+                    params_.request_count)
+            {
+                LOG_ERROR("[ShortConv1dStage] Request-batched CPU short-conv requires host request lengths");
+                return false;
+            }
+            const int state_size =
+                params_.channels * std::max(0, params_.kernel_size - 1);
+            if (!params_.kernel->supportsRequestLiveStateBank(
+                    params_.request_count, state_size))
+            {
+                LOG_ERROR("[ShortConv1dStage] CPU backend lacks request-owned live conv-state storage");
+                return false;
+            }
+            const bool ok =
+                params_.kernel->forwardBatchedRequestsWithHostSeqLens(
+                    input_data, weight_data, bias_data,
+                    output_data, params_.conv_state,
+                    params_.seq_len, params_.request_count,
+                    params_.request_seq_len, params_.channels,
+                    params_.kernel_size,
+                    params_.request_seq_lens_host->data(),
+                    /*apply_silu=*/true);
+            if (!ok)
+            {
+                LOG_ERROR("[ShortConv1dStage] CPU grouped request kernel failed");
+                return false;
+            }
+            return true;
         }
 
         const int effective_seq_len = effectivePrefillSeqLen();

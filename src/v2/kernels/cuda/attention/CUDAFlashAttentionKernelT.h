@@ -376,10 +376,10 @@ namespace llaminar2
              *
              * This is the graph-stage proof boundary for M=2..4 verifier rows.
              * It prepares row-local attention parameters for the whole verifier
-             * span, then invokes one small-M attention dispatch.  The current
-             * CUDA backend still executes row-local flash-decode launches inside
-             * that dispatch, so this is correctness plumbing, not the final
-             * hardware-ceiling grouped attention kernel.
+             * span, then invokes one grouped flash-decode phase grid and one
+             * grouped reduction grid. Each row shares the same K/V allocation
+             * while retaining the split partition and reduction order selected
+             * by serial M=1 decode.
              */
             bool compute_verifier_rows_decode_equivalent(
                 const ITensor *Q,

@@ -202,6 +202,68 @@ __global__ void cuda_repack_q8_0_to_vnni(
 }
 
 // ============================================================================
+// Kernel 4c: Q8_1 repack (symmetric 8-bit with an auxiliary block sum)
+// ============================================================================
+
+/**
+ * @brief Normalize Q8_1 into the raw-INT8 device execution layout.
+ *
+ * The precomputed source sum accelerates some host-side activation consumers,
+ * but device weight GEMM derives compensation from its own activation panels.
+ * Consequently the prepared weight needs only the 32 signed values and the
+ * original FP16 scale, exactly matching codebook 19's device representation.
+ */
+__global__ void cuda_repack_q8_1_to_vnni(
+    const Q8_1Block* __restrict__ d_raw,
+    uint8_t*         __restrict__ d_payload,
+    uint16_t*        __restrict__ d_scales,
+    int N, int blocks_per_row)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (n >= N || b >= blocks_per_row) return;
+
+    const auto& blk = d_raw[n * blocks_per_row + b];
+    const size_t linear = static_cast<size_t>(b) * N + n;
+    uint8_t* dst = d_payload + linear * 32;
+    copy16(dst, blk.qs);
+    copy16(dst + 16, blk.qs + 16);
+    d_scales[linear] = blk.d;
+}
+
+// ============================================================================
+// Kernel 4d: Q8_K repack (256 raw INT8 values plus auxiliary partial sums)
+// ============================================================================
+
+/**
+ * @brief Normalize one 32-value slice of Q8_K into raw-INT8 device layout.
+ *
+ * Q8_K has no in-block scale; its values are already the represented signed
+ * integers.  Each prepared 32-value block therefore receives FP16 1.0.  The
+ * source `bsums` are derived metadata and are unnecessary after preparation.
+ */
+__global__ void cuda_repack_q8_k_to_vnni(
+    const Q8_KBlock* __restrict__ d_raw,
+    uint8_t*         __restrict__ d_payload,
+    uint16_t*        __restrict__ d_scales,
+    int N, int blocks_per_row, int superblocks_per_row)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (n >= N || b >= blocks_per_row) return;
+
+    const int superblock = b / 8;
+    const int subblock = b % 8;
+    const auto& blk = d_raw[n * superblocks_per_row + superblock];
+    const size_t linear = static_cast<size_t>(b) * N + n;
+    uint8_t* dst = d_payload + linear * 32;
+    const int8_t* src = blk.qs + subblock * 32;
+    copy16(dst, src);
+    copy16(dst + 16, src + 16);
+    d_scales[linear] = 0x3c00u; // IEEE FP16 1.0.
+}
+
+// ============================================================================
 // Kernel 5: Q4_K repack
 // ============================================================================
 
@@ -881,6 +943,23 @@ bool launchVnniRepackCUDA(
         cuda_repack_q8_0_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q8_0Block*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row);
+        break;
+    }
+    case RepackFormat::Q8_1: {
+        dim3 block(256, 1);
+        dim3 grid((N + 255) / 256, blocks_per_row);
+        cuda_repack_q8_1_to_vnni<<<grid, block, 0, cuda_stream>>>(
+            static_cast<const Q8_1Block*>(d_raw_blocks),
+            d_payload, d_scales, N, blocks_per_row);
+        break;
+    }
+    case RepackFormat::Q8_K: {
+        const int superblocks_per_row = (K + 255) / 256;
+        dim3 block(256, 1);
+        dim3 grid((N + 255) / 256, blocks_per_row);
+        cuda_repack_q8_k_to_vnni<<<grid, block, 0, cuda_stream>>>(
+            static_cast<const Q8_KBlock*>(d_raw_blocks),
+            d_payload, d_scales, N, blocks_per_row, superblocks_per_row);
         break;
     }
     case RepackFormat::Q4_K: {

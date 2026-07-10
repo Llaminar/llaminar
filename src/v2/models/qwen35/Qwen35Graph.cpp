@@ -649,7 +649,8 @@ namespace llaminar2
                 input.position_ids_device,
                 device,
                 sidecar_stage_prefix,
-                /*layer_idx_is_cache_local=*/true);
+                /*layer_idx_is_cache_local=*/true,
+                input.first_sequence_index);
             if (kv_append.size() == 0)
                 return ComputeGraph{};
 
@@ -666,12 +667,13 @@ namespace llaminar2
             mtp_buffers,
             /*layer_idx=*/0,
             input.seq_len,
-                input.batch_size,
-                input.kv_cache,
-                input.position_ids,
-                input.position_ids_device,
-                device,
-                input.sequence_lengths,
+            input.batch_size,
+            input.kv_cache,
+            input.position_ids,
+            input.position_ids_device,
+            device,
+            input.sequence_lengths,
+            /*sequence_lengths_device=*/nullptr,
             sidecar_stage_prefix,
             /*layer_idx_is_cache_local=*/true);
         if (attention.size() == 0)
@@ -774,21 +776,25 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
-        const void *position_ids_device)
+        const void *position_ids_device,
+        const int32_t *sequence_lengths_device)
     {
         DecodeReplicatedDenseScope decode_dense_scope(*this, seq_len * batch_size);
         if (isGDNLayer(layer_idx))
         {
             (void)position_ids_device;
             return buildGDNAttentionGraph(layer, buffers, layer_idx,
-                                          seq_len, batch_size, kv_cache, device);
+                                          seq_len, batch_size, kv_cache, device,
+                                          sequence_lengths,
+                                          sequence_lengths_device);
         }
         else
         {
             // Full attention layers — custom Qwen3.5 FA path with Q gate split
             return buildFAAttentionGraph(
                 layer, buffers, layer_idx, seq_len, batch_size,
-                kv_cache, position_ids, position_ids_device, device, sequence_lengths);
+                kv_cache, position_ids, position_ids_device, device,
+                sequence_lengths, sequence_lengths_device);
         }
     }
 
@@ -803,7 +809,9 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         IKVCache *kv_cache,
-        DeviceId device)
+        DeviceId device,
+        const std::vector<int> *sequence_lengths,
+        const int32_t *sequence_lengths_device)
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
@@ -1046,10 +1054,16 @@ namespace llaminar2
         conv_params.output = buffers.get(BufferId::GDN_QKV); // In-place (conv modifies QKV)
         conv_params.weight = gdn_layer->ssm_conv1d;
         conv_params.bias = nullptr; // Conv bias from ssm_dt.bias if available
-        conv_params.conv_state = gdn_state->conv_state.data();
+        // CPU kernels own live state in the cache vector. GPU kernels own stable
+        // device banks and must never adopt a host pointer as live state.
+        conv_params.conv_state = device.is_cpu()
+                                     ? gdn_state->conv_state.data()
+                                     : nullptr;
         conv_params.seq_len = total_tokens;
         conv_params.request_count = batch_size;
         conv_params.request_seq_len = seq_len;
+        conv_params.request_seq_lens_host = sequence_lengths;
+        conv_params.request_seq_lens_device = sequence_lengths_device;
         conv_params.channels = qkv_dim;
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
         conv_params.layer_idx = layer_idx;
@@ -1089,10 +1103,14 @@ namespace llaminar2
         rec_params.A_log = gdn_layer->ssm_a; // Learnable log-space gate
         rec_params.dt_bias = gdn_layer->ssm_dt_bias;
         rec_params.output = buffers.attn_output;
-        rec_params.recurrence_state = gdn_state->recurrence_state.data();
+        rec_params.recurrence_state = device.is_cpu()
+                                          ? gdn_state->recurrence_state.data()
+                                          : nullptr;
         rec_params.seq_len = total_tokens;
         rec_params.request_count = batch_size;
         rec_params.request_seq_len = seq_len;
+        rec_params.request_seq_lens_host = sequence_lengths;
+        rec_params.request_seq_lens_device = sequence_lengths_device;
         rec_params.n_heads = n_v_heads;   // Recurrence runs with value head count
         rec_params.n_k_heads = n_k_heads; // Key head count for QKV split
         rec_params.d_k = d_k;
@@ -1264,7 +1282,8 @@ namespace llaminar2
         const void *position_ids_device,
         DeviceId device,
         const std::string &stage_prefix_override,
-        bool layer_idx_is_cache_local)
+        bool layer_idx_is_cache_local,
+        int first_seq_idx)
     {
         ComputeGraph graph;
         if (!kv_cache)
@@ -1396,10 +1415,12 @@ namespace llaminar2
             seq_len,
             batch_size,
             kv_cache,
+            /*request_sequence_lengths_device=*/nullptr,
             device,
             rope_node,
             cache_source_dependencies,
-            layer_idx_is_cache_local);
+            layer_idx_is_cache_local,
+            first_seq_idx);
         graph.setTerminalNode(kv_append);
         return graph;
     }
@@ -1415,6 +1436,7 @@ namespace llaminar2
         const void *position_ids_device,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
+        const int32_t *sequence_lengths_device,
         const std::string &stage_prefix_override,
         bool layer_idx_is_cache_local)
     {
@@ -1579,7 +1601,9 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node,
+            kv_cache, position_ids, position_ids_device,
+            sequence_lengths_device,
+            device, has_qkv_proj, rope_node,
             cache_source_dependencies,
             layer_idx_is_cache_local);
 

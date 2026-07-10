@@ -256,7 +256,7 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_ClampedToSize)
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }
 
-TEST(Test__CUDARingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperations)
+TEST(Test__CUDARingKVCache_Comprehensive, Evict_SequenceCountTracksAcrossOperations)
 {
     if (!hasCUDA())
         GTEST_SKIP() << "CUDA not available";
@@ -270,16 +270,13 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperatio
     CudaBuffer d_K(h_K), d_V(h_V);
 
     cache->append(0, 0, d_K.ptr, d_V.ptr, 20, 0);
-    EXPECT_EQ(cache->get_total_evicted(), 0);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 20);
 
     cache->evict_oldest(0, 0, 5);
-    EXPECT_EQ(cache->get_total_evicted(), 5);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 15);
 
     cache->evict_oldest(0, 0, 3);
-    EXPECT_EQ(cache->get_total_evicted(), 8);
-
-    cache->reset_eviction_counter();
-    EXPECT_EQ(cache->get_total_evicted(), 0);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 12);
 }
 
 TEST(Test__CUDARingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
@@ -633,8 +630,6 @@ TEST(Test__CUDARingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq);
     // Note: filling to exact capacity wraps the head pointer to position 0,
     // so is_wrapped() returns true. This is by design in the ring buffer.
-    EXPECT_EQ(cache->get_total_evicted(), 0);
-
     // Retrieve and verify data integrity despite head-pointer wrap
     const void *dk, *dv;
     int len;
@@ -647,10 +642,10 @@ TEST(Test__CUDARingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
 }
 
 // =============================================================================
-// 12. Clear All Resets Eviction and Linearization Counters
+// 12. Clear All Resets Canonical Ring State
 // =============================================================================
 
-TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCounters)
+TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCanonicalRingState)
 {
     if (!hasCUDA())
         GTEST_SKIP() << "CUDA not available";
@@ -662,9 +657,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCounters)
     auto h_data = generateRandomFP32(10 * kv_dim);
     CudaBuffer d_K(h_data), d_V(h_data);
 
-    // Cause some evictions and linearizations
+    // Fill beyond capacity and force a scalar linearization before reset.
     cache->append(0, 0, d_K.ptr, d_V.ptr, 10, 0);
-    EXPECT_GT(cache->get_total_evicted(), 0);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
 
     const void *dk, *dv;
     int len;

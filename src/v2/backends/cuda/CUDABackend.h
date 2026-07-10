@@ -164,7 +164,10 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_token_device,
-            void *out_probability_device = nullptr) override;
+            void *out_probability_device = nullptr,
+            uint64_t threshold_seed = 0,
+            const void *threshold_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSampleProcessedLogitsF32Device(
             const void *logits_device,
             int vocab_size,
@@ -189,7 +192,10 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_token_device,
-            void *out_probability_device = nullptr) override;
+            void *out_probability_device = nullptr,
+            uint64_t threshold_seed = 0,
+            const void *threshold_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
             const void *logits_device,
             int vocab_size,
@@ -301,7 +307,9 @@ namespace llaminar2
             const void *draft_token_probabilities_device = nullptr,
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
-            int inverse_sample_vocab_size = 0) override;
+            int inverse_sample_vocab_size = 0,
+            const void *threshold_base_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
             const void *draft_logits_device,
@@ -336,7 +344,9 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr,
-            bool no_draft_probabilities = false) override;
+            bool no_draft_probabilities = false,
+            const void *threshold_base_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSpeculativeVerifyProcessedTargetDraftLogitsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
             const void *draft_logits_device,
@@ -452,7 +462,33 @@ namespace llaminar2
             int32_t filler_token,
             int device_id,
             void *stream,
-            void *out_tokens_device) override;
+            void *out_tokens_device,
+            const void *base_positions_device,
+            int position_offset,
+            void *out_position_ids_device) override;
+        bool enqueuePrepareMTPBatchedSidecarInputs(
+            const void *condition_tokens_device,
+            int condition_token_stride,
+            const void *base_positions_device,
+            int position_offset,
+            int request_count,
+            int device_id,
+            void *stream,
+            void *out_condition_tokens_device,
+            void *out_position_ids_device) override;
+        bool enqueueInitializeMTPDeviceLogicalState(
+            const void *sampled_tokens_device,
+            const void *target_positions_device,
+            int request_count,
+            int device_id,
+            void *stream,
+            void *out_base_cached_tokens_device,
+            void *out_target_positions_device,
+            void *out_accepted_state_counts_device,
+            void *out_next_condition_tokens_device,
+            void *out_all_drafts_accepted_flags_device,
+            void *out_stopped_flags_device,
+            void *out_publication_ok_flags_device) override;
 
         // GPU-side sparse logit penalty application
         bool applyLogitPenaltiesF32(void *logits_device,

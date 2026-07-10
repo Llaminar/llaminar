@@ -1,3 +1,9 @@
+/**
+ * @file Test__MTPSpecStateContract.cpp
+ * @brief Verifies speculative-decode metadata, state publication, and
+ *        transaction contracts for CPU and device-resident GPU paths.
+ */
+
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -97,6 +103,27 @@ namespace
             return restore_ok_;
         }
 
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override
+        {
+            if (!host_row_indices || request_count <= 0)
+                return false;
+            batch_host_restored_rows.emplace_back(
+                host_row_indices,
+                host_row_indices + request_count);
+            batch_host_request_counts.push_back(request_count);
+            batch_host_streams.push_back(stream);
+            recordOperation("batch_host_restore");
+            return restore_ok_;
+        }
+
+        void clearVerifierStateCaptureBindingAfterPublication() override
+        {
+            ++capture_binding_clear_calls;
+        }
+
         bool requiresPostVerifierStatePublication() const override
         {
             return post_restore_publication_;
@@ -122,7 +149,11 @@ namespace
         std::vector<int> batch_request_counts;
         std::vector<int> batch_row_index_strides;
         std::vector<void *> batch_streams;
+        std::vector<std::vector<int>> batch_host_restored_rows;
+        std::vector<int> batch_host_request_counts;
+        std::vector<void *> batch_host_streams;
         std::vector<void *> post_restore_streams;
+        int capture_binding_clear_calls = 0;
 
     private:
         void recordOperation(const char *operation)
@@ -887,6 +918,56 @@ TEST(Test__MTPSpecStateContract, PublisherAllowsZeroAcceptedWithoutStageRestore)
     EXPECT_EQ(result.restored_stage_count, 0);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_TRUE(captured.restored_rows.empty());
+}
+
+/**
+ * @brief Host request batches publish each captured stage exactly once.
+ *
+ * A rejected request carries a negative row and remains on its prior live
+ * state.  The publisher forwards the entire vector to the request-aware stage
+ * ABI instead of replaying the scalar restore against one shared state slot.
+ */
+TEST(Test__MTPSpecStateContract, BatchedHostPublisherUsesOneGroupedRestorePerStage)
+{
+    FakeVerifierStateStage captured0(/*captures=*/true);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+    FakeVerifierStateStage captured1(/*captures=*/true);
+    const int restore_rows[3] = {1, -1, 8};
+
+    MTPSpecStepPlan first =
+        participantPlan(/*participant_id=*/0, /*accepted_count=*/2);
+    MTPSpecStepPlan second =
+        participantPlan(/*participant_id=*/1, /*accepted_count=*/0);
+    MTPSpecStepPlan third =
+        participantPlan(/*participant_id=*/2, /*accepted_count=*/1);
+    MTPSpecStepPlanBatch batch = planBatch({first, second, third});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRows(
+            batch,
+            restore_rows,
+            {&captured0, &skipped, &captured1},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 3);
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_TRUE(captured0.restored_rows.empty());
+    EXPECT_TRUE(captured1.restored_rows.empty());
+    EXPECT_THAT(captured0.batch_host_restored_rows,
+                ElementsAre(ElementsAre(1, -1, 8)));
+    EXPECT_THAT(captured1.batch_host_restored_rows,
+                ElementsAre(ElementsAre(1, -1, 8)));
+    EXPECT_THAT(captured0.batch_host_request_counts, ElementsAre(3));
+    EXPECT_THAT(captured1.batch_host_request_counts, ElementsAre(3));
+    EXPECT_THAT(captured0.batch_host_streams, ElementsAre(nullptr));
+    EXPECT_THAT(captured1.batch_host_streams, ElementsAre(nullptr));
+    EXPECT_EQ(captured0.capture_binding_clear_calls, 1);
+    EXPECT_EQ(captured1.capture_binding_clear_calls, 1);
+    EXPECT_TRUE(skipped.batch_host_restored_rows.empty());
 }
 
 TEST(Test__MTPSpecStateContract, PublisherRejectsGpuNullStream)

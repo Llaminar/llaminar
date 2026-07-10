@@ -55,6 +55,20 @@ extern "C"
         int max_snapshot_rows,
         int device_idx, void *stream);
 
+    bool rocmGDN_chunk_forward_batched_effective(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *device_effective_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream);
+
     // GPU memory helpers (implemented in ROCmGatedDeltaNetKernels.hip)
     bool rocmGDN_gpu_malloc(float **ptr, size_t count);
     void rocmGDN_gpu_free(float *ptr);
@@ -80,6 +94,16 @@ extern "C"
         const int *device_row_indices,
         int request_count,
         int row_index_stride,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
+    bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+        float *dst,
+        const float *capture,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
         int rows,
         int state_size,
         int device_idx,
@@ -126,6 +150,9 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
+            // GPU kernels own the only live state. The generic destination is a
+            // CPU-backend concern and is intentionally ignored here.
+            (void)dst_state;
             if (!selectState(verifier_state_capture_size_) ||
                 !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
@@ -141,22 +168,10 @@ namespace llaminar2
             if (stream)
             {
                 rocmGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
-                if (dst_state)
-                {
-                    /*
-                     * Publication owns both the HIP live state and the hybrid
-                     * cache's host mirror.  Updating the mirror here keeps any
-                     * post-publication graph rebuild decode-equivalent.
-                     */
-                    rocmGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
-                    rocmGDN_stream_synchronize(stream);
-                }
             }
             else
             {
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
-                if (dst_state)
-                    rocmGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
             }
             return true;
         }
@@ -166,12 +181,7 @@ namespace llaminar2
             const int *device_row_index,
             void *stream) override
         {
-            /*
-             * Device-indexed publication consumes GPU-resident accepted-row
-             * metadata and restores HIP live state only. Do not update the host
-             * mirror from this method; that would force a stream sync and split
-             * live-state ownership across host and device.
-             */
+            // Accepted-row metadata and live recurrent state remain on device.
             (void)dst_state;
             if (!selectState(verifier_state_capture_size_) ||
                 !verifier_state_capture_ || !device_row_index ||
@@ -223,6 +233,35 @@ namespace llaminar2
                 device_row_indices,
                 request_count,
                 row_index_stride,
+                verifier_state_capture_rows_,
+                request_state_bank_state_size_,
+                device_ordinal_,
+                stream);
+        }
+
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override
+        {
+            (void)dst_states;
+            if (!request_state_bank_ ||
+                request_state_bank_state_size_ <= 0 ||
+                request_state_bank_capacity_ < request_count ||
+                !verifier_state_capture_ ||
+                !device_request_seq_lens ||
+                !stream)
+            {
+                return false;
+            }
+            return rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+                request_state_bank_,
+                verifier_state_capture_,
+                device_request_seq_lens,
+                request_count,
+                request_row_width,
                 verifier_state_capture_rows_,
                 request_state_bank_state_size_,
                 device_ordinal_,
@@ -487,6 +526,75 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Run variable-length request recurrence as one HIP launch.
+         *
+         * The grouped launch encodes request identity directly while each
+         * block preserves serial timestep order for its request-local state. A
+         * single contiguous device copy seeds speculative state when verifier
+         * capture is active.
+         */
+        bool chunkForwardBatchedRequestsWithDeviceSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int head_dim_k, int head_dim_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_request_seq_lens) override
+        {
+            (void)state;
+            (void)chunk_size;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size =
+                n_heads * head_dim_k * head_dim_v;
+            if (!stream_ || !device_request_seq_lens ||
+                seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+                seq_len != request_count * request_seq_len ||
+                required_state_size <= 0)
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Invalid device-length request-batched shape");
+                return false;
+            }
+            if (!ensureRequestStateBank(request_count, required_state_size))
+                return false;
+
+            const bool capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ >= request_count * request_seq_len &&
+                verifier_state_capture_size_ == required_state_size;
+            float *effective_states = request_state_bank_;
+            if (capture_active)
+            {
+                const int work_floats = request_count * required_state_size;
+                if (!speculative_state_work_ ||
+                    speculative_state_work_size_ < work_floats)
+                {
+                    LOG_ERROR("[ROCmGatedDeltaNet] Grouped verifier requires one speculative state slot per request");
+                    return false;
+                }
+                rocmGDN_gpu_memcpy_async(
+                    speculative_state_work_,
+                    request_state_bank_,
+                    static_cast<size_t>(work_floats),
+                    stream_);
+                effective_states = speculative_state_work_;
+            }
+
+            return rocmGDN_chunk_forward_batched_effective(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, effective_states,
+                seq_len, request_count, request_seq_len,
+                n_heads, head_dim_k, head_dim_v,
+                use_qk_l2norm,
+                device_request_seq_lens,
+                capture_active ? verifier_state_capture_ : nullptr,
+                required_state_size,
+                capture_active ? verifier_state_capture_rows_ : 0,
+                device_ordinal_, stream_);
+        }
+
         bool recurrent_step(
             const float *q, const float *k, const float *v,
             const float *alpha, const float *beta_raw,
@@ -531,6 +639,40 @@ namespace llaminar2
         }
 
         void setGPUStream(void *stream) override { stream_ = stream; }
+
+        /**
+         * @brief Enqueue a diagnostic copy of the resident request-state bank.
+         *
+         * This observation API exists for integration parity tests and state
+         * diagnostics only; production execution never consumes the host copy.
+         * The caller owns @p dst_host and must synchronize @p stream before
+         * reading it.  Shape validation prevents a diagnostic from silently
+         * reading beyond the persistent request allocation.
+         */
+        bool exportRequestStateBank(
+            void *dst_host,
+            int request_count,
+            int state_size,
+            void *stream) const
+        {
+            if (!dst_host || !stream ||
+                !request_state_bank_ ||
+                request_count <= 0 || state_size <= 0 ||
+                request_count > request_state_bank_capacity_ ||
+                state_size != request_state_bank_state_size_)
+            {
+                return false;
+            }
+
+            rocmGDN_gpu_set_device(device_ordinal_);
+            rocmGDN_gpu_memcpy_d2h_async(
+                static_cast<float *>(dst_host),
+                request_state_bank_,
+                static_cast<size_t>(request_count) *
+                    static_cast<size_t>(state_size),
+                stream);
+            return true;
+        }
 
         bool exportState(void *dst_host, void *dst_device, void *stream) const override
         {

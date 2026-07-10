@@ -503,4 +503,24 @@ namespace llaminar2
         return row_scale;
     }
 
+    /**
+     * @brief Pack one logical 32-value Q8_K slice as raw INT8 plus unit scale.
+     *
+     * Eight logical execution blocks share one 256-value Q8_K source block.
+     * `bsums` are derived acceleration metadata, so preserving `qs` exactly is
+     * sufficient for both execution and lossless reverse repack.
+     */
+    void Q8_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const int superblocks_per_row = (ctx.blocks_per_row + 7) / 8;
+        const int superblock = b / 8;
+        const int subblock = b % 8;
+        const auto *block = &typed_data()[
+            static_cast<size_t>(n) * static_cast<size_t>(superblocks_per_row) +
+            static_cast<size_t>(superblock)];
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        std::memcpy(vnniPayloadDst(ctx, linear), block->qs + subblock * 32, 32);
+        ctx.scales_array[linear] = fp32_to_fp16(1.0f);
+    }
+
 } // namespace llaminar2

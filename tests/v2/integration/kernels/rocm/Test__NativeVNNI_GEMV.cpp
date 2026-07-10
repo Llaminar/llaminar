@@ -2,7 +2,7 @@
  * @file Test__NativeVNNI_GEMV.cpp
  * @brief Integration tests for native-VNNI GEMV kernel — GPU accuracy comparison
  *
- * Tests the complete native-VNNI GEMV pipeline on GPU for all 16 supported formats:
+ * Tests the complete native-VNNI GEMV pipeline on GPU for all quantized formats:
  *   1. Create random quantized weights
  *   2. Pack with packWeightsToROCm() → produces native-VNNI payload/scales
  *   3. Create ROCmQuantisedGemmKernel with workspace
@@ -407,6 +407,9 @@ namespace
         {"Q8_0", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ8_0Random({N, K}); }, true},
+        {"Q8_1", false, 0.990f,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_1Random({N, K}); }, true},
         {"IQ4_NL", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
@@ -441,6 +444,9 @@ namespace
         {"Q2_K", true, 0.970f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ2_KRandom({N, K}); }},
+        {"Q8_K", true, 0.990f,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_KRandom({N, K}); }, true},
 
         // Tier 3: IQ grid-index super-blocks
         {"IQ3_S", true, 0.975f,
@@ -1501,16 +1507,16 @@ namespace
     }
 
     // =============================================================================
-    // Summary test: run all 16 formats at moderate dimensions and print table
+    // Summary test: run every quantized format at moderate dimensions and print table
     // =============================================================================
 
     /**
-     * @test Comprehensive accuracy sweep: all 16 native-VNNI formats in one test
+     * @test Comprehensive accuracy sweep: every quantized format in one test
      *
      * Runs each format through M=1 GEMV with N=128, K varies by format.
      * Prints a summary table at the end with cosine similarity and max abs error.
      */
-    TEST_F(NativeVNNIGEMVTest, AccuracySweep_All16Formats)
+    TEST_F(NativeVNNIGEMVTest, AccuracySweep_AllQuantizedFormats)
     {
         if (!has_rocm_device_)
         {

@@ -16,9 +16,14 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 // Forward declaration of extern "C" kernel wrapper
 extern "C"
@@ -39,6 +44,18 @@ extern "C"
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         const int *device_effective_seq_len,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream);
+
+    bool cudaGDN_short_conv1d_batched(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *request_states,
+        int request_count, int request_seq_len,
+        int channels, int kernel_size,
+        bool apply_silu,
+        const int *device_request_seq_lens,
         float *state_snapshots,
         int snapshot_stride_floats,
         int max_snapshot_rows,
@@ -69,6 +86,16 @@ extern "C"
         const int *device_row_indices,
         int request_count,
         int row_index_stride,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
+    bool cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+        float *dst,
+        const float *capture,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
         int rows,
         int state_size,
         int device_idx,
@@ -120,6 +147,9 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
+            // GPU kernels own the only live state. The generic destination is a
+            // CPU-backend concern and is intentionally ignored here.
+            (void)dst_state;
             if (!selectState(verifier_state_capture_size_) ||
                 !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
@@ -135,22 +165,10 @@ namespace llaminar2
             if (stream)
             {
                 cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
-                if (dst_state)
-                {
-                    /*
-                     * Keep the hybrid cache's host conv-state mirror aligned
-                     * with the device state restored for graph replay.  A graph
-                     * rebuild after publication may consult this host vector.
-                     */
-                    cudaGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
-                    cudaGDN_stream_synchronize(stream);
-                }
             }
             else
             {
                 cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
-                if (dst_state)
-                    cudaGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
             }
             return true;
         }
@@ -160,11 +178,7 @@ namespace llaminar2
             const int *device_row_index,
             void *stream) override
         {
-            /*
-             * Device-indexed MTP publication restores only implementation-owned
-             * GPU live state. Keeping the host mirror untouched avoids a D2H
-             * sync on the verifier stream and makes replay ownership explicit.
-             */
+            // Accepted-row metadata and live recurrent state remain on device.
             (void)dst_state;
             if (!selectState(verifier_state_capture_size_) ||
                 !verifier_state_capture_ || !device_row_index ||
@@ -184,6 +198,7 @@ namespace llaminar2
                 stream);
             if (!ok)
                 return false;
+            debugLogDeviceIndexedRestoreSamples("CUDAShortConvolution", stream);
             return true;
         }
 
@@ -216,6 +231,35 @@ namespace llaminar2
                 device_row_indices,
                 request_count,
                 row_index_stride,
+                verifier_state_capture_rows_,
+                request_state_bank_state_size_,
+                device_ordinal_,
+                stream);
+        }
+
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override
+        {
+            (void)dst_states;
+            if (!request_state_bank_ ||
+                request_state_bank_state_size_ <= 0 ||
+                request_state_bank_capacity_ < request_count ||
+                !verifier_state_capture_ ||
+                !device_request_seq_lens ||
+                !stream)
+            {
+                return false;
+            }
+            return cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+                request_state_bank_,
+                verifier_state_capture_,
+                device_request_seq_lens,
+                request_count,
+                request_row_width,
                 verifier_state_capture_rows_,
                 request_state_bank_state_size_,
                 device_ordinal_,
@@ -520,6 +564,96 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Execute one native grouped variable-length request matrix.
+         *
+         * Live and speculative state banks are contiguous, allowing verifier
+         * setup to use one device copy and the kernel launch to encode request
+         * identity directly. No request is replayed through the scalar API.
+         */
+        bool forwardBatchedRequestsWithDeviceSeqLens(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            const int *device_request_seq_lens,
+            bool apply_silu = true) override
+        {
+            (void)conv_state;
+            cudaGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size = channels * (kernel_size - 1);
+            if (!stream_ || !device_request_seq_lens ||
+                seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+                seq_len != request_count * request_seq_len ||
+                required_state_size <= 0)
+            {
+                LOG_ERROR("[CUDAShortConvolution] Invalid device-length request-batched shape");
+                return false;
+            }
+            if (!ensureRequestStateBank(request_count, required_state_size))
+                return false;
+
+            const bool capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ >= request_count * request_seq_len &&
+                verifier_state_capture_size_ == required_state_size;
+            float *effective_states = request_state_bank_;
+            if (capture_active)
+            {
+                const int work_floats = request_count * required_state_size;
+                if (!speculative_state_work_ ||
+                    speculative_state_work_size_ < work_floats)
+                {
+                    LOG_ERROR("[CUDAShortConvolution] Grouped verifier requires one speculative state slot per request");
+                    return false;
+                }
+                cudaGDN_gpu_memcpy_async(
+                    speculative_state_work_,
+                    request_state_bank_,
+                    static_cast<size_t>(work_floats),
+                    stream_);
+                effective_states = speculative_state_work_;
+            }
+
+            float *effective_output = output;
+            const bool needs_scratch = input == output;
+            const int output_floats = seq_len * channels;
+            if (needs_scratch)
+            {
+                if (!scratchPointer() || scratchCapacity() < output_floats)
+                {
+                    LOG_ERROR("[CUDAShortConvolution] Grouped request scratch is too small: need "
+                              << output_floats << " floats, have " << scratchCapacity());
+                    return false;
+                }
+                effective_output = scratchPointer();
+            }
+
+            if (!cudaGDN_short_conv1d_batched(
+                    input, weight, bias,
+                    effective_output, effective_states,
+                    request_count, request_seq_len,
+                    channels, kernel_size, apply_silu,
+                    device_request_seq_lens,
+                    capture_active ? verifier_state_capture_ : nullptr,
+                    required_state_size,
+                    capture_active ? verifier_state_capture_rows_ : 0,
+                    device_ordinal_, stream_))
+            {
+                return false;
+            }
+
+            if (needs_scratch)
+            {
+                cudaGDN_gpu_memcpy_async(
+                    output,
+                    scratchPointer(),
+                    static_cast<size_t>(output_floats),
+                    stream_);
+            }
+            return true;
+        }
+
         void setGPUStream(void *stream) override { stream_ = stream; }
 
         bool exportState(void *dst_host, void *dst_device, void *stream) const override
@@ -660,6 +794,100 @@ namespace llaminar2
         int verifier_state_capture_size_ = 0;
         float *speculative_state_work_ = nullptr;
         int speculative_state_work_size_ = 0;
+
+        static uint64_t hashFloatBytes(const float *values, size_t count)
+        {
+            constexpr uint64_t kOffset = 1469598103934665603ull;
+            constexpr uint64_t kPrime = 1099511628211ull;
+            uint64_t hash = kOffset;
+            const auto *bytes = reinterpret_cast<const unsigned char *>(values);
+            const size_t byte_count = count * sizeof(float);
+            for (size_t i = 0; i < byte_count; ++i)
+            {
+                hash ^= static_cast<uint64_t>(bytes[i]);
+                hash *= kPrime;
+            }
+            return hash;
+        }
+
+        static size_t countNonZeroFloats(const float *values, size_t count)
+        {
+            size_t nonzero = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (values[i] != 0.0f)
+                    ++nonzero;
+            }
+            return nonzero;
+        }
+
+        static double sumAbsoluteFloats(const float *values, size_t count)
+        {
+            double sum = 0.0;
+            for (size_t i = 0; i < count; ++i)
+                sum += static_cast<double>(std::fabs(values[i]));
+            return sum;
+        }
+
+        void debugLogDeviceIndexedRestoreSamples(const char *component, void *stream) const
+        {
+            if (!DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS") ||
+                !stream ||
+                !gpu_state_ ||
+                !verifier_state_capture_ ||
+                state_size_ <= 0 ||
+                verifier_state_capture_rows_ <= 0 ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return;
+            }
+
+            const int rows_to_copy = std::min(verifier_state_capture_rows_, 4);
+            const size_t row_floats = static_cast<size_t>(state_size_);
+            const size_t vectors = static_cast<size_t>(rows_to_copy + 1);
+            std::vector<float> host(vectors * row_floats, 0.0f);
+
+            cudaGDN_gpu_memcpy_d2h_async(
+                host.data(),
+                gpu_state_,
+                row_floats,
+                stream);
+            for (int row = 0; row < rows_to_copy; ++row)
+            {
+                const float *src =
+                    verifier_state_capture_ +
+                    static_cast<size_t>(row) *
+                        static_cast<size_t>(verifier_state_capture_size_);
+                cudaGDN_gpu_memcpy_d2h_async(
+                    host.data() + static_cast<size_t>(row + 1) * row_floats,
+                    src,
+                    row_floats,
+                    stream);
+            }
+            cudaGDN_stream_synchronize(stream);
+
+            const auto log_summary =
+                [&](const char *label, const float *values)
+            {
+                LOG_INFO("[MTPPublicationDiagnostics] phase=cuda_gdn_restore_sample"
+                         << " component=" << component
+                         << " kernel=" << static_cast<const void *>(this)
+                         << " label=" << label
+                         << " state_size=" << state_size_
+                         << " capture_rows=" << verifier_state_capture_rows_
+                         << " hash=" << hashFloatBytes(values, row_floats)
+                         << " nonzero=" << countNonZeroFloats(values, row_floats)
+                         << " sum_abs=" << sumAbsoluteFloats(values, row_floats));
+            };
+
+            log_summary("live_after_restore", host.data());
+            for (int row = 0; row < rows_to_copy; ++row)
+            {
+                const std::string label = "capture_row_" + std::to_string(row);
+                log_summary(label.c_str(),
+                            host.data() + static_cast<size_t>(row + 1) * row_floats);
+            }
+        }
 
         bool selectState(int required_state_size)
         {

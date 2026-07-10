@@ -221,6 +221,30 @@ namespace
         }
     }
 
+#ifdef HAVE_CUDA
+    /** @brief Own an explicit non-default stream for legacy CUDA parity cells. */
+    class ScopedCudaStream
+    {
+    public:
+        ScopedCudaStream()
+        {
+            if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess)
+                stream_ = nullptr;
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream_)
+                (void)cudaStreamDestroy(stream_);
+        }
+
+        cudaStream_t get() const { return stream_; }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
+#endif
+
 } // namespace
 
 // ============================================================================
@@ -797,6 +821,9 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Small)
 
     // CUDA kernel with workspace
     llaminar2::cuda::CUDARoPEKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     // Set up workspace for RoPE kernel
     DeviceWorkspaceManager workspace(DeviceId::cuda(0), 16 * 1024 * 1024); // 16MB
@@ -875,6 +902,9 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     llaminar2::cuda::CUDARoPEKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
 
     // Set up workspace for RoPE kernel
     DeviceWorkspaceManager workspace(DeviceId::cuda(0), 16 * 1024 * 1024); // 16MB
@@ -947,6 +977,9 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
                                        rope_theta, -1, rotary_dim));
 
     llaminar2::cuda::CUDARoPEKernelT<ActivationPrecision::FP32> cuda_kernel;
+    ScopedCudaStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    cuda_kernel.setGPUStream(stream.get());
     DeviceWorkspaceManager workspace(DeviceId::cuda(0), 16 * 1024 * 1024); // 16MB
     auto reqs = cuda_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";

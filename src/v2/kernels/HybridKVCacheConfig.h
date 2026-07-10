@@ -40,8 +40,14 @@ namespace llaminar2
      * - Recurrence state: delta-rule S matrix, updated in-place each step
      * - Conv state: causal convolution sliding window of (kernel-1) tokens
      *
-     * Always stored in FP32. The --kv-cache-precision flag has no effect
-     * on GDN state precision.
+     * CPU backends store the live state in the FP32 vectors below. GPU
+     * backends leave those vectors empty and keep the only live copies in the
+     * short-convolution and recurrence kernel objects. The explicit element
+     * counts describe the participant-local bank without requiring a host
+     * allocation, which prevents graph construction from accidentally treating
+     * a stale host vector as authoritative GPU state.
+     *
+     * The --kv-cache-precision flag has no effect on GDN state precision.
      */
     struct HybridGDNLayerState
     {
@@ -50,6 +56,12 @@ namespace llaminar2
         int d_k = 0;       ///< Key/query dimension per head
         int d_v = 0;       ///< Value dimension per head
         int conv_kernel_size = 0;
+
+        /// Participant-local recurrence bank size in FP32 elements.
+        int local_recurrence_state_size = 0;
+
+        /// Participant-local short-convolution bank size in FP32 elements.
+        int local_conv_state_size = 0;
 
         /**
          * @brief Full decode-bank recurrence size in FP32 elements.
@@ -72,30 +84,49 @@ namespace llaminar2
          */
         int full_conv_state_size = 0;
 
-        /// Recurrence state S: [n_v_heads, d_k, d_v] (FP32)
+        /// CPU-owned recurrence state S: [n_v_heads, d_k, d_v] (FP32).
+        /// GPU caches deliberately leave this vector empty.
         std::vector<float> recurrence_state;
 
-        /// Short convolution state: [qkv_dim, conv_kernel-1] (FP32)
+        /// CPU-owned short-convolution state: [qkv_dim, kernel-1] (FP32).
+        /// GPU caches deliberately leave this vector empty.
         std::vector<float> conv_state;
 
         /// Kernel instances for this layer (owned by the cache)
         std::shared_ptr<ITensorShortConvolution> conv_kernel;
         std::shared_ptr<ITensorGatedDeltaNet> rec_kernel;
 
-        /// Initialize (zero-fill) all state
-        void initialize(int qkv_dim)
+        /**
+         * @brief Initialize the CPU-owned live state vectors.
+         *
+         * GPU caches must call @ref initializeShape instead and let their
+         * backend kernels allocate the live device banks.
+         */
+        void initializeCPUState(int qkv_dim)
         {
-            const size_t s_size = static_cast<size_t>(n_v_heads) *
-                                  static_cast<size_t>(d_k) *
-                                  static_cast<size_t>(d_v);
-            recurrence_state.assign(s_size, 0.0f);
+            initializeShape(qkv_dim);
+            recurrence_state.assign(
+                static_cast<size_t>(local_recurrence_state_size), 0.0f);
 
-            if (conv_kernel_size > 1)
-            {
-                const size_t c_size = static_cast<size_t>(qkv_dim) *
-                                      static_cast<size_t>(conv_kernel_size - 1);
-                conv_state.assign(c_size, 0.0f);
-            }
+            conv_state.assign(
+                static_cast<size_t>(local_conv_state_size), 0.0f);
+        }
+
+        /**
+         * @brief Record local bank dimensions without allocating host storage.
+         *
+         * This is the GPU initialization path. The shape remains available to
+         * graph planning, prefix serialization, and device-bank allocation,
+         * while the empty vectors make accidental host-state adoption visible.
+         */
+        void initializeShape(int qkv_dim)
+        {
+            local_recurrence_state_size = n_v_heads * d_k * d_v;
+            local_conv_state_size = conv_kernel_size > 1
+                                        ? qkv_dim * (conv_kernel_size - 1)
+                                        : 0;
+            recurrence_state.clear();
+            conv_state.clear();
         }
 
         /// Reset host-side state to zero (for new sequence)
@@ -110,10 +141,18 @@ namespace llaminar2
         /// Requires full ITensorShortConvolution/ITensorGatedDeltaNet definitions.
         void resetGPUKernelState();
 
-        /// Total memory in bytes
-        size_t memoryBytes() const
+        /// Total CPU-owned live-state memory in bytes.
+        size_t cpuMemoryBytes() const
         {
             return (recurrence_state.size() + conv_state.size()) * sizeof(float);
+        }
+
+        /// Participant-local logical state size independent of memory residence.
+        size_t localStateBytes() const
+        {
+            return (static_cast<size_t>(local_recurrence_state_size) +
+                    static_cast<size_t>(local_conv_state_size)) *
+                   sizeof(float);
         }
     };
 

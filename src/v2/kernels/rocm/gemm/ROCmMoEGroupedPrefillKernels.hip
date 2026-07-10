@@ -1176,6 +1176,7 @@ __global__ __launch_bounds__(64)
 void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, K]
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, K / 32]
+    const int*     __restrict__ d_group_token_indices, // [total_slots] token rows or route slots
     const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs, // [num_experts]
     const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,   // [num_experts]
     const int*     __restrict__ d_group_counts,      // [num_experts]
@@ -1183,6 +1184,10 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const int*     __restrict__ d_active_expert_ids, // [active_expert_slots]
     float*         __restrict__ gate_out,            // [total_slots, N]
     float*         __restrict__ up_out,              // [total_slots, N]
+    int seq_len,
+    int top_k,
+    int grouped_indices_are_route_slots,
+    int input_is_original_rows,
     int N,
     int K)
 {
@@ -1208,9 +1213,19 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     }
 
     const int blocks_per_row = K / 32;
-    const int8_t* slot_A = A_int8 + static_cast<size_t>(grouped_slot) * K;
+    int input_row = grouped_slot;
+    if (input_is_original_rows)
+    {
+        const int source_index = d_group_token_indices[grouped_slot];
+        input_row = grouped_indices_are_route_slots
+                        ? (source_index / top_k)
+                        : source_index;
+        if (input_row < 0 || input_row >= seq_len)
+            return;
+    }
+    const int8_t* slot_A = A_int8 + static_cast<size_t>(input_row) * K;
     const float* slot_scales =
-        scales_A_blockwise + static_cast<size_t>(grouped_slot) * blocks_per_row;
+        scales_A_blockwise + static_cast<size_t>(input_row) * blocks_per_row;
     const size_t out_index = static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
                              static_cast<size_t>(n);
     gate_out[out_index] = moe_prefill_dot_desc_range<FMT>(
@@ -1786,6 +1801,8 @@ extern "C" {
 bool rocmMoE_grouped_prefill_pipeline(
     // Input
     const float*  d_hidden,              // [seq_len, d_model] FP32 hidden states
+    const int8_t* d_prequantized_hidden, // optional [seq_len, d_model] router-owned Q8 rows
+    const float*  d_prequantized_hidden_scales, // optional [seq_len, d_model / 32]
     // Weight descriptors (already on device)
     const void*   d_gate_desc_table,     // DeviceNativeVNNIMatrixDesc[num_experts]
     const void*   d_up_desc_table,       // DeviceNativeVNNIMatrixDesc[num_experts]
@@ -1852,6 +1869,10 @@ bool rocmMoE_grouped_prefill_pipeline(
         max_tokens_per_expert <= 4 &&
         d_scratch_gate &&
         d_scratch_up;
+    const bool reuse_prequantized_hidden =
+        verifier_decode_equivalent_gateup &&
+        d_prequantized_hidden &&
+        d_prequantized_hidden_scales;
     const bool verifier_decode_equivalent_ordered_down =
         verifier_decode_equivalent_gateup &&
         !original_slot_atomic_scatter &&
@@ -1871,7 +1892,13 @@ bool rocmMoE_grouped_prefill_pipeline(
 
     // =========================================================================
     // Kernel 1: Gather + Quantize hidden → A_int8 (FLAT grid over total_slots)
+    //
+    // A verifier router already quantizes every original row for its Q8 logits
+    // GEMV.  When those device rows are published, gate/up addresses them
+    // through d_group_token_indices and this launch is unnecessary.  Ordinary
+    // prefill and non-Q8 routing retain the grouped gather/quantize path.
     // =========================================================================
+    if (!reuse_prequantized_hidden)
     {
         dim3 grid(blocks_per_d_model, total_slots);
         dim3 block(32);
@@ -1916,9 +1943,13 @@ bool rocmMoE_grouped_prefill_pipeline(
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT>), \
                     grid, block, 0, hip_stream, \
-                    d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
+                    d_group_token_indices, gate_descs, up_descs, \
                     d_group_counts, d_group_offsets, d_active_expert_ids, \
-                    d_scratch_gate, d_scratch_up, intermediate, d_model); \
+                    d_scratch_gate, d_scratch_up, seq_len, top_k, \
+                    grouped_indices_are_route_slots, reuse_prequantized_hidden ? 1 : 0, \
+                    intermediate, d_model); \
             } while (0)
         #define LAUNCH_GATEUP_PREFILL_TM(FMT, TM) \
             do { \

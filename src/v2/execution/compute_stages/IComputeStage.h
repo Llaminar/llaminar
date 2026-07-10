@@ -748,6 +748,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore one host-selected verifier row per CPU request.
+         *
+         * `host_row_indices[request]` contains a flat verifier snapshot row;
+         * negative values leave that request's live state unchanged.  Native
+         * CPU grouped stages must restore the complete vector in one call so
+         * scalar publication cannot overwrite one shared layer state or clear
+         * capture bindings between requests.
+         */
+        virtual bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream = nullptr)
+        {
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Restore mutable model state captured after a verifier row chosen on device.
          *
          * Device-resident stochastic MTP publication receives accepted-count
@@ -796,6 +816,60 @@ namespace llaminar2
             (void)stream;
             return false;
         }
+
+        /**
+         * @brief Publish request-local terminal states from device real lengths.
+         *
+         * Padded request-batched prefill owns one captured state row per flat
+         * `(request,row)` coordinate. Implementations derive each terminal row
+         * as `request * request_row_width + real_length - 1` on @p stream and
+         * restore all request-owned live states without exposing row indices to
+         * the host. The default is a hard failure.
+         */
+        virtual bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream)
+        {
+            (void)device_request_seq_lens;
+            (void)request_count;
+            (void)request_row_width;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Report that grouped request execution already committed live state.
+         *
+         * Long request-batched prefill may reserve only a small MTP verifier
+         * snapshot window. When that window cannot cover the complete flattened
+         * request matrix, conforming grouped kernels execute directly against
+         * request-owned live state banks and need no post-graph restore. Stages
+         * must return true only for that exact backend policy and geometry.
+         */
+        virtual bool requestBatchedTerminalStateCommittedDuringExecution(
+            int request_count,
+            int request_row_width) const
+        {
+            (void)request_count;
+            (void)request_row_width;
+            return false;
+        }
+
+        /**
+         * @brief Detach verifier-row scratch from a shared kernel after publication.
+         *
+         * Some GPU recurrent kernels are shared between the all-position verifier
+         * graph and the ordinary one-token decode graph.  The verifier graph binds
+         * speculative capture/work buffers so it can snapshot every candidate row
+         * without mutating live state.  After accepted-state publication restores
+         * the chosen row into live device state, the next ordinary decode must no
+         * longer see those speculative buffers as active.  Stages that multiplex a
+         * shared backend kernel override this hook to leave the live state resident
+         * while clearing only the verifier-capture binding.
+         */
+        virtual void clearVerifierStateCaptureBindingAfterPublication() {}
 
         /**
          * @brief True when this stage must publish derived live state after verifier-row restore.

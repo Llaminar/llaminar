@@ -75,43 +75,38 @@ namespace llaminar2::cpu::native_vnni
      *    so the entire working set is a single sequential memory stream per thread.
      *    This improves L3 cache utilization for large-K shapes like FFN_Down.
      */
-    /// Return the native block byte size for a given codebook_id.
-    /// For per-block formats (Q4_0, IQ4_NL, Q8_0, etc.), returns sizeof(BlockType).
-    /// For superblock formats (Q6_K, Q3_K, etc.), returns the superblock byte size.
-    /// Returns 0 for unknown formats.
-    inline size_t native_block_bytes_for_codebook(uint8_t codebook_id)
+    /**
+     * @brief Return the raw source block size for a native-VNNI format.
+     *
+     * Several source formats intentionally share an execution codebook after
+     * preparation, so codebook id alone is not sufficient.  The superblock bit
+     * disambiguates IQ4_NL/IQ4_XS, Q4_1/Q4_K, and Q5_1/Q5_K.  This metadata is
+     * used only by transferred/deferred prepared weights; eager kernels retain
+     * their already interleaved representation.
+     */
+    inline size_t native_block_bytes_for_format(uint8_t codebook_id, bool is_superblock)
     {
         switch (codebook_id)
         {
         case 0:  return 18;  // Q4_0Block
-        case 4:  return 18;  // IQ4_NLBlock
-        case 5:  return 20;  // Q4_1Block
+        case 4:  return is_superblock ? 136 : 18; // IQ4_XSBlock / IQ4_NLBlock
+        case 5:  return is_superblock ? 144 : 20; // Q4_KBlock / Q4_1Block
         case 6:  return 22;  // Q5_0Block
-        case 7:  return 24;  // Q5_1Block
-        case 10: return 210; // Q6_KBlock (superblock, 256 elements)
-        case 11: return 110; // Q3_KBlock (superblock, 256 elements)
-        case 12: return 84;  // Q2_KBlock (superblock, 256 elements)
-        case 13: return 144; // Q4_KBlock (superblock, 256 elements)
-        case 14: return 176; // Q5_KBlock (superblock, 256 elements)
+        case 7:  return is_superblock ? 176 : 24; // Q5_KBlock / Q5_1Block
+        case 8:  return 210; // Q6_KBlock
+        case 9:  return 110; // Q3_KBlock
+        case 10: return 84;  // Q2_KBlock
+        case 11: return 110; // IQ3_SBlock
+        case 12: return 98;  // IQ3_XXSBlock
+        case 13: return 82;  // IQ2_SBlock
+        case 14: return 74;  // IQ2_XSBlock
+        case 15: return 66;  // IQ2_XXSBlock
+        case 16: return 50;  // IQ1_SBlock
+        case 17: return 56;  // IQ1_MBlock
         case 19: return 34;  // Q8_0Block
+        case 20: return 36;  // Q8_1Block
+        case 21: return 288; // Q8_KBlock
         default: return 0;
-        }
-    }
-
-    /// Return the number of quantized elements per native block for a given codebook_id.
-    /// Per-block formats: 32 elements. Superblock formats: 256 elements.
-    inline int native_block_elements_for_codebook(uint8_t codebook_id)
-    {
-        switch (codebook_id)
-        {
-        case 10: // Q6_K
-        case 11: // Q3_K
-        case 12: // Q2_K
-        case 13: // Q4_K
-        case 14: // Q5_K
-            return 256;
-        default:
-            return 32;
         }
     }
 

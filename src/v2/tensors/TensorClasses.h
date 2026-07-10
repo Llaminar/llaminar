@@ -429,7 +429,8 @@ namespace llaminar2
          * symmetry, etc.) that describe how this format is packed for VNNI
          * kernels. Formats returning non-null are routed to NativeVNNI GEMV/GEMM.
          *
-         * @return Pointer to static metadata, or nullptr for non-VNNI formats (Q8_0, Q8_1)
+         * @return Pointer to static metadata, or nullptr when the tensor cannot be
+         *         represented by the native-VNNI packing contract.
          */
         virtual const NativeVnniFormatInfo *vnniFormatInfo() const { return nullptr; }
 
@@ -441,7 +442,8 @@ namespace llaminar2
          * output arrays in the VnniPackContext.  Super-block formats decompose
          * on the fly using (b / 8, b % 8) addressing.
          *
-         * Default is a no-op for non-VNNI formats (Q8_0, Q8_1).
+         * Default is a no-op for formats that use the generic pre-decoded INT8
+         * packing path rather than preserving a compressed native payload.
          *
          * @param ctx  Packing context with output buffers and layout parameters
          * @param n    Row index (output feature)
@@ -3764,6 +3766,7 @@ namespace llaminar2
             static constexpr NativeVnniFormatInfo info{20, 32, false, false, false, 127.0f};
             return &info;
         }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         /// Efficient override: reads Q8_1 blocks directly via typed_data()
         /// without virtual dispatch per block.
@@ -6416,6 +6419,24 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+
+        /**
+         * @brief Describe Q8_K as a lossless pre-decoded INT8 VNNI source.
+         *
+         * Q8_K already stores signed INT8 values.  Its 16-element block sums are
+         * an auxiliary dot-product acceleration and do not participate in the
+         * represented weight values, so CPU and GPU preparation can copy the
+         * values into the common 32-byte INT8 payload and publish a unit FP16
+         * scale for every 32-element execution block.  Codebook 21 identifies
+         * the source layout during preparation; GPU execution canonicalizes the
+         * prepared payload to the tuned raw-INT8 codebook 19.
+         */
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{21, 32, false, true, false, 127.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
 
         /// Efficient override: reads Q8_K superblocks directly via typed_data().
         /// Q8_K has no per-block scale so values are already int8; only needs

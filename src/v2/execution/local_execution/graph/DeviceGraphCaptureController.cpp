@@ -1306,7 +1306,7 @@ namespace llaminar2
             }
 
             gpu_ctx->setGraphCaptureActive(true);
-            GraphCaptureGuard capture_guard(false);
+            GraphCaptureGuard capture_guard;
             gpu_ctx->clearLastError();
 
             if (!segment.capture->beginCapture())
@@ -2258,21 +2258,17 @@ namespace llaminar2
                 bool exec_ok = true;
                 bool end_capture_ok = true;
                 {
-                    // Set capture-active flags only for the actual stream-capture
-                    // interval. Segmented non-collective capture skips replay
-                    // callbacks on the immediate launch, so stateful stages must
-                    // apply logical host bookkeeping while recording. Collective
-                    // Phase-2 capture re-executes stages after capture, and
-                    // prefill capture uses replay callbacks, so both leave this
-                    // bookkeeping flag disabled.
-                    const bool capture_exec_updates_host_state = !has_collective_nodes;
-
+                    // Set the capture-active flag only for the actual stream
+                    // capture interval. Stateful GPU stages mutate canonical
+                    // device state in graph order; capture never advances a
+                    // parallel host representation.
+                    //
                     // Set capture-active flag BEFORE beginCapture() to minimize
                     // the race window where another device's thread might call
                     // synchronize() on this context after HIP starts capturing
                     // but before the flag is set.
                     gpu_ctx->setGraphCaptureActive(true);
-                    GraphCaptureGuard capture_guard(capture_exec_updates_host_state);
+                    GraphCaptureGuard capture_guard;
 
                     // Clear any sticky HIP error left over from warmup or prior
                     // operations on this stream. Without this, the first kernel

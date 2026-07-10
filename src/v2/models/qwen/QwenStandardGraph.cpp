@@ -90,7 +90,8 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
-        const void *position_ids_device)
+        const void *position_ids_device,
+        const int32_t *sequence_lengths_device)
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
@@ -210,7 +211,9 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node,
+            kv_cache, position_ids, position_ids_device,
+            sequence_lengths_device,
+            device, has_qkv_proj, rope_node,
             cache_source_dependencies);
 
         // Stage 5: Wo projection + optional TP allreduce

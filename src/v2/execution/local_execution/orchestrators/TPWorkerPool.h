@@ -1,25 +1,28 @@
-#pragma once
+/**
+ * @file TPWorkerPool.h
+ * @brief Persistent, generation-safe worker fan-out for tensor-parallel ranks.
+ *
+ * RankOrchestrator performs the same logical operation on every LocalTP
+ * participant. Creating one `std::async` thread per participant and per decode
+ * step is expensive, so this pool keeps one worker alive for each participant.
+ * Workers retain their runtime thread state and are awakened by `dispatch()`.
+ * The caller then uses `collectAll()` as the rank-local completion fence.
+ *
+ * A dispatch generation owns its callable, result slots, completion count, and
+ * collector notification. The pool does not allow the next generation to
+ * replace those objects until the current generation has been collected. This
+ * invariant matters for very short MTP sidecar operations: under scheduler
+ * contention, a worker can finish between dispatch and collector admission.
+ * Generation-qualified state prevents that completion from being reset or
+ * mistaken for a neighboring operation.
+ *
+ * Workers intentionally do not select a CUDA or HIP device themselves. Device
+ * graph runners submit work through streams that already belong to the correct
+ * device context; the rank's dispatched callable also installs the profiler
+ * device metadata required by that operation.
+ */
 
-// ============================================================================
-// TPWorkerPool — Persistent thread pool for TP device forwarding
-// ============================================================================
-//
-// Replaces std::async(std::launch::async) per decode step with pre-spawned
-// worker threads. Benefits:
-//   - Eliminates thread creation/destruction overhead (~100-150µs per step)
-//   - Worker threads retain HIP/CUDA device context (no per-call setup)
-//   - Lower wakeup latency via condition_variable vs pthread_create
-//
-// Thread lifecycle:
-//   1. Construction: spawns N persistent worker threads
-//   2. dispatch(): wakes all workers with a callable
-//   3. collectAll(): blocks until all workers complete, returns results
-//   4. Destruction: signals workers to exit and joins
-//
-// IMPORTANT: Workers do NOT call hipSetDevice — the DeviceGraphOrchestrator
-// uses stream-based GPU operations which are device-agnostic. The HIP runtime
-// routes calls to the correct GPU based on the stream's device binding.
-// ============================================================================
+#pragma once
 
 #include <atomic>
 #include <chrono>
@@ -36,6 +39,22 @@
 namespace llaminar2
 {
 
+    /**
+     * @brief Fan one rank-local operation out to persistent participant workers.
+     *
+     * The public protocol is deliberately strict and sequential:
+     *
+     * 1. `dispatch()` publishes exactly one new generation.
+     * 2. Every worker executes that generation once.
+     * 3. One or more observers may call `collectAll()` for that generation.
+     * 4. A later `dispatch()` is admitted only after the generation is complete
+     *    and at least one collector has consumed its result snapshot.
+     *
+     * RankOrchestrator follows this protocol synchronously. Rejecting an
+     * overlapping dispatch turns an ownership bug into an immediate diagnostic
+     * instead of silently dropping a participant operation and hanging at a
+     * later collective.
+     */
     class TPWorkerPool
     {
     public:
@@ -51,6 +70,11 @@ namespace llaminar2
             : num_workers_(num_workers),
               results_(num_workers)
         {
+            if (num_workers_ == 0)
+            {
+                throw std::invalid_argument(
+                    "TPWorkerPool requires at least one participant worker");
+            }
             workers_.reserve(num_workers);
             for (size_t i = 0; i < num_workers; ++i)
             {
@@ -89,16 +113,30 @@ namespace llaminar2
          */
         void dispatch(std::function<bool(size_t)> fn)
         {
+            if (!fn)
+            {
+                throw std::invalid_argument(
+                    "TPWorkerPool dispatch requires a callable");
+            }
+
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                if (generation_ != collected_generation_ ||
+                    active_collectors_ != 0)
+                {
+                    throw std::logic_error(
+                        "TPWorkerPool cannot replace a generation while results remain uncollected");
+                }
+
                 work_fn_ = std::move(fn);
                 generation_++;
-                // Reset results
-                for (auto &r : results_)
+                for (size_t index = 0; index < results_.size(); ++index)
                 {
+                    auto &r = results_[index];
                     r.success = false;
                     r.completed = false;
                     r.exception = nullptr;
+                    r.worker_index = index;
                 }
                 completed_count_.store(0, std::memory_order_release);
                 first_failure_index_.store(SIZE_MAX, std::memory_order_release);
@@ -118,9 +156,17 @@ namespace llaminar2
          */
         std::vector<WorkerResult> collectAll(int timeout_ms = 0)
         {
-            std::unique_lock<std::mutex> lock(collect_mutex_);
-            auto pred = [this]()
-            { return completed_count_.load(std::memory_order_acquire) >= num_workers_; };
+            std::unique_lock<std::mutex> lock(mutex_);
+            const uint64_t target_generation = generation_;
+            if (target_generation == 0)
+                return results_;
+            ++active_collectors_;
+
+            auto pred = [this, target_generation]()
+            {
+                return shutdown_ ||
+                       completed_generation_ >= target_generation;
+            };
 
             if (timeout_ms > 0)
             {
@@ -131,7 +177,14 @@ namespace llaminar2
                 collect_cv_.wait(lock, pred);
             }
 
-            return results_;
+            std::vector<WorkerResult> snapshot = results_;
+            if (completed_generation_ >= target_generation)
+            {
+                collected_generation_ =
+                    std::max(collected_generation_, target_generation);
+            }
+            --active_collectors_;
+            return snapshot;
         }
 
         /**
@@ -177,6 +230,7 @@ namespace llaminar2
             while (true)
             {
                 std::function<bool(size_t)> fn;
+                uint64_t work_generation = 0;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
                     dispatch_cv_.wait(lock, [this, last_gen]()
@@ -186,6 +240,7 @@ namespace llaminar2
                         return;
 
                     last_gen = generation_;
+                    work_generation = generation_;
                     fn = work_fn_;
                 }
 
@@ -258,14 +313,41 @@ namespace llaminar2
                 }
                 result.completed = true;
 
-                results_[index] = std::move(result);
-
-                // Signal completion
-                auto prev = completed_count_.fetch_add(1, std::memory_order_acq_rel);
-                if (prev + 1 >= num_workers_)
+                bool generation_complete = false;
                 {
-                    // Last worker — wake the collector
-                    collect_cv_.notify_one();
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (work_generation != generation_)
+                    {
+                        LOG_ERROR(
+                            "[TPWorkerPool] Worker " << index
+                            << " completed generation " << work_generation
+                            << " after generation " << generation_
+                            << " replaced it");
+                        result.success = false;
+                    }
+
+                    results_[index] = std::move(result);
+                    const size_t completed =
+                        completed_count_.fetch_add(
+                            1,
+                            std::memory_order_acq_rel) +
+                        1;
+                    if (completed >= num_workers_)
+                    {
+                        completed_generation_ = work_generation;
+                        generation_complete = true;
+                    }
+                }
+
+                if (generation_complete)
+                {
+                    /*
+                     * More than one diagnostic observer may wait for the same
+                     * generation. Waking all observers is required because no
+                     * later worker completion exists to rescue a waiter left
+                     * asleep after this generation reaches its terminal count.
+                     */
+                    collect_cv_.notify_all();
                 }
             }
         }
@@ -280,10 +362,12 @@ namespace llaminar2
         std::function<bool(size_t)> work_fn_;
         std::function<void()> failure_callback_;
         uint64_t generation_ = 0;
+        uint64_t completed_generation_ = 0;
+        uint64_t collected_generation_ = 0;
+        size_t active_collectors_ = 0;
         bool shutdown_ = false;
 
-        // Collection synchronization
-        std::mutex collect_mutex_;
+        // Collection state is published under mutex_ with the dispatch state.
         std::condition_variable collect_cv_;
         std::atomic<size_t> completed_count_{0};
         std::atomic<size_t> first_failure_index_{SIZE_MAX};

@@ -40,6 +40,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -1523,6 +1524,22 @@ namespace llaminar2::test::parity::qwen36
             });
     }
 
+    inline bool hasPerfCounter(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == domain &&
+                       record.name == name;
+            });
+    }
+
     inline double perfCounterSum(
         const std::vector<PerfStatRecord> &records,
         const std::string &domain,
@@ -1716,8 +1733,9 @@ namespace llaminar2::test::parity::qwen36
      * MoE parity compares response tokens against a no-MTP Llaminar baseline,
      * but token equality alone does not prove the request used the intended
      * vLLM-style grouped transaction.  These perfstats assertions make the
-     * ExpertOverlay matrix catch accidental regressions back to row-serial
-     * replay, while still keeping direct all-position publication disabled.
+     * ExpertOverlay matrix catch accidental regressions away from grouped
+     * decode-equivalent verifier rows, while still keeping direct all-position
+     * publication disabled.
      *
      * @param test_case MoE parity fixture under test.
      * @param records Perfstats snapshot captured immediately after the request.
@@ -1728,10 +1746,17 @@ namespace llaminar2::test::parity::qwen36
         const std::vector<PerfStatRecord> &records,
         const std::string &context)
     {
-        const bool used_serial_replay =
+        const bool used_retired_serial_replay =
             hasMTPPerfCounter(
                 records,
                 "decode_equivalent_sequential_verifier_runs");
+        const bool used_grouped_host_publication =
+            hasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_publication_uses") &&
+            hasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_state_publications");
         const bool used_grouped_device_publication =
             hasMTPPerfCounter(
                 records,
@@ -1759,7 +1784,7 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_TRUE(used_grouped_verifier)
                 << context << " should run grouped greedy MoE verifier rows.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_serial_replay)
+            EXPECT_FALSE(used_retired_serial_replay)
                 << context << " must not use row-serial MoE verifier replay "
                    "when grouped device publication is available.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
@@ -1770,9 +1795,15 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
 
-        EXPECT_TRUE(used_serial_replay || used_grouped_device_publication)
-            << context << " should exercise an explicit decode-equivalent "
-               "MoE MTP verifier path.\n"
+        EXPECT_TRUE(used_grouped_verifier)
+            << context << " should run grouped decode-equivalent MoE verifier rows.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(used_grouped_device_publication || used_grouped_host_publication)
+            << context << " should publish grouped MoE verifier state through "
+               "an explicit grouped publication path.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(used_retired_serial_replay)
+            << context << " must not use the retired row-serial MoE verifier replay.\n"
             << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_FALSE(used_direct_all_position_publication)
             << context << " must not use unproven MoE direct all-position "
@@ -3155,10 +3186,10 @@ namespace llaminar2::test::parity::qwen36
                 << PerfStatsCollector::summaryString({"mtp"});
         }
 
-        const bool used_decode_equivalent_stochastic_verifier =
+        const bool used_grouped_stochastic_verifier =
             hasMTPPerfCounter(
                 phase138_records,
-                "decode_equivalent_stochastic_verifier_runs");
+                "grouped_decode_equivalent_stochastic_verifier_runs");
         const bool used_grouped_outcome_device_publication =
             hasMTPPerfCounter(
                 phase138_records,
@@ -3182,10 +3213,10 @@ namespace llaminar2::test::parity::qwen36
                 << "GPU Qwen3.6 MoE stochastic MTP must exercise vLLM-style "
                    "all-position state publication\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-                << "GPU Qwen3.6 MoE stochastic MTP must not fall back to the "
-                   "decode-equivalent stochastic verifier once publication is "
-                   "available\n"
+            EXPECT_FALSE(used_grouped_stochastic_verifier)
+                << "GPU Qwen3.6 MoE stochastic MTP must not also run grouped "
+                   "decode-equivalent stochastic verification once direct "
+                   "all-position publication is available\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
         else if (moECaseExpectsGroupedOutcomeDevicePublication(test_case))
@@ -3199,22 +3230,50 @@ namespace llaminar2::test::parity::qwen36
                    "back to direct all-position publication; grouped outcome "
                    "is the proven MoE contract\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-                << "GPU Qwen3.6 MoE stochastic MTP must not fall back to the "
-                   "row-serial stochastic verifier once grouped outcome "
-                   "publication is available\n"
-                << PerfStatsCollector::summaryString({"mtp"});
         }
         else
         {
-            EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
-                << "CPU Qwen3.6 MoE stochastic MTP must use the shared "
-                   "decode-equivalent verifier while direct all-position "
+            EXPECT_TRUE(used_grouped_stochastic_verifier)
+                << "CPU Qwen3.6 MoE stochastic MTP must use grouped "
+                   "decode-equivalent verification while direct all-position "
                    "publication is not advertised\n"
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_FALSE(used_all_position_publication)
                 << "CPU Qwen3.6 MoE stochastic MTP must not publish from an "
                    "unproven multi-row all-position verifier\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+        }
+
+        const bool homogeneous_gpu_local_tp =
+            test_case.topology ==
+                MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
+            test_case.topology ==
+                MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly;
+        if (homogeneous_gpu_local_tp && requested_draft_depth > 1)
+        {
+            EXPECT_TRUE(hasMTPPerfCounter(
+                phase138_records,
+                "device_resident_shifted_mtp_kv_commit_boundaries"))
+                << "Depth>1 LocalTP MTP must commit at least one shifted-cache "
+                   "suffix row from the canonical device boundary. This is a "
+                   "mandatory production operation, independent of whether the "
+                   "sampled draft is ultimately accepted.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(hasMTPPerfCounter(
+                phase138_records,
+                "device_resident_shifted_mtp_kv_state_mailbox_retargets"))
+                << "A LocalTP shifted-cache suffix append must carry its "
+                   "canonical device count and readiness event into the new "
+                   "live-state epoch.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(hasMTPPerfCounter(
+                phase138_records,
+                "speculative_shifted_kv_token_position_fusions"))
+                << "Depth>1 LocalTP MTP must prepare accepted suffix tokens and "
+                   "absolute positions in the fused GPU primitive from compact "
+                   "outcome metadata plus the resident pre-verifier base row. "
+                   "Seeing publication counters without this counter would "
+                   "permit a host-derived position path to return unnoticed.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
 
@@ -3817,7 +3876,61 @@ namespace llaminar2::test::parity::qwen36
         std::string right_label = "mtp";
         bool present_in_baseline = false;
         bool present_in_mtp = false;
+        bool byte_identical = false;
+        size_t first_mismatch_index = std::numeric_limits<size_t>::max();
+        uint32_t first_left_bits = 0;
+        uint32_t first_right_bits = 0;
     };
+
+    /**
+     * @brief Record the exact FP32 byte comparison for one diagnostic row.
+     *
+     * Numeric metrics remain useful for estimating how quickly a mismatch is
+     * amplifying, but grouped verifier publication requires the production
+     * M>1 row to be identical to the backend's production M=1 row.  Capturing
+     * the first raw word here makes every caller report the same exact oracle
+     * and gives a focused kernel regression the bit patterns it must reproduce.
+     *
+     * @param row Diagnostic record that will receive the exact result.
+     * @param left First FP32 vector.
+     * @param right Second FP32 vector.
+     * @param size Number of FP32 elements in both vectors.
+     */
+    inline void recordMoESnapshotByteComparison(
+        MoESnapshotCompareRow *row,
+        const float *left,
+        const float *right,
+        size_t size)
+    {
+        if (!row || !left || !right || size == 0)
+        {
+            return;
+        }
+
+        row->byte_identical =
+            std::memcmp(left, right, size * sizeof(float)) == 0;
+        if (row->byte_identical)
+        {
+            return;
+        }
+
+        for (size_t i = 0; i < size; ++i)
+        {
+            uint32_t left_bits = 0;
+            uint32_t right_bits = 0;
+            std::memcpy(&left_bits, left + i, sizeof(left_bits));
+            std::memcpy(&right_bits, right + i, sizeof(right_bits));
+            if (left_bits == right_bits)
+            {
+                continue;
+            }
+
+            row->first_mismatch_index = i;
+            row->first_left_bits = left_bits;
+            row->first_right_bits = right_bits;
+            return;
+        }
+    }
 
     /**
      * @brief Compare two stage snapshots as softmax distributions.
@@ -3913,6 +4026,11 @@ namespace llaminar2::test::parity::qwen36
         }
 
         row.elements = baseline_size;
+        recordMoESnapshotByteComparison(
+            &row,
+            baseline_data,
+            mtp_data,
+            baseline_size);
         double dot = 0.0;
         double baseline_norm = 0.0;
         double mtp_norm = 0.0;
@@ -3981,6 +4099,11 @@ namespace llaminar2::test::parity::qwen36
 
         const auto &baseline_data = baseline_it->second;
         row.elements = baseline_data.size();
+        recordMoESnapshotByteComparison(
+            &row,
+            baseline_data.data(),
+            mtp_data,
+            baseline_data.size());
         double dot = 0.0;
         double baseline_norm = 0.0;
         double mtp_norm = 0.0;
@@ -4133,6 +4256,11 @@ namespace llaminar2::test::parity::qwen36
         }
 
         row.elements = left_size;
+        recordMoESnapshotByteComparison(
+            &row,
+            left_data,
+            right,
+            left_size);
         double dot = 0.0;
         double left_norm = 0.0;
         double right_norm = 0.0;
@@ -4200,7 +4328,7 @@ namespace llaminar2::test::parity::qwen36
     {
         csv << "comparison,sync_idx,output_tokens,key,reference_key,elements,"
                "cosine,rel_l2,symmetric_kl,max_abs_diff,left_l2,right_l2,left_mean,right_mean,left_label,right_label,"
-               "present_left,present_right\n";
+               "present_left,present_right,byte_identical,first_mismatch_index,first_left_bits,first_right_bits\n";
     }
 
     inline void writeMoESnapshotCsvRow(std::ofstream &csv, const MoESnapshotCompareRow &row)
@@ -4222,7 +4350,21 @@ namespace llaminar2::test::parity::qwen36
             << csvEscapeMoEDiagnostic(row.left_label) << ','
             << csvEscapeMoEDiagnostic(row.right_label) << ','
             << (row.present_in_baseline ? "true" : "false") << ','
-            << (row.present_in_mtp ? "true" : "false") << '\n';
+            << (row.present_in_mtp ? "true" : "false") << ','
+            << (row.byte_identical ? "true" : "false") << ',';
+        if (row.first_mismatch_index == std::numeric_limits<size_t>::max())
+        {
+            csv << "";
+        }
+        else
+        {
+            csv << row.first_mismatch_index;
+        }
+        csv << ','
+            << "0x" << std::hex << std::setw(8) << std::setfill('0')
+            << row.first_left_bits << ','
+            << "0x" << std::setw(8) << row.first_right_bits
+            << std::dec << std::setfill(' ') << '\n';
         csv.flush();
     }
 
@@ -4287,6 +4429,38 @@ namespace llaminar2::test::parity::qwen36
         return nullptr;
     }
 
+    /**
+     * @brief Return the first non-byte-identical operation in graph order.
+     *
+     * The caller is responsible for supplying rows in graph execution order.
+     * This exact predicate is intentionally separate from the cosine-based
+     * diagnostic above: cosine answers how large drift has become, while this
+     * function identifies the operation that first violated grouped decode's
+     * publication contract.
+     */
+    inline const MoESnapshotCompareRow *firstMoEDiagnosticByteDivergence(
+        const std::vector<MoESnapshotCompareRow> &rows,
+        const std::string &comparison,
+        bool include_sidecar_keys)
+    {
+        for (const auto &row : rows)
+        {
+            if (row.comparison != comparison)
+            {
+                continue;
+            }
+            if (!include_sidecar_keys && isMTPSidecarSnapshotKey(row.key))
+            {
+                continue;
+            }
+            if (!isComparableMoEDiagnosticRow(row) || !row.byte_identical)
+            {
+                return &row;
+            }
+        }
+        return nullptr;
+    }
+
     inline const MoESnapshotCompareRow *worstComparableMoEDiagnosticRow(
         const std::vector<MoESnapshotCompareRow> &rows,
         const std::string &comparison,
@@ -4344,7 +4518,16 @@ namespace llaminar2::test::parity::qwen36
             << " symmetric_kl=" << row.symmetric_kl
             << " max_abs_diff=" << row.max_abs_diff
             << " present_left=" << (row.present_in_baseline ? "true" : "false")
-            << " present_right=" << (row.present_in_mtp ? "true" : "false");
+            << " present_right=" << (row.present_in_mtp ? "true" : "false")
+            << " byte_identical=" << (row.byte_identical ? "true" : "false");
+        if (row.first_mismatch_index != std::numeric_limits<size_t>::max())
+        {
+            oss << " first_mismatch_index=" << row.first_mismatch_index
+                << " left_bits=0x" << std::hex << std::setw(8)
+                << std::setfill('0') << row.first_left_bits
+                << " right_bits=0x" << std::setw(8)
+                << row.first_right_bits << std::dec << std::setfill(' ');
+        }
         return oss.str();
     }
 
@@ -4594,7 +4777,11 @@ namespace llaminar2::test::parity::qwen36
             keys.push_back(prefix + "_MOE_ROUTER_OUTPUT");
             keys.push_back(prefix + "_MOE_ROUTING_INDICES");
             keys.push_back(prefix + "_MOE_ROUTING_WEIGHTS");
+            keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+            keys.push_back(prefix + "_MOE_SHARED_EXPERT_OUTPUT");
+            keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
             keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+            keys.push_back(prefix + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED");
             keys.push_back(prefix + "_MOE_COMBINED_OUTPUT_ALLREDUCED");
             keys.push_back(prefix + "_FFN_RESIDUAL");
         }
@@ -5274,6 +5461,25 @@ namespace llaminar2::test::parity::qwen36
             begin + static_cast<std::ptrdiff_t>(serial_snapshot_size));
     }
 
+    /**
+     * @brief Map a grouped-only verifier stage to its serial decode oracle.
+     *
+     * The grouped LM-head path first gathers the selected normalized hidden
+     * rows into LM_HEAD_ROWS_SELECT.  Serial M=1 decode feeds FINAL_NORM
+     * directly into the LM head and therefore has no row-select stage with the
+     * same name.  Comparing the selected grouped row to serial FINAL_NORM proves
+     * the gather itself without pretending the serial graph owns that stage.
+     */
+    inline std::string serialReferenceKeyForMoEGroupedVerifierSnapshot(
+        const std::string &grouped_key)
+    {
+        if (grouped_key == "LM_HEAD_ROWS_SELECT")
+        {
+            return "FINAL_NORM";
+        }
+        return grouped_key;
+    }
+
     inline void appendMoEAllPositionVerifierRows(
         const std::map<std::string, std::vector<float>> &all_position_snapshots,
         const std::map<std::string, std::vector<float>> &serial_snapshots,
@@ -5284,16 +5490,41 @@ namespace llaminar2::test::parity::qwen36
     {
         std::vector<std::string> keys;
         keys.reserve(all_position_snapshots.size() + serial_snapshots.size());
+        std::set<std::string> seen_keys;
+        auto append_key_if_captured =
+            [&](const std::string &key)
+        {
+            if (seen_keys.find(key) != seen_keys.end())
+            {
+                return;
+            }
+            if (all_position_snapshots.find(key) == all_position_snapshots.end() &&
+                serial_snapshots.find(key) == serial_snapshots.end())
+            {
+                return;
+            }
+            seen_keys.insert(key);
+            keys.push_back(key);
+        };
+
+        /*
+         * std::map iteration is lexical, which puts FINAL_NORM before layer 0
+         * and layer 10 before layer 2.  Preserve the declarative graph-stage
+         * order so the first exact mismatch is the producer that introduced
+         * drift rather than whichever downstream key sorts first.
+         */
+        for (const auto &key : qwen36MoEGroupedVerifierSnapshotKeys())
+        {
+            append_key_if_captured(key);
+        }
         for (const auto &entry : all_position_snapshots)
         {
-            keys.push_back(entry.first);
+            append_key_if_captured(entry.first);
         }
         for (const auto &entry : serial_snapshots)
         {
-            keys.push_back(entry.first);
+            append_key_if_captured(entry.first);
         }
-        std::sort(keys.begin(), keys.end());
-        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 
         const std::string comparison =
             "all_position_row" + std::to_string(row) +
@@ -5301,7 +5532,9 @@ namespace llaminar2::test::parity::qwen36
         for (const auto &key : keys)
         {
             const auto all_it = all_position_snapshots.find(key);
-            const auto serial_it = serial_snapshots.find(key);
+            const std::string reference_key =
+                serialReferenceKeyForMoEGroupedVerifierSnapshot(key);
+            const auto serial_it = serial_snapshots.find(reference_key);
             if (all_it == all_position_snapshots.end() ||
                 serial_it == serial_snapshots.end())
             {
@@ -5310,7 +5543,7 @@ namespace llaminar2::test::parity::qwen36
                 missing.sync_idx = row;
                 missing.output_tokens = output_tokens;
                 missing.key = key;
-                missing.reference_key = key;
+                missing.reference_key = reference_key;
                 missing.left_label = "all_position";
                 missing.right_label = "serial";
                 missing.present_in_baseline =
@@ -5338,7 +5571,7 @@ namespace llaminar2::test::parity::qwen36
                 row,
                 output_tokens,
                 key,
-                key,
+                reference_key,
                 comparison,
                 "all_position",
                 "serial");
@@ -5361,6 +5594,13 @@ namespace llaminar2::test::parity::qwen36
     {
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
+        std::unique_ptr<ScopedEnvironmentValues> perf_stats_enabled;
+        if (expect_grouped_moe_verifier_prefill)
+        {
+            perf_stats_enabled.reset(new ScopedEnvironmentValues({
+                {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+            }));
+        }
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -5401,6 +5641,8 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(runner, nullptr);
         const int vocab = runner->vocab_size();
         ASSERT_GT(vocab, 0);
+        const bool capture_operation_snapshots =
+            !verify_published_state_continuation;
 
         auto sample_current = [&](const char *label) -> int32_t
         {
@@ -5418,7 +5660,21 @@ namespace llaminar2::test::parity::qwen36
         runner->setSuppressTimeline(true);
         runner->setSkipLogitsGatherDecode(use_skip_gather);
         runner->setSkipLogitsGatherPrefill(use_skip_gather);
-        runner->enableSnapshotCapture();
+        if (capture_operation_snapshots)
+        {
+            runner->enableSnapshotCapture();
+        }
+        else
+        {
+            /*
+             * Publication proofs need live KV/GDN/short-conv state, compact
+             * verifier outcomes, logits, and continuation tokens.  They do not
+             * need per-stage tensor snapshots, and enabling those snapshots on
+             * the 35B MoE GPU fixture can exhaust the 24 GB CUDA cards before
+             * the MTP publication path is reached.
+             */
+            runner->disableSnapshotCapture();
+        }
 
         ASSERT_TRUE(runner->forward(
             prompt_tokens.data(),
@@ -5623,7 +5879,7 @@ namespace llaminar2::test::parity::qwen36
                                              ? "rocm_moe_grouped_prefill_active_expert_grid_calls"
                                              : "cuda_moe_grouped_prefill_swiglu_path_calls";
             const auto records = PerfStatsCollector::snapshot({"kernel", "mtp"});
-            EXPECT_TRUE(hasMTPPerfCounter(records, routed_counter))
+            EXPECT_TRUE(hasPerfCounter(records, "kernel", routed_counter))
                 << "SingleDevice GPU MoE verifier must exercise the routed "
                    "grouped prefill path.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
@@ -5641,11 +5897,38 @@ namespace llaminar2::test::parity::qwen36
                    "for production; strict full-model continuation gates failed "
                    "after component-only microbenches looked healthy.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
-            EXPECT_FALSE(hasMTPPerfCounter(
-                records,
-                "moe_decode_equivalent_verifier_prefill_runs"))
-                << "GPU MoE verifier rows must not quietly fall back to the "
-                   "row-serial decode-equivalent MoE expert/shared stages.\n"
+
+            auto tag_equals = [](const PerfStatRecord &record,
+                                 const char *key,
+                                 const char *value) -> bool
+            {
+                const auto it = record.tags.find(key);
+                return it != record.tags.end() && it->second == value;
+            };
+            const bool has_retired_row_serial_replay =
+                std::any_of(
+                    records.begin(),
+                    records.end(),
+                    [&](const PerfStatRecord &record)
+                    {
+                        if (record.kind != PerfStatRecord::Kind::Counter ||
+                            record.domain != "mtp")
+                        {
+                            return false;
+                        }
+                        if (record.name ==
+                            "decode_equivalent_sequential_verifier_runs")
+                        {
+                            return true;
+                        }
+                        return record.name ==
+                                   "moe_decode_equivalent_verifier_prefill_runs" &&
+                               tag_equals(record, "route", "single_row_decode");
+                    });
+            EXPECT_FALSE(has_retired_row_serial_replay)
+                << "GPU MoE verifier rows must not quietly fall back to "
+                   "row-serial replay.  Grouped router/expert verifier counters "
+                   "are allowed; explicit single-row decode routes are not.\n"
                 << PerfStatsCollector::summaryString({"kernel", "mtp"});
         }
         std::vector<int32_t> all_position_rows(verifier_tokens.size(), -1);
@@ -5768,7 +6051,10 @@ namespace llaminar2::test::parity::qwen36
             all_position_logits,
             all_position_logits + static_cast<size_t>(all_position_rows.size()) *
                                       static_cast<size_t>(vocab));
-        const auto all_position_snapshots = captureMoERunnerSnapshots(*runner);
+        const auto all_position_snapshots =
+            capture_operation_snapshots
+                ? captureMoERunnerSnapshots(*runner)
+                : std::map<std::string, std::vector<float>>{};
 
         if (verify_published_state_continuation)
         {
@@ -5853,7 +6139,6 @@ namespace llaminar2::test::parity::qwen36
             publication_request.request_count = 1;
             publication_request.max_draft_tokens =
                 static_cast<int>(verifier_tokens.size());
-            publication_request.base_sidecar_position = base_sidecar_position;
             publication_request.publish_mtp_shifted_kv = true;
 
             std::string publication_error;
@@ -5867,9 +6152,6 @@ namespace llaminar2::test::parity::qwen36
                 << "device-resident publication must leave a typed logical "
                    "state mailbox for subsequent planning";
             ASSERT_EQ(logical_state.request_count, 1);
-            ASSERT_FALSE(runner->hostLogicalStateMirrorsDeviceResidentState())
-                << "device-resident publication must not repair host mirrors "
-                   "through an adoption bridge";
             ASSERT_NE(
                 logical_state.targetSequenceLengthDeviceForRequest(0),
                 nullptr);
@@ -5884,8 +6166,7 @@ namespace llaminar2::test::parity::qwen36
                 nullptr);
             const PrefixRuntimeStateSnapshot published_state_probe =
                 runner->prefixStateProbe();
-            const bool published_state_host_mirrors_resident =
-                runner->hostLogicalStateMirrorsDeviceResidentState();
+            const bool published_state_is_device_owned = logical_state.valid();
 
             auto summarize_runtime_state =
                 [](const PrefixRuntimeStateSnapshot &probe) -> std::string
@@ -6025,7 +6306,10 @@ namespace llaminar2::test::parity::qwen36
                 &published_continuation));
 
             ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base));
-            runner->clearSnapshots();
+            if (capture_operation_snapshots)
+            {
+                runner->clearSnapshots();
+            }
             PrefixRuntimeStateSnapshot serial_row0_state_probe;
             int32_t serial_ready = -1;
             for (int row = 0; row < committed_verifier_rows; ++row)
@@ -6089,12 +6373,40 @@ namespace llaminar2::test::parity::qwen36
                     serial_state_probe,
                     published_state_probe,
                     main_only_publication_compare_options);
-            if (published_state_host_mirrors_resident)
+
+            EXPECT_TRUE(verifierGDNStateByteIdentical(
+                published_state_probe,
+                serial_state_probe,
+                "MoE device-resident publication accepted GDN/short-conv state"))
+                << "Accepted verifier-row publication must restore exactly the "
+                   "same recurrent buffers that serial decode produced.  This "
+                   "is checked before continuation so stale host mirrors cannot "
+                   "hide device-owned state drift."
+                << "\ncondition_prefix_tokens="
+                << joinTokensMoEDiagnostic({expected_tokens[0], expected_tokens[1]})
+                << "\nverifier_tokens="
+                << joinTokensMoEDiagnostic(verifier_tokens)
+                << "\nall_position_rows="
+                << joinTokensMoEDiagnostic(all_position_rows)
+                << "\ncommitted_verifier_rows="
+                << committed_verifier_rows
+                << "\nfirst_gdn_mismatch="
+                << first_gdn_state_mismatch(
+                       serial_state_probe,
+                       published_state_probe)
+                << "\npublished_state={"
+                << summarizeMoEPrefixRuntimeProbe(published_state_probe)
+                << "}\nserial_state={"
+                << summarizeMoEPrefixRuntimeProbe(serial_state_probe)
+                << "}\nmtp_perfstats="
+                << PerfStatsCollector::summaryString({"mtp"});
+
+            if (published_state_is_device_owned)
             {
                 EXPECT_TRUE(publication_state_match)
                     << "MTP all-position publication must publish the same "
                        "runtime metadata as serial accepted-row decode before "
-                       "continuation when host mirrors are current"
+                       "continuation from its device-owned mailbox"
                     << "\nreason=" << publication_state_match.reason
                     << "\nstrict_reason="
                     << strict_publication_state_match.reason
@@ -6242,35 +6554,53 @@ namespace llaminar2::test::parity::qwen36
                 serial_logits,
                 serial_logits + static_cast<size_t>(vocab));
             serial_top5_by_row.push_back(topKSummary(runner->logits(), vocab, 5));
-            serial_snapshots_by_row.push_back(captureMoERunnerSnapshots(*runner));
+            if (capture_operation_snapshots)
+            {
+                serial_snapshots_by_row.push_back(
+                    captureMoERunnerSnapshots(*runner));
+            }
         }
 
-        const auto result_dir = moeDiagnosticResultsDir();
-        const auto csv_path = result_dir / "main_verifier_all_position_vs_serial.csv";
-        std::ofstream csv(csv_path);
-        ASSERT_TRUE(csv.is_open()) << "failed to open " << csv_path;
-        writeMoESnapshotCsvHeader(csv);
+        std::filesystem::path csv_path;
         std::vector<MoESnapshotCompareRow> rows;
-        for (size_t row = 0; row < verifier_tokens.size(); ++row)
+        if (capture_operation_snapshots)
         {
-            appendMoEAllPositionVerifierRows(
-                all_position_snapshots,
-                serial_snapshots_by_row[row],
-                static_cast<int>(row),
-                static_cast<int>(row + 1),
-                csv,
-                &rows);
+            const auto result_dir = moeDiagnosticResultsDir();
+            csv_path =
+                result_dir / "main_verifier_all_position_vs_serial.csv";
+            std::ofstream csv(csv_path);
+            ASSERT_TRUE(csv.is_open()) << "failed to open " << csv_path;
+            writeMoESnapshotCsvHeader(csv);
+            ASSERT_EQ(serial_snapshots_by_row.size(), verifier_tokens.size());
+            for (size_t row = 0; row < verifier_tokens.size(); ++row)
+            {
+                appendMoEAllPositionVerifierRows(
+                    all_position_snapshots,
+                    serial_snapshots_by_row[row],
+                    static_cast<int>(row),
+                    static_cast<int>(row + 1),
+                    csv,
+                    &rows);
+            }
         }
 
         auto first_bad_row = [&](const std::string &comparison)
             -> const MoESnapshotCompareRow *
         {
+            if (!capture_operation_snapshots)
+                return nullptr;
             return firstMoEDiagnosticDivergence(
                 rows,
                 comparison,
                 0.9999,
                 /*include_sidecar_keys=*/true);
         };
+        const std::string snapshot_diagnostic_location =
+            capture_operation_snapshots
+                ? csv_path.string()
+                : std::string(
+                      "disabled for publication proof; byte-state and "
+                      "continuation gates remain active");
 
         for (size_t row = 0; row < verifier_tokens.size(); ++row)
         {
@@ -6294,7 +6624,7 @@ namespace llaminar2::test::parity::qwen36
                 << joinTokensMoEDiagnostic(verifier_tokens)
                 << "\nrow all-position top5=[" << all_position_top5 << "]"
                 << "\nrow serial top5=[" << serial_top5_by_row[row] << "]"
-                << "\ndiagnostic CSV: " << csv_path;
+                << "\ndiagnostic CSV: " << snapshot_diagnostic_location;
             EXPECT_EQ(all_position_rows[row], serial_rows[row])
                 << "all-position row " << row
                 << " must match " << (row + 1)
@@ -6313,7 +6643,7 @@ namespace llaminar2::test::parity::qwen36
                 << (first_bad_row(comparison)
                         ? describeMoEDiagnosticRow(*first_bad_row(comparison))
                         : std::string("none"))
-                << "\ndiagnostic CSV: " << csv_path;
+                << "\ndiagnostic CSV: " << snapshot_diagnostic_location;
         }
 
         runner->disableSnapshotCapture();
@@ -6767,9 +7097,6 @@ namespace llaminar2::test::parity::qwen36
             grouped_snapshot_diagnostic
                 ? captureMoERunnerSnapshots(*runner)
                 : std::map<std::string, std::vector<float>>{};
-        const PrefixRuntimeStateSnapshot grouped_verifier_probe =
-            runner->prefixStateProbe();
-
         /*
          * The hard oracle for this focused grouped-forward proof is the
          * restore-and-replay serial decode pass below.  The live extension probe
@@ -6790,7 +7117,6 @@ namespace llaminar2::test::parity::qwen36
         serial_snapshots_by_row.reserve(verifier_tokens.size());
         std::vector<std::string> serial_top5_by_row;
         serial_top5_by_row.reserve(verifier_tokens.size());
-        PrefixRuntimeStateSnapshot serial_replay_final_probe;
 
         for (size_t row = 0; row < verifier_tokens.size(); ++row)
         {
@@ -6823,11 +7149,11 @@ namespace llaminar2::test::parity::qwen36
                 serial_snapshots_by_row.push_back(
                     captureMoERunnerSnapshots(*runner));
             }
-            if (row + 1 == verifier_tokens.size())
-                serial_replay_final_probe = runner->prefixStateProbe();
         }
 
         std::string grouped_snapshot_diagnostic_summary;
+        std::vector<std::string> grouped_snapshot_byte_failures(
+            verifier_tokens.size());
         if (grouped_snapshot_diagnostic)
         {
             const auto result_dir = moeDiagnosticResultsDir();
@@ -6848,20 +7174,158 @@ namespace llaminar2::test::parity::qwen36
                     &diagnostic_rows);
             }
 
-            std::ostringstream diag;
-            diag << "\ngrouped_snapshot_csv=" << csv_path;
+            std::vector<const MoESnapshotCompareRow *> first_byte_divergences;
+            first_byte_divergences.reserve(verifier_tokens.size());
+            std::set<std::string> divergent_layer_prefixes;
+            std::set<std::string> raw_key_set;
             for (size_t row = 0; row < verifier_tokens.size(); ++row)
             {
                 const std::string comparison =
                     "all_position_row" + std::to_string(row) +
                     "_vs_serial_prefix" + std::to_string(row + 1);
-                if (const auto *first_bad = firstMoEDiagnosticDivergence(
+                const auto *first_bad = firstMoEDiagnosticByteDivergence(
+                    diagnostic_rows,
+                    comparison,
+                    /*include_sidecar_keys=*/true);
+                if (!first_bad)
+                {
+                    continue;
+                }
+
+                first_byte_divergences.push_back(first_bad);
+                grouped_snapshot_byte_failures[row] =
+                    describeMoEDiagnosticRow(*first_bad);
+                const size_t separator = first_bad->key.find('_');
+                if (first_bad->key.rfind("layer", 0) == 0 &&
+                    separator != std::string::npos)
+                {
+                    divergent_layer_prefixes.insert(
+                        first_bad->key.substr(0, separator + 1));
+                }
+                else
+                {
+                    raw_key_set.insert(first_bad->key);
+                }
+            }
+
+            /*
+             * A first mismatch such as layer34_MOE_EXPERT_OUTPUT is only
+             * reproducible when the dump also includes that layer's normalized
+             * input, route IDs/weights, shared branch, and adjacent projection
+             * outputs.  Include every captured tensor from each first-bad layer
+             * for every row in the grouped batch.
+             */
+            for (const auto &key : qwen36MoEGroupedVerifierSnapshotKeys())
+            {
+                for (const auto &prefix : divergent_layer_prefixes)
+                {
+                    if (key.rfind(prefix, 0) == 0)
+                    {
+                        raw_key_set.insert(key);
+                        break;
+                    }
+                }
+            }
+
+            const bool explicit_raw_snapshot_dump =
+                std::getenv("LLAMINAR_MOE_GROUPED_VERIFIER_RAW_SNAPSHOT_DUMP") != nullptr;
+            if (explicit_raw_snapshot_dump && raw_key_set.empty())
+            {
+                raw_key_set.insert("layer3_FFN_NORM");
+                raw_key_set.insert("layer3_MOE_ROUTING_INDICES");
+                raw_key_set.insert("layer3_MOE_ROUTING_WEIGHTS");
+                raw_key_set.insert("layer3_MOE_EXPERT_OUTPUT");
+                raw_key_set.insert("layer3_MOE_COMBINED_OUTPUT");
+            }
+
+            const bool raw_snapshot_dump =
+                explicit_raw_snapshot_dump || !first_byte_divergences.empty();
+            std::filesystem::path raw_snapshot_path;
+            if (raw_snapshot_dump)
+            {
+                /*
+                 * The comparison CSV deliberately stores compact metrics so it
+                 * remains readable across the full 40-layer graph.  When a
+                 * model-level drift needs to become a focused kernel
+                 * regression, however, we also need the exact production inputs.
+                 * A byte mismatch enables this dump automatically; the explicit
+                 * environment flag remains useful for collecting the historical
+                 * layer-3 fixture from a passing run.
+                 */
+                raw_snapshot_path = result_dir / "grouped_verifier_raw_snapshots.csv";
+                std::ofstream raw_csv(raw_snapshot_path);
+                ASSERT_TRUE(raw_csv.is_open()) << "failed to open " << raw_snapshot_path;
+                raw_csv << "runner,row,key,index,value,hex_bits\n";
+
+                auto write_raw_vector =
+                    [&](const char *runner_label,
+                        size_t row,
+                        const std::string &key,
+                        const std::vector<float> &values)
+                {
+                    for (size_t i = 0; i < values.size(); ++i)
+                    {
+                        uint32_t bits = 0;
+                        std::memcpy(&bits, values.data() + i, sizeof(bits));
+                        raw_csv << runner_label << ','
+                                << row << ','
+                                << key << ','
+                                << i << ','
+                                << std::setprecision(9) << values[i] << ','
+                                << "0x" << std::hex << std::setw(8) << std::setfill('0') << bits
+                                << std::dec << std::setfill(' ') << '\n';
+                    }
+                };
+
+                for (size_t row = 0; row < verifier_tokens.size(); ++row)
+                {
+                    for (const auto &key : raw_key_set)
+                    {
+                        const auto grouped_it = grouped_snapshots.find(key);
+                        const auto serial_it = serial_snapshots_by_row[row].find(key);
+                        if (grouped_it != grouped_snapshots.end() &&
+                            serial_it != serial_snapshots_by_row[row].end() &&
+                            !grouped_it->second.empty() &&
+                            !serial_it->second.empty())
+                        {
+                            write_raw_vector(
+                                "grouped",
+                                row,
+                                key,
+                                selectMoEVerifierSnapshotRow(
+                                    grouped_it->second,
+                                    serial_it->second.size(),
+                                    static_cast<int>(row)));
+                            write_raw_vector(
+                                "serial",
+                                row,
+                                key,
+                                serial_it->second);
+                        }
+                    }
+                }
+            }
+
+            std::ostringstream diag;
+            diag << "\ngrouped_snapshot_csv=" << csv_path;
+            if (!raw_snapshot_path.empty())
+                diag << "\ngrouped_raw_snapshot_csv=" << raw_snapshot_path;
+            diag << "\nserial_decode_path_perfstats:\n"
+                 << PerfStatsCollector::summaryString(
+                        {"moe_runtime_decode",
+                         "kernel.rocm_moe_grouped_decode_fused_calls",
+                         "kernel.rocm_moe_grouped_down_decode_calls"});
+            for (size_t row = 0; row < verifier_tokens.size(); ++row)
+            {
+                const std::string comparison =
+                    "all_position_row" + std::to_string(row) +
+                    "_vs_serial_prefix" + std::to_string(row + 1);
+                if (const auto *first_bad = firstMoEDiagnosticByteDivergence(
                         diagnostic_rows,
                         comparison,
-                        0.9999,
                         /*include_sidecar_keys=*/true))
                 {
-                    diag << "\nfirst_divergent_stage_row" << row << ": "
+                    diag << "\nfirst_byte_divergent_stage_row" << row << ": "
                          << describeMoEDiagnosticRow(*first_bad);
                 }
             }
@@ -6870,11 +7334,21 @@ namespace llaminar2::test::parity::qwen36
 
         (void)expected_ready_token;
         (void)live_serial_extension_probe;
-        (void)grouped_verifier_probe;
-        (void)serial_replay_final_probe;
 
         for (size_t row = 0; row < verifier_tokens.size(); ++row)
         {
+            if (grouped_snapshot_diagnostic)
+            {
+                EXPECT_TRUE(grouped_snapshot_byte_failures[row].empty())
+                    << "MoE grouped verifier operation row " << row
+                    << " must be byte-identical to production serial decode"
+                    << "\nverifier_tokens="
+                    << joinTokensMoEDiagnostic(verifier_tokens)
+                    << "\nfirst_byte_divergence="
+                    << grouped_snapshot_byte_failures[row]
+                    << grouped_snapshot_diagnostic_summary;
+            }
+
             const float *grouped_row_logits =
                 grouped_logits_copy.data() + row * static_cast<size_t>(vocab);
             EXPECT_TRUE(verifierLogitsByteIdentical(
@@ -7499,7 +7973,7 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_FALSE(test_case.devices.empty());
         ASSERT_TRUE(test_case.devices.front().toLocalDeviceId().is_gpu())
             << "Phase 9.6 persistent sidecar metadata is a GPU graph-capture "
-               "contract; CPU keeps host-owned replay for now.";
+               "contract; CPU validates grouped verifier rows separately.";
 
         ScopedEnvironmentValues perf_stats_enabled({
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
@@ -7537,48 +8011,58 @@ namespace llaminar2::test::parity::qwen36
             << "MTP sidecar runtime tables must not register request-level "
                "decode histogram sync callbacks.\n"
             << PerfStatsCollector::summaryString({"mtp"});
-        if (moECaseExpectsAllPositionSpecPublication(test_case))
-        {
-            EXPECT_TRUE(hasMTPPerfCounter(
-                records,
-                "all_position_state_publication_verifier_runs"))
-                << "GPU MoE MTP should use the vLLM-style all-position verifier "
-                   "publication contract now that SingleDevice CUDA/ROCm have "
-                   "strict continuation proof.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(hasMTPPerfCounter(
-                records,
-                "decode_equivalent_sequential_verifier_runs"))
-                << "GPU MoE MTP should not use the row-serial replay verifier "
-                   "when direct all-position publication is advertised.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-        }
-        else
-        {
-            EXPECT_TRUE(hasMTPPerfCounter(
-                records,
-                "decode_equivalent_sequential_verifier_runs"))
-                << "CPU and non-SingleDevice MoE MTP must stay on "
-                   "decode-equivalent verification until their own grouped "
-                   "all-position continuation proof exists.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(hasMTPPerfCounter(
-                records,
-                "all_position_state_publication_verifier_runs"))
-                << "MoE direct all-position publication must remain disabled "
-                   "outside the proven SingleDevice GPU lanes.\n"
-                << PerfStatsCollector::summaryString({"mtp"});
-        }
+        EXPECT_TRUE(hasMTPPerfCounter(
+            records,
+            "grouped_decode_equivalent_greedy_verifier_runs"))
+            << "GPU MoE MTP should run grouped decode-equivalent verifier rows.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(hasMTPPerfCounter(
+            records,
+            "grouped_outcome_device_resident_publication_uses"))
+            << "GPU MoE MTP should publish grouped verifier outcomes through "
+               "the device-resident mailbox.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(hasMTPPerfCounter(
+            records,
+            "device_resident_shifted_mtp_kv_state_mailboxes"))
+            << "GPU MoE MTP must publish the shifted cache's canonical device "
+               "count after a resident sidecar or accepted-state transaction.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        const bool consumed_shifted_boundary = hasMTPPerfCounter(
+            records,
+            "device_resident_shifted_mtp_kv_commit_boundaries");
+        const bool retargeted_shifted_boundary = hasMTPPerfCounter(
+            records,
+            "device_resident_shifted_mtp_kv_state_mailbox_retargets");
+        EXPECT_EQ(consumed_shifted_boundary, retargeted_shifted_boundary)
+            << "When a depth-1 trajectory needs a separate shifted-row commit, "
+               "the same transaction must both consume the canonical boundary "
+               "and carry it across the resulting live-state epoch. Fully "
+               "accepted trajectories may publish atomically without either "
+               "extra operation.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfCounter(
+            records,
+            "decode_equivalent_sequential_verifier_runs"))
+            << "GPU MoE MTP must not use retired row-serial verifier replay.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfCounter(
+            records,
+            "all_position_state_publication_verifier_runs"))
+            << "MoE direct all-position publication must remain disabled "
+               "outside the proven single-owner lane.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
 
         PerfStatsCollector::reset();
     }
 
-    inline void runMoEMainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported(
+    inline void runMoEMainVerifierUsesGroupedDecodeEquivalentPublication(
         const MoEPrefixRestoreParityCase &test_case)
     {
         ASSERT_FALSE(moECaseExpectsAllPositionSpecPublication(test_case))
-            << "This regression is for CPU hybrid/GDN MoE, where direct "
-               "all-position publication is intentionally not advertised.";
+            << "This regression covers the grouped decode-equivalent MoE "
+               "verifier contract when direct all-position publication is "
+               "intentionally not advertised.";
 
         ScopedEnvironmentValues perf_stats_enabled({
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
@@ -7597,19 +8081,26 @@ namespace llaminar2::test::parity::qwen36
         const auto records = PerfStatsCollector::snapshot({"mtp"});
         EXPECT_TRUE(hasMTPPerfCounter(
             records,
+            "grouped_decode_equivalent_greedy_verifier_runs"))
+            << "MoE MTP must choose grouped decode-equivalent verifier rows "
+               "rather than row-serial replay.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(
+            hasMTPPerfCounter(records, "grouped_outcome_device_resident_publication_uses") ||
+            hasMTPPerfCounter(records, "grouped_outcome_host_publication_uses"))
+            << "MoE MTP must publish grouped verifier state through an "
+               "explicit grouped publication path.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(hasMTPPerfCounter(
+            records,
             "decode_equivalent_sequential_verifier_runs"))
-            << "CPU MoE MTP must choose the shared decode-equivalent verifier "
-               "rather than publishing from a multi-row all-position graph.\n"
+            << "MoE MTP must not use retired row-serial verifier replay.\n"
             << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_FALSE(hasMTPPerfCounter(
             records,
             "all_position_state_publication_verifier_runs"))
-            << "CPU MoE MTP unexpectedly used direct all-position publication "
-               "after that capability was withdrawn.\n"
-            << PerfStatsCollector::summaryString({"mtp"});
-        EXPECT_FALSE(hasMTPPerfCounter(records, "spec_state_publications"))
-            << "CPU MoE MTP must not call spec-state publication until CPU "
-               "all-position verifier rows are decode-equivalent.\n"
+            << "MoE MTP unexpectedly used direct all-position publication "
+               "after that capability was withdrawn for this lane.\n"
             << PerfStatsCollector::summaryString({"mtp"});
 
         PerfStatsCollector::reset();

@@ -70,6 +70,55 @@ namespace llaminar2::cuda
             }
         }
 
+        /**
+         * @brief Pack request-terminal rows using device-resident real lengths.
+         *
+         * A request-batched prefill tensor is flattened as contiguous padded
+         * request rows. Every output row therefore has an independent source
+         * index even when requests have unequal lengths. Reading lengths in the
+         * kernel keeps this derivation ordered with the graph and avoids sharing
+         * verifier-row metadata that belongs to a different lifecycle.
+         */
+        __global__ void requestTerminalRowsSelectFP32Kernel(
+            const float *__restrict__ input,
+            float *__restrict__ output,
+            const int32_t *__restrict__ request_sequence_lengths,
+            int seq_len,
+            int request_row_stride,
+            int d_model,
+            int request_count)
+        {
+            const int total = request_count * d_model;
+            const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+            const int stride = blockDim.x * gridDim.x;
+            for (int idx = thread_index; idx < total; idx += stride)
+            {
+                const int request = idx / d_model;
+                const int column = idx - request * d_model;
+
+                /*
+                 * Admission rejects invalid lengths on the host API boundary.
+                 * Clamp again in device code solely to make a malformed launch
+                 * memory-safe; valid production requests take the straight path.
+                 */
+                const int raw_length = request_sequence_lengths[request];
+                const int request_length = raw_length < 1
+                                               ? 1
+                                               : (raw_length > request_row_stride
+                                                      ? request_row_stride
+                                                      : raw_length);
+                const int raw_source_row =
+                    request * request_row_stride + request_length - 1;
+                const int source_row = raw_source_row < seq_len
+                                           ? raw_source_row
+                                           : seq_len - 1;
+                const size_t source_offset =
+                    static_cast<size_t>(source_row) * static_cast<size_t>(d_model) +
+                    static_cast<size_t>(column);
+                output[static_cast<size_t>(idx)] = input[source_offset];
+            }
+        }
+
         /// @brief Concatenate two [rows, hidden_dim] matrices row-wise as [embedding, hidden].
         __global__ void mtpConcatFP32Kernel(
             const float *__restrict__ hidden,
@@ -257,6 +306,47 @@ namespace llaminar2::cuda
             seq_len,
             d_model,
             selected_row_count);
+        return ok(cudaGetLastError());
+    }
+
+    bool launchRequestTerminalRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *request_sequence_lengths,
+        int seq_len,
+        int request_row_stride,
+        int d_model,
+        int request_count,
+        void *stream)
+    {
+        if (!input || !output || !request_sequence_lengths || !stream ||
+            seq_len <= 0 || request_row_stride <= 0 || d_model <= 0 ||
+            request_count <= 0 ||
+            request_count * request_row_stride != seq_len)
+        {
+            return false;
+        }
+
+        constexpr int threads_per_block = 256;
+        const int total = request_count * d_model;
+        const int blocks = std::max(
+            1,
+            std::min(
+                1024,
+                (total + threads_per_block - 1) / threads_per_block));
+        auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        requestTerminalRowsSelectFP32Kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            cuda_stream>>>(
+            input,
+            output,
+            request_sequence_lengths,
+            seq_len,
+            request_row_stride,
+            d_model,
+            request_count);
         return ok(cudaGetLastError());
     }
 

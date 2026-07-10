@@ -102,7 +102,8 @@ namespace llaminar2
         WorkspaceRequirements reqs;
         if (params_.device_id.is_gpu() &&
             selected_row_count_ > 0 &&
-            params_.declare_selected_rows_workspace)
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::StageOwnedIndices)
         {
             reqs.buffers.push_back({
                 selectedRowsBufferName(),
@@ -137,9 +138,10 @@ namespace llaminar2
             return false;
         }
         if (params_.device_id.is_gpu() &&
-            !params_.upload_selected_rows_to_workspace)
+            params_.device_row_index_source !=
+                DeviceRowIndexSource::StageOwnedIndices)
         {
-            LOG_ERROR("[HiddenStateRowsSelectStage] Cannot mutate selected rows through the stage when row metadata is external");
+            LOG_ERROR("[HiddenStateRowsSelectStage] Cannot mutate selected rows through the stage when the device owns row metadata");
             return false;
         }
 
@@ -174,6 +176,15 @@ namespace llaminar2
                       << params_.device_id.toString());
             return false;
         }
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::RequestTerminalLengths)
+        {
+            /*
+             * The captured row-copy kernel reads the current request lengths
+             * directly. There is no launch-time host metadata to upload.
+             */
+            return true;
+        }
         return uploadGpuSelectedRows();
     }
 
@@ -192,6 +203,35 @@ namespace llaminar2
             LOG_ERROR("[HiddenStateRowsSelectStage] Invalid dimensions: seq_len=" << params_.seq_len
                                                                                   << " d_model=" << params_.d_model
                                                                                   << " selected_row_count=" << selected_row_count_);
+            return false;
+        }
+
+        if (params_.device_id.is_gpu() &&
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::RequestTerminalLengths)
+        {
+            const bool valid_request_geometry =
+                params_.request_sequence_lengths_device != nullptr &&
+                params_.request_row_stride > 0 &&
+                selected_row_count_ * params_.request_row_stride ==
+                    params_.seq_len;
+            if (!valid_request_geometry)
+            {
+                LOG_ERROR("[HiddenStateRowsSelectStage] Request-terminal row selection requires "
+                          << "resident lengths and exact flattened geometry: seq_len="
+                          << params_.seq_len
+                          << " request_count=" << selected_row_count_
+                          << " request_row_stride=" << params_.request_row_stride
+                          << " lengths=" << params_.request_sequence_lengths_device);
+                return false;
+            }
+        }
+        if (params_.device_id.is_gpu() &&
+            params_.device_row_index_source ==
+                DeviceRowIndexSource::ExternalDeviceIndices &&
+            params_.workspace_buffer_name.empty())
+        {
+            LOG_ERROR("[HiddenStateRowsSelectStage] External device row indices require a named workspace buffer");
             return false;
         }
 
@@ -270,6 +310,13 @@ namespace llaminar2
 
     bool HiddenStateRowsSelectStage::ensureGpuParamStateInitialized()
     {
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::RequestTerminalLengths)
+        {
+            LOG_ERROR("[HiddenStateRowsSelectStage] Request-terminal row selection must not bind a row-index workspace");
+            return false;
+        }
+
         const std::string rows_buffer = selectedRowsBufferName();
         const size_t expected_bytes = static_cast<size_t>(selected_row_count_) * sizeof(int);
         if (!bound_workspace_ ||
@@ -303,7 +350,8 @@ namespace llaminar2
         auto state = std::make_unique<GpuParamState>();
         state->device = params_.device_id;
         state->device_selected_rows = device_selected_rows;
-        if (!params_.upload_selected_rows_to_workspace)
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::ExternalDeviceIndices)
         {
             // External metadata mode is the vLLM-style path: another workspace
             // consumer owns and updates the row-index array. This stage only
@@ -351,9 +399,15 @@ namespace llaminar2
 
     bool HiddenStateRowsSelectStage::uploadGpuSelectedRows()
     {
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::RequestTerminalLengths)
+        {
+            return true;
+        }
         if (!ensureGpuParamStateInitialized())
             return false;
-        if (!params_.upload_selected_rows_to_workspace)
+        if (params_.device_row_index_source ==
+            DeviceRowIndexSource::ExternalDeviceIndices)
         {
             gpu_state_->device_value_uploaded = true;
             return true;
@@ -412,7 +466,10 @@ namespace llaminar2
 
     bool HiddenStateRowsSelectStage::executeGPU(TensorBase *input_base, TensorBase *output_base)
     {
-        if (!ensureGpuParamStateInitialized())
+        const bool request_terminal_rows =
+            params_.device_row_index_source ==
+            DeviceRowIndexSource::RequestTerminalLengths;
+        if (!request_terminal_rows && !ensureGpuParamStateInitialized())
             return false;
 
         const bool graph_managed = params_.input_buffer_id.has_value() && params_.output_buffer_id.has_value();
@@ -440,7 +497,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!uploadGpuSelectedRows())
+        if (!request_terminal_rows && !uploadGpuSelectedRows())
         {
             LOG_ERROR("[HiddenStateRowsSelectStage] Failed to update GPU selected-row array");
             return false;
@@ -450,27 +507,57 @@ namespace llaminar2
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            launched = cuda::launchRowsSelectFP32(
-                input_device,
-                output_device,
-                gpu_state_->device_selected_rows,
-                params_.seq_len,
-                params_.d_model,
-                selected_row_count_,
-                gpuStream());
+            if (request_terminal_rows)
+            {
+                launched = cuda::launchRequestTerminalRowsSelectFP32(
+                    input_device,
+                    output_device,
+                    params_.request_sequence_lengths_device,
+                    params_.seq_len,
+                    params_.request_row_stride,
+                    params_.d_model,
+                    selected_row_count_,
+                    gpuStream());
+            }
+            else
+            {
+                launched = cuda::launchRowsSelectFP32(
+                    input_device,
+                    output_device,
+                    gpu_state_->device_selected_rows,
+                    params_.seq_len,
+                    params_.d_model,
+                    selected_row_count_,
+                    gpuStream());
+            }
 #endif
         }
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            launched = rocm::launchRowsSelectFP32(
-                input_device,
-                output_device,
-                gpu_state_->device_selected_rows,
-                params_.seq_len,
-                params_.d_model,
-                selected_row_count_,
-                gpuStream());
+            if (request_terminal_rows)
+            {
+                launched = rocm::launchRequestTerminalRowsSelectFP32(
+                    input_device,
+                    output_device,
+                    params_.request_sequence_lengths_device,
+                    params_.seq_len,
+                    params_.request_row_stride,
+                    params_.d_model,
+                    selected_row_count_,
+                    gpuStream());
+            }
+            else
+            {
+                launched = rocm::launchRowsSelectFP32(
+                    input_device,
+                    output_device,
+                    gpu_state_->device_selected_rows,
+                    params_.seq_len,
+                    params_.d_model,
+                    selected_row_count_,
+                    gpuStream());
+            }
 #endif
         }
 
@@ -546,6 +633,10 @@ namespace llaminar2
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("selected_row_count", selected_row_count_);
+        info.addScalarInt(
+            "device_row_index_source",
+            static_cast<int>(params_.device_row_index_source));
+        info.addScalarInt("request_row_stride", params_.request_row_stride);
         return info;
     }
 

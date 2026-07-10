@@ -10,8 +10,10 @@
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
+#include "../../cpu/native_vnni/CPUNativeVNNIGemv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,6 +23,100 @@
 namespace llaminar2
 {
 
+    void CPUMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
+    {
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_rows_ = 0;
+        router_q8_hidden_d_model_ = 0;
+        router_q8_hidden_valid_ = false;
+    }
+
+    bool CPUMoEKernel::publishRouterQ8Hidden(
+        const float *source,
+        int rows,
+        int d_model)
+    {
+        invalidateRouterQ8HiddenPublication();
+        if (!source || rows < 1 || rows > 4 || d_model <= 0)
+            return false;
+
+        const int blocks_per_row = (d_model + Q8_1Block::BLOCK_SIZE - 1) /
+                                   Q8_1Block::BLOCK_SIZE;
+        router_q8_hidden_.resize(
+            static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
+
+        /*
+         * Verifier batches contain at most four rows.  Quantizing them directly
+         * avoids an OpenMP fork whose scheduling overhead would exceed the SIMD
+         * block work, while preserving the exact serial-decode block primitive.
+         */
+        const bool rows_are_block_aligned = (d_model % Q8_1Block::BLOCK_SIZE) == 0;
+        for (int row = 0; row < rows; ++row)
+        {
+            const float *row_source =
+                source + static_cast<size_t>(row) * static_cast<size_t>(d_model);
+            Q8_1Block *row_q8 =
+                router_q8_hidden_.data() +
+                static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+            int block = 0;
+#if defined(__AVX512F__)
+            if (rows_are_block_aligned)
+            {
+                for (; block + 1 < blocks_per_row; block += 2)
+                {
+                    simd::quantize_two_blocks_avx512(
+                        row_source + static_cast<size_t>(block) * Q8_1Block::BLOCK_SIZE,
+                        row_q8[block],
+                        row_q8[block + 1]);
+                }
+            }
+#endif
+            for (; block < blocks_per_row; ++block)
+            {
+                const int block_start = block * Q8_1Block::BLOCK_SIZE;
+                simd::quantize_single_block(
+                    row_source + block_start,
+                    row_q8[block],
+                    std::min(
+                        static_cast<int>(Q8_1Block::BLOCK_SIZE),
+                        d_model - block_start));
+            }
+        }
+
+        router_q8_hidden_source_ = source;
+        router_q8_hidden_rows_ = rows;
+        router_q8_hidden_d_model_ = d_model;
+        router_q8_hidden_valid_ = true;
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_moe_router_q8_hidden_publication_calls",
+            1.0,
+            "moe",
+            "cpu",
+            {{"rows", std::to_string(rows)},
+             {"d_model", std::to_string(d_model)}});
+        return true;
+    }
+
+    const Q8_1Block *CPUMoEKernel::publishedRouterQ8Hidden(
+        const float *source,
+        int rows,
+        int d_model) const noexcept
+    {
+        if (!router_q8_hidden_valid_ ||
+            !source ||
+            router_q8_hidden_source_ != source ||
+            rows <= 0 ||
+            router_q8_hidden_rows_ < rows ||
+            d_model <= 0 ||
+            router_q8_hidden_d_model_ != d_model ||
+            router_q8_hidden_.empty())
+        {
+            return nullptr;
+        }
+        return router_q8_hidden_.data();
+    }
+
     bool CPUMoEKernel::route(
         const float *hidden,
         const float *gate_weights,
@@ -29,6 +125,25 @@ namespace llaminar2
         bool normalize_weights,
         MoERoutingResult &result)
     {
+        invalidateRouterQ8HiddenPublication();
+        if (!hidden || !gate_weights || seq_len <= 0 || d_model <= 0 ||
+            num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[CPUMoEKernel::route] invalid routing pointer or dimensions");
+            return false;
+        }
+
+        /*
+         * MTP and ordinary decode use M=1..4.  Publish their Q8_1 rows before
+         * routing so the immediately following native expert stage never repeats
+         * this activation transform once per selected expert.
+         */
+        if (seq_len <= 4 && !publishRouterQ8Hidden(hidden, seq_len, d_model))
+        {
+            LOG_ERROR("[CPUMoEKernel::route] failed to publish verifier Q8_1 hidden rows");
+            return false;
+        }
+
         result.expert_indices.resize(static_cast<size_t>(seq_len) * top_k);
         result.expert_weights.resize(static_cast<size_t>(seq_len) * top_k);
         result.router_logits.resize(static_cast<size_t>(seq_len) * num_experts);

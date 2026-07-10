@@ -22,9 +22,8 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
-#include "../../common/EmbedQ8Repack.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../common/PreparedEmbeddingWeights.h"
-#include "../../KernelFactory.h"
 #include <climits>
 #include "../../rope/RoPEDeviceParams.h"
 
@@ -101,6 +100,26 @@ extern "C"
     // Embedding lookup - FP32
     cudaError_t launch_embedding_lookup(
         const float *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset,
+        cudaStream_t stream);
+
+    // Embedding lookup - native 16-bit floating tables, FP32 output
+    cudaError_t launch_embedding_lookup_fp16_source(
+        const uint16_t *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset,
+        cudaStream_t stream);
+    cudaError_t launch_embedding_lookup_bf16_source(
+        const uint16_t *embed_data,
         const int *token_ids,
         float *output,
         int num_tokens,
@@ -355,6 +374,141 @@ namespace
         device_valid = true;
         return true;
     }
+
+    /**
+     * @brief Publish proof that one compact verifier embedding launch ran.
+     *
+     * M=1 calls are the serial oracle and intentionally do not emit this
+     * counter. The device-token tag prevents a host upload from accidentally
+     * satisfying the device-owned MTP regression gate.
+     */
+    void recordCudaGroupedEmbeddingCall(
+        const llaminar2::TensorBase *embed_table,
+        int num_tokens,
+        int d_model,
+        int device,
+        bool uses_device_token_ids,
+        const char *weight_route)
+    {
+        if (num_tokens < 2 || num_tokens > 4)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_embedding_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            llaminar2::DeviceId::cuda(device).to_string(),
+            {{"weight_format", llaminar2::tensorTypeName(embed_table->native_type())},
+             {"verifier_rows", std::to_string(num_tokens)},
+             {"d_model", std::to_string(d_model)},
+             {"weight_route", weight_route},
+             {"token_source", uses_device_token_ids ? "device" : "host_workspace"},
+             {"invocation_policy", "single_grouped_launch"}});
+    }
+
+    /**
+     * @brief Record the exact CUDA RoPE route used by a verifier row group.
+     *
+     * M=1 is the serial witness and intentionally emits nothing. The position
+     * route distinguishes the mutable device-row kernel used by request-batched
+     * MTP from the contiguous device-scalar kernel used by ordinary decode.
+     */
+    void recordCudaGroupedRoPECall(
+        const char *tensor_format,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int rotary_dim,
+        int device,
+        const char *position_route)
+    {
+        if (verifier_rows < 2 || verifier_rows > 4)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_rope_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            llaminar2::DeviceId::cuda(device).to_string(),
+            {{"tensor_format", tensor_format},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"q_heads", std::to_string(n_heads)},
+             {"kv_heads", std::to_string(n_kv_heads)},
+             {"head_dim", std::to_string(head_dim)},
+             {"rotary_dim", std::to_string(rotary_dim)},
+             {"position_route", position_route},
+             {"capture_mode", llaminar2::isGraphCaptureActive() ? "graph_capture" : "direct"},
+             {"invocation_policy", "single_grouped_launch"}});
+    }
+
+    /**
+     * @brief Record one successful production CUDA RMSNorm verifier launch.
+     *
+     * RMSNorm maps every logical row to one independent CUDA block. A grouped
+     * MTP call therefore preserves the exact M=1 reduction tree while paying
+     * one host launch for the complete verifier group. Serial M=1 witnesses do
+     * not emit this counter, allowing integration tests to prove that the
+     * grouped side entered the economical production route exactly once.
+     *
+     * @param tensor_format Native activation/output representation.
+     * @param verifier_rows Number of MTP verifier rows in this launch.
+     * @param cols Number of values reduced and normalized per row.
+     * @param device CUDA ordinal on which the grouped kernel was launched.
+     */
+    void recordCudaGroupedRMSNormCall(
+        const char *tensor_format,
+        int verifier_rows,
+        int cols,
+        int device)
+    {
+        if (verifier_rows < 2 || verifier_rows > 4)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_rmsnorm_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            llaminar2::DeviceId::cuda(device).to_string(),
+            {{"tensor_format", tensor_format},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"cols", std::to_string(cols)},
+             {"capture_mode", llaminar2::isGraphCaptureActive() ? "graph_capture" : "direct"},
+             {"row_mapping", "one_block_per_row"},
+             {"invocation_policy", "single_grouped_launch"}});
+    }
+
+    /**
+     * @brief Record one successful production CUDA grouped SwiGLU launch.
+     *
+     * SwiGLU is elementwise, so all verifier rows share one flat device grid
+     * without changing any row's arithmetic. M=1 serial witnesses emit no
+     * counter, allowing integration tests to reject hidden row replay.
+     */
+    void recordCudaGroupedSwiGLUCall(
+        const char *tensor_format,
+        int verifier_rows,
+        int cols,
+        int device)
+    {
+        if (verifier_rows < 2 || verifier_rows > 4)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_swiglu_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            llaminar2::DeviceId::cuda(device).to_string(),
+            {{"tensor_format", tensor_format},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"cols", std::to_string(cols)},
+             {"capture_mode", llaminar2::isGraphCaptureActive() ? "graph_capture" : "direct"},
+             {"invocation_policy", "single_flat_launch"}});
+    }
 } // namespace
 
 namespace llaminar2
@@ -401,6 +555,11 @@ namespace llaminar2
             (void)mpi_ctx;
             if (!input || !weight || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<FP32>] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
             if (input->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
                 return false;
 
@@ -421,10 +580,15 @@ namespace llaminar2
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
 
-            // Launch kernel asynchronously - no sync needed since all ops are on default stream
-            // Stream ordering guarantees subsequent kernels wait for this one
+            // Launch asynchronously on the executor-owned stream. One block is
+            // assigned to each row, so grouped MTP retains the serial reduction
+            // order while amortizing launch overhead across all verifier rows.
             CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::RMS_NORM, gpu_stream_);
-            return cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
+            const bool ok = cudaOps_rmsnorm_fp32(
+                d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
+            if (ok)
+                recordCudaGroupedRMSNormCall("FP32", rows, cols, dev);
+            return ok;
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -466,6 +630,11 @@ namespace llaminar2
             (void)mpi_ctx;
             if (!input || !weight || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<BF16>] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
             if (input->native_type() != TensorType::BF16 || output->native_type() != TensorType::BF16)
                 return false;
 
@@ -487,8 +656,13 @@ namespace llaminar2
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
-            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
-            return cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
+            // DeviceGraphExecutor owns synchronization; successful M=2..4
+            // launches publish their native grouped route for regression gates.
+            const bool ok = cudaOps_rmsnorm_bf16(
+                d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
+            if (ok)
+                recordCudaGroupedRMSNormCall("BF16", rows, cols, dev);
+            return ok;
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -530,6 +704,11 @@ namespace llaminar2
             (void)mpi_ctx;
             if (!input || !weight || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDARMSNormKernelT<FP16>] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
             if (input->native_type() != TensorType::FP16 || output->native_type() != TensorType::FP16)
                 return false;
 
@@ -551,8 +730,13 @@ namespace llaminar2
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
-            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
-            return cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
+            // DeviceGraphExecutor owns synchronization; successful M=2..4
+            // launches publish their native grouped route for regression gates.
+            const bool ok = cudaOps_rmsnorm_fp16(
+                d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
+            if (ok)
+                recordCudaGroupedRMSNormCall("FP16", rows, cols, dev);
+            return ok;
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -581,8 +765,12 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual; // TODO: implement residual addition
             (void)mpi_ctx;
+            if (add_residual)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP32>] add_residual has no residual operand and is unsupported");
+                return false;
+            }
             int size = rows * cols;
             return apply_typed(gate, up, output, size);
         }
@@ -596,10 +784,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP32>] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
+            if (add_residual)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP32>] apply_tensor does not accept add_residual");
+                return false;
+            }
             if (gate->native_type() != TensorType::FP32 ||
                 up->native_type() != TensorType::FP32 ||
                 output->native_type() != TensorType::FP32)
@@ -625,7 +822,11 @@ namespace llaminar2
             int size = rows * cols;
             // Launch kernel asynchronously - stream ordering handles dependencies
             CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::SWIGLU, gpu_stream_);
-            return cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev, gpu_stream_);
+            const bool ok = cudaOps_swiglu_fp32(
+                d_gate, d_up, d_output, size, dev, gpu_stream_);
+            if (ok)
+                recordCudaGroupedSwiGLUCall("FP32", rows, cols, dev);
+            return ok;
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -651,9 +852,13 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
             (void)device_idx;
+            if (add_residual)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<BF16>] add_residual has no residual operand and is unsupported");
+                return false;
+            }
             int size = rows * cols;
             return apply_typed(gate, up, output, size);
         }
@@ -667,10 +872,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<BF16>] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
+            if (add_residual)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<BF16>] apply_tensor does not accept add_residual");
+                return false;
+            }
             if (gate->native_type() != TensorType::BF16 ||
                 up->native_type() != TensorType::BF16 ||
                 output->native_type() != TensorType::BF16)
@@ -692,8 +906,12 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
-            return cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev, gpu_stream_);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::SWIGLU, gpu_stream_);
+            const bool ok = cudaOps_swiglu_bf16(
+                d_gate, d_up, d_output, size, dev, gpu_stream_);
+            if (ok)
+                recordCudaGroupedSwiGLUCall("BF16", rows, cols, dev);
+            return ok;
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -721,9 +939,13 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
             (void)device_idx;
+            if (add_residual)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP16>] add_residual has no residual operand and is unsupported");
+                return false;
+            }
             int size = rows * cols;
             return apply_typed(gate, up, output, size);
         }
@@ -737,10 +959,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP16>] apply_tensor requires an explicit non-null CUDA stream");
+                return false;
+            }
+            if (add_residual)
+            {
+                LOG_ERROR("[CUDASwiGLUKernelT<FP16>] apply_tensor does not accept add_residual");
+                return false;
+            }
             if (gate->native_type() != TensorType::FP16 ||
                 up->native_type() != TensorType::FP16 ||
                 output->native_type() != TensorType::FP16)
@@ -762,8 +993,12 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - DeviceGraphExecutor handles async execution via stream ordering
-            return cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev, gpu_stream_);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::SWIGLU, gpu_stream_);
+            const bool ok = cudaOps_swiglu_fp16(
+                d_gate, d_up, d_output, size, dev, gpu_stream_);
+            if (ok)
+                recordCudaGroupedSwiGLUCall("FP16", rows, cols, dev);
+            return ok;
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -865,6 +1100,18 @@ namespace llaminar2
 
             // Effective rotary dimension: 0 means full rotation (=head_dim)
             const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+            auto complete_launch = [&](bool ok, const char *position_route)
+            {
+                if (ok)
+                {
+                    recordCudaGroupedRoPECall(
+                        "FP32", seq_len, n_heads, n_kv_heads,
+                        head_dim, eff_rotary, dev, position_route);
+                    if (sync_after)
+                        cudaDeviceSynchronize();
+                }
+                return ok;
+            };
 
             // Require workspace to be bound
             if (!workspace_)
@@ -907,9 +1154,7 @@ namespace llaminar2
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp32_decode_v3(Q, K, d_inv_freq, pos,
                                                       n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
-                if (ok && sync_after)
-                    cudaDeviceSynchronize();
-                return ok;
+                return complete_launch(ok, "decode_scalar");
             }
 
             {
@@ -963,9 +1208,7 @@ namespace llaminar2
                     }
                     bool ok = cudaOps_rope_fp32_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
                                                               n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream, d_params);
-                    if (ok && sync_after)
-                        cudaDeviceSynchronize();
-                    return ok;
+                    return complete_launch(ok, "contiguous_device_scalar");
                 }
             }
 
@@ -1001,9 +1244,7 @@ namespace llaminar2
 
             bool ok = cudaOps_rope_fp32_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
                                            n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
-            if (ok && sync_after)
-                cudaDeviceSynchronize();
-            return ok;
+            return complete_launch(ok, "explicit_device_rows");
         }
 
         // =========================================================================
@@ -1090,6 +1331,18 @@ namespace llaminar2
 
             // Effective rotary dimension: 0 means full rotation (=head_dim)
             const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+            auto complete_launch = [&](bool ok, const char *position_route)
+            {
+                if (ok)
+                {
+                    recordCudaGroupedRoPECall(
+                        "BF16", seq_len, n_heads, n_kv_heads,
+                        head_dim, eff_rotary, dev, position_route);
+                    if (sync_after)
+                        cudaDeviceSynchronize();
+                }
+                return ok;
+            };
 
             // Require workspace to be bound
             if (!workspace_)
@@ -1128,9 +1381,7 @@ namespace llaminar2
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_bf16_decode_v3(Q, K, d_inv_freq, pos,
                                                       n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
-                if (ok && sync_after)
-                    cudaDeviceSynchronize();
-                return ok;
+                return complete_launch(ok, "decode_scalar");
             }
 
             {
@@ -1182,9 +1433,7 @@ namespace llaminar2
                     }
                     bool ok = cudaOps_rope_bf16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
                                                               n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream, d_params);
-                    if (ok && sync_after)
-                        cudaDeviceSynchronize();
-                    return ok;
+                    return complete_launch(ok, "contiguous_device_scalar");
                 }
             }
 
@@ -1220,9 +1469,7 @@ namespace llaminar2
 
             bool ok = cudaOps_rope_bf16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
                                            n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
-            if (ok && sync_after)
-                cudaDeviceSynchronize();
-            return ok;
+            return complete_launch(ok, "explicit_device_rows");
         }
 
         // =========================================================================
@@ -1309,6 +1556,18 @@ namespace llaminar2
 
             // Effective rotary dimension: 0 means full rotation (=head_dim)
             const int eff_rotary = (rotary_dim > 0 && rotary_dim < head_dim) ? rotary_dim : head_dim;
+            auto complete_launch = [&](bool ok, const char *position_route)
+            {
+                if (ok)
+                {
+                    recordCudaGroupedRoPECall(
+                        "FP16", seq_len, n_heads, n_kv_heads,
+                        head_dim, eff_rotary, dev, position_route);
+                    if (sync_after)
+                        cudaDeviceSynchronize();
+                }
+                return ok;
+            };
 
             // Require workspace to be bound
             if (!workspace_)
@@ -1347,9 +1606,7 @@ namespace llaminar2
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp16_decode_v3(Q, K, d_inv_freq, pos,
                                                       n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
-                if (ok && sync_after)
-                    cudaDeviceSynchronize();
-                return ok;
+                return complete_launch(ok, "decode_scalar");
             }
 
             {
@@ -1401,9 +1658,7 @@ namespace llaminar2
                     }
                     bool ok = cudaOps_rope_fp16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
                                                               n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream, d_params);
-                    if (ok && sync_after)
-                        cudaDeviceSynchronize();
-                    return ok;
+                    return complete_launch(ok, "contiguous_device_scalar");
                 }
             }
 
@@ -1439,9 +1694,7 @@ namespace llaminar2
 
             bool ok = cudaOps_rope_fp16_v3(Q, K, d_inv_freq, d_position_ids, seq_len,
                                            n_heads, n_kv_heads, head_dim, eff_rotary, dev, stream);
-            if (ok && sync_after)
-                cudaDeviceSynchronize();
-            return ok;
+            return complete_launch(ok, "explicit_device_rows");
         }
 
     } // namespace cuda
@@ -1669,13 +1922,15 @@ namespace llaminar2
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
         if (!gpu_stream_)
         {
-            cudaError_t set_err = cudaSetDevice(dev);
-            if (set_err != cudaSuccess)
-            {
-                fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
-                        dev, cudaGetErrorString(set_err));
-                return false;
-            }
+            fprintf(stderr, "[CUDAEmbeddingKernelT] apply_tensor requires an explicit non-null CUDA stream\n");
+            return false;
+        }
+        cudaError_t set_err = cudaSetDevice(dev);
+        if (set_err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
+                    dev, cudaGetErrorString(set_err));
+            return false;
         }
 
         // =====================================================================
@@ -1814,89 +2069,92 @@ namespace llaminar2
                         cudaGetErrorString(err));
                 return false;
             }
+            recordCudaGroupedEmbeddingCall(
+                embed_table,
+                num_tokens,
+                d_model,
+                dev,
+                use_device_token_ids,
+                "resident_fp32");
             return true;
         }
 
-        // --- Quantized path: repack to EmbedQ8 via IINT8Unpackable ---
-        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
-        if (unpackable)
+        // --- Native FP16/BF16 path: preserve loaded table precision on device ---
+        const TensorType table_type = embed_table->native_type();
+        if ((table_type == TensorType::FP16 || table_type == TensorType::BF16) &&
+            embed_table->isOnGPU())
         {
-            // --- Preferred path: use model-owned PreparedWeightStore handle ---
-            using namespace llaminar::v2::kernels;
+            const auto *d_embed = static_cast<const uint16_t *>(embed_table->gpu_data_ptr());
+            if (validate_gpu_ptrs &&
+                !validateCudaPointerForDevice(d_embed, dev, "EMBED_FLOAT16", /*fail_on_query_error=*/true))
+            {
+                return false;
+            }
+            if (validate_gpu_ptrs && !checkCudaNoPriorError("EmbedFloat16 launch"))
+            {
+                return false;
+            }
+
+            const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                              ? local_vocab_size_
+                                              : static_cast<int>(embed_table->rows());
+            const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::EMBEDDING_LOOKUP, gpu_stream_);
+            err = table_type == TensorType::FP16
+                      ? launch_embedding_lookup_fp16_source(
+                            d_embed, d_token_ids, d_output, num_tokens, d_model,
+                            launch_vocab_size, launch_vocab_offset,
+                            static_cast<cudaStream_t>(gpu_stream_))
+                      : launch_embedding_lookup_bf16_source(
+                            d_embed, d_token_ids, d_output, num_tokens, d_model,
+                            launch_vocab_size, launch_vocab_offset,
+                            static_cast<cudaStream_t>(gpu_stream_));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAEmbeddingKernelT] Native " << tensorTypeName(table_type)
+                                                           << " embedding launch failed: "
+                                                           << cudaGetErrorString(err));
+                return false;
+            }
+            recordCudaGroupedEmbeddingCall(
+                embed_table,
+                num_tokens,
+                d_model,
+                dev,
+                use_device_token_ids,
+                table_type == TensorType::FP16 ? "resident_fp16" : "resident_bf16");
+            return true;
+        }
+
+        // --- Quantized path: consume model-owned prepared EmbedQ8 weights ---
+        if (dynamic_cast<const IINT8Unpackable *>(embed_table))
+        {
             const DeviceId dev_id = DeviceId::cuda(dev);
-            const PreparedEmbeddingHandle *prepared = nullptr;
-            if (prepared_embedding_handle_ && prepared_embedding_handle_->device_id == dev_id)
-                prepared = prepared_embedding_handle_;
-
-            void *d_embed_q8 = nullptr;
-            size_t blocks_per_row = 0;
-            int vocab_offset = 0;
-            int local_vocab_size = static_cast<int>(embed_table->rows());
-
-            if (prepared && prepared->weights && prepared->weights->device_data)
+            const PreparedEmbeddingHandle *prepared = prepared_embedding_handle_;
+            const bool prepared_matches =
+                prepared &&
+                prepared->tensor == embed_table &&
+                prepared->device_id == dev_id &&
+                prepared->weights &&
+                prepared->weights->device_id == dev_id &&
+                prepared->weights->device_data &&
+                prepared->weights->d_model == d_model &&
+                prepared->weights->blocks_per_row > 0 &&
+                prepared->weights->vocab_size > 0;
+            if (!prepared_matches)
             {
-                // Fast path: GPU-resident prepared data from weight loading
-                d_embed_q8 = prepared->weights->device_data;
-                blocks_per_row = prepared->weights->blocks_per_row;
-                vocab_offset = static_cast<int>(prepared->weights->vocab_offset);
-                local_vocab_size = static_cast<int>(prepared->weights->vocab_size);
+                LOG_ERROR("[CUDAEmbeddingKernelT] Quantized GPU embedding requires matching prepared device weights: "
+                          << "tensor=" << static_cast<const void *>(embed_table)
+                          << " format=" << tensorTypeName(embed_table->native_type())
+                          << " device=" << dev_id.to_string()
+                          << " d_model=" << d_model);
+                return false;
             }
-            else
-            {
-                // Fallback: workspace-based lazy repack (for tests, CPU-only, etc.)
-                if (!prepared)
-                {
-                    LOG_DEBUG("[CUDAEmbeddingKernelT] Prepared embedding lookup miss: "
-                              << "tensor_ptr=" << static_cast<const void *>(embed_table)
-                              << " device=" << dev_id.to_string()
-                              << " — using workspace fallback");
-                }
-                d_embed_q8 = workspace_ ? workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE) : nullptr;
-                if (!d_embed_q8)
-                {
-                    fprintf(stderr, "[CUDAEmbeddingKernelT] No prepared embedding weights and no workspace EMBED_TABLE buffer\n");
-                    return false;
-                }
 
-                // Check if we need to repack + upload (first call or different tensor for THIS workspace)
-                bool needs_upload = false;
-                {
-                    std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                    auto it = s_workspace_embed_cache_.find(workspace_);
-                    needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
-                }
-                if (needs_upload)
-                {
-                    // CPU-side repack: any quant format → EmbedQ8Block via IINT8Unpackable
-                    auto repacked = repackEmbeddingToQ8(embed_table, d_model);
-
-                    err = cudaMemcpyAsync(d_embed_q8, repacked.data.data(), repacked.byte_size,
-                                          cudaMemcpyHostToDevice,
-                                          static_cast<cudaStream_t>(gpu_stream_));
-                    if (err != cudaSuccess)
-                    {
-                        fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to upload EmbedQ8 data: %s\n",
-                                cudaGetErrorString(err));
-                        return false;
-                    }
-
-                    blocks_per_row = repacked.blocks_per_row;
-
-                    {
-                        std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                        s_workspace_embed_cache_[workspace_] = embed_table;
-                    }
-                    LOG_DEBUG("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
-                             << tensorTypeName(embed_table->native_type()) << " "
-                             << repacked.vocab_size << "x" << d_model
-                             << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                             << " (" << repacked.blocks_per_row << " blocks/row)");
-                }
-                else
-                {
-                    blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
-                }
-            }
+            void *d_embed_q8 = prepared->weights->device_data;
+            const size_t blocks_per_row = prepared->weights->blocks_per_row;
+            const int vocab_offset = static_cast<int>(prepared->weights->vocab_offset);
+            const int local_vocab_size = static_cast<int>(prepared->weights->vocab_size);
 
             if (validate_gpu_ptrs)
             {
@@ -1997,12 +2255,18 @@ namespace llaminar2
                 }
                 return false;
             }
+            recordCudaGroupedEmbeddingCall(
+                embed_table,
+                num_tokens,
+                d_model,
+                dev,
+                use_device_token_ids,
+                "prepared_device_embed_q8");
             return true;
         }
 
-        // No FP32 fallback — embedding table must be either FP32-on-GPU or IINT8Unpackable
-        fprintf(stderr, "[CUDAEmbeddingKernelT] Embedding table type %s is not FP32-on-GPU "
-                        "and does not implement IINT8Unpackable\n",
+        fprintf(stderr, "[CUDAEmbeddingKernelT] Embedding table type %s is not a resident floating table "
+                        "and does not have a prepared quantized representation\n",
                 tensorTypeName(embed_table->native_type()));
         return false;
     }
@@ -2015,6 +2279,7 @@ namespace llaminar2
         int m, int n, int k) const
     {
         (void)n; // Unused for embedding
+        (void)k; // Persistent embedding weights are not graph workspace
 
         WorkspaceRequirements reqs;
 
@@ -2027,22 +2292,6 @@ namespace llaminar2
             256, // Alignment for CUDA
             true // Required
         });
-
-        // Buffer 2: Embedding table temp [vocab_size × blocks_per_row × sizeof(EmbedQ8Block)]
-        // Only needed when PreparedEmbeddingWeights are NOT available (test/fallback path).
-        // When weights are prepared during loading, the prepared data lives in its own
-        // GPU allocation and this workspace buffer is unused.
-        if (!prepared_embedding_handle_)
-        {
-            constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
-            size_t d_model_size = (k > 0) ? static_cast<size_t>(k) : 896;
-            size_t blocks_per_row = (d_model_size + 31) / 32;
-            size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * blocks_per_row * sizeof(EmbedQ8Block);
-            reqs.buffers.push_back({EmbeddingWorkspaceBuffers::EMBED_TABLE,
-                                    embed_table_bytes,
-                                    256,
-                                    true});
-        }
 
         return reqs;
     }

@@ -124,7 +124,8 @@ namespace llaminar2
             const int *position_ids,
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr,
-            const void *position_ids_device = nullptr) override = 0;
+            const void *position_ids_device = nullptr,
+            const int32_t *sequence_lengths_device = nullptr) override = 0;
 
         // =====================================================================
         // Configuration
@@ -573,6 +574,9 @@ namespace llaminar2
          * @param bucket_seq_len Bucket length marker (0 = non-bucket path).
          * @param device Device assigned to the row-select stage.
          * @param dependency_out Receives the node name LM head should depend on.
+         * @param request_sequence_lengths_device Optional device-owned request
+         *        lengths used to derive one terminal row per padded request.
+         * @param request_row_stride Padded source-row stride for each request.
          * @param input_buffer_id BufferId for final_norm_output.
          * @return Tensor that LM head should read.
          */
@@ -585,6 +589,8 @@ namespace llaminar2
             int bucket_seq_len,
             DeviceId device,
             std::string &dependency_out,
+            const int32_t *request_sequence_lengths_device = nullptr,
+            int request_row_stride = 0,
             BufferId input_buffer_id = BufferId::NORMALIZED) const;
 
         [[noreturn]] void failMissingGpuExpertGemmEngines(
@@ -667,6 +673,8 @@ namespace llaminar2
          *                  when @p layer_idx_is_cache_local is true.
          * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
          *                                 KV cache layer id.
+         * @param request_sequence_lengths_device Device-owned request lengths
+         *        consumed by captured GPU append publication.
          * @return KV append node name, or rope_dependency when no KV cache is present.
          */
         std::string addKVCacheAppend(
@@ -677,10 +685,12 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             IKVCache *kv_cache,
+            const int32_t *request_sequence_lengths_device,
             DeviceId device,
             const std::string &rope_dependency,
             const std::vector<std::string> &cache_source_dependencies = {},
-            bool layer_idx_is_cache_local = false);
+            bool layer_idx_is_cache_local = false,
+            int first_seq_idx = 0);
 
         /**
          * @brief Add KV cache append, attention compute, and optional gather stages.
@@ -689,6 +699,8 @@ namespace llaminar2
          *                  when @p layer_idx_is_cache_local is true.
          * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
          *                                 KV cache layer id.
+         * @param request_sequence_lengths_device Device-owned request lengths
+         *        consumed by captured GPU append publication.
          * @return Terminal attention node name
          */
         std::string addKVCacheAndAttention(
@@ -703,6 +715,7 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             const void *position_ids_device,
+            const int32_t *request_sequence_lengths_device,
             DeviceId device,
             bool has_qkv_proj,
             const std::string &rope_dependency,

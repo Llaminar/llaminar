@@ -664,6 +664,31 @@ namespace llaminar2
             std::size_t *workspace_slot,
             const char *context) const;
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
+
+        /**
+         * @brief Resolve one fixed-stride grouped descriptor-table slot.
+         *
+         * Routed MoE tables and singleton shared-expert tables coexist in the
+         * same graph-owned descriptor arena.  Every slot must consequently use
+         * the workspace's maximum-expert stride; multiplying a slot by the
+         * current table width lets narrow shared tables overwrite routed
+         * descriptors.  The helper validates the table width and returns the
+         * isolated device range owned by the requested slot.
+         *
+         * @param buffer_name Workspace buffer containing one descriptor role.
+         * @param slot Stable descriptor-table slot selected by the registry.
+         * @param num_experts Number of live descriptors in this table.
+         * @param device_descs Receives the beginning of the isolated slot.
+         * @param context Diagnostic operation name used on validation failure.
+         * @return True when the complete table fits in an isolated slot.
+         */
+        bool bindGroupedDescriptorTableSlot(
+            const char *buffer_name,
+            std::size_t slot,
+            int num_experts,
+            DeviceNativeVNNIMatrixDesc **device_descs,
+            const char *context);
+
         bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
         void clearWorkspaceScratchBindings() noexcept;
         void releaseDeviceBuffers() noexcept;
@@ -681,6 +706,50 @@ namespace llaminar2
             int num_experts,
             int top_k,
             const char *context);
+        /**
+         * @brief Revoke the device router-to-expert Q8 hidden publication.
+         *
+         * CUDA graph arenas reuse the same FP32 addresses across layers and
+         * tokens, so pointer identity alone cannot prove that decode scratch
+         * belongs to the current router invocation.
+         */
+        void invalidateRouterQ8HiddenPublication() noexcept;
+
+        /**
+         * @brief Publish contiguous Q8 rows produced by the current router.
+         *
+         * @param source FP32 device row base quantized by the router.
+         * @param rows Number of valid rows in decode hidden scratch.
+         * @param recorded_during_capture True when the producer was recorded,
+         *        but not yet executed, by the active CUDA graph capture.
+         */
+        void publishRouterQ8Hidden(
+            const float *source,
+            int rows,
+            bool recorded_during_capture) noexcept;
+
+        /**
+         * @brief Return whether the following expert stage may consume the publication.
+         *
+         * Capture-recorded rows are consumable only by a consumer recorded in
+         * that same active capture.  Eager code must wait for a fresh eager
+         * router producer instead of observing scratch from an older launch.
+         */
+        bool canReuseRouterQ8Hidden(
+            const float *source,
+            int rows,
+            int d_model) const noexcept;
+
+        /**
+         * @brief Explain why a router Q8 hidden publication cannot be consumed.
+         *
+         * @return A stable perf-diagnostic reason string, or nullptr when the
+         *         publication is eligible for the requested grouped expert pass.
+         */
+        const char *routerQ8HiddenReuseBlockReason(
+            const float *source,
+            int rows,
+            int d_model) const noexcept;
 
         struct GroupedDownDescriptorTable
         {
@@ -790,8 +859,10 @@ namespace llaminar2
 
         int8_t *d_decode_hidden_int8_ = nullptr;
         float *d_decode_hidden_scales_ = nullptr;
-        const float *router_q8_hidden_source_ = nullptr;
-        bool router_q8_hidden_valid_ = false;
+        const float *router_q8_hidden_source_ = nullptr; ///< FP32 row base that produced the Q8 publication
+        int router_q8_hidden_rows_ = 0; ///< Contiguous valid rows in decode hidden scratch
+        bool router_q8_hidden_valid_ = false; ///< Set only by a successful Q8 router producer
+        bool router_q8_hidden_capture_recorded_ = false; ///< Producer exists only in the current capture
         int decode_gateup_topk_cap_ = 0;
         int decode_gateup_d_model_cap_ = 0;
         std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;

@@ -28,7 +28,6 @@
 #pragma once
 
 #include "CUDARingKVCacheBase.h"
-#include "../../kvcache/KVCacheDeviceParams.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
 #include "CUDATurboQuantKernels.h"
@@ -71,6 +70,30 @@ namespace llaminar2
                           const TurboQuantContext *tq_ctx,
                           int device_id = 0);
 
+        /**
+         * @brief Construct a LocalTP shard of the asymmetric TQ cache.
+         *
+         * Storage and verifier publication contain only the local KV heads,
+         * while the base cache retains the global head count for graph policy
+         * and diagnostics.  Rotation matrices are generated for global head
+         * IDs `[kv_head_start, kv_head_start + local_n_kv_heads)` so a shard is
+         * mathematically identical to slicing the replicated cache.
+         *
+         * @param n_layers Number of transformer layers owned by this cache.
+         * @param batch_size Number of request sequences.
+         * @param max_seq_len Ring capacity.
+         * @param n_kv_heads Global number of KV heads.
+         * @param local_n_kv_heads Number of KV heads stored on this device.
+         * @param kv_head_start First global KV head stored on this device.
+         * @param head_dim Width of one KV head, either 64 or 128.
+         * @param tq_ctx TurboQuant codebook/rotation context.
+         * @param device_id CUDA device ordinal.
+         */
+        CUDARingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
+                          int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                          int head_dim, const TurboQuantContext *tq_ctx,
+                          int device_id = 0);
+
         ~CUDARingKVCacheTQ();
 
         // Non-copyable, non-movable
@@ -98,6 +121,34 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
 
+        /**
+         * @brief Dequantize independent TQ rings from device-owned metadata.
+         *
+         * One grouped TQ8 kernel and one grouped TQ4 kernel read every
+         * request's immutable ring pointer plus its live device head/count.
+         * The result is a compact request-major FP16 view consumed directly by
+         * request-batched attention. No host ring mirror or row replay is
+         * involved, and both launches are safe to record in a CUDA graph.
+         */
+        bool get_kv_batched_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            int max_kv_len,
+            ITensor **out_k,
+            ITensor **out_v,
+            void *gpu_stream) override;
+
+        bool get_kv_batched_converted_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            int max_kv_len,
+            ActivationPrecision target,
+            ITensor **out_k,
+            ITensor **out_v,
+            const KVReadParams &read) override;
+
         // Append (quantizes FP32 input to TQ8/TQ4 on GPU)
         bool append(int layer, int seq_idx,
                     const ITensor *K, const ITensor *V,
@@ -106,6 +157,27 @@ namespace llaminar2
         bool appendWithStream(int layer, int seq_idx,
                               const ITensor *K, const ITensor *V,
                               int num_tokens, void *gpu_stream) override;
+
+        /**
+         * @brief Publish FP32 MTP verifier rows directly into TQ8/TQ4 storage.
+         *
+         * This is a true grouped implementation: one fused CUDA grid quantizes
+         * all K and V rows and writes their wrapped ring destinations.  During
+         * graph capture the destination head remains entirely device-owned.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream) override;
+
+        KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc,
+                                void *dst_k, void *dst_v) const override;
+        bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc,
+                                const void *src_k, const void *src_v) override;
 
         /**
          * @brief Clear all TQ ring entries, scratch views, and device storage.
@@ -132,16 +204,11 @@ namespace llaminar2
                               int *out_kv_len,
                               const KVReadParams *rope = nullptr) override;
 
-        // Sharding (basic — not yet implemented for TQ)
-        bool is_sharded() const override { return false; }
-        int local_n_kv_heads() const override { return n_kv_heads_; }
-        int kv_head_start() const override { return 0; }
+        // LocalTP sharding metadata.
+        bool is_sharded() const override { return local_n_kv_heads_ != n_kv_heads_; }
+        int local_n_kv_heads() const override { return local_n_kv_heads_; }
+        int kv_head_start() const override { return kv_head_start_; }
         int local_kv_dim() const override { return kv_dim_; }
-
-        // TQ-specific graph capture support (dynamic dequant params)
-        void setDynamicDequantParams(int layer, int seq_idx,
-                                     float rope_theta, int position_start,
-                                     void *gpu_stream) override;
 
         // Eviction
         void evict_oldest(int layer, int seq_idx, int num_tokens);
@@ -161,8 +228,19 @@ namespace llaminar2
         const void *raw_k_cache(int layer, int seq_idx = 0) const { return entries_[layer][seq_idx].d_K; }
         /// Get raw TQ4 V ring buffer for a layer/seq (for fused attention)
         const void *raw_v_cache(int layer, int seq_idx = 0) const { return entries_[layer][seq_idx].d_V; }
-        /// Get ring buffer tail position (start of valid data)
-        int ring_tail(int layer, int seq_idx = 0) const { return entries_[layer][seq_idx].tail(max_seq_len_); }
+        /**
+         * @brief Observe the ring tail for opt-in diagnostics.
+         *
+         * This performs the same explicit device observation as sequenceState()
+         * and must not be used by graph-captured production kernels.
+         */
+        int ring_tail(int layer, int seq_idx = 0) const
+        {
+            const KVCacheSequenceState state = sequenceState(layer, seq_idx);
+            return state.cached_tokens > 0
+                       ? (state.implementation_head - state.cached_tokens + max_seq_len_) % max_seq_len_
+                       : state.implementation_head;
+        }
         /// Get K block size (bytes per TQ8Block<D>)
         size_t k_block_size() const { return k_block_size_; }
         /// Get V block size (bytes per TQ4Block<D>)
@@ -179,6 +257,9 @@ namespace llaminar2
         size_t k_pos_bytes_; ///< n_kv_heads * k_block_size
         size_t v_pos_bytes_; ///< n_kv_heads * v_block_size
 
+        int local_n_kv_heads_; ///< Heads physically stored and processed by this shard.
+        int kv_head_start_;    ///< First global KV head represented by local head zero.
+
         // TurboQuant context (not owned)
         const TurboQuantContext *tq_ctx_;
 
@@ -192,26 +273,17 @@ namespace llaminar2
         {
             void *d_K = nullptr; ///< TQ8 blocks: [max_seq_len * n_kv_heads] TQ8Block<D>
             void *d_V = nullptr; ///< TQ4 blocks: [max_seq_len * n_kv_heads] TQ4Block<D>
-
-            int head = 0;  ///< Next write position
-            int count = 0; ///< Valid tokens
-
-            int tail(int max_seq_len) const
-            {
-                return (head - count + max_seq_len) % max_seq_len;
-            }
-
-            bool is_wrapped(int max_seq_len) const
-            {
-                if (count == 0)
-                    return false;
-                int t = tail(max_seq_len);
-                return t >= head && count > 0;
-            }
         };
 
         // [n_layers][batch_size]
         std::vector<std::vector<TQEntry>> entries_;
+
+        /// Cache-owned immutable entry topology for grouped device reads.
+        void **d_batched_k_entry_table_ = nullptr;
+        void **d_batched_v_entry_table_ = nullptr;
+        /// Stable wrappers over the grouped FP16 payload in layer scratch.
+        std::unique_ptr<ITensor> batched_k_view_;
+        std::unique_ptr<ITensor> batched_v_view_;
 
         // =====================================================================
         // Per-Layer FP16 Scratch Buffers (one per layer, enables incremental dequant)
@@ -237,109 +309,32 @@ namespace llaminar2
             std::unique_ptr<ITensor> k_view;
             std::unique_ptr<ITensor> v_view;
 
-            // Cache tracking — avoids redundant dequant when the same
-            // (layer, seq, params) is accessed consecutively.
-            int cached_layer = -1;
-            int cached_seq = -1;
-            int cached_count = 0;
-            int cached_head = -1;
-            int cached_tail = -1;
-            float cached_rope_theta = 0.0f;
-            int cached_position_start = -1;
-
             void invalidate()
             {
-                cached_layer = -1;
-                cached_seq = -1;
-                cached_count = 0;
-                cached_head = -1;
-                cached_tail = -1;
-                cached_rope_theta = 0.0f;
-                cached_position_start = -1;
-            }
-
-            bool is_current_for(int layer, int seq, int count, int head,
-                                float rope_theta, int pos_start) const
-            {
-                return cached_layer == layer && cached_seq == seq &&
-                       cached_count == count && cached_head == head &&
-                       cached_rope_theta == rope_theta &&
-                       (rope_theta <= 0.0f || cached_position_start == pos_start);
-            }
-
-            /// Check if we can do incremental dequant (only 1 new position)
-            bool can_incremental(int layer, int seq, int count, int tail,
-                                 float rope_theta, int pos_start) const
-            {
-                return cached_layer == layer && cached_seq == seq &&
-                       cached_count > 0 && count == cached_count + 1 &&
-                       cached_tail == tail &&
-                       cached_rope_theta == rope_theta &&
-                       (rope_theta <= 0.0f || cached_position_start == pos_start);
+                k_view.reset();
+                v_view.reset();
             }
         };
 
         mutable std::vector<ScratchBuffer> layer_scratch_; ///< Per-layer scratch buffers
 
-        // =====================================================================
-        // Pre-allocated temp buffers for GPU quantization (avoid per-call malloc)
-        // =====================================================================
-        void *d_quantize_k_temp_ = nullptr; ///< Temp TQ8 blocks [max_seq_len * n_kv_heads]
-        void *d_quantize_v_temp_ = nullptr; ///< Temp TQ4 blocks [max_seq_len * n_kv_heads]
-
-        // =====================================================================
-        // Device-side dynamic params for CUDA graph capture
-        // =====================================================================
-        // Note: d_head_params_ and h_head_params_ are in CUDARingKVCacheBase
-
-        // Incremental dequant params (TQ-specific, for graph-capturable attention)
-        TQDequantDynamicParams *d_dequant_params_ = nullptr; ///< [n_layers_] device
-        TQDequantDynamicParams *h_dequant_params_ = nullptr; ///< [n_layers_] pinned host
-        mutable std::vector<uint8_t> dequant_params_device_valid_; ///< Per-layer pre-upload readiness
-
         mutable cudaStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
-
-        // =====================================================================
-        // CUDARingKVCacheBase entry accessors and hooks
-        // =====================================================================
-
-        int entryHead(int layer, int seq_idx) const override { return entries_[layer][seq_idx].head; }
-        int entryCount(int layer, int seq_idx) const override { return entries_[layer][seq_idx].count; }
-        void setEntryHead(int layer, int seq_idx, int value) override { entries_[layer][seq_idx].head = value; }
-        void setEntryCount(int layer, int seq_idx, int value) override { entries_[layer][seq_idx].count = value; }
-
-        void resetEntry(int layer, int seq_idx) override
-        {
-            entries_[layer][seq_idx].head = 0;
-            entries_[layer][seq_idx].count = 0;
-        }
 
         void onClearSequence(int layer, int seq_idx) override
         {
             layer_scratch_[layer].invalidate();
         }
 
-        void onEviction(int layer, int seq_idx, int num_evicted) override
-        {
-            (void)num_evicted;
-            if (layer_scratch_[layer].cached_layer == layer &&
-                layer_scratch_[layer].cached_seq == seq_idx)
-                layer_scratch_[layer].invalidate();
-        }
-
-        void onAdvanceComplete(int layer, int seq_idx) override
-        {
-            auto &scratch = layer_scratch_[layer];
-            if (scratch.cached_layer == layer && scratch.cached_seq == seq_idx)
-            {
-                scratch.cached_count = entries_[layer][seq_idx].count;
-                scratch.cached_head = entries_[layer][seq_idx].head;
-            }
-        }
-
         // Helpers
         void allocate_entry(TQEntry &entry);
         void free_entry(TQEntry &entry);
+
+        /**
+         * @brief Publish every `[layer, request]` TQ ring pointer before capture.
+         * @param stream Explicit initialization stream ordering the H2D publish.
+         * @return true when both cache-owned device tables are ready.
+         */
+        bool publishBatchedEntryTables(cudaStream_t stream);
 
         /// @brief Return the stream used for clear-time memset operations.
         cudaStream_t clearStream() const;
@@ -353,12 +348,19 @@ namespace llaminar2
         /// @brief Reset graph-capture sidecar params for one layer/sequence entry.
         void clearDynamicParams(int layer, int seq_idx, cudaStream_t stream);
 
-        /// Dequantize a layer's TQ ring into the shared scratch buffer.
-        /// Returns false on kernel launch failure.
+        /**
+         * @brief Materialize one scalar diagnostic view from canonical device state.
+         *
+         * Production attention uses the grouped device-state dequantizer. This
+         * helper takes one temporary state observation and performs a complete
+         * linearize/dequant so no host generation ledger can become stale.
+         */
         bool dequant_to_scratch(int layer, int seq_idx,
                                 float rope_theta,
                                 int position_start,
-                                cudaStream_t stream) const;
+                                int rope_dim,
+                                cudaStream_t stream,
+                                int *out_count) const;
     };
 
 } // namespace llaminar2

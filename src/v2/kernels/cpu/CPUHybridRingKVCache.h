@@ -445,7 +445,7 @@ namespace llaminar2
         {
             size_t total = 0;
             for (const auto &state : gdn_states_)
-                total += state.memoryBytes();
+                total += state.cpuMemoryBytes();
             return total;
         }
 
@@ -804,7 +804,7 @@ namespace llaminar2
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
                 state.full_recurrence_state_size = full_recurrence_state_size;
                 state.full_conv_state_size = full_conv_state_size;
-                state.initialize(qkv_dim);
+                state.initializeCPUState(qkv_dim);
             }
 
             LOG_DEBUG("[CPUHybridRingKVCache] Created: " << total_layers_ << " total layers, "

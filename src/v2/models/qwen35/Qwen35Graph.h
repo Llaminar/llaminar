@@ -88,7 +88,8 @@ namespace llaminar2
             const int *position_ids,
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr,
-            const void *position_ids_device = nullptr) override;
+            const void *position_ids_device = nullptr,
+            const int32_t *sequence_lengths_device = nullptr) override;
 
         ComputeGraph buildMTPGraph(
             int depth_idx,
@@ -144,6 +145,7 @@ namespace llaminar2
             const void *position_ids_device,
             DeviceId device,
             const std::vector<int> *sequence_lengths,
+            const int32_t *sequence_lengths_device,
             const std::string &stage_prefix_override = {},
             bool layer_idx_is_cache_local = false);
 
@@ -158,7 +160,8 @@ namespace llaminar2
             const void *position_ids_device,
             DeviceId device,
             const std::string &stage_prefix_override = {},
-            bool layer_idx_is_cache_local = false);
+            bool layer_idx_is_cache_local = false,
+            int first_seq_idx = 0);
 
         // =====================================================================
         // GDN Attention Sub-Graph Building
@@ -179,7 +182,9 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             IKVCache *kv_cache,
-            DeviceId device);
+            DeviceId device,
+            const std::vector<int> *sequence_lengths,
+            const int32_t *sequence_lengths_device);
 
         /**
          * @brief Check if a layer uses GDN (vs full attention)

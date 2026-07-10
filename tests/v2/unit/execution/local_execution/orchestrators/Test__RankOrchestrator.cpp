@@ -580,10 +580,15 @@ public:
                 return false;
             }
 
-            const int base_cached_tokens =
-                !request.base_cached_tokens.empty()
-                    ? request.base_cached_tokens[static_cast<size_t>(request_index)]
-                    : position_;
+            /*
+             * Production snapshots the pre-verifier cache length into its
+             * persistent device metadata before verifier replay.  The mock's
+             * `position_` is that resident scalar.  Deliberately do not accept
+             * a value through DeviceSpeculativePublicationRequest: doing so
+             * would teach this unit fixture the host-mirror contract that the
+             * GPU API has retired.
+             */
+            const int base_cached_tokens = position_;
             const int accepted_count =
                 row_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
             const int target_cached_tokens =
@@ -658,6 +663,7 @@ public:
         handle.stream = const_cast<int *>(&resident_stream_token_);
         handle.ready_event = const_cast<int *>(&resident_ready_event_token_);
         handle.live_state_epoch = 1;
+        handle.mtp_transaction.state = resident_mtp_transaction_state_;
         return handle;
     }
 
@@ -839,15 +845,14 @@ public:
         const DeviceSpeculativeOutcomeHandle &outcome,
         int request_index,
         int main_forward_token_count,
-        bool allow_speculative_discard = false,
-        int position_offset_override = -1) override
+        bool allow_speculative_discard = false) override
     {
         using namespace sampling_math;
         ++commit_mtp_initial_device_outcome_calls_;
         last_commit_mtp_already_appended_ = 0;
         last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
         last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
-        last_commit_mtp_position_offset_override_ = position_offset_override;
+        last_commit_mtp_position_offset_override_ = checkpoint.cached_tokens;
         last_commit_mtp_checkpoint_valid_ = checkpoint.valid;
         last_commit_mtp_checkpoint_logical_ = checkpoint.logical_checkpoint;
         last_commit_mtp_checkpoint_cached_tokens_ = checkpoint.cached_tokens;
@@ -864,12 +869,6 @@ public:
         {
             return false;
         }
-        if (position_offset_override >= 0 &&
-            position_offset_override != checkpoint.cached_tokens)
-        {
-            return false;
-        }
-
         const int *meta =
             static_cast<const int *>(outcome.meta_device) +
             static_cast<size_t>(request_index) *
@@ -1295,6 +1294,7 @@ public:
             std::shared_ptr<void>(
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
+        attachMockResidentMTPTransaction(out_handle, /*request_count=*/1);
         return out_handle->valid();
     }
 
@@ -1742,6 +1742,7 @@ public:
             std::shared_ptr<void>(
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
+        attachMockResidentMTPTransaction(out_handle, request_count);
         return out_handle->valid();
     }
 
@@ -1749,6 +1750,7 @@ public:
     {
         clear_cache_calls_.fetch_add(1, std::memory_order_relaxed);
         position_ = 0;
+        resident_mtp_transaction_state_.reset();
     }
 
     int get_position() const override
@@ -2021,6 +2023,14 @@ public:
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
     void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
     void set_primary_device_id(DeviceId device_id) { device_id_ = device_id; }
+    /**
+     * @brief Seed the mock's device-owned pre-verifier sequence position.
+     *
+     * This is test setup for the resident cache-count snapshot.  It must not be
+     * copied into a publication request, because the production GPU publisher
+     * obtains the same value from persistent device metadata.
+     */
+    void set_mock_device_position(int position) { position_ = position; }
     void set_supports_mtp_sidecar_preserves_main_state(bool supported) { supports_mtp_sidecar_preserves_main_state_ = supported; }
     void set_supports_mtp_sidecar_logits_stream_handoff(bool supported) { supports_mtp_sidecar_logits_stream_handoff_ = supported; }
     void set_supports_mtp_device_draft_token_input(bool supported) { supports_mtp_device_draft_token_input_ = supported; }
@@ -2271,6 +2281,44 @@ public:
     }
 
 private:
+    /**
+     * @brief Attach a request-scoped shifted-cache ownership lease to an outcome.
+     *
+     * Real GPU runners expose canonical per-depth cache-count device pointers
+     * and an event fence owned by the active MTP session.  These unit tests use
+     * ordinary process memory as their fake device address space, but retain
+     * the same pointer, stream, event, and generation lifetime so RankOrchestrator
+     * exercises the production ownership checks rather than a weaker mock ABI.
+     */
+    void attachMockResidentMTPTransaction(
+        DeviceSpeculativeOutcomeHandle *out_handle,
+        int request_count)
+    {
+        if (!out_handle || request_count <= 0 ||
+            request_count > kMockResidentOutcomeRequestCapacity)
+        {
+            return;
+        }
+
+        std::fill(
+            resident_shifted_cached_tokens_.begin(),
+            resident_shifted_cached_tokens_.end(),
+            position_);
+        auto state = std::make_shared<DeviceResidentMTPTransactionState>();
+        state->device = device_id_;
+        state->request_count = request_count;
+        state->shifted_cached_tokens_device_by_depth = {
+            resident_shifted_cached_tokens_.data()};
+        state->producer_stream = &resident_stream_token_;
+        state->ready_event = std::shared_ptr<void>(
+            &resident_mtp_transaction_ready_event_token_,
+            [](void *) {});
+        state->session_epoch = 1;
+        state->mutation_generation = ++resident_mtp_transaction_generation_;
+        resident_mtp_transaction_state_ = std::move(state);
+        out_handle->mtp_transaction.state = resident_mtp_transaction_state_;
+    }
+
     bool sampleMockAllPositionRows(
         int start_row,
         int row_count,
@@ -2547,6 +2595,12 @@ private:
                    kMockResidentOutcomeRequestCapacity>
         staged_resident_meta_{};
     mutable int resident_outcome_ready_event_token_ = 0;
+    mutable int resident_mtp_transaction_ready_event_token_ = 0;
+    uint64_t resident_mtp_transaction_generation_ = 0;
+    std::array<int, kMockResidentOutcomeRequestCapacity>
+        resident_shifted_cached_tokens_{};
+    std::shared_ptr<DeviceResidentMTPTransactionState>
+        resident_mtp_transaction_state_;
 };
 
 // =============================================================================
@@ -5861,6 +5915,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
     runner0_ptr->set_supports_mtp_sidecar_logits_stream_handoff(true);
     runner0_ptr->set_supports_mtp_device_draft_token_input(true);
     runner0_ptr->set_uses_mirrored_localtp_mtp_head_for_verifier(true);
+    runner0_ptr->set_mock_device_position(64);
     runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
     runner0_ptr->set_mock_all_position_logits(
         {
@@ -5876,6 +5931,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
     runner1_ptr->set_supports_mtp_sidecar_logits_stream_handoff(true);
     runner1_ptr->set_supports_mtp_device_draft_token_input(true);
     runner1_ptr->set_uses_mirrored_localtp_mtp_head_for_verifier(true);
+    runner1_ptr->set_mock_device_position(64);
     runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
     runner1_ptr->set_mock_all_position_logits(
         {
@@ -5939,8 +5995,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
         handle,
         /*request_index=*/0,
         /*main_forward_token_count=*/2,
-        /*allow_speculative_discard=*/true,
-        /*position_offset_override=*/64));
+        /*allow_speculative_discard=*/true));
     EXPECT_EQ(runner0_ptr->commit_mtp_initial_device_outcome_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->commit_mtp_initial_device_outcome_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->commit_mtp_checkpoint_terminal_hidden_call_count(), 0u);
@@ -5956,7 +6011,6 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
     request.outcome = handle;
     request.request_count = 1;
     request.max_draft_tokens = static_cast<int>(draft_tokens.size());
-    request.base_sidecar_position = 64;
     request.publish_mtp_shifted_kv = true;
 
     std::string error;
@@ -6080,6 +6134,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
     runner0_ptr->set_supports_mtp_device_draft_token_input(true);
     runner0_ptr->set_supports_device_stochastic_mtp_verification(true);
     runner0_ptr->set_uses_mirrored_localtp_mtp_head_for_verifier(true);
+    runner0_ptr->set_mock_device_position(64);
     runner0_ptr->set_stochastic_sample_token(1);
     runner0_ptr->set_mtp_publication_rendezvous(rendezvous);
     runner0_ptr->set_mock_logits_local(/*local_vocab=*/2, {0.0f, 5.0f});
@@ -6099,6 +6154,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
     runner1_ptr->set_supports_mtp_device_draft_token_input(true);
     runner1_ptr->set_supports_device_stochastic_mtp_verification(true);
     runner1_ptr->set_uses_mirrored_localtp_mtp_head_for_verifier(true);
+    runner1_ptr->set_mock_device_position(64);
     runner1_ptr->set_stochastic_sample_token(4);
     runner1_ptr->set_mtp_publication_rendezvous(rendezvous);
     runner1_ptr->set_mock_logits_local(/*local_vocab=*/3, {1.0f, 0.0f, 0.0f});
@@ -6243,7 +6299,6 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
     request.outcome = handle;
     request.request_count = 1;
     request.max_draft_tokens = 2;
-    request.base_sidecar_position = 64;
     request.publish_mtp_shifted_kv = true;
 
     std::string error;

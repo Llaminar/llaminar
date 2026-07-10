@@ -15,6 +15,7 @@
 
 #include "ROCmRingKVCache.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/TensorClasses.h"
@@ -23,46 +24,44 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/KVCacheProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../kvcache/KVCacheLogicalBlockCodec.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Check whether the opt-in MTP publication trace is enabled.
+         *
+         * HIP graph capture records the append kernels while replay-time
+         * metadata remains device resident.  This diagnostic gate lets the
+         * capture path report the dynamic scalar pointers it records without
+         * changing production stream or ownership behavior.
+         */
+        bool mtpKVPublicationDiagnosticsEnabled()
+        {
+            return debugEnv().runtime_debug.mtp_publication_diagnostics;
+        }
+    } // namespace
 
     // =========================================================================
     // External HIP Kernel Declarations
     // =========================================================================
 
-    // FP32 kernel wrappers
-    extern "C" void hip_ring_append_fp32(
-        float *d_K_cache, float *d_V_cache,
-        const float *d_K_new, const float *d_V_new,
-        int head, int max_seq_len, int kv_dim, int num_tokens,
-        hipStream_t stream);
-
+    // Scalar diagnostic linearization wrappers.
     extern "C" void hip_ring_linearize_fp32(
         float *d_out,
         const float *d_cache,
         int tail, int count, int max_seq_len, int kv_dim,
-        hipStream_t stream);
-
-    extern "C" void hip_ring_gather_batched_fp32(
-        float *d_K_out, float *d_V_out,
-        const float *const *d_K_caches, const float *const *d_V_caches,
-        const int *tails, const int *counts,
-        int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
-        hipStream_t stream);
-
-    // FP16 kernel wrappers
-    extern "C" void hip_ring_append_fp16(
-        _Float16 *d_K_cache, _Float16 *d_V_cache,
-        const _Float16 *d_K_new, const _Float16 *d_V_new,
-        int head, int max_seq_len, int kv_dim, int num_tokens,
         hipStream_t stream);
 
     extern "C" void hip_ring_linearize_fp16(
@@ -71,38 +70,10 @@ namespace llaminar2
         int tail, int count, int max_seq_len, int kv_dim,
         hipStream_t stream);
 
-    extern "C" void hip_ring_gather_batched_fp16(
-        _Float16 *d_K_out, _Float16 *d_V_out,
-        const _Float16 *const *d_K_caches, const _Float16 *const *d_V_caches,
-        const int *tails, const int *counts,
-        int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
-        hipStream_t stream);
-
-    // BF16 kernel wrappers
-    extern "C" void hip_ring_append_bf16(
-        hip_bfloat16 *d_K_cache, hip_bfloat16 *d_V_cache,
-        const hip_bfloat16 *d_K_new, const hip_bfloat16 *d_V_new,
-        int head, int max_seq_len, int kv_dim, int num_tokens,
-        hipStream_t stream);
-
     extern "C" void hip_ring_linearize_bf16(
         hip_bfloat16 *d_out,
         const hip_bfloat16 *d_cache,
         int tail, int count, int max_seq_len, int kv_dim,
-        hipStream_t stream);
-
-    extern "C" void hip_ring_gather_batched_bf16(
-        hip_bfloat16 *d_K_out, hip_bfloat16 *d_V_out,
-        const hip_bfloat16 *const *d_K_caches, const hip_bfloat16 *const *d_V_caches,
-        const int *tails, const int *counts,
-        int num_seqs, int max_kv_len, int max_seq_len, int kv_dim,
-        hipStream_t stream);
-
-    // Q8_1 kernel wrappers (block-based)
-    extern "C" void hip_ring_append_q8_1(
-        Q8_1Block *d_K_cache, Q8_1Block *d_V_cache,
-        const Q8_1Block *d_K_new, const Q8_1Block *d_V_new,
-        int head, int max_seq_len, int kv_blocks, int num_tokens,
         hipStream_t stream);
 
     extern "C" void hip_ring_linearize_q8_1(
@@ -111,12 +82,38 @@ namespace llaminar2
         int tail, int count, int max_seq_len, int kv_blocks,
         hipStream_t stream);
 
-    extern "C" void hip_ring_gather_batched_q8_1(
-        Q8_1Block *d_K_out, Q8_1Block *d_V_out,
-        const Q8_1Block *const *d_K_caches, const Q8_1Block *const *d_V_caches,
-        const int *tails, const int *counts,
-        int num_seqs, int max_kv_len, int max_seq_len, int kv_blocks,
-        hipStream_t stream);
+    extern "C" hipError_t hip_ring_gather_batched_device_state_fp32(
+        float *, float *, const float *const *, const float *const *,
+        const int *, const int *, int, int, int, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_device_state_fp16(
+        _Float16 *, _Float16 *, const _Float16 *const *, const _Float16 *const *,
+        const int *, const int *, int, int, int, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_device_state_bf16(
+        hip_bfloat16 *, hip_bfloat16 *,
+        const hip_bfloat16 *const *, const hip_bfloat16 *const *,
+        const int *, const int *, int, int, int, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_device_state_q8_1(
+        Q8_1Block *, Q8_1Block *,
+        const Q8_1Block *const *, const Q8_1Block *const *,
+        const int *, const int *, int, int, int, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_converted_device_state_fp32(
+        _Float16 *, _Float16 *, const float *const *, const float *const *,
+        const int *, const int *, int, int, int, int, int, int, int,
+        float, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_converted_device_state_fp16(
+        _Float16 *, _Float16 *, const _Float16 *const *, const _Float16 *const *,
+        const int *, const int *, int, int, int, int, int, int, int,
+        float, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_converted_device_state_bf16(
+        _Float16 *, _Float16 *,
+        const hip_bfloat16 *const *, const hip_bfloat16 *const *,
+        const int *, const int *, int, int, int, int, int, int, int,
+        float, int, int, hipStream_t);
+    extern "C" hipError_t hip_ring_gather_batched_converted_device_state_q8_1(
+        _Float16 *, _Float16 *,
+        const Q8_1Block *const *, const Q8_1Block *const *,
+        const int *, const int *, int, int, int, int, int, int, int,
+        float, int, int, hipStream_t);
 
     // Dynamic head append wrappers (graph-capturable)
     extern "C" void hip_ring_append_dynamic_fp32(
@@ -133,24 +130,12 @@ namespace llaminar2
         const int *, const int *, int, int, int, hipStream_t);
     extern "C" bool hip_ring_append_converted_fp16(
         _Float16 *, _Float16 *, const void *, const void *, TensorType,
-        int, const int *, const int *, int, int, int, hipStream_t);
+        const int *, const int *, int, int, int, hipStream_t);
     extern "C" void hip_kv_sequence_state_advance(
         int *, int *, int, int, hipStream_t);
     extern "C" void hip_kv_sequence_state_advance_dynamic(
         int *, int *, const int *, int, int, hipStream_t);
 
-    extern "C" void hip_ring_append_verifier_rows_fp32(
-        float *, float *, const float *, const float *,
-        int, int, int, int, int, int, int, bool, bool, hipStream_t);
-    extern "C" void hip_ring_append_verifier_rows_fp16(
-        _Float16 *, _Float16 *, const _Float16 *, const _Float16 *,
-        int, int, int, int, int, int, int, bool, bool, hipStream_t);
-    extern "C" void hip_ring_append_verifier_rows_bf16(
-        hip_bfloat16 *, hip_bfloat16 *, const hip_bfloat16 *, const hip_bfloat16 *,
-        int, int, int, int, int, int, int, bool, bool, hipStream_t);
-    extern "C" void hip_ring_append_verifier_rows_q8_1(
-        Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
-        int, int, int, int, int, int, int, bool, bool, hipStream_t);
     extern "C" void hip_ring_append_verifier_rows_dynamic_fp32(
         float *, float *, const float *, const float *,
         const int *, int, int, int, int, int, int, bool, bool, hipStream_t);
@@ -380,7 +365,7 @@ namespace llaminar2
 
         const auto stream = static_cast<hipStream_t>(gpu_stream);
 
-        if (precision() == ActivationPrecision::FP16 &&
+        if (k_precision() == ActivationPrecision::FP16 &&
             (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
         {
             const auto &k_shape = K->shape();
@@ -422,7 +407,7 @@ namespace llaminar2
             return ok;
         }
 
-        if (precision() == ActivationPrecision::Q8_1 &&
+        if (k_precision() == ActivationPrecision::Q8_1 &&
             (K->native_type() != TensorType::Q8_1 || V->native_type() != TensorType::Q8_1))
         {
             const auto &k_shape = K->shape();
@@ -663,6 +648,16 @@ namespace llaminar2
         }
         rope_shadows_.clear();
 
+        // The entry tables contain device pointers into this cache's pool, but
+        // are separate cache-owned allocations. Release them before the pool
+        // so no stale topology survives while the persistent payload is freed.
+        if (d_batched_k_entry_table_)
+            (void)hipFree(d_batched_k_entry_table_);
+        if (d_batched_v_entry_table_)
+            (void)hipFree(d_batched_v_entry_table_);
+        d_batched_k_entry_table_ = nullptr;
+        d_batched_v_entry_table_ = nullptr;
+
         if (pool_base_)
         {
             // All entries point into the single pool — free it once
@@ -674,17 +669,6 @@ namespace llaminar2
                 {
                     entry.d_K = nullptr;
                     entry.d_V = nullptr;
-                }
-            }
-        }
-        else
-        {
-            // Fallback: individually allocated entries
-            for (auto &layer_entries : entries_)
-            {
-                for (auto &entry : layer_entries)
-                {
-                    free_entry(entry);
                 }
             }
         }
@@ -756,15 +740,27 @@ namespace llaminar2
 
         entry.d_K = reinterpret_cast<DataT *>(base + entry_offset + 0 * buffer_size);
         entry.d_V = reinterpret_cast<DataT *>(base + entry_offset + 1 * buffer_size);
-        entry.head = 0;
-        entry.count = 0;
     }
 
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::allocate_all_entries()
     {
-        // Single pooled allocation for all KV cache entries
-        allocate_pool();
+        const int total_entries = n_layers_ * batch_size_;
+
+        /*
+         * A hybrid model may contain no full-attention layers at all. Such a
+         * cache legitimately owns no K/V payload and therefore needs no pool;
+         * this is distinct from a failed allocation for a non-empty topology.
+         */
+        if (total_entries > 0)
+        {
+            allocate_pool();
+            if (!pool_base_)
+            {
+                throw std::runtime_error(
+                    "[ROCmRingKVCache] Canonical pooled KV allocation is required");
+            }
+        }
 
         entries_.resize(n_layers_);
         int linear_idx = 0;
@@ -773,14 +769,7 @@ namespace llaminar2
             entries_[layer].resize(batch_size_);
             for (int seq = 0; seq < batch_size_; ++seq)
             {
-                if (pool_base_)
-                {
-                    assign_entry_from_pool(entries_[layer][seq], linear_idx++);
-                }
-                else
-                {
-                    allocate_entry(entries_[layer][seq]); // Fallback if pool alloc failed
-                }
+                assign_entry_from_pool(entries_[layer][seq], linear_idx++);
             }
         }
 
@@ -798,45 +787,8 @@ namespace llaminar2
         allocateDeviceParams(); // Base class method (ROCmRingKVCacheBase)
     }
 
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::allocate_entry(EntryT &entry)
-    {
-        size_t buffer_size = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
-
-        // Main K/V buffers
-        (void)hipMalloc(&entry.d_K, buffer_size);
-        (void)hipMalloc(&entry.d_V, buffer_size);
-
-        // Initialize state
-        entry.head = 0;
-        entry.count = 0;
-    }
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::free_entry(EntryT &entry)
-    {
-        if (entry.d_K)
-        {
-            hipError_t err = hipFree(entry.d_K);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_K) failed: %s\n", hipGetErrorString(err));
-            }
-        }
-        if (entry.d_V)
-        {
-            hipError_t err = hipFree(entry.d_V);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_V) failed: %s\n", hipGetErrorString(err));
-            }
-        }
-        entry.d_K = nullptr;
-        entry.d_V = nullptr;
-    }
-
-    // get_cached_tokens(), get_head_position(), is_wrapped() are now
-    // provided by ROCmRingKVCacheBase via entry accessor overrides.
+    // Sequence-state observations are provided by ROCmRingKVCacheBase from
+    // the canonical device rows; entries contain payload topology only.
 
     template <ActivationPrecision Precision>
     bool ROCmRingKVCache<Precision>::append(
@@ -884,82 +836,34 @@ namespace llaminar2
                                              .defaultStream());
         }
 
-        // Track how many tokens to skip from input (earliest tokens that would be overwritten)
-        int tokens_to_skip = 0;
-        int tokens_to_write = num_tokens;
-
-        // Check if we would exceed capacity (ring buffer overwrites oldest)
-        if (!capture_active && entry.count + num_tokens > max_seq_len_)
+        if (num_tokens > 0)
         {
-            // Calculate how many existing tokens to evict
-            int to_evict = entry.count + num_tokens - max_seq_len_;
-
-            // If eviction would be more than current count, we're also skipping input tokens
-            if (to_evict > entry.count)
+            if (!d_head_params_ || !d_count_params_)
             {
-                // Skip input tokens that would be immediately overwritten
-                tokens_to_skip = to_evict - entry.count;
-                tokens_to_write = num_tokens - tokens_to_skip;
-                // Count both existing cache tokens AND skipped input tokens as evicted
-                total_evicted_ += entry.count + tokens_to_skip;
-                entry.count = 0;
-                LOG_DEBUG("[ROCmRingKVCache::append] Skipping " << tokens_to_skip
-                                                                << " input tokens, writing " << tokens_to_write);
-            }
-            else
-            {
-                entry.count -= to_evict;
-                total_evicted_ += to_evict;
-                LOG_DEBUG("[ROCmRingKVCache::append] Auto-evicted " << to_evict << " tokens");
-            }
-        }
-
-        // Launch append kernel with adjusted pointers (skip earliest tokens)
-        if (tokens_to_write > 0)
-        {
-            const DataT *d_k_adjusted = d_k + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
-            const DataT *d_v_adjusted = d_v + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
-
-            // Use dynamic head params only while recording a graph. In regular
-            // execution, the scalar-head append path snapshots the host head
-            // value at launch time. Captured graphs read a stable device scalar
-            // uploaded by updateDynamicParams()/setDynamicHead() before
-            // capture/replay; do not record H2D copies in the captured graph.
-            if (capture_active && d_head_params_ && h_head_params_)
-            {
-                int idx = layer * batch_size_ + seq_idx;
-                const int *d_append_count = deviceDynamicAppendCountPtr(layer, seq_idx);
-                if (!d_append_count)
-                {
-                    LOG_ERROR("[ROCmRingKVCache::append] Dynamic append count is required during HIP graph capture");
-                    return false;
-                }
-                launch_append_kernel_dynamic(entry, d_k_adjusted, d_v_adjusted,
-                                             &d_head_params_[idx], d_append_count,
-                                             tokens_to_write, effective_stream);
-                if (d_count_params_)
-                {
-                    hip_kv_sequence_state_advance_dynamic(
-                        &d_head_params_[idx], &d_count_params_[idx],
-                        d_append_count,
-                        tokens_to_write, max_seq_len_, effective_stream);
-                }
-            }
-            else
-            {
-                // Fallback: scalar head argument (non-graph path)
-                launch_append_kernel(entry, d_k_adjusted, d_v_adjusted, tokens_to_write, effective_stream);
-            }
-        }
-
-        if (!capture_active)
-        {
-            // Update host metadata only for real execution. Captured graph
-            // launches use replay callbacks to advance by real (unpadded) tokens.
-            entry.head = (entry.head + tokens_to_write) % max_seq_len_;
-            entry.count += tokens_to_write;
-            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, effective_stream))
+                LOG_ERROR("[ROCmRingKVCache::append] Canonical device sequence state is unavailable");
                 return false;
+            }
+            const int idx = layer * batch_size_ + seq_idx;
+            const int *d_append_count = deviceDynamicAppendCountPtr(layer, seq_idx);
+            if (mtpKVPublicationDiagnosticsEnabled())
+            {
+                LOG_INFO("[MTPPublicationDiagnostics] phase=rocm_kv_append_capture_enqueue"
+                         << " path=typed"
+                         << " layer=" << layer
+                         << " seq_idx=" << seq_idx
+                         << " captured_num_tokens=" << num_tokens
+                         << " d_head=" << static_cast<const void *>(&d_head_params_[idx])
+                         << " d_count=" << static_cast<const void *>(&d_count_params_[idx])
+                         << " d_append_count=" << static_cast<const void *>(d_append_count)
+                         << " stream=" << static_cast<void *>(effective_stream));
+            }
+            launch_append_kernel_dynamic(entry, d_k, d_v,
+                                         &d_head_params_[idx], d_append_count,
+                                         num_tokens, effective_stream);
+            hip_kv_sequence_state_advance_dynamic(
+                &d_head_params_[idx], &d_count_params_[idx],
+                d_append_count,
+                num_tokens, max_seq_len_, effective_stream);
         }
 
         return true;
@@ -1122,53 +1026,13 @@ namespace llaminar2
 
         EntryT &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
-        int source_start = 0;
-        int rows_to_write = verifier_rows;
-        if (!capture_active && entry.count + verifier_rows > max_seq_len_)
-        {
-            const int to_evict = entry.count + verifier_rows - max_seq_len_;
-            if (to_evict > entry.count)
-            {
-                source_start = to_evict - entry.count;
-                rows_to_write = verifier_rows - source_start;
-                total_evicted_ += entry.count + source_start;
-                entry.count = 0;
-            }
-            else
-            {
-                entry.count -= to_evict;
-                total_evicted_ += to_evict;
-            }
-        }
+        const int source_start = std::max(0, verifier_rows - max_seq_len_);
+        const int rows_to_write = verifier_rows - source_start;
 
         const int head_storage_dim =
             (Precision == ActivationPrecision::Q8_1)
                 ? (head_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE
                 : head_dim_;
-
-        auto launch_static = [&]()
-        {
-            if constexpr (Precision == ActivationPrecision::FP32)
-                hip_ring_append_verifier_rows_fp32(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                   verifier_rows, source_start, rows_to_write,
-                                                   k_head_major, v_head_major, stream);
-            else if constexpr (Precision == ActivationPrecision::FP16)
-                hip_ring_append_verifier_rows_fp16(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                   verifier_rows, source_start, rows_to_write,
-                                                   k_head_major, v_head_major, stream);
-            else if constexpr (Precision == ActivationPrecision::BF16)
-                hip_ring_append_verifier_rows_bf16(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                   verifier_rows, source_start, rows_to_write,
-                                                   k_head_major, v_head_major, stream);
-            else
-                hip_ring_append_verifier_rows_q8_1(entry.d_K, entry.d_V, typed_k, typed_v,
-                                                   entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
-                                                   verifier_rows, source_start, rows_to_write,
-                                                   k_head_major, v_head_major, stream);
-        };
 
         auto launch_dynamic = [&](const int *d_head)
         {
@@ -1194,21 +1058,16 @@ namespace llaminar2
                                                            k_head_major, v_head_major, stream);
         };
 
-        if (capture_active && d_head_params_ && h_head_params_)
+        if (!d_head_params_ || !d_count_params_)
         {
-            const int idx = layer * batch_size_ + seq_idx;
-            launch_dynamic(&d_head_params_[idx]);
-            if (d_count_params_)
-            {
-                hip_kv_sequence_state_advance(
-                    &d_head_params_[idx], &d_count_params_[idx],
-                    rows_to_write, max_seq_len_, stream);
-            }
+            LOG_ERROR("[ROCmRingKVCache] Grouped verifier requires canonical device sequence state");
+            return false;
         }
-        else
-        {
-            launch_static();
-        }
+        const int idx = layer * batch_size_ + seq_idx;
+        launch_dynamic(&d_head_params_[idx]);
+        hip_kv_sequence_state_advance(
+            &d_head_params_[idx], &d_count_params_[idx],
+            verifier_rows, max_seq_len_, stream);
 
         const hipError_t launch_err = hipGetLastError();
         if (launch_err != hipSuccess)
@@ -1218,14 +1077,29 @@ namespace llaminar2
             return false;
         }
 
-        if (!capture_active)
-        {
-            entry.head = (entry.head + rows_to_write) % max_seq_len_;
-            entry.count += rows_to_write;
-            invalidateRoPEShadow(layer, seq_idx);
-            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
-                return false;
-        }
+        // The all-format MTP sweep consumes this route record to prove that a
+        // successful byte comparison came from the grouped GPU publication
+        // kernel and the canonical device-state metadata path.
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_kv_cache_grouped_verifier_append_calls",
+            1.0,
+            "verifier",
+            "rocm",
+            {{"cache_format", activationPrecisionToString(Precision)},
+             {"source_k_format", K->dtype_name()},
+             {"source_v_format", V->dtype_name()},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"source_k_layout", k_head_major ? "head_major" : "position_major"},
+             {"source_v_layout", v_head_major ? "head_major" : "position_major"},
+             {"execution_mode", capture_active ? "graph_captured" : "eager_device_state"},
+             {"topology", (local_n_kv_heads_ != n_kv_heads_ || kv_head_start_ != 0)
+                              ? "local_tp_shard"
+                              : "replicated"},
+             {"commit_policy", "single_grouped_metadata_commit"},
+             {"local_kv_heads", std::to_string(local_n_kv_heads_)},
+             {"head_dim", std::to_string(head_dim_)},
+             {"kv_head_start", std::to_string(kv_head_start_)}});
 
         return true;
     }
@@ -1271,128 +1145,37 @@ namespace llaminar2
                 return true;
 
             EntryT &entry = entries_[layer][seq_idx];
-            const bool capture_active = isGraphCaptureActive();
-            int tokens_to_skip = 0;
-            int tokens_to_write = num_tokens;
-
-            if (!capture_active && entry.count + num_tokens > max_seq_len_)
-            {
-                const int to_evict = entry.count + num_tokens - max_seq_len_;
-                if (to_evict > entry.count)
-                {
-                    tokens_to_skip = to_evict - entry.count;
-                    tokens_to_write = num_tokens - tokens_to_skip;
-                    total_evicted_ += entry.count + tokens_to_skip;
-                    entry.count = 0;
-                    LOG_DEBUG("[ROCmRingKVCache::appendConvertedWithStream] Skipping " << tokens_to_skip
-                                                                                        << " input tokens, writing " << tokens_to_write);
-                }
-                else
-                {
-                    entry.count -= to_evict;
-                    total_evicted_ += to_evict;
-                    LOG_DEBUG("[ROCmRingKVCache::appendConvertedWithStream] Auto-evicted " << to_evict << " tokens");
-                }
-            }
-
-            if (tokens_to_write <= 0)
-                return true;
-
-            const size_t source_row_stride = (src_type == TensorType::Q8_1)
-                                                 ? static_cast<size_t>((kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) /
-                                                                       Q8_1Block::BLOCK_SIZE)
-                                                 : static_cast<size_t>(kv_dim_);
-            const size_t source_element_size = (src_type == TensorType::Q8_1)
-                                                   ? sizeof(Q8_1Block)
-                                                   : (src_type == TensorType::FP32 ? sizeof(float) : sizeof(uint16_t));
-            const auto *d_k_adjusted = static_cast<const std::byte *>(d_k_src) +
-                                       static_cast<size_t>(tokens_to_skip) * source_row_stride * source_element_size;
-            const auto *d_v_adjusted = static_cast<const std::byte *>(d_v_src) +
-                                       static_cast<size_t>(tokens_to_skip) * source_row_stride * source_element_size;
-
             const int idx = layer * batch_size_ + seq_idx;
-            const int *d_head = nullptr;
-            const int *d_append_count = nullptr;
-            if (capture_active)
+            if (!d_head_params_ || !d_count_params_)
             {
-                if (!d_head_params_ || !h_head_params_)
-                {
-                    LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Dynamic head params are required during graph capture");
-                    return false;
-                }
-                d_head = &d_head_params_[idx];
-                d_append_count = deviceDynamicAppendCountPtr(layer, seq_idx);
-                if (!d_append_count)
-                {
-                    LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Dynamic append count is required during HIP graph capture");
-                    return false;
-                }
+                LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Canonical device sequence state is unavailable");
+                return false;
             }
+            const int *d_head = &d_head_params_[idx];
+            const int *d_append_count =
+                deviceDynamicAppendCountPtr(layer, seq_idx);
 
             if (!hip_ring_append_converted_fp16(
                     entry.d_K, entry.d_V,
-                    d_k_adjusted, d_v_adjusted, src_type,
-                    entry.head, d_head, d_append_count,
-                    max_seq_len_, kv_dim_, tokens_to_write, stream))
+                    d_k_src, d_v_src, src_type,
+                    d_head, d_append_count,
+                    max_seq_len_, kv_dim_, num_tokens, stream))
             {
                 LOG_ERROR("[ROCmRingKVCache::appendConvertedWithStream] Fused converted append launch failed");
                 return false;
             }
 
-            if (capture_active && d_count_params_)
-            {
-                hip_kv_sequence_state_advance_dynamic(
-                    &d_head_params_[idx], &d_count_params_[idx],
-                    d_append_count,
-                    tokens_to_write, max_seq_len_, stream);
-            }
-
-            if (!capture_active)
-            {
-                entry.head = (entry.head + tokens_to_write) % max_seq_len_;
-                entry.count += tokens_to_write;
-                invalidateRoPEShadow(layer, seq_idx);
-                if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
-                    return false;
-            }
+            hip_kv_sequence_state_advance_dynamic(
+                &d_head_params_[idx], &d_count_params_[idx],
+                d_append_count,
+                num_tokens, max_seq_len_, stream);
 
             return true;
         }
     }
 
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::launch_append_kernel(
-        EntryT &entry, const DataT *d_k, const DataT *d_v,
-        int num_tokens, hipStream_t stream)
-    {
-        if constexpr (Precision == ActivationPrecision::FP32)
-        {
-            hip_ring_append_fp32(
-                entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
-        }
-        else if constexpr (Precision == ActivationPrecision::FP16)
-        {
-            hip_ring_append_fp16(
-                entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
-        }
-        else if constexpr (Precision == ActivationPrecision::BF16)
-        {
-            hip_ring_append_bf16(
-                entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
-        }
-        else if constexpr (Precision == ActivationPrecision::Q8_1)
-        {
-            hip_ring_append_q8_1(
-                entry.d_K, entry.d_V, d_k, d_v,
-                entry.head, max_seq_len_, kv_storage_dim_, num_tokens, stream);
-        }
-    }
-
-    // allocate_device_params(), free_device_params(), setDynamicHead(), advanceHead()
-    // are now provided by ROCmRingKVCacheBase.
+    // Device sequence-state allocation and graph bindings are provided by
+    // ROCmRingKVCacheBase.
 
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::launch_append_kernel_dynamic(
@@ -1452,9 +1235,17 @@ namespace llaminar2
         }
 
         EntryT &entry = entries_[layer][seq_idx];
-        *kv_len = entry.count;
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv] Could not observe canonical device sequence state");
+            return false;
+        }
+        const int count = state.cached_tokens;
+        const int head = state.implementation_head;
+        *kv_len = count;
 
-        if (entry.count == 0)
+        if (count == 0)
         {
             *d_k_out = nullptr;
             *d_v_out = nullptr;
@@ -1462,15 +1253,15 @@ namespace llaminar2
         }
 
         // Optimization: if not wrapped, return direct pointers
-        if (!entry.is_wrapped(max_seq_len_))
+        if (!state.wrapped)
         {
-            int tail = entry.tail(max_seq_len_);
+            const int tail = (head - count + max_seq_len_) % max_seq_len_;
             *d_k_out = entry.d_K + static_cast<size_t>(tail) * kv_storage_dim_;
             *d_v_out = entry.d_V + static_cast<size_t>(tail) * kv_storage_dim_;
             return true;
         }
 
-        if (!linearize_entry(entry, stream))
+        if (!linearize_entry(entry, head, count, stream))
             return false;
 
         *d_k_out = static_cast<DataT *>(conv_scratch_k_);
@@ -1480,7 +1271,11 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    bool ROCmRingKVCache<Precision>::linearize_entry(EntryT &entry, hipStream_t stream)
+    bool ROCmRingKVCache<Precision>::linearize_entry(
+        EntryT &entry,
+        int head,
+        int count,
+        hipStream_t stream)
     {
         const size_t buffer_size = static_cast<size_t>(max_seq_len_) *
                                    static_cast<size_t>(kv_storage_dim_) *
@@ -1488,7 +1283,7 @@ namespace llaminar2
         if (!ensureConvScratch(buffer_size))
             return false;
 
-        launch_linearize_kernel(entry,
+        launch_linearize_kernel(entry, head, count,
                                 static_cast<DataT *>(conv_scratch_k_),
                                 static_cast<DataT *>(conv_scratch_v_),
                                 stream);
@@ -1497,48 +1292,52 @@ namespace llaminar2
 
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::launch_linearize_kernel(
-        const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
+        const EntryT &entry,
+        int head,
+        int count,
+        DataT *d_k_out,
+        DataT *d_v_out,
         hipStream_t stream)
     {
-        int tail = entry.tail(max_seq_len_);
+        const int tail = (head - count + max_seq_len_) % max_seq_len_;
 
         if constexpr (Precision == ActivationPrecision::FP32)
         {
             // Linearize K
             hip_ring_linearize_fp32(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
             // Linearize V
             hip_ring_linearize_fp32(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
             hip_ring_linearize_fp16(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
             hip_ring_linearize_fp16(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
             hip_ring_linearize_bf16(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
             hip_ring_linearize_bf16(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
             hip_ring_linearize_q8_1(
                 d_k_out, entry.d_K,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
             hip_ring_linearize_q8_1(
                 d_v_out, entry.d_V,
-                tail, entry.count, max_seq_len_, kv_storage_dim_, stream);
+                tail, count, max_seq_len_, kv_storage_dim_, stream);
         }
     }
 
@@ -1555,14 +1354,19 @@ namespace llaminar2
         }
 
         const EntryT &entry = entries_[layer][seq_idx];
-        *kv_len = entry.count;
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return false;
+        *kv_len = state.cached_tokens;
 
-        if (entry.count == 0)
+        if (state.cached_tokens == 0)
         {
             return true;
         }
 
         launch_linearize_kernel(entry,
+                                state.implementation_head,
+                                state.cached_tokens,
                                 static_cast<DataT *>(d_k_out),
                                 static_cast<DataT *>(d_v_out),
                                 stream);
@@ -1604,13 +1408,7 @@ namespace llaminar2
         {
             return {};
         }
-
-        const auto &entry = entries_[local_layer][seq_idx];
-        KVCacheSequenceState state;
-        state.cached_tokens = entry.count;
-        state.implementation_head = entry.head;
-        state.wrapped = entry.is_wrapped(max_seq_len_);
-        return state;
+        return ROCmRingKVCacheBase::sequenceState(local_layer, seq_idx);
     }
 
     template <ActivationPrecision Precision>
@@ -1625,10 +1423,42 @@ namespace llaminar2
             return false;
         }
 
-        const auto &entry = entries_[local_layer][desc.seq_idx];
-        if (desc.logical_token_start > entry.count ||
-            desc.token_count > entry.count - desc.logical_token_start)
+        if (!desc.stream)
         {
+            if (desc.token_count == 0)
+            {
+                KVCacheSequenceState state;
+                return observeDeviceSequenceState(
+                           local_layer, desc.seq_idx, &state) &&
+                       desc.logical_token_start <= state.cached_tokens;
+            }
+            LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] non-empty GPU logical export requires an explicit stream");
+            return false;
+        }
+
+        (void)hipSetDevice(device_id_);
+        hipStream_t stream = static_cast<hipStream_t>(desc.stream);
+        const auto &entry = entries_[local_layer][desc.seq_idx];
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(local_layer, desc.seq_idx, &state))
+            return false;
+        const int export_head = state.implementation_head;
+        const int export_count = state.cached_tokens;
+
+        if (export_count < 0 || export_count > max_seq_len_ ||
+            export_head < 0 || export_head >= max_seq_len_ ||
+            desc.logical_token_start > export_count ||
+            desc.token_count > export_count - desc.logical_token_start)
+        {
+            LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] logical export bounds rejected"
+                      << " global_layer=" << desc.layer
+                      << " local_layer=" << local_layer
+                      << " seq_idx=" << desc.seq_idx
+                      << " logical_start=" << desc.logical_token_start
+                      << " token_count=" << desc.token_count
+                      << " device_head=" << export_head
+                      << " device_count=" << export_count
+                      << " max_seq_len=" << max_seq_len_);
             return false;
         }
         if (desc.token_count == 0)
@@ -1637,18 +1467,25 @@ namespace llaminar2
         }
         if (!dst_k || !dst_v || !entry.d_K || !entry.d_V)
         {
-            return false;
-        }
-        if (!desc.stream)
-        {
-            LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] non-empty GPU logical export requires an explicit stream");
+            LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] logical export storage unavailable"
+                      << " global_layer=" << desc.layer
+                      << " local_layer=" << local_layer
+                      << " seq_idx=" << desc.seq_idx
+                      << " token_count=" << desc.token_count
+                      << " dst_k=" << dst_k
+                      << " dst_v=" << dst_v
+                      << " entry_k=" << entry.d_K
+                      << " entry_v=" << entry.d_V);
             return false;
         }
 
-        (void)hipSetDevice(device_id_);
-        hipStream_t stream = static_cast<hipStream_t>(desc.stream);
         const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
-        const int tail = entry.tail(max_seq_len_);
+        int tail = export_head - export_count;
+        tail %= max_seq_len_;
+        if (tail < 0)
+        {
+            tail += max_seq_len_;
+        }
         auto *out_k = static_cast<uint8_t *>(dst_k);
         auto *out_v = static_cast<uint8_t *>(dst_v);
 
@@ -1725,9 +1562,8 @@ namespace llaminar2
         {
             if (desc.logical_token_start == 0)
             {
-                entry.head = 0;
-                entry.count = 0;
-                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+                if (!setDeviceSequenceState(
+                        local_layer, desc.seq_idx, 0, 0, stream))
                     return false;
                 invalidateRoPEShadow(local_layer, desc.seq_idx);
             }
@@ -1737,8 +1573,10 @@ namespace llaminar2
         {
             return false;
         }
-        if (desc.logical_token_start != entry.count ||
-            entry.head != (entry.count % max_seq_len_))
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(local_layer, desc.seq_idx, &state) ||
+            desc.logical_token_start != state.cached_tokens ||
+            state.implementation_head != (state.cached_tokens % max_seq_len_))
         {
             return false;
         }
@@ -1772,9 +1610,10 @@ namespace llaminar2
             return false;
         }
 
-        entry.count = desc.logical_token_start + desc.token_count;
-        entry.head = entry.count % max_seq_len_;
-        if (d_count_params_ && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+        const int new_count = desc.logical_token_start + desc.token_count;
+        const int new_head = new_count % max_seq_len_;
+        if (!setDeviceSequenceState(
+                local_layer, desc.seq_idx, new_head, new_count, stream))
             return false;
 
         const hipError_t sync_err = hipStreamSynchronize(stream);
@@ -1793,14 +1632,16 @@ namespace llaminar2
     bool ROCmRingKVCache<Precision>::truncateSequence(int seq_idx, int cached_tokens, void *stream)
     {
         if (seq_idx < 0 || seq_idx >= batch_size_ ||
-            cached_tokens < 0 || cached_tokens > max_seq_len_)
+            cached_tokens < 0 || cached_tokens > max_seq_len_ || !stream)
         {
             return false;
         }
 
+        std::vector<KVCacheSequenceState> states(static_cast<size_t>(n_layers_));
         for (int layer = 0; layer < n_layers_; ++layer)
         {
-            if (cached_tokens > entries_[layer][seq_idx].count)
+            if (!observeDeviceSequenceState(layer, seq_idx, &states[layer]) ||
+                cached_tokens > states[layer].cached_tokens)
             {
                 return false;
             }
@@ -1808,24 +1649,18 @@ namespace llaminar2
 
         for (int layer = 0; layer < n_layers_; ++layer)
         {
-            auto &entry = entries_[layer][seq_idx];
-            if (entry.count == cached_tokens)
-            {
-                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
-                    return false;
+            const KVCacheSequenceState &state = states[layer];
+            if (state.cached_tokens == cached_tokens)
                 continue;
-            }
-            if (cached_tokens == 0)
-            {
-                entry.head = 0;
-            }
-            else
-            {
-                const int tail = entry.tail(max_seq_len_);
-                entry.head = (tail + cached_tokens) % max_seq_len_;
-            }
-            entry.count = cached_tokens;
-            if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+
+            const int tail =
+                (state.implementation_head - state.cached_tokens + max_seq_len_) %
+                max_seq_len_;
+            const int new_head = cached_tokens == 0
+                                     ? 0
+                                     : (tail + cached_tokens) % max_seq_len_;
+            if (!setDeviceSequenceState(
+                    layer, seq_idx, new_head, cached_tokens, stream))
                 return false;
             invalidateRoPEShadow(layer, seq_idx);
         }
@@ -1840,12 +1675,22 @@ namespace llaminar2
             return;
         }
 
-        EntryT &entry = entries_[layer][seq_idx];
-        int to_evict = std::min(num_tokens, entry.count);
-
-        // O(1) eviction - just update count (tail moves implicitly)
-        entry.count -= to_evict;
-        total_evicted_ += to_evict;
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return;
+        const int to_evict = std::min(num_tokens, state.cached_tokens);
+        const int next_count = state.cached_tokens - to_evict;
+        hipStream_t stream = static_cast<hipStream_t>(
+            GPUDeviceContextPool::instance()
+                .getAMDContext(device_id_)
+                .defaultStream());
+        if (!setDeviceSequenceState(
+                layer, seq_idx, state.implementation_head, next_count, stream) ||
+            hipStreamSynchronize(stream) != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::evict_oldest] Device metadata update failed");
+            return;
+        }
     }
 
     template <ActivationPrecision Precision>
@@ -1875,14 +1720,14 @@ namespace llaminar2
             return -1;
         }
 
-        // Collect entry pointers and metadata
-        std::vector<EntryT *> entry_ptrs(num_seqs);
         int actual_max_kv_len = 0;
 
         for (int seq = 0; seq < num_seqs; ++seq)
         {
-            entry_ptrs[seq] = &entries_[layer][seq];
-            kv_lens[seq] = entry_ptrs[seq]->count;
+            KVCacheSequenceState state;
+            if (!observeDeviceSequenceState(layer, seq, &state))
+                return -1;
+            kv_lens[seq] = state.cached_tokens;
             actual_max_kv_len = std::max(actual_max_kv_len, kv_lens[seq]);
         }
 
@@ -1894,113 +1739,349 @@ namespace llaminar2
         // Use provided max_kv_len or actual
         int out_max_kv_len = (max_kv_len > 0) ? max_kv_len : actual_max_kv_len;
 
-        launch_gather_kernel(entry_ptrs,
-                             static_cast<DataT *>(d_k_out),
-                             static_cast<DataT *>(d_v_out),
-                             kv_lens, out_max_kv_len,
-                             num_seqs, stream);
+        if (!stream || !d_k_out || !d_v_out ||
+            !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
+            !d_head_params_ || !d_count_params_ ||
+            !batched_pointer_tables_ready_)
+            return -1;
+
+        const int entry_offset = layer * batch_size_;
+        hipError_t launch_error = hipErrorInvalidValue;
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            launch_error = hip_ring_gather_batched_device_state_fp32(
+                static_cast<float *>(d_k_out), static_cast<float *>(d_v_out),
+                const_cast<const float *const *>(d_batched_k_entry_table_),
+                const_cast<const float *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, num_seqs,
+                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            launch_error = hip_ring_gather_batched_device_state_fp16(
+                static_cast<_Float16 *>(d_k_out), static_cast<_Float16 *>(d_v_out),
+                const_cast<const _Float16 *const *>(d_batched_k_entry_table_),
+                const_cast<const _Float16 *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, num_seqs,
+                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            launch_error = hip_ring_gather_batched_device_state_bf16(
+                static_cast<hip_bfloat16 *>(d_k_out), static_cast<hip_bfloat16 *>(d_v_out),
+                const_cast<const hip_bfloat16 *const *>(d_batched_k_entry_table_),
+                const_cast<const hip_bfloat16 *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, num_seqs,
+                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            launch_error = hip_ring_gather_batched_device_state_q8_1(
+                static_cast<Q8_1Block *>(d_k_out), static_cast<Q8_1Block *>(d_v_out),
+                const_cast<const Q8_1Block *const *>(d_batched_k_entry_table_),
+                const_cast<const Q8_1Block *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, num_seqs,
+                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+        }
+        if (launch_error != hipSuccess)
+            return -1;
 
         return actual_max_kv_len;
     }
 
     template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::launch_gather_kernel(
-        const std::vector<EntryT *> &entries,
-        DataT *d_k_out, DataT *d_v_out,
-        int *kv_lens, int max_kv_len,
-        int num_seqs, hipStream_t stream)
+    bool ROCmRingKVCache<Precision>::get_kv_batched_device_view(
+        int layer,
+        int first_seq_idx,
+        int request_count,
+        int max_kv_len,
+        ITensor **out_k,
+        ITensor **out_v,
+        void *gpu_stream)
     {
-        // Device arrays for kernel
-        DataT **d_k_caches = nullptr;
-        DataT **d_v_caches = nullptr;
-        int *d_tails = nullptr;
-        int *d_counts = nullptr;
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
 
-        if (!validateROCmWorkspaceBinding(workspace_, device_id_, "ROCmRingKVCache"))
+        const bool request_range_valid =
+            first_seq_idx >= 0 && request_count > 0 &&
+            request_count <= batch_size_ &&
+            first_seq_idx <= batch_size_ - request_count;
+        if (layer < 0 || layer >= n_layers_ || !request_range_valid ||
+            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
+            !gpu_stream || !workspace_ || !workspace_->isAllocated() ||
+            !d_head_params_ || !d_count_params_ ||
+            !batched_pointer_tables_ready_)
         {
-            return;
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_device_view] Invalid resident gather contract"
+                      << " layer=" << layer
+                      << " first_seq=" << first_seq_idx
+                      << " requests=" << request_count
+                      << " max_kv_len=" << max_kv_len
+                      << " batch_capacity=" << batch_size_
+                      << " max_seq_len=" << max_seq_len_
+                      << " stream=" << gpu_stream
+                      << " workspace=" << (workspace_ ? "bound" : "missing")
+                      << " pointer_tables="
+                      << (batched_pointer_tables_ready_ ? "ready" : "missing"));
+            return false;
         }
 
-        // Use pre-allocated workspace buffers (fast path - workspace is required)
-        d_k_caches = reinterpret_cast<DataT **>(
-            workspace_->getBuffer(KVCacheWorkspaceBuffers::K_CACHE_PTRS));
-        d_v_caches = reinterpret_cast<DataT **>(
-            workspace_->getBuffer(KVCacheWorkspaceBuffers::V_CACHE_PTRS));
-        d_tails = reinterpret_cast<int *>(
-            workspace_->getBuffer(KVCacheWorkspaceBuffers::TAILS));
-        d_counts = reinterpret_cast<int *>(
-            workspace_->getBuffer(KVCacheWorkspaceBuffers::COUNTS));
-
-        LOG_TRACE("[ROCmRingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
-
-        // Prepare host arrays
-        std::vector<DataT *> h_k_caches(num_seqs);
-        std::vector<DataT *> h_v_caches(num_seqs);
-        std::vector<int> h_tails(num_seqs);
-        std::vector<int> h_counts(num_seqs);
-
-        for (int i = 0; i < num_seqs; ++i)
+        const size_t rows =
+            static_cast<size_t>(request_count) * static_cast<size_t>(max_kv_len);
+        if (kv_storage_dim_ <= 0 ||
+            rows > std::numeric_limits<size_t>::max() /
+                       static_cast<size_t>(kv_storage_dim_) ||
+            rows * static_cast<size_t>(kv_storage_dim_) >
+                std::numeric_limits<size_t>::max() / sizeof(DataT))
         {
-            h_k_caches[i] = entries[i]->d_K;
-            h_v_caches[i] = entries[i]->d_V;
-            h_tails[i] = entries[i]->tail(max_seq_len_);
-            h_counts[i] = entries[i]->count;
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_device_view] Gather byte size overflow");
+            return false;
+        }
+        const size_t required_bytes =
+            rows * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        if (!ensureConvScratch(required_bytes) ||
+            !conv_scratch_k_ || !conv_scratch_v_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_device_view] Native gather scratch is unavailable"
+                      << " required_bytes=" << required_bytes);
+            return false;
         }
 
-        // Copy to device
-        (void)hipMemcpyAsync(d_k_caches, h_k_caches.data(), num_seqs * sizeof(DataT *),
-                       hipMemcpyHostToDevice, stream);
-        (void)hipMemcpyAsync(d_v_caches, h_v_caches.data(), num_seqs * sizeof(DataT *),
-                       hipMemcpyHostToDevice, stream);
-        (void)hipMemcpyAsync(d_tails, h_tails.data(), num_seqs * sizeof(int),
-                       hipMemcpyHostToDevice, stream);
-        (void)hipMemcpyAsync(d_counts, h_counts.data(), num_seqs * sizeof(int),
-                       hipMemcpyHostToDevice, stream);
+        if (!d_batched_k_entry_table_ || !d_batched_v_entry_table_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_device_view] Missing cache-owned immutable entry pointer tables");
+            return false;
+        }
 
-        // Launch kernel (via extern "C" wrapper)
+        const int entry_offset = layer * batch_size_ + first_seq_idx;
+        const auto stream = static_cast<hipStream_t>(gpu_stream);
+        hipError_t launch_error = hipErrorInvalidValue;
         if constexpr (Precision == ActivationPrecision::FP32)
         {
-            hip_ring_gather_batched_fp32(
-                d_k_out, d_v_out,
-                const_cast<const float *const *>(d_k_caches),
-                const_cast<const float *const *>(d_v_caches),
-                d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+            launch_error = hip_ring_gather_batched_device_state_fp32(
+                static_cast<float *>(conv_scratch_k_),
+                static_cast<float *>(conv_scratch_v_),
+                const_cast<const float *const *>(d_batched_k_entry_table_),
+                const_cast<const float *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
-            hip_ring_gather_batched_fp16(
-                d_k_out, d_v_out,
-                const_cast<const _Float16 *const *>(d_k_caches),
-                const_cast<const _Float16 *const *>(d_v_caches),
-                d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+            launch_error = hip_ring_gather_batched_device_state_fp16(
+                static_cast<_Float16 *>(conv_scratch_k_),
+                static_cast<_Float16 *>(conv_scratch_v_),
+                const_cast<const _Float16 *const *>(d_batched_k_entry_table_),
+                const_cast<const _Float16 *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
-            hip_ring_gather_batched_bf16(
-                d_k_out, d_v_out,
-                const_cast<const hip_bfloat16 *const *>(d_k_caches),
-                const_cast<const hip_bfloat16 *const *>(d_v_caches),
-                d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+            launch_error = hip_ring_gather_batched_device_state_bf16(
+                static_cast<hip_bfloat16 *>(conv_scratch_k_),
+                static_cast<hip_bfloat16 *>(conv_scratch_v_),
+                const_cast<const hip_bfloat16 *const *>(d_batched_k_entry_table_),
+                const_cast<const hip_bfloat16 *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
-            hip_ring_gather_batched_q8_1(
-                d_k_out, d_v_out,
-                const_cast<const Q8_1Block *const *>(d_k_caches),
-                const_cast<const Q8_1Block *const *>(d_v_caches),
-                d_tails, d_counts,
-                num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+            launch_error = hip_ring_gather_batched_device_state_q8_1(
+                static_cast<Q8_1Block *>(conv_scratch_k_),
+                static_cast<Q8_1Block *>(conv_scratch_v_),
+                const_cast<const Q8_1Block *const *>(d_batched_k_entry_table_),
+                const_cast<const Q8_1Block *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+        }
+        if (launch_error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_device_view] Gather launch failed: "
+                      << hipGetErrorString(launch_error));
+            return false;
         }
 
-        // Removed hipStreamSynchronize() - caller manages coherence via events
-        // Workspace buffers are caller-owned, no cleanup needed
+        constexpr TensorType tensor_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            return TensorType::FP32;
+        }();
+
+        const size_t columns = static_cast<size_t>(kv_storage_dim_);
+        if (!batched_k_view_ ||
+            batched_k_view_->gpu_data_ptr() != conv_scratch_k_ ||
+            batched_k_view_->shape().size() < 2 ||
+            batched_k_view_->shape()[0] != rows ||
+            batched_k_view_->shape()[1] != columns)
+        {
+            batched_k_view_ = std::make_unique<GpuTensorView>(
+                conv_scratch_k_, rows, columns, tensor_type, device_id_);
+        }
+        if (!batched_v_view_ ||
+            batched_v_view_->gpu_data_ptr() != conv_scratch_v_ ||
+            batched_v_view_->shape().size() < 2 ||
+            batched_v_view_->shape()[0] != rows ||
+            batched_v_view_->shape()[1] != columns)
+        {
+            batched_v_view_ = std::make_unique<GpuTensorView>(
+                conv_scratch_v_, rows, columns, tensor_type, device_id_);
+        }
+
+        if (out_k)
+            *out_k = batched_k_view_.get();
+        if (out_v)
+            *out_v = batched_v_view_.get();
+        return true;
     }
 
-    // clear(), clear_sequence(), clear_layer() are now provided by
-    // ROCmRingKVCacheBase via entry accessor overrides (resetEntry, onClearSequence).
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv_batched_converted_device_view(
+        int layer,
+        int first_seq_idx,
+        int request_count,
+        int max_kv_len,
+        ActivationPrecision target,
+        ITensor **out_k,
+        ITensor **out_v,
+        const KVReadParams &read)
+    {
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+
+        const int requested_heads =
+            read.n_kv_heads > 0 ? read.n_kv_heads : local_n_kv_heads_;
+        const int requested_head_dim =
+            read.head_dim > 0 ? read.head_dim : head_dim_;
+        const int effective_rope_dim =
+            read.rope_dim > 0 ? read.rope_dim : requested_head_dim;
+        if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
+            request_count <= 0 ||
+            first_seq_idx > batch_size_ - request_count ||
+            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
+            target != ActivationPrecision::FP16 || !read.gpu_stream ||
+            requested_heads != local_n_kv_heads_ ||
+            requested_head_dim != head_dim_ ||
+            effective_rope_dim <= 0 || effective_rope_dim > head_dim_ ||
+            (effective_rope_dim % 2) != 0 ||
+            !d_head_params_ || !d_count_params_ ||
+            !batched_pointer_tables_ready_ ||
+            !d_batched_k_entry_table_ || !d_batched_v_entry_table_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_converted_device_view] Invalid grouped conversion contract"
+                      << " layer=" << layer
+                      << " first_seq=" << first_seq_idx
+                      << " requests=" << request_count
+                      << " max_kv_len=" << max_kv_len
+                      << " target=" << activationPrecisionToString(target)
+                      << " heads=" << requested_heads
+                      << " head_dim=" << requested_head_dim
+                      << " rope_dim=" << effective_rope_dim
+                      << " stream=" << read.gpu_stream);
+            return false;
+        }
+
+        const size_t rows =
+            static_cast<size_t>(request_count) * max_kv_len;
+        const size_t required_bytes =
+            rows * static_cast<size_t>(kv_dim_) * sizeof(_Float16);
+        if (!ensureConvScratch(required_bytes) ||
+            !conv_scratch_k_ || !conv_scratch_v_)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_converted_device_view] FP16 grouped workspace is unavailable"
+                      << " required_bytes=" << required_bytes);
+            return false;
+        }
+
+        auto *k_output = static_cast<_Float16 *>(conv_scratch_k_);
+        auto *v_output = static_cast<_Float16 *>(conv_scratch_v_);
+        const int entry_offset = layer * batch_size_ + first_seq_idx;
+        auto stream = static_cast<hipStream_t>(read.gpu_stream);
+        hipError_t status = hipErrorInvalidValue;
+        if constexpr (Precision == ActivationPrecision::FP32)
+        {
+            status = hip_ring_gather_batched_converted_device_state_fp32(
+                k_output, v_output,
+                const_cast<const float *const *>(d_batched_k_entry_table_),
+                const_cast<const float *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                read.rope_theta, read.position_start, effective_rope_dim, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::FP16)
+        {
+            status = hip_ring_gather_batched_converted_device_state_fp16(
+                k_output, v_output,
+                const_cast<const _Float16 *const *>(d_batched_k_entry_table_),
+                const_cast<const _Float16 *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                read.rope_theta, read.position_start, effective_rope_dim, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::BF16)
+        {
+            status = hip_ring_gather_batched_converted_device_state_bf16(
+                k_output, v_output,
+                const_cast<const hip_bfloat16 *const *>(d_batched_k_entry_table_),
+                const_cast<const hip_bfloat16 *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                read.rope_theta, read.position_start, effective_rope_dim, stream);
+        }
+        else if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            status = hip_ring_gather_batched_converted_device_state_q8_1(
+                k_output, v_output,
+                const_cast<const Q8_1Block *const *>(d_batched_k_entry_table_),
+                const_cast<const Q8_1Block *const *>(d_batched_v_entry_table_),
+                d_head_params_, d_count_params_, entry_offset, request_count,
+                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                read.rope_theta, read.position_start, effective_rope_dim, stream);
+        }
+        if (status != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_batched_converted_device_view] Grouped conversion launch failed: "
+                      << hipGetErrorString(status));
+            return false;
+        }
+
+        if (!converted_batched_k_view_ ||
+            converted_batched_k_view_->gpu_data_ptr() != k_output ||
+            converted_batched_k_view_->shape().size() < 2 ||
+            converted_batched_k_view_->shape()[0] != rows)
+        {
+            converted_batched_k_view_ = std::make_unique<GpuTensorView>(
+                k_output, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, device_id_);
+        }
+        if (!converted_batched_v_view_ ||
+            converted_batched_v_view_->gpu_data_ptr() != v_output ||
+            converted_batched_v_view_->shape().size() < 2 ||
+            converted_batched_v_view_->shape()[0] != rows)
+        {
+            converted_batched_v_view_ = std::make_unique<GpuTensorView>(
+                v_output, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, device_id_);
+        }
+        if (out_k)
+            *out_k = converted_batched_k_view_.get();
+        if (out_v)
+            *out_v = converted_batched_v_view_.get();
+        return true;
+    }
+
+    // clear_sequence() and clear_layer() are provided by ROCmRingKVCacheBase;
+    // this override additionally scrubs cache-owned payload sidecars.
 
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::clear()
@@ -2018,18 +2099,9 @@ namespace llaminar2
         // the next conversion starts from fresh allocation just like a new cache.
         freeConvScratch();
 
-        // Dynamic head params are used by both captured and non-captured append
-        // paths. Keep the allocations stable, but reset host and device values
-        // to match empty ring entries before the next request's first append.
+        // Keep canonical device allocations stable for captured graph pointers.
         const int num_entries = n_layers_ * batch_size_;
-        if (h_head_params_ && num_entries > 0)
-        {
-            std::memset(h_head_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
-        }
-        if (h_count_params_ && num_entries > 0)
-        {
-            std::memset(h_count_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
-        }
+        std::fill(append_count_sources_.begin(), append_count_sources_.end(), nullptr);
         if (d_head_params_ && num_entries > 0)
         {
             hipError_t head_err = hipMemsetAsync(d_head_params_, 0,
@@ -2070,9 +2142,6 @@ namespace llaminar2
                     (void)hipFree(shadow.d_V);
                     shadow.d_V = nullptr;
                 }
-                shadow.converted_count = 0;
-                shadow.last_head = -1;
-                shadow.rope_applied = false;
                 shadow.k_view.reset();
                 shadow.v_view.reset();
             }
@@ -2125,7 +2194,7 @@ namespace llaminar2
         // clear_layer() to accept global model layer ids, so dispatching there
         // with compressed FA indices would skip/reset the wrong entries. Clear
         // compressed entries directly while still using the base sequence helper
-        // for resetEntry()/onClearSequence() bookkeeping.
+        // for canonical metadata reset and type-specific sidecar invalidation.
         for (int layer = 0; layer < n_layers_; ++layer)
         {
             for (int seq = 0; seq < batch_size_; ++seq)
@@ -2302,42 +2371,22 @@ namespace llaminar2
         const bool has_token_hint = n > 0;
         const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
         const int scratch_tokens = has_token_hint ? m : max_seq_len_;
-        const int bounded_batch_size = std::max(1, actual_batch_size);
+        const int bounded_batch_size =
+            std::max(std::max(1, actual_batch_size), batch_size_);
         const int bounded_scratch_tokens = std::max(1, scratch_tokens);
+        const size_t batched_scratch_tokens =
+            static_cast<size_t>(bounded_scratch_tokens) *
+            static_cast<size_t>(bounded_batch_size);
         const size_t fp32_scratch_bytes =
-            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(float);
+            batched_scratch_tokens * static_cast<size_t>(kv_dim_) * sizeof(float);
         const size_t fp16_scratch_bytes =
-            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
+            batched_scratch_tokens * static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
         const size_t native_scratch_bytes =
-            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+            batched_scratch_tokens * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         const size_t conversion_scratch_bytes =
             std::max(fp32_scratch_bytes, std::max(fp16_scratch_bytes, native_scratch_bytes));
 
         WorkspaceRequirements reqs;
-
-        // Buffer for K cache pointers: DataT* per sequence
-        reqs.buffers.push_back({
-            KVCacheWorkspaceBuffers::K_CACHE_PTRS,
-            static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
-            sizeof(void *) // Pointer alignment
-        });
-
-        // Buffer for V cache pointers: DataT* per sequence
-        reqs.buffers.push_back({
-            KVCacheWorkspaceBuffers::V_CACHE_PTRS,
-            static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
-            sizeof(void *) // Pointer alignment
-        });
-
-        // Buffer for tail indices: int per sequence
-        reqs.buffers.push_back({KVCacheWorkspaceBuffers::TAILS,
-                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
-                                sizeof(int)});
-
-        // Buffer for count values: int per sequence
-        reqs.buffers.push_back({KVCacheWorkspaceBuffers::COUNTS,
-                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
-                                sizeof(int)});
 
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_K,
                                 conversion_scratch_bytes,
@@ -2351,10 +2400,6 @@ namespace llaminar2
         LOG_DEBUG("[ROCmRingKVCache] Workspace requirements: batch_size="
                   << bounded_batch_size
                   << " scratch_tokens=" << bounded_scratch_tokens
-                  << " K_CACHE_PTRS=" << bounded_batch_size * sizeof(DataT *)
-                  << " V_CACHE_PTRS=" << bounded_batch_size * sizeof(DataT *)
-                  << " TAILS=" << bounded_batch_size * sizeof(int)
-                  << " COUNTS=" << bounded_batch_size * sizeof(int)
                   << " CONV_SCRATCH(each)=" << conversion_scratch_bytes);
 
         return reqs;
@@ -2364,6 +2409,85 @@ namespace llaminar2
     void ROCmRingKVCache<Precision>::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         workspace_ = workspace;
+        batched_pointer_tables_ready_ = false;
+        batched_k_view_.reset();
+        batched_v_view_.reset();
+        converted_batched_k_view_.reset();
+        converted_batched_v_view_.reset();
+
+        if (workspace_ && workspace_->isAllocated())
+        {
+            const size_t entry_count =
+                static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
+            const size_t table_bytes = entry_count * sizeof(DataT *);
+            if (entry_count > 0)
+            {
+                std::vector<DataT *> h_k_table(entry_count);
+                std::vector<DataT *> h_v_table(entry_count);
+                for (int layer = 0; layer < n_layers_; ++layer)
+                {
+                    for (int seq = 0; seq < batch_size_; ++seq)
+                    {
+                        const size_t index =
+                            static_cast<size_t>(layer) * static_cast<size_t>(batch_size_) +
+                            static_cast<size_t>(seq);
+                        h_k_table[index] = entries_[layer][seq].d_K;
+                        h_v_table[index] = entries_[layer][seq].d_V;
+                    }
+                }
+
+                (void)HipDeviceGuard::setDevice(device_id_);
+                if (!d_batched_k_entry_table_)
+                {
+                    const hipError_t allocation_error = hipMalloc(
+                        reinterpret_cast<void **>(&d_batched_k_entry_table_),
+                        table_bytes);
+                    if (allocation_error != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmRingKVCache] Failed to allocate cache-owned K entry table: "
+                                  << hipGetErrorString(allocation_error));
+                    }
+                }
+                if (!d_batched_v_entry_table_)
+                {
+                    const hipError_t allocation_error = hipMalloc(
+                        reinterpret_cast<void **>(&d_batched_v_entry_table_),
+                        table_bytes);
+                    if (allocation_error != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmRingKVCache] Failed to allocate cache-owned V entry table: "
+                                  << hipGetErrorString(allocation_error));
+                    }
+                }
+                if (!d_batched_k_entry_table_ || !d_batched_v_entry_table_)
+                {
+                    LOG_ERROR("[ROCmRingKVCache] Cache-owned batched entry tables are unavailable");
+                    LOG_DEBUG("[ROCmRingKVCache] Workspace bound: yes");
+                    return;
+                }
+
+                const hipError_t k_copy = hipMemcpy(
+                    d_batched_k_entry_table_, h_k_table.data(), table_bytes,
+                    hipMemcpyHostToDevice);
+                const hipError_t v_copy = k_copy == hipSuccess
+                                              ? hipMemcpy(
+                                                    d_batched_v_entry_table_,
+                                                    h_v_table.data(),
+                                                    table_bytes,
+                                                    hipMemcpyHostToDevice)
+                                              : k_copy;
+                if (k_copy == hipSuccess && v_copy == hipSuccess)
+                {
+                    batched_pointer_tables_ready_ = true;
+                }
+                else
+                {
+                    LOG_ERROR("[ROCmRingKVCache] Failed to publish immutable batched entry pointer tables"
+                              << " k_error=" << hipGetErrorString(k_copy)
+                              << " v_error=" << hipGetErrorString(v_copy));
+                }
+            }
+        }
         LOG_DEBUG("[ROCmRingKVCache] Workspace bound: " << (workspace ? "yes" : "no"));
     }
 
@@ -2485,11 +2609,17 @@ namespace llaminar2
         }
 
         const EntryT &entry = entries_[layer][seq_idx];
-        if (!entry.d_K || !entry.d_V || token_count < entry.count)
+        KVCacheSequenceState state;
+        if (!entry.d_K || !entry.d_V ||
+            !observeDeviceSequenceState(layer, seq_idx, &state) ||
+            token_count < state.cached_tokens)
             return false;
-        if (entry.count > 0 && entry.tail(max_seq_len_) != 0)
+        const int tail =
+            (state.implementation_head - state.cached_tokens + max_seq_len_) %
+            max_seq_len_;
+        if (state.cached_tokens > 0 && tail != 0)
             return false;
-        if (entry.head != entry.count)
+        if (state.implementation_head != state.cached_tokens)
             return false;
 
         constexpr TensorType tensor_type = []() constexpr
@@ -2592,9 +2722,6 @@ namespace llaminar2
             (void)hipSetDevice(device_id_);
             (void)hipMalloc(&shadow.d_K, buf_bytes);
             (void)hipMalloc(&shadow.d_V, buf_bytes);
-            shadow.converted_count = 0;
-            shadow.last_head = -1;
-            shadow.rope_applied = false;
         }
     }
 
@@ -2607,9 +2734,6 @@ namespace llaminar2
             return;
 
         auto &shadow = rope_shadows_[layer][seq_idx];
-        shadow.converted_count = 0;
-        shadow.last_head = -1;
-        shadow.rope_applied = false;
         shadow.k_view.reset();
         shadow.v_view.reset();
     }
@@ -2628,26 +2752,39 @@ namespace llaminar2
     {
         (void)target; // We always produce FP16 on GPU
 
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Scalar conversion is forbidden during graph capture; use get_kv_batched_converted_device_view");
+            return false;
+        }
 
         const auto &entry = entries_[layer][seq_idx];
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return false;
         const int requested_token_count =
             rope && rope->requested_token_count > 0
                 ? rope->requested_token_count
                 : 0;
-        const bool read_past_host_count =
-            requested_token_count > entry.count;
-        if (entry.count == 0 && !read_past_host_count)
+        if (requested_token_count > 0 &&
+            requested_token_count != state.cached_tokens)
         {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return true;
+            LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Requested scalar span does not match canonical device count"
+                      << " requested=" << requested_token_count
+                      << " device_count=" << state.cached_tokens);
+            return false;
         }
+        const int read_count = state.cached_tokens;
+        if (read_count == 0)
+            return true;
 
         // If no RoPE is requested, the raw cache tensors already have the
         // required representation.
@@ -2656,15 +2793,7 @@ namespace llaminar2
         // has already been remapped by the hybrid override of get_kv_converted().
         const bool want_rope = (rope && rope->rope_theta > 0.0f);
         if (!want_rope)
-        {
-            if (read_past_host_count)
-            {
-                return ROCmRingKVCache::get_kv_snapshot_view(
-                    layer, seq_idx, requested_token_count,
-                    out_k, out_v, out_kv_len);
-            }
             return ROCmRingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
-        }
 
         (void)hipSetDevice(device_id_);
         const hipStream_t stream = getEffectiveStream(
@@ -2672,388 +2801,126 @@ namespace llaminar2
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];
-        const int read_count =
-            requested_token_count > 0 ? requested_token_count : entry.count;
-        if (read_count <= 0 || read_count > max_seq_len_)
+        if (!shadow.d_K || !shadow.d_V || read_count > max_seq_len_)
         {
-            LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Invalid requested token count "
-                      << read_count << " for max_seq_len=" << max_seq_len_);
+            LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Scalar conversion storage is unavailable");
             return false;
         }
 
-        if (read_past_host_count)
-        {
-            /*
-             * Captured MTP verifier graphs append grouped rows on device and
-             * intentionally postpone host ring metadata updates.  When the
-             * requested span is still a direct physical prefix, the RoPE shadow
-             * can be built from the post-append device payload in graph order.
-             */
-            if ((entry.count > 0 && entry.tail(max_seq_len_) != 0) ||
-                entry.head != entry.count)
-            {
-                LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Requested post-append RoPE shadow is not physically contiguous"
-                          << " layer=" << layer
-                          << " seq=" << seq_idx
-                          << " host_count=" << entry.count
-                          << " head=" << entry.head
-                          << " requested=" << read_count);
-                return false;
-            }
-
-            auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
-            auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
-            if constexpr (Precision == ActivationPrecision::FP16)
-            {
-                const size_t bytes =
-                    static_cast<size_t>(read_count) *
-                    static_cast<size_t>(kv_dim_) *
-                    sizeof(_Float16);
-                hipError_t err = hipMemcpyAsync(
-                    shadow_k, entry.d_K, bytes,
-                    hipMemcpyDeviceToDevice, stream);
-                if (err == hipSuccess)
-                {
-                    err = hipMemcpyAsync(
-                        shadow_v, entry.d_V, bytes,
-                        hipMemcpyDeviceToDevice, stream);
-                }
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP16 shadow copy failed: "
-                              << hipGetErrorString(err));
-                    return false;
-                }
-                if (!hip_rope_apply_fp16(shadow_k, read_count, local_n_kv_heads_, head_dim_,
-                                         rope->rope_theta, rope->position_start, stream,
-                                         rope->rope_dim))
-                {
-                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP16 RoPE application failed");
-                    return false;
-                }
-            }
-            else if constexpr (Precision == ActivationPrecision::FP32)
-            {
-                const size_t bytes =
-                    static_cast<size_t>(read_count) *
-                    static_cast<size_t>(kv_dim_) *
-                    sizeof(float);
-                if (!ensureConvScratch(bytes))
-                    return false;
-
-                auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
-                auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
-                hipError_t err = hipMemcpyAsync(
-                    d_temp_k, entry.d_K, bytes,
-                    hipMemcpyDeviceToDevice, stream);
-                if (err == hipSuccess)
-                {
-                    err = hipMemcpyAsync(
-                        d_temp_v, entry.d_V, bytes,
-                        hipMemcpyDeviceToDevice, stream);
-                }
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP32 scratch copy failed: "
-                              << hipGetErrorString(err));
-                    return false;
-                }
-                if (!hip_rope_apply_fp32(d_temp_k, read_count, local_n_kv_heads_, head_dim_,
-                                         rope->rope_theta, rope->position_start, stream,
-                                         rope->rope_dim) ||
-                    !hip_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
-                                                reinterpret_cast<uint16_t *>(shadow_k),
-                                                read_count * kv_dim_, stream) ||
-                    !hip_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
-                                                reinterpret_cast<uint16_t *>(shadow_v),
-                                                read_count * kv_dim_, stream))
-                {
-                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append FP32 RoPE/convert failed");
-                    return false;
-                }
-            }
-            else if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                if (!hip_convert_tensor_to_fp16(entry.d_K, TensorType::Q8_1,
-                                                reinterpret_cast<uint16_t *>(shadow_k),
-                                                read_count * kv_dim_, stream) ||
-                    !hip_convert_tensor_to_fp16(entry.d_V, TensorType::Q8_1,
-                                                reinterpret_cast<uint16_t *>(shadow_v),
-                                                read_count * kv_dim_, stream) ||
-                    !hip_rope_apply_fp16(shadow_k, read_count, local_n_kv_heads_, head_dim_,
-                                         rope->rope_theta, rope->position_start, stream,
-                                         rope->rope_dim))
-                {
-                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append Q8_1 RoPE/convert failed");
-                    return false;
-                }
-            }
-            else if constexpr (Precision == ActivationPrecision::BF16)
-            {
-                if (!hip_convert_tensor_to_fp16(entry.d_K, TensorType::BF16,
-                                                reinterpret_cast<uint16_t *>(shadow_k),
-                                                read_count * kv_dim_, stream) ||
-                    !hip_convert_tensor_to_fp16(entry.d_V, TensorType::BF16,
-                                                reinterpret_cast<uint16_t *>(shadow_v),
-                                                read_count * kv_dim_, stream) ||
-                    !hip_rope_apply_fp16(shadow_k, read_count, local_n_kv_heads_, head_dim_,
-                                         rope->rope_theta, rope->position_start, stream,
-                                         rope->rope_dim))
-                {
-                    LOG_ERROR("[ROCmRingKVCache::get_kv_converted] Post-append BF16 RoPE/convert failed");
-                    return false;
-                }
-            }
-
-            shadow.converted_count = read_count;
-            shadow.last_head = read_count;
-            shadow.rope_applied = true;
-
-            if (!shadow.k_view ||
-                shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
-            {
-                shadow.k_view = std::make_unique<GpuTensorView>(
-                    shadow.d_K, shadow.converted_count, kv_dim_,
-                    TensorType::FP16, device_id_);
-            }
-            if (!shadow.v_view ||
-                shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
-            {
-                shadow.v_view = std::make_unique<GpuTensorView>(
-                    shadow.d_V, shadow.converted_count, kv_dim_,
-                    TensorType::FP16, device_id_);
-            }
-
-            if (out_k)
-                *out_k = shadow.k_view.get();
-            if (out_v)
-                *out_v = shadow.v_view.get();
-            if (out_kv_len)
-                *out_kv_len = shadow.converted_count;
-            return true;
-        }
-
-        // Detect incremental vs full rebuild
-        const int new_tokens = entry.count - shadow.converted_count;
-        const bool need_full_rebuild = (shadow.converted_count == 0 ||
-                                        new_tokens < 0 ||
-                                        shadow.converted_count > entry.count);
+        /*
+         * This scalar API is an explicit observation-boundary rebuild.
+         * Production attention uses the grouped device conversion kernel and
+         * never asks a host shadow generation whether graph replay changed it.
+         */
 
         if constexpr (Precision == ActivationPrecision::FP16)
         {
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
             auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
-
-            if (need_full_rebuild)
-            {
-                int kv_len = 0;
-                // Qualified call avoids virtual dispatch — prevents ROCmHybridRingKVCache
-                // from double-remapping the already-remapped layer index.
-                if (!ROCmRingKVCache::linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
-                    return false;
-
-                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream,
-                                    rope->rope_dim);
-
-                shadow.converted_count = kv_len;
-            }
-            else if (new_tokens > 0)
-            {
-                int kv_len = 0;
-                if (!ROCmRingKVCache::linearize_to(layer, seq_idx, shadow_k, shadow_v, &kv_len, stream))
-                    return false;
-
-                // Apply RoPE to ALL tokens — linearize_to overwrites the entire
-                // shadow with fresh (non-RoPE'd) data from the ring buffer.
-                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream,
-                                    rope->rope_dim);
-
-                shadow.converted_count = kv_len;
-            }
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                shadow_k, shadow_v, stream);
+            if (!hip_rope_apply_fp16(
+                    shadow_k, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
+                return false;
         }
         else if constexpr (Precision == ActivationPrecision::FP32)
         {
-            // FP32 cache → linearize to scratch, apply RoPE, convert to FP16 shadow
             const size_t row_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
-            const size_t total_bytes = static_cast<size_t>(entry.count) * row_bytes;
-
+            const size_t total_bytes = static_cast<size_t>(read_count) * row_bytes;
             if (!ensureConvScratch(total_bytes))
                 return false;
-
             auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
             auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!ROCmRingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
-                return false;
-
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
             auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
-
-            if (need_full_rebuild)
-            {
-                hip_rope_apply_fp32(d_temp_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream,
-                                    rope->rope_dim);
-
-                hip_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
-                                           reinterpret_cast<uint16_t *>(shadow_k),
-                                           kv_len * kv_dim_, stream);
-                hip_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
-                                           reinterpret_cast<uint16_t *>(shadow_v),
-                                           kv_len * kv_dim_, stream);
-            }
-            else if (new_tokens > 0)
-            {
-                const int old_count = shadow.converted_count;
-                float *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
-                float *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                hip_rope_apply_fp32(new_k_start, new_tokens, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start + old_count, stream,
-                                    rope->rope_dim);
-
-                _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
-                _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                hip_convert_tensor_to_fp16(new_k_start, TensorType::FP32,
-                                           reinterpret_cast<uint16_t *>(shadow_k_new),
-                                           new_tokens * kv_dim_, stream);
-                hip_convert_tensor_to_fp16(new_v_start, TensorType::FP32,
-                                           reinterpret_cast<uint16_t *>(shadow_v_new),
-                                           new_tokens * kv_dim_, stream);
-            }
-
-            shadow.converted_count = kv_len;
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!hip_rope_apply_fp32(
+                    d_temp_k, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim) ||
+                !hip_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::FP32,
+                    reinterpret_cast<uint16_t *>(shadow_k),
+                    read_count * kv_dim_, stream) ||
+                !hip_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::FP32,
+                    reinterpret_cast<uint16_t *>(shadow_v),
+                    read_count * kv_dim_, stream))
+                return false;
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
-            // Q8_1 cache → linearize to scratch, dequant to FP16 shadow, RoPE
             const size_t q8_row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(Q8_1Block);
-            const size_t q8_total = static_cast<size_t>(entry.count) * q8_row_bytes;
-
+            const size_t q8_total = static_cast<size_t>(read_count) * q8_row_bytes;
             if (!ensureConvScratch(q8_total))
                 return false;
-
             auto *d_temp_k = static_cast<Q8_1Block *>(conv_scratch_k_);
             auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!ROCmRingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
-                return false;
-
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
             auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
-
-            if (need_full_rebuild)
-            {
-                hip_convert_tensor_to_fp16(d_temp_k, TensorType::Q8_1,
-                                           reinterpret_cast<uint16_t *>(shadow_k),
-                                           kv_len * kv_dim_, stream);
-                hip_convert_tensor_to_fp16(d_temp_v, TensorType::Q8_1,
-                                           reinterpret_cast<uint16_t *>(shadow_v),
-                                           kv_len * kv_dim_, stream);
-
-                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream,
-                                    rope->rope_dim);
-            }
-            else if (new_tokens > 0)
-            {
-                const int old_count = shadow.converted_count;
-                Q8_1Block *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_storage_dim_;
-                Q8_1Block *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_storage_dim_;
-
-                _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
-                _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                hip_convert_tensor_to_fp16(new_k_start, TensorType::Q8_1,
-                                           reinterpret_cast<uint16_t *>(shadow_k_new),
-                                           new_tokens * kv_dim_, stream);
-                hip_convert_tensor_to_fp16(new_v_start, TensorType::Q8_1,
-                                           reinterpret_cast<uint16_t *>(shadow_v_new),
-                                           new_tokens * kv_dim_, stream);
-
-                hip_rope_apply_fp16(shadow_k_new, new_tokens, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta,
-                                    rope->position_start + old_count, stream,
-                                    rope->rope_dim);
-            }
-
-            shadow.converted_count = kv_len;
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!hip_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::Q8_1,
+                    reinterpret_cast<uint16_t *>(shadow_k),
+                    read_count * kv_dim_, stream) ||
+                !hip_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::Q8_1,
+                    reinterpret_cast<uint16_t *>(shadow_v),
+                    read_count * kv_dim_, stream) ||
+                !hip_rope_apply_fp16(
+                    shadow_k, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
+                return false;
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
-            // BF16 → linearize to scratch, convert to FP16 shadow, RoPE
-            const size_t bf16_bytes = static_cast<size_t>(entry.count) * kv_dim_ * sizeof(hip_bfloat16);
-
+            const size_t bf16_bytes = static_cast<size_t>(read_count) * kv_dim_ * sizeof(hip_bfloat16);
             if (!ensureConvScratch(bf16_bytes))
                 return false;
-
             auto *d_temp_k = static_cast<hip_bfloat16 *>(conv_scratch_k_);
             auto *d_temp_v = static_cast<hip_bfloat16 *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!ROCmRingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
-                return false;
-
             auto *shadow_k = static_cast<_Float16 *>(shadow.d_K);
             auto *shadow_v = static_cast<_Float16 *>(shadow.d_V);
-
-            if (need_full_rebuild)
-            {
-                hip_convert_tensor_to_fp16(d_temp_k, TensorType::BF16,
-                                           reinterpret_cast<uint16_t *>(shadow_k),
-                                           kv_len * kv_dim_, stream);
-                hip_convert_tensor_to_fp16(d_temp_v, TensorType::BF16,
-                                           reinterpret_cast<uint16_t *>(shadow_v),
-                                           kv_len * kv_dim_, stream);
-
-                hip_rope_apply_fp16(shadow_k, kv_len, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta, rope->position_start, stream,
-                                    rope->rope_dim);
-            }
-            else if (new_tokens > 0)
-            {
-                const int old_count = shadow.converted_count;
-                hip_bfloat16 *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
-                hip_bfloat16 *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                _Float16 *shadow_k_new = shadow_k + static_cast<size_t>(old_count) * kv_dim_;
-                _Float16 *shadow_v_new = shadow_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                hip_convert_tensor_to_fp16(new_k_start, TensorType::BF16,
-                                           reinterpret_cast<uint16_t *>(shadow_k_new),
-                                           new_tokens * kv_dim_, stream);
-                hip_convert_tensor_to_fp16(new_v_start, TensorType::BF16,
-                                           reinterpret_cast<uint16_t *>(shadow_v_new),
-                                           new_tokens * kv_dim_, stream);
-
-                hip_rope_apply_fp16(shadow_k_new, new_tokens, local_n_kv_heads_, head_dim_,
-                                    rope->rope_theta,
-                                    rope->position_start + old_count, stream,
-                                    rope->rope_dim);
-            }
-
-            shadow.converted_count = kv_len;
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!hip_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::BF16,
+                    reinterpret_cast<uint16_t *>(shadow_k),
+                    read_count * kv_dim_, stream) ||
+                !hip_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::BF16,
+                    reinterpret_cast<uint16_t *>(shadow_v),
+                    read_count * kv_dim_, stream) ||
+                !hip_rope_apply_fp16(
+                    shadow_k, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
+                return false;
         }
 
-        shadow.last_head = entry.head;
-        shadow.rope_applied = true;
+        if (hipGetLastError() != hipSuccess)
+            return false;
 
         // Create/update GpuTensorViews for the shadow buffers
-        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.k_view = std::make_unique<GpuTensorView>(
-                shadow.d_K, shadow.converted_count, kv_dim_,
+                shadow.d_K, read_count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
-        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.v_view = std::make_unique<GpuTensorView>(
-                shadow.d_V, shadow.converted_count, kv_dim_,
+                shadow.d_V, read_count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
 
@@ -3062,7 +2929,7 @@ namespace llaminar2
         if (out_v)
             *out_v = shadow.v_view.get();
         if (out_kv_len)
-            *out_kv_len = shadow.converted_count;
+            *out_kv_len = read_count;
 
         return true;
     }

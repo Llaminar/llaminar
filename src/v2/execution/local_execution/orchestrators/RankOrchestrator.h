@@ -515,17 +515,6 @@ namespace llaminar2
          */
         DeviceResidentLogicalSequenceStateHandle
         deviceResidentLogicalSequenceState() const override;
-        /**
-         * @brief Report whether rank-level host position mirrors are current.
-         *
-         * LocalTP resident MTP publication records device-owned logical state
-         * on each child runner.  The rank aggregate is only safe for ordinary
-         * host-position planning when every child reports that its host mirrors
-         * were refreshed by the same transaction.  If any participant still
-         * requires resident-mailbox planning, rank-level decode must follow that
-         * device-resident path as well.
-         */
-        bool hostLogicalStateMirrorsDeviceResidentState() const override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -554,8 +543,7 @@ namespace llaminar2
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
@@ -565,17 +553,14 @@ namespace llaminar2
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowsFromDeviceOutcome(
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
             int already_appended_tokens,
             int max_state_commit_rows,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1,
-            int already_appended_shifted_kv_tokens = -1) override;
+            bool allow_speculative_discard = false) override;
         bool flushPendingMTPWork() override;
         bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;
@@ -1390,6 +1375,21 @@ namespace llaminar2
         void applyLogitsGatherSkipFlags();
 
         /**
+         * @brief Resolve the backend used by rank-owned GPU logits operations.
+         *
+         * Production ranks have no injected resolver and therefore use the
+         * process-wide BackendManager.  The createForTest() constructor installs
+         * a resolver that deliberately returns nullptr, allowing unit tests to
+         * exercise CUDA/ROCm-shaped placement metadata without initializing a
+         * physical GPU runtime.
+         *
+         * @param device GPU device that owns the logits payload.
+         * @return Backend for the device, or nullptr when backend access is
+         *         intentionally unavailable.
+         */
+        IBackend *resolveLogitsBackend(DeviceId device) const;
+
+        /**
          * @brief Forward same-domain LocalTP child runtime histograms into the
          *        selected rebalance controller.
          *
@@ -1482,6 +1482,17 @@ namespace llaminar2
         /// Lazy-initialized on first TP forward call.
         std::unique_ptr<TPWorkerPool> tp_worker_pool_;
         bool tp_first_forward_completed_ = false;
+
+        /**
+         * @brief Permit this rank to initialize or synchronize physical GPU backends.
+         *
+         * Production constructors leave this enabled. `createForTest()` injects
+         * mock child runners that may advertise CUDA/ROCm-shaped device IDs to
+         * exercise placement policy, but unit tests must never initialize those
+         * physical backends. The private test constructor therefore disables
+         * backend pinning and mmap-release synchronization explicitly.
+         */
+        bool external_device_backend_access_enabled_ = true;
         /**
          * @brief Scoped switch that routes rank fan-out to grouped child APIs.
          *

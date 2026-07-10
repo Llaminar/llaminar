@@ -36,6 +36,8 @@ enum class RepackFormat : uint8_t {
     IQ1_S   = 16,  ///< IQ 1-bit (256-element super-blocks, 50 bytes)
     IQ1_M   = 17,  ///< IQ 1-bit (256-element super-blocks, 56 bytes)
     Q8_0    = 18,  ///< Symmetric 8-bit (32-element blocks, 34 bytes)
+    Q8_1    = 19,  ///< Symmetric 8-bit plus precomputed sum (32-element blocks, 36 bytes)
+    Q8_K    = 20,  ///< Raw signed 8-bit K-quant (256-element blocks, 288 bytes)
     RAW_FP  = 255, ///< Floating-point passthrough (no repack, direct H2D copy)
 };
 
@@ -70,6 +72,7 @@ inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id,
         case 6:  return RepackFormat::Q5_0;
         case 7:  return RepackFormat::Q5_1;
         case 19: return RepackFormat::Q8_0;
+        case 20: return RepackFormat::Q8_1;
         default: return std::nullopt;
         }
     } else {
@@ -87,9 +90,26 @@ inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id,
         case 15: return RepackFormat::IQ2_XXS;
         case 16: return RepackFormat::IQ1_S;
         case 17: return RepackFormat::IQ1_M;
+        case 21: return RepackFormat::Q8_K;
         default: return std::nullopt;
         }
     }
+}
+
+/**
+ * @brief Return the codebook consumed by device GEMM/MoE kernels after repack.
+ *
+ * Q8_0, Q8_1, and Q8_K have different source block layouts, but preparation
+ * normalizes all three into the same 32-byte signed-INT8 payload with one FP16
+ * scale per execution block.  Reusing codebook 19 keeps dense and grouped MoE
+ * dispatch on the tuned economical raw-INT8 kernels while the RepackFormat
+ * continues to identify the original source layout correctly.
+ */
+inline uint8_t canonicalDeviceVnniCodebookId(uint8_t source_codebook_id)
+{
+    return source_codebook_id == 20 || source_codebook_id == 21
+               ? static_cast<uint8_t>(19)
+               : source_codebook_id;
 }
 
 } // namespace llaminar2

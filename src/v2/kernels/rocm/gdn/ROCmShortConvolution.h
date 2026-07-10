@@ -42,6 +42,18 @@ extern "C"
         int max_snapshot_rows,
         int device_idx, void *stream);
 
+    bool rocmGDN_short_conv1d_batched(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *request_states,
+        int request_count, int request_seq_len,
+        int channels, int kernel_size,
+        bool apply_silu,
+        const int *device_request_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream);
+
     // GPU memory helpers (implemented in ROCmGatedDeltaNetKernels.hip)
     bool rocmGDN_gpu_malloc(float **ptr, size_t count);
     void rocmGDN_gpu_free(float *ptr);
@@ -67,6 +79,16 @@ extern "C"
         const int *device_row_indices,
         int request_count,
         int row_index_stride,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
+    bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+        float *dst,
+        const float *capture,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
         int rows,
         int state_size,
         int device_idx,
@@ -118,6 +140,9 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
+            // GPU kernels own the only live state. The generic destination is a
+            // CPU-backend concern and is intentionally ignored here.
+            (void)dst_state;
             if (!selectState(verifier_state_capture_size_) ||
                 !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
@@ -133,22 +158,10 @@ namespace llaminar2
             if (stream)
             {
                 rocmGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
-                if (dst_state)
-                {
-                    /*
-                     * Keep the host conv-state mirror aligned with the HIP
-                     * state restored for graph replay.  This makes publication
-                     * atomic across graph rebuilds and captured replays.
-                     */
-                    rocmGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
-                    rocmGDN_stream_synchronize(stream);
-                }
             }
             else
             {
                 rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
-                if (dst_state)
-                    rocmGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
             }
             return true;
         }
@@ -158,11 +171,7 @@ namespace llaminar2
             const int *device_row_index,
             void *stream) override
         {
-            /*
-             * Device-indexed MTP publication is a device-owned state handoff.
-             * Host mirror refresh is deliberately excluded so replay can stay
-             * ordered on the explicit HIP stream without a D2H synchronization.
-             */
+            // Accepted-row metadata and live recurrent state remain on device.
             (void)dst_state;
             if (!selectState(verifier_state_capture_size_) ||
                 !verifier_state_capture_ || !device_row_index ||
@@ -214,6 +223,35 @@ namespace llaminar2
                 device_row_indices,
                 request_count,
                 row_index_stride,
+                verifier_state_capture_rows_,
+                request_state_bank_state_size_,
+                device_ordinal_,
+                stream);
+        }
+
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override
+        {
+            (void)dst_states;
+            if (!request_state_bank_ ||
+                request_state_bank_state_size_ <= 0 ||
+                request_state_bank_capacity_ < request_count ||
+                !verifier_state_capture_ ||
+                !device_request_seq_lens ||
+                !stream)
+            {
+                return false;
+            }
+            return rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+                request_state_bank_,
+                verifier_state_capture_,
+                device_request_seq_lens,
+                request_count,
+                request_row_width,
                 verifier_state_capture_rows_,
                 request_state_bank_state_size_,
                 device_ordinal_,
@@ -518,6 +556,96 @@ namespace llaminar2
                     output,
                     scratchPointer(),
                     static_cast<size_t>(flattened_output_floats),
+                    stream_);
+            }
+            return true;
+        }
+
+        /**
+         * @brief Execute one native grouped variable-length request matrix.
+         *
+         * The HIP launch owns the request dimension and reads all real row
+         * counts from device memory. Live and speculative states are contiguous
+         * request banks, so this path performs no scalar request replay.
+         */
+        bool forwardBatchedRequestsWithDeviceSeqLens(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            const int *device_request_seq_lens,
+            bool apply_silu = true) override
+        {
+            (void)conv_state;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size = channels * (kernel_size - 1);
+            if (!stream_ || !device_request_seq_lens ||
+                seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+                seq_len != request_count * request_seq_len ||
+                required_state_size <= 0)
+            {
+                LOG_ERROR("[ROCmShortConvolution] Invalid device-length request-batched shape");
+                return false;
+            }
+            if (!ensureRequestStateBank(request_count, required_state_size))
+                return false;
+
+            const bool capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ >= request_count * request_seq_len &&
+                verifier_state_capture_size_ == required_state_size;
+            float *effective_states = request_state_bank_;
+            if (capture_active)
+            {
+                const int work_floats = request_count * required_state_size;
+                if (!speculative_state_work_ ||
+                    speculative_state_work_size_ < work_floats)
+                {
+                    LOG_ERROR("[ROCmShortConvolution] Grouped verifier requires one speculative state slot per request");
+                    return false;
+                }
+                rocmGDN_gpu_memcpy_async(
+                    speculative_state_work_,
+                    request_state_bank_,
+                    static_cast<size_t>(work_floats),
+                    stream_);
+                effective_states = speculative_state_work_;
+            }
+
+            float *effective_output = output;
+            const bool needs_scratch = input == output;
+            const int output_floats = seq_len * channels;
+            if (needs_scratch)
+            {
+                if (!scratchPointer() || scratchCapacity() < output_floats)
+                {
+                    LOG_ERROR("[ROCmShortConvolution] Grouped request scratch is too small: need "
+                              << output_floats << " floats, have " << scratchCapacity());
+                    return false;
+                }
+                effective_output = scratchPointer();
+            }
+
+            if (!rocmGDN_short_conv1d_batched(
+                    input, weight, bias,
+                    effective_output, effective_states,
+                    request_count, request_seq_len,
+                    channels, kernel_size, apply_silu,
+                    device_request_seq_lens,
+                    capture_active ? verifier_state_capture_ : nullptr,
+                    required_state_size,
+                    capture_active ? verifier_state_capture_rows_ : 0,
+                    device_ordinal_, stream_))
+            {
+                return false;
+            }
+
+            if (needs_scratch)
+            {
+                rocmGDN_gpu_memcpy_async(
+                    output,
+                    scratchPointer(),
+                    static_cast<size_t>(output_floats),
                     stream_);
             }
             return true;

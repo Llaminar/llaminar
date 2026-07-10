@@ -260,19 +260,27 @@ namespace llaminar2
         int prefill_bucket_seq_len_ = 0;
 
         /**
-         * @brief Pre-append KV history observed for the current dynamic stage pass.
+         * @brief Request geometry for the current dynamic stage pass.
          *
-         * A GPU graph capture records KV append kernels before attention kernels,
-         * but host cache metadata may be advanced eagerly for bookkeeping while
-         * the device metadata is advanced inside the captured graph.  These
-         * request-local mirrors preserve the boundary that matters to attention:
-         * how many real cached tokens existed before this stage's append, how
-         * many real query rows belong to the current prompt chunk, and therefore
-         * what post-append KV span the attention stage must represent.
+         * The admitted request cursor determines fixed host launch geometry; it
+         * is not a cache-state mirror. GPU attention derives every live row
+         * length from canonical device metadata after the captured append.
          */
         int dynamic_pre_append_cached_tokens_ = -1;
         int dynamic_logical_seq_len_ = 0;
         int dynamic_post_append_kv_len_ = 0;
+
+        /**
+         * @brief Stable per-request CPU KV descriptors for grouped decode.
+         *
+         * Request-batched CPU attention cannot flatten independent cache slots
+         * into one scalar sequence. These vectors are sized with the graph and
+         * reused on every execution so the grouped production path performs no
+         * hot-loop descriptor allocation.
+         */
+        std::vector<const ITensor *> cpu_grouped_k_views_;
+        std::vector<const ITensor *> cpu_grouped_v_views_;
+        std::vector<int> cpu_grouped_kv_lens_;
 
         /**
          * @brief Get or create the attention kernel

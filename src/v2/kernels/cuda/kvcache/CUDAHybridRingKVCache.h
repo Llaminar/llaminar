@@ -19,7 +19,6 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 
 #include <cstdint>
-#include <cstring>
 
 namespace llaminar2
 {
@@ -356,6 +355,34 @@ namespace llaminar2
                                            kv_lens, max_kv_len, stream);
         }
 
+        bool get_kv_batched_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            int max_kv_len,
+            ITensor **out_k,
+            ITensor **out_v,
+            void *gpu_stream) override
+        {
+            const int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                return false;
+            }
+            return Base::get_kv_batched_device_view(
+                kv_idx,
+                first_seq_idx,
+                request_count,
+                max_kv_len,
+                out_k,
+                out_v,
+                gpu_stream);
+        }
+
         void clear() override
         {
             // Base::clear() resets compressed FA entries directly and scrubs
@@ -364,7 +391,6 @@ namespace llaminar2
             Base::clear();
             for (auto &state : gdn_states_)
             {
-                state.reset();
                 state.resetGPUKernelState();
             }
         }
@@ -393,7 +419,6 @@ namespace llaminar2
                 int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
                 {
-                    gdn_states_[gdn_idx].reset();
                     gdn_states_[gdn_idx].resetGPUKernelState();
                 }
             }
@@ -464,29 +489,23 @@ namespace llaminar2
             return Base::get_kv_converted(kv_idx, seq_idx, target, out_k, out_v, out_kv_len, rope);
         }
 
-        // Graph capture support with remapping
-        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override
+        /** @brief Remap one graph append-count binding to the compressed FA slot. */
+        bool bindGraphAppendCountSource(
+            int layer,
+            int seq_idx,
+            const int32_t *append_tokens_device,
+            int captured_max_tokens,
+            void *gpu_stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-                return;
-            Base::setDynamicHead(kv_idx, seq_idx, gpu_stream);
-        }
-
-        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override
-        {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            const int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return false;
-            return Base::setDynamicAppendState(kv_idx, seq_idx, append_tokens, gpu_stream);
-        }
-
-        void advanceHead(int layer, int seq_idx, int num_tokens) override
-        {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-                return;
-            Base::advanceHead(kv_idx, seq_idx, num_tokens);
+            return Base::bindGraphAppendCountSource(
+                kv_idx,
+                seq_idx,
+                append_tokens_device,
+                captured_max_tokens,
+                gpu_stream);
         }
 
         // =====================================================================
@@ -522,14 +541,14 @@ namespace llaminar2
 
         float *getRecurrenceState(int layer) override
         {
-            auto *state = getGDNState(layer);
-            return state ? state->recurrence_state.data() : nullptr;
+            (void)layer;
+            return nullptr;
         }
 
         float *getConvState(int layer) override
         {
-            auto *state = getGDNState(layer);
-            return state ? state->conv_state.data() : nullptr;
+            (void)layer;
+            return nullptr;
         }
 
         ITensorShortConvolution *getConvKernel(int layer) override
@@ -548,7 +567,6 @@ namespace llaminar2
         {
             for (auto &state : gdn_states_)
             {
-                state.reset();
                 state.resetGPUKernelState();
             }
         }
@@ -560,7 +578,7 @@ namespace llaminar2
         {
             size_t total = 0;
             for (const auto &state : gdn_states_)
-                total += state.memoryBytes();
+                total += state.localStateBytes();
             return total;
         }
 
@@ -577,15 +595,11 @@ namespace llaminar2
             if (desc.seq_idx < 0)
                 return false;
 
-            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
-            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
-            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
-            const bool host_staged_device_state = needs_device && !dst_device && dst_host;
-            if ((needs_host && !dst_host) ||
-                (needs_device && !dst_device && !host_staged_device_state))
-            {
+            const HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!desc.include_device_state || metadata.device_bytes == 0)
+                return true;
+            if (!dst_host && !dst_device)
                 return false;
-            }
 
             void *effective_stream = desc.stream;
             if (!effective_stream && this->device_id() >= 0)
@@ -594,45 +608,16 @@ namespace llaminar2
                 return false;
             }
 
-            bool ok = true;
-            if (host_staged_device_state)
-            {
-                if (ok && needs_host)
-                {
-                    auto *host_cursor = reinterpret_cast<uint8_t *>(dst_host);
-                    uint8_t *device_cursor = nullptr;
-                    ok = exportHybridStatePayload(
-                        host_cursor,
-                        device_cursor,
-                        effective_stream,
-                        true,
-                        false);
-                }
-                if (ok && needs_device)
-                {
-                    auto *host_device_cursor =
-                        reinterpret_cast<uint8_t *>(dst_host) +
-                        (needs_host ? metadata.host_bytes : 0);
-                    uint8_t *device_cursor = nullptr;
-                    ok = exportHybridStatePayload(
-                        host_device_cursor,
-                        device_cursor,
-                        effective_stream,
-                        false,
-                        true);
-                }
-            }
-            else
-            {
-                auto *host_cursor = needs_host ? reinterpret_cast<uint8_t *>(dst_host) : nullptr;
-                auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
-                ok = exportHybridStatePayload(
-                    host_cursor,
-                    device_cursor,
-                    effective_stream,
-                    desc.include_host_state,
-                    desc.include_device_state);
-            }
+            auto *host_cursor = dst_device
+                                    ? nullptr
+                                    : reinterpret_cast<uint8_t *>(dst_host);
+            auto *device_cursor = reinterpret_cast<uint8_t *>(dst_device);
+            const bool ok = exportHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                effective_stream,
+                false,
+                true);
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getNvidiaContext(this->device_id())
@@ -648,22 +633,11 @@ namespace llaminar2
             if (desc.seq_idx < 0)
                 return false;
 
-            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
-            const bool needs_host =
-                (desc.include_host_state ||
-                 desc.import_host_state_into_device_state ||
-                 desc.import_device_state_from_host_state) &&
-                metadata.host_bytes > 0;
-            const bool needs_device =
-                desc.include_device_state &&
-                !desc.import_device_state_from_host_state &&
-                metadata.device_bytes > 0;
-            const bool host_staged_device_state = needs_device && !src_device && src_host;
-            if ((needs_host && !src_host) ||
-                (needs_device && !src_device && !host_staged_device_state))
-            {
+            const HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!desc.include_device_state || metadata.device_bytes == 0)
+                return true;
+            if (!src_host && !src_device)
                 return false;
-            }
 
             void *effective_stream = desc.stream;
             if (!effective_stream && this->device_id() >= 0)
@@ -672,75 +646,16 @@ namespace llaminar2
                 return false;
             }
 
-            bool ok = true;
-            if (desc.import_device_state_from_host_state)
-            {
-                const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
-                const uint8_t *device_cursor = nullptr;
-                ok = importHybridStatePayload(
-                    host_cursor,
-                    device_cursor,
-                    effective_stream,
-                    desc.include_host_state,
-                    false,
-                    true);
-            }
-            else if (host_staged_device_state)
-            {
-                if (needs_device)
-                {
-                    const auto *host_device_cursor =
-                        reinterpret_cast<const uint8_t *>(src_host) +
-                        (needs_host ? metadata.host_bytes : 0);
-                    const uint8_t *device_cursor = nullptr;
-                    ok = importHybridStatePayload(
-                        host_device_cursor,
-                        device_cursor,
-                        effective_stream,
-                        false,
-                        true,
-                        false);
-                }
-                if (ok && needs_host)
-                {
-                    const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
-                    const uint8_t *device_cursor = nullptr;
-                    ok = importHybridStatePayload(
-                        host_cursor,
-                        device_cursor,
-                        effective_stream,
-                        desc.include_host_state,
-                        false,
-                        desc.import_host_state_into_device_state);
-                }
-            }
-            else
-            {
-                if (needs_device)
-                {
-                    const uint8_t *host_cursor = nullptr;
-                    const auto *device_cursor = reinterpret_cast<const uint8_t *>(src_device);
-                    ok = importHybridStatePayload(
-                        host_cursor,
-                        device_cursor,
-                        effective_stream,
-                        false,
-                        true,
-                        false);
-                }
-                if (ok && needs_host)
-                {
-                    const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
-                    const uint8_t *device_cursor = nullptr;
-                    ok = importHybridStatePayload(
-                        host_cursor,
-                        device_cursor,
-                        effective_stream,
-                        desc.include_host_state,
-                        false,
-                        desc.import_host_state_into_device_state);
-                }
-            }
+            const auto *host_cursor = src_device
+                                          ? nullptr
+                                          : reinterpret_cast<const uint8_t *>(src_host);
+            const auto *device_cursor = reinterpret_cast<const uint8_t *>(src_device);
+            const bool ok = importHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                effective_stream,
+                false,
+                true);
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getNvidiaContext(this->device_id())
@@ -776,7 +691,7 @@ namespace llaminar2
             HybridPrefixStateMetadata metadata;
             metadata.total_layers = total_layers_;
             metadata.gdn_layers = layer_map_.gdnLayerCount();
-            metadata.host_bytes = gdnMemoryBytes();
+            metadata.host_bytes = 0;
 
             for (int layer = 0; layer < total_layers_; ++layer)
             {
@@ -785,22 +700,43 @@ namespace llaminar2
                     continue;
                 const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
                 if (state.conv_kernel)
-                    metadata.device_bytes += fullConvStateBytes(state);
+                {
+                    metadata.device_bytes += localConvStateBytes(state);
+                    if (state.full_conv_state_size != state.local_conv_state_size)
+                        metadata.device_bytes += fullConvStateBytes(state);
+                }
                 if (state.rec_kernel)
-                    metadata.device_bytes += fullRecurrenceStateBytes(state);
+                {
+                    metadata.device_bytes += localRecurrenceStateBytes(state);
+                    if (state.full_recurrence_state_size !=
+                        state.local_recurrence_state_size)
+                    {
+                        metadata.device_bytes += fullRecurrenceStateBytes(state);
+                    }
+                }
             }
             metadata.has_device_kernel_state = metadata.device_bytes > 0;
             return metadata;
         }
 
+        /// @brief Returns the participant-local short-convolution bank size.
+        static size_t localConvStateBytes(const HybridGDNLayerState &state)
+        {
+            return static_cast<size_t>(state.local_conv_state_size) * sizeof(float);
+        }
+
+        /// @brief Returns the participant-local recurrence bank size.
+        static size_t localRecurrenceStateBytes(const HybridGDNLayerState &state)
+        {
+            return static_cast<size_t>(state.local_recurrence_state_size) * sizeof(float);
+        }
+
         /**
          * @brief Returns the serialized full-bank conv-state byte count.
          *
-         * The prefix payload contract is shape-based, not allocation-based.
-         * Fresh TP targets may only have the local suffix-prefill bank
-         * resident when they import a prefix block, so the full decode-bank
-         * payload size must come from model configuration rather than from
-         * largestStateBytes().
+         * Both local and full banks are allocated before graph capture. Prefix
+         * payloads therefore serialize each distinct bank in deterministic
+         * shape order instead of relying on an out-of-band host mirror.
          */
         static size_t fullConvStateBytes(const HybridGDNLayerState &state)
         {
@@ -826,9 +762,14 @@ namespace llaminar2
             uint8_t *&host_cursor,
             uint8_t *&device_cursor,
             void *stream,
-            bool include_host_state = true,
+            bool include_host_state = false,
             bool include_device_state = true) const
         {
+            if (include_host_state)
+                return false;
+            if (!include_device_state)
+                return true;
+
             for (int layer = 0; layer < total_layers_; ++layer)
             {
                 const int gdn_idx = layer_map_.toGDNIndex(layer);
@@ -836,98 +777,78 @@ namespace llaminar2
                     continue;
                 const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state.recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
-                if (include_host_state && recurrence_bytes > 0)
+                if (state.conv_kernel)
                 {
-                    if (!host_cursor ||
-                        !state.rec_kernel ||
-                        !state.rec_kernel->exportStateForSize(
-                            static_cast<int>(state.recurrence_state.size()),
+                    if (!exportDeviceBank(
+                            *state.conv_kernel,
+                            state.local_conv_state_size,
                             host_cursor,
-                            nullptr,
+                            device_cursor,
                             stream))
-                    {
                         return false;
-                    }
-                    host_cursor += recurrence_bytes;
-                }
-                if (include_host_state && conv_bytes > 0)
-                {
-                    if (!host_cursor ||
-                        !state.conv_kernel ||
-                        !state.conv_kernel->exportStateForSize(
-                            static_cast<int>(state.conv_state.size()),
+                    if (state.full_conv_state_size != state.local_conv_state_size &&
+                        !exportDeviceBank(
+                            *state.conv_kernel,
+                            state.full_conv_state_size,
                             host_cursor,
-                            nullptr,
+                            device_cursor,
                             stream))
-                    {
                         return false;
-                    }
-                    host_cursor += conv_bytes;
                 }
-
-                if (include_device_state && state.conv_kernel)
+                if (state.rec_kernel)
                 {
-                    const size_t bytes = fullConvStateBytes(state);
-                    if (bytes > 0)
-                    {
-                        const int state_size =
-                            static_cast<int>(bytes / sizeof(float));
-                        if (device_cursor)
-                        {
-                            if (!state.conv_kernel->exportStateForSize(
-                                    state_size,
-                                    nullptr,
-                                    device_cursor,
-                                    stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state.conv_kernel->exportStateForSize(
-                                    state_size,
-                                    host_cursor,
-                                    nullptr,
-                                    stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
-                }
-                if (include_device_state && state.rec_kernel)
-                {
-                    const size_t bytes = fullRecurrenceStateBytes(state);
-                    if (bytes > 0)
-                    {
-                        const int state_size =
-                            static_cast<int>(bytes / sizeof(float));
-                        if (device_cursor)
-                        {
-                            if (!state.rec_kernel->exportStateForSize(
-                                    state_size,
-                                    nullptr,
-                                    device_cursor,
-                                    stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state.rec_kernel->exportStateForSize(
-                                    state_size,
-                                    host_cursor,
-                                    nullptr,
-                                    stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
+                    if (!exportDeviceBank(
+                            *state.rec_kernel,
+                            state.local_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
+                    if (state.full_recurrence_state_size !=
+                            state.local_recurrence_state_size &&
+                        !exportDeviceBank(
+                            *state.rec_kernel,
+                            state.full_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
             }
+            return true;
+        }
+
+        /**
+         * @brief Export one kernel-owned state bank to device or archive memory.
+         *
+         * A non-null device cursor keeps live checkpoints device resident. A
+         * host cursor is accepted only as an explicit prefix-archive transport;
+         * it is never retained or adopted as live GPU state.
+         */
+        template <typename Kernel>
+        static bool exportDeviceBank(
+            Kernel &kernel,
+            int state_size,
+            uint8_t *&host_cursor,
+            uint8_t *&device_cursor,
+            void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            const size_t bytes = static_cast<size_t>(state_size) * sizeof(float);
+            if (device_cursor)
+            {
+                if (!kernel.exportStateForSize(
+                        state_size, nullptr, device_cursor, stream))
+                    return false;
+                device_cursor += bytes;
+                return true;
+            }
+            if (!host_cursor ||
+                !kernel.exportStateForSize(
+                    state_size, host_cursor, nullptr, stream))
+                return false;
+            host_cursor += bytes;
             return true;
         }
 
@@ -935,10 +856,14 @@ namespace llaminar2
             const uint8_t *&host_cursor,
             const uint8_t *&device_cursor,
             void *stream,
-            bool include_host_state = true,
-            bool include_device_state = true,
-            bool import_device_state_from_host_state = false)
+            bool include_host_state = false,
+            bool include_device_state = true)
         {
+            if (include_host_state)
+                return false;
+            if (!include_device_state)
+                return true;
+
             for (int layer = 0; layer < total_layers_; ++layer)
             {
                 const int gdn_idx = layer_map_.toGDNIndex(layer);
@@ -946,115 +871,72 @@ namespace llaminar2
                     continue;
                 auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state.recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
-                const uint8_t *recurrence_host_src = nullptr;
-                const uint8_t *conv_host_src = nullptr;
-                if ((include_host_state || import_device_state_from_host_state) &&
-                    recurrence_bytes > 0)
+                if (state.conv_kernel)
                 {
-                    recurrence_host_src = host_cursor;
-                    if (include_host_state)
-                    {
-                        std::memcpy(state.recurrence_state.data(), host_cursor, recurrence_bytes);
-                    }
-                    host_cursor += recurrence_bytes;
-                }
-                if ((include_host_state || import_device_state_from_host_state) &&
-                    conv_bytes > 0)
-                {
-                    conv_host_src = host_cursor;
-                    if (include_host_state)
-                    {
-                        std::memcpy(state.conv_state.data(), host_cursor, conv_bytes);
-                    }
-                    host_cursor += conv_bytes;
-                }
-
-                if (import_device_state_from_host_state)
-                {
-                    if ((recurrence_bytes > 0 &&
-                         (!recurrence_host_src ||
-                          !state.rec_kernel ||
-                          !state.rec_kernel->importStateForSize(
-                              static_cast<int>(state.recurrence_state.size()),
-                              recurrence_host_src,
-                              nullptr,
-                              stream))) ||
-                        (conv_bytes > 0 &&
-                         (!conv_host_src ||
-                          !state.conv_kernel ||
-                          !state.conv_kernel->importStateForSize(
-                              static_cast<int>(state.conv_state.size()),
-                              conv_host_src,
-                              nullptr,
-                              stream))))
-                    {
+                    if (!importDeviceBank(
+                            *state.conv_kernel,
+                            state.local_conv_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
                         return false;
-                    }
+                    if (state.full_conv_state_size != state.local_conv_state_size &&
+                        !importDeviceBank(
+                            *state.conv_kernel,
+                            state.full_conv_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
-
-                if (include_device_state && state.conv_kernel)
+                if (state.rec_kernel)
                 {
-                    const size_t bytes = fullConvStateBytes(state);
-                    if (bytes > 0)
-                    {
-                        const int state_size =
-                            static_cast<int>(bytes / sizeof(float));
-                        if (device_cursor)
-                        {
-                            if (!state.conv_kernel->importStateForSize(
-                                    state_size,
-                                    nullptr,
-                                    device_cursor,
-                                    stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state.conv_kernel->importStateForSize(
-                                    state_size,
-                                    host_cursor,
-                                    nullptr,
-                                    stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
-                }
-                if (include_device_state && state.rec_kernel)
-                {
-                    const size_t bytes = fullRecurrenceStateBytes(state);
-                    if (bytes > 0)
-                    {
-                        const int state_size =
-                            static_cast<int>(bytes / sizeof(float));
-                        if (device_cursor)
-                        {
-                            if (!state.rec_kernel->importStateForSize(
-                                    state_size,
-                                    nullptr,
-                                    device_cursor,
-                                    stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state.rec_kernel->importStateForSize(
-                                    state_size,
-                                    host_cursor,
-                                    nullptr,
-                                    stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
+                    if (!importDeviceBank(
+                            *state.rec_kernel,
+                            state.local_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
+                    if (state.full_recurrence_state_size !=
+                            state.local_recurrence_state_size &&
+                        !importDeviceBank(
+                            *state.rec_kernel,
+                            state.full_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
             }
+            return true;
+        }
+
+        /// @brief Import one serialized bank without ever retaining its host address.
+        template <typename Kernel>
+        static bool importDeviceBank(
+            Kernel &kernel,
+            int state_size,
+            const uint8_t *&host_cursor,
+            const uint8_t *&device_cursor,
+            void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            const size_t bytes = static_cast<size_t>(state_size) * sizeof(float);
+            if (device_cursor)
+            {
+                if (!kernel.importStateForSize(
+                        state_size, nullptr, device_cursor, stream))
+                    return false;
+                device_cursor += bytes;
+                return true;
+            }
+            if (!host_cursor ||
+                !kernel.importStateForSize(
+                    state_size, host_cursor, nullptr, stream))
+                return false;
+            host_cursor += bytes;
             return true;
         }
 
@@ -1121,7 +1003,7 @@ namespace llaminar2
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
                 state.full_recurrence_state_size = full_recurrence_state_size;
                 state.full_conv_state_size = full_conv_state_size;
-                state.initialize(qkv_dim);
+                state.initializeShape(qkv_dim);
             }
 
             LOG_DEBUG("[CUDAHybridRingKVCache] Created: " << total_layers_ << " total layers, "

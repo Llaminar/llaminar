@@ -813,7 +813,8 @@ namespace llaminar2
           mode_(ParallelismMode::TP), // Test factory currently only supports TP mode
           device_runners_(std::move(device_runners)),
           config_(config),
-          logits_backend_resolver_(resolveNoBackendForInjectedUnitTest)
+          logits_backend_resolver_(resolveNoBackendForInjectedUnitTest),
+          external_device_backend_access_enabled_(false)
     {
         // Initialize stage sharding map from model architecture (if registered)
         const auto arch = model_ctx_->architecture();
@@ -841,7 +842,8 @@ namespace llaminar2
                 if (device_runners_.size() > 1)
                 {
                     DeviceId primary_dev = device_runners_[0]->primaryDeviceId();
-                    if (primary_dev.is_gpu())
+                    if (external_device_backend_access_enabled_ &&
+                        primary_dev.is_gpu())
                     {
                         logits_gatherer_->pinForDevice(primary_dev);
                     }
@@ -1352,7 +1354,8 @@ namespace llaminar2
                 if (device_runners_.size() > 1)
                 {
                     DeviceId primary_dev = device_runners_[0]->primaryDeviceId();
-                    if (primary_dev.is_gpu())
+                    if (external_device_backend_access_enabled_ &&
+                        primary_dev.is_gpu())
                     {
                         logits_gatherer_->pinForDevice(primary_dev);
                     }
@@ -2716,7 +2719,10 @@ namespace llaminar2
                     if (!mmap_dontneed_advised_)
                     {
                         mmap_dontneed_advised_ = true;
-                        if (synchronizeGpuBackendsBeforeRankMmapRelease(config_))
+                        const bool device_writes_ready =
+                            !external_device_backend_access_enabled_ ||
+                            synchronizeGpuBackendsBeforeRankMmapRelease(config_);
+                        if (device_writes_ready)
                         {
                             if (debugEnv().vram_trace)
                                 LOG_TRACE("[VRAM_TRACE] rank_mmap_release.before_advise phase=after_first_prefill");
@@ -4149,48 +4155,6 @@ namespace llaminar2
         return handle;
     }
 
-    bool RankOrchestrator::hostLogicalStateMirrorsDeviceResidentState() const
-    {
-        if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
-        {
-            return pp_sidecar->hostLogicalStateMirrorsDeviceResidentState();
-        }
-        if (device_runners_.size() == 1 && device_runners_[0])
-        {
-            return device_runners_[0]
-                ->hostLogicalStateMirrorsDeviceResidentState();
-        }
-        if (device_runners_.size() < 2 ||
-            rank_resident_child_logical_state_handles_.size() !=
-                device_runners_.size())
-        {
-            return true;
-        }
-
-        /*
-         * The rank-owned mailbox is an identity token for LocalTP dispatch; the
-         * real logical rows live in child metadata buffers.  Treat the rank host
-         * mirrors as current only when every participant with a resident mailbox
-         * can make the same claim.  This keeps decode planning on the
-         * device-resident route after mirrored child publication.
-         */
-        for (size_t i = 0; i < device_runners_.size(); ++i)
-        {
-            const auto &child_handle =
-                rank_resident_child_logical_state_handles_[i];
-            if (!child_handle.valid())
-                return true;
-            if (!device_runners_[i])
-                return true;
-            if (!device_runners_[i]
-                     ->hostLogicalStateMirrorsDeviceResidentState())
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
     bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,
@@ -4549,8 +4513,7 @@ namespace llaminar2
         const DeviceResidentLogicalSequenceStateHandle &logical_state,
         int request_index,
         int already_appended_tokens,
-        bool allow_speculative_discard,
-        int position_offset_override)
+        bool allow_speculative_discard)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
@@ -4558,8 +4521,7 @@ namespace llaminar2
                 logical_state,
                 request_index,
                 already_appended_tokens,
-                allow_speculative_discard,
-                position_offset_override);
+                allow_speculative_discard);
         }
         if (device_runners_.size() != 1 || !device_runners_[0])
         {
@@ -4599,7 +4561,6 @@ namespace llaminar2
                  request_index,
                  already_appended_tokens,
                  allow_speculative_discard,
-                 position_offset_override,
                  kernel_phase,
                  rocm_phase,
                  cuda_phase,
@@ -4621,8 +4582,7 @@ namespace llaminar2
                                rank_resident_child_logical_state_handles_[i],
                                request_index,
                                already_appended_tokens,
-                               allow_speculative_discard,
-                               position_offset_override);
+                               allow_speculative_discard);
                 });
 
             bool all_success = true;
@@ -4664,8 +4624,7 @@ namespace llaminar2
             logical_state,
             request_index,
             already_appended_tokens,
-            allow_speculative_discard,
-            position_offset_override);
+            allow_speculative_discard);
     }
 
     bool RankOrchestrator::commitMTPShiftedRowsFromDeviceOutcome(
@@ -4674,9 +4633,7 @@ namespace llaminar2
         int already_appended_tokens,
         int max_state_commit_rows,
         int main_forward_token_count,
-        bool allow_speculative_discard,
-        int position_offset_override,
-        int already_appended_shifted_kv_tokens)
+        bool allow_speculative_discard)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
@@ -4686,9 +4643,7 @@ namespace llaminar2
                 already_appended_tokens,
                 max_state_commit_rows,
                 main_forward_token_count,
-                allow_speculative_discard,
-                position_offset_override,
-                already_appended_shifted_kv_tokens);
+                allow_speculative_discard);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
@@ -4698,9 +4653,7 @@ namespace llaminar2
                 already_appended_tokens,
                 max_state_commit_rows,
                 main_forward_token_count,
-                allow_speculative_discard,
-                position_offset_override,
-                already_appended_shifted_kv_tokens);
+                allow_speculative_discard);
         }
 
         const bool mirrored_child_outcome =
@@ -4747,8 +4700,6 @@ namespace llaminar2
              max_state_commit_rows,
              main_forward_token_count,
              allow_speculative_discard,
-             position_offset_override,
-             already_appended_shifted_kv_tokens,
              kernel_phase,
              rocm_phase,
              cuda_phase,
@@ -4772,9 +4723,7 @@ namespace llaminar2
                            already_appended_tokens,
                            max_state_commit_rows,
                            main_forward_token_count,
-                           allow_speculative_discard,
-                           position_offset_override,
-                           already_appended_shifted_kv_tokens);
+                           allow_speculative_discard);
             });
 
         bool all_success = true;
@@ -5209,8 +5158,7 @@ namespace llaminar2
         const DeviceSpeculativeOutcomeHandle &outcome,
         int request_index,
         int main_forward_token_count,
-        bool allow_speculative_discard,
-        int position_offset_override)
+        bool allow_speculative_discard)
     {
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
@@ -5231,8 +5179,7 @@ namespace llaminar2
                 outcome,
                 request_index,
                 main_forward_token_count,
-                allow_speculative_discard,
-                position_offset_override);
+                allow_speculative_discard);
         }
         if (device_runners_.empty())
             return false;
@@ -5246,8 +5193,7 @@ namespace llaminar2
                 outcome,
                 request_index,
                 main_forward_token_count,
-                allow_speculative_discard,
-                position_offset_override);
+                allow_speculative_discard);
         }
 
         const bool aggregate_checkpoint =
@@ -5314,7 +5260,6 @@ namespace llaminar2
              request_index,
              main_forward_token_count,
              allow_speculative_discard,
-             position_offset_override,
              kernel_phase,
              rocm_phase,
              cuda_phase,
@@ -5349,8 +5294,7 @@ namespace llaminar2
                     rank_mirrored_child_outcomes_[i],
                     request_index,
                     main_forward_token_count,
-                    allow_speculative_discard,
-                    position_offset_override);
+                    allow_speculative_discard);
             });
 
         bool all_success = true;
@@ -6742,7 +6686,7 @@ namespace llaminar2
             {
                 if (!info.gpu_ptr || !info.stream)
                     return false;
-                IBackend *backend = getBackendFor(*info.device);
+                IBackend *backend = resolveLogitsBackend(*info.device);
                 if (!backend)
                     return false;
 
@@ -6952,7 +6896,7 @@ namespace llaminar2
                 {
                     if (!info.gpu_ptr || !info.stream)
                         return false;
-                    IBackend *backend = getBackendFor(*info.device);
+                    IBackend *backend = resolveLogitsBackend(*info.device);
                     if (!backend)
                         return false;
                     const float *row_ptr =
@@ -8841,8 +8785,16 @@ namespace llaminar2
 
         const bool derive_thresholds =
             request.derive_thresholds_from_seed &&
+            request.draw_position_source ==
+                DeviceStochasticDrawPositionSource::HostLogicalPosition &&
             request.use_vllm_probability_rejection &&
-            request.inverse_sample_seed != 0;
+            request.inverse_sample_seed != 0 &&
+            request.inverse_sample_first_logical_position >= 0;
+        if (request.derive_thresholds_from_seed != derive_thresholds)
+        {
+            LOG_ERROR("[RankOrchestrator] CPU rank stochastic verifier cannot consume a device-owned draw-position descriptor");
+            return false;
+        }
         std::array<float, kSpeculativeBatchMaxRows> accept_thresholds{};
         std::array<float, kSpeculativeBatchMaxRows> residual_thresholds{};
         for (int row = 0; row < request.row_count; ++row)
@@ -12392,6 +12344,16 @@ namespace llaminar2
             tp_ctx_->synchronize();
         }
 
+        /*
+         * createForTest() may inject runners whose placement metadata names a
+         * CUDA or ROCm device.  Those identifiers are policy fixtures, not live
+         * hardware ownership.  The injected LocalTP context above is host-only,
+         * and the unit-test boundary must end before BackendManager lookup so
+         * teardown cannot create a physical GPU context as a side effect.
+         */
+        if (!external_device_backend_access_enabled_)
+            return;
+
         auto synchronize_runner_device =
             [](const std::unique_ptr<IInferenceRunner> &runner)
         {
@@ -12428,6 +12390,13 @@ namespace llaminar2
             }
             synchronize_runner_device(runner);
         }
+    }
+
+    IBackend *RankOrchestrator::resolveLogitsBackend(DeviceId device) const
+    {
+        if (logits_backend_resolver_)
+            return logits_backend_resolver_(device);
+        return getBackendFor(device);
     }
 
     MoERebalanceController *RankOrchestrator::moeRebalanceController() const

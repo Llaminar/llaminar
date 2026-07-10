@@ -22,6 +22,8 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
+#include "../../../kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -62,6 +64,7 @@ namespace llaminar2
 {
     // Alias for fully-qualified KernelFactory access
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
+    using cpu::native_vnni::CPUNativeVNNIGemmKernel;
 
     namespace
     {
@@ -1727,9 +1730,15 @@ namespace llaminar2
         if (!waitForPendingGpuDirectTransfers())
             return false;
 
-        if (!raw_weights_released_ && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
+        const bool has_complete_expert_views =
+            params_.expert_gate_views.size() == static_cast<size_t>(params_.num_experts) &&
+            params_.expert_up_views.size() == static_cast<size_t>(params_.num_experts) &&
+            params_.expert_down_views.size() == static_cast<size_t>(params_.num_experts);
+        if (!raw_weights_released_ &&
+            (!params_.gate_exps || !params_.up_exps || !params_.down_exps) &&
+            !has_complete_expert_views)
         {
-            LOG_ERROR("[MoEExpertComputeStage] Null expert weight tensors");
+            LOG_ERROR("[MoEExpertComputeStage] Missing both raw expert tensors and complete pre-extracted expert views");
             return false;
         }
 
@@ -2702,9 +2711,9 @@ namespace llaminar2
 
         // ---------------------------------------------------------------
         // Phase 1: Batch all experts' gate+up into ONE fused GEMV call.
-        // This quantizes the input to Q8_1 once (not 8×) and uses a single
-        // OMP parallel region (not 8×), saving ~7×(2µs quant + 6µs OMP)
-        // = ~56µs per layer × 36 MoE layers = ~2ms per decode token.
+        // CPU NativeVNNI consumes the Q8_1 row already published by routing;
+        // GPU and floating CPU bundles retain their backend-native activation
+        // preparation.  Every route still uses one parallel projection region.
         // ---------------------------------------------------------------
         struct ActiveExpert
         {
@@ -2819,12 +2828,91 @@ namespace llaminar2
             num_active++;
         }
 
-        // Single fused call: quantize once + single OMP region for all gate+up
+        // Single fused call: router-Q8 reuse on CPU NativeVNNI, then one
+        // projection region for every active expert's gate/up pair.
         if (num_active > 0)
         {
-            if (!batch_projections_[0].kernel->multiply_fused_tensor(
-                    input_tensor, batch_projections_, /*m=*/1, d_model,
-                    nullptr, getWorkspace()))
+            bool projected = false;
+            if (!is_gpu)
+            {
+                bool any_native = false;
+                bool all_native = true;
+                for (const auto &projection : batch_projections_)
+                {
+                    const bool native =
+                        dynamic_cast<CPUNativeVNNIGemmKernel *>(projection.kernel) != nullptr;
+                    any_native = any_native || native;
+                    all_native = all_native && native;
+                }
+                if (any_native != all_native)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU decode cannot mix "
+                              "NativeVNNI and floating gate/up projection contracts in layer "
+                              << params_.layer_idx);
+                    return false;
+                }
+
+                if (all_native)
+                {
+                    auto *cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
+                    auto *native_gate = dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                        batch_projections_[0].kernel);
+                    const float *input_rows = input_tensor->data();
+                    const Q8_1Block *published_router_q8 =
+                        cpu_moe_kernel && input_rows
+                            ? cpu_moe_kernel->publishedRouterQ8Hidden(
+                                  input_rows,
+                                  /*rows=*/1,
+                                  d_model)
+                            : nullptr;
+                    if (!native_gate || !published_router_q8)
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI decode is "
+                                  "missing its router Q8_1 publication for layer "
+                                  << params_.layer_idx);
+                        return false;
+                    }
+                    projected =
+                        native_gate->multiply_fused_router_q8_hidden_decode_equivalent(
+                            published_router_q8,
+                            batch_projections_,
+                            /*m=*/1,
+                            d_model);
+                    if (projected)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "cpu_moe_decode_router_q8_reuse_calls",
+                            1.0,
+                            "moe",
+                            "cpu",
+                            {{"top_k", std::to_string(top_k)},
+                             {"active_experts", std::to_string(num_active)}});
+                    }
+                }
+                else
+                {
+                    projected = batch_projections_[0].kernel->multiply_fused_tensor(
+                        input_tensor,
+                        batch_projections_,
+                        /*m=*/1,
+                        d_model,
+                        nullptr,
+                        getWorkspace());
+                }
+            }
+            else
+            {
+                projected = batch_projections_[0].kernel->multiply_fused_tensor(
+                    input_tensor,
+                    batch_projections_,
+                    /*m=*/1,
+                    d_model,
+                    nullptr,
+                    getWorkspace());
+            }
+
+            if (!projected)
             {
                 LOG_ERROR("[MoEExpertComputeStage] Decode gate/up batched projection failed for layer "
                           << params_.layer_idx);
@@ -3218,6 +3306,70 @@ namespace llaminar2
             return true;
         }
 
+        /*
+         * NativeVNNI gate/up projections all consume the same Q8_1 activation
+         * contract.  Require the immediately preceding CPU router publication
+         * once for the complete verifier batch, then gather blocks from it for
+         * each expert chunk.  Floating-point expert bundles retain their own
+         * grouped implementation; mixing the two contracts within one routed
+         * layer is rejected because it would make publication semantics depend
+         * on which expert happened to win top-k.
+         */
+        bool any_native_gateup = false;
+        bool all_native_gateup = true;
+        for (int expert_id : active_experts)
+        {
+            const bool native_gate =
+                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    cached_gate_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
+            const bool native_up =
+                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    cached_up_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
+            if (native_gate != native_up)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier found mixed "
+                          "gate/up kernel contracts for expert "
+                          << expert_id << " layer=" << params_.layer_idx);
+                return false;
+            }
+            any_native_gateup = any_native_gateup || native_gate;
+            all_native_gateup = all_native_gateup && native_gate;
+        }
+        if (any_native_gateup != all_native_gateup)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier cannot mix "
+                      "NativeVNNI and floating expert gate/up contracts in layer "
+                      << params_.layer_idx);
+            return false;
+        }
+
+        const Q8_1Block *published_router_q8 = nullptr;
+        const int router_q8_blocks_per_row =
+            (d_model + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        if (all_native_gateup)
+        {
+            auto *cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
+            const float *input_rows = params_.input->data();
+            if (!cpu_moe_kernel || !input_rows)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped verifier "
+                          "requires the production CPUMoEKernel router");
+                return false;
+            }
+            published_router_q8 = cpu_moe_kernel->publishedRouterQ8Hidden(
+                input_rows,
+                seq_len,
+                d_model);
+            if (!published_router_q8)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped verifier "
+                          "is missing the matching router Q8_1 publication for layer "
+                          << params_.layer_idx << " seq_len=" << seq_len
+                          << " d_model=" << d_model);
+                return false;
+            }
+        }
+
         std::vector<float> route_slot_outputs(
             local_slots.size() * static_cast<size_t>(d_model),
             0.0f);
@@ -3236,7 +3388,7 @@ namespace llaminar2
 
         auto ensure_cpu_scratch = [&](int rows) -> bool
         {
-            if (!scratch_has_shape(scratch_batch_, rows, d_model))
+            if (!all_native_gateup && !scratch_has_shape(scratch_batch_, rows, d_model))
                 scratch_batch_ = makeScratchFP32(rows, d_model, params_.device_id);
             if (!scratch_has_shape(scratch_gate_, rows, intermediate))
                 scratch_gate_ = makeScratchFP32(rows, intermediate, params_.device_id);
@@ -3245,8 +3397,17 @@ namespace llaminar2
             if (!scratch_has_shape(scratch_out_, rows, d_model))
                 scratch_out_ = makeScratchFP32(rows, d_model, params_.device_id);
             scratch_capacity_ = std::max(scratch_capacity_, rows);
-            return scratch_batch_ && scratch_gate_ && scratch_up_ && scratch_out_;
+            return (all_native_gateup || scratch_batch_) &&
+                   scratch_gate_ && scratch_up_ && scratch_out_;
         };
+
+        std::vector<Q8_1Block> gathered_router_q8;
+        if (all_native_gateup)
+        {
+            gathered_router_q8.resize(
+                static_cast<size_t>(4) *
+                static_cast<size_t>(router_q8_blocks_per_row));
+        }
 
         for (int expert_id : active_experts)
         {
@@ -3278,33 +3439,72 @@ namespace llaminar2
                         local_slots[static_cast<size_t>(local_slot)].row;
                 }
 
-                kernel->gatherTokenBatchFromTensors(
-                    params_.input,
-                    scratch_batch_.get(),
-                    token_indices.data(),
-                    chunk_rows,
-                    d_model);
+                if (all_native_gateup)
+                {
+                    for (int i = 0; i < chunk_rows; ++i)
+                    {
+                        const Q8_1Block *source_row =
+                            published_router_q8 +
+                            static_cast<size_t>(token_indices[static_cast<size_t>(i)]) *
+                                static_cast<size_t>(router_q8_blocks_per_row);
+                        Q8_1Block *destination_row =
+                            gathered_router_q8.data() +
+                            static_cast<size_t>(i) *
+                                static_cast<size_t>(router_q8_blocks_per_row);
+                        std::copy_n(
+                            source_row,
+                            router_q8_blocks_per_row,
+                            destination_row);
+                    }
+                }
+                else
+                {
+                    kernel->gatherTokenBatchFromTensors(
+                        params_.input,
+                        scratch_batch_.get(),
+                        token_indices.data(),
+                        chunk_rows,
+                        d_model);
+                }
 
-                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                    {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"},
-                    {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"}};
+                batch_projections_.clear();
+                batch_projections_.push_back(
+                    {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"});
+                batch_projections_.push_back(
+                    {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"});
 
-                const bool projected =
-                    chunk_rows > 1
-                        ? gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
-                              scratch_batch_.get(),
-                              projections,
-                              chunk_rows,
-                              d_model,
-                              nullptr,
-                              getWorkspace())
-                        : gate_gemm->multiply_fused_tensor(
-                              scratch_batch_.get(),
-                              projections,
-                              chunk_rows,
-                              d_model,
-                              nullptr,
-                              getWorkspace());
+                bool projected = false;
+                if (all_native_gateup)
+                {
+                    auto *native_gate =
+                        dynamic_cast<CPUNativeVNNIGemmKernel *>(gate_gemm);
+                    projected = native_gate &&
+                                native_gate->multiply_fused_router_q8_hidden_decode_equivalent(
+                                    gathered_router_q8.data(),
+                                    batch_projections_,
+                                    chunk_rows,
+                                    d_model);
+                }
+                else if (chunk_rows > 1)
+                {
+                    projected = gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
+                        scratch_batch_.get(),
+                        batch_projections_,
+                        chunk_rows,
+                        d_model,
+                        nullptr,
+                        getWorkspace());
+                }
+                else
+                {
+                    projected = gate_gemm->multiply_fused_tensor(
+                        scratch_batch_.get(),
+                        batch_projections_,
+                        chunk_rows,
+                        d_model,
+                        nullptr,
+                        getWorkspace());
+                }
                 if (!projected)
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier gate/up projection failed"
@@ -3402,6 +3602,19 @@ namespace llaminar2
              {"active_experts", std::to_string(active_experts.size())},
              {"seq_len", std::to_string(seq_len)},
              {"top_k", std::to_string(top_k)}});
+        if (all_native_gateup)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_moe_grouped_verifier_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                "cpu",
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"active_experts", std::to_string(active_experts.size())},
+                 {"route", "cpu_expert_slot_grouped"}});
+        }
         return true;
     }
 

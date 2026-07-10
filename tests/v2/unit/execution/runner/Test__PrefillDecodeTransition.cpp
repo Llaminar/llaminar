@@ -42,6 +42,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -64,6 +66,17 @@ namespace
             seed,
             logical_position,
             purpose);
+    }
+
+    /**
+     * @brief Return the native FP32 representation for strict RNG comparisons.
+     *
+     * Stochastic MTP thresholds are publication inputs, so an ULP-tolerant
+     * matcher is too weak: this helper lets focused tests require all 32 bits.
+     */
+    uint32_t floatBytes(float value)
+    {
+        return std::bit_cast<uint32_t>(value);
     }
 
     class ScopedEnv
@@ -258,7 +271,12 @@ namespace
             ++forward_with_device_token_ids_count_;
             last_forward_device_token_ids_ = token_ids_device;
             last_forward_device_token_seq_len_ = padded_seq_len;
-            return token_ids_device && forward_batch(token_batches);
+            if (!token_ids_device)
+                return false;
+            forward_batch_uses_device_token_ids_ = true;
+            const bool ok = forward_batch(token_batches);
+            forward_batch_uses_device_token_ids_ = false;
+            return ok;
         }
 
         const void *prepareMTPVerifierInputTokensOnDevice(
@@ -1021,9 +1039,15 @@ namespace
                     }
                 }
             }
-            resident_logical_state_request_count_ = plans.request_count;
-            resident_logical_state_valid_ = true;
-            resident_logical_state_host_mirror_current_ = true;
+            /*
+             * This mock method represents the CPU/host grouped publisher. It
+             * may update ordinary logical getters, but it must not fabricate a
+             * device mailbox. GPU production tests use
+             * publishAcceptedMTPSpecStateBatchFromDeviceOutcome(), which owns
+             * the event-backed resident rows below.
+             */
+            resident_logical_state_request_count_ = 0;
+            resident_logical_state_valid_ = false;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -1056,13 +1080,20 @@ namespace
                     *error = "mock device-resident MTP publication request is invalid";
                 return false;
             }
-            if (primary_device_.is_gpu() && !request.base_cached_tokens.empty())
+            const DeviceResidentMTPTransactionLease &transaction =
+                request.outcome.mtp_transaction;
+            if (!transaction.valid() ||
+                transaction.state->device != primary_device_ ||
+                transaction.state->request_count != request.request_count ||
+                !transaction.state->coversDepth(0))
             {
                 if (error)
                     *error =
-                        "mock GPU device-resident MTP publication forbids host base-cache vectors";
+                        "mock GPU publication requires its outcome transaction lease";
                 return false;
             }
+            const int *base_cached_tokens_device =
+                transaction.state->cachedTokensForDepth(0);
 
             const int *meta = request.outcome.meta_device;
             for (int request_index = 0;
@@ -1080,13 +1111,13 @@ namespace
                     return false;
                 }
                 const int base_cached_tokens =
-                    !request.base_cached_tokens.empty()
-                        ? request.base_cached_tokens[static_cast<size_t>(request_index)]
-                        : (resident_base_cached_tokens_[static_cast<size_t>(request_index)] >= 0
-                               ? resident_base_cached_tokens_[static_cast<size_t>(request_index)]
-                               : (request_index < static_cast<int>(sequence_lengths_.size())
-                                      ? sequence_lengths_[static_cast<size_t>(request_index)]
-                                      : position_));
+                    base_cached_tokens_device[request_index];
+                if (base_cached_tokens < 0)
+                {
+                    if (error)
+                        *error = "mock transaction has no resident verifier-base count";
+                    return false;
+                }
                 const int target_cached_tokens =
                     base_cached_tokens +
                     row_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
@@ -1137,7 +1168,6 @@ namespace
             }
             resident_logical_state_request_count_ = request.request_count;
             resident_logical_state_valid_ = true;
-            resident_logical_state_host_mirror_current_ = false;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -1171,18 +1201,11 @@ namespace
             return handle;
         }
 
-        bool hostLogicalStateMirrorsDeviceResidentState() const override
-        {
-            return !resident_logical_state_valid_ ||
-                   resident_logical_state_host_mirror_current_;
-        }
-
         bool commitMTPShiftedRowFromDeviceResidentLogicalState(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override
+            bool allow_speculative_discard = false) override
         {
             ++resident_logical_state_shifted_commit_count_;
             if (!logical_state.coversRequest(request_index) ||
@@ -1207,13 +1230,14 @@ namespace
             last_commit_mtp_main_forward_token_count_ = 0;
             last_commit_mtp_allow_speculative_discard_ =
                 allow_speculative_discard;
-            last_commit_mtp_position_offset_override_ =
-                position_offset_override;
+            const int position_offset =
+                logical_state.target_positions_device[request_index];
+            last_commit_mtp_position_offset_override_ = position_offset;
             last_commit_mtp_tokens_.assign(1, token);
             last_resident_logical_state_shifted_commit_token_ = token;
             return appendOneShiftedMTPRow(
                 already_appended_tokens,
-                position_offset_override,
+                position_offset,
                 allow_speculative_discard);
         }
 
@@ -1222,8 +1246,7 @@ namespace
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override
+            bool allow_speculative_discard = false) override
         {
             using namespace sampling_math;
             ++device_outcome_initial_shifted_commit_count_;
@@ -1237,13 +1260,6 @@ namespace
             {
                 return false;
             }
-            if (position_offset_override >= 0 &&
-                position_offset_override !=
-                    static_cast<int>(checkpoint.cached_tokens))
-            {
-                return false;
-            }
-
             const int *meta =
                 outcome.meta_device +
                 static_cast<size_t>(request_index) *
@@ -1257,6 +1273,10 @@ namespace
                     static_cast<size_t>(outcome.output_token_stride);
             const int output_count = meta[kSpecBatchMetaOutputCount];
             const int32_t token = output_count > 0 ? tokens[0] : 0;
+            const int resident_base_position =
+                resident_base_cached_tokens_[static_cast<size_t>(request_index)];
+            if (resident_base_position < 0)
+                return false;
 
             ++commit_mtp_shifted_count_;
             last_commit_mtp_already_appended_ = 0;
@@ -1264,15 +1284,18 @@ namespace
                 main_forward_token_count;
             last_commit_mtp_allow_speculative_discard_ =
                 allow_speculative_discard;
-            last_commit_mtp_position_offset_override_ =
-                position_offset_override;
+            /*
+             * This array models the GPU metadata row captured immediately
+             * before verifier replay. The checkpoint remains responsible for
+             * terminal hidden only; its host cached-token field is deliberately
+             * not consulted by the device-outcome publication mock.
+             */
+            last_commit_mtp_position_offset_override_ = resident_base_position;
             last_commit_mtp_already_appended_shifted_kv_ = 0;
             last_commit_mtp_tokens_.assign(1, token);
             return appendOneShiftedMTPRow(
                 /*already_appended_tokens=*/0,
-                position_offset_override >= 0
-                    ? position_offset_override
-                    : static_cast<int>(checkpoint.cached_tokens),
+                resident_base_position,
                 allow_speculative_discard);
         }
 
@@ -1282,9 +1305,7 @@ namespace
             int already_appended_tokens,
             int max_state_commit_rows,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1,
-            int already_appended_shifted_kv_tokens = -1) override
+            bool allow_speculative_discard = false) override
         {
             using namespace sampling_math;
             ++device_outcome_shifted_commit_count_;
@@ -1342,21 +1363,24 @@ namespace
                 main_forward_token_count;
             last_commit_mtp_allow_speculative_discard_ =
                 allow_speculative_discard;
-            last_commit_mtp_position_offset_override_ =
-                position_offset_override;
+            const int resident_base_position =
+                resident_base_cached_tokens_[static_cast<size_t>(request_index)];
+            if (resident_base_position < 0)
+                return false;
+            last_commit_mtp_position_offset_override_ = resident_base_position;
             last_commit_mtp_already_appended_shifted_kv_ =
-                already_appended_shifted_kv_tokens;
+                already_appended_tokens;
 
-            const int position_offset =
-                position_offset_override >= 0
-                    ? position_offset_override
-                    : position_;
-            const int resident_shifted_kv_tokens =
-                already_appended_shifted_kv_tokens >= 0
-                    ? already_appended_shifted_kv_tokens
-                    : already_appended_tokens;
+            /*
+             * Production selects this boundary from the shifted cache's
+             * canonical device counter and composes the suffix offset with the
+             * resident verifier base. Model that transaction directly instead
+             * of reusing position_, which verifier forward_batch() has already
+             * advanced beyond the pre-verifier boundary.
+             */
             const int expected_before =
-                std::max(0, position_offset - 1 + resident_shifted_kv_tokens);
+                std::max(0,
+                         resident_base_position - 1 + already_appended_tokens);
             if (mtp_shifted_cached_tokens_ > expected_before)
             {
                 if (!allow_speculative_discard)
@@ -1420,21 +1444,33 @@ namespace
             return true;
         }
 
-        bool forwardMTPBatchAndSampleGreedyToDeviceDraftSlots(
-            const int32_t *draft_condition_tokens,
-            const int *position_ids,
+        bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
             int first_draft_slot,
-            int slot_stride,
-            int32_t *out_tokens) override
+            int slot_stride) override
         {
-            ++forward_mtp_batch_and_sample_to_device_draft_slots_count_;
+            ++forward_mtp_batch_from_resident_state_to_device_draft_slots_count_;
             last_mtp_batch_device_draft_first_slot_ = first_draft_slot;
             last_mtp_batch_device_draft_slot_stride_ = slot_stride;
+            last_mtp_batch_resident_condition_tokens_.clear();
+            last_mtp_batch_resident_position_ids_.clear();
             const int last_slot =
                 first_draft_slot +
                 (request_batch > 0 ? (request_batch - 1) * slot_stride : 0);
-            if (first_draft_slot < 0 ||
+            if (!mtp_enabled_ ||
+                !supports_mtp_device_draft_token_input_ ||
+                !primary_device_.is_gpu() ||
+                !logical_state.valid() ||
+                !logical_state.coversRequest(request_batch - 1) ||
+                logical_state.device != primary_device_ ||
+                logical_state.target_positions_device !=
+                    resident_target_positions_.data() ||
+                logical_state.next_condition_tokens_device !=
+                    resident_next_condition_tokens_.data() ||
+                request_batch <= 0 ||
+                request_batch > batch_capacity_ ||
+                first_draft_slot < 0 ||
                 slot_stride <= 0 ||
                 last_slot >=
                     static_cast<int>(device_draft_sample_tokens_.size()))
@@ -1442,27 +1478,23 @@ namespace
                 return false;
             }
 
-            std::array<int32_t, 8> shadow{};
-            shadow.fill(-1);
-            if (!forwardMTPBatchAndSampleGreedy(
-                    draft_condition_tokens,
-                    position_ids,
-                    request_batch,
-                    shadow.data()))
+            for (int request = 0; request < request_batch; ++request)
             {
-                return false;
-            }
-
-            for (int i = 0; i < request_batch; ++i)
-            {
-                const int32_t token = shadow[static_cast<size_t>(i)];
-                if (token < 0)
+                const int32_t condition =
+                    logical_state.next_condition_tokens_device[request];
+                const int32_t position =
+                    logical_state.target_positions_device[request];
+                if (condition < 0 || position < 0)
                     return false;
+                last_mtp_batch_resident_condition_tokens_.push_back(condition);
+                last_mtp_batch_resident_position_ids_.push_back(position);
                 device_draft_sample_tokens_[
-                    static_cast<size_t>(first_draft_slot + i * slot_stride)] = token;
-                if (out_tokens)
-                    out_tokens[i] = token;
+                    static_cast<size_t>(
+                        first_draft_slot + request * slot_stride)] =
+                    MTP_ARGMAX_TOKEN;
             }
+            mtp_logits_.assign(VOCAB_SIZE, -10.0f);
+            mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
             return true;
         }
 
@@ -1503,48 +1535,81 @@ namespace
             return true;
         }
 
-        bool forwardMTPBatchFromLastDraftAndSampleGreedyToDeviceDraftSlots(
-            const int32_t *draft_condition_tokens,
-            const int *position_ids,
+        bool forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
+            int first_condition_slot,
+            int condition_slot_stride,
+            int position_offset,
             int first_draft_slot,
-            int slot_stride,
-            int32_t *out_tokens) override
+            int draft_slot_stride) override
         {
-            ++forward_mtp_batch_from_last_draft_and_sample_to_device_draft_slots_count_;
+            ++forward_mtp_batch_from_device_draft_slots_to_device_draft_slots_count_;
+            last_chained_mtp_batch_device_condition_first_slots_.push_back(
+                first_condition_slot);
+            last_chained_mtp_batch_device_condition_slot_strides_.push_back(
+                condition_slot_stride);
+            last_chained_mtp_batch_device_position_offsets_.push_back(
+                position_offset);
             last_chained_mtp_batch_device_draft_first_slots_.push_back(first_draft_slot);
-            last_chained_mtp_batch_device_draft_slot_strides_.push_back(slot_stride);
-            const int last_slot =
+            last_chained_mtp_batch_device_draft_slot_strides_.push_back(
+                draft_slot_stride);
+            const int last_condition_slot =
+                first_condition_slot +
+                (request_batch > 0
+                     ? (request_batch - 1) * condition_slot_stride
+                     : 0);
+            const int last_draft_slot =
                 first_draft_slot +
-                (request_batch > 0 ? (request_batch - 1) * slot_stride : 0);
-            if (first_draft_slot < 0 ||
-                slot_stride <= 0 ||
-                last_slot >= static_cast<int>(device_draft_sample_tokens_.size()))
+                (request_batch > 0
+                     ? (request_batch - 1) * draft_slot_stride
+                     : 0);
+            if (!mtp_enabled_ ||
+                !supports_chained_mtp_drafts_ ||
+                !supports_mtp_device_draft_token_input_ ||
+                !primary_device_.is_gpu() ||
+                !logical_state.valid() ||
+                !logical_state.coversRequest(request_batch - 1) ||
+                logical_state.device != primary_device_ ||
+                logical_state.target_positions_device !=
+                    resident_target_positions_.data() ||
+                request_batch <= 0 ||
+                request_batch > batch_capacity_ ||
+                first_condition_slot < 0 ||
+                condition_slot_stride <= 0 ||
+                last_condition_slot >=
+                    static_cast<int>(device_draft_sample_tokens_.size()) ||
+                position_offset <= 0 ||
+                first_draft_slot < 0 ||
+                draft_slot_stride <= 0 ||
+                last_draft_slot >=
+                    static_cast<int>(device_draft_sample_tokens_.size()))
             {
                 return false;
             }
 
-            std::array<int32_t, 8> shadow{};
-            shadow.fill(-1);
-            if (!forwardMTPBatchFromLastDraftAndSampleGreedy(
-                    draft_condition_tokens,
-                    position_ids,
-                    request_batch,
-                    shadow.data()))
+            last_chained_mtp_batch_condition_tokens_.clear();
+            last_chained_mtp_batch_position_ids_.clear();
+            for (int request = 0; request < request_batch; ++request)
             {
-                return false;
-            }
-
-            for (int i = 0; i < request_batch; ++i)
-            {
-                const int32_t token = shadow[static_cast<size_t>(i)];
-                if (token < 0)
+                const int source_slot =
+                    first_condition_slot + request * condition_slot_stride;
+                const int32_t condition =
+                    device_draft_sample_tokens_[static_cast<size_t>(source_slot)];
+                const int32_t position =
+                    logical_state.target_positions_device[request] +
+                    position_offset;
+                if (condition < 0 || position < 0)
                     return false;
+                last_chained_mtp_batch_condition_tokens_.push_back(condition);
+                last_chained_mtp_batch_position_ids_.push_back(position);
                 device_draft_sample_tokens_[
-                    static_cast<size_t>(first_draft_slot + i * slot_stride)] = token;
-                if (out_tokens)
-                    out_tokens[i] = token;
+                    static_cast<size_t>(
+                        first_draft_slot + request * draft_slot_stride)] =
+                    MTP_ARGMAX_TOKEN;
             }
+            mtp_logits_.assign(VOCAB_SIZE, -10.0f);
+            mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
             return true;
         }
 
@@ -1842,6 +1907,39 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Return the mock runner's request-scoped shifted-KV transaction.
+         *
+         * The unit mock stores its fake device rows in ordinary test memory, but
+         * it preserves the production ownership model: outcomes carry a shared
+         * lease naming the canonical depth count row and its latest event fence.
+         * No publication request receives a parallel host count payload.
+         */
+        DeviceResidentMTPTransactionLease makeMockMTPTransactionLease(
+            int request_count)
+        {
+            if (!mock_mtp_transaction_)
+            {
+                mock_mtp_transaction_ =
+                    std::make_shared<DeviceResidentMTPTransactionState>();
+            }
+            mock_mtp_transaction_->device = primary_device_;
+            mock_mtp_transaction_->request_count = request_count;
+            auto &depth_counts =
+                mock_mtp_transaction_->shifted_cached_tokens_device_by_depth;
+            depth_counts.clear();
+            depth_counts.push_back(resident_base_cached_tokens_.data());
+            mock_mtp_transaction_->producer_stream = &resident_stream_token_;
+            mock_mtp_transaction_->ready_event =
+                std::shared_ptr<void>(
+                    &resident_outcome_response_ready_event_token_,
+                    [](void *) {});
+            mock_mtp_transaction_->session_epoch = 1;
+            ++mock_mtp_transaction_->mutation_generation;
+            return DeviceResidentMTPTransactionLease{
+                .state = mock_mtp_transaction_};
+        }
+
         bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
             const int32_t *draft_tokens,
             int draft_token_count,
@@ -1903,6 +2001,8 @@ namespace
                 std::shared_ptr<void>(
                     &resident_outcome_response_ready_event_token_,
                     [](void *) {});
+            out_handle->mtp_transaction =
+                makeMockMTPTransactionLease(/*request_count=*/1);
             return out_handle->valid();
         }
 
@@ -1929,6 +2029,8 @@ namespace
             last_request_batch_outcome_inverse_sample_seeds_.clear();
             last_request_batch_outcome_inverse_sample_first_positions_.clear();
             last_request_batch_outcome_derived_thresholds_.clear();
+            last_request_batch_outcome_resident_threshold_positions_.clear();
+            last_request_batch_outcome_effective_first_positions_.clear();
             last_request_batch_outcome_serial_sample_equivalent_.clear();
             last_request_batch_outcome_sample_thresholds_.clear();
             if (!requests ||
@@ -1970,7 +2072,7 @@ namespace
                 last_request_batch_outcome_first_tokens_.push_back(
                     request.first_token);
                 last_request_batch_outcome_first_tokens_from_device_.push_back(
-                    false);
+                    true);
                 last_request_batch_outcome_token_row_offsets_.push_back(
                     request.token_row_offset);
                 last_request_batch_outcome_token_row_strides_.push_back(
@@ -2080,6 +2182,8 @@ namespace
                 std::shared_ptr<void>(
                     &resident_outcome_response_ready_event_token_,
                     [](void *) {});
+            out_handle->mtp_transaction =
+                makeMockMTPTransactionLease(request_count);
             return out_handle->valid();
         }
 
@@ -2173,27 +2277,44 @@ namespace
             int request_count,
             const SamplingParams &params,
             int32_t *out_tokens,
-            const float *stochastic_thresholds = nullptr) override
+            const uint64_t *stochastic_position_seeds = nullptr) override
         {
             ++sample_main_logits_batch_rows_count_;
             last_main_logits_batch_sampling_params_ = params;
             last_main_logits_batch_request_count_ = request_count;
             last_main_logits_batch_thresholds_.clear();
-            if (stochastic_thresholds && request_count > 0)
-            {
-                last_main_logits_batch_thresholds_.assign(
-                    stochastic_thresholds,
-                    stochastic_thresholds + request_count);
-            }
+            last_main_logits_batch_position_seeds_.clear();
+            last_main_logits_batch_resident_positions_.clear();
             if (!supports_main_logits_batch_rows_on_device_ ||
                 !primary_device_.is_gpu() ||
                 request_count <= 0 ||
                 !out_tokens ||
                 padded_seq_len_ <= 0 ||
                 static_cast<int>(sequence_lengths_.size()) < request_count ||
-                batch_logits_.empty())
+                batch_logits_.empty() ||
+                (!params.is_greedy() && !stochastic_position_seeds))
             {
                 return false;
+            }
+
+            if (!params.is_greedy())
+            {
+                for (int request = 0; request < request_count; ++request)
+                {
+                    const uint64_t seed = stochastic_position_seeds[request];
+                    const int resident_position =
+                        sequence_lengths_[static_cast<size_t>(request)];
+                    if (seed == 0 || resident_position < 0)
+                        return false;
+                    last_main_logits_batch_position_seeds_.push_back(seed);
+                    last_main_logits_batch_resident_positions_.push_back(
+                        resident_position);
+                    last_main_logits_batch_thresholds_.push_back(
+                        sampling_math::mtp_spec_threshold_from_seed(
+                            seed,
+                            resident_position,
+                            0 /* MTPSpecStochasticDrawPurpose::Sample */));
+                }
             }
 
             for (int request = 0; request < request_count; ++request)
@@ -2211,6 +2332,27 @@ namespace
                     return false;
                 out_tokens[request] = static_cast<int32_t>(
                     greedyArgmax(batch_logits_.data() + offset, VOCAB_SIZE));
+                device_target_sample_tokens_[static_cast<size_t>(request)] =
+                    out_tokens[request];
+            }
+
+            if (supports_device_resident_mtp_spec_state_publication_ &&
+                supports_mtp_device_draft_token_input_)
+            {
+                for (int request = 0; request < request_count; ++request)
+                {
+                    const size_t idx = static_cast<size_t>(request);
+                    resident_base_cached_tokens_[idx] = sequence_lengths_[idx];
+                    resident_target_positions_[idx] = sequence_lengths_[idx];
+                    resident_target_sequence_lengths_[idx] = sequence_lengths_[idx];
+                    resident_accepted_state_counts_[idx] = 0;
+                    resident_next_condition_tokens_[idx] = out_tokens[request];
+                    resident_all_drafts_accepted_flags_[idx] = 0;
+                    resident_stopped_flags_[idx] = 0;
+                    resident_publication_ok_flags_[idx] = 1;
+                }
+                resident_logical_state_request_count_ = request_count;
+                resident_logical_state_valid_ = true;
             }
             return true;
         }
@@ -2950,6 +3092,8 @@ namespace
             last_request_batch_outcome_inverse_sample_seeds_.clear();
             last_request_batch_outcome_inverse_sample_first_positions_.clear();
             last_request_batch_outcome_derived_thresholds_.clear();
+            last_request_batch_outcome_resident_threshold_positions_.clear();
+            last_request_batch_outcome_effective_first_positions_.clear();
             last_request_batch_outcome_serial_sample_equivalent_.clear();
             last_request_batch_outcome_sample_thresholds_.clear();
             if (!requests || request_count <= 0 || !outcomes)
@@ -2976,16 +3120,65 @@ namespace
                     request.token_row_offset);
                 last_request_batch_outcome_token_row_strides_.push_back(
                     request.token_row_stride);
-                last_request_batch_outcome_bonus_thresholds_.push_back(
-                    request.bonus_threshold);
                 last_request_batch_outcome_inverse_sample_seeds_.push_back(
                     request.inverse_sample_seed);
                 last_request_batch_outcome_inverse_sample_first_positions_.push_back(
                     request.inverse_sample_first_logical_position);
                 last_request_batch_outcome_derived_thresholds_.push_back(
                     request.derive_thresholds_from_seed);
+                last_request_batch_outcome_resident_threshold_positions_.push_back(
+                    request.draw_position_source ==
+                    DeviceStochasticDrawPositionSource::ResidentLogicalState);
                 last_request_batch_outcome_serial_sample_equivalent_.push_back(
                     request.serial_sample_equivalent);
+
+                int effective_first_logical_position =
+                    request.inverse_sample_first_logical_position;
+                if (request.draw_position_source ==
+                    DeviceStochasticDrawPositionSource::ResidentLogicalState)
+                {
+                    if (!request.derive_thresholds_from_seed ||
+                        request.inverse_sample_seed == 0 ||
+                        request.inverse_sample_first_logical_position >= 0 ||
+                        !resident_logical_state_valid_ ||
+                        request.request_id < 0 ||
+                        request.request_id >= resident_logical_state_request_count_)
+                    {
+                        return false;
+                    }
+                    effective_first_logical_position =
+                        resident_target_positions_[static_cast<size_t>(
+                            request.request_id)] +
+                        1;
+                }
+                else if (request.draw_position_source ==
+                         DeviceStochasticDrawPositionSource::VerifierBaseSnapshot)
+                {
+                    if (!request.derive_thresholds_from_seed ||
+                        request.inverse_sample_seed == 0 ||
+                        request.inverse_sample_first_logical_position >= 0 ||
+                        request.request_id < 0 ||
+                        request.request_id >= kMockResidentOutcomeRequestCapacity)
+                    {
+                        return false;
+                    }
+                    effective_first_logical_position =
+                        resident_base_cached_tokens_[static_cast<size_t>(
+                            request.request_id)] +
+                        1;
+                }
+                last_request_batch_outcome_effective_first_positions_.push_back(
+                    effective_first_logical_position);
+
+                const float effective_bonus_threshold =
+                    request.derive_thresholds_from_seed
+                        ? mtpSeededVerifierThreshold(
+                              request.inverse_sample_seed,
+                              effective_first_logical_position + request.row_count,
+                              0 /* MTPSpecStochasticDrawPurpose::Sample */)
+                        : request.bonus_threshold;
+                last_request_batch_outcome_bonus_thresholds_.push_back(
+                    effective_bonus_threshold);
                 std::vector<int32_t> draft_tokens;
                 std::vector<float> accept_thresholds;
                 std::vector<float> residual_thresholds;
@@ -2999,11 +3192,17 @@ namespace
                     draft_tokens.push_back(
                         request.draft_tokens[static_cast<size_t>(row)]);
                     sample_thresholds.push_back(
-                        request.sample_thresholds[static_cast<size_t>(row)]);
+                        request.derive_thresholds_from_seed &&
+                                request.serial_sample_equivalent
+                            ? mtpSeededVerifierThreshold(
+                                  request.inverse_sample_seed,
+                                  effective_first_logical_position + row,
+                                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+                            : request.sample_thresholds[static_cast<size_t>(row)]);
                     if (request.derive_thresholds_from_seed)
                     {
                         const int logical_position =
-                            request.inverse_sample_first_logical_position + row;
+                            effective_first_logical_position + row;
                         /*
                          * Seeded vLLM-style verification derives these
                          * thresholds in the backend kernel.  The mock records
@@ -3136,6 +3335,8 @@ namespace
             last_request_batch_outcome_inverse_sample_seeds_.clear();
             last_request_batch_outcome_inverse_sample_first_positions_.clear();
             last_request_batch_outcome_derived_thresholds_.clear();
+            last_request_batch_outcome_resident_threshold_positions_.clear();
+            last_request_batch_outcome_effective_first_positions_.clear();
             last_request_batch_outcome_serial_sample_equivalent_.clear();
             last_request_batch_outcome_sample_thresholds_.clear();
             if (!requests || request_count <= 0 || !out_handle)
@@ -3164,16 +3365,62 @@ namespace
                     request.token_row_offset);
                 last_request_batch_outcome_token_row_strides_.push_back(
                     request.token_row_stride);
-                last_request_batch_outcome_bonus_thresholds_.push_back(
-                    request.bonus_threshold);
                 last_request_batch_outcome_inverse_sample_seeds_.push_back(
                     request.inverse_sample_seed);
                 last_request_batch_outcome_inverse_sample_first_positions_.push_back(
                     request.inverse_sample_first_logical_position);
                 last_request_batch_outcome_derived_thresholds_.push_back(
                     request.derive_thresholds_from_seed);
+                last_request_batch_outcome_resident_threshold_positions_.push_back(
+                    request.draw_position_source ==
+                    DeviceStochasticDrawPositionSource::ResidentLogicalState);
                 last_request_batch_outcome_serial_sample_equivalent_.push_back(
                     request.serial_sample_equivalent);
+
+                int effective_first_logical_position =
+                    request.inverse_sample_first_logical_position;
+                if (request.draw_position_source ==
+                    DeviceStochasticDrawPositionSource::ResidentLogicalState)
+                {
+                    if (!request.derive_thresholds_from_seed ||
+                        request.inverse_sample_seed == 0 ||
+                        request.inverse_sample_first_logical_position >= 0 ||
+                        !resident_logical_state_valid_ ||
+                        request.request_id < 0 ||
+                        request.request_id >= resident_logical_state_request_count_)
+                    {
+                        return false;
+                    }
+                    effective_first_logical_position =
+                        resident_target_positions_[static_cast<size_t>(
+                            request.request_id)] +
+                        1;
+                }
+                else if (request.draw_position_source ==
+                         DeviceStochasticDrawPositionSource::VerifierBaseSnapshot)
+                {
+                    if (!request.derive_thresholds_from_seed ||
+                        request.inverse_sample_seed == 0 ||
+                        request.inverse_sample_first_logical_position >= 0 ||
+                        request.request_id < 0 ||
+                        request.request_id >= kMockResidentOutcomeRequestCapacity)
+                    {
+                        return false;
+                    }
+                    effective_first_logical_position =
+                        resident_base_cached_tokens_[static_cast<size_t>(
+                            request.request_id)] +
+                        1;
+                }
+                last_request_batch_outcome_effective_first_positions_.push_back(
+                    effective_first_logical_position);
+                last_request_batch_outcome_bonus_thresholds_.push_back(
+                    request.derive_thresholds_from_seed
+                        ? mtpSeededVerifierThreshold(
+                              request.inverse_sample_seed,
+                              effective_first_logical_position + request.row_count,
+                              0 /* MTPSpecStochasticDrawPurpose::Sample */)
+                        : request.bonus_threshold);
 
                 std::vector<int32_t> draft_tokens;
                 std::vector<float> accept_thresholds;
@@ -3188,11 +3435,17 @@ namespace
                     draft_tokens.push_back(
                         request.draft_tokens[static_cast<size_t>(row)]);
                     sample_thresholds.push_back(
-                        request.sample_thresholds[static_cast<size_t>(row)]);
+                        request.derive_thresholds_from_seed &&
+                                request.serial_sample_equivalent
+                            ? mtpSeededVerifierThreshold(
+                                  request.inverse_sample_seed,
+                                  effective_first_logical_position + row,
+                                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+                            : request.sample_thresholds[static_cast<size_t>(row)]);
                     if (request.derive_thresholds_from_seed)
                     {
                         const int logical_position =
-                            request.inverse_sample_first_logical_position + row;
+                            effective_first_logical_position + row;
                         accept_thresholds.push_back(
                             mtpSeededVerifierThreshold(
                                 request.inverse_sample_seed,
@@ -3253,10 +3506,13 @@ namespace
                         meta = {};
                     for (int row = 0; row < request.row_count; ++row)
                     {
+                        const int32_t draft_token =
+                            request.use_device_draft_tokens
+                                ? device_draft_sample_tokens_[static_cast<size_t>(
+                                      request.first_draft_slot + row)]
+                                : request.draft_tokens[static_cast<size_t>(row)];
                         row_tokens[static_cast<size_t>(row)] =
-                            request.draft_tokens[static_cast<size_t>(row)] >= 0
-                                ? request.draft_tokens[static_cast<size_t>(row)]
-                                : (100 + row);
+                            draft_token >= 0 ? draft_token : (100 + row);
                     }
                     int32_t first_token = request.first_token;
                     if (request.first_token_from_device)
@@ -3342,6 +3598,25 @@ namespace
                                 request.token_row_offset)];
                     }
 
+                    int first_sample_logical_position =
+                        request.inverse_sample_first_logical_position;
+                    if (request.draw_position_source ==
+                        DeviceStochasticDrawPositionSource::ResidentLogicalState)
+                    {
+                        first_sample_logical_position =
+                            resident_target_positions_[static_cast<size_t>(
+                                request.request_id)] +
+                            1;
+                    }
+                    else if (request.draw_position_source ==
+                             DeviceStochasticDrawPositionSource::VerifierBaseSnapshot)
+                    {
+                        first_sample_logical_position =
+                            resident_base_cached_tokens_[static_cast<size_t>(
+                                request.request_id)] +
+                            1;
+                    }
+
                     std::array<int, sampling_math::kSpeculativeBatchMaxRows>
                         row_tokens = {-1, -1, -1, -1};
                     std::array<int, sampling_math::kSpeculativeBatchMaxRows>
@@ -3356,7 +3631,12 @@ namespace
                         const int sampled_target =
                             sampleWithThreshold(
                                 target,
-                                request.sample_thresholds[static_cast<size_t>(row)]);
+                                request.derive_thresholds_from_seed
+                                    ? mtpSeededVerifierThreshold(
+                                          request.inverse_sample_seed,
+                                          first_sample_logical_position + row,
+                                          0 /* MTPSpecStochasticDrawPurpose::Sample */)
+                                    : request.sample_thresholds[static_cast<size_t>(row)]);
                         if (sampled_target < 0)
                             return false;
                         const int32_t draft_token =
@@ -3375,8 +3655,15 @@ namespace
                     if (bonus_distribution.empty())
                         return false;
                     const int bonus_ready_token =
-                        sampleWithThreshold(bonus_distribution,
-                                            request.bonus_threshold);
+                        sampleWithThreshold(
+                            bonus_distribution,
+                            request.derive_thresholds_from_seed
+                                ? mtpSeededVerifierThreshold(
+                                      request.inverse_sample_seed,
+                                      first_sample_logical_position +
+                                          request.row_count,
+                                      0 /* MTPSpecStochasticDrawPurpose::Sample */)
+                                : request.bonus_threshold);
                     if (bonus_ready_token < 0)
                         return false;
 
@@ -3615,6 +3902,8 @@ namespace
                 std::shared_ptr<void>(
                     &resident_outcome_response_ready_event_token_,
                     [](void *) {});
+            out_handle->mtp_transaction =
+                makeMockMTPTransactionLease(request_count);
             return out_handle->valid();
         }
 
@@ -3883,6 +4172,14 @@ namespace
         {
             return last_request_batch_outcome_inverse_sample_first_positions_;
         }
+        const std::vector<bool> &lastRequestBatchOutcomeResidentThresholdPositions() const
+        {
+            return last_request_batch_outcome_resident_threshold_positions_;
+        }
+        const std::vector<int> &lastRequestBatchOutcomeEffectiveFirstPositions() const
+        {
+            return last_request_batch_outcome_effective_first_positions_;
+        }
         const std::vector<bool> &lastRequestBatchOutcomeDerivedThresholds() const
         {
             return last_request_batch_outcome_derived_thresholds_;
@@ -3900,9 +4197,9 @@ namespace
         {
             return forward_mtp_batch_and_sample_count_;
         }
-        int forwardMTPBatchAndSampleToDeviceDraftSlotsCount() const
+        int forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount() const
         {
-            return forward_mtp_batch_and_sample_to_device_draft_slots_count_;
+            return forward_mtp_batch_from_resident_state_to_device_draft_slots_count_;
         }
         int lastMTPBatchDeviceDraftFirstSlot() const
         {
@@ -3912,13 +4209,33 @@ namespace
         {
             return last_mtp_batch_device_draft_slot_stride_;
         }
+        const std::vector<int32_t> &lastMTPBatchResidentConditionTokens() const
+        {
+            return last_mtp_batch_resident_condition_tokens_;
+        }
+        const std::vector<int> &lastMTPBatchResidentPositionIds() const
+        {
+            return last_mtp_batch_resident_position_ids_;
+        }
         int forwardMTPBatchFromLastDraftAndSampleCount() const
         {
             return forward_mtp_batch_from_last_draft_and_sample_count_;
         }
-        int forwardMTPBatchFromLastDraftAndSampleToDeviceDraftSlotsCount() const
+        int forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount() const
         {
-            return forward_mtp_batch_from_last_draft_and_sample_to_device_draft_slots_count_;
+            return forward_mtp_batch_from_device_draft_slots_to_device_draft_slots_count_;
+        }
+        const std::vector<int> &lastChainedMTPBatchDeviceConditionFirstSlots() const
+        {
+            return last_chained_mtp_batch_device_condition_first_slots_;
+        }
+        const std::vector<int> &lastChainedMTPBatchDeviceConditionSlotStrides() const
+        {
+            return last_chained_mtp_batch_device_condition_slot_strides_;
+        }
+        const std::vector<int> &lastChainedMTPBatchDevicePositionOffsets() const
+        {
+            return last_chained_mtp_batch_device_position_offsets_;
         }
         const std::vector<int> &lastChainedMTPBatchDeviceDraftFirstSlots() const
         {
@@ -3991,6 +4308,14 @@ namespace
         const std::vector<float> &lastMainLogitsBatchThresholds() const
         {
             return last_main_logits_batch_thresholds_;
+        }
+        const std::vector<uint64_t> &lastMainLogitsBatchPositionSeeds() const
+        {
+            return last_main_logits_batch_position_seeds_;
+        }
+        const std::vector<int> &lastMainLogitsBatchResidentPositions() const
+        {
+            return last_main_logits_batch_resident_positions_;
         }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleMTPLogitsToDeviceDraftSlotCount() const
@@ -4872,9 +5197,23 @@ namespace
                     {
                         if (rel < accepted_prefix)
                         {
-                            token =
-                                last_mtp_spec_verifier_plan_.verifier_input_tokens[
-                                    static_cast<size_t>(start + rel + 1)];
+                            if (forward_batch_uses_device_token_ids_ &&
+                                last_forward_device_token_ids_)
+                            {
+                                const auto *device_tokens =
+                                    static_cast<const int32_t *>(
+                                        last_forward_device_token_ids_);
+                                token = device_tokens[
+                                    static_cast<size_t>(request) *
+                                        static_cast<size_t>(padded_seq_len_) +
+                                    static_cast<size_t>(rel + 1)];
+                            }
+                            else
+                            {
+                                token =
+                                    last_mtp_spec_verifier_plan_.verifier_input_tokens[
+                                        static_cast<size_t>(start + rel + 1)];
+                            }
                         }
                         else
                         {
@@ -4941,9 +5280,9 @@ namespace
         int forward_mtp_from_device_target_for_device_sampling_count_{0};
         int forward_mtp_and_sample_count_{0};
         int forward_mtp_batch_and_sample_count_{0};
-        int forward_mtp_batch_and_sample_to_device_draft_slots_count_{0};
+        int forward_mtp_batch_from_resident_state_to_device_draft_slots_count_{0};
         int forward_mtp_batch_from_last_draft_and_sample_count_{0};
-        int forward_mtp_batch_from_last_draft_and_sample_to_device_draft_slots_count_{0};
+        int forward_mtp_batch_from_device_draft_slots_to_device_draft_slots_count_{0};
         int forward_mtp_from_last_draft_and_sample_count_{0};
         int flush_pending_mtp_work_count_{0};
         int clear_cache_count_{0};
@@ -4966,6 +5305,8 @@ namespace
         int sample_main_logits_batch_rows_count_{0};
         int last_main_logits_batch_request_count_{0};
         std::vector<float> last_main_logits_batch_thresholds_;
+        std::vector<uint64_t> last_main_logits_batch_position_seeds_;
+        std::vector<int> last_main_logits_batch_resident_positions_;
         int sample_mtp_logits_count_{0};
         int sample_mtp_logits_to_device_draft_slot_count_{0};
         bool force_main_device_greedy_sample_failure_{false};
@@ -5016,6 +5357,11 @@ namespace
         int last_chained_mtp_position_id_{-1};
         int last_mtp_batch_device_draft_first_slot_{-1};
         int last_mtp_batch_device_draft_slot_stride_{1};
+        std::vector<int32_t> last_mtp_batch_resident_condition_tokens_;
+        std::vector<int> last_mtp_batch_resident_position_ids_;
+        std::vector<int> last_chained_mtp_batch_device_condition_first_slots_;
+        std::vector<int> last_chained_mtp_batch_device_condition_slot_strides_;
+        std::vector<int> last_chained_mtp_batch_device_position_offsets_;
         std::vector<int> last_chained_mtp_batch_device_draft_first_slots_;
         std::vector<int> last_chained_mtp_batch_device_draft_slot_strides_;
         int last_device_target_shifted_commit_token_{-1};
@@ -5106,6 +5452,8 @@ namespace
         std::vector<uint64_t> last_request_batch_outcome_inverse_sample_seeds_;
         std::vector<int> last_request_batch_outcome_inverse_sample_first_positions_;
         std::vector<bool> last_request_batch_outcome_derived_thresholds_;
+        std::vector<bool> last_request_batch_outcome_resident_threshold_positions_;
+        std::vector<int> last_request_batch_outcome_effective_first_positions_;
         std::vector<bool> last_request_batch_outcome_serial_sample_equivalent_;
         std::vector<std::vector<float>> last_request_batch_outcome_sample_thresholds_;
         std::vector<std::string> publication_events_;
@@ -5138,8 +5486,9 @@ namespace
         int resident_stream_token_{0};
         int resident_outcome_response_ready_event_token_{0};
         int resident_ready_event_token_{0};
+        std::shared_ptr<DeviceResidentMTPTransactionState>
+            mock_mtp_transaction_;
         bool resident_logical_state_valid_{false};
-        bool resident_logical_state_host_mirror_current_{true};
         int resident_logical_state_request_count_{0};
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
             resident_target_positions_{};
@@ -5158,6 +5507,7 @@ namespace
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
             resident_publication_ok_flags_{};
         const void *last_forward_device_token_ids_{nullptr};
+        bool forward_batch_uses_device_token_ids_{false};
         std::vector<SamplingDistributionEntry> invalid_distribution_;
         size_t verifier_accepted_prefix_script_index_{0};
         size_t verifier_reject_token_script_index_{0};
@@ -5598,7 +5948,7 @@ namespace
             << "The CPU Sampler must never receive GPU logits pointers";
     }
 
-    TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticGpuPrefillUsesPositionKeyedThresholds)
+    TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticGpuPrefillUsesResidentPositionKeyedThresholds)
     {
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
@@ -5623,21 +5973,25 @@ namespace
 
         const std::vector<float> &thresholds =
             mock->lastMainLogitsBatchThresholds();
+        EXPECT_THAT(mock->lastMainLogitsBatchPositionSeeds(),
+                    ElementsAre(sampling.seed, sampling.seed));
+        EXPECT_THAT(mock->lastMainLogitsBatchResidentPositions(),
+                    ElementsAre(3, 2));
         ASSERT_THAT(thresholds, SizeIs(2));
-        EXPECT_NEAR(thresholds[0],
-                    sampling_math::uniform01(
-                        sampling.seed,
-                        /*logical_position=*/3u * 8u +
-                            static_cast<uint64_t>(
-                                0 /* MTPSpecStochasticDrawPurpose::Sample */)),
-                    1e-7f);
-        EXPECT_NEAR(thresholds[1],
-                    sampling_math::uniform01(
-                        sampling.seed,
-                        /*logical_position=*/2u * 8u +
-                            static_cast<uint64_t>(
-                                0 /* MTPSpecStochasticDrawPurpose::Sample */)),
-                    1e-7f);
+        EXPECT_EQ(
+            floatBytes(thresholds[0]),
+            floatBytes(sampling_math::uniform01(
+                sampling.seed,
+                /*logical_position=*/3u * 8u +
+                    static_cast<uint64_t>(
+                        0 /* MTPSpecStochasticDrawPurpose::Sample */))));
+        EXPECT_EQ(
+            floatBytes(thresholds[1]),
+            floatBytes(sampling_math::uniform01(
+                sampling.seed,
+                /*logical_position=*/2u * 8u +
+                    static_cast<uint64_t>(
+                        0 /* MTPSpecStochasticDrawPurpose::Sample */))));
         EXPECT_EQ(mock->getLogitsCallCount(), 0)
             << "Seeded stochastic request batches must remain on the GPU "
                "distribution path instead of falling back to host logits";
@@ -5928,7 +6282,7 @@ namespace
         EXPECT_THAT(second.requests[1].tokens,
                     ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
-        EXPECT_EQ(mock->forwardMTPBatchAndSampleToDeviceDraftSlotsCount(), 1)
+        EXPECT_EQ(mock->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(), 1)
             << "Depth-one stochastic request batching should sample sidecar "
                "drafts directly into runner-owned device slots.";
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftFirstSlot(), 0);
@@ -5955,9 +6309,10 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 2);
-        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty())
-            << "GPU request-batch publication must consume the pre-verifier "
-               "device base-cache snapshot, not a host vector.";
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
+                        .outcome.mtp_transaction.valid())
+            << "GPU request-batch publication must carry the child-local "
+               "shifted-cache transaction that owns the verifier-base count.";
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticContinuationPublishesDeviceOutcomes)
@@ -5998,12 +6353,24 @@ namespace
         EXPECT_THAT(second.requests[1].tokens,
                     ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->forwardMTPBatchAndSampleCount(), 1);
-        EXPECT_EQ(mock->forwardMTPBatchFromLastDraftAndSampleCount(), 1);
-        EXPECT_EQ(mock->forwardMTPBatchAndSampleToDeviceDraftSlotsCount(), 1);
+        EXPECT_EQ(mock->forwardMTPBatchAndSampleCount(), 0)
+            << "GPU request batches must not invoke the host-token grouped sidecar API.";
+        EXPECT_EQ(mock->forwardMTPBatchFromLastDraftAndSampleCount(), 0)
+            << "GPU chained sidecars must consume device draft slots directly.";
+        EXPECT_EQ(mock->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(), 1);
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftFirstSlot(), 0);
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftSlotStride(), 2);
-        EXPECT_EQ(mock->forwardMTPBatchFromLastDraftAndSampleToDeviceDraftSlotsCount(), 1);
+        EXPECT_THAT(mock->lastMTPBatchResidentConditionTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+        EXPECT_THAT(mock->lastMTPBatchResidentPositionIds(), ElementsAre(3, 2));
+        EXPECT_EQ(mock->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(), 1);
+        EXPECT_THAT(mock->lastChainedMTPBatchDeviceConditionFirstSlots(),
+                    ElementsAre(0));
+        EXPECT_THAT(mock->lastChainedMTPBatchDeviceConditionSlotStrides(),
+                    ElementsAre(2));
+        EXPECT_THAT(mock->lastChainedMTPBatchDevicePositionOffsets(),
+                    ElementsAre(1));
         EXPECT_THAT(mock->lastChainedMTPBatchDeviceDraftFirstSlots(),
                     ElementsAre(1));
         EXPECT_THAT(mock->lastChainedMTPBatchDeviceDraftSlotStrides(),
@@ -6013,7 +6380,9 @@ namespace
                "forward across both requests";
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
         EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
-                    ElementsAre(false, false));
+                    ElementsAre(true, true));
+        EXPECT_EQ(mock->flushPendingMTPWorkCount(), 0)
+            << "Readiness events, not a host stream synchronization, order the GPU verifier.";
         EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
         EXPECT_EQ(mock->lastForwardDeviceTokenIds(),
                   mock->deviceVerifierInputTokens().data());
@@ -6057,9 +6426,10 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
-        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty())
-            << "GPU request-batch publication must not smuggle host base-cache "
-               "counts into resident state mutation.";
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
+                        .outcome.mtp_transaction.valid())
+            << "GPU request-batch publication must consume its canonical "
+               "device count row through the outcome transaction lease.";
         EXPECT_THAT(mock->sequence_lengths(), ElementsAre(3, 3))
             << "The backend host mirror intentionally remains at the prefill "
                "length after resident request-batch publication.";
@@ -6090,9 +6460,11 @@ namespace
         EXPECT_EQ(verifier_tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
         EXPECT_EQ(verifier_tokens[3], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
         EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
+                    ElementsAre(-1, -1));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeEffectiveFirstPositions(),
                     ElementsAre(7, 6))
-            << "The next verifier step should schedule from per-request "
-               "transaction shadows, not stale backend sequence_lengths().";
+            << "The next verifier step must read the positions published by "
+               "the prior device transaction, not stale backend host mirrors.";
     }
 
     /**
@@ -6151,7 +6523,7 @@ namespace
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
         EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
         EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
-                    ElementsAre(false, false));
+                    ElementsAre(true, true));
         EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokensFromDevice(),
                     ElementsAre(true, true));
         EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowOffsets(),
@@ -6166,7 +6538,8 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
-        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty());
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
+                        .outcome.mtp_transaction.valid());
     }
 
     /**
@@ -6211,8 +6584,8 @@ namespace
                     ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
-        EXPECT_EQ(mock->forwardMTPBatchAndSampleToDeviceDraftSlotsCount(), 1);
-        EXPECT_EQ(mock->forwardMTPBatchFromLastDraftAndSampleToDeviceDraftSlotsCount(), 1);
+        EXPECT_EQ(mock->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(), 1);
+        EXPECT_EQ(mock->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(), 1);
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensHostRowCount(), 0);
         EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
@@ -6230,6 +6603,11 @@ namespace
         EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[1],
                     ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->deviceVerifierInputTokens()[1],
+                  MockInferenceRunner::MTP_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->deviceVerifierInputTokens()[2],
+                  MockInferenceRunner::MTP_ARGMAX_TOKEN)
+            << "The zero-valued scheduler row is shape metadata; verifier values live on device.";
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
             << "The hidden direct publisher must not be used.";
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
@@ -6238,21 +6616,20 @@ namespace
                                 "host_outcome_bridge"));
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().request_count, 2);
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
-        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest().base_cached_tokens.empty());
+        EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
+                        .outcome.mtp_transaction.valid());
     }
 
     /**
-     * @brief Post-publication greedy request batches reuse resident row-zero tokens.
+     * @brief GPU request batches use resident row-zero tokens from prefill onward.
      *
-     * The first request-batched MTP verifier after prefill has no prior device
-     * logical-state mailbox, so its condition token is still the host-visible
-     * sampled prefill token.  Once compact resident publication has produced
-     * `next_condition_tokens_device`, the next grouped verifier must consume
-     * those device rows directly instead of re-uploading the same token from
-     * the per-request host shadow.
+     * Terminal prefill sampling publishes the first device logical-state mailbox
+     * before returning its response tokens. The first grouped sidecar and every
+     * post-verifier continuation must therefore consume resident condition and
+     * position rows; a host-token first transaction is no longer permitted.
      */
     TEST_F(Test__PrefillDecodeTransition,
-           RequestBatchedGreedyVerifierUsesResidentConditionTokensAfterPublication)
+           RequestBatchedGreedyVerifierUsesResidentConditionTokensFromPrefillOnward)
     {
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
@@ -6274,7 +6651,11 @@ namespace
         GenerationBatchResult first_mtp = runner->decodeStepBatch(2);
         ASSERT_TRUE(first_mtp.error.empty()) << first_mtp.error;
         EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
-                    ElementsAre(false, false));
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastMTPBatchResidentConditionTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+        EXPECT_THAT(mock->lastMTPBatchResidentPositionIds(), ElementsAre(3, 2));
 
         GenerationBatchResult ready_bonus = runner->decodeStepBatch(2);
         ASSERT_TRUE(ready_bonus.error.empty()) << ready_bonus.error;
@@ -6353,10 +6734,16 @@ namespace
                     ElementsAre(0, 3));
         EXPECT_THAT(mock->lastRequestBatchOutcomeBonusTargetSlots(),
                     ElementsAre(3, 7));
-        EXPECT_EQ(mock->forwardMTPBatchAndSampleToDeviceDraftSlotsCount(), 1);
+        EXPECT_EQ(mock->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(), 1);
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftFirstSlot(), 0);
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftSlotStride(), 3);
-        EXPECT_EQ(mock->forwardMTPBatchFromLastDraftAndSampleToDeviceDraftSlotsCount(), 2);
+        EXPECT_EQ(mock->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(), 2);
+        EXPECT_THAT(mock->lastChainedMTPBatchDeviceConditionFirstSlots(),
+                    ElementsAre(0, 1));
+        EXPECT_THAT(mock->lastChainedMTPBatchDeviceConditionSlotStrides(),
+                    ElementsAre(3, 3));
+        EXPECT_THAT(mock->lastChainedMTPBatchDevicePositionOffsets(),
+                    ElementsAre(1, 2));
         EXPECT_THAT(mock->lastChainedMTPBatchDeviceDraftFirstSlots(),
                     ElementsAre(1, 2));
         EXPECT_THAT(mock->lastChainedMTPBatchDeviceDraftSlotStrides(),
@@ -6369,27 +6756,28 @@ namespace
                                 MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
         ASSERT_THAT(mock->lastRequestBatchOutcomeDraftTokens(), SizeIs(2));
         EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[0],
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(0, 0, 0));
         EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[1],
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(0, 0, 0));
+        EXPECT_THAT(
+            std::vector<int32_t>(
+                mock->deviceVerifierInputTokens().begin() + 1,
+                mock->deviceVerifierInputTokens().begin() + 4),
+            ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                        MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                        MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(),
                     ElementsAre(static_cast<uint64_t>(sampling.seed),
                                 static_cast<uint64_t>(sampling.seed)));
         EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
-                    ElementsAre(4, 3));
+                    ElementsAre(-1, -1));
         ASSERT_EQ(mock->lastRequestBatchOutcomeDerivedThresholds().size(), 2u);
-        EXPECT_FALSE(mock->lastRequestBatchOutcomeDerivedThresholds()[0])
-            << "Production request batches must pass explicit, value-owned "
-               "thresholds until the complete served stochastic sampler stream "
-               "is device-owned and benchmark-proven.";
-        EXPECT_FALSE(mock->lastRequestBatchOutcomeDerivedThresholds()[1])
-            << "Production request batches must pass explicit, value-owned "
-               "thresholds until the complete served stochastic sampler stream "
-               "is device-owned and benchmark-proven.";
+        EXPECT_TRUE(mock->lastRequestBatchOutcomeDerivedThresholds()[0]);
+        EXPECT_TRUE(mock->lastRequestBatchOutcomeDerivedThresholds()[1]);
+        EXPECT_THAT(mock->lastRequestBatchOutcomeResidentThresholdPositions(),
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeEffectiveFirstPositions(),
+                    ElementsAre(4, 3));
 
         auto threshold = [&](int logical_position, int purpose) {
             return mtpSeededVerifierThreshold(
@@ -6406,29 +6794,35 @@ namespace
         const std::array<int, 3> request1_positions = {3, 4, 5};
         for (int row = 0; row < 3; ++row)
         {
-            EXPECT_NEAR(mock->lastRequestBatchOutcomeAcceptThresholds()[0][row],
-                        threshold(request0_positions[static_cast<size_t>(row)],
-                                  1 /* MTPSpecStochasticDrawPurpose::Accept */),
-                        1e-7f);
-            EXPECT_NEAR(mock->lastRequestBatchOutcomeResidualThresholds()[0][row],
-                        threshold(request0_positions[static_cast<size_t>(row)],
-                                  2 /* MTPSpecStochasticDrawPurpose::Residual */),
-                        1e-7f);
-            EXPECT_NEAR(mock->lastRequestBatchOutcomeAcceptThresholds()[1][row],
-                        threshold(request1_positions[static_cast<size_t>(row)],
-                                  1 /* MTPSpecStochasticDrawPurpose::Accept */),
-                        1e-7f);
-            EXPECT_NEAR(mock->lastRequestBatchOutcomeResidualThresholds()[1][row],
-                        threshold(request1_positions[static_cast<size_t>(row)],
-                                  2 /* MTPSpecStochasticDrawPurpose::Residual */),
-                        1e-7f);
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[0][row]),
+                floatBytes(threshold(
+                    request0_positions[static_cast<size_t>(row)],
+                    1 /* MTPSpecStochasticDrawPurpose::Accept */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeResidualThresholds()[0][row]),
+                floatBytes(threshold(
+                    request0_positions[static_cast<size_t>(row)],
+                    2 /* MTPSpecStochasticDrawPurpose::Residual */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[1][row]),
+                floatBytes(threshold(
+                    request1_positions[static_cast<size_t>(row)],
+                    1 /* MTPSpecStochasticDrawPurpose::Accept */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeResidualThresholds()[1][row]),
+                floatBytes(threshold(
+                    request1_positions[static_cast<size_t>(row)],
+                    2 /* MTPSpecStochasticDrawPurpose::Residual */)));
         }
-        EXPECT_NEAR(mock->lastRequestBatchOutcomeBonusThresholds()[0],
-                    threshold(7, 0 /* MTPSpecStochasticDrawPurpose::Sample */),
-                    1e-7f);
-        EXPECT_NEAR(mock->lastRequestBatchOutcomeBonusThresholds()[1],
-                    threshold(6, 0 /* MTPSpecStochasticDrawPurpose::Sample */),
-                    1e-7f);
+        EXPECT_EQ(
+            floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[0]),
+            floatBytes(threshold(
+                7, 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
+        EXPECT_EQ(
+            floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[1]),
+            floatBytes(threshold(
+                6, 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
 
         const auto records = PerfStatsCollector::snapshot({"mtp"});
         const PerfStatsCollector::Tags batch_tags{
@@ -6465,14 +6859,18 @@ namespace
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticUnseededKeepsExplicitThresholds)
+    TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticUnseededResolvesResidentPositionSeedsOnce)
     {
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
                 /*max_request_batch=*/2,
                 /*mtp_draft_tokens=*/2,
                 MTPVerifyMode::SpeculativeSampling);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
 
         SamplingParams sampling;
         sampling.temperature = 0.1f;
@@ -6490,20 +6888,65 @@ namespace
         ASSERT_TRUE(second.error.empty()) << second.error;
 
         ASSERT_EQ(mock->lastRequestBatchOutcomeDerivedThresholds().size(), 2u);
-        EXPECT_FALSE(mock->lastRequestBatchOutcomeDerivedThresholds()[0])
-            << "Unseeded stochastic verification owns a request-local sampler "
-               "stream, so thresholds must be explicit values rather than "
-               "derived from a seed.";
-        EXPECT_FALSE(mock->lastRequestBatchOutcomeDerivedThresholds()[1])
-            << "Unseeded stochastic verification owns a request-local sampler "
-               "stream, so thresholds must be explicit values rather than "
-               "derived from a seed.";
+        EXPECT_TRUE(mock->lastRequestBatchOutcomeDerivedThresholds()[0]);
+        EXPECT_TRUE(mock->lastRequestBatchOutcomeDerivedThresholds()[1]);
+        EXPECT_THAT(mock->lastRequestBatchOutcomeResidentThresholdPositions(),
+                    ElementsAre(true, true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
+                    ElementsAre(-1, -1));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeEffectiveFirstPositions(),
+                    ElementsAre(4, 3));
+
+        ASSERT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(), SizeIs(2));
+        const uint64_t request0_seed =
+            mock->lastRequestBatchOutcomeInverseSampleSeeds()[0];
+        const uint64_t request1_seed =
+            mock->lastRequestBatchOutcomeInverseSampleSeeds()[1];
+        EXPECT_NE(request0_seed, 0u);
+        EXPECT_NE(request1_seed, 0u);
+
         ASSERT_THAT(mock->lastRequestBatchOutcomeAcceptThresholds(), SizeIs(2));
         ASSERT_THAT(mock->lastRequestBatchOutcomeResidualThresholds(), SizeIs(2));
-        EXPECT_THAT(mock->lastRequestBatchOutcomeAcceptThresholds()[0], SizeIs(2));
-        EXPECT_THAT(mock->lastRequestBatchOutcomeAcceptThresholds()[1], SizeIs(2));
-        EXPECT_THAT(mock->lastRequestBatchOutcomeResidualThresholds()[0], SizeIs(2));
-        EXPECT_THAT(mock->lastRequestBatchOutcomeResidualThresholds()[1], SizeIs(2));
+        for (int row = 0; row < 2; ++row)
+        {
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[0][row]),
+                floatBytes(mtpSeededVerifierThreshold(
+                    request0_seed,
+                    4 + row,
+                    1 /* MTPSpecStochasticDrawPurpose::Accept */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeResidualThresholds()[0][row]),
+                floatBytes(mtpSeededVerifierThreshold(
+                    request0_seed,
+                    4 + row,
+                    2 /* MTPSpecStochasticDrawPurpose::Residual */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[1][row]),
+                floatBytes(mtpSeededVerifierThreshold(
+                    request1_seed,
+                    3 + row,
+                    1 /* MTPSpecStochasticDrawPurpose::Accept */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeResidualThresholds()[1][row]),
+                floatBytes(mtpSeededVerifierThreshold(
+                    request1_seed,
+                    3 + row,
+                    2 /* MTPSpecStochasticDrawPurpose::Residual */)));
+        }
+        ASSERT_THAT(mock->lastRequestBatchOutcomeBonusThresholds(), SizeIs(2));
+        EXPECT_EQ(
+            floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[0]),
+            floatBytes(mtpSeededVerifierThreshold(
+                request0_seed,
+                6,
+                0 /* MTPSpecStochasticDrawPurpose::Sample */)));
+        EXPECT_EQ(
+            floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[1]),
+            floatBytes(mtpSeededVerifierThreshold(
+                request1_seed,
+                5,
+                0 /* MTPSpecStochasticDrawPurpose::Sample */)));
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticMixedReadyAndRejectStaysLockstep)
@@ -9142,9 +9585,25 @@ namespace
                "summary path, not the distribution-only vLLM rejection path.";
         ASSERT_EQ(mock->lastRequestBatchOutcomeSerialSampleEquivalent().size(), 1u);
         EXPECT_TRUE(mock->lastRequestBatchOutcomeSerialSampleEquivalent()[0]);
+        ASSERT_EQ(mock->lastRequestBatchOutcomeDerivedThresholds().size(), 1u);
+        EXPECT_TRUE(mock->lastRequestBatchOutcomeDerivedThresholds()[0]);
+        ASSERT_EQ(mock->lastRequestBatchOutcomeResidentThresholdPositions().size(), 1u);
+        EXPECT_FALSE(mock->lastRequestBatchOutcomeResidentThresholdPositions()[0])
+            << "the strict single-request lane reads the pre-verifier base snapshot, not the post-publication mailbox";
+        ASSERT_EQ(mock->lastRequestBatchOutcomeInverseSampleSeeds().size(), 1u);
+        EXPECT_EQ(mock->lastRequestBatchOutcomeInverseSampleSeeds()[0], sampling.seed);
+        ASSERT_EQ(mock->lastRequestBatchOutcomeInverseSampleFirstPositions().size(), 1u);
+        EXPECT_EQ(mock->lastRequestBatchOutcomeInverseSampleFirstPositions()[0], -1)
+            << "a device-owned base snapshot must replace the host logical-position scalar";
         ASSERT_EQ(mock->lastRequestBatchOutcomeSampleThresholds().size(), 1u);
         EXPECT_THAT(mock->lastRequestBatchOutcomeSampleThresholds()[0],
                     SizeIs(1));
+        EXPECT_EQ(
+            mock->lastRequestBatchOutcomeSampleThresholds()[0][0],
+            sampling_math::mtp_spec_threshold_from_seed(
+                static_cast<uint64_t>(sampling.seed),
+                mock->lastRequestBatchOutcomeEffectiveFirstPositions()[0],
+                0 /* MTPSpecStochasticDrawPurpose::Sample */));
         EXPECT_EQ(mock->publishMTPSpecStateCount(), 0);
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0);
         EXPECT_EQ(mock->publishDeviceResidentMTPSpecStateCount(), 1);
@@ -9706,10 +10165,13 @@ namespace
         EXPECT_TRUE(request.valid());
         EXPECT_EQ(request.request_count, 1);
         EXPECT_EQ(request.max_draft_tokens, 2);
-        EXPECT_TRUE(request.base_cached_tokens.empty())
-            << "Device-resident publication should use the pre-verifier "
-               "device snapshot, not a host base-cache shadow.";
-        EXPECT_EQ(request.base_sidecar_position, 5);
+        ASSERT_TRUE(request.outcome.mtp_transaction.valid())
+            << "Device-resident publication should use the verifier outcome's "
+               "request-scoped shifted-cache transaction.";
+        ASSERT_TRUE(request.outcome.mtp_transaction.state->coversDepth(0));
+        EXPECT_EQ(
+            request.outcome.mtp_transaction.state->cachedTokensForDepth(0)[0],
+            5);
         const auto records = PerfStatsCollector::snapshot({"mtp"});
         const PerfStatRecord *skipped_checkpoint =
             findPerfRecord(records,

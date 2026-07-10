@@ -332,6 +332,7 @@ namespace llaminar2
                 {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
                 {"uses_device_token_ids", boolTag(signature.uses_device_token_ids)},
                 {"uses_device_position_ids", boolTag(signature.uses_device_position_ids)},
+                {"uses_device_sequence_lengths", boolTag(signature.uses_device_sequence_lengths)},
                 {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
 
@@ -1088,24 +1089,32 @@ namespace llaminar2
             }
 
             forward_signature = ForwardGraphSignature{
-                bucketed_prefill ? bucketed_prefill_seq_len : effective_input.seq_len,
-                effective_input.batch_size,
-                effective_input.device,
-                is_decode,
-                decode_has_history,
-                all_position_logits,
-                all_position_logits ? std::max(0, host.allPositionLogitRows()) : 0,
-                input.token_ids_device != nullptr,
-                input.position_ids_device != nullptr,
-                is_standard_path,
-                config_.pp_stage_config.has_value(),
-                pp_first_layer,
-                pp_last_layer,
-                pp_has_embedding,
-                pp_has_lm_head,
-                bucketed_prefill,
-                bucketed_prefill ? bucketed_prefill_seq_len : 0,
-                host.moePlacementEpoch()};
+                .seq_len = bucketed_prefill
+                               ? bucketed_prefill_seq_len
+                               : effective_input.seq_len,
+                .batch_size = effective_input.batch_size,
+                .device = effective_input.device,
+                .decode = is_decode,
+                .decode_has_history = decode_has_history,
+                .all_position_logits = all_position_logits,
+                .all_position_logit_rows =
+                    all_position_logits
+                        ? std::max(0, host.allPositionLogitRows())
+                        : 0,
+                .uses_device_token_ids = input.token_ids_device != nullptr,
+                .uses_device_position_ids = input.position_ids_device != nullptr,
+                .uses_device_sequence_lengths =
+                    input.sequence_lengths_device != nullptr,
+                .standard_path = is_standard_path,
+                .pp_stage_enabled = config_.pp_stage_config.has_value(),
+                .pp_first_layer = pp_first_layer,
+                .pp_last_layer = pp_last_layer,
+                .pp_has_embedding = pp_has_embedding,
+                .pp_has_lm_head = pp_has_lm_head,
+                .is_bucketed_prefill = bucketed_prefill,
+                .bucket_seq_len =
+                    bucketed_prefill ? bucketed_prefill_seq_len : 0,
+                .moe_placement_epoch = host.moePlacementEpoch()};
 
             auto cache_it = cache_.find(forward_signature);
             if (cache_it != cache_.end())
@@ -1689,20 +1698,48 @@ namespace llaminar2
         }
         const int *replay_position_ids =
             selectForwardReplayHostPositionIds(forward_cache, input);
+        const int position_row_count = forwardPositionRowCount(input);
+        if ((input.position_ids_device || replay_position_ids) &&
+            position_row_count <= 0)
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Cached graph replay received invalid flattened position geometry: batch="
+                      << input.batch_size << " seq_len=" << input.seq_len);
+            return false;
+        }
         for (auto *stage : forward_cache.dynamic_param_stages)
         {
-            stage->updateDynamicParams(input.position_offset, input.seq_len);
             if (input.position_ids_device)
             {
+                if (!stage->supportsDeviceResidentDynamicPositionReplay())
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Stage "
+                              << stage->name()
+                              << " cannot consume device-resident replay positions without host scalar state");
+                    return false;
+                }
                 stage->updateDynamicDevicePositionIds(
                     input.position_ids_device,
-                    input.seq_len);
+                    position_row_count);
+                /*
+                 * RoPE consumes device position rows directly.  Calling the
+                 * scalar update afterward would clear its device pointer.
+                 * Other dynamic stages use this hook as a resident-state marker
+                 * and still need their non-position replay scalars stamped.
+                 */
+                if (stage->type() == ComputeStageType::ROPE)
+                    continue;
+                stage->updateDynamicParams(input.position_offset, input.seq_len);
             }
             else if (replay_position_ids)
             {
+                stage->updateDynamicParams(input.position_offset, input.seq_len);
                 stage->updateDynamicPositionIds(
                     replay_position_ids,
-                    input.seq_len);
+                    position_row_count);
+            }
+            else
+            {
+                stage->updateDynamicParams(input.position_offset, input.seq_len);
             }
         }
 
@@ -2369,7 +2406,10 @@ namespace llaminar2
                     *forward_cache.graph,
                     terminal_row,
                     stream,
-                    context))
+                    context,
+                    input.sequence_lengths_device,
+                    input.batch_size,
+                    input.seq_len))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph terminal state publication failed"
                           << (context ? std::string(" during ") + context : std::string{})
@@ -2529,7 +2569,7 @@ namespace llaminar2
             // real synchronizable events).
             bool exec_success;
             {
-                GraphCaptureGuard capture_guard(/*host_bookkeeping=*/true);
+                GraphCaptureGuard capture_guard;
                 exec_success = executor_.executeFastDecode(
                     *forward_cache.graph, ctx, &forward_cache.collective_nodes);
             }
@@ -3080,6 +3120,17 @@ namespace llaminar2
                 }
             }
 
+            const int position_row_count =
+                forwardPositionRowCount(effective_input);
+            if ((effective_input.position_ids_device ||
+                 effective_input.position_ids) &&
+                position_row_count <= 0)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Cache-miss graph received invalid flattened position geometry: batch="
+                          << effective_input.batch_size
+                          << " seq_len=" << effective_input.seq_len);
+                return false;
+            }
             for (auto *stage : cache_miss_dynamic_param_stages)
             {
                 /*
@@ -3088,19 +3139,37 @@ namespace llaminar2
                  * captures the current request/chunk positions, not only the
                  * scalar offset baked into the graph build.
                  */
-                stage->updateDynamicParams(
-                    effective_input.position_offset,
-                    effective_input.seq_len);
                 if (effective_input.position_ids_device)
                 {
+                    if (!stage->supportsDeviceResidentDynamicPositionReplay())
+                    {
+                        LOG_ERROR("[ForwardExecutionEngine] Stage "
+                                  << stage->name()
+                                  << " cannot consume device-resident replay positions without host scalar state");
+                        return false;
+                    }
                     stage->updateDynamicDevicePositionIds(
                         effective_input.position_ids_device,
+                        position_row_count);
+                    if (stage->type() == ComputeStageType::ROPE)
+                        continue;
+                    stage->updateDynamicParams(
+                        effective_input.position_offset,
                         effective_input.seq_len);
                 }
                 else if (effective_input.position_ids)
                 {
+                    stage->updateDynamicParams(
+                        effective_input.position_offset,
+                        effective_input.seq_len);
                     stage->updateDynamicPositionIds(
                         effective_input.position_ids,
+                        position_row_count);
+                }
+                else
+                {
+                    stage->updateDynamicParams(
+                        effective_input.position_offset,
                         effective_input.seq_len);
                 }
             }
@@ -3130,7 +3199,10 @@ namespace llaminar2
                         nullptr,
                         should_cache
                             ? "prefill_cache_miss"
-                            : "prefill_eager"))
+                            : "prefill_eager",
+                        effective_input.sequence_lengths_device,
+                        effective_input.batch_size,
+                        effective_input.seq_len))
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Failed to publish captured terminal prefill state after cache miss");
                     return false;

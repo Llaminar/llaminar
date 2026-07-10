@@ -22,7 +22,9 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <random>
 #include <vector>
@@ -30,6 +32,8 @@
 #include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/utils/CPUFeatures.h"
+#include "v2/utils/DebugEnv.h"
+#include "v2/utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
 
@@ -156,6 +160,87 @@ namespace
             if (!std::isfinite(buf[i]))
                 return false;
         return true;
+    }
+
+    /** @brief Enable route telemetry for grouped Q16 verifier attention tests. */
+    class ScopedPerfStats
+    {
+    public:
+        ScopedPerfStats()
+        {
+            const char *old_value = std::getenv("LLAMINAR_PERF_STATS_SUMMARY");
+            if (old_value)
+            {
+                had_old_value_ = true;
+                old_value_ = old_value;
+            }
+            setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+        ~ScopedPerfStats()
+        {
+            if (had_old_value_)
+                setenv("LLAMINAR_PERF_STATS_SUMMARY", old_value_.c_str(), 1);
+            else
+                unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+    private:
+        bool had_old_value_ = false;
+        std::string old_value_;
+    };
+
+    /** @brief Report the first bitwise mismatch in a grouped Q16 attention row. */
+    void expectByteExactFP32(const float *actual,
+                             const float *expected,
+                             size_t count,
+                             const std::string &context)
+    {
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
+        for (size_t index = 0; index < count; ++index)
+        {
+            uint32_t actual_bits = 0;
+            uint32_t expected_bits = 0;
+            std::memcpy(&actual_bits, actual + index, sizeof(actual_bits));
+            std::memcpy(&expected_bits, expected + index, sizeof(expected_bits));
+            if (actual_bits != expected_bits)
+            {
+                ADD_FAILURE() << context << " first byte mismatch at element " << index
+                              << " actual=" << actual[index]
+                              << " expected=" << expected[index]
+                              << " actual_bits=" << actual_bits
+                              << " expected_bits=" << expected_bits;
+                return;
+            }
+        }
+    }
+
+    /** @brief Assert that grouped Q16 attention used the decode-equivalent tile route. */
+    void expectGroupedQ16AttentionCounter(int verifier_rows, int kv_len)
+    {
+        bool found = false;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_attention_grouped_verifier_rows_calls"}))
+        {
+            const auto format = record.tags.find("cache_format");
+            const auto rows = record.tags.find("verifier_rows");
+            const auto length = record.tags.find("kv_len");
+            const auto policy = record.tags.find("tile_policy");
+            found = found ||
+                    (format != record.tags.end() && format->second == "q16_1" &&
+                     rows != record.tags.end() && rows->second == std::to_string(verifier_rows) &&
+                     length != record.tags.end() && length->second == std::to_string(kv_len) &&
+                     policy != record.tags.end() && policy->second == "serial_decode_equivalent");
+        }
+        EXPECT_TRUE(found)
+            << "Grouped Q16 verifier attention did not publish its production route counter\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cpu_attention_grouped_verifier_rows_calls"}, 20);
     }
 
     /// Q16_1 quantisation introduces bounded error. Tolerances are looser than FP32
@@ -684,6 +769,8 @@ TEST_F(Test__Q16DecodeHeadMajor, SingleKVPosition_HD128)
 
 TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
 {
+    ScopedPerfStats perfstats;
+
     /*
      * Production Q16 KV caches are head-major, while the MTP verifier presents
      * a compact group of candidate rows.  Row r in the group must match serial
@@ -715,6 +802,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
     {
         const int kv_len = BASE_KV + m;
         std::vector<float> grouped(static_cast<size_t>(m) * Q_DIM, 0.0f);
+        PerfStatsCollector::reset();
         ASSERT_TRUE(callQ16GroupedVerifier(
             Q_all.data(),
             grouped.data(),
@@ -726,6 +814,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
             N_KV_HEADS,
             HEAD_DIM))
             << "M=" << m;
+        expectGroupedQ16AttentionCounter(m, kv_len);
 
         for (int row = 0; row < m; ++row)
         {
@@ -742,16 +831,20 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
                 << "M=" << m << " row=" << row;
 
             const float *grouped_row = grouped.data() + static_cast<size_t>(row) * Q_DIM;
-            const float max_diff = max_abs_error(grouped_row, serial.data(), Q_DIM);
-            const float cos = cosine_similarity(grouped_row, serial.data(), Q_DIM);
-            EXPECT_LT(max_diff, 1e-5f) << "M=" << m << " row=" << row;
-            EXPECT_GT(cos, 0.999999f) << "M=" << m << " row=" << row;
+            expectByteExactFP32(
+                grouped_row,
+                serial.data(),
+                Q_DIM,
+                "Q16 grouped verifier attention M=" + std::to_string(m) +
+                    " row=" + std::to_string(row));
         }
     }
 }
 
 TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_M2ToM4)
 {
+    ScopedPerfStats perfstats;
+
     /*
      * Qwen3.6 dense attention uses a wider head layout than the small unit
      * case above.  This regression keeps the grouped verifier path honest for
@@ -783,6 +876,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shap
     {
         const int kv_len = BASE_KV + m;
         std::vector<float> grouped(static_cast<size_t>(m) * Q_DIM, 0.0f);
+        PerfStatsCollector::reset();
         ASSERT_TRUE(callQ16GroupedVerifier(
             Q_all.data(),
             grouped.data(),
@@ -794,6 +888,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shap
             N_KV_HEADS,
             HEAD_DIM))
             << "M=" << m;
+        expectGroupedQ16AttentionCounter(m, kv_len);
 
         for (int row = 0; row < m; ++row)
         {
@@ -810,10 +905,12 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shap
                 << "M=" << m << " row=" << row;
 
             const float *grouped_row = grouped.data() + static_cast<size_t>(row) * Q_DIM;
-            const float max_diff = max_abs_error(grouped_row, serial.data(), Q_DIM);
-            const float cos = cosine_similarity(grouped_row, serial.data(), Q_DIM);
-            EXPECT_LT(max_diff, 1e-5f) << "M=" << m << " row=" << row;
-            EXPECT_GT(cos, 0.999999f) << "M=" << m << " row=" << row;
+            expectByteExactFP32(
+                grouped_row,
+                serial.data(),
+                Q_DIM,
+                "Q16 Qwen3.6 grouped verifier attention M=" + std::to_string(m) +
+                    " row=" + std::to_string(row));
         }
     }
 }

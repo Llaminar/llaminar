@@ -1924,25 +1924,24 @@ namespace llaminar2
             const int *position_ids,
             int request_batch,
             int32_t *out_tokens) override;
-        bool forwardMTPBatchAndSampleGreedyToDeviceDraftSlots(
-            const int32_t *draft_condition_tokens,
-            const int *position_ids,
+        bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
             int first_draft_slot,
-            int slot_stride,
-            int32_t *out_tokens) override;
+            int slot_stride) override;
         bool forwardMTPBatchFromLastDraftAndSampleGreedy(
             const int32_t *draft_condition_tokens,
             const int *position_ids,
             int request_batch,
             int32_t *out_tokens) override;
-        bool forwardMTPBatchFromLastDraftAndSampleGreedyToDeviceDraftSlots(
-            const int32_t *draft_condition_tokens,
-            const int *position_ids,
+        bool forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
+            int first_condition_slot,
+            int condition_slot_stride,
+            int position_offset,
             int first_draft_slot,
-            int slot_stride,
-            int32_t *out_tokens) override;
+            int draft_slot_stride) override;
         bool forwardMTPFromLastDraftAndSampleGreedy(
             int32_t draft_condition_token,
             int position_id,
@@ -2014,8 +2013,7 @@ namespace llaminar2
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
             int already_appended_tokens,
@@ -2025,17 +2023,14 @@ namespace llaminar2
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
             int already_appended_tokens,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1) override;
+            bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowsFromDeviceOutcome(
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
             int already_appended_tokens,
             int max_state_commit_rows,
             int main_forward_token_count,
-            bool allow_speculative_discard = false,
-            int position_offset_override = -1,
-            int already_appended_shifted_kv_tokens = -1) override;
+            bool allow_speculative_discard = false) override;
         bool ensureMTPCheckpointTerminalHidden() override;
         uint64_t forwardReplayLiveStateEpoch() const
         {
@@ -2448,7 +2443,7 @@ namespace llaminar2
             int request_count,
             const SamplingParams &params,
             int32_t *out_tokens,
-            const float *stochastic_thresholds = nullptr) override;
+            const uint64_t *stochastic_position_seeds = nullptr) override;
 
         /**
          * @brief Apply sparse logit penalties on device
@@ -2813,6 +2808,7 @@ namespace llaminar2
             shifted_mtp_kv_ready_.producer_stream = nullptr;
             clearPendingAllPositionVerifierStateReady();
             clearDeviceResidentLogicalSequenceStateMailbox();
+            retireDeviceResidentMTPTransaction();
             cache_stats_ = CacheStats{};
             if (request.reset_kv || request.reset_gdn)
                 state_.clearMainKVAndGDNState();
@@ -2944,9 +2940,8 @@ namespace llaminar2
          * This is the structured device-side counterpart to get_position() and
          * sequence_lengths().  It stays invalid until a verifier outcome has
          * produced resident publication metadata on an explicit stream.
-         */
+        */
         DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override;
-        bool hostLogicalStateMirrorsDeviceResidentState() const override;
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
@@ -3636,7 +3631,10 @@ namespace llaminar2
             DeviceDistributionBuffer buffer,
             int slot,
             float threshold,
-            int32_t *out_token_host);
+            int32_t *out_token_host,
+            uint64_t threshold_seed = 0,
+            const int32_t *threshold_position_device = nullptr,
+            int threshold_position_offset = 0);
 
         /**
          * @brief Shared vLLM-style draft proposal implementation.
@@ -3702,6 +3700,8 @@ namespace llaminar2
             DeviceSpeculativeVerifyBatchOutcome *out,
             uint64_t inverse_sample_seed,
             int inverse_sample_first_logical_position,
+            const int32_t *threshold_base_position_device,
+            int threshold_position_offset,
             bool use_vllm_probability_rejection,
             bool serial_sample_equivalent,
             int output_request_slot,
@@ -3984,6 +3984,36 @@ namespace llaminar2
          * to be rebound after publication.
          */
         bool preservesMTPSidecarReplayAfterSpecPublication() const;
+        /**
+         * @brief Prepare the shifted MTP KV boundary consumed by one commit.
+         *
+         * A GPU transaction lease is an event-ordered device ownership
+         * contract. In that mode this helper validates request/depth binding,
+         * session ownership, and the cache's canonical device counter, then
+         * deliberately avoids every host cache getter. CPU calls retain their
+         * ordinary synchronous count validation and optional truncation.
+         *
+         * @param cache Shifted MTP cache that will receive the next row.
+         * @param depth MTP cache depth represented by @p cache.
+         * @param request_index Logical request inside the cache batch.
+         * @param expected_cached_tokens CPU boundary. Ignored for GPU owners.
+         * @param allow_speculative_discard Whether CPU state may be
+         *        truncated to @p expected_cached_tokens.
+         * @param stream Explicit GPU stream, or nullptr for CPU execution.
+         * @param transaction Explicit child-local GPU transaction lease. GPU
+         *        callers must provide a lease owned by this runner.
+         * @param operation Stable diagnostic/perfstats operation name.
+         * @return true when the boundary is ordered and ready for append.
+         */
+        bool prepareShiftedMTPKVCommitBoundary(
+            IKVCache &cache,
+            int depth,
+            int request_index,
+            int expected_cached_tokens,
+            bool allow_speculative_discard,
+            void *stream,
+            const DeviceResidentMTPTransactionLease *transaction,
+            const char *operation);
         void handleLivePrefixReplayStateAfterMutation(
             LivePrefixMutationReason reason,
             const char *operation,
@@ -4035,12 +4065,18 @@ namespace llaminar2
                                      int speculative_outcome_output_token_stride = 0,
                                      int speculative_outcome_request_index = -1,
                                      int speculative_first_output_token_index = 0,
-                                     void *speculative_outcome_ready_event = nullptr);
+                                     void *speculative_outcome_ready_event = nullptr,
+                                     int draft_condition_token_stride = 1,
+                                     int draft_condition_ready_count = 1,
+                                     int draft_condition_ready_stride = 1,
+                                     int device_position_offset = 0,
+                                     int first_seq_idx = 0);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
-                                                int position_offset);
-        void updateMTPShiftedCacheMetadata(int active_batch_size);
+                                                int position_offset,
+                                                const std::vector<int> *request_lengths = nullptr,
+                                                const std::vector<int> *position_ids = nullptr);
 
         /**
          * @brief Record that main forward produced a new hidden-state tensor.
@@ -4082,6 +4118,7 @@ namespace llaminar2
             int position_id = 0;
             int seq_len = 0;
             int batch_size = 1;
+            int first_seq_idx = 0;
             bool uses_device_token_ids = false;
             bool uses_device_position_ids = false;
             int condition_token_slot = -1;
@@ -4666,6 +4703,10 @@ namespace llaminar2
         void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, 3], p(sampled draft token)
         void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1, mtp_sidecar_condition_token_capacity_]
         int mtp_sidecar_condition_token_capacity_ = 0; ///< Total staged condition-token scalars across all sidecar slots.
+        void *mtp_sidecar_position_ids_dev_ = nullptr; ///< INT32 [request_batch], stable positions for chained device sidecars.
+        void *request_sequence_lengths_dev_ = nullptr; ///< INT32 [batch], immutable real rows admitted before GPU prefill.
+        int request_sequence_lengths_capacity_ = 0; ///< Number of request rows reserved in the arena allocation.
+        int request_sequence_lengths_active_count_ = 0; ///< Rows populated for the current request-batched prefill.
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
         void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 target/verifier top-k partial scratch.
         void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 target/verifier top-k partial scratch.
@@ -4961,7 +5002,19 @@ namespace llaminar2
         };
         DeviceResidentLogicalSequenceStateMailbox
             device_resident_logical_sequence_state_mailbox_;
-        uint64_t device_resident_logical_sequence_host_mirror_epoch_ = 0;
+
+        /**
+         * @brief Persistent request-session owner for device-resident MTP KV state.
+         *
+         * The transaction points directly at each shifted cache's canonical
+         * device count row. Its stream/event fence advances after every
+         * mutation, but its identity remains stable until request reset. Compact
+         * outcomes and logical-state handles hold child-local leases to this
+         * shared object, so RankOrchestrator never has to rediscover ownership
+         * through an ambient mailbox.
+         */
+        std::shared_ptr<DeviceResidentMTPTransactionState>
+            device_resident_mtp_transaction_;
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
@@ -5117,7 +5170,6 @@ namespace llaminar2
         bool compute_row_indexed_all_position_logits_ = false;
         int row_indexed_all_position_logits_row_count_ = 0;
         int request_batched_prefill_logits_row_count_ = 0;
-        std::vector<int32_t> request_batched_prefill_logit_rows_;
 
         /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
         MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{
@@ -5299,8 +5351,9 @@ namespace llaminar2
          * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  It does not
          * mutate KV, positions, or terminal hidden state; instead it validates
          * that @p request belongs to the last all-position verifier graph,
-         * uploads the host-known base cache counts into the runner metadata
-         * workspace, and asks the backend to derive accepted restore rows,
+         * snapshots the canonical pre-verifier cache count device-to-device
+         * into the runner metadata workspace, and asks the backend to derive
+         * accepted restore rows,
          * target cache counts, accepted-state counts, and per-request validity
          * flags on the verifier stream.  Later publication slices consume those
          * workspace buffers directly, so no code should reconstruct these
@@ -5313,12 +5366,108 @@ namespace llaminar2
         /// Drop any stale device logical-state mailbox after request/session mutation.
         void clearDeviceResidentLogicalSequenceStateMailbox();
 
+        /// Retire the request-scoped device MTP transaction at a true session boundary.
+        void retireDeviceResidentMTPTransaction();
+
+        /**
+         * @brief Advance the request-scoped MTP transaction fence after a mutation.
+         *
+         * The helper resolves canonical count rows directly from each IKVCache.
+         * It creates a transaction only when the current request session has no
+         * owner, then updates that owner's producer stream, event, and mutation
+         * generation in place. No live-state epoch retargeting is involved.
+         *
+         * @param request_count Number of active request entries in each count row.
+         * @param producer_stream Explicit stream that completed all cache publications.
+         * @param producer_name Stable diagnostic label for perfstats.
+         * @param ready_event Optional already-recorded event on @p producer_stream.
+         * @return true after the transaction fence has been advanced.
+         */
+        bool recordDeviceResidentMTPTransactionMutation(
+            int request_count,
+            void *producer_stream,
+            const char *producer_name,
+            std::shared_ptr<void> ready_event = {});
+
+        /**
+         * @brief Advance the persistent transaction after GPU state restore.
+         *
+         * Restore replaces cache contents but not the request-scoped IKVCache
+         * allocations. The transaction therefore keeps its identity and records
+         * a new fence after all restore writes. No host cache count is read or
+         * adopted.
+         *
+         * @param producer_stream Explicit stream containing all restore writes.
+         * @param producer_name Stable diagnostic label for perfstats and errors.
+         * @return true when no GPU MTP caches exist or the fence was advanced.
+         */
+        bool recordRestoredDeviceResidentMTPTransaction(
+            void *producer_stream,
+            const char *producer_name);
+
+        /// Return the current child-local lease, or an empty lease before admission.
+        DeviceResidentMTPTransactionLease
+        currentDeviceResidentMTPTransactionLease() const;
+
+        /// Validate ownership and queue a wait for the transaction's latest fence.
+        bool waitForDeviceResidentMTPTransaction(
+            const DeviceResidentMTPTransactionLease &transaction,
+            void *consumer_stream,
+            const char *consumer_name) const;
+
+        /// Read the device-owned main logical token count for diagnostics/checkpoints.
+        std::optional<int> deviceResidentLogicalTokenCountForObservation(
+            int request_index,
+            void *consumer_stream,
+            const char *consumer_name) const;
+
+        /// Read the device-owned shifted-MTP KV token count for diagnostics/checkpoints.
+        std::optional<int> deviceResidentShiftedMTPKVTokenCountForObservation(
+            int depth,
+            int request_index,
+            void *consumer_stream,
+            const char *consumer_name) const;
+
         /// Record the device pointers that later DGO logical-state consumers must use.
         bool recordDeviceResidentLogicalSequenceStateMailbox(
             const MTPSpecDecodeMetadataDevicePointers &ptrs,
             int request_count,
             void *producer_stream,
             std::string *error = nullptr);
+
+        /**
+         * @brief Admit request-local real row counts into persistent GPU state.
+         *
+         * Prompt lengths are immutable API input, but they must cross the host/device
+         * boundary exactly once before they can become GPU execution state. This
+         * helper uploads the row before graph preparation and fences that explicit
+         * stream before capture starts. GDN, short-conv, first-token sampling, and
+         * initial MTP mailbox publication then consume the same device owner.
+         */
+        bool stageRequestBatchSequenceLengthsOnDevice(int request_count);
+
+        /**
+         * @brief Admit one real prefill append width into persistent GPU state.
+         *
+         * Single-request bucketed prefill uses the same graph-stable arena row
+         * as request-batched prefill. The one admission copy occurs before graph
+         * preparation; captured KV append kernels retain the device pointer and
+         * read the current request width directly on every replay.
+         */
+        bool stageSingleRequestAppendLengthOnDevice(int append_tokens);
+
+        /**
+         * @brief Publish the initial request-batched logical state after prefill.
+         *
+         * Terminal prefill sampling writes contiguous target-token slots on the
+         * GPU. This helper waits for those slots on @p producer_stream, seeds the
+         * persistent metadata workspace from the previously staged device position
+         * row and sampled tokens, then records the first resident mailbox. No host
+         * logical-state mirror participates in this publication.
+         */
+        bool initializeDeviceResidentLogicalSequenceStateFromMainBatchSamples(
+            int request_count,
+            void *producer_stream);
 
         /**
          * @brief Retarget the current resident mailbox after a shifted-MTP KV append.
@@ -5344,12 +5493,10 @@ namespace llaminar2
         /**
          * @brief Queue an observation-only wait for resident logical-state metadata.
          *
-         * Device-resident MTP publication can leave request positions and
-         * sequence lengths in GPU metadata until a later host-adoption boundary.
-         * Host-visible diagnostics must wait for the producer stream before
-         * reading any paired live KV/GDN/MTP state, but they must not clear or
-         * adopt the mailbox because scheduler and publication code still own
-         * the semantic transition.
+         * Device-resident MTP publication leaves request positions and sequence
+         * lengths in canonical GPU metadata. Host-visible diagnostics must wait
+         * for the producer stream before reading paired live KV/GDN/MTP state,
+         * but observation never adopts or replaces that device ownership.
          */
         bool waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
             void *consumer_stream,
@@ -5358,12 +5505,11 @@ namespace llaminar2
         /**
          * @brief Whether DGO can consume device-published logical sequence state.
          *
-         * The cache can publish its device head/count mirrors independently,
-         * but the runner is not safe to mutate until positions,
-         * sequence_lengths(), and graph-signature inputs are also updated from
-         * the same resident metadata.  Keeping this as a separate gate prevents
-         * a future KV-cache implementation from partially publishing state
-         * before DGO has a device-owned logical-state mailbox.
+         * The cache can publish its device head/count rows independently, but
+         * dynamic positions and sequence lengths must be published from the
+         * same transaction metadata and consumed through DGO's resident
+         * mailbox. Keeping this as a separate gate prevents partial cache-only
+         * publication from being mistaken for a complete live-state handoff.
          */
         bool supportsDeviceResidentLogicalSequenceStatePublication() const;
 

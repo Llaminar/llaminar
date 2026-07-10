@@ -11,16 +11,22 @@
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cassert>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {
     extern "C" void cuda_kv_sequence_state_advance(
         int *d_head, int *d_count, int num_tokens, int max_seq_len,
         cudaStream_t stream);
+    extern "C" void cuda_kv_sequence_state_advance_dynamic(
+        int *d_head, int *d_count, const int *d_append_count,
+        int captured_num_tokens, int max_seq_len, cudaStream_t stream);
 
     // =========================================================================
     // Construction / Destruction
@@ -31,10 +37,28 @@ namespace llaminar2
         int n_kv_heads, int head_dim,
         const TurboQuantContext *tq_ctx,
         int device_id)
+        : CUDARingKVCacheTQ(n_layers, batch_size, max_seq_len,
+                            n_kv_heads, n_kv_heads, 0,
+                            head_dim, tq_ctx, device_id)
+    {
+    }
+
+    CUDARingKVCacheTQ::CUDARingKVCacheTQ(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, const TurboQuantContext *tq_ctx,
+        int device_id)
         : CUDARingKVCacheBase(n_layers, batch_size, max_seq_len,
-                              n_kv_heads, head_dim, n_kv_heads * head_dim, device_id),
+                              n_kv_heads, head_dim, local_n_kv_heads * head_dim, device_id),
+          local_n_kv_heads_(local_n_kv_heads),
+          kv_head_start_(kv_head_start),
           tq_ctx_(tq_ctx)
     {
+        if (local_n_kv_heads <= 0 || local_n_kv_heads > n_kv_heads ||
+            kv_head_start < 0 || kv_head_start + local_n_kv_heads > n_kv_heads)
+        {
+            throw std::invalid_argument("CUDARingKVCacheTQ: invalid LocalTP KV-head range");
+        }
         cudaSetDevice(device_id);
 
         // Determine block sizes
@@ -54,31 +78,36 @@ namespace llaminar2
             throw std::runtime_error("CUDARingKVCacheTQ: head_dim must be 64 or 128");
         }
 
-        k_pos_bytes_ = static_cast<size_t>(n_kv_heads) * k_block_size_;
-        v_pos_bytes_ = static_cast<size_t>(n_kv_heads) * v_block_size_;
+        k_pos_bytes_ = static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
+        v_pos_bytes_ = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
 
         LOG_DEBUG("CUDARingKVCacheTQ: K block=" << k_block_size_ << "B, V block=" << v_block_size_
                                                 << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
-                                                << " (vs FP16: " << (n_kv_heads * head_dim * 2 * 2) << "B)");
+                                                << " (vs FP16: " << (local_n_kv_heads_ * head_dim * 2 * 2) << "B)");
 
-        // Upload codebooks to constant memory
-        cuda_tq_upload_codebooks(0);
+        cudaStream_t init_stream = static_cast<cudaStream_t>(
+            GPUDeviceContextPool::instance().getNvidiaContext(device_id).defaultStream());
+        if (!init_stream)
+            throw std::runtime_error("CUDARingKVCacheTQ: explicit initialization stream unavailable");
+
+        // Upload persistent codebooks and shard-specific rotations on one
+        // explicit stream.  The constructor fences that stream before return,
+        // so the first graph capture cannot race partially initialized state.
+        cuda_tq_upload_codebooks(init_stream);
 
         // Create GPU rotation matrices from TurboQuantContext
         if (tq_ctx)
         {
             rotations_ = cuda_tq_create_rotations(
-                n_layers, n_kv_heads, head_dim,
-                tq_ctx->rotation().seed, device_id, 0);
+                n_layers, local_n_kv_heads_, head_dim,
+                tq_ctx->rotation().seed, device_id, init_stream, kv_head_start_);
 
             // Diagnostic: verify GPU rotation matches CPU rotation
             {
                 const auto &layer0_ctx = tq_ctx->for_layer(0);
-                const auto &head0_ctx = layer0_ctx.for_layer(0);
+                const auto &head0_ctx = layer0_ctx.for_layer(kv_head_start_);
                 const auto &cpu_rot = head0_ctx.rotation();
                 float gpu_rot_val = 0.0f;
-                cudaStream_t init_stream = static_cast<cudaStream_t>(
-                    GPUDeviceContextPool::instance().getNvidiaContext(device_id).defaultStream());
                 cudaMemcpyAsync(&gpu_rot_val, rotations_.d_rotations,
                                 sizeof(float), cudaMemcpyDeviceToHost, init_stream);
                 cudaStreamSynchronize(init_stream);
@@ -104,10 +133,23 @@ namespace llaminar2
                 allocate_entry(entries_[l][b]);
             }
         }
+        if (!publishBatchedEntryTables(init_stream))
+        {
+            for (auto &layer : entries_)
+                for (auto &entry : layer)
+                    free_entry(entry);
+            cuda_tq_free_rotations(rotations_);
+            throw std::runtime_error(
+                "CUDARingKVCacheTQ: failed to publish resident batched entry topology");
+        }
 
         // Allocate per-layer FP16 scratch buffers (enables incremental dequant + FP16 flash attention)
         {
-            const size_t scratch_bytes = static_cast<size_t>(max_seq_len) * kv_dim_ * sizeof(__half);
+            // Scalar reads use the first request span. Grouped reads use every
+            // request span in-place, so one allocation supports both paths.
+            const size_t scratch_bytes =
+                static_cast<size_t>(batch_size) * max_seq_len * kv_dim_ *
+                sizeof(__half);
             layer_scratch_.resize(n_layers);
             for (int l = 0; l < n_layers; ++l)
             {
@@ -124,29 +166,19 @@ namespace llaminar2
                       << (total_scratch_bytes / (1024 * 1024)) << "MB (" << n_layers << " layers)");
         }
 
-        // Pre-allocate temp buffers for GPU-side quantization (avoids per-call cudaMalloc)
-        {
-            const size_t k_temp_bytes = static_cast<size_t>(max_seq_len) * n_kv_heads * k_block_size_;
-            const size_t v_temp_bytes = static_cast<size_t>(max_seq_len) * n_kv_heads * v_block_size_;
-            cudaMalloc(&d_quantize_k_temp_, k_temp_bytes);
-            cudaMalloc(&d_quantize_v_temp_, v_temp_bytes);
-            LOG_DEBUG("CUDARingKVCacheTQ: pre-allocated quantize temp buffers: K="
-                      << (k_temp_bytes / 1024) << "KB, V=" << (v_temp_bytes / 1024) << "KB");
-        }
-
-        // Allocate device-side dynamic params for CUDA graph capture
-        // d_head_params_ and h_head_params_ are allocated by CUDARingKVCacheBase
+        // Canonical device head/count and append-count mailboxes are allocated
+        // by CUDARingKVCacheBase. Incremental dequant consumes those values
+        // directly, so TQ owns no parallel host/device replay metadata.
         allocateDeviceParams();
-        {
-            // TQ-specific dequant params
-            cudaMalloc(&d_dequant_params_, n_layers * sizeof(TQDequantDynamicParams));
-            cudaMallocHost(&h_dequant_params_, n_layers * sizeof(TQDequantDynamicParams));
-            memset(h_dequant_params_, 0, n_layers * sizeof(TQDequantDynamicParams));
-            dequant_params_device_valid_.assign(static_cast<size_t>(n_layers), 0);
-        }
+
+        const cudaError_t init_sync = cudaStreamSynchronize(init_stream);
+        if (init_sync != cudaSuccess)
+            throw std::runtime_error(std::string("CUDARingKVCacheTQ initialization failed: ") +
+                                     cudaGetErrorString(init_sync));
 
         LOG_DEBUG("CUDARingKVCacheTQ created: " << n_layers << " layers, "
-                                                << max_seq_len << " max_seq_len, " << n_kv_heads << " KV heads, "
+                                                << max_seq_len << " max_seq_len, " << local_n_kv_heads_
+                                                << "/" << n_kv_heads << " local/total KV heads, "
                                                 << head_dim << " head_dim on cuda:" << device_id);
     }
 
@@ -160,6 +192,15 @@ namespace llaminar2
                 free_entry(entry);
         }
 
+        batched_k_view_.reset();
+        batched_v_view_.reset();
+        if (d_batched_k_entry_table_)
+            cudaFree(d_batched_k_entry_table_);
+        if (d_batched_v_entry_table_)
+            cudaFree(d_batched_v_entry_table_);
+        d_batched_k_entry_table_ = nullptr;
+        d_batched_v_entry_table_ = nullptr;
+
         // Free per-layer scratch buffers
         for (auto &scratch : layer_scratch_)
         {
@@ -172,81 +213,63 @@ namespace llaminar2
         }
         layer_scratch_.clear();
 
-        // Free pre-allocated quantize temp buffers
-        if (d_quantize_k_temp_)
-            cudaFree(d_quantize_k_temp_);
-        if (d_quantize_v_temp_)
-            cudaFree(d_quantize_v_temp_);
-
-        // Free graph capture dynamic params (TQ-specific only)
-        // Note: d_head_params_/h_head_params_ are freed by ~CUDARingKVCacheBase()
-        if (d_dequant_params_)
-            cudaFree(d_dequant_params_);
-        if (h_dequant_params_)
-            cudaFreeHost(h_dequant_params_);
-
         cuda_tq_free_rotations(rotations_);
     }
 
-    // =========================================================================
-    // Graph Capture Support (TQ-specific: setDynamicDequantParams)
-    // Note: setDynamicHead and advanceHead are now in CUDARingKVCacheBase
-    // =========================================================================
-
-    void CUDARingKVCacheTQ::setDynamicDequantParams(
-        int layer, int seq_idx,
-        float rope_theta, int position_start,
-        void *gpu_stream)
+    bool CUDARingKVCacheTQ::publishBatchedEntryTables(cudaStream_t stream)
     {
-        if (!d_dequant_params_ || !h_dequant_params_)
-            return;
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-        dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
+        if (!stream || n_layers_ <= 0 || batch_size_ <= 0)
+            return false;
 
-        const auto &entry = entries_[layer][seq_idx];
-
-        // Compute dequant params for the NEXT incremental step.
-        // At this point, entry.count and entry.head reflect the state
-        // BEFORE this step's append. After append:
-        //   - The new token is written at entry.head (current value)
-        //   - The new token occupies scratch slot entry.count (0-indexed)
-        h_dequant_params_[layer].ring_pos = entry.head;
-        h_dequant_params_[layer].out_offset_elems = entry.count * kv_dim_;
-        h_dequant_params_[layer].rope_position =
-            (rope_theta > 0.0f) ? position_start + entry.count : 0;
-
-        auto *stream = static_cast<cudaStream_t>(gpu_stream);
-        if (!stream)
+        const size_t entry_count =
+            static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
+        const size_t table_bytes = entry_count * sizeof(void *);
+        std::vector<void *> host_k(entry_count);
+        std::vector<void *> host_v(entry_count);
+        for (int layer = 0; layer < n_layers_; ++layer)
         {
-            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] Explicit CUDA stream required");
-            return;
+            for (int request = 0; request < batch_size_; ++request)
+            {
+                const size_t index =
+                    static_cast<size_t>(layer) * batch_size_ + request;
+                host_k[index] = entries_[layer][request].d_K;
+                host_v[index] = entries_[layer][request].d_V;
+            }
         }
 
-        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-        const cudaError_t cap_err = cudaStreamIsCapturing(stream, &status);
-        if (cap_err != cudaSuccess)
+        cudaError_t status = cudaMalloc(
+            reinterpret_cast<void **>(&d_batched_k_entry_table_), table_bytes);
+        if (status == cudaSuccess)
         {
-            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] cudaStreamIsCapturing failed: "
-                      << cudaGetErrorString(cap_err));
-            return;
+            status = cudaMalloc(
+                reinterpret_cast<void **>(&d_batched_v_entry_table_),
+                table_bytes);
         }
-        if (isGraphCaptureActive() || status == cudaStreamCaptureStatusActive)
+        if (status == cudaSuccess)
         {
-            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] Refusing to record TQ dequant-param H2D inside CUDA graph capture");
-            return;
+            status = cudaMemcpyAsync(
+                d_batched_k_entry_table_, host_k.data(), table_bytes,
+                cudaMemcpyHostToDevice, stream);
         }
-
-        const cudaError_t copy_err =
-            cudaMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                            sizeof(TQDequantDynamicParams), cudaMemcpyHostToDevice, stream);
-        if (copy_err != cudaSuccess)
+        if (status == cudaSuccess)
         {
-            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] cudaMemcpyAsync failed: "
-                      << cudaGetErrorString(copy_err));
-            return;
+            status = cudaMemcpyAsync(
+                d_batched_v_entry_table_, host_v.data(), table_bytes,
+                cudaMemcpyHostToDevice, stream);
         }
-        dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
+        if (status != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] Resident entry-table publication failed: "
+                      << cudaGetErrorString(status));
+            if (d_batched_k_entry_table_)
+                cudaFree(d_batched_k_entry_table_);
+            if (d_batched_v_entry_table_)
+                cudaFree(d_batched_v_entry_table_);
+            d_batched_k_entry_table_ = nullptr;
+            d_batched_v_entry_table_ = nullptr;
+            return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -266,8 +289,6 @@ namespace llaminar2
         cudaMemsetAsync(entry.d_V, 0, v_bytes, alloc_stream);
         cudaStreamSynchronize(alloc_stream);
 
-        entry.head = 0;
-        entry.count = 0;
     }
 
     void CUDARingKVCacheTQ::free_entry(TQEntry &entry)
@@ -321,222 +342,360 @@ namespace llaminar2
         cached_stream_ = stream;
 
         TQEntry &entry = entries_[layer][seq_idx];
-        const bool capture_active = isGraphCaptureActive();
+        const int index = layer * batch_size_ + seq_idx;
+        const int *d_append_count =
+            deviceDynamicAppendCountPtr(layer, seq_idx);
+        if (!d_head_params_ || !d_count_params_)
+            return false;
 
-        // One-time warning when ring buffer starts wrapping
-        if (!capture_active && entry.count + num_tokens > max_seq_len_ && !wrap_warned_)
+        const bool prepared_tq =
+            K->native_type() == TensorType::TQ8 &&
+            V->native_type() == TensorType::TQ4;
+        if (prepared_tq)
         {
-            LOG_WARN("Context window full (" << max_seq_len_
-                                             << " tokens). Sliding window is now overwriting oldest tokens. "
-                                             << "Use -c <size> to increase context length.");
-            wrap_warned_ = true;
-        }
-
-        const bool k_is_tq = (K->native_type() == TensorType::TQ8 || K->native_type() == TensorType::TQ4);
-        const bool v_is_tq = (V->native_type() == TensorType::TQ4);
-
-        LOG_DEBUG("[CUDARingKVCacheTQ::append] layer=" << layer
-                                                       << " seq=" << seq_idx << " tokens=" << num_tokens
-                                                       << " K.is_gpu=" << K->is_on_gpu()
-                                                       << " K.dtype=" << K->dtype_name()
-                                                       << " V.dtype=" << V->dtype_name()
-                                                       << " pre_quantized=" << (k_is_tq && v_is_tq));
-
-        // ================================================================
-        // Fast path: K and V are already TQ-quantized blocks
-        // (from KVCacheAppendStage which pre-quantizes on CPU)
-        // Just upload blocks directly to the GPU ring buffer.
-        // ================================================================
-        if (k_is_tq && v_is_tq)
-        {
-            const uint8_t *h_K_blocks = static_cast<const uint8_t *>(K->raw_data());
-            const uint8_t *h_V_blocks = static_cast<const uint8_t *>(V->raw_data());
-            if (!h_K_blocks || !h_V_blocks)
+            if (!K->gpu_data_ptr() || !V->gpu_data_ptr() ||
+                K->shape().empty() || V->shape().empty() ||
+                K->shape()[0] < static_cast<size_t>(num_tokens) ||
+                V->shape()[0] < static_cast<size_t>(num_tokens))
+            {
+                LOG_ERROR("[CUDARingKVCacheTQ::appendWithStream] Prepared TQ rows must already be device resident");
                 return false;
-
-            const size_t k_row_bytes = static_cast<size_t>(n_kv_heads_) * k_block_size_;
-            const size_t v_row_bytes = static_cast<size_t>(n_kv_heads_) * v_block_size_;
-
-            // Copy each token's blocks to the correct ring position
-            for (int t = 0; t < num_tokens; ++t)
-            {
-                const int pos = (entry.head + t) % max_seq_len_;
-                const size_t k_dst_offset = static_cast<size_t>(pos) * k_row_bytes;
-                const size_t v_dst_offset = static_cast<size_t>(pos) * v_row_bytes;
-                const size_t k_src_offset = static_cast<size_t>(t) * k_row_bytes;
-                const size_t v_src_offset = static_cast<size_t>(t) * v_row_bytes;
-
-                cudaMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_K) + k_dst_offset,
-                    h_K_blocks + k_src_offset,
-                    k_row_bytes, cudaMemcpyHostToDevice, stream);
-                cudaMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_V) + v_dst_offset,
-                    h_V_blocks + v_src_offset,
-                    v_row_bytes, cudaMemcpyHostToDevice, stream);
             }
 
-            if (!capture_active)
+            const bool copy_ok = cuda_tq_copy_prepared_rows_ring_dynamic(
+                K->gpu_data_ptr(), V->gpu_data_ptr(), entry.d_K, entry.d_V,
+                &d_head_params_[index], d_append_count,
+                max_seq_len_, num_tokens,
+                k_pos_bytes_, v_pos_bytes_, false, false,
+                local_n_kv_heads_, stream);
+            if (copy_ok)
             {
-                // Host metadata changes only after real execution; graph capture
-                // records kernels and lets replay callbacks advance by real tokens.
-                entry.head = (entry.head + num_tokens) % max_seq_len_;
-                entry.count = std::min(entry.count + num_tokens, max_seq_len_);
-
-                // Invalidate scratch if it holds data for this (layer, seq)
-                if (layer_scratch_[layer].cached_layer == layer && layer_scratch_[layer].cached_seq == seq_idx)
-                    layer_scratch_[layer].invalidate();
+                cuda_kv_sequence_state_advance_dynamic(
+                    &d_head_params_[index], &d_count_params_[index],
+                    d_append_count, num_tokens, max_seq_len_, stream);
             }
-
+            if (!copy_ok)
+                return false;
             return true;
         }
 
-        // ================================================================
-        // GPU quantize path: K and V are FP32 — quantize on GPU
-        // ================================================================
-
-        // Fast path: single token + data already on GPU (decode hot path)
-        // Fused kernel writes directly to ring buffer — no temp, no memcpy.
-        if (num_tokens == 1 && K->is_on_gpu() && V->is_on_gpu())
+        if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32 ||
+            !K->gpu_data_ptr() || !V->gpu_data_ptr())
         {
-            const float *d_K_new = static_cast<const float *>(K->gpu_data_ptr());
-            const float *d_V_new = static_cast<const float *>(V->gpu_data_ptr());
-            const int D = head_dim_;
-            const size_t layer_rot_offset = static_cast<size_t>(layer) * n_kv_heads_ * D * D;
-            const float *d_rot = rotations_.d_rotations + layer_rot_offset;
-
-            bool ok;
-            if (isGraphCaptureActive() && d_head_params_ && h_head_params_ && stream)
-            {
-                // Captured graphs read ring_pos from a stable device scalar
-                // uploaded by updateDynamicParams()/setDynamicHead() before
-                // capture/replay. Do not record H2D copies in the graph.
-                const int idx = layer * batch_size_ + seq_idx;
-                ok = cuda_tq_quantize_fused_ring_dynamic(
-                    d_K_new, d_V_new, d_rot,
-                    entry.d_K, entry.d_V,
-                    &d_head_params_[idx], n_kv_heads_, head_dim_, stream);
-                if (ok && d_count_params_)
-                {
-                    cuda_kv_sequence_state_advance(
-                        &d_head_params_[idx], &d_count_params_[idx],
-                        /*num_tokens=*/1, max_seq_len_, stream);
-                }
-            }
-            else
-            {
-                const int ring_pos = entry.head % max_seq_len_;
-                ok = cuda_tq_quantize_fused_ring(
-                    d_K_new, d_V_new, d_rot,
-                    entry.d_K, entry.d_V,
-                    ring_pos, n_kv_heads_, head_dim_, stream);
-            }
-
-            if (!capture_active)
-            {
-                entry.head = (entry.head + 1) % max_seq_len_;
-                entry.count = std::min(entry.count + 1, max_seq_len_);
-            }
-            return ok;
+            LOG_ERROR("[CUDARingKVCacheTQ::appendWithStream] TQ cache append requires device-resident FP32 K/V tensors");
+            return false;
+        }
+        if (K->shape().size() < 2 || V->shape().size() < 2 ||
+            K->shape()[0] < static_cast<size_t>(num_tokens) ||
+            V->shape()[0] < static_cast<size_t>(num_tokens) ||
+            K->shape()[1] != static_cast<size_t>(kv_dim_) ||
+            V->shape()[1] != static_cast<size_t>(kv_dim_))
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::appendWithStream] Position-major K/V shape does not match the local cache shard");
+            return false;
         }
 
-        // General path: multi-token or host data (prefill)
-        // Uses temp buffers + D2D memcpy for ring-wrapping.
-        const float *d_K_new = nullptr;
-        const float *d_V_new = nullptr;
-        void *d_K_uploaded = nullptr;
-        void *d_V_uploaded = nullptr;
-
-        if (K->is_on_gpu())
+        const auto *d_k = static_cast<const float *>(K->gpu_data_ptr());
+        const auto *d_v = static_cast<const float *>(V->gpu_data_ptr());
+        const size_t rotation_offset = static_cast<size_t>(layer) *
+                                       local_n_kv_heads_ * head_dim_ * head_dim_;
+        const float *d_rotations = rotations_.d_rotations + rotation_offset;
+        const bool ok = cuda_tq_quantize_grouped_ring_dynamic(
+            d_k, d_v, d_rotations, entry.d_K, entry.d_V,
+            &d_head_params_[index], d_append_count,
+            max_seq_len_, num_tokens,
+            local_n_kv_heads_, head_dim_, false, false, stream);
+        if (ok)
         {
-            d_K_new = static_cast<const float *>(K->gpu_data_ptr());
+            cuda_kv_sequence_state_advance_dynamic(
+                &d_head_params_[index], &d_count_params_[index],
+                d_append_count, num_tokens, max_seq_len_, stream);
+        }
+        if (!ok)
+            return false;
+
+        return true;
+    }
+
+    bool CUDARingKVCacheTQ::appendVerifierRowsDecodeEquivalent(
+        int layer,
+        int seq_idx,
+        const ITensor *K,
+        const ITensor *V,
+        int verifier_rows,
+        void *gpu_stream)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_ ||
+            verifier_rows < 1 || verifier_rows > 4 || !K || !V || !gpu_stream)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] Invalid grouped verifier append request");
+            return false;
+        }
+        const bool fp32_sources =
+            K->native_type() == TensorType::FP32 &&
+            V->native_type() == TensorType::FP32;
+        const bool prepared_tq_sources =
+            K->native_type() == TensorType::TQ8 &&
+            V->native_type() == TensorType::TQ4;
+        if (!fp32_sources && !prepared_tq_sources)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] Grouped verifier publication requires device-resident FP32/FP32 or prepared TQ8/TQ4 K/V; got K="
+                      << K->dtype_name() << " V=" << V->dtype_name());
+            return false;
+        }
+
+        const auto source_layout = [&](const ITensor *tensor,
+                                       const char *label,
+                                       bool *head_major) -> bool
+        {
+            if (!tensor || !head_major || tensor->shape().size() < 2)
+                return false;
+            const size_t rows = tensor->shape()[0];
+            const size_t cols = tensor->shape()[1];
+            const bool position_major =
+                rows >= static_cast<size_t>(verifier_rows) &&
+                cols == static_cast<size_t>(kv_dim_);
+            const bool verifier_head_major =
+                rows == static_cast<size_t>(local_n_kv_heads_ * verifier_rows) &&
+                cols == static_cast<size_t>(head_dim_);
+            if (!position_major && !verifier_head_major)
+            {
+                LOG_ERROR("[CUDARingKVCacheTQ] Unsupported grouped " << label
+                          << " shape [" << rows << "," << cols << "] for M="
+                          << verifier_rows << " local_heads=" << local_n_kv_heads_
+                          << " head_dim=" << head_dim_);
+                return false;
+            }
+            *head_major = verifier_head_major && !position_major;
+            return true;
+        };
+
+        bool k_head_major = false;
+        bool v_head_major = false;
+        if (!source_layout(K, "K", &k_head_major) ||
+            !source_layout(V, "V", &v_head_major))
+        {
+            return false;
+        }
+
+        const void *d_k = K->gpu_data_ptr();
+        const void *d_v = V->gpu_data_ptr();
+        if (!d_k || !d_v)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] Grouped verifier K/V must already be device resident");
+            return false;
+        }
+
+        cudaSetDevice(device_id_);
+        const auto stream = static_cast<cudaStream_t>(gpu_stream);
+        cached_stream_ = stream;
+        auto &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
+        const size_t rotation_offset = static_cast<size_t>(layer) *
+                                       local_n_kv_heads_ * head_dim_ * head_dim_;
+        const float *d_rotations = rotations_.d_rotations + rotation_offset;
+
+        if (!d_head_params_ || !d_count_params_)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] Grouped verifier requires canonical device sequence state");
+            return false;
+        }
+        bool ok = false;
+        const int index = layer * batch_size_ + seq_idx;
+        if (prepared_tq_sources)
+        {
+            ok = cuda_tq_copy_prepared_rows_ring_dynamic(
+                d_k, d_v, entry.d_K, entry.d_V,
+                &d_head_params_[index], /*d_row_count=*/nullptr,
+                max_seq_len_, verifier_rows,
+                k_pos_bytes_, v_pos_bytes_, k_head_major, v_head_major,
+                local_n_kv_heads_, stream);
         }
         else
         {
-            // Need to upload K from host — use pre-allocated scratch as staging
-            const float *h_K = K->data();
-            if (!h_K)
-                return false;
-            size_t k_bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
-            cudaMalloc(&d_K_uploaded, k_bytes);
-            cudaMemcpyAsync(d_K_uploaded, h_K, k_bytes, cudaMemcpyHostToDevice, stream);
-            d_K_new = static_cast<const float *>(d_K_uploaded);
+            ok = cuda_tq_quantize_grouped_ring_dynamic(
+                static_cast<const float *>(d_k),
+                static_cast<const float *>(d_v),
+                d_rotations, entry.d_K, entry.d_V,
+                &d_head_params_[index], /*d_row_count=*/nullptr,
+                max_seq_len_, verifier_rows,
+                local_n_kv_heads_, head_dim_, k_head_major, v_head_major, stream);
         }
-
-        if (V->is_on_gpu())
-        {
-            d_V_new = static_cast<const float *>(V->gpu_data_ptr());
-        }
-        else
-        {
-            const float *h_V = V->data();
-            if (!h_V)
-            {
-                if (d_K_uploaded)
-                    cudaFree(d_K_uploaded);
-                return false;
-            }
-            size_t v_bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
-            cudaMalloc(&d_V_uploaded, v_bytes);
-            cudaMemcpyAsync(d_V_uploaded, h_V, v_bytes, cudaMemcpyHostToDevice, stream);
-            d_V_new = static_cast<const float *>(d_V_uploaded);
-        }
-
-        // Get rotation matrices for this layer
-        const int D = head_dim_;
-        const size_t layer_rot_offset = static_cast<size_t>(layer) * n_kv_heads_ * D * D;
-        const float *d_K_rot = rotations_.d_rotations + layer_rot_offset;
-
-        // Quantize into pre-allocated temp buffers (no per-call cudaMalloc!)
-        bool ok = cuda_tq8_quantize(d_K_new, d_K_rot, d_quantize_k_temp_,
-                                    num_tokens, n_kv_heads_, head_dim_, stream);
         if (ok)
         {
-            ok = cuda_tq4_quantize(d_V_new, d_K_rot, d_quantize_v_temp_,
-                                   num_tokens, n_kv_heads_, head_dim_, stream);
+            cuda_kv_sequence_state_advance(
+                &d_head_params_[index], &d_count_params_[index],
+                verifier_rows, max_seq_len_, stream);
+        }
+        if (!ok)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ] Grouped verifier publication launch failed");
+            return false;
         }
 
-        if (ok)
-        {
-            // Copy quantized blocks from temp to ring buffer positions
-            const size_t k_pos_bytes = static_cast<size_t>(n_kv_heads_) * k_block_size_;
-            const size_t v_pos_bytes = static_cast<size_t>(n_kv_heads_) * v_block_size_;
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_kv_cache_grouped_verifier_append_calls",
+            1.0,
+            "verifier",
+            "cuda",
+            {{"cache_format", "TQ8/TQ4"},
+             {"source_k_format", K->dtype_name()},
+             {"source_v_format", V->dtype_name()},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"source_k_layout", k_head_major ? "head_major" : "position_major"},
+             {"source_v_layout", v_head_major ? "head_major" : "position_major"},
+             {"execution_mode", capture_active ? "graph_captured" : "eager_device_state"},
+             {"topology", is_sharded() ? "local_tp_shard" : "replicated"},
+             {"commit_policy", "single_grouped_metadata_commit"},
+             {"local_kv_heads", std::to_string(local_n_kv_heads_)},
+             {"head_dim", std::to_string(head_dim_)},
+             {"kv_head_start", std::to_string(kv_head_start_)}});
+        return true;
+    }
 
-            for (int t = 0; t < num_tokens; ++t)
+    IKVCache::KVCacheLogicalBlockLayout
+    CUDARingKVCacheTQ::logicalBlockLayout(int global_layer, int token_count) const
+    {
+        KVCacheLogicalBlockLayout layout{
+            .k_precision = ActivationPrecision::TQ8,
+            .v_precision = ActivationPrecision::TQ4,
+            .layout = TensorLayout::KV_POS_HEAD_DIM,
+            .local_kv_heads = local_n_kv_heads_,
+            .kv_head_start = kv_head_start_,
+            .head_dim = head_dim_,
+            .device_resident = true,
+        };
+        if (remapLayerIndex(global_layer) < 0 || token_count <= 0)
+            return layout;
+        layout.k_bytes = static_cast<size_t>(token_count) * k_pos_bytes_;
+        layout.v_bytes = static_cast<size_t>(token_count) * v_pos_bytes_;
+        return layout;
+    }
+
+    IKVCache::KVCacheSequenceState
+    CUDARingKVCacheTQ::sequenceState(int global_layer, int seq_idx) const
+    {
+        const int layer = remapLayerIndex(global_layer);
+        if (layer < 0 || seq_idx < 0 || seq_idx >= batch_size_)
+            return {};
+        return CUDARingKVCacheBase::sequenceState(layer, seq_idx);
+    }
+
+    bool CUDARingKVCacheTQ::exportLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc,
+        void *dst_k,
+        void *dst_v) const
+    {
+        const int layer = remapLayerIndex(desc.layer);
+        if (layer < 0 || desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0)
+        {
+            return false;
+        }
+        const auto &entry = entries_[layer][desc.seq_idx];
+        if (desc.token_count == 0)
+        {
+            KVCacheSequenceState state;
+            return observeDeviceSequenceState(layer, desc.seq_idx, &state) &&
+                   desc.logical_token_start <= state.cached_tokens;
+        }
+        if (!desc.stream || !dst_k || !dst_v || !entry.d_K || !entry.d_V)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::exportLogicalBlock] Non-empty export requires destinations and an explicit stream");
+            return false;
+        }
+
+        cudaSetDevice(device_id_);
+        const auto stream = static_cast<cudaStream_t>(desc.stream);
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, desc.seq_idx, &state))
+            return false;
+        const int export_head = state.implementation_head;
+        const int export_count = state.cached_tokens;
+        if (export_head < 0 || export_head >= max_seq_len_ || export_count < 0 ||
+            export_count > max_seq_len_ || desc.logical_token_start > export_count ||
+            desc.token_count > export_count - desc.logical_token_start)
+        {
+            return false;
+        }
+
+        int tail = (export_head - export_count) % max_seq_len_;
+        if (tail < 0)
+            tail += max_seq_len_;
+        auto *out_k = static_cast<uint8_t *>(dst_k);
+        auto *out_v = static_cast<uint8_t *>(dst_v);
+        const auto *ring_k = static_cast<const uint8_t *>(entry.d_K);
+        const auto *ring_v = static_cast<const uint8_t *>(entry.d_V);
+        for (int row = 0; row < desc.token_count; ++row)
+        {
+            const int logical_row = desc.logical_token_start + row;
+            const int physical_row = (tail + logical_row) % max_seq_len_;
+            if (cudaMemcpyAsync(out_k + static_cast<size_t>(row) * k_pos_bytes_,
+                                ring_k + static_cast<size_t>(physical_row) * k_pos_bytes_,
+                                k_pos_bytes_, cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+                cudaMemcpyAsync(out_v + static_cast<size_t>(row) * v_pos_bytes_,
+                                ring_v + static_cast<size_t>(physical_row) * v_pos_bytes_,
+                                v_pos_bytes_, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
             {
-                int dst_pos = (entry.head + t) % max_seq_len_;
-                cudaMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_K) + static_cast<size_t>(dst_pos) * k_pos_bytes,
-                    static_cast<uint8_t *>(d_quantize_k_temp_) + static_cast<size_t>(t) * k_pos_bytes,
-                    k_pos_bytes, cudaMemcpyDeviceToDevice, stream);
-                cudaMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_V) + static_cast<size_t>(dst_pos) * v_pos_bytes,
-                    static_cast<uint8_t *>(d_quantize_v_temp_) + static_cast<size_t>(t) * v_pos_bytes,
-                    v_pos_bytes, cudaMemcpyDeviceToDevice, stream);
+                LOG_ERROR("[CUDARingKVCacheTQ::exportLogicalBlock] TQ payload copy failed");
+                return false;
             }
         }
+        return cudaStreamSynchronize(stream) == cudaSuccess;
+    }
 
-        if (!capture_active)
+    bool CUDARingKVCacheTQ::importLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc,
+        const void *src_k,
+        const void *src_v)
+    {
+        const int layer = remapLayerIndex(desc.layer);
+        if (layer < 0 || desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0 ||
+            desc.logical_token_start > max_seq_len_ ||
+            desc.token_count > max_seq_len_ - desc.logical_token_start || !desc.stream)
         {
-            // Update host metadata only for real execution; captured prefill
-            // launches advance metadata through onGraphReplayed().
-            entry.head = (entry.head + num_tokens) % max_seq_len_;
-            entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            return false;
+        }
+        auto &entry = entries_[layer][desc.seq_idx];
+        const auto stream = static_cast<cudaStream_t>(desc.stream);
+        if (desc.token_count == 0)
+        {
+            if (desc.logical_token_start != 0)
+                return true;
+            layer_scratch_[layer].invalidate();
+            return setDeviceSequenceState(
+                layer, desc.seq_idx, 0, 0, stream);
+        }
+        KVCacheSequenceState state;
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+            !observeDeviceSequenceState(layer, desc.seq_idx, &state) ||
+            desc.logical_token_start != state.cached_tokens ||
+            state.implementation_head != state.cached_tokens % max_seq_len_)
+        {
+            return false;
         }
 
-        // Invalidate scratch — we wrote new data that the scratch doesn't know about
-        // (scratch still holds the OLD dequanted content; new position needs dequant)
-        // DON'T invalidate — let incremental dequant handle it!
-        // The per-layer scratch has count-1 positions dequanted; the new position
-        // will be dequanted incrementally on next get_kv_converted().
-
-        // Free temp buffers if we uploaded from host
-        if (d_K_uploaded)
-            cudaFree(d_K_uploaded);
-        if (d_V_uploaded)
-            cudaFree(d_V_uploaded);
-
-        return ok;
+        cudaSetDevice(device_id_);
+        const size_t k_bytes = static_cast<size_t>(desc.token_count) * k_pos_bytes_;
+        const size_t v_bytes = static_cast<size_t>(desc.token_count) * v_pos_bytes_;
+        auto *ring_k = static_cast<uint8_t *>(entry.d_K);
+        auto *ring_v = static_cast<uint8_t *>(entry.d_V);
+        if (cudaMemcpyAsync(ring_k + static_cast<size_t>(desc.logical_token_start) * k_pos_bytes_,
+                            src_k, k_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaMemcpyAsync(ring_v + static_cast<size_t>(desc.logical_token_start) * v_pos_bytes_,
+                            src_v, v_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        {
+            return false;
+        }
+        const int new_count = desc.logical_token_start + desc.token_count;
+        const int new_head = new_count % max_seq_len_;
+        layer_scratch_[layer].invalidate();
+        if (!setDeviceSequenceState(
+                layer, desc.seq_idx, new_head, new_count, stream))
+            return false;
+        return cudaStreamSynchronize(stream) == cudaSuccess;
     }
 
     // =========================================================================
@@ -574,7 +733,9 @@ namespace llaminar2
     void CUDARingKVCacheTQ::clearScratchStorage(int layer, cudaStream_t stream)
     {
         auto &scratch = layer_scratch_[layer];
-        const size_t scratch_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(__half);
+        const size_t scratch_bytes =
+            static_cast<size_t>(batch_size_) * max_seq_len_ * kv_dim_ *
+            sizeof(__half);
 
         if (scratch.d_K)
         {
@@ -597,10 +758,7 @@ namespace llaminar2
     void CUDARingKVCacheTQ::clearDynamicParams(int layer, int seq_idx, cudaStream_t stream)
     {
         const int entry_idx = layer * batch_size_ + seq_idx;
-        if (h_head_params_)
-            h_head_params_[entry_idx] = 0;
-        if (h_count_params_)
-            h_count_params_[entry_idx] = 0;
+        append_count_sources_[static_cast<size_t>(entry_idx)] = nullptr;
         if (d_head_params_)
         {
             cudaError_t err = cudaMemsetAsync(&d_head_params_[entry_idx], 0, sizeof(int), stream);
@@ -614,17 +772,6 @@ namespace llaminar2
                 LOG_WARN("[CUDARingKVCacheTQ::clear] count param memset failed: " << cudaGetErrorString(err));
         }
 
-        if (h_dequant_params_)
-            std::memset(&h_dequant_params_[layer], 0, sizeof(TQDequantDynamicParams));
-        if (layer >= 0 && layer < static_cast<int>(dequant_params_device_valid_.size()))
-            dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
-        if (d_dequant_params_)
-        {
-            cudaError_t err = cudaMemsetAsync(&d_dequant_params_[layer], 0,
-                                              sizeof(TQDequantDynamicParams), stream);
-            if (err != cudaSuccess)
-                LOG_WARN("[CUDARingKVCacheTQ::clear] dequant param memset failed: " << cudaGetErrorString(err));
-        }
     }
 
     void CUDARingKVCacheTQ::clear_sequence(int layer, int seq_idx)
@@ -720,133 +867,43 @@ namespace llaminar2
     }
 
     bool CUDARingKVCacheTQ::dequant_to_scratch(
-        int layer, int seq_idx, float rope_theta, int position_start, cudaStream_t stream) const
+        int layer, int seq_idx, float rope_theta, int position_start,
+        int rope_dim, cudaStream_t stream, int *out_count) const
     {
+        if (!out_count || isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] Scalar observation is unavailable during graph capture");
+            return false;
+        }
+
         auto &scratch = layer_scratch_[layer];
         const auto &entry = entries_[layer][seq_idx];
-
-        if (entry.count == 0)
-        {
-            scratch.cached_count = 0;
-            scratch.cached_layer = layer;
-            scratch.cached_seq = seq_idx;
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return false;
+        *out_count = state.cached_tokens;
+        if (state.cached_tokens == 0)
             return true;
-        }
 
-        // Check if scratch already holds the right data
-        if (scratch.is_current_for(layer, seq_idx, entry.count, entry.head,
-                                   rope_theta, position_start))
-        {
-            return true; // Already up-to-date
-        }
-
-        const int tail = entry.tail(max_seq_len_);
+        const int tail =
+            (state.implementation_head - state.cached_tokens + max_seq_len_) %
+            max_seq_len_;
         const int D = head_dim_;
-        const size_t layer_rot_offset = static_cast<size_t>(layer) * n_kv_heads_ * D * D;
+        const size_t layer_rot_offset = static_cast<size_t>(layer) * local_n_kv_heads_ * D * D;
         const float *d_K_rot_t = rotations_.d_rotations_t + layer_rot_offset;
         const float *d_V_rot_t = d_K_rot_t;
         const float *d_K_rot = rotations_.d_rotations + layer_rot_offset;
         const float *d_V_rot = d_K_rot;
 
-        // Incremental dequant: only process the newly appended position.
-        // Valid during decode when count increased by exactly 1 and no eviction.
-        // Per-layer scratch makes this reliable — no cross-layer invalidation.
-        //
-        // Uses fused K+V kernel: 1 launch per layer instead of 2.
-        if (scratch.can_incremental(layer, seq_idx, entry.count, tail,
-                                    rope_theta, position_start))
-        {
-            bool ok;
-            if (d_dequant_params_ && h_dequant_params_ && stream)
-            {
-                // Graph-capturable path: the kernel reads dynamic params from
-                // device memory. Captured execution must not record H2D; params
-                // are pre-uploaded by setDynamicDequantParams().
-                if (isGraphCaptureActive())
-                {
-                    if (layer < 0 ||
-                        layer >= static_cast<int>(dequant_params_device_valid_.size()) ||
-                        !dequant_params_device_valid_[static_cast<size_t>(layer)])
-                    {
-                        LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] TQ dequant params were not ready before CUDA graph capture");
-                        return false;
-                    }
-                }
-                else
-                {
-                    h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
-                    h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
-                    h_dequant_params_[layer].rope_position =
-                        (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
-
-                    cudaError_t copy_err =
-                        cudaMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                                        sizeof(TQDequantDynamicParams), cudaMemcpyHostToDevice, stream);
-                    if (copy_err != cudaSuccess)
-                    {
-                        LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] cudaMemcpyAsync failed: "
-                                  << cudaGetErrorString(copy_err));
-                        return false;
-                    }
-                    dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
-                }
-
-                ok = cuda_tq_incremental_single_fp16_dynamic(
-                    scratch.d_K, scratch.d_V,
-                    entry.d_K, entry.d_V,
-                    d_K_rot, d_V_rot,
-                    &d_dequant_params_[layer],
-                    n_kv_heads_, head_dim_,
-                    rope_theta, stream);
-            }
-            else
-            {
-                const int new_pos = entry.count - 1;
-                const int new_ring_pos = (tail + new_pos) % max_seq_len_;
-                const size_t out_offset = static_cast<size_t>(new_pos) * kv_dim_;
-
-                ok = cuda_tq_incremental_single_fp16(
-                    scratch.d_K + out_offset,
-                    scratch.d_V + out_offset,
-                    entry.d_K, entry.d_V,
-                    d_K_rot, d_V_rot,
-                    new_ring_pos, 0, // out_offset_elems=0 since we offset the pointers
-                    n_kv_heads_, head_dim_,
-                    rope_theta, (rope_theta > 0.0f) ? position_start + new_pos : 0,
-                    stream);
-            }
-
-            if (ok)
-            {
-                scratch.cached_count = entry.count;
-                scratch.cached_head = entry.head;
-            }
-            return ok;
-        }
-
-        // Full linearize + dequant + optional RoPE into per-layer FP16 scratch
-        bool ok = cuda_tq_ring_linearize_dequant_fp16(
+        return cuda_tq_ring_linearize_dequant_fp16(
             scratch.d_K, scratch.d_V,
             entry.d_K, entry.d_V,
             d_K_rot_t, d_V_rot_t,
             d_K_rot, d_V_rot,
-            tail, entry.count, max_seq_len_,
-            n_kv_heads_, head_dim_,
-            rope_theta, position_start,
+            tail, state.cached_tokens, max_seq_len_,
+            local_n_kv_heads_, head_dim_,
+            rope_theta, position_start, rope_dim,
             stream);
-
-        if (ok)
-        {
-            scratch.cached_layer = layer;
-            scratch.cached_seq = seq_idx;
-            scratch.cached_count = entry.count;
-            scratch.cached_head = entry.head;
-            scratch.cached_tail = tail;
-            scratch.cached_rope_theta = rope_theta;
-            scratch.cached_position_start = position_start;
-        }
-
-        return ok;
     }
 
     // =========================================================================
@@ -864,21 +921,23 @@ namespace llaminar2
 
         cudaSetDevice(device_id_);
 
-        // Dequant into per-layer scratch (no RoPE for raw get_k)
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
+        int count = 0;
+        if (!dequant_to_scratch(
+                layer, seq_idx, 0.0f, 0, 0, clearStream(), &count) ||
+            count == 0)
+            return nullptr;
 
         auto &scratch = layer_scratch_[layer];
-        const auto &entry = entries_[layer][seq_idx];
 
         if (!scratch.k_view)
         {
             scratch.k_view = std::make_unique<GpuTensorView>(
-                scratch.d_K, entry.count, kv_dim_,
+                scratch.d_K, count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(scratch.d_K, entry.count);
+            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(scratch.d_K, count);
         }
 
         return scratch.k_view.get();
@@ -896,20 +955,23 @@ namespace llaminar2
 
         cudaSetDevice(device_id_);
 
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
+        int count = 0;
+        if (!dequant_to_scratch(
+                layer, seq_idx, 0.0f, 0, 0, clearStream(), &count) ||
+            count == 0)
+            return nullptr;
 
         auto &scratch = layer_scratch_[layer];
-        const auto &entry = entries_[layer][seq_idx];
 
         if (!scratch.v_view)
         {
             scratch.v_view = std::make_unique<GpuTensorView>(
-                scratch.d_V, entry.count, kv_dim_,
+                scratch.d_V, count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(scratch.d_V, entry.count);
+            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(scratch.d_V, count);
         }
 
         return scratch.v_view.get();
@@ -937,7 +999,7 @@ namespace llaminar2
         if (out_v)
             *out_v = v;
         if (out_kv_len)
-            *out_kv_len = get_cached_tokens(layer, seq_idx);
+            *out_kv_len = static_cast<int>(k->rows());
         return true;
     }
 
@@ -954,7 +1016,201 @@ namespace llaminar2
         if (out_v)
             *out_v = v;
         if (out_kv_len)
-            *out_kv_len = get_cached_tokens(layer, seq_idx);
+            *out_kv_len = static_cast<int>(k->rows());
+        return true;
+    }
+
+    bool CUDARingKVCacheTQ::get_kv_batched_device_view(
+        int layer,
+        int first_seq_idx,
+        int request_count,
+        int max_kv_len,
+        ITensor **out_k,
+        ITensor **out_v,
+        void *gpu_stream)
+    {
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
+            request_count <= 0 ||
+            first_seq_idx > batch_size_ - request_count ||
+            max_kv_len <= 0 || max_kv_len > max_seq_len_ || !gpu_stream ||
+            !d_head_params_ || !d_count_params_ ||
+            !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
+            !rotations_.d_rotations)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_device_view] Invalid resident gather contract"
+                      << " layer=" << layer
+                      << " first_seq=" << first_seq_idx
+                      << " requests=" << request_count
+                      << " max_kv_len=" << max_kv_len
+                      << " stream=" << gpu_stream);
+            return false;
+        }
+
+        cudaSetDevice(device_id_);
+        auto &scratch = layer_scratch_[layer];
+        const size_t rotation_offset =
+            static_cast<size_t>(layer) * local_n_kv_heads_ * head_dim_ * head_dim_;
+        const int entry_offset = layer * batch_size_ + first_seq_idx;
+        const auto stream = static_cast<cudaStream_t>(gpu_stream);
+        if (!cuda_tq_batched_ring_dequant_fp16_device_state(
+                scratch.d_K,
+                scratch.d_V,
+                const_cast<const void *const *>(d_batched_k_entry_table_),
+                const_cast<const void *const *>(d_batched_v_entry_table_),
+                d_head_params_,
+                d_count_params_,
+                rotations_.d_rotations + rotation_offset,
+                entry_offset,
+                request_count,
+                max_kv_len,
+                max_seq_len_,
+                local_n_kv_heads_,
+                head_dim_,
+                /*rope_theta=*/0.0f,
+                /*position_start=*/0,
+                /*rope_dim=*/0,
+                stream))
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_device_view] Grouped TQ dequant launch failed");
+            return false;
+        }
+
+        // Grouped materialization overwrites the shared layer scratch, so a
+        // later scalar read must rebuild its own sequence-local contents.
+        scratch.invalidate();
+        cached_stream_ = stream;
+        const size_t rows =
+            static_cast<size_t>(request_count) * max_kv_len;
+        if (!batched_k_view_ ||
+            batched_k_view_->gpu_data_ptr() != scratch.d_K ||
+            batched_k_view_->shape().empty() ||
+            batched_k_view_->shape()[0] != rows)
+        {
+            batched_k_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_K, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, device_id_);
+        }
+        if (!batched_v_view_ ||
+            batched_v_view_->gpu_data_ptr() != scratch.d_V ||
+            batched_v_view_->shape().empty() ||
+            batched_v_view_->shape()[0] != rows)
+        {
+            batched_v_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_V, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, device_id_);
+        }
+        if (out_k)
+            *out_k = batched_k_view_.get();
+        if (out_v)
+            *out_v = batched_v_view_.get();
+        return true;
+    }
+
+    bool CUDARingKVCacheTQ::get_kv_batched_converted_device_view(
+        int layer,
+        int first_seq_idx,
+        int request_count,
+        int max_kv_len,
+        ActivationPrecision target,
+        ITensor **out_k,
+        ITensor **out_v,
+        const KVReadParams &read)
+    {
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        const int requested_heads =
+            read.n_kv_heads > 0 ? read.n_kv_heads : local_n_kv_heads_;
+        const int requested_head_dim =
+            read.head_dim > 0 ? read.head_dim : head_dim_;
+        const int effective_rope_dim =
+            read.rope_dim > 0 ? read.rope_dim : requested_head_dim;
+        if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
+            request_count <= 0 ||
+            first_seq_idx > batch_size_ - request_count ||
+            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
+            target != ActivationPrecision::FP16 || !read.gpu_stream ||
+            requested_heads != local_n_kv_heads_ ||
+            requested_head_dim != head_dim_ ||
+            effective_rope_dim <= 0 || effective_rope_dim > head_dim_ ||
+            (effective_rope_dim % 2) != 0 ||
+            !d_head_params_ || !d_count_params_ ||
+            !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
+            !rotations_.d_rotations)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_converted_device_view] Invalid grouped conversion contract"
+                      << " layer=" << layer
+                      << " first_seq=" << first_seq_idx
+                      << " requests=" << request_count
+                      << " max_kv_len=" << max_kv_len
+                      << " target=" << activationPrecisionToString(target)
+                      << " heads=" << requested_heads
+                      << " head_dim=" << requested_head_dim
+                      << " rope_dim=" << effective_rope_dim
+                      << " stream=" << read.gpu_stream);
+            return false;
+        }
+
+        cudaSetDevice(device_id_);
+        auto &scratch = layer_scratch_[layer];
+        const size_t rotation_offset =
+            static_cast<size_t>(layer) * local_n_kv_heads_ * head_dim_ * head_dim_;
+        const int entry_offset = layer * batch_size_ + first_seq_idx;
+        const auto stream = static_cast<cudaStream_t>(read.gpu_stream);
+        if (!cuda_tq_batched_ring_dequant_fp16_device_state(
+                scratch.d_K,
+                scratch.d_V,
+                const_cast<const void *const *>(d_batched_k_entry_table_),
+                const_cast<const void *const *>(d_batched_v_entry_table_),
+                d_head_params_,
+                d_count_params_,
+                rotations_.d_rotations + rotation_offset,
+                entry_offset,
+                request_count,
+                max_kv_len,
+                max_seq_len_,
+                local_n_kv_heads_,
+                head_dim_,
+                read.rope_theta,
+                read.position_start,
+                effective_rope_dim,
+                stream))
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::get_kv_batched_converted_device_view] Grouped TQ conversion/RoPE launch failed");
+            return false;
+        }
+
+        scratch.invalidate();
+        cached_stream_ = stream;
+        const size_t rows =
+            static_cast<size_t>(request_count) * max_kv_len;
+        if (!batched_k_view_ ||
+            batched_k_view_->gpu_data_ptr() != scratch.d_K ||
+            batched_k_view_->shape().empty() ||
+            batched_k_view_->shape()[0] != rows)
+        {
+            batched_k_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_K, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, device_id_);
+        }
+        if (!batched_v_view_ ||
+            batched_v_view_->gpu_data_ptr() != scratch.d_V ||
+            batched_v_view_->shape().empty() ||
+            batched_v_view_->shape()[0] != rows)
+        {
+            batched_v_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_V, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, device_id_);
+        }
+        if (out_k)
+            *out_k = batched_k_view_.get();
+        if (out_v)
+            *out_v = batched_v_view_.get();
         return true;
     }
 
@@ -969,39 +1225,40 @@ namespace llaminar2
         int *out_kv_len,
         const KVReadParams *rope)
     {
+        (void)target;
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
-
-        const auto &entry = entries_[layer][seq_idx];
-        if (entry.count == 0)
-        {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return true;
-        }
 
         cudaSetDevice(device_id_);
 
         // Determine RoPE parameters
         float rope_theta = 0.0f;
         int position_start = 0;
+        int rope_dim = 0;
         if (rope && rope->rope_theta > 0.0f)
         {
             rope_theta = rope->rope_theta;
             position_start = rope->position_start;
+            rope_dim = rope->rope_dim > 0 ? rope->rope_dim : head_dim_;
         }
 
         // Dequant to per-layer FP32 scratch with optional RoPE on an explicit stream.
         cudaStream_t stream = (rope && rope->gpu_stream)
                                   ? static_cast<cudaStream_t>(rope->gpu_stream)
                                   : clearStream();
-        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, stream);
-        if (!ok)
+        int count = 0;
+        if (!dequant_to_scratch(
+                layer, seq_idx, rope_theta, position_start, rope_dim,
+                stream, &count))
             return false;
+        if (count == 0)
+            return true;
 
         auto &scratch = layer_scratch_[layer];
 
@@ -1009,22 +1266,22 @@ namespace llaminar2
         if (!scratch.k_view)
         {
             scratch.k_view = std::make_unique<GpuTensorView>(
-                scratch.d_K, entry.count, kv_dim_,
+                scratch.d_K, count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(scratch.d_K, entry.count);
+            static_cast<GpuTensorView *>(scratch.k_view.get())->update_view(scratch.d_K, count);
         }
         if (!scratch.v_view)
         {
             scratch.v_view = std::make_unique<GpuTensorView>(
-                scratch.d_V, entry.count, kv_dim_,
+                scratch.d_V, count, kv_dim_,
                 TensorType::FP16, device_id_);
         }
         else
         {
-            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(scratch.d_V, entry.count);
+            static_cast<GpuTensorView *>(scratch.v_view.get())->update_view(scratch.d_V, count);
         }
 
         if (out_k)
@@ -1032,7 +1289,7 @@ namespace llaminar2
         if (out_v)
             *out_v = scratch.v_view.get();
         if (out_kv_len)
-            *out_kv_len = entry.count;
+            *out_kv_len = count;
 
         return true;
     }
@@ -1046,9 +1303,19 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return;
 
-        auto &entry = entries_[layer][seq_idx];
-        int evict = std::min(num_tokens, entry.count);
-        entry.count -= evict;
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return;
+        const int evict = std::min(num_tokens, state.cached_tokens);
+        const auto stream = clearStream();
+        if (!setDeviceSequenceState(
+                layer, seq_idx, state.implementation_head,
+                state.cached_tokens - evict, stream) ||
+            cudaStreamSynchronize(stream) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::evict_oldest] Device metadata update failed");
+            return;
+        }
 
         // Invalidate per-layer scratch (eviction changes the tail position)
         layer_scratch_[layer].invalidate();

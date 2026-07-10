@@ -945,7 +945,11 @@ namespace llaminar2
          * The threshold is a host-provided random draw in [0, 1), allowing callers
          * to preserve their existing deterministic RNG stream while keeping logits
          * and distribution math on the device. The output token is written to a
-         * scalar device buffer. Requires an explicit non-null stream.
+         * scalar device buffer. When @p threshold_position_device is non-null,
+         * the kernel instead derives the draw from @p threshold_seed and
+         * `*threshold_position_device + threshold_position_offset`; this is the
+         * fully resident MTP path and @p threshold is ignored. Requires an
+         * explicit non-null stream.
          */
         virtual bool enqueueSampleDistributionF32Device(
             const void *token_ids_device,
@@ -955,7 +959,10 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_token_device,
-            void *out_probability_device = nullptr)
+            void *out_probability_device = nullptr,
+            uint64_t threshold_seed = 0,
+            const void *threshold_position_device = nullptr,
+            int threshold_position_offset = 0)
         {
             (void)token_ids_device;
             (void)probs_device;
@@ -965,6 +972,9 @@ namespace llaminar2
             (void)stream;
             (void)out_token_device;
             (void)out_probability_device;
+            (void)threshold_seed;
+            (void)threshold_position_device;
+            (void)threshold_position_offset;
             return false;
         }
 
@@ -1010,6 +1020,8 @@ namespace llaminar2
          *
          * Backends must use the explicit non-null @p stream only. They must not
          * allocate, synchronize, or fall back to a default/null GPU stream.
+         * A non-null @p threshold_position_device selects the same resident
+         * position-keyed draw contract as enqueueSampleDistributionF32Device().
          */
         virtual bool enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
             const void *logits_device,
@@ -1026,7 +1038,10 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_token_device,
-            void *out_probability_device = nullptr)
+            void *out_probability_device = nullptr,
+            uint64_t threshold_seed = 0,
+            const void *threshold_position_device = nullptr,
+            int threshold_position_offset = 0)
         {
             (void)logits_device;
             (void)vocab_size;
@@ -1043,6 +1058,9 @@ namespace llaminar2
             (void)stream;
             (void)out_token_device;
             (void)out_probability_device;
+            (void)threshold_seed;
+            (void)threshold_position_device;
+            (void)threshold_position_offset;
             return false;
         }
 
@@ -1342,11 +1360,16 @@ namespace llaminar2
          * Thresholds normally arrive as scalar host values.  For deterministic
          * seeded vLLM-style one-hot verification, callers may pass both
          * threshold arrays as null and provide `inverse_sample_seed` plus
-         * `inverse_sample_first_logical_position`; the backend must derive
-         * accept/residual thresholds inside the explicit stream launch using
-         * `sampling_math::mtp_spec_threshold_from_seed()`.  Passing only one
-         * null threshold array, omitting the seed, or requesting seeded
-         * thresholds with a materialized draft distribution is invalid.
+         * exactly one logical-position source. A non-negative
+         * `inverse_sample_first_logical_position` is the compatibility scalar
+         * source. A non-null `threshold_base_position_device` is the fully
+         * resident source; row zero uses the pointed-to value plus
+         * `threshold_position_offset`, and later rows increment from there.
+         * The backend derives accept/residual thresholds inside the explicit
+         * stream launch with `sampling_math::mtp_spec_threshold_from_seed()`.
+         * Passing only one null threshold array, omitting the seed, supplying
+         * both position sources, or requesting seeded thresholds with a
+         * materialized draft distribution is invalid.
          *
          * Implementations must only enqueue work on `stream`; they must not
          * allocate, synchronize, or use a default/null GPU stream.
@@ -1371,7 +1394,9 @@ namespace llaminar2
             const void *draft_token_probabilities_device = nullptr,
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
-            int inverse_sample_vocab_size = 0)
+            int inverse_sample_vocab_size = 0,
+            const void *threshold_base_position_device = nullptr,
+            int threshold_position_offset = 0)
         {
             (void)target_token_ids_device;
             (void)target_probs_device;
@@ -1393,6 +1418,8 @@ namespace llaminar2
             (void)inverse_sample_seed;
             (void)inverse_sample_first_logical_position;
             (void)inverse_sample_vocab_size;
+            (void)threshold_base_position_device;
+            (void)threshold_position_offset;
             return false;
         }
 
@@ -1461,7 +1488,12 @@ namespace llaminar2
          * This keeps the production path closer to vLLM by avoiding target
          * full-probability rows and inverse-random matrices. Implementations
          * must launch only on the explicit non-null `stream`; no allocation,
-         * synchronization, or device-default/null stream use is allowed.
+         * synchronization, or device-default/null stream use is allowed. When
+         * @p accept_thresholds_host is null, @p inverse_sample_seed must be
+         * non-zero and exactly one position source must be supplied. The
+         * resident source is @p threshold_base_position_device plus
+         * @p threshold_position_offset; it controls both acceptance and inverse
+         * recovery so those two decisions cannot observe different positions.
          */
         virtual bool enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
@@ -1480,7 +1512,9 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr,
-            bool no_draft_probabilities = false)
+            bool no_draft_probabilities = false,
+            const void *threshold_base_position_device = nullptr,
+            int threshold_position_offset = 0)
         {
             (void)target_logits_device;
             (void)draft_probabilities_device;
@@ -1499,6 +1533,8 @@ namespace llaminar2
             (void)out_accept_probability_device;
             (void)out_accept_threshold_device;
             (void)no_draft_probabilities;
+            (void)threshold_base_position_device;
+            (void)threshold_position_offset;
             return false;
         }
 
@@ -1850,7 +1886,10 @@ namespace llaminar2
          * suffix index is publishable copy from @p output_tokens_device starting
          * at @p first_output_token_index; rows beyond the compact accepted-state
          * count receive @p filler_token and are later discarded by device-resident
-         * shifted-KV publication.
+         * shifted-KV publication.  The same launch expands the request's
+         * canonical verifier-base count into contiguous absolute positions in
+         * @p out_position_ids_device.  Fusing these writes avoids both a host
+         * scalar position and a second tiny metadata kernel before graph replay.
          *
          * Backends must enqueue this work on the explicit @p stream, perform no
          * allocation, and keep the same metadata semantics as SamplingMath's
@@ -1867,7 +1906,10 @@ namespace llaminar2
             int32_t filler_token,
             int device_id,
             void *stream,
-            void *out_tokens_device)
+            void *out_tokens_device,
+            const void *base_positions_device,
+            int position_offset,
+            void *out_position_ids_device)
         {
             (void)meta_device;
             (void)meta_stride;
@@ -1880,6 +1922,121 @@ namespace llaminar2
             (void)device_id;
             (void)stream;
             (void)out_tokens_device;
+            (void)base_positions_device;
+            (void)position_offset;
+            (void)out_position_ids_device;
+            return false;
+        }
+
+        /**
+         * @brief Compose one request-batched MTP sidecar input entirely on GPU.
+         *
+         * Request-batched MTP stores sampled proposals in request-major slots:
+         * depth @c d for request @c r lives at
+         * `condition_tokens_device[r * condition_token_stride]` after the caller
+         * advances the source pointer to depth @c d. The next grouped sidecar,
+         * however, consumes contiguous request rows. This primitive gathers
+         * those token IDs and derives each row's absolute RoPE/KV position from
+         * a device-owned base-position mailbox in one small launch. Keeping the
+         * two values in one preparation kernel gives the captured sidecar stable
+         * arena pointers and removes the former D2H token shadow followed by H2D
+         * restaging at every speculative depth.
+         *
+         * Implementations must enqueue on the explicit non-null @p stream,
+         * perform no allocation or synchronization, and support the production
+         * request-batch bound of one through four rows.
+         *
+         * @param condition_tokens_device Device INT32 proposal slots.
+         * @param condition_token_stride Element stride between request proposals.
+         * @param base_positions_device Device INT32 base position for each request.
+         * @param position_offset Draft-depth offset added to every base position.
+         * @param request_count Number of request rows to compose.
+         * @param device_id GPU ordinal owning every pointer.
+         * @param stream Explicit CUDA/HIP stream used by the following sidecar.
+         * @param out_condition_tokens_device Contiguous INT32 output token rows.
+         * @param out_position_ids_device Contiguous INT32 absolute positions.
+         * @return true when the preparation kernel was enqueued successfully.
+         */
+        virtual bool enqueuePrepareMTPBatchedSidecarInputs(
+            const void *condition_tokens_device,
+            int condition_token_stride,
+            const void *base_positions_device,
+            int position_offset,
+            int request_count,
+            int device_id,
+            void *stream,
+            void *out_condition_tokens_device,
+            void *out_position_ids_device)
+        {
+            (void)condition_tokens_device;
+            (void)condition_token_stride;
+            (void)base_positions_device;
+            (void)position_offset;
+            (void)request_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_condition_tokens_device;
+            (void)out_position_ids_device;
+            return false;
+        }
+
+        /**
+         * @brief Seed the request-batched GPU logical-state mailbox after prefill.
+         *
+         * The terminal prefill sampler already owns one sampled token per request
+         * in @p sampled_tokens_device. Request admission has likewise published
+         * each prompt's next logical position to @p target_positions_device. This
+         * primitive turns those two device rows into the first complete MTP
+         * publication mailbox in one bounded kernel launch. No mutable position or
+         * sampled-token shadow is adopted from host memory at this boundary.
+         *
+         * The input position row may alias @p out_target_positions_device. That is
+         * the production shape when request admission writes directly into the
+         * persistent metadata workspace: each kernel lane must load its position
+         * before publishing that same lane's output fields. Implementations must
+         * enqueue on the explicit non-null @p stream without allocation,
+         * synchronization, or a default-stream fallback.
+         *
+         * @param sampled_tokens_device Contiguous INT32 sampled prefill tokens.
+         * @param target_positions_device Device INT32 prompt positions, one per request.
+         * @param request_count Number of initialized request rows (one through four).
+         * @param device_id GPU ordinal owning every device pointer.
+         * @param stream Explicit CUDA/HIP stream ordered after terminal sampling.
+         * @param out_base_cached_tokens_device Device INT32 base cache lengths.
+         * @param out_target_positions_device Device INT32 next decode positions.
+         * @param out_accepted_state_counts_device Device INT32 zeroed accept counts.
+         * @param out_next_condition_tokens_device Device INT32 sampled conditions.
+         * @param out_all_drafts_accepted_flags_device Device INT32 zeroed flags.
+         * @param out_stopped_flags_device Device INT32 zeroed stop flags.
+         * @param out_publication_ok_flags_device Device INT32 one-valued validity flags.
+         * @return true when mailbox initialization was enqueued successfully.
+         */
+        virtual bool enqueueInitializeMTPDeviceLogicalState(
+            const void *sampled_tokens_device,
+            const void *target_positions_device,
+            int request_count,
+            int device_id,
+            void *stream,
+            void *out_base_cached_tokens_device,
+            void *out_target_positions_device,
+            void *out_accepted_state_counts_device,
+            void *out_next_condition_tokens_device,
+            void *out_all_drafts_accepted_flags_device,
+            void *out_stopped_flags_device,
+            void *out_publication_ok_flags_device)
+        {
+            (void)sampled_tokens_device;
+            (void)target_positions_device;
+            (void)request_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_base_cached_tokens_device;
+            (void)out_target_positions_device;
+            (void)out_accepted_state_counts_device;
+            (void)out_next_condition_tokens_device;
+            (void)out_all_drafts_accepted_flags_device;
+            (void)out_stopped_flags_device;
+            (void)out_publication_ok_flags_device;
             return false;
         }
 

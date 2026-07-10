@@ -55,6 +55,84 @@
 namespace llaminar2::test
 {
     /**
+     * @brief Return the raw GGUF byte count for a quantized tensor or 2D view.
+     *
+     * Some quantized expert views alias a slice of a 3D parent tensor and report
+     * `size_bytes()==0` because they do not own a separate raw buffer.  The
+     * production GPU loaders intentionally recover the byte count from the
+     * matrix geometry and codebook block size before staging those views.  The
+     * test harness must do the same so focused real-weight regressions exercise
+     * production-style GPU upload/repack instead of accidentally rejecting valid
+     * expert views during setup.
+     */
+    inline size_t quantizedRawBytesForGpuPreparedTest(const TensorBase &tensor)
+    {
+        const size_t reported = tensor.size_bytes();
+        if (reported > 0)
+            return reported;
+
+        const auto &shape = tensor.shape();
+        if (shape.size() != 2)
+            return 0;
+
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        auto bytes_for = [rows, cols](size_t block_size, size_t block_bytes) -> size_t
+        {
+            const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+            return rows * blocks_per_row * block_bytes;
+        };
+
+        switch (tensor.native_type())
+        {
+        case TensorType::IQ4_NL:
+            return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+        case TensorType::IQ4_XS:
+            return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
+        case TensorType::Q8_0:
+            return bytes_for(Q8_0Block::BLOCK_SIZE, sizeof(Q8_0Block));
+        case TensorType::Q8_1:
+            return bytes_for(Q8_1Block::BLOCK_SIZE, sizeof(Q8_1Block));
+        case TensorType::Q4_0:
+            return bytes_for(Q4_0Block::BLOCK_SIZE, sizeof(Q4_0Block));
+        case TensorType::Q4_1:
+            return bytes_for(Q4_1Block::BLOCK_SIZE, sizeof(Q4_1Block));
+        case TensorType::Q5_0:
+            return bytes_for(Q5_0Block::BLOCK_SIZE, sizeof(Q5_0Block));
+        case TensorType::Q5_1:
+            return bytes_for(Q5_1Block::BLOCK_SIZE, sizeof(Q5_1Block));
+        case TensorType::Q2_K:
+            return bytes_for(Q2_KBlock::BLOCK_SIZE, sizeof(Q2_KBlock));
+        case TensorType::Q3_K:
+            return bytes_for(Q3_KBlock::BLOCK_SIZE, sizeof(Q3_KBlock));
+        case TensorType::Q4_K:
+            return bytes_for(Q4_KBlock::BLOCK_SIZE, sizeof(Q4_KBlock));
+        case TensorType::Q5_K:
+            return bytes_for(Q5_KBlock::BLOCK_SIZE, sizeof(Q5_KBlock));
+        case TensorType::Q6_K:
+            return bytes_for(Q6_KBlock::BLOCK_SIZE, sizeof(Q6_KBlock));
+        case TensorType::Q8_K:
+            return bytes_for(Q8_KBlock::BLOCK_SIZE, sizeof(Q8_KBlock));
+        case TensorType::IQ2_XXS:
+            return bytes_for(IQ2_XXSBlock::BLOCK_SIZE, sizeof(IQ2_XXSBlock));
+        case TensorType::IQ2_XS:
+            return bytes_for(IQ2_XSBlock::BLOCK_SIZE, sizeof(IQ2_XSBlock));
+        case TensorType::IQ2_S:
+            return bytes_for(IQ2_SBlock::BLOCK_SIZE, sizeof(IQ2_SBlock));
+        case TensorType::IQ3_XXS:
+            return bytes_for(IQ3_XXSBlock::BLOCK_SIZE, sizeof(IQ3_XXSBlock));
+        case TensorType::IQ3_S:
+            return bytes_for(IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock));
+        case TensorType::IQ1_S:
+            return bytes_for(IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock));
+        case TensorType::IQ1_M:
+            return bytes_for(IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock));
+        default:
+            return 0;
+        }
+    }
+
+    /**
      * @brief Owns all lifetime objects backing a GPU-prepared GEMM kernel.
      *
      * The `kernel` pointer is borrowed from `store`; both `store` and
@@ -128,7 +206,9 @@ namespace llaminar2::test
 
         const int N = static_cast<int>(weights->rows());
         const int K = static_cast<int>(weights->cols());
-        const size_t raw_bytes = weights->size_bytes();
+        const size_t raw_bytes = quantizedRawBytesForGpuPreparedTest(*weights);
+        if (raw_bytes == 0)
+            throw std::runtime_error("registerGpuPreparedGemmInStore: could not determine quantized raw byte count");
 
         auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
         if (!repack_fmt)
@@ -182,7 +262,7 @@ namespace llaminar2::test
                 static_cast<uint16_t *>(slot->d_native_vnni_scales),
                 static_cast<uint16_t *>(slot->d_native_vnni_mins),
                 static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                vnni->codebook_id, blocks_per_row,
+                canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                 orchestrator);
             prep_kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
         }
@@ -196,7 +276,7 @@ namespace llaminar2::test
                 slot->d_native_vnni_scales,
                 slot->d_native_vnni_mins,
                 slot->d_native_vnni_emins,
-                vnni->codebook_id, blocks_per_row,
+                canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                 orchestrator);
             prep_kind = kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
         }
@@ -322,7 +402,9 @@ namespace llaminar2::test
 
         const int N = static_cast<int>(weights->rows());
         const int K = static_cast<int>(weights->cols());
-        const size_t raw_bytes = weights->size_bytes();
+        const size_t raw_bytes = quantizedRawBytesForGpuPreparedTest(*weights);
+        if (raw_bytes == 0)
+            throw std::runtime_error("makeGpuPreparedGemm: could not determine quantized raw byte count");
 
         // Resolve the GPU repack-kernel dispatch format from the codebook id.
         auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
@@ -386,7 +468,7 @@ namespace llaminar2::test
                 static_cast<uint16_t *>(slot->d_native_vnni_scales),
                 static_cast<uint16_t *>(slot->d_native_vnni_mins),
                 static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                vnni->codebook_id, blocks_per_row,
+                canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                 out.orchestrator); // lifetime owner: keeps VRAM pool alive
             prep_kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
         }
@@ -400,7 +482,7 @@ namespace llaminar2::test
                 slot->d_native_vnni_scales,
                 slot->d_native_vnni_mins,
                 slot->d_native_vnni_emins,
-                vnni->codebook_id, blocks_per_row,
+                canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
                 out.orchestrator); // lifetime owner: keeps VRAM pool alive
             prep_kind = kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
         }

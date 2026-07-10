@@ -416,6 +416,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
@@ -448,6 +452,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
@@ -480,6 +488,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 

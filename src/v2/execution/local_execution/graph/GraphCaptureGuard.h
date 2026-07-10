@@ -32,25 +32,8 @@ namespace llaminar2
     /// Thread-local flag: true when inside a graph capture recording window.
     inline thread_local bool tls_graph_capture_active = false;
 
-    /**
-     * @brief True when captured stage execution should also apply logical
-     *        host-side bookkeeping.
-     *
-     * Stream capture records GPU work but does not execute it until launch.
-     * Cached decode graph capture skips replay callbacks on the immediate
-     * launch-after-capture, so stateful stages still need to update host
-     * metadata while recording for later stages in the same captured segment.
-     * Prefill capture enables this for stateful stages whose later captured
-     * stages need same-pass logical metadata, while still skipping duplicate
-     * replay callbacks after the immediate launch-after-capture.
-     */
-    inline thread_local bool tls_graph_capture_host_bookkeeping = false;
-
     /// Query whether the current thread is recording into a GPU graph.
     inline bool isGraphCaptureActive() { return tls_graph_capture_active; }
-
-    /// Query whether captured stage execution should update logical host state.
-    inline bool isGraphCaptureHostBookkeepingActive() { return tls_graph_capture_host_bookkeeping; }
 
     /**
      * @brief RAII guard that sets the graph-capture-active flag for the
@@ -59,16 +42,14 @@ namespace llaminar2
     class GraphCaptureGuard
     {
     public:
-        explicit GraphCaptureGuard(bool host_bookkeeping = false)
-            : prev_(tls_graph_capture_active), prev_host_bookkeeping_(tls_graph_capture_host_bookkeeping)
+        GraphCaptureGuard()
+            : prev_(tls_graph_capture_active)
         {
             tls_graph_capture_active = true;
-            tls_graph_capture_host_bookkeeping = prev_host_bookkeeping_ || host_bookkeeping;
         }
 
         ~GraphCaptureGuard()
         {
-            tls_graph_capture_host_bookkeeping = prev_host_bookkeeping_;
             tls_graph_capture_active = prev_;
         }
 
@@ -77,8 +58,7 @@ namespace llaminar2
         GraphCaptureGuard &operator=(const GraphCaptureGuard &) = delete;
 
     private:
-        bool prev_;                  ///< Previous graph-capture flag (for nested guard support)
-        bool prev_host_bookkeeping_; ///< Previous logical bookkeeping flag
+        bool prev_; ///< Previous graph-capture flag (for nested guard support).
     };
 
 } // namespace llaminar2

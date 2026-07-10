@@ -258,6 +258,8 @@ namespace llaminar2
                 (void)seq_idx;
                 (void)tokens_to_evict;
             }
+            int get_total_evicted() const override { return 0; }
+            void reset_eviction_counter() override {}
 
             DeviceId get_layer_device(int layer) const override
             {
@@ -265,8 +267,6 @@ namespace llaminar2
                 return DeviceId::cpu();
             }
 
-            int get_total_evicted() const override { return 0; }
-            void reset_eviction_counter() override {}
 
             int gather_kv_batched(int layer, int num_sequences, TensorBase *out_k,
                                   TensorBase *out_v, std::vector<int> &out_kv_lens) override
@@ -400,15 +400,15 @@ namespace llaminar2
 
             AttentionComputeStage stage(params);
 
-            kv_cache_->setCachedTokens(0, 62); // post-append kv_len=63
+            stage.updateDynamicParams(/*pos_offset=*/62, /*seq_len=*/1);
             const uint64_t bucket_a = stage.graphCaptureVariantSignature();
             ASSERT_NE(bucket_a, 0u);
 
-            kv_cache_->setCachedTokens(0, 63); // post-append kv_len=64
+            stage.updateDynamicParams(/*pos_offset=*/63, /*seq_len=*/1);
             const uint64_t bucket_a_edge = stage.graphCaptureVariantSignature();
             EXPECT_EQ(bucket_a_edge, bucket_a);
 
-            kv_cache_->setCachedTokens(0, 64); // post-append kv_len=65
+            stage.updateDynamicParams(/*pos_offset=*/64, /*seq_len=*/1);
             const uint64_t bucket_b = stage.graphCaptureVariantSignature();
             EXPECT_NE(bucket_b, 0u);
             EXPECT_NE(bucket_b, bucket_a)

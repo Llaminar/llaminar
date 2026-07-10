@@ -62,6 +62,23 @@ namespace llaminar2
             int seq_len = 0;             ///< Sequence length
             int request_count = 1;       ///< Number of independent requests in the flattened verifier tensor.
             int request_seq_len = 0;     ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
+            /**
+             * @brief Host-owned real row counts for CPU request batching.
+             *
+             * The vector is orchestration-state storage whose address remains
+             * valid for the graph lifetime. CPU grouped kernels read it
+             * directly; GPU kernels use the resident pointer below.
+             */
+            const std::vector<int> *request_seq_lens_host = nullptr;
+            /**
+             * @brief Device-owned real row count for each request.
+             *
+             * Non-null only for GPU request batches whose flattened rows may
+             * contain padding. The pointer is arena-owned and stable across
+             * graph capture/replay; kernels clamp each value to
+             * `request_seq_len` and never read the host sequence-length vector.
+             */
+            const int32_t *request_seq_lens_device = nullptr;
             int channels = 0;            ///< Number of channels (= QKV dim)
             int kernel_size = 4;         ///< Convolution kernel width
             int layer_idx = -1;          ///< Logical model layer for stable graph workspace naming.
@@ -104,11 +121,23 @@ namespace llaminar2
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
-        void updateDynamicParams(int pos_offset, int seq_len) override
-        {
-            (void)pos_offset; // Conv1d doesn't use position offsets
-            params_.seq_len = seq_len;
-        }
+        /**
+         * @brief Refresh the logical row geometry for the next graph execution.
+         *
+         * @param pos_offset Unused by short convolution because its history is
+         *        carried by the request-local convolution state.
+         * @param seq_len Number of rows contributed by one request.  For a
+         *        request-batched graph, the stage kernel still receives one
+         *        flattened tensor containing `request_count * seq_len` rows.
+         *
+         * The execution engine expresses dynamic sequence length in the same
+         * per-request domain used to build a request-batched graph.  Keeping
+         * `Params::seq_len` in that domain would make the flattened geometry
+         * internally inconsistent and would either reject the grouped kernel
+         * or let one request consume another request's rows.  This method keeps
+         * both representations synchronized whenever a cached graph is reused.
+         */
+        void updateDynamicParams(int pos_offset, int seq_len) override;
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
@@ -162,6 +191,10 @@ namespace llaminar2
             return verifierStateCaptureWorkspaceRequired();
         }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream = nullptr) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;
@@ -178,6 +211,21 @@ namespace llaminar2
             int request_count,
             int row_index_stride,
             void *stream) override;
+        /**
+         * @brief Publish every request's real terminal conv state on device.
+         *
+         * The backend derives flat capture rows from resident request lengths
+         * and writes the request-owned live state bank in one grouped launch.
+         */
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override;
+        bool requestBatchedTerminalStateCommittedDuringExecution(
+            int request_count,
+            int request_row_width) const override;
+        void clearVerifierStateCaptureBindingAfterPublication() override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         // Short conv1d operates fully on-device when GPU is active — graph-capturable

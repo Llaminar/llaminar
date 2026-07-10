@@ -1178,6 +1178,18 @@ namespace
     // and halving KV cache bandwidth.
     // =========================================================================
 
+    /**
+     * @brief FP16-KV flash-decode phase shared by scalar and grouped verifier launches.
+     *
+     * @tparam GROUPED_VERIFIER_ROWS When false, `blockIdx.z` is an ordinary
+     * batch row with its own contiguous K/V payload. When true, it is a compact
+     * verifier row: all rows share one K/V payload, read a row-local logical
+     * length from `device_params`, and may use fewer splits than the fixed
+     * launch geometry. The arithmetic inside each active block is deliberately
+     * identical in both modes so grouped publication remains byte-equivalent to
+     * serial decode.
+     */
+    template <bool GROUPED_VERIFIER_ROWS>
     __global__ __launch_bounds__(256, 4) void flash_decoding_fp16kv_kernel(
         const float *__restrict__ Q,
         const half *__restrict__ K_cache,
@@ -1195,11 +1207,12 @@ namespace
         int head_start = 0,
         int gqa_n_rep = 0)
     {
-        int kv_stride = kv_len;
+        const int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
         if (device_params)
         {
-            kv_len_runtime = device_params->kv_len;
+            const int param_row = GROUPED_VERIFIER_ROWS ? blockIdx.z : 0;
+            kv_len_runtime = device_params[param_row].kv_len;
         }
 
         const int head_idx = blockIdx.x;
@@ -1211,11 +1224,31 @@ namespace
                                     ? (head_start + head_idx) / effective_gqa
                                     : head_idx / effective_gqa;
 
-        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
+        int row_num_splits = num_splits;
+        if constexpr (GROUPED_VERIFIER_ROWS)
+        {
+            /*
+             * `num_splits` is the serial policy result for the longest row.
+             * Shorter verifier rows apply the same minimum-16-KV-items cap as
+             * computeNumSplitsForDevice(), yielding exactly their M=1 split
+             * count without changing the captured grid dimensions.
+             */
+            row_num_splits = min(
+                num_splits,
+                max(1, kv_len_runtime / 16));
+        }
+
+        const int partial_idx =
+            (batch_idx * n_heads + head_idx) * num_splits + split_idx;
+        if (split_idx >= row_num_splits)
+        {
+            return;
+        }
+
+        const int split_size =
+            (kv_len_runtime + row_num_splits - 1) / row_num_splits;
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_len_runtime);
-
-        const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
         if (kv_start >= kv_len_runtime)
         {
@@ -1253,8 +1286,15 @@ namespace
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
-        const half *K_batch = K_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
-        const half *V_batch = V_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const size_t kv_batch_offset =
+            GROUPED_VERIFIER_ROWS
+                ? 0
+                : static_cast<size_t>(batch_idx) *
+                      static_cast<size_t>(kv_stride) *
+                      static_cast<size_t>(n_kv_heads) *
+                      static_cast<size_t>(head_dim);
+        const half *K_batch = K_cache + kv_batch_offset;
+        const half *V_batch = V_cache + kv_batch_offset;
 
         for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
         {
@@ -1343,6 +1383,79 @@ namespace
                 sum += warp_scales[w] * block_O[w * head_dim + d];
             }
             O_out[d] = sum;
+        }
+    }
+
+    /**
+     * @brief Reduce grouped verifier partials with each row's serial split count.
+     *
+     * The partial arena has a fixed `max_num_splits` stride so its address and
+     * graph geometry remain stable. Only the prefix selected by the row-local
+     * KV length participates in the reduction. The scalar decoder's reduction
+     * visits the same split indices in the same order and applies the same FP32
+     * expressions, which is the byte-equivalence requirement for MTP state
+     * publication.
+     */
+    __global__ void flash_decoding_grouped_verifier_reduce_fp32_kernel(
+        const float *__restrict__ O_partial,
+        const float *__restrict__ m_partial,
+        const float *__restrict__ l_partial,
+        float *__restrict__ O,
+        int n_heads,
+        int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+    {
+        const int head_idx = blockIdx.x;
+        const int verifier_row = blockIdx.y;
+        const int tid = threadIdx.x;
+
+        const int row_kv_len = device_params[verifier_row].kv_len;
+        const int row_num_splits = min(
+            max_num_splits,
+            max(1, row_kv_len / 16));
+        const int base_idx =
+            (verifier_row * n_heads + head_idx) * max_num_splits;
+
+        __shared__ float global_m;
+        __shared__ float global_l;
+        __shared__ float split_scales[32];
+
+        if (tid == 0)
+        {
+            float m_max = -FLT_MAX;
+            for (int split = 0; split < row_num_splits; ++split)
+            {
+                m_max = fmaxf(m_max, m_partial[base_idx + split]);
+            }
+            global_m = m_max;
+
+            float l_sum = 0.0f;
+            for (int split = 0; split < row_num_splits; ++split)
+            {
+                const float scale =
+                    __expf(m_partial[base_idx + split] - m_max);
+                split_scales[split] = scale;
+                l_sum += scale * l_partial[base_idx + split];
+            }
+            global_l = l_sum;
+        }
+        __syncthreads();
+
+        const float inv_l =
+            global_l > 0.0f ? (1.0f / global_l) : 0.0f;
+        float *O_out =
+            O + (verifier_row * n_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += blockDim.x)
+        {
+            float O_sum = 0.0f;
+            for (int split = 0; split < row_num_splits; ++split)
+            {
+                const float *O_s =
+                    O_partial + (base_idx + split) * head_dim;
+                O_sum += split_scales[split] * O_s[d];
+            }
+            O_out[d] = O_sum * inv_l;
         }
     }
 
@@ -2286,7 +2399,7 @@ extern "C"
             int block_size = 256;
             size_t smem_size = head_dim * sizeof(float);
 
-            flash_decoding_fp16kv_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
+            flash_decoding_fp16kv_kernel<false><<<grid, block_size, smem_size, cuda_stream>>>(
                 Q,
                 static_cast<const half *>(K_cache_fp16),
                 static_cast<const half *>(V_cache_fp16),
@@ -2304,6 +2417,98 @@ extern "C"
             flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
                 O_partial, m_partial, l_partial, O,
                 n_heads, head_dim, num_splits);
+        }
+
+        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Launch an economical, serial-equivalent grouped FP16-KV verifier.
+     *
+     * This is not an ordinary attention batch. Q/output have one row per MTP
+     * verifier position, while K/V name one shared cache whose visible prefix
+     * grows by one position per row. A fixed maximum-split grid keeps the launch
+     * graph-capturable; row-local device metadata masks surplus split blocks and
+     * reproduces the exact scalar split partition.
+     */
+    int cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
+        const float *Q,
+        const void *K_cache_fp16,
+        const void *V_cache_fp16,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int verifier_rows,
+        int max_kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        if (!Q || !K_cache_fp16 || !V_cache_fp16 || !O ||
+            !O_partial || !m_partial || !l_partial || !device_params ||
+            !stream || verifier_rows < 2 || verifier_rows > 4 ||
+            max_kv_len <= verifier_rows || n_heads <= 0 ||
+            n_kv_heads <= 0 || head_dim <= 0 ||
+            max_num_splits <= 0 || max_num_splits > 32)
+        {
+            return -1;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        const float softmax_scale =
+            1.0f / sqrtf(static_cast<float>(head_dim));
+
+        /*
+         * Phase 1 uses one z-plane per verifier row. All rows share K/V, but
+         * each active block reads that row's logical length and scalar-equivalent
+         * split count from stable device metadata.
+         */
+        {
+            const dim3 grid(n_heads, max_num_splits, verifier_rows);
+            constexpr int block_size = 256;
+            const size_t smem_size =
+                static_cast<size_t>(head_dim) * sizeof(float);
+            flash_decoding_fp16kv_kernel<true>
+                <<<grid, block_size, smem_size, cuda_stream>>>(
+                    Q,
+                    static_cast<const half *>(K_cache_fp16),
+                    static_cast<const half *>(V_cache_fp16),
+                    O_partial,
+                    m_partial,
+                    l_partial,
+                    max_kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_num_splits,
+                    softmax_scale,
+                    device_params,
+                    head_start,
+                    gqa_n_rep);
+        }
+
+        /* Phase 2 merges each row's active split prefix in serial order. */
+        {
+            const dim3 grid(n_heads, verifier_rows);
+            const int block_size = min(head_dim, 256);
+            flash_decoding_grouped_verifier_reduce_fp32_kernel
+                <<<grid, block_size, 0, cuda_stream>>>(
+                    O_partial,
+                    m_partial,
+                    l_partial,
+                    O,
+                    n_heads,
+                    head_dim,
+                    max_num_splits,
+                    device_params);
         }
 
         return cudaGetLastError() == cudaSuccess ? 0 : -1;

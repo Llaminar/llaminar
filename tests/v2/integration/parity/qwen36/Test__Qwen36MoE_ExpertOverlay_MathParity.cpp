@@ -24,9 +24,6 @@
 #include "execution/mtp/MTPWeightManifest.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
-#ifdef HAVE_CUDA
-#include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
-#endif
 
 #include <algorithm>
 #include <array>
@@ -557,9 +554,6 @@ namespace
             }
         }
         llaminar::v2::kernels::KernelFactory::clearCache();
-#ifdef HAVE_CUDA
-        llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
-#endif
         pipeline_cache.clear();
 
         /*
@@ -592,9 +586,6 @@ namespace
         if (cache.empty() && overlayPipelineCache().empty())
         {
             llaminar::v2::kernels::KernelFactory::clearCache();
-#ifdef HAVE_CUDA
-            llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
-#endif
         }
 
         auto model_ctx = ModelContext::create(

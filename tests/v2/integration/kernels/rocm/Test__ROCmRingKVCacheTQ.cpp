@@ -20,7 +20,7 @@
  * 11. Shadow buffer invalidation on append
  * 12. Head dim 128 support
  * 13. RoPE position correctness
- * 14. Host-side append via CPU tensors
+ * 14. Host-created tensors explicitly prepared before device-only append
  * 15. Metadata accessor verification
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
@@ -28,11 +28,14 @@
 
 #include <gtest/gtest.h>
 #include <vector>
+#include <array>
 #include <random>
 #include <cmath>
 #include <numeric>
+#include <iomanip>
 #include <cstring>
 #include <cstdint>
+#include <string>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -40,6 +43,8 @@
 #include "kernels/rocm/kvcache/ROCmRingKVCacheTQFactory.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "kernels/IKVCache.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 #include "tensors/GpuTensorView.h"
 #include "utils/Logger.h"
@@ -93,6 +98,15 @@ namespace
                               const ITensor *K, const ITensor *V, int num_tokens,
                               const ScopedHipStream &stream)
     {
+        auto ensure = [&](const ITensor *tensor)
+        {
+            if (tensor && tensor->gpu_data_ptr())
+                return true;
+            auto *base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(tensor));
+            return base && base->ensureOnDevice(DeviceId::rocm(0), stream.opaque());
+        };
+        if (!ensure(K) || !ensure(V))
+            return false;
         return cache.appendWithStream(layer, seq_idx, K, V, num_tokens, stream.opaque());
     }
 
@@ -180,9 +194,8 @@ namespace
         EXPECT_EQ(out_v, nullptr);
 
         const ITensor *raw_k = cache.get_k(layer, seq_idx);
-        ASSERT_NE(raw_k, nullptr);
-        ASSERT_FALSE(raw_k->shape().empty());
-        EXPECT_EQ(raw_k->shape()[0], 0u);
+        EXPECT_EQ(raw_k, nullptr)
+            << "An empty device-owned ring has no scalar tensor view";
     }
 
 } // namespace
@@ -1087,10 +1100,10 @@ TEST(Test__ROCmRingKVCacheTQ, RoPE_PositionCorrectness)
 }
 
 // =============================================================================
-// 14. Host-Side Append (via CPU Tensor)
+// 14. Host-created tensors are explicitly prepared before device-only append
 // =============================================================================
 
-TEST(Test__ROCmRingKVCacheTQ, HostSideAppend_ViaCPUTensor)
+TEST(Test__ROCmRingKVCacheTQ, HostCreatedTensorIsPreparedOnDeviceBeforeAppend)
 {
     if (!hasROCm())
         GTEST_SKIP() << "ROCm not available";
@@ -1123,7 +1136,7 @@ TEST(Test__ROCmRingKVCacheTQ, HostSideAppend_ViaCPUTensor)
 
     auto result_K = downloadFP16ToFP32(out_k->gpu_data_ptr(), num_tokens * kv_dim);
     float cos_k = computeCosineSimilarity(h_K.data(), result_K.data(), num_tokens * kv_dim);
-    EXPECT_GT(cos_k, 0.94f) << "Host-side append quality too low";
+    EXPECT_GT(cos_k, 0.94f) << "Prepared device append quality too low";
 }
 
 // =============================================================================
@@ -1151,6 +1164,638 @@ TEST(Test__ROCmRingKVCacheTQ, MetadataAccessors)
     EXPECT_EQ(cache_ptr->k_precision(), ActivationPrecision::TQ8);
     EXPECT_EQ(cache_ptr->v_precision(), ActivationPrecision::TQ4);
     EXPECT_FALSE(cache_ptr->is_sharded());
+}
+
+/**
+ * @brief Prove grouped resident TQ reads equal scalar ROCm dequant bytes.
+ *
+ * The test covers both supported TQ block dimensions, a wrapped request-zero
+ * ring, and a shorter request-one ring. The grouped device-state path is
+ * captured and replayed as production attention uses it. Every live FP16 K/V
+ * word must equal the existing scalar dequant route, and every padding word
+ * must be zero so one request cannot observe another request's cache payload.
+ */
+TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBytes)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    constexpr int batch_size = 2;
+    constexpr int max_seq_len = 6;
+    constexpr int n_kv_heads = 2;
+    constexpr std::array<int, batch_size> expected_counts{6, 4};
+
+    for (const int head_dim : {64, 128})
+    {
+        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+        const int kv_dim = n_kv_heads * head_dim;
+        TurboQuantContext tq_ctx(head_dim, 42);
+        auto cache_owner = createROCmRingKVCacheTQ(
+            /*n_layers=*/1, batch_size, max_seq_len,
+            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_owner.get());
+        ASSERT_NE(cache, nullptr);
+        ScopedHipStream stream;
+        std::vector<float *> allocations;
+
+        auto appendChunk = [&](int request, int rows, unsigned k_seed, unsigned v_seed)
+        {
+            const auto host_k = generateRandomFP32(
+                static_cast<size_t>(rows) * kv_dim, k_seed);
+            const auto host_v = generateRandomFP32(
+                static_cast<size_t>(rows) * kv_dim, v_seed);
+            float *device_k = uploadToGPU(host_k);
+            float *device_v = uploadToGPU(host_v);
+            allocations.push_back(device_k);
+            allocations.push_back(device_v);
+            GpuTensorView k_view(
+                device_k, rows, kv_dim, TensorType::FP32, /*device_id=*/0);
+            GpuTensorView v_view(
+                device_v, rows, kv_dim, TensorType::FP32, /*device_id=*/0);
+            return appendWithTestStream(
+                *cache, /*layer=*/0, request, &k_view, &v_view, rows, stream);
+        };
+
+        ASSERT_TRUE(appendChunk(0, 5, 101, 201));
+        ASSERT_TRUE(appendChunk(0, 4, 102, 202));
+        ASSERT_TRUE(appendChunk(1, 4, 103, 203));
+        stream.synchronize();
+        for (float *allocation : allocations)
+            ASSERT_EQ(hipFree(allocation), hipSuccess);
+        ASSERT_EQ(cache->get_cached_tokens(0, 0), expected_counts[0]);
+        ASSERT_EQ(cache->get_cached_tokens(0, 1), expected_counts[1]);
+
+        std::array<std::vector<uint16_t>, batch_size> scalar_k;
+        std::array<std::vector<uint16_t>, batch_size> scalar_v;
+        IKVCache::KVReadParams read_params;
+        read_params.gpu_stream = stream.opaque();
+        for (int request = 0; request < batch_size; ++request)
+        {
+            ITensor *serial_k = nullptr;
+            ITensor *serial_v = nullptr;
+            int serial_count = 0;
+            ASSERT_TRUE(cache->get_kv_converted(
+                0, request, ActivationPrecision::FP16,
+                &serial_k, &serial_v, &serial_count, &read_params));
+            ASSERT_EQ(serial_count, expected_counts[request]);
+            ASSERT_NE(serial_k, nullptr);
+            ASSERT_NE(serial_v, nullptr);
+            stream.synchronize();
+
+            const size_t elements =
+                static_cast<size_t>(serial_count) * kv_dim;
+            scalar_k[request].resize(elements);
+            scalar_v[request].resize(elements);
+            ASSERT_EQ(
+                hipMemcpy(scalar_k[request].data(), serial_k->gpu_data_ptr(),
+                          elements * sizeof(uint16_t), hipMemcpyDeviceToHost),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpy(scalar_v[request].data(), serial_v->gpu_data_ptr(),
+                          elements * sizeof(uint16_t), hipMemcpyDeviceToHost),
+                hipSuccess);
+        }
+
+        ITensor *grouped_k = nullptr;
+        ITensor *grouped_v = nullptr;
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream.stream(), hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool gather_ok = false;
+        {
+            GraphCaptureGuard guard;
+            gather_ok = cache->get_kv_batched_device_view(
+                /*layer=*/0,
+                /*first_seq_idx=*/0,
+                batch_size,
+                max_seq_len,
+                &grouped_k,
+                &grouped_v,
+                stream.opaque());
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream.stream(), &graph), hipSuccess);
+        ASSERT_TRUE(gather_ok);
+        ASSERT_NE(grouped_k, nullptr);
+        ASSERT_NE(grouped_v, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+
+        const size_t grouped_elements =
+            static_cast<size_t>(batch_size) * max_seq_len * kv_dim;
+        std::vector<uint16_t> actual_k(grouped_elements);
+        std::vector<uint16_t> actual_v(grouped_elements);
+        ASSERT_EQ(
+            hipMemcpy(actual_k.data(), grouped_k->gpu_data_ptr(),
+                      grouped_elements * sizeof(uint16_t), hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(actual_v.data(), grouped_v->gpu_data_ptr(),
+                      grouped_elements * sizeof(uint16_t), hipMemcpyDeviceToHost),
+            hipSuccess);
+
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const size_t request_offset =
+                static_cast<size_t>(request) * max_seq_len * kv_dim;
+            const size_t live_elements =
+                static_cast<size_t>(expected_counts[request]) * kv_dim;
+            auto expectWordsEqual = [&](const uint16_t *actual,
+                                        const std::vector<uint16_t> &expected,
+                                        const char *label)
+            {
+                size_t first_difference = live_elements;
+                for (size_t index = 0; index < live_elements; ++index)
+                {
+                    if (actual[index] != expected[index])
+                    {
+                        first_difference = index;
+                        break;
+                    }
+                }
+                EXPECT_EQ(first_difference, live_elements)
+                    << label << " grouped bytes differ for request " << request
+                    << " first_word=" << first_difference
+                    << " row=" << first_difference / static_cast<size_t>(kv_dim)
+                    << " column=" << first_difference % static_cast<size_t>(kv_dim)
+                    << " actual_bits=0x" << std::hex
+                    << (first_difference < live_elements
+                            ? actual[first_difference]
+                            : uint16_t{0})
+                    << " expected_bits=0x"
+                    << (first_difference < live_elements
+                            ? expected[first_difference]
+                            : uint16_t{0})
+                    << std::dec;
+            };
+            expectWordsEqual(
+                actual_k.data() + request_offset, scalar_k[request], "TQ8 K");
+            expectWordsEqual(
+                actual_v.data() + request_offset, scalar_v[request], "TQ4 V");
+            for (size_t index = live_elements;
+                 index < static_cast<size_t>(max_seq_len) * kv_dim; ++index)
+            {
+                EXPECT_EQ(actual_k[request_offset + index], uint16_t{0});
+                EXPECT_EQ(actual_v[request_offset + index], uint16_t{0});
+            }
+        }
+
+        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+    }
+}
+
+/**
+ * @brief Proves unequal captured TQ appends preserve exact continuation bytes.
+ *
+ * The production stage records an eight-row FP32-to-TQ append for two requests,
+ * while resident device metadata publishes logical lengths `{8, 5}`. Replaying
+ * that graph with one real row against a ten-row ring forces every illegal
+ * padded store to wrap through live history. The resulting TQ8-K/TQ4-V cache is
+ * dequantized and compared byte-for-byte with an exact-row reference cache.
+ * Both supported block dimensions execute their native HIP specializations.
+ */
+TEST(Test__ROCmRingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationBytes)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    constexpr int batch_size = 2;
+    constexpr int captured_rows = 8;
+    constexpr int max_seq_len = 10;
+    constexpr int n_kv_heads = 2;
+    constexpr std::array<int, batch_size> initial_counts{captured_rows, 5};
+    constexpr std::array<int, batch_size> final_counts{captured_rows + 1, 6};
+
+    for (const int head_dim : {64, 128})
+    {
+        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+        const int kv_dim = n_kv_heads * head_dim;
+        const size_t source_elements =
+            static_cast<size_t>(batch_size) * captured_rows * kv_dim;
+        auto k_values = generateRandomFP32(source_elements, 1701 + head_dim);
+        auto v_values = generateRandomFP32(source_elements, 1907 + head_dim);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const size_t request_begin =
+                static_cast<size_t>(request) * captured_rows * kv_dim;
+            for (size_t index = 0;
+                 index < static_cast<size_t>(captured_rows) * kv_dim;
+                 ++index)
+            {
+                k_values[request_begin + index] += 0.5f * request;
+                v_values[request_begin + index] -= 0.375f * request;
+            }
+        }
+
+        auto k_tensor = createFP32Tensor(
+            k_values, batch_size * captured_rows, kv_dim);
+        auto v_tensor = createFP32Tensor(
+            v_values, batch_size * captured_rows, kv_dim);
+        ASSERT_NE(k_tensor, nullptr);
+        ASSERT_NE(v_tensor, nullptr);
+
+        TurboQuantContext tq_ctx(head_dim, 42);
+        ScopedHipStream stream;
+        ROCmRingKVCacheTQ actual(
+            /*n_layers=*/1, batch_size, max_seq_len,
+            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        ROCmRingKVCacheTQ reference(
+            /*n_layers=*/1, batch_size, max_seq_len,
+            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+
+        int32_t *device_lengths = nullptr;
+        ASSERT_EQ(
+            hipMalloc(&device_lengths, batch_size * sizeof(int32_t)),
+            hipSuccess);
+        const std::array<int32_t, batch_size> first_device_lengths{
+            initial_counts[0], initial_counts[1]};
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_lengths,
+                first_device_lengths.data(),
+                batch_size * sizeof(int32_t),
+                hipMemcpyHostToDevice,
+                stream.stream()),
+            hipSuccess);
+
+        KVCacheAppendStage append_stage({
+            .device_id = DeviceId::rocm(0),
+            .K = k_tensor.get(),
+            .V = v_tensor.get(),
+            .kv_cache = &actual,
+            .layer_idx = 0,
+            .seq_idx = 0,
+            .num_tokens = batch_size * captured_rows,
+            .batch_size = batch_size,
+            .seq_len = captured_rows,
+            .request_sequence_lengths_device = device_lengths,
+            .head_dim = head_dim,
+            .turboquant_ctx = &tq_ctx,
+        });
+        append_stage.setGPUStream(stream.opaque());
+        append_stage.updateDynamicParams(/*pos_offset=*/0, captured_rows);
+        stream.synchronize();
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream.stream(), hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok = append_stage.execute(nullptr);
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream.stream(), &graph), hipSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+
+        constexpr std::array<int32_t, batch_size> continuation_lengths{1, 1};
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_lengths,
+                continuation_lengths.data(),
+                batch_size * sizeof(int32_t),
+                hipMemcpyHostToDevice,
+                stream.stream()),
+            hipSuccess);
+        append_stage.updateDynamicParams(
+            /*pos_offset=*/captured_rows,
+            /*seq_len=*/captured_rows);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+        auto *k_base = static_cast<float *>(k_tensor->gpu_data_ptr());
+        auto *v_base = static_cast<float *>(v_tensor->gpu_data_ptr());
+        ASSERT_NE(k_base, nullptr);
+        ASSERT_NE(v_base, nullptr);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const size_t request_offset =
+                static_cast<size_t>(request) * captured_rows * kv_dim;
+            GpuTensorView initial_k(
+                k_base + request_offset,
+                initial_counts[request], kv_dim,
+                TensorType::FP32, /*device_id=*/0);
+            GpuTensorView initial_v(
+                v_base + request_offset,
+                initial_counts[request], kv_dim,
+                TensorType::FP32, /*device_id=*/0);
+            ASSERT_TRUE(appendWithTestStream(
+                reference, 0, request,
+                &initial_k, &initial_v,
+                initial_counts[request], stream));
+
+            GpuTensorView continuation_k(
+                k_base + request_offset,
+                /*rows=*/1, kv_dim,
+                TensorType::FP32, /*device_id=*/0);
+            GpuTensorView continuation_v(
+                v_base + request_offset,
+                /*rows=*/1, kv_dim,
+                TensorType::FP32, /*device_id=*/0);
+            ASSERT_TRUE(appendWithTestStream(
+                reference, 0, request,
+                &continuation_k, &continuation_v,
+                /*num_tokens=*/1, stream));
+        }
+        stream.synchronize();
+
+        IKVCache::KVReadParams read_params;
+        read_params.gpu_stream = stream.opaque();
+        for (int request = 0; request < batch_size; ++request)
+        {
+            read_params.requested_token_count = final_counts[request];
+            SCOPED_TRACE("request=" + std::to_string(request));
+            EXPECT_EQ(actual.get_cached_tokens(0, request), final_counts[request]);
+            EXPECT_EQ(actual.ring_head(0, request), final_counts[request]);
+            EXPECT_EQ(reference.get_cached_tokens(0, request), final_counts[request]);
+
+            int device_count = -1;
+            int device_head = -1;
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    &device_count,
+                    actual.deviceCachedTokenCountPtr(0, request),
+                    sizeof(int), hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    &device_head,
+                    actual.deviceRingHeadPtr(0, request),
+                    sizeof(int), hipMemcpyDeviceToHost, stream.stream()),
+                hipSuccess);
+            stream.synchronize();
+            EXPECT_EQ(device_count, final_counts[request]);
+            EXPECT_EQ(device_head, final_counts[request]);
+
+            ITensor *actual_k = nullptr;
+            ITensor *actual_v = nullptr;
+            int actual_rows = 0;
+            ASSERT_TRUE(actual.get_kv_converted(
+                0, request, ActivationPrecision::FP16,
+                &actual_k, &actual_v, &actual_rows, &read_params));
+            ASSERT_EQ(actual_rows, final_counts[request]);
+            stream.synchronize();
+            const size_t bytes =
+                static_cast<size_t>(actual_rows) * kv_dim * sizeof(uint16_t);
+            std::vector<uint8_t> actual_k_bytes(bytes);
+            std::vector<uint8_t> actual_v_bytes(bytes);
+            ASSERT_EQ(
+                hipMemcpy(
+                    actual_k_bytes.data(), actual_k->gpu_data_ptr(),
+                    bytes, hipMemcpyDeviceToHost),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpy(
+                    actual_v_bytes.data(), actual_v->gpu_data_ptr(),
+                    bytes, hipMemcpyDeviceToHost),
+                hipSuccess);
+
+            ITensor *reference_k = nullptr;
+            ITensor *reference_v = nullptr;
+            int reference_rows = 0;
+            ASSERT_TRUE(reference.get_kv_converted(
+                0, request, ActivationPrecision::FP16,
+                &reference_k, &reference_v, &reference_rows, &read_params));
+            ASSERT_EQ(reference_rows, final_counts[request]);
+            stream.synchronize();
+            std::vector<uint8_t> reference_k_bytes(bytes);
+            std::vector<uint8_t> reference_v_bytes(bytes);
+            ASSERT_EQ(
+                hipMemcpy(
+                    reference_k_bytes.data(), reference_k->gpu_data_ptr(),
+                    bytes, hipMemcpyDeviceToHost),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpy(
+                    reference_v_bytes.data(), reference_v->gpu_data_ptr(),
+                    bytes, hipMemcpyDeviceToHost),
+                hipSuccess);
+
+            EXPECT_EQ(
+                std::memcmp(
+                    actual_k_bytes.data(), reference_k_bytes.data(), bytes),
+                0)
+                << "captured TQ8 K continuation changed live bytes";
+            EXPECT_EQ(
+                std::memcmp(
+                    actual_v_bytes.data(), reference_v_bytes.data(), bytes),
+                0)
+                << "captured TQ4 V continuation changed live bytes";
+        }
+
+        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+        ASSERT_EQ(hipFree(device_lengths), hipSuccess);
+    }
+}
+
+/**
+ * @brief Proves captured grouped dequant follows post-append device state.
+ *
+ * Four rows initialize the compressed cache. A graph captures one append plus
+ * the production request-batched TQ materialization and is launched twice.
+ * The read kernel must consume the HIP-resident head/count advanced by the
+ * preceding append node on each replay. The six-row result is compared
+ * byte-for-byte with two serial appends for both supported TQ dimensions.
+ */
+TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    constexpr int history_rows = 4;
+    constexpr int final_rows = history_rows + 2;
+    constexpr int max_seq_len = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr float rope_theta = 10000.0f;
+    constexpr int position_start = 3;
+
+    for (const int head_dim : {64, 128})
+    {
+        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+        const int kv_dim = n_kv_heads * head_dim;
+        auto history_k_values = generateRandomFP32(
+            static_cast<size_t>(history_rows) * kv_dim, 2701 + head_dim);
+        auto history_v_values = generateRandomFP32(
+            static_cast<size_t>(history_rows) * kv_dim, 2907 + head_dim);
+        auto continuation_k_values = generateRandomFP32(kv_dim, 3109 + head_dim);
+        auto continuation_v_values = generateRandomFP32(kv_dim, 3301 + head_dim);
+        auto history_k = createFP32Tensor(history_k_values, history_rows, kv_dim);
+        auto history_v = createFP32Tensor(history_v_values, history_rows, kv_dim);
+        auto continuation_k = createFP32Tensor(continuation_k_values, 1, kv_dim);
+        auto continuation_v = createFP32Tensor(continuation_v_values, 1, kv_dim);
+        ASSERT_NE(history_k, nullptr);
+        ASSERT_NE(history_v, nullptr);
+        ASSERT_NE(continuation_k, nullptr);
+        ASSERT_NE(continuation_v, nullptr);
+
+        TurboQuantContext tq_ctx(head_dim, 42);
+        ScopedHipStream stream;
+        ROCmRingKVCacheTQ actual(
+            /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
+            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        ROCmRingKVCacheTQ reference(
+            /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
+            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+        ASSERT_TRUE(history_k->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        ASSERT_TRUE(history_v->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        ASSERT_TRUE(continuation_k->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        ASSERT_TRUE(continuation_v->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        ASSERT_TRUE(appendWithTestStream(
+            actual, 0, 0, history_k.get(), history_v.get(), history_rows, stream));
+        ASSERT_TRUE(appendWithTestStream(
+            reference, 0, 0, history_k.get(), history_v.get(), history_rows, stream));
+        stream.synchronize();
+
+        IKVCache::KVReadParams read_params;
+        read_params.rope_theta = rope_theta;
+        read_params.position_start = position_start;
+        read_params.n_kv_heads = n_kv_heads;
+        read_params.head_dim = head_dim;
+        read_params.rope_dim = head_dim;
+        read_params.turboquant_ctx = &tq_ctx;
+        read_params.gpu_stream = stream.opaque();
+
+        KVCacheAppendStage append_stage({
+            .device_id = DeviceId::rocm(0),
+            .K = continuation_k.get(),
+            .V = continuation_v.get(),
+            .kv_cache = &actual,
+            .layer_idx = 0,
+            .seq_idx = 0,
+            .num_tokens = 1,
+            .batch_size = 1,
+            .seq_len = 1,
+            .head_dim = head_dim,
+            .turboquant_ctx = &tq_ctx,
+        });
+        append_stage.setGPUStream(stream.opaque());
+        append_stage.updateDynamicDevicePositionIds(
+            actual.deviceCachedTokenCountPtr(0, 0), /*seq_len=*/1);
+        append_stage.updateDynamicParams(/*pos_offset=*/history_rows, /*seq_len=*/1);
+        stream.synchronize();
+
+        ITensor *captured_k = nullptr;
+        ITensor *captured_v = nullptr;
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream.stream(), hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok = append_stage.execute(nullptr) &&
+                         actual.get_kv_batched_converted_device_view(
+                             0, 0, /*request_count=*/1, max_seq_len,
+                             ActivationPrecision::FP16,
+                             &captured_k, &captured_v, read_params);
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream.stream(), &graph), hipSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(captured_k, nullptr);
+        ASSERT_NE(captured_v, nullptr);
+        ASSERT_EQ(captured_k->rows(), static_cast<size_t>(max_seq_len));
+        ASSERT_EQ(captured_v->rows(), static_cast<size_t>(max_seq_len));
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+        EXPECT_EQ(actual.get_cached_tokens(0, 0), history_rows + 1);
+
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+        EXPECT_EQ(actual.get_cached_tokens(0, 0), final_rows);
+        int device_count = -1;
+        int device_head = -1;
+        ASSERT_EQ(
+            hipMemcpy(
+                &device_count, actual.deviceCachedTokenCountPtr(0, 0),
+                sizeof(int), hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                &device_head, actual.deviceRingHeadPtr(0, 0),
+                sizeof(int), hipMemcpyDeviceToHost),
+            hipSuccess);
+        EXPECT_EQ(device_count, final_rows);
+        EXPECT_EQ(device_head, final_rows);
+
+        ASSERT_TRUE(appendWithTestStream(
+            reference, 0, 0,
+            continuation_k.get(), continuation_v.get(), 1, stream));
+        ITensor *reference_k = nullptr;
+        ITensor *reference_v = nullptr;
+        int reference_rows = 0;
+        ASSERT_TRUE(reference.get_kv_converted(
+            0, 0, ActivationPrecision::FP16,
+            &reference_k, &reference_v, &reference_rows, &read_params));
+        ASSERT_EQ(reference_rows, history_rows + 1);
+        stream.synchronize();
+        ASSERT_TRUE(appendWithTestStream(
+            reference, 0, 0,
+            continuation_k.get(), continuation_v.get(), 1, stream));
+        ASSERT_TRUE(reference.get_kv_converted(
+            0, 0, ActivationPrecision::FP16,
+            &reference_k, &reference_v, &reference_rows, &read_params));
+        ASSERT_EQ(reference_rows, final_rows);
+        stream.synchronize();
+
+        const size_t bytes =
+            static_cast<size_t>(final_rows) * kv_dim * sizeof(uint16_t);
+        std::vector<uint8_t> actual_k_bytes(bytes);
+        std::vector<uint8_t> actual_v_bytes(bytes);
+        std::vector<uint8_t> reference_k_bytes(bytes);
+        std::vector<uint8_t> reference_v_bytes(bytes);
+        ASSERT_EQ(
+            hipMemcpy(
+                actual_k_bytes.data(), captured_k->gpu_data_ptr(),
+                bytes, hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                actual_v_bytes.data(), captured_v->gpu_data_ptr(),
+                bytes, hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                reference_k_bytes.data(), reference_k->gpu_data_ptr(),
+                bytes, hipMemcpyDeviceToHost),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                reference_v_bytes.data(), reference_v->gpu_data_ptr(),
+                bytes, hipMemcpyDeviceToHost),
+            hipSuccess);
+        EXPECT_EQ(
+            std::memcmp(actual_k_bytes.data(), reference_k_bytes.data(), bytes),
+            0)
+            << "captured device-owned TQ8 K dequant differs from exact continuation";
+        EXPECT_EQ(
+            std::memcmp(actual_v_bytes.data(), reference_v_bytes.data(), bytes),
+            0)
+            << "captured device-owned TQ4 V dequant differs from exact continuation";
+
+        EXPECT_EQ(actual.get_cached_tokens(0, 0), final_rows);
+        EXPECT_EQ(actual.ring_head(0, 0), final_rows);
+        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+    }
 }
 
 #endif // HAVE_ROCM

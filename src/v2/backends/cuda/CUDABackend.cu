@@ -854,7 +854,11 @@ namespace llaminar2
     extern "C" bool cudaOps_sample_distribution_f32(
         const int *token_ids, const float *probs,
         int k, float threshold,
-        int *out_token, float *out_probability, int device_idx, void *stream);
+        int *out_token, float *out_probability,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
+        int device_idx, void *stream);
     extern "C" bool cudaOps_sample_processed_logits_f32(
         const float *logits,
         int vocab_size,
@@ -885,6 +889,9 @@ namespace llaminar2
         int stop_token_count,
         int *out_token,
         float *out_probability,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
         int device_idx,
         void *stream);
     extern "C" bool cudaOps_softmax_processed_logits_f32(
@@ -969,6 +976,8 @@ namespace llaminar2
         unsigned long long threshold_seed,
         int threshold_first_logical_position,
         int thresholds_from_seed,
+        const int *threshold_base_position,
+        int threshold_position_offset,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -1006,6 +1015,9 @@ namespace llaminar2
         float accept_threshold3,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
+        int thresholds_from_seed,
+        const int *threshold_base_position,
+        int threshold_position_offset,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -1136,6 +1148,32 @@ namespace llaminar2
         int row_count,
         int32_t filler_token,
         int32_t *out_tokens,
+        const int32_t *base_positions,
+        int position_offset,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_prepare_mtp_batched_sidecar_inputs(
+        const int32_t *condition_tokens,
+        int condition_token_stride,
+        const int32_t *base_positions,
+        int position_offset,
+        int request_count,
+        int32_t *out_condition_tokens,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_initialize_mtp_device_logical_state(
+        const int32_t *sampled_tokens,
+        const int32_t *target_positions_device,
+        int request_count,
+        int32_t *out_base_cached_tokens,
+        int32_t *out_target_positions,
+        int32_t *out_accepted_state_counts,
+        int32_t *out_next_condition_tokens,
+        int32_t *out_all_drafts_accepted_flags,
+        int32_t *out_stopped_flags,
+        int32_t *out_publication_ok_flags,
         int device_idx,
         void *stream);
 
@@ -1662,11 +1700,15 @@ namespace llaminar2
         int device_id,
         void *stream,
         void *out_token_device,
-        void *out_probability_device)
+        void *out_probability_device,
+        uint64_t threshold_seed,
+        const void *threshold_position_device,
+        int threshold_position_offset)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !token_ids_device || !probs_device ||
-            top_k <= 0 || top_k > 256 || !stream || !out_token_device)
+            top_k <= 0 || top_k > 256 || !stream || !out_token_device ||
+            (threshold_position_device && threshold_seed == 0))
         {
             return false;
         }
@@ -1679,6 +1721,9 @@ namespace llaminar2
             threshold,
             static_cast<int *>(out_token_device),
             static_cast<float *>(out_probability_device),
+            static_cast<unsigned long long>(threshold_seed),
+            static_cast<const int *>(threshold_position_device),
+            threshold_position_offset,
             device_id,
             stream);
     }
@@ -1727,7 +1772,10 @@ namespace llaminar2
         int device_id,
         void *stream,
         void *out_token_device,
-        void *out_probability_device)
+        void *out_probability_device,
+        uint64_t threshold_seed,
+        const void *threshold_position_device,
+        int threshold_position_offset)
     {
         using namespace sampling_math;
         if (device_id >= device_count_ || device_id < 0 ||
@@ -1738,7 +1786,8 @@ namespace llaminar2
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens_host) ||
-            !stream || !out_token_device)
+            !stream || !out_token_device ||
+            (threshold_position_device && threshold_seed == 0))
         {
             return false;
         }
@@ -1770,6 +1819,9 @@ namespace llaminar2
             stop_token_count,
             static_cast<int *>(out_token_device),
             static_cast<float *>(out_probability_device),
+            static_cast<unsigned long long>(threshold_seed),
+            static_cast<const int *>(threshold_position_device),
+            threshold_position_offset,
             device_id,
             stream);
     }
@@ -2037,7 +2089,9 @@ namespace llaminar2
         const void *draft_token_probabilities_device,
         uint64_t inverse_sample_seed,
         int inverse_sample_first_logical_position,
-        int inverse_sample_vocab_size)
+        int inverse_sample_vocab_size,
+        const void *threshold_base_position_device,
+        int threshold_position_offset)
     {
         const bool has_draft_distribution =
             draft_token_ids_device != nullptr && draft_probs_device != nullptr;
@@ -2046,12 +2100,15 @@ namespace llaminar2
         const bool has_host_thresholds =
             accept_thresholds_host != nullptr &&
             residual_thresholds_host != nullptr;
+        const int threshold_position_source_count =
+            (inverse_sample_first_logical_position >= 0 ? 1 : 0) +
+            (threshold_base_position_device != nullptr ? 1 : 0);
         const bool uses_seeded_device_thresholds =
             accept_thresholds_host == nullptr &&
             residual_thresholds_host == nullptr &&
             has_one_hot_draft_distribution &&
             inverse_sample_seed != 0 &&
-            inverse_sample_first_logical_position >= 0;
+            threshold_position_source_count == 1;
         if (device_id >= device_count_ || device_id < 0 ||
             !target_token_ids_device || !target_probs_device ||
             (!has_draft_distribution && !has_one_hot_draft_distribution) ||
@@ -2101,6 +2158,8 @@ namespace llaminar2
             uses_seeded_device_thresholds ? inverse_sample_seed : 0ull,
             inverse_sample_first_logical_position,
             uses_seeded_device_thresholds ? 1 : 0,
+            static_cast<const int *>(threshold_base_position_device),
+            threshold_position_offset,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
@@ -2191,8 +2250,18 @@ namespace llaminar2
         void *out_accepted_device,
         void *out_accept_probability_device,
         void *out_accept_threshold_device,
-        bool no_draft_probabilities)
+        bool no_draft_probabilities,
+        const void *threshold_base_position_device,
+        int threshold_position_offset)
     {
+        const bool has_host_thresholds = accept_thresholds_host != nullptr;
+        const int threshold_position_source_count =
+            (inverse_sample_first_logical_position >= 0 ? 1 : 0) +
+            (threshold_base_position_device != nullptr ? 1 : 0);
+        const bool uses_seeded_device_thresholds =
+            !has_host_thresholds &&
+            inverse_sample_seed != 0 &&
+            threshold_position_source_count == 1;
         if (device_id >= device_count_ || device_id < 0 ||
             !target_logits_device ||
             (!no_draft_probabilities && !draft_probabilities_device) ||
@@ -2201,15 +2270,19 @@ namespace llaminar2
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
             (!no_draft_probabilities && draft_row_stride < vocab_size) ||
-            !accept_thresholds_host ||
+            (!has_host_thresholds && !uses_seeded_device_thresholds) ||
+            (has_host_thresholds && threshold_base_position_device) ||
             !stream || !out_token_device || !out_accepted_device)
         {
             return false;
         }
 
         float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = 0; i < row_count; ++i)
-            accept_thresholds[i] = accept_thresholds_host[i];
+        if (has_host_thresholds)
+        {
+            for (int i = 0; i < row_count; ++i)
+                accept_thresholds[i] = accept_thresholds_host[i];
+        }
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         return cudaOps_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_f32(
@@ -2226,6 +2299,9 @@ namespace llaminar2
             accept_thresholds[3],
             static_cast<unsigned long long>(inverse_sample_seed),
             inverse_sample_first_logical_position,
+            uses_seeded_device_thresholds ? 1 : 0,
+            static_cast<const int *>(threshold_base_position_device),
+            threshold_position_offset,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
@@ -2637,12 +2713,17 @@ namespace llaminar2
         int32_t filler_token,
         int device_id,
         void *stream,
-        void *out_tokens_device)
+        void *out_tokens_device,
+        const void *base_positions_device,
+        int position_offset,
+        void *out_position_ids_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !meta_device ||
             !output_tokens_device ||
             !out_tokens_device ||
+            !base_positions_device ||
+            !out_position_ids_device ||
             !stream ||
             meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
             output_token_stride < sampling_math::kSpeculativeBatchMaxOutputTokens ||
@@ -2665,6 +2746,93 @@ namespace llaminar2
             row_count,
             filler_token,
             static_cast<int32_t *>(out_tokens_device),
+            static_cast<const int32_t *>(base_positions_device),
+            position_offset,
+            static_cast<int32_t *>(out_position_ids_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueuePrepareMTPBatchedSidecarInputs(
+        const void *condition_tokens_device,
+        int condition_token_stride,
+        const void *base_positions_device,
+        int position_offset,
+        int request_count,
+        int device_id,
+        void *stream,
+        void *out_condition_tokens_device,
+        void *out_position_ids_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !condition_tokens_device ||
+            condition_token_stride <= 0 ||
+            !base_positions_device ||
+            request_count <= 0 ||
+            request_count > sampling_math::kSpeculativeBatchMaxRows ||
+            !stream ||
+            !out_condition_tokens_device ||
+            !out_position_ids_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_prepare_mtp_batched_sidecar_inputs(
+            static_cast<const int32_t *>(condition_tokens_device),
+            condition_token_stride,
+            static_cast<const int32_t *>(base_positions_device),
+            position_offset,
+            request_count,
+            static_cast<int32_t *>(out_condition_tokens_device),
+            static_cast<int32_t *>(out_position_ids_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueInitializeMTPDeviceLogicalState(
+        const void *sampled_tokens_device,
+        const void *target_positions_device,
+        int request_count,
+        int device_id,
+        void *stream,
+        void *out_base_cached_tokens_device,
+        void *out_target_positions_device,
+        void *out_accepted_state_counts_device,
+        void *out_next_condition_tokens_device,
+        void *out_all_drafts_accepted_flags_device,
+        void *out_stopped_flags_device,
+        void *out_publication_ok_flags_device)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !sampled_tokens_device ||
+            !target_positions_device ||
+            request_count <= 0 ||
+            request_count > sampling_math::kSpeculativeBatchMaxRows ||
+            !stream ||
+            !out_base_cached_tokens_device ||
+            !out_target_positions_device ||
+            !out_accepted_state_counts_device ||
+            !out_next_condition_tokens_device ||
+            !out_all_drafts_accepted_flags_device ||
+            !out_stopped_flags_device ||
+            !out_publication_ok_flags_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_initialize_mtp_device_logical_state(
+            static_cast<const int32_t *>(sampled_tokens_device),
+            static_cast<const int32_t *>(target_positions_device),
+            request_count,
+            static_cast<int32_t *>(out_base_cached_tokens_device),
+            static_cast<int32_t *>(out_target_positions_device),
+            static_cast<int32_t *>(out_accepted_state_counts_device),
+            static_cast<int32_t *>(out_next_condition_tokens_device),
+            static_cast<int32_t *>(out_all_drafts_accepted_flags_device),
+            static_cast<int32_t *>(out_stopped_flags_device),
+            static_cast<int32_t *>(out_publication_ok_flags_device),
             device_id,
             stream);
     }

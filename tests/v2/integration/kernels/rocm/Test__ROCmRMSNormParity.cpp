@@ -248,6 +248,43 @@ namespace
         }
     }
 
+#ifdef HAVE_ROCM
+    /**
+     * @brief Own an explicit non-default HIP stream for tensor-aware parity.
+     *
+     * Production GPU stages never use HIP's legacy default stream. Keeping the
+     * stream in an RAII owner lets fatal GoogleTest assertions unwind without
+     * leaking runtime resources and makes these older parity cells obey the
+     * same stream contract as graph execution.
+     */
+    class ScopedROCmStream
+    {
+    public:
+        explicit ScopedROCmStream(int device = 0)
+        {
+            if (hipSetDevice(device) != hipSuccess)
+                return;
+            if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) != hipSuccess)
+                stream_ = nullptr;
+        }
+
+        ~ScopedROCmStream()
+        {
+            if (stream_)
+                (void)hipStreamDestroy(stream_);
+        }
+
+        ScopedROCmStream(const ScopedROCmStream &) = delete;
+        ScopedROCmStream &operator=(const ScopedROCmStream &) = delete;
+
+        /** @return Owned HIP stream, or null if setup failed. */
+        hipStream_t get() const { return stream_; }
+
+    private:
+        hipStream_t stream_ = nullptr;
+    };
+#endif
+
 } // anonymous namespace
 
 // ============================================================================
@@ -732,17 +769,20 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_ApplyTensor)
 
     // Upload tensors to GPU
     DeviceId rocm_device = DeviceId::rocm(0);
-    ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+    ScopedROCmStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream.get()));
 
     // ROCm kernel using apply_tensor() API
     llaminar2::rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream.get());
     ASSERT_TRUE(rocm_kernel.apply_tensor(
         input.get(), gamma.get(), rocm_output.get(),
         rows, cols, epsilon, nullptr, 0));
 
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
@@ -817,16 +857,19 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer21InputParity)
         rows, cols, epsilon, false, nullptr, -1);
 
     DeviceId rocm_device = DeviceId::rocm(0);
-    ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+    ScopedROCmStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream.get()));
 
     llaminar2::rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream.get());
     ASSERT_TRUE(rocm_kernel.apply_tensor(
         input.get(), gamma.get(), rocm_output.get(),
         rows, cols, epsilon, nullptr, 0));
 
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
@@ -903,16 +946,19 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer3InputParity)
         rows, cols, epsilon, false, nullptr, -1);
 
     DeviceId rocm_device = DeviceId::rocm(0);
-    ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+    ScopedROCmStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(gamma->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream.get()));
 
     llaminar2::rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream.get());
     ASSERT_TRUE(rocm_kernel.apply_tensor(
         input.get(), gamma.get(), rocm_output.get(),
         rows, cols, epsilon, nullptr, 0));
 
-    (void)hipDeviceSynchronize();
+    ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 

@@ -71,6 +71,19 @@ namespace { // anonymous namespace to avoid symbol conflicts with CUDA kernels
 // Occupancy: 128 wavefronts / 60 CUs = 2.1 waves/CU (was 0.53)
 // =========================================================================
 
+/**
+ * @brief Advance a tiny grouped recurrence with the exact scalar HIP arithmetic.
+ *
+ * Scalar decode and grouped MTP verification both enter this kernel.  M=1 uses
+ * one loop iteration; M=2..4 keeps the same block resident and advances rows in
+ * causal order.  In particular, the four-way `d_k` split, wavefront reduction,
+ * gate math, and state-update expressions are shared rather than reimplemented
+ * by a prefill kernel with a subtly different floating-point schedule.
+ *
+ * Grid X flattens request and head identity. Grid Y owns independent value
+ * columns. Post-row snapshots use the flattened request-row namespace, so one
+ * launch publishes every verifier state row without host replay.
+ */
 __global__ void rocm_gdn_recurrent_step_kernel(
     const float *__restrict__ q,
     const float *__restrict__ k,
@@ -81,13 +94,19 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const float *__restrict__ dt_bias,
     float *__restrict__ output,
     float *__restrict__ state,
+    int request_count, int request_seq_len,
     int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     const int *__restrict__ effective_seq_len_ptr,
-    int effective_row_idx)
+    int effective_row_idx,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows)
 {
-    const int h = blockIdx.x;
-    if (h >= n_heads) return;
+    const int request_head = blockIdx.x;
+    const int request = request_head / n_heads;
+    const int h = request_head - request * n_heads;
+    if (request >= request_count || h >= n_heads) return;
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
@@ -99,11 +118,16 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const int col_in_block = tid % cols_per_block;     // 0..63
     const int vi = blockIdx.y * cols_per_block + col_in_block;
 
-    const float *q_head = q + h * d_k;
-    const float *k_head = k + h * d_k;
-    const float *v_head = v + h * d_v;
-    float *S = state + (size_t)h * d_k * d_v;
-    float *o_head = output + h * d_v;
+    const size_t row_qk_stride =
+        static_cast<size_t>(n_heads) * static_cast<size_t>(d_k);
+    const size_t row_v_stride =
+        static_cast<size_t>(n_heads) * static_cast<size_t>(d_v);
+    const size_t request_state_stride =
+        static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) *
+        static_cast<size_t>(d_v);
+    float *S =
+        state + static_cast<size_t>(request) * request_state_stride +
+        static_cast<size_t>(h) * d_k * d_v;
 
     extern __shared__ float smem[];
     float *q_local = smem;                              // [d_k]
@@ -117,79 +141,109 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const int lane_id = tid % 64;
     const int num_warps = block_size / 64; // 4
 
-    if (effective_seq_len_ptr && effective_row_idx >= *effective_seq_len_ptr)
+    for (int request_row = 0; request_row < request_seq_len; ++request_row)
     {
-        if (vi < d_v && split_id == 0)
-            o_head[vi] = 0.0f;
-        return;
-    }
+        const int flat_row = request * request_seq_len + request_row;
+        const float *q_head =
+            q + static_cast<size_t>(flat_row) * row_qk_stride +
+            static_cast<size_t>(h) * d_k;
+        const float *k_head =
+            k + static_cast<size_t>(flat_row) * row_qk_stride +
+            static_cast<size_t>(h) * d_k;
+        const float *v_head =
+            v + static_cast<size_t>(flat_row) * row_v_stride +
+            static_cast<size_t>(h) * d_v;
+        float *o_head =
+            output + static_cast<size_t>(flat_row) * row_v_stride +
+            static_cast<size_t>(h) * d_v;
 
-    // Load Q and K into shared memory (all 256 threads cooperate)
-    for (int i = tid; i < d_k; i += block_size) {
-        q_local[i] = q_head[i];
-        k_local[i] = k_head[i];
-    }
-    __syncthreads();
+        const int logical_row = effective_row_idx + request_row;
+        if (effective_seq_len_ptr &&
+            logical_row >= effective_seq_len_ptr[request])
+        {
+            if (vi < d_v && split_id == 0)
+                o_head[vi] = 0.0f;
+            __syncthreads();
+            continue;
+        }
 
-    if (use_qk_l2norm) {
-        // Multi-wavefront Q norm reduction
-        float q_sum = 0.0f;
+        // Preserve scalar decode's 256-thread Q/K normalization tree.
         for (int i = tid; i < d_k; i += block_size)
-            q_sum += q_local[i] * q_local[i];
-        for (int offset = 32; offset > 0; offset >>= 1)
-            q_sum += __shfl_xor(q_sum, offset);
-        if (lane_id == 0) warp_sums[warp_id] = q_sum;
-        __syncthreads();
-        if (tid == 0) {
-            float total = 0.0f;
-            for (int w = 0; w < num_warps; w++) total += warp_sums[w];
-            warp_sums[0] = total;
+        {
+            q_local[i] = q_head[i];
+            k_local[i] = k_head[i];
         }
         __syncthreads();
-        float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-        for (int i = tid; i < d_k; i += block_size)
-            q_local[i] *= q_inv;
-        __syncthreads();
 
-        // Multi-wavefront K norm reduction
-        float k_sum = 0.0f;
-        for (int i = tid; i < d_k; i += block_size)
-            k_sum += k_local[i] * k_local[i];
-        for (int offset = 32; offset > 0; offset >>= 1)
-            k_sum += __shfl_xor(k_sum, offset);
-        if (lane_id == 0) warp_sums[warp_id] = k_sum;
-        __syncthreads();
-        if (tid == 0) {
-            float total = 0.0f;
-            for (int w = 0; w < num_warps; w++) total += warp_sums[w];
-            warp_sums[0] = total;
+        if (use_qk_l2norm)
+        {
+            float q_sum = 0.0f;
+            for (int i = tid; i < d_k; i += block_size)
+                q_sum += q_local[i] * q_local[i];
+            for (int offset = 32; offset > 0; offset >>= 1)
+                q_sum += __shfl_xor(q_sum, offset);
+            if (lane_id == 0)
+                warp_sums[warp_id] = q_sum;
+            __syncthreads();
+            if (tid == 0)
+            {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; ++w)
+                    total += warp_sums[w];
+                warp_sums[0] = total;
+            }
+            __syncthreads();
+            const float q_inv =
+                scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            for (int i = tid; i < d_k; i += block_size)
+                q_local[i] *= q_inv;
+            __syncthreads();
+
+            float k_sum = 0.0f;
+            for (int i = tid; i < d_k; i += block_size)
+                k_sum += k_local[i] * k_local[i];
+            for (int offset = 32; offset > 0; offset >>= 1)
+                k_sum += __shfl_xor(k_sum, offset);
+            if (lane_id == 0)
+                warp_sums[warp_id] = k_sum;
+            __syncthreads();
+            if (tid == 0)
+            {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; ++w)
+                    total += warp_sums[w];
+                warp_sums[0] = total;
+            }
+            __syncthreads();
+            const float k_inv =
+                1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            for (int i = tid; i < d_k; i += block_size)
+                k_local[i] *= k_inv;
+            __syncthreads();
+        }
+        else
+        {
+            for (int i = tid; i < d_k; i += block_size)
+                q_local[i] *= scale;
+            __syncthreads();
+        }
+
+        if (tid == 0)
+        {
+            const size_t gate_index =
+                static_cast<size_t>(flat_row) *
+                    static_cast<size_t>(n_heads) +
+                h;
+            const float x = alpha[gate_index] + dt_bias[h];
+            const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+            warp_sums[0] = expf(A_log[h] * sp);
+            warp_sums[1] =
+                1.0f / (1.0f + expf(-beta_raw[gate_index]));
         }
         __syncthreads();
-        float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-        for (int i = tid; i < d_k; i += block_size)
-            k_local[i] *= k_inv;
-        __syncthreads();
-    } else {
-        for (int i = tid; i < d_k; i += block_size)
-            q_local[i] *= scale;
-        __syncthreads();
-    }
+        const float decay = warp_sums[0];
+        const float beta_h = warp_sums[1];
 
-    // Gate and beta — compute on thread 0, broadcast via shared memory
-    float decay, beta_h;
-    if (tid == 0) {
-        float x = alpha[h] + dt_bias[h];
-        float sp = (x > 20.0f) ? x : log1pf(expf(x));
-        warp_sums[0] = expf(A_log[h] * sp);
-        warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[h]));
-    }
-    __syncthreads();
-    decay = warp_sums[0];
-    beta_h = warp_sums[1];
-
-    // Row-split column processing: ROW_SPLIT=4 threads collaborate on each
-    // column, splitting d_k rows. Shared-memory reduction for kv and output.
-    {
         const int rows_per_split = d_k / ROW_SPLIT;
         const int j_start = split_id * rows_per_split;
         const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
@@ -217,9 +271,18 @@ __global__ void rocm_gdn_recurrent_step_kernel(
         // Pass 2: Fused decay + update + partial output (read-modify-write)
         float partial_out = 0.0f;
         if (vi < d_v) {
+            float *snapshot =
+                state_snapshots && flat_row < max_snapshot_rows
+                    ? state_snapshots +
+                          static_cast<size_t>(flat_row) *
+                              static_cast<size_t>(snapshot_stride_floats) +
+                          static_cast<size_t>(h) * d_k * d_v
+                    : nullptr;
             for (int j = j_start; j < j_end; j++) {
                 float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
                 S[j * d_v + vi] = s_new;
+                if (snapshot)
+                    snapshot[j * d_v + vi] = s_new;
                 partial_out += s_new * q_local[j];
             }
         }
@@ -233,6 +296,9 @@ __global__ void rocm_gdn_recurrent_step_kernel(
                 out_vi += reduce_out[col_in_block + s * cols_per_block];
             o_head[vi] = out_vi;
         }
+
+        // Shared Q/K and reduction slots are reused by the next causal row.
+        __syncthreads();
     }
 }
 
@@ -268,11 +334,13 @@ void rocm_gdn_chunk_forward_kernel(
     float *__restrict__ state_snapshots,
     int snapshot_stride_floats,
     int max_snapshot_rows,
-    int seq_len, int n_heads, int d_k, int d_v,
+    int request_count, int request_seq_len,
+    int n_heads, int d_k, int d_v,
     bool use_qk_l2norm)
 {
+    const int request = blockIdx.z;
     const int h = blockIdx.x;
-    if (h >= n_heads) return;
+    if (request >= request_count || h >= n_heads) return;
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
@@ -287,7 +355,12 @@ void rocm_gdn_chunk_forward_kernel(
     const int v_stride = n_heads * d_v;
     const float scale = rsqrtf((float)d_k);
 
-    float *S = state + (size_t)h * d_k * d_v;
+    const int request_row_base = request * request_seq_len;
+    const size_t request_state_stride =
+        static_cast<size_t>(n_heads) * d_k * d_v;
+    float *S = state +
+               static_cast<size_t>(request) * request_state_stride +
+               static_cast<size_t>(h) * d_k * d_v;
 
     extern __shared__ float smem[];
     float *q_local = smem;
@@ -310,11 +383,15 @@ void rocm_gdn_chunk_forward_kernel(
     }
     __syncthreads();
 
-    int effective_seq_len = seq_len;
+    int effective_seq_len = request_seq_len;
     if (effective_seq_len_ptr)
     {
-        const int raw_effective = *effective_seq_len_ptr;
-        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+        const int raw_effective = effective_seq_len_ptr[request];
+        effective_seq_len = raw_effective < 0
+                                ? 0
+                                : (raw_effective > request_seq_len
+                                       ? request_seq_len
+                                       : raw_effective);
     }
 
     // =====================================================================
@@ -373,11 +450,12 @@ void rocm_gdn_chunk_forward_kernel(
         sc24=sc25=sc26=sc27=sc28=sc29=sc30=sc31=0.0f;
     }
 
-    for (int t = 0; t < seq_len; t++) {
-        const float *q_src = Q + t * qk_stride + h * d_k;
-        const float *k_src = K + t * qk_stride + h * d_k;
-        const float *v_src = V + t * v_stride + h * d_v;
-        float *o_dst = output + t * v_stride + h * d_v;
+    for (int t = 0; t < request_seq_len; t++) {
+        const int row = request_row_base + t;
+        const float *q_src = Q + row * qk_stride + h * d_k;
+        const float *k_src = K + row * qk_stride + h * d_k;
+        const float *v_src = V + row * v_stride + h * d_v;
+        float *o_dst = output + row * v_stride + h * d_v;
 
         if (t >= effective_seq_len) {
             if (vi < d_v && split_id == 0)
@@ -439,10 +517,10 @@ void rocm_gdn_chunk_forward_kernel(
         // Gate and beta
         float decay, beta_h;
         if (tid == 0) {
-            float x = alpha[t * n_heads + h] + dt_bias_h;
+            float x = alpha[row * n_heads + h] + dt_bias_h;
             float sp = (x > 20.0f) ? x : log1pf(expf(x));
             warp_sums[0] = expf(A_log_h * sp);
-            warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
+            warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[row * n_heads + h]));
         }
         __syncthreads();
         decay = warp_sums[0];
@@ -548,10 +626,10 @@ void rocm_gdn_chunk_forward_kernel(
                 out_vi += reduce_out[col_in_block + s * cols_per_block];
             o_dst[vi] = out_vi;
         }
-        if (state_snapshots && t < max_snapshot_rows && vi < d_v) {
+        if (state_snapshots && row < max_snapshot_rows && vi < d_v) {
             float *snapshot =
                 state_snapshots +
-                (size_t)t * snapshot_stride_floats +
+                (size_t)row * snapshot_stride_floats +
                 (size_t)h * d_k * d_v;
             snapshot[(j_start +  0) * d_v + vi] = sc0;
             snapshot[(j_start +  1) * d_v + vi] = sc1;
@@ -852,6 +930,245 @@ __global__ void rocm_short_conv1d_state_update_kernel(
     }
 }
 
+/**
+ * @brief Grouped short-conv for tiny request-local row groups.
+ *
+ * A lane owns one `(request, channel)` pair for the complete row group. This
+ * preserves serial decode's causal accumulation order, zeroes padding, writes
+ * request-indexed snapshots, and commits one request-owned live state in a
+ * single HIP launch.
+ */
+__global__ void rocm_short_conv1d_batched_small_m_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    const float *__restrict__ bias,
+    float *__restrict__ output,
+    float *__restrict__ request_states,
+    const int *__restrict__ request_seq_lens,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int request_count,
+    int request_seq_len,
+    int channels,
+    int kernel_size,
+    bool apply_silu)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    const int request = blockIdx.y;
+    if (ch >= channels || request >= request_count)
+        return;
+
+    const int ks_minus1 = kernel_size - 1;
+    if (ks_minus1 <= 0)
+        return;
+
+    const int raw_real_len = request_seq_lens[request];
+    const int real_len =
+        raw_real_len < 0 ? 0 :
+        (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+    const size_t row_base =
+        static_cast<size_t>(request) *
+        static_cast<size_t>(request_seq_len);
+    const size_t element_base = row_base * static_cast<size_t>(channels);
+    const size_t state_base =
+        static_cast<size_t>(request) *
+        static_cast<size_t>(channels) *
+        static_cast<size_t>(ks_minus1);
+    float *channel_state =
+        request_states + state_base +
+        static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+    const float *channel_weight =
+        weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
+
+    for (int t = 0; t < request_seq_len; ++t)
+    {
+        float sum = 0.0f;
+        if (t < real_len)
+        {
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                const int src_t = t - ks_minus1 + k;
+                const float value =
+                    src_t >= 0
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_state[ks_minus1 + src_t];
+                sum += value * channel_weight[k];
+            }
+            if (bias)
+                sum += bias[ch];
+            if (apply_silu)
+                sum = sum / (1.0f + expf(-sum));
+        }
+        output[element_base + static_cast<size_t>(t) * channels + ch] = sum;
+
+        const int snapshot_row = request * request_seq_len + t;
+        if (state_snapshots &&
+            t < real_len &&
+            snapshot_row < max_snapshot_rows)
+        {
+            float *snapshot =
+                state_snapshots +
+                static_cast<size_t>(snapshot_row) *
+                    static_cast<size_t>(snapshot_stride_floats) +
+                static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = t - ks_minus1 + 1 + state_idx;
+                snapshot[state_idx] =
+                    src_t >= 0
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_state[ks_minus1 + src_t];
+            }
+        }
+    }
+
+    for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+    {
+        const int src_t = real_len - ks_minus1 + state_idx;
+        channel_state[state_idx] =
+            src_t >= 0 && src_t < real_len
+                ? input[element_base +
+                        static_cast<size_t>(src_t) * channels + ch]
+                : channel_state[ks_minus1 + src_t];
+    }
+}
+
+/**
+ * @brief Grouped long-prefill convolution over flattened request rows.
+ *
+ * Threads cover `(request, row, channel)` directly. Causal indexing is always
+ * request-relative, and the companion commit kernel publishes terminal state
+ * only after every output thread has finished reading the initial state bank.
+ */
+__global__ void rocm_short_conv1d_batched_prefill_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    const float *__restrict__ bias,
+    float *__restrict__ output,
+    const float *__restrict__ request_states,
+    const int *__restrict__ request_seq_lens,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int request_count,
+    int request_seq_len,
+    int channels,
+    int kernel_size,
+    bool apply_silu)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int request_elements = request_seq_len * channels;
+    const int total = request_count * request_elements;
+    if (idx >= total)
+        return;
+
+    const int request = idx / request_elements;
+    const int request_element = idx - request * request_elements;
+    const int t = request_element / channels;
+    const int ch = request_element - t * channels;
+    const int ks_minus1 = kernel_size - 1;
+    const int raw_real_len = request_seq_lens[request];
+    const int real_len =
+        raw_real_len < 0 ? 0 :
+        (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+    const size_t row_base =
+        static_cast<size_t>(request) *
+        static_cast<size_t>(request_seq_len);
+    const size_t element_base = row_base * static_cast<size_t>(channels);
+    const float *channel_state =
+        request_states +
+        static_cast<size_t>(request) * channels * ks_minus1 +
+        static_cast<size_t>(ch) * ks_minus1;
+
+    float sum = 0.0f;
+    if (t < real_len)
+    {
+        for (int k = 0; k < kernel_size; ++k)
+        {
+            const int src_t = t - ks_minus1 + k;
+            const float value =
+                src_t >= 0
+                    ? input[element_base +
+                            static_cast<size_t>(src_t) * channels + ch]
+                    : channel_state[ks_minus1 + src_t];
+            sum += value * weight[ch * kernel_size + k];
+        }
+        if (bias)
+            sum += bias[ch];
+        if (apply_silu)
+            sum = sum / (1.0f + expf(-sum));
+    }
+    output[element_base + static_cast<size_t>(t) * channels + ch] = sum;
+
+    const int snapshot_row = request * request_seq_len + t;
+    if (state_snapshots &&
+        t < real_len &&
+        snapshot_row < max_snapshot_rows)
+    {
+        float *snapshot =
+            state_snapshots +
+            static_cast<size_t>(snapshot_row) *
+                static_cast<size_t>(snapshot_stride_floats) +
+            static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        {
+            const int src_t = t - ks_minus1 + 1 + state_idx;
+            snapshot[state_idx] =
+                src_t >= 0
+                    ? input[element_base +
+                            static_cast<size_t>(src_t) * channels + ch]
+                    : channel_state[ks_minus1 + src_t];
+        }
+    }
+}
+
+/** @brief Commit each request's terminal real-row convolution state. */
+__global__ void rocm_short_conv1d_batched_state_update_kernel(
+    const float *__restrict__ input,
+    float *__restrict__ request_states,
+    const int *__restrict__ request_seq_lens,
+    int request_count,
+    int request_seq_len,
+    int channels,
+    int kernel_size)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = request_count * channels;
+    if (idx >= total)
+        return;
+
+    const int request = idx / channels;
+    const int ch = idx - request * channels;
+    const int ks_minus1 = kernel_size - 1;
+    if (ks_minus1 <= 0)
+        return;
+    const int raw_real_len = request_seq_lens[request];
+    const int real_len =
+        raw_real_len < 0 ? 0 :
+        (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+    const size_t element_base =
+        static_cast<size_t>(request) *
+        static_cast<size_t>(request_seq_len) *
+        static_cast<size_t>(channels);
+    float *channel_state =
+        request_states +
+        static_cast<size_t>(request) * channels * ks_minus1 +
+        static_cast<size_t>(ch) * ks_minus1;
+
+    for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+    {
+        const int src_t = real_len - ks_minus1 + state_idx;
+        channel_state[state_idx] =
+            src_t >= 0 && src_t < real_len
+                ? input[element_base +
+                        static_cast<size_t>(src_t) * channels + ch]
+                : channel_state[ks_minus1 + src_t];
+    }
+}
+
 // =========================================================================
 // GatedRMSNorm Kernel — Cooperative (one block per normalization group)
 //
@@ -1066,6 +1383,7 @@ __global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
     const int *__restrict__ row_indices,
     int request_count,
     int row_index_stride,
+    int request_row_width,
     int rows,
     int state_size)
 {
@@ -1084,7 +1402,11 @@ __global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
     {
         const int request = linear / state_size;
         const int state_offset = linear - request * state_size;
-        const int row = row_indices[request * row_index_stride];
+        const int metadata_value = row_indices[request * row_index_stride];
+        const int row =
+            request_row_width > 0
+                ? request * request_row_width + metadata_value - 1
+                : metadata_value;
         if (row < 0 || row >= rows)
             continue;
         dst[linear] =
@@ -1339,6 +1661,7 @@ bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
         device_row_indices,
         request_count,
         row_index_stride,
+        /*request_row_width=*/0,
         rows,
         state_size);
     hipError_t err = hipGetLastError();
@@ -1347,6 +1670,54 @@ bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
         fprintf(stderr,
                 "[rocmGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
                 hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+    float *dst,
+    const float *capture,
+    const int *device_request_seq_lens,
+    int request_count,
+    int request_row_width,
+    int rows,
+    int state_size,
+    int device_idx,
+    void *stream)
+{
+    if (!dst || !capture || !device_request_seq_lens ||
+        request_count <= 0 || request_row_width <= 0 ||
+        rows < request_count * request_row_width ||
+        state_size <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = ((request_count * state_size) + threads - 1) / threads;
+    blocks = std::max(1, std::min(blocks, 1024));
+    hipLaunchKernelGGL(
+        rocm_gdn_copy_capture_rows_from_device_indices_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        static_cast<hipStream_t>(stream),
+        dst,
+        capture,
+        device_request_seq_lens,
+        request_count,
+        /*row_index_stride=*/1,
+        request_row_width,
+        rows,
+        state_size);
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_gpu_copy_capture_terminal_rows_from_device_lengths] %s\n",
+                hipGetErrorString(error));
         return false;
     }
     return true;
@@ -1597,9 +1968,13 @@ bool rocmGDN_recurrent_step(
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         q, k, v, alpha, beta_raw, A_log, dt_bias,
         output, state,
+        /*request_count=*/1, /*request_seq_len=*/1,
         n_heads, d_k, d_v, use_qk_l2norm,
         nullptr,
-        -1);
+        -1,
+        /*state_snapshots=*/nullptr,
+        /*snapshot_stride_floats=*/0,
+        /*max_snapshot_rows=*/0);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
@@ -1640,9 +2015,13 @@ bool rocmGDN_recurrent_step_effective_row(
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         q, k, v, alpha, beta_raw, A_log, dt_bias,
         output, state,
+        /*request_count=*/1, /*request_seq_len=*/1,
         n_heads, d_k, d_v, use_qk_l2norm,
         device_effective_seq_len,
-        row_idx);
+        row_idx,
+        /*state_snapshots=*/nullptr,
+        /*snapshot_stride_floats=*/0,
+        /*max_snapshot_rows=*/0);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
@@ -1655,6 +2034,153 @@ bool rocmGDN_recurrent_step_effective_row(
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmGDN_recurrent_step_effective_row_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmGDN_chunk_forward_batched_kernel_route(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int request_count, int request_seq_len,
+    int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    const int *device_effective_seq_len,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+        !output || !state || !stream ||
+        seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+        seq_len != request_count * request_seq_len ||
+        n_heads <= 0 || d_k <= 0 || d_v <= 0)
+    {
+        return false;
+    }
+
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
+    {
+        print_pointer_attrs("Q", Q);
+        print_pointer_attrs("K", K);
+        print_pointer_attrs("V", V);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+    }
+
+    /*
+     * Tiny verifier groups, small padded request matrices, and one-row
+     * continuation share the scalar recurrence kernel through width eight.
+     * Grid X flattens `(request, head)` and each block advances M rows in order.
+     * This preserves the exact wavefront reduction and state-update schedule
+     * while retaining one economical launch for the request matrix.
+     */
+    if (request_seq_len <= 8)
+    {
+        if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
+        {
+            fprintf(
+                stderr,
+                "[rocmGDN_recurrent_step_batched] requests=%d heads=%d d_k=%d d_v=%d state=%p output=%p lengths=%p\n",
+                request_count,
+                n_heads,
+                d_k,
+                d_v,
+                static_cast<void *>(state),
+                static_cast<void *>(output),
+                static_cast<const void *>(device_effective_seq_len));
+        }
+        constexpr int col_threads = 256;
+        constexpr int row_split = 4;
+        const int cols_per_block = col_threads / row_split;
+        const int num_col_blocks =
+            (d_v + cols_per_block - 1) / cols_per_block;
+        const int smem_size =
+            (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
+
+        hipLaunchKernelGGL(
+            rocm_gdn_recurrent_step_kernel,
+            dim3(request_count * n_heads, num_col_blocks),
+            dim3(col_threads),
+            smem_size,
+            static_cast<hipStream_t>(stream),
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, state,
+            request_count, request_seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            device_effective_seq_len,
+            /*effective_row_idx=*/0,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGDN_recurrent_step_batched] %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+        if (llaminar2::debugEnv().rocm.gdn_sync)
+        {
+            err = hipStreamSynchronize(static_cast<hipStream_t>(stream));
+            if (err != hipSuccess)
+            {
+                fprintf(stderr,
+                        "[rocmGDN_recurrent_step_batched_sync] %s\n",
+                        hipGetErrorString(err));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
+    // 4 wavefronts/block — matches CUDA's ROW_SPLIT=4 to reduce per-step
+    // reduction error that compounds through the GDN recurrence.
+    int col_threads = 256;
+    int cols_per_block = col_threads / 4; // 64 columns per block
+    if (d_v <= 64)
+    {
+        col_threads = 128;
+        cols_per_block = col_threads / 4; // 32 columns per block
+    }
+    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
+    int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+
+    hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
+        dim3(n_heads, num_col_blocks, request_count), dim3(col_threads), smem_size, (hipStream_t)stream,
+        Q, K, V, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        device_effective_seq_len,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
+        request_count, request_seq_len,
+        n_heads, d_k, d_v, use_qk_l2norm);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "[rocmGDN_chunk_forward] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_chunk_forward_sync] %s\n", hipGetErrorString(err));
             return false;
         }
     }
@@ -1674,60 +2200,16 @@ bool rocmGDN_chunk_forward_kernel_route(
     const int *device_effective_seq_len,
     int device_idx, void *stream)
 {
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-
-    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
-    {
-        print_pointer_attrs("Q", Q);
-        print_pointer_attrs("K", K);
-        print_pointer_attrs("V", V);
-        print_pointer_attrs("alpha", alpha);
-        print_pointer_attrs("beta", beta_raw);
-        print_pointer_attrs("A_log", A_log);
-        print_pointer_attrs("dt_bias", dt_bias);
-        print_pointer_attrs("output", output);
-        print_pointer_attrs("state", state);
-    }
-
-    // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
-    // 4 wavefronts/block — matches CUDA's ROW_SPLIT=4 to reduce per-step
-    // reduction error that compounds through the GDN recurrence.
-    int col_threads = 256;
-    int cols_per_block = col_threads / 4; // 64 columns per block
-    if (d_v <= 64)
-    {
-        col_threads = 128;
-        cols_per_block = col_threads / 4; // 32 columns per block
-    }
-    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-    // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
-    int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
-
-    hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
-        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
+    return rocmGDN_chunk_forward_batched_kernel_route(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
-        device_effective_seq_len,
+        seq_len, /*request_count=*/1, /*request_seq_len=*/seq_len,
+        n_heads, d_k, d_v, use_qk_l2norm,
         state_snapshots,
         snapshot_stride_floats,
         max_snapshot_rows,
-        seq_len, n_heads, d_k, d_v, use_qk_l2norm);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        fprintf(stderr, "[rocmGDN_chunk_forward] %s\n", hipGetErrorString(err));
-        return false;
-    }
-    if (llaminar2::debugEnv().rocm.gdn_sync)
-    {
-        err = hipStreamSynchronize((hipStream_t)stream);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmGDN_chunk_forward_sync] %s\n", hipGetErrorString(err));
-            return false;
-        }
-    }
-    return true;
+        device_effective_seq_len,
+        device_idx, stream);
 }
 
 bool rocmGDN_chunk_forward(
@@ -1814,6 +2296,41 @@ bool rocmGDN_chunk_forward_effective(
         }
     }
     return true;
+}
+
+/**
+ * @brief Launch one request-grouped HIP recurrence over padded rows.
+ *
+ * Request identity is encoded in grid Z. Every request therefore advances its
+ * own state bank inside the same launch while reading its real row count from
+ * device memory; no host request loop participates in graph replay.
+ */
+bool rocmGDN_chunk_forward_batched_effective(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int request_count, int request_seq_len,
+    int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    const int *device_effective_seq_lens,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    if (!device_effective_seq_lens)
+        return false;
+    return rocmGDN_chunk_forward_batched_kernel_route(
+        Q, K, V, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        seq_len, request_count, request_seq_len,
+        n_heads, d_k, d_v, use_qk_l2norm,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
+        device_effective_seq_lens,
+        device_idx, stream);
 }
 
 bool rocmGDN_short_conv1d(
@@ -1926,6 +2443,89 @@ bool rocmGDN_short_conv1d_effective(
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "[rocmGDN_short_conv1d_effective] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Launch native grouped request-batched short convolution on HIP.
+ *
+ * Tiny groups use one request-by-channel launch. Longer prefill uses one
+ * flattened output launch and one grouped terminal-state commit, preserving
+ * the production scalar arithmetic while avoiding a host request loop.
+ */
+bool rocmGDN_short_conv1d_batched(
+    const float *input, const float *weight, const float *bias,
+    float *output, float *request_states,
+    int request_count, int request_seq_len,
+    int channels, int kernel_size,
+    bool apply_silu,
+    const int *device_request_seq_lens,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    if (!input || !weight || !output || !request_states ||
+        !device_request_seq_lens || !stream ||
+        request_count <= 0 || request_seq_len <= 0 ||
+        channels <= 0 || kernel_size <= 1)
+    {
+        return false;
+    }
+
+    constexpr int threads = 256;
+    if (request_seq_len <= 4)
+    {
+        const int channel_blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(
+            rocm_short_conv1d_batched_small_m_kernel,
+            dim3(channel_blocks, request_count),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            input, weight, bias, output, request_states,
+            device_request_seq_lens,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            request_count, request_seq_len,
+            channels, kernel_size, apply_silu);
+    }
+    else
+    {
+        const int output_elements = request_count * request_seq_len * channels;
+        const int output_blocks = (output_elements + threads - 1) / threads;
+        hipLaunchKernelGGL(
+            rocm_short_conv1d_batched_prefill_kernel,
+            dim3(output_blocks),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            input, weight, bias, output, request_states,
+            device_request_seq_lens,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            request_count, request_seq_len,
+            channels, kernel_size, apply_silu);
+
+        const int state_elements = request_count * channels;
+        const int state_blocks = (state_elements + threads - 1) / threads;
+        hipLaunchKernelGGL(
+            rocm_short_conv1d_batched_state_update_kernel,
+            dim3(state_blocks),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            input, request_states, device_request_seq_lens,
+            request_count, request_seq_len, channels, kernel_size);
+    }
+
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_short_conv1d_batched] %s\n",
+                hipGetErrorString(error));
         return false;
     }
     return true;

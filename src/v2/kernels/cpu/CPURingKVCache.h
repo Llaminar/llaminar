@@ -324,7 +324,6 @@ namespace llaminar2
         void clear_layer(int layer) override;
 
         /** @brief Advance ring metadata after an externally managed append/replay. */
-        void advanceHead(int layer, int seq_idx, int num_tokens) override;
 
         /// Bring in ICPUKVCache::clear_sequence(seq_idx) which clears across all layers.
         using ICPUKVCache::clear_sequence;

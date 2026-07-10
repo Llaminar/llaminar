@@ -209,6 +209,7 @@ namespace
             params.batch_size = 1;
             params.seq_len = 2;
             params.kv_len = kv_cache.cached_tokens;
+            params.position_offset = kv_cache.cached_tokens;
             params.n_heads = 16;
             params.n_kv_heads = 2;
             params.head_dim = 256;
@@ -259,6 +260,7 @@ namespace
             params.batch_size = 1;
             params.seq_len = 2;
             params.kv_len = kv_cache.cached_tokens;
+            params.position_offset = kv_cache.cached_tokens;
             params.n_heads = 16;
             params.n_kv_heads = 2;
             params.head_dim = 256;
@@ -311,6 +313,7 @@ namespace
             params.batch_size = 1;
             params.seq_len = 2;
             params.kv_len = kv_cache.cached_tokens;
+            params.position_offset = kv_cache.cached_tokens;
             params.n_heads = 16;
             params.n_kv_heads = 2;
             params.head_dim = 256;

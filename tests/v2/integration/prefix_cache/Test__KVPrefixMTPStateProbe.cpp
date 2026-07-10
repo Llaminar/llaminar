@@ -31,12 +31,15 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
 #include <initializer_list>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -50,6 +53,225 @@ using namespace llaminar2::test;
 namespace
 {
     constexpr const char *kDenseModelPath = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+    /**
+     * @brief Host materialization of one graph-stage diagnostic snapshot.
+     *
+     * Production GPU execution remains device-owned.  The integration-only
+     * snapshot callback records point-in-time D2D copies inside graph capture
+     * and materializes those copies after execution, so this diagnostic cannot
+     * alter the ownership or ordering contract of the tensors being tested.
+     */
+    struct RequestBatchStageSnapshot
+    {
+        std::vector<float> data;  ///< Immutable post-execution stage contents.
+    };
+
+    /**
+     * @brief Return semantic Qwen3.6 snapshot keys in forward execution order.
+     *
+     * The filter intentionally names every dense attention, GDN, and FFN
+     * intermediate that SnapshotCapture can publish.  A model layer only emits
+     * keys for its actual implementation, so one exhaustive list covers both
+     * full-attention and GDN layers without teaching this regression the model's
+     * layer schedule.  Generating more layer names than the loaded model owns is
+     * harmless because the graph's snapshot-stage filter simply never matches
+     * them.
+     */
+    std::vector<std::string> requestBatchPrefillSnapshotKeys()
+    {
+        static const std::vector<std::string> kLayerStageOrder = {
+            "ATTENTION_NORM",
+            "QKV_PROJECTION",
+            "GDN_Z_PROJECTION",
+            "GDN_ALPHA",
+            "GDN_BETA",
+            "GDN_CONV1D_OUTPUT",
+            "GDN_DELTA_RULE_OUTPUT",
+            "GDN_NORM_GATE_OUTPUT",
+            "Q_PROJECTION",
+            "K_PROJECTION",
+            "V_PROJECTION",
+            "Q_NORM",
+            "K_NORM",
+            "Q_ROPE",
+            "K_ROPE",
+            "FA_GATE",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_CONTEXT_GATED",
+            "ATTENTION_OUTPUT",
+            "ATTENTION_RESIDUAL",
+            "FFN_NORM",
+            "FFN_GATE",
+            "FFN_UP",
+            "FFN_SWIGLU",
+            "FFN_DOWN",
+            "FFN_RESIDUAL",
+        };
+
+        constexpr int kMaximumDiagnosticLayers = 128;
+        std::vector<std::string> keys;
+        keys.reserve(
+            3 + static_cast<size_t>(kMaximumDiagnosticLayers) *
+                    kLayerStageOrder.size());
+        keys.push_back("EMBEDDING");
+        for (int layer = 0; layer < kMaximumDiagnosticLayers; ++layer)
+        {
+            const std::string prefix = "layer" + std::to_string(layer) + "_";
+            for (const std::string &stage : kLayerStageOrder)
+                keys.push_back(prefix + stage);
+        }
+        keys.push_back("FINAL_NORM");
+        keys.push_back("LM_HEAD");
+        return keys;
+    }
+
+    /**
+     * @brief Copy all valid snapshots currently published by a runner.
+     *
+     * Keeping a private copy is important because clearSnapshots() reuses the
+     * runner for the batched pass.  The public orchestration API intentionally
+     * exposes a flat FP32 semantic view; the comparison helper below infers its
+     * row geometry from the isolated and request-batched execution contracts.
+     */
+    std::map<std::string, RequestBatchStageSnapshot> captureRequestBatchSnapshots(
+        const IOrchestrationRunner &runner)
+    {
+        std::map<std::string, RequestBatchStageSnapshot> snapshots;
+        for (const std::string &key : runner.getSnapshotKeys())
+        {
+            size_t size = 0;
+            const float *data = runner.getSnapshot(key, size);
+            if (!data || size == 0)
+                continue;
+
+            RequestBatchStageSnapshot snapshot;
+            snapshot.data.assign(data, data + size);
+            snapshots.emplace(key, std::move(snapshot));
+        }
+        return snapshots;
+    }
+
+    /**
+     * @brief Compare one unequal-length request against its isolated prefill.
+     *
+     * Full-row stages use the scalar and flattened-batch terminal row indices.
+     * Compact LM-head-style stages instead expose one row per request, so their
+     * isolated row zero is compared with the selected request row.  The first
+     * mismatch is returned in graph order with exact IEEE-754 bit patterns; this
+     * makes the regression identify the responsible grouped operation instead
+     * of merely reporting a later sampled-token difference.
+     */
+    ::testing::AssertionResult requestBatchTerminalRowsByteIdentical(
+        const std::map<std::string, RequestBatchStageSnapshot> &scalar,
+        const std::map<std::string, RequestBatchStageSnapshot> &batched,
+        const std::vector<std::string> &ordered_keys,
+        size_t scalar_total_rows,
+        size_t batch_total_rows,
+        size_t scalar_terminal_row,
+        size_t batch_terminal_row,
+        size_t request_index,
+        size_t request_count,
+        const std::string &label)
+    {
+        size_t comparable = 0;
+        for (const std::string &key : ordered_keys)
+        {
+            const auto scalar_it = scalar.find(key);
+            const auto batch_it = batched.find(key);
+            if (scalar_it == scalar.end() || batch_it == batched.end())
+                continue;
+
+            const RequestBatchStageSnapshot &one = scalar_it->second;
+            const RequestBatchStageSnapshot &many = batch_it->second;
+
+            size_t one_row = scalar_terminal_row;
+            size_t many_row = batch_terminal_row;
+            size_t one_rows = 0;
+            size_t many_rows = 0;
+            size_t cols = 0;
+            if (scalar_total_rows > 0 && batch_total_rows > 0 &&
+                one.data.size() % scalar_total_rows == 0 &&
+                many.data.size() % batch_total_rows == 0 &&
+                one.data.size() / scalar_total_rows ==
+                    many.data.size() / batch_total_rows)
+            {
+                one_rows = scalar_total_rows;
+                many_rows = batch_total_rows;
+                cols = one.data.size() / one_rows;
+            }
+            else if (many.data.size() == one.data.size() * request_count)
+            {
+                one_rows = 1;
+                many_rows = request_count;
+                cols = one.data.size();
+                one_row = 0;
+                many_row = request_index;
+            }
+            else
+            {
+                continue;
+            }
+            if (one_row >= one_rows || many_row >= many_rows || cols == 0)
+                continue;
+
+            ++comparable;
+            const size_t one_offset = one_row * cols;
+            const size_t many_offset = many_row * cols;
+            size_t mismatch_count = 0;
+            size_t first_col = 0;
+            uint32_t scalar_bits = 0;
+            uint32_t batch_bits = 0;
+            float scalar_value = 0.0f;
+            float batch_value = 0.0f;
+            float max_abs = 0.0f;
+            for (size_t col = 0; col < cols; ++col)
+            {
+                const float expected = one.data[one_offset + col];
+                const float actual = many.data[many_offset + col];
+                uint32_t expected_bits = 0;
+                uint32_t actual_bits = 0;
+                std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+                std::memcpy(&actual_bits, &actual, sizeof(actual_bits));
+                if (expected_bits == actual_bits)
+                    continue;
+
+                if (mismatch_count == 0)
+                {
+                    first_col = col;
+                    scalar_bits = expected_bits;
+                    batch_bits = actual_bits;
+                    scalar_value = expected;
+                    batch_value = actual;
+                }
+                ++mismatch_count;
+                max_abs = std::max(max_abs, std::fabs(actual - expected));
+            }
+
+            if (mismatch_count > 0)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " first divergent grouped stage " << key
+                       << " after " << comparable << " comparable stages: "
+                       << mismatch_count << "/" << cols
+                       << " values differ; first_col=" << first_col
+                       << " batch=" << batch_value
+                       << " scalar=" << scalar_value
+                       << " batch_bits=0x" << std::hex << batch_bits
+                       << " scalar_bits=0x" << scalar_bits << std::dec
+                       << " max_abs=" << max_abs
+                       << " scalar_shape=[" << one_rows << "," << cols << "]"
+                       << " batch_shape=[" << many_rows << "," << cols << "]";
+            }
+        }
+
+        if (comparable == 0)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " captured no comparable scalar/batched stage rows";
+        }
+        return ::testing::AssertionSuccess();
+    }
 
     class ScopedDebugEnv
     {
@@ -324,6 +546,35 @@ namespace
     }
 
     /**
+     * @brief Sum a counter across tag partitions for one exact domain and phase.
+     *
+     * Production ownership counters intentionally live beside the operation
+     * they describe. Request admission is an `mtp/prefill` event, while grouped
+     * terminal-state commits are `forward_graph/prefill` events. Keeping domain
+     * and phase explicit prevents a decode-only helper from silently reporting
+     * zero for a path that did execute.
+     */
+    double perfCounterValue(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &domain,
+        const std::string &name,
+        const std::string &phase)
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Counter &&
+                record.domain == domain &&
+                record.name == name &&
+                record.phase == phase)
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    }
+
+    /**
      * @brief Sum a decode graph lifecycle counter by execution context.
      *
      * Phase 6 MTP graph capture relies on named forward-graph contexts
@@ -400,21 +651,22 @@ namespace
     /**
      * @brief Identify which verifier contract executed for the current MTP run.
      *
-     * Phase 9.7 keeps direct all-position state publication fail-closed until a
-     * backend/model lane proves every verifier row against serial decode.  The
-     * supported migration lane is the shared decode-equivalent verifier, for
-     * both greedy and stochastic sampling. That lane must still use graph-
+     * Direct all-position state publication stays fail-closed until a
+     * backend/model lane proves the stronger continuation contract.  The
+     * baseline production lane is grouped decode-equivalent verification, for
+     * both greedy and stochastic sampling.  That lane must still use graph-
      * captured main decode and catch-up contexts. This helper lets probes assert
-     * the active contract instead of baking in the older all-position-only
-     * expectation.
+     * the active contract instead of baking in an all-position-only expectation.
      */
     MTPVerifierGraphPath mtpVerifierGraphPath(
         const std::vector<PerfStatRecord> &records)
     {
         if (mtpCounterValue(records, "all_position_state_publication_verifier_runs") >= 1.0)
             return MTPVerifierGraphPath::AllPositionStatePublication;
-        if (mtpCounterValue(records, "decode_equivalent_stochastic_verifier_runs") >= 1.0 ||
-            mtpCounterValue(records, "decode_equivalent_sequential_verifier_runs") >= 1.0)
+        if (mtpCounterValue(records, "grouped_decode_equivalent_greedy_verifier_runs") >= 1.0 ||
+            mtpCounterValue(records, "grouped_decode_equivalent_stochastic_verifier_runs") >= 1.0 ||
+            mtpCounterValue(records, "grouped_outcome_device_resident_publication_uses") >= 1.0 ||
+            mtpCounterValue(records, "grouped_outcome_host_publication_uses") >= 1.0)
             return MTPVerifierGraphPath::DecodeEquivalent;
         return MTPVerifierGraphPath::None;
     }
@@ -1511,15 +1763,15 @@ namespace
             EXPECT_GE(counter("all_position_state_publication_verifier_runs"), 1.0)
                 << backend_name << " stochastic MTP must publish accepted verifier rows "
                 << "through all-position state publication when that capability is advertised";
-            EXPECT_EQ(counter("decode_equivalent_stochastic_verifier_runs"), 0.0)
+            EXPECT_EQ(counter("grouped_decode_equivalent_stochastic_verifier_runs"), 0.0)
                 << backend_name << " all-position stochastic MTP must not also "
-                << "run the decode-equivalent verifier";
+                << "run the grouped decode-equivalent verifier";
         }
         else
         {
-            EXPECT_GE(counter("decode_equivalent_stochastic_verifier_runs"), 1.0)
-                << backend_name << " Phase 9.7 stochastic MTP should use the "
-                << "shared decode-equivalent verifier while direct all-position "
+            EXPECT_GE(counter("grouped_decode_equivalent_stochastic_verifier_runs"), 1.0)
+                << backend_name << " stochastic MTP should use grouped "
+                << "decode-equivalent verification while direct all-position "
                 << "publication remains fail-closed";
             EXPECT_EQ(counter("all_position_state_publication_verifier_runs"), 0.0)
                 << backend_name << " decode-equivalent stochastic MTP must not "
@@ -1588,6 +1840,221 @@ namespace
             << backend_name << " stochastic MTP must not build verifier distributions from host full logits";
         EXPECT_EQ(counter("phase138_stochastic_spec_decode_runs"), 0.0)
             << backend_name << " stochastic MTP must not use the retired accepted-count-only fallback";
+    }
+
+    /**
+     * @brief Prove request-batched stochastic prefill is position-owned on GPU.
+     *
+     * This regression deliberately uses two prefixes with unequal lengths. A
+     * row-indexing bug, stale host length, or batch-index-keyed RNG draw therefore
+     * changes at least one first token. Scalar one-request generation supplies the
+     * production decode oracle; the request-batched path must return the same token
+     * for each request and must report every device-resident ownership transition.
+     *
+     * Only the immutable prompt-length row crosses H2D during admission. Compact
+     * terminal logits, position-keyed threshold derivation, sampled token slots,
+     * and first mailbox publication remain on one explicitly ordered GPU stream.
+     */
+    void runQwen36MTPGpuRequestBatchResidentPrefill(
+        GlobalDeviceAddress device,
+        const std::string &backend_name)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_request_batch_prefill_stats.json"},
+            {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
+        });
+
+        const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+        if (!env_model)
+            env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+        const std::string model_path =
+            env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << "Qwen3.6 dense request-batch model not found: "
+                         << model_path;
+        }
+
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = 128;
+        config.batch_size = 2;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = device;
+        config.kv_cache_precision = "auto";
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+        config.mtp.max_request_batch = 2;
+        config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        ASSERT_TRUE(runner->supportsPrefillBatch(/*request_batch=*/2));
+
+        auto tokenizer = runner->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int32_t> long_prompt =
+            buildDeterministicPromptTokens(*tokenizer, /*requested_tokens=*/16);
+        ASSERT_EQ(long_prompt.size(), 16u);
+        const std::vector<int32_t> short_prompt(
+            long_prompt.begin(),
+            long_prompt.begin() + 11);
+
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.seed = 0x4D545031u;
+
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        auto run_batch_invariance_case = [&](const SamplingParams &params,
+                                             const char *sampling_mode)
+        {
+            SCOPED_TRACE(
+                backend_name + " request-batched prefill " + sampling_mode);
+
+            runner->clearCache();
+            runner->setSamplingParams(params);
+            ASSERT_TRUE(runner->prefill(long_prompt)) << runner->lastError();
+            runner->setDecodeStepTokenBudget(1);
+            const GenerationResult scalar_long = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(scalar_long.error.empty()) << scalar_long.error;
+            ASSERT_EQ(scalar_long.tokens.size(), 1u);
+
+            const bool capture_stage_diagnostics = params.temperature == 0.0f;
+            const std::vector<std::string> diagnostic_keys =
+                capture_stage_diagnostics
+                    ? requestBatchPrefillSnapshotKeys()
+                    : std::vector<std::string>{};
+            if (capture_stage_diagnostics)
+            {
+                runner->setSnapshotCaptureFilter(diagnostic_keys);
+                runner->enableSnapshotCapture();
+                runner->clearSnapshots();
+            }
+
+            runner->clearCache();
+            runner->setSamplingParams(params);
+            ASSERT_TRUE(runner->prefill(short_prompt)) << runner->lastError();
+            /*
+             * Copy the prefill snapshots before decodeStep() launches the MTP
+             * sidecar.  SnapshotCapture intentionally publishes bare aliases
+             * for sidecar stages, so waiting until after decode would replace
+             * the M=11 prefill rows with the subsequent M=1 draft rows.
+             */
+            const auto scalar_short_snapshots =
+                capture_stage_diagnostics
+                    ? captureRequestBatchSnapshots(*runner)
+                    : std::map<std::string, RequestBatchStageSnapshot>{};
+            runner->setDecodeStepTokenBudget(1);
+            const GenerationResult scalar_short = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(scalar_short.error.empty()) << scalar_short.error;
+            ASSERT_EQ(scalar_short.tokens.size(), 1u);
+
+            runner->clearCache();
+            if (capture_stage_diagnostics)
+                runner->clearSnapshots();
+            runner->setSamplingParams(params);
+            PerfStatsCollector::reset();
+            ASSERT_TRUE(runner->prefillBatch({long_prompt, short_prompt}))
+                << runner->lastError();
+            const auto batch_snapshots =
+                capture_stage_diagnostics
+                    ? captureRequestBatchSnapshots(*runner)
+                    : std::map<std::string, RequestBatchStageSnapshot>{};
+            ASSERT_TRUE(runner->supportsDecodeStepBatch(/*request_batch=*/2));
+            runner->setDecodeStepTokenBudget(1);
+            const GenerationBatchResult batched =
+                runner->decodeStepBatch(/*request_batch=*/2);
+            runner->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(batched.error.empty()) << batched.error;
+            ASSERT_EQ(batched.requests.size(), 2u);
+            ASSERT_EQ(batched.requests[0].tokens.size(), 1u);
+            ASSERT_EQ(batched.requests[1].tokens.size(), 1u);
+
+            if (capture_stage_diagnostics)
+            {
+                EXPECT_TRUE(requestBatchTerminalRowsByteIdentical(
+                    scalar_short_snapshots,
+                    batch_snapshots,
+                    diagnostic_keys,
+                    /*scalar_total_rows=*/short_prompt.size(),
+                    /*batch_total_rows=*/long_prompt.size() * 2,
+                    /*scalar_terminal_row=*/short_prompt.size() - 1,
+                    /*batch_terminal_row=*/long_prompt.size() + short_prompt.size() - 1,
+                    /*request_index=*/1,
+                    /*request_count=*/2,
+                    backend_name + " unequal-length request-batch prefill"));
+                runner->disableSnapshotCapture();
+            }
+
+            EXPECT_EQ(batched.requests[0].tokens[0], scalar_long.tokens[0])
+                << backend_name << " " << sampling_mode
+                << " request row zero must be batch-invariant against scalar decode; "
+                << "batch={" << batched.requests[0].tokens[0] << ","
+                << batched.requests[1].tokens[0] << "} scalar={"
+                << scalar_long.tokens[0] << "," << scalar_short.tokens[0] << "}";
+            EXPECT_EQ(batched.requests[1].tokens[0], scalar_short.tokens[0])
+                << backend_name << " " << sampling_mode
+                << " request row one must use its own resident logical position; "
+                << "batch={" << batched.requests[0].tokens[0] << ","
+                << batched.requests[1].tokens[0] << "} scalar={"
+                << scalar_long.tokens[0] << "," << scalar_short.tokens[0] << "}";
+        };
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        run_batch_invariance_case(greedy, "greedy");
+        run_batch_invariance_case(stochastic, "stochastic");
+
+        const auto records = PerfStatsCollector::snapshot({"mtp", "forward_graph"});
+        auto mtp_decode_counter = [&](const std::string &name)
+        {
+            return mtpCounterValue(records, name);
+        };
+        EXPECT_EQ(
+            perfCounterValue(
+                records,
+                "mtp",
+                "request_batch_prefill_device_position_admissions",
+                "prefill"),
+            2.0)
+            << backend_name << " must admit one device position per request";
+        EXPECT_EQ(
+            mtp_decode_counter("request_batch_prefill_resident_position_threshold_rows"),
+            2.0)
+            << backend_name << " must derive both first-token draws on device";
+        EXPECT_EQ(
+            mtp_decode_counter("request_batch_prefill_device_logical_state_publications"),
+            1.0)
+            << backend_name << " must publish one complete request-batch mailbox";
+        EXPECT_GE(mtp_decode_counter("device_resident_logical_state_mailboxes"), 1.0);
+        EXPECT_EQ(mtp_decode_counter("first_token_stochastic_samples"), 0.0)
+            << backend_name << " must not route batched GPU prefill through host logits";
+        EXPECT_GT(
+            perfCounterValue(
+                records,
+                "forward_graph",
+                "request_batched_terminal_state_direct_commits",
+                "prefill"),
+            0.0)
+            << backend_name
+            << " long padded prefill must commit GDN/short-conv request banks inside grouped kernels";
+
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+        runner->shutdown();
+        PerfStatsCollector::reset();
     }
 
     /**
@@ -2945,6 +3412,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
         "ROCm");
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRequestBatchResidentPrefill)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 request-batch prefill";
+    }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count());
+    runQwen36MTPGpuRequestBatchResidentPrefill(
+        GlobalDeviceAddress::rocm(rocm_ordinal),
+        "ROCm");
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepeatabilityLong)
 {
     auto &dm = DeviceManager::instance();
@@ -2997,6 +3480,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke
     ASSERT_LT(cuda_ordinal, dm.cuda_device_count())
         << "Selected CUDA device ordinal is outside the available device range";
     runQwen36MTPGpuGraphsStochasticRealModelSmoke(
+        GlobalDeviceAddress::cuda(cuda_ordinal),
+        "CUDA");
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPRequestBatchResidentPrefill)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No CUDA device available for Qwen3.6 request-batch prefill";
+    }
+    const int cuda_ordinal = qwen36CudaSingleDeviceOrdinal();
+    ASSERT_GE(cuda_ordinal, 0);
+    ASSERT_LT(cuda_ordinal, dm.cuda_device_count());
+    runQwen36MTPGpuRequestBatchResidentPrefill(
         GlobalDeviceAddress::cuda(cuda_ordinal),
         "CUDA");
 }
@@ -3126,6 +3625,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
         {"result", "miss"},
         {"seq_len", "1"},
         {"uses_device_position_ids", "false"},
+        {"uses_device_sequence_lengths", "false"},
         {"uses_device_token_ids", "false"},
     };
     const PerfStatsCollector::Tags hit_tags = {
@@ -3137,6 +3637,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
         {"result", "hit"},
         {"seq_len", "1"},
         {"uses_device_position_ids", "false"},
+        {"uses_device_sequence_lengths", "false"},
         {"uses_device_token_ids", "false"},
     };
     EXPECT_GE(findPerfCounterValue(records, "forward_graph", "forward_cache_lookup", "decode", miss_tags), 1.0);

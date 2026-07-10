@@ -20,6 +20,7 @@
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -77,6 +78,7 @@ namespace
         const char *label;
         WeightCreator create;
         float min_cosine;
+        TensorType tensor_type = TensorType::FP32;
     };
 
     /**
@@ -461,44 +463,11 @@ namespace
 
     std::vector<NativeFormatCase> nativeFormatCases()
     {
-        return {
-            {"Q4_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ4_0Random(shape, seed); }, 0.985f},
-            {"Q4_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ4_1Random(shape, seed); }, 0.985f},
-            {"Q5_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ5_0Random(shape, seed); }, 0.985f},
-            {"Q5_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ5_1Random(shape, seed); }, 0.985f},
-            {"Q6_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ6_KRandom(shape, seed); }, 0.985f},
-            {"Q3_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ3_KRandom(shape, seed); }, 0.985f},
-            {"Q2_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ2_KRandom(shape, seed); }, 0.985f},
-            {"Q4_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ4_KRandom(shape, seed); }, 0.985f},
-            {"Q5_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ5_KRandom(shape, seed); }, 0.985f},
-            {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }, 0.985f},
-            {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }, 0.985f},
-            {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ3_SRandom(shape, seed); }, 0.985f},
-            {"IQ3_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }, 0.985f},
-            {"IQ2_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }, 0.985f},
-            {"IQ2_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }, 0.985f},
-            {"IQ2_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }, 0.985f},
-            {"IQ1_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }, 0.985f},
-            {"IQ1_M", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }, 0.985f},
-        };
+        std::vector<NativeFormatCase> formats;
+        formats.reserve(quantizedVerifierFormats().size());
+        for (const auto &format : quantizedVerifierFormats())
+            formats.push_back({format.label, format.create, 0.985f, format.tensor_type});
+        return formats;
     }
 
     /**
@@ -1159,20 +1128,29 @@ namespace
             {static_cast<size_t>(N), static_cast<size_t>(K)},
             9898);
 
-        ROCmPackedWeights packed;
-        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-        expectPackedPath(packed, PackedPath::NativeVNNI);
+        /*
+         * Drive the same persistent GPU preparation pipeline used by model
+         * loading.  The old version of this helper used packWeightsToROCm(),
+         * which could prove a host-built descriptor while leaving device
+         * repack, publication metadata, and Q8 source-layout handling untested.
+         */
+        auto prepared = makeGpuPreparedGemm(
+            weights.get(),
+            DeviceId::rocm(0),
+            std::string("test.rocm.grouped_verifier.") + label,
+            ModelContextId{static_cast<uint64_t>(989800 + M)});
+        auto *kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(prepared.kernel);
+        ASSERT_NE(kernel, nullptr) << label << " production prepared ROCm kernel";
 
 #ifdef HAVE_ROCM
         hipStream_t stream = nullptr;
         ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 #endif
 
-        ROCmQuantisedGemmKernel kernel(&packed, 0);
 #ifdef HAVE_ROCM
-        kernel.setGPUStream(stream);
+        kernel->setGPUStream(stream);
 #endif
-        auto workspace = bindWorkspace(kernel, M, N, K);
+        auto workspace = bindWorkspace(*kernel, M, N, K);
         ASSERT_NE(workspace, nullptr);
 
         auto grouped_input = TestTensorFactory::createFP32Random(
@@ -1200,8 +1178,8 @@ namespace
          * the economical grouped kernel.
          */
         {
-            auto verifier_scope = kernel.beginVerifierDecodeEquivalentScope();
-            ASSERT_TRUE(kernel.multiply_tensor(grouped_input.get(), grouped_output.get(), M, N, K));
+            auto verifier_scope = kernel->beginVerifierDecodeEquivalentScope();
+            ASSERT_TRUE(kernel->multiply_tensor(grouped_input.get(), grouped_output.get(), M, N, K));
         }
 #ifdef HAVE_ROCM
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -1229,7 +1207,7 @@ namespace
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 #endif
 
-            ASSERT_TRUE(kernel.multiply_tensor(row_input.get(), row_output.get(), 1, N, K))
+            ASSERT_TRUE(kernel->multiply_tensor(row_input.get(), row_output.get(), 1, N, K))
                 << "serial row=" << row;
 #ifdef HAVE_ROCM
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -1263,10 +1241,10 @@ namespace
             static_cast<size_t>(N));
 
 #ifdef HAVE_ROCM
-        kernel.setGPUStream(nullptr);
+        kernel->setGPUStream(nullptr);
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
-        kernel.unbindWorkspace();
+        kernel->unbindWorkspace();
     }
 
     std::filesystem::path qwen36DenseModelPath()
@@ -1494,46 +1472,18 @@ namespace
      */
     std::vector<NativeFormatCase> localTPWoQuantizedFormatCases()
     {
-        return {
-            {"Q4_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ4_0Random(shape, seed); }, 0.0f},
-            {"Q4_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ4_1Random(shape, seed); }, 0.0f},
-            {"Q5_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ5_0Random(shape, seed); }, 0.0f},
-            {"Q5_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ5_1Random(shape, seed); }, 0.0f},
-            {"Q6_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ6_KRandom(shape, seed); }, 0.0f},
-            {"Q3_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ3_KRandom(shape, seed); }, 0.0f},
-            {"Q2_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ2_KRandom(shape, seed); }, 0.0f},
-            {"Q4_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ4_KRandom(shape, seed); }, 0.0f},
-            {"Q5_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ5_KRandom(shape, seed); }, 0.0f},
-            {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }, 0.0f},
-            {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return createBoundedIQ4XSForGroupedMoE(shape, seed); }, 0.0f},
-            {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return createNonzeroIQ3SForGroupedMoE(shape, seed); }, 0.0f},
-            {"IQ3_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }, 0.0f},
-            {"IQ2_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }, 0.0f},
-            {"IQ2_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }, 0.0f},
-            {"IQ2_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }, 0.0f},
-            {"IQ1_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }, 0.0f},
-            {"IQ1_M", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }, 0.0f},
-            {"Q8_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
-             { return TestTensorFactory::createQ8_0Random(shape, seed); }, 0.0f},
-        };
+        std::vector<NativeFormatCase> formats;
+        formats.reserve(quantizedVerifierFormats().size());
+        for (const auto &format : quantizedVerifierFormats())
+        {
+            WeightCreator creator = format.create;
+            if (format.tensor_type == TensorType::IQ4_XS)
+                creator = createBoundedIQ4XSForGroupedMoE;
+            else if (format.tensor_type == TensorType::IQ3_S)
+                creator = createNonzeroIQ3SForGroupedMoE;
+            formats.push_back({format.label, std::move(creator), 0.0f, format.tensor_type});
+        }
+        return formats;
     }
 
     std::vector<NativeFormatCase> localTPWoFloatingPointFormatCases()
@@ -3321,6 +3271,177 @@ namespace
             kernel->unbindWorkspace();
     }
 
+    /**
+     * @brief Compare one padded request-batch projection with an isolated request.
+     *
+     * Request-batched prefill can move a projection from an M=11 launch to an
+     * M=32 launch even though the second request still owns only eleven real
+     * rows.  Every GEMM row is mathematically independent, so a dispatch-policy
+     * change is not allowed to alter any output byte.  This helper exercises the
+     * ordinary production fused-projection entry point at both shapes; it does
+     * not force the MTP verifier policy or replay rows through M=1.
+     */
+    void runMixedProjectionPaddedPrefillMatchesIsolatedRequest(
+        const char *label,
+        int padded_rows,
+        int request_row_offset,
+        int request_rows,
+        int K,
+        const std::vector<WeightCreator> &createWeights,
+        const std::vector<int> &Ns,
+        const std::vector<const char *> &projection_names)
+    {
+        ASSERT_GT(padded_rows, 0);
+        ASSERT_GE(request_row_offset, 0);
+        ASSERT_GT(request_rows, 0);
+        ASSERT_LE(request_row_offset + request_rows, padded_rows);
+        ASSERT_EQ(createWeights.size(), Ns.size());
+        ASSERT_EQ(projection_names.size(), Ns.size());
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        ASSERT_NE(stream, nullptr);
+#endif
+
+        std::vector<std::unique_ptr<TensorBase>> weights;
+        std::vector<ROCmPackedWeights> packed(Ns.size());
+        std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
+        weights.reserve(Ns.size());
+        kernels.reserve(Ns.size());
+
+        WorkspaceRequirements combined;
+        for (size_t projection = 0; projection < Ns.size(); ++projection)
+        {
+            weights.push_back(createWeights[projection](
+                {static_cast<size_t>(Ns[projection]),
+                 static_cast<size_t>(K)},
+                static_cast<uint32_t>(12100 + projection)));
+            ASSERT_TRUE(packWeightsToROCm(
+                weights.back().get(), packed[projection]));
+            expectPackedPath(packed[projection], PackedPath::NativeVNNI);
+            kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(
+                &packed[projection], 0));
+#ifdef HAVE_ROCM
+            kernels.back()->setGPUStream(stream);
+#endif
+            combined.merge(kernels.back()->getWorkspaceRequirements(
+                padded_rows, Ns[projection], K));
+            combined.merge(kernels.back()->getWorkspaceRequirements(
+                request_rows, Ns[projection], K));
+        }
+
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        ASSERT_TRUE(workspace->allocate(combined));
+        for (auto &kernel : kernels)
+            kernel->bindWorkspace(workspace.get());
+
+        auto padded_input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(padded_rows), static_cast<size_t>(K)},
+            -0.35f,
+            0.35f,
+            12190u);
+        for (int row = request_row_offset + request_rows;
+             row < padded_rows;
+             ++row)
+        {
+            std::fill_n(
+                padded_input->mutable_data() +
+                    static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                1000.0f + static_cast<float>(row));
+        }
+
+        auto isolated_input = TestTensorFactory::createFP32(
+            {static_cast<size_t>(request_rows), static_cast<size_t>(K)});
+        std::copy_n(
+            padded_input->data() +
+                static_cast<size_t>(request_row_offset) *
+                    static_cast<size_t>(K),
+            static_cast<size_t>(request_rows) * static_cast<size_t>(K),
+            isolated_input->mutable_data());
+#ifdef HAVE_ROCM
+        ASSERT_TRUE(padded_input->ensureOnDevice(DeviceId::rocm(0), stream));
+        ASSERT_TRUE(isolated_input->ensureOnDevice(DeviceId::rocm(0), stream));
+#else
+        ASSERT_TRUE(padded_input->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(isolated_input->ensureOnDevice(DeviceId::rocm(0)));
+#endif
+
+        std::vector<std::unique_ptr<FP32Tensor>> padded_outputs;
+        std::vector<std::unique_ptr<FP32Tensor>> isolated_outputs;
+        std::vector<ITensorGemm::TensorProjectionDesc> padded_projections;
+        std::vector<ITensorGemm::TensorProjectionDesc> isolated_projections;
+        for (size_t projection = 0; projection < Ns.size(); ++projection)
+        {
+            padded_outputs.push_back(TestTensorFactory::createFP32(
+                {static_cast<size_t>(padded_rows),
+                 static_cast<size_t>(Ns[projection])}));
+            isolated_outputs.push_back(TestTensorFactory::createFP32(
+                {static_cast<size_t>(request_rows),
+                 static_cast<size_t>(Ns[projection])}));
+            ASSERT_TRUE(padded_outputs.back()->allocateOnDevice(
+                DeviceId::rocm(0)));
+            ASSERT_TRUE(isolated_outputs.back()->allocateOnDevice(
+                DeviceId::rocm(0)));
+            padded_projections.emplace_back(
+                kernels[projection].get(),
+                padded_outputs.back().get(),
+                Ns[projection],
+                nullptr,
+                projection_names[projection]);
+            isolated_projections.emplace_back(
+                kernels[projection].get(),
+                isolated_outputs.back().get(),
+                Ns[projection],
+                nullptr,
+                projection_names[projection]);
+        }
+
+        ASSERT_TRUE(kernels.front()->multiply_fused_tensor(
+            padded_input.get(), padded_projections, padded_rows, K));
+        ASSERT_TRUE(kernels.front()->multiply_fused_tensor(
+            isolated_input.get(), isolated_projections, request_rows, K));
+#ifdef HAVE_ROCM
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+
+        for (size_t projection = 0; projection < Ns.size(); ++projection)
+        {
+            padded_outputs[projection]->transitionTo(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            isolated_outputs[projection]->transitionTo(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            const size_t row_width = static_cast<size_t>(Ns[projection]);
+            const float *padded_request =
+                padded_outputs[projection]->data() +
+                static_cast<size_t>(request_row_offset) * row_width;
+            const float *isolated_request =
+                isolated_outputs[projection]->data();
+            expectBitwiseFP32RowsEqual(
+                std::string(label) + " projection=" +
+                    projection_names[projection] +
+                    " padded-M=" + std::to_string(padded_rows) +
+                    " isolated-M=" + std::to_string(request_rows),
+                padded_request,
+                isolated_request,
+                static_cast<size_t>(request_rows) * row_width,
+                row_width);
+        }
+
+#ifdef HAVE_ROCM
+        for (auto &kernel : kernels)
+            kernel->setGPUStream(nullptr);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+        for (auto &kernel : kernels)
+            kernel->unbindWorkspace();
+    }
+
 #ifdef HAVE_ROCM
     template <typename CreateWeights>
     void runGraphCapturedDispatchSmallMMatchesReference(
@@ -3407,6 +3528,70 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ8_0Random(shape, seed); },
         0.985f);
+}
+
+/**
+ * @test Prove every quantized source format through production preparation and dispatch.
+ *
+ * Each M=2/3/4 grouped call uses the persistent device repack pipeline and the
+ * public ITensorGemm entry point, then compares raw FP32 output bytes against M
+ * independent production M=1 calls on the same prepared kernel.  Perfstats are
+ * part of the acceptance contract: byte equality without one grouped small-M
+ * launch per format/depth could be satisfied by serial replay.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, ProductionPreparedAllQuantizedFormatsM234MatchSerialDecodeBytes)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    constexpr int N = 384;
+    constexpr int K = 512;
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        for (int M : {2, 3, 4})
+        {
+            runGroupedSmallMMatchesSerialRows(
+                format.label,
+                M,
+                N,
+                K,
+                format.create);
+        }
+    }
+
+    uint64_t grouped_calls = 0;
+    uint64_t canonical_raw_int8_calls = 0;
+    for (const auto &record : PerfStatsCollector::snapshot(
+             {"kernel.rocm_native_vnni_small_m_calls"}))
+    {
+        if (record.domain != "kernel" ||
+            record.name != "rocm_native_vnni_small_m_calls" ||
+            record.kind != PerfStatRecord::Kind::Counter)
+        {
+            continue;
+        }
+        ASSERT_EQ(record.tags.at("n"), std::to_string(N));
+        ASSERT_EQ(record.tags.at("k"), std::to_string(K));
+        const std::string &m = record.tags.at("m");
+        ASSERT_TRUE(m == "2" || m == "3" || m == "4");
+        grouped_calls += record.count;
+        if (record.tags.at("codebook") == "19")
+            canonical_raw_int8_calls += record.count;
+    }
+
+    EXPECT_EQ(grouped_calls, quantizedVerifierFormats().size() * 3u)
+        << "Every canonical quantized format and M=2/3/4 depth must execute "
+           "one economical ROCm grouped small-M kernel\n"
+        << PerfStatsCollector::summaryString(
+               {"kernel.rocm_native_vnni_small_m_calls"}, 100);
+    EXPECT_EQ(canonical_raw_int8_calls, 9u)
+        << "Q8_0, Q8_1, and Q8_K must each use codebook 19 at M=2/3/4";
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)
@@ -3623,6 +3808,645 @@ TEST(Test__ROCmQuantisedGemmSmallM, ReplicatedWoFloatingPointFormatsGroupedVerif
     }
 }
 
+/**
+ * @test Prove every floating ROCm projection format uses grouped verifier math.
+ *
+ * FP32, FP16, and BF16 weights do not enter the NativeVNNI codebook kernels.
+ * They are uploaded through the production RAW_FP weight path and dispatched to
+ * the ROCm floating GEMM implementation.  The verifier API must still execute
+ * both projections as one economical device-resident group and preserve the
+ * exact per-row accumulation order used by ordinary M=1 decode.
+ *
+ * This regression intentionally checks the backend route counters in addition
+ * to byte equality.  Calling two serial GEMMs into an M-row tensor could produce
+ * the same bytes while silently defeating the grouped MTP implementation.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, FloatingProjectionAllFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    constexpr int K = 192;
+    constexpr int N = 80;
+    constexpr std::array<int, 3> verifier_rows = {2, 3, 4};
+    const DeviceId device = DeviceId::rocm(0);
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    ASSERT_NE(stream, nullptr);
+
+    uint64_t model_id = 181000;
+    for (const auto &format : localTPWoFloatingPointFormatCases())
+    {
+        SCOPED_TRACE(format.label);
+
+        auto alpha_weights = format.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(model_id + 1));
+        auto beta_weights = format.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(model_id + 2));
+        ASSERT_NE(alpha_weights, nullptr);
+        ASSERT_NE(beta_weights, nullptr);
+
+        const TensorType dtype = alpha_weights->native_type();
+        ASSERT_EQ(beta_weights->native_type(), dtype);
+        const char *dtype_tag = tensorTypeName(dtype);
+
+        auto alpha_prepared = makeGpuPreparedFloatingPointGemm(
+            alpha_weights.get(),
+            device,
+            std::string("test.rocm.floating_grouped.alpha.") + dtype_tag,
+            ModelContextId{model_id++});
+        auto beta_prepared = makeGpuPreparedFloatingPointGemm(
+            beta_weights.get(),
+            device,
+            std::string("test.rocm.floating_grouped.beta.") + dtype_tag,
+            ModelContextId{model_id++});
+        ASSERT_NE(alpha_prepared.kernel, nullptr);
+        ASSERT_NE(beta_prepared.kernel, nullptr);
+
+        std::array<ITensorGemm *, 2> kernels = {
+            alpha_prepared.kernel,
+            beta_prepared.kernel};
+        WorkspaceRequirements requirements;
+        for (ITensorGemm *kernel : kernels)
+        {
+            kernel->setGPUStream(stream);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr)
+                << dtype_tag << " floating GEMM must declare workspace ownership";
+            requirements.merge(consumer->getWorkspaceRequirements(4, N, K));
+        }
+
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        for (ITensorGemm *kernel : kernels)
+        {
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr);
+            consumer->bindWorkspace(&workspace);
+        }
+
+        for (const int M : verifier_rows)
+        {
+            SCOPED_TRACE(std::string(dtype_tag) + " M=" + std::to_string(M));
+
+            auto grouped_input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)},
+                -0.35f,
+                0.35f,
+                static_cast<uint32_t>(182000 + M + model_id));
+            const std::vector<float> input_values(
+                grouped_input->data(),
+                grouped_input->data() + grouped_input->numel());
+            auto alpha_grouped = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(N)});
+            auto beta_grouped = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(N)});
+            ASSERT_TRUE(grouped_input->ensureOnDevice(device, stream));
+            ASSERT_TRUE(alpha_grouped->allocateOnDevice(device, stream));
+            ASSERT_TRUE(beta_grouped->allocateOnDevice(device, stream));
+
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {alpha_prepared.kernel, alpha_grouped.get(), N, nullptr, "alpha"},
+                {beta_prepared.kernel, beta_grouped.get(), N, nullptr, "beta"}};
+            ASSERT_TRUE(alpha_prepared.kernel->multiply_fused_verifier_rows_decode_equivalent(
+                grouped_input.get(), projections, M, K, nullptr, &workspace))
+                << dtype_tag << " grouped floating projection M=" << M;
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            alpha_grouped->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            beta_grouped->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+
+            const std::vector<float> alpha_grouped_values(
+                alpha_grouped->data(),
+                alpha_grouped->data() + alpha_grouped->numel());
+            const std::vector<float> beta_grouped_values(
+                beta_grouped->data(),
+                beta_grouped->data() + beta_grouped->numel());
+            std::vector<float> alpha_serial_values(
+                static_cast<size_t>(M) * static_cast<size_t>(N));
+            std::vector<float> beta_serial_values(
+                static_cast<size_t>(M) * static_cast<size_t>(N));
+
+            for (int row = 0; row < M; ++row)
+            {
+                auto row_input = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(K)});
+                std::copy_n(
+                    input_values.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    K,
+                    row_input->mutable_data());
+                auto alpha_serial = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(N)});
+                auto beta_serial = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(N)});
+                ASSERT_TRUE(row_input->ensureOnDevice(device, stream));
+                ASSERT_TRUE(alpha_serial->allocateOnDevice(device, stream));
+                ASSERT_TRUE(beta_serial->allocateOnDevice(device, stream));
+
+                ASSERT_TRUE(alpha_prepared.kernel->multiply_tensor(
+                    row_input.get(), alpha_serial.get(),
+                    1, N, K,
+                    /*transpose_B=*/true,
+                    1.0f,
+                    0.0f,
+                    nullptr,
+                    nullptr,
+                    -1,
+                    &workspace));
+                ASSERT_TRUE(beta_prepared.kernel->multiply_tensor(
+                    row_input.get(), beta_serial.get(),
+                    1, N, K,
+                    /*transpose_B=*/true,
+                    1.0f,
+                    0.0f,
+                    nullptr,
+                    nullptr,
+                    -1,
+                    &workspace));
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                alpha_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                beta_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                std::copy_n(
+                    alpha_serial->data(),
+                    N,
+                    alpha_serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+                std::copy_n(
+                    beta_serial->data(),
+                    N,
+                    beta_serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+            }
+
+            expectBitwiseFP32RowsEqual(
+                std::string("ROCm ") + dtype_tag +
+                    " grouped alpha projection M=" + std::to_string(M),
+                alpha_grouped_values.data(),
+                alpha_serial_values.data(),
+                alpha_grouped_values.size(),
+                static_cast<size_t>(N));
+            expectBitwiseFP32RowsEqual(
+                std::string("ROCm ") + dtype_tag +
+                    " grouped beta projection M=" + std::to_string(M),
+                beta_grouped_values.data(),
+                beta_serial_values.data(),
+                beta_grouped_values.size(),
+                static_cast<size_t>(N));
+        }
+
+        for (ITensorGemm *kernel : kernels)
+        {
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr);
+            consumer->unbindWorkspace();
+            kernel->setGPUStream(nullptr);
+        }
+    }
+
+    uint64_t fp32_grouped_calls = 0;
+    uint64_t fp16_grouped_calls = 0;
+    uint64_t bf16_grouped_calls = 0;
+    const auto records = PerfStatsCollector::snapshot(
+        {"kernel.rocm_fp32_small_n_batched_projection_calls",
+         "kernel.rocm_fp32_batched_projection_calls",
+         "kernel.rocm_fp32x16_grouped_verifier_projection_calls"});
+    for (const auto &record : records)
+    {
+        auto tag_equals = [&](const char *name, const std::string &value)
+        {
+            const auto it = record.tags.find(name);
+            return it != record.tags.end() && it->second == value;
+        };
+        const auto m_it = record.tags.find("m");
+        if (m_it == record.tags.end() ||
+            (m_it->second != "2" && m_it->second != "3" && m_it->second != "4"))
+        {
+            continue;
+        }
+
+        if ((record.name == "rocm_fp32_small_n_batched_projection_calls" ||
+             record.name == "rocm_fp32_batched_projection_calls") &&
+            tag_equals("n", std::to_string(N)) &&
+            tag_equals("k", std::to_string(K)) &&
+            tag_equals("batch", "2"))
+        {
+            fp32_grouped_calls += record.count;
+        }
+        else if (record.name == "rocm_fp32x16_grouped_verifier_projection_calls" &&
+                 tag_equals("n", std::to_string(N)) &&
+                 tag_equals("k", std::to_string(K)) &&
+                 tag_equals("projections", "2") &&
+                 tag_equals("route", "fixed_order_fp32x16_batched_projection"))
+        {
+            if (tag_equals("dtype", "fp16"))
+                fp16_grouped_calls += record.count;
+            else if (tag_equals("dtype", "bf16"))
+                bf16_grouped_calls += record.count;
+        }
+    }
+    EXPECT_EQ(fp32_grouped_calls, verifier_rows.size())
+        << "ROCm FP32 verifier projections must use one batched projection per M bucket";
+    EXPECT_EQ(fp16_grouped_calls, verifier_rows.size())
+        << "ROCm FP16 verifier projections must use the fixed-order grouped kernel";
+    EXPECT_EQ(bf16_grouped_calls, verifier_rows.size())
+        << "ROCm BF16 verifier projections must use the fixed-order grouped kernel";
+
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    PerfStatsCollector::reset();
+#endif
+}
+
+/**
+ * @test Prove floating GDN gates are invariant to padded request batching.
+ *
+ * Dense Qwen 3.6 emits 48 alpha and beta values per token from FP32 weights.
+ * A short request therefore moves from M=11 in isolation to M=32 inside a
+ * two-request padded prefill.  Exercise the ordinary fused production API for
+ * every floating weight storage format and require the short request's eleven
+ * rows to retain identical FP32 bytes.
+ */
+TEST(
+    Test__ROCmQuantisedGemmSmallM,
+    FloatingGDNProjectionAllFormatsPaddedPrefillMatchesIsolatedRequestBytes)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    constexpr int padded_rows = 32;
+    constexpr int request_row_offset = 16;
+    constexpr int request_rows = 11;
+    constexpr int K = 5120;
+    constexpr int N = 48;
+    const DeviceId device = DeviceId::rocm(0);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+        hipSuccess);
+    ASSERT_NE(stream, nullptr);
+
+    uint64_t model_id = 187000;
+    for (const auto &format : localTPWoFloatingPointFormatCases())
+    {
+        SCOPED_TRACE(format.label);
+        auto alpha_weights = format.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(model_id + 1));
+        auto beta_weights = format.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(model_id + 2));
+        ASSERT_NE(alpha_weights, nullptr);
+        ASSERT_NE(beta_weights, nullptr);
+
+        const TensorType dtype = alpha_weights->native_type();
+        ASSERT_EQ(beta_weights->native_type(), dtype);
+        const char *dtype_tag = tensorTypeName(dtype);
+        auto alpha_prepared = makeGpuPreparedFloatingPointGemm(
+            alpha_weights.get(),
+            device,
+            std::string("test.rocm.padded_gdn.alpha.") + dtype_tag,
+            ModelContextId{model_id++});
+        auto beta_prepared = makeGpuPreparedFloatingPointGemm(
+            beta_weights.get(),
+            device,
+            std::string("test.rocm.padded_gdn.beta.") + dtype_tag,
+            ModelContextId{model_id++});
+        ASSERT_NE(alpha_prepared.kernel, nullptr);
+        ASSERT_NE(beta_prepared.kernel, nullptr);
+
+        std::array<ITensorGemm *, 2> kernels{
+            alpha_prepared.kernel,
+            beta_prepared.kernel,
+        };
+        WorkspaceRequirements requirements;
+        for (ITensorGemm *kernel : kernels)
+        {
+            kernel->setGPUStream(stream);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr);
+            requirements.merge(consumer->getWorkspaceRequirements(
+                padded_rows, N, K));
+            requirements.merge(consumer->getWorkspaceRequirements(
+                request_rows, N, K));
+        }
+
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        for (ITensorGemm *kernel : kernels)
+        {
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr);
+            consumer->bindWorkspace(&workspace);
+        }
+
+        auto padded_input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(padded_rows), static_cast<size_t>(K)},
+            -0.35f,
+            0.35f,
+            static_cast<uint32_t>(188000 + model_id));
+        auto isolated_input = TestTensorFactory::createFP32(
+            {static_cast<size_t>(request_rows), static_cast<size_t>(K)});
+        std::copy_n(
+            padded_input->data() +
+                static_cast<size_t>(request_row_offset) *
+                    static_cast<size_t>(K),
+            static_cast<size_t>(request_rows) * static_cast<size_t>(K),
+            isolated_input->mutable_data());
+        ASSERT_TRUE(padded_input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(isolated_input->ensureOnDevice(device, stream));
+
+        auto alpha_padded = TestTensorFactory::createFP32(
+            {static_cast<size_t>(padded_rows), static_cast<size_t>(N)});
+        auto beta_padded = TestTensorFactory::createFP32(
+            {static_cast<size_t>(padded_rows), static_cast<size_t>(N)});
+        auto alpha_isolated = TestTensorFactory::createFP32(
+            {static_cast<size_t>(request_rows), static_cast<size_t>(N)});
+        auto beta_isolated = TestTensorFactory::createFP32(
+            {static_cast<size_t>(request_rows), static_cast<size_t>(N)});
+        for (TensorBase *output : {
+                 alpha_padded.get(),
+                 beta_padded.get(),
+                 alpha_isolated.get(),
+                 beta_isolated.get()})
+        {
+            ASSERT_TRUE(output->allocateOnDevice(device, stream));
+        }
+
+        std::vector<ITensorGemm::TensorProjectionDesc> padded_projections = {
+            {alpha_prepared.kernel, alpha_padded.get(), N, nullptr, "alpha"},
+            {beta_prepared.kernel, beta_padded.get(), N, nullptr, "beta"},
+        };
+        std::vector<ITensorGemm::TensorProjectionDesc> isolated_projections = {
+            {alpha_prepared.kernel, alpha_isolated.get(), N, nullptr, "alpha"},
+            {beta_prepared.kernel, beta_isolated.get(), N, nullptr, "beta"},
+        };
+        ASSERT_TRUE(alpha_prepared.kernel->multiply_fused_tensor(
+            padded_input.get(),
+            padded_projections,
+            padded_rows,
+            K,
+            nullptr,
+            &workspace));
+        ASSERT_TRUE(alpha_prepared.kernel->multiply_fused_tensor(
+            isolated_input.get(),
+            isolated_projections,
+            request_rows,
+            K,
+            nullptr,
+            &workspace));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        for (TensorBase *output : {
+                 alpha_padded.get(),
+                 beta_padded.get(),
+                 alpha_isolated.get(),
+                 beta_isolated.get()})
+        {
+            output->transitionTo(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                device);
+        }
+
+        expectBitwiseFP32RowsEqual(
+            std::string("ROCm ") + dtype_tag +
+                " padded GDN alpha projection",
+            alpha_padded->data() +
+                static_cast<size_t>(request_row_offset) * N,
+            alpha_isolated->data(),
+            static_cast<size_t>(request_rows) * N,
+            N);
+        expectBitwiseFP32RowsEqual(
+            std::string("ROCm ") + dtype_tag +
+                " padded GDN beta projection",
+            beta_padded->data() +
+                static_cast<size_t>(request_row_offset) * N,
+            beta_isolated->data(),
+            static_cast<size_t>(request_rows) * N,
+            N);
+
+        for (ITensorGemm *kernel : kernels)
+        {
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr);
+            consumer->unbindWorkspace();
+            kernel->setGPUStream(nullptr);
+        }
+    }
+
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @test Prove floating ROCm grouped SwiGLU/down matches serial decode by bytes.
+ *
+ * The down projection is a separate grouped contract from gate/up projection:
+ * it fuses SiLU, elementwise multiplication, and the weight projection.  Sweep
+ * every floating weight storage type so a backend-library implementation cannot
+ * quietly replace the fixed-order production kernel for one dtype.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, FloatingSwiGLUDownAllFormatsGroupedVerifierRowsMatchSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    constexpr int K = 192;
+    constexpr int N = 80;
+    constexpr std::array<int, 3> verifier_rows = {2, 3, 4};
+    const DeviceId device = DeviceId::rocm(0);
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    ASSERT_NE(stream, nullptr);
+
+    uint64_t model_id = 183000;
+    for (const auto &format : localTPWoFloatingPointFormatCases())
+    {
+        SCOPED_TRACE(format.label);
+
+        auto down_weights = format.create(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(model_id + 1));
+        ASSERT_NE(down_weights, nullptr);
+        const char *dtype_tag = tensorTypeName(down_weights->native_type());
+        auto down_prepared = makeGpuPreparedFloatingPointGemm(
+            down_weights.get(),
+            device,
+            std::string("test.rocm.floating_grouped.swiglu_down.") + dtype_tag,
+            ModelContextId{model_id++});
+        ASSERT_NE(down_prepared.kernel, nullptr);
+        down_prepared.kernel->setGPUStream(stream);
+
+        auto *consumer = dynamic_cast<IWorkspaceConsumer *>(down_prepared.kernel);
+        ASSERT_NE(consumer, nullptr)
+            << dtype_tag << " floating down GEMM must declare workspace ownership";
+        const WorkspaceRequirements requirements =
+            consumer->getWorkspaceRequirements(4, N, K);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        consumer->bindWorkspace(&workspace);
+
+        for (const int M : verifier_rows)
+        {
+            SCOPED_TRACE(std::string(dtype_tag) + " M=" + std::to_string(M));
+
+            auto grouped_gate = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)},
+                -0.45f,
+                0.45f,
+                static_cast<uint32_t>(184000 + M + model_id));
+            auto grouped_up = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)},
+                -0.45f,
+                0.45f,
+                static_cast<uint32_t>(185000 + M + model_id));
+            const std::vector<float> gate_values(
+                grouped_gate->data(),
+                grouped_gate->data() + grouped_gate->numel());
+            const std::vector<float> up_values(
+                grouped_up->data(),
+                grouped_up->data() + grouped_up->numel());
+            auto grouped_output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(N)});
+            ASSERT_TRUE(grouped_gate->ensureOnDevice(device, stream));
+            ASSERT_TRUE(grouped_up->ensureOnDevice(device, stream));
+            ASSERT_TRUE(grouped_output->allocateOnDevice(device, stream));
+
+            ASSERT_TRUE(down_prepared.kernel->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                grouped_gate.get(),
+                grouped_up.get(),
+                grouped_output.get(),
+                M,
+                N,
+                K,
+                1.0f,
+                0.0f,
+                &workspace))
+                << dtype_tag << " grouped floating SwiGLU/down M=" << M;
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            const std::vector<float> grouped_values(
+                grouped_output->data(),
+                grouped_output->data() + grouped_output->numel());
+
+            std::vector<float> serial_values(
+                static_cast<size_t>(M) * static_cast<size_t>(N));
+            for (int row = 0; row < M; ++row)
+            {
+                auto row_gate = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(K)});
+                auto row_up = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(K)});
+                std::copy_n(
+                    gate_values.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    K,
+                    row_gate->mutable_data());
+                std::copy_n(
+                    up_values.data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                    K,
+                    row_up->mutable_data());
+                auto row_output = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(N)});
+                ASSERT_TRUE(row_gate->ensureOnDevice(device, stream));
+                ASSERT_TRUE(row_up->ensureOnDevice(device, stream));
+                ASSERT_TRUE(row_output->allocateOnDevice(device, stream));
+
+                ASSERT_TRUE(down_prepared.kernel->multiply_tensor_with_fused_swiglu(
+                    row_gate.get(),
+                    row_up.get(),
+                    row_output.get(),
+                    1,
+                    N,
+                    K,
+                    1.0f,
+                    0.0f,
+                    &workspace));
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                row_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+                std::copy_n(
+                    row_output->data(),
+                    N,
+                    serial_values.data() + static_cast<size_t>(row) * static_cast<size_t>(N));
+            }
+
+            expectBitwiseFP32RowsEqual(
+                std::string("ROCm ") + dtype_tag +
+                    " grouped floating SwiGLU/down M=" + std::to_string(M),
+                grouped_values.data(),
+                serial_values.data(),
+                grouped_values.size(),
+                static_cast<size_t>(N));
+        }
+
+        consumer->unbindWorkspace();
+        down_prepared.kernel->setGPUStream(nullptr);
+    }
+
+    std::array<uint64_t, 3> grouped_calls = {0, 0, 0};
+    const auto records = PerfStatsCollector::snapshot(
+        {"kernel.rocm_floating_grouped_verifier_swiglu_down_calls"});
+    for (const auto &record : records)
+    {
+        if (record.name != "rocm_floating_grouped_verifier_swiglu_down_calls")
+            continue;
+        auto tag_equals = [&](const char *name, const std::string &value)
+        {
+            const auto it = record.tags.find(name);
+            return it != record.tags.end() && it->second == value;
+        };
+        const auto m_it = record.tags.find("m");
+        if (m_it == record.tags.end() ||
+            (m_it->second != "2" && m_it->second != "3" && m_it->second != "4") ||
+            !tag_equals("n", std::to_string(N)) ||
+            !tag_equals("k", std::to_string(K)) ||
+            !tag_equals("route", "fixed_order_floating_swiglu_down") ||
+            !tag_equals("verifier", "1"))
+        {
+            continue;
+        }
+        if (tag_equals("dtype", "fp32"))
+            grouped_calls[0] += record.count;
+        else if (tag_equals("dtype", "fp16"))
+            grouped_calls[1] += record.count;
+        else if (tag_equals("dtype", "bf16"))
+            grouped_calls[2] += record.count;
+    }
+    EXPECT_EQ(grouped_calls[0], verifier_rows.size());
+    EXPECT_EQ(grouped_calls[1], verifier_rows.size());
+    EXPECT_EQ(grouped_calls[2], verifier_rows.size());
+
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    PerfStatsCollector::reset();
+#endif
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, RealQwen36OutputGEMMStageGroupedVerifierRowsMatchSerialDecode)
 {
     if (!hasROCmDevice())
@@ -3816,7 +4640,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchNativeSmallMAllCodebooksMatchReferen
                 M,
                 N,
                 K,
-                PackedPath::NativeVNNI,
+                isInt8VnniFormat(format.tensor_type)
+                    ? PackedPath::INT8VNNI
+                    : PackedPath::NativeVNNI,
                 format.create,
                 format.min_cosine);
         }
@@ -5773,6 +6599,30 @@ TEST(Test__ROCmQuantisedGemmSmallM, MixedCodebookQwen36GDNQkvZPairSmallMMatchesS
             {10240, 6144},
             {"qkv", "z"});
     }
+}
+
+TEST(
+    Test__ROCmQuantisedGemmSmallM,
+    MixedCodebookQwen36GDNPaddedPrefillMatchesIsolatedRequestBytes)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    std::vector<WeightCreator> creators = {
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); }};
+
+    runMixedProjectionPaddedPrefillMatchesIsolatedRequest(
+        "mixed Q5_K/Q4_K Qwen3.6 GDN request-batched prefill",
+        /*padded_rows=*/32,
+        /*request_row_offset=*/16,
+        /*request_rows=*/11,
+        /*K=*/5120,
+        creators,
+        /*Ns=*/{10240, 6144},
+        /*projection_names=*/{"qkv", "z"});
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, GDNIQ4XSQwen36MoEQkvZPairSmallMMatchesSerialM1DecodeRowsStrict)

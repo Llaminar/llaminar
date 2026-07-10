@@ -41,8 +41,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "fort.hpp"
 
-// TestTensorFactory for creating random quantized tensors
-#include "utils/TestTensorFactory.h"
+#include "utils/QuantizedVerifierFormats.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -826,78 +825,59 @@ namespace
     std::unique_ptr<TensorBase> createWeightsForFormat(
         const std::string &fmt_name, size_t N, size_t K)
     {
-        if (fmt_name == "Q4_0")
-            return TestTensorFactory::createQ4_0Random({N, K});
-        if (fmt_name == "IQ4_NL")
-            return TestTensorFactory::createIQ4_NLRandom({N, K});
-        if (fmt_name == "Q4_1")
-            return TestTensorFactory::createQ4_1Random({N, K});
-        if (fmt_name == "IQ4_XS")
-            return TestTensorFactory::createIQ4_XSRandom({N, K});
-        if (fmt_name == "Q5_0")
-            return TestTensorFactory::createQ5_0Random({N, K});
-        if (fmt_name == "Q5_1")
-            return TestTensorFactory::createQ5_1Random({N, K});
-        if (fmt_name == "Q4_K")
-            return TestTensorFactory::createQ4_KRandom({N, K});
-        if (fmt_name == "Q5_K")
-            return TestTensorFactory::createQ5_KRandom({N, K});
-        if (fmt_name == "Q6_K")
-            return TestTensorFactory::createQ6_KRandom({N, K});
-        if (fmt_name == "Q3_K")
-            return TestTensorFactory::createQ3_KRandom({N, K});
-        if (fmt_name == "Q2_K")
-            return TestTensorFactory::createQ2_KRandom({N, K});
-        if (fmt_name == "IQ3_S")
-            return TestTensorFactory::createIQ3_SRandom({N, K});
-        if (fmt_name == "IQ3_XXS")
-            return TestTensorFactory::createIQ3_XXSRandom({N, K});
-        if (fmt_name == "IQ2_S")
-            return TestTensorFactory::createIQ2_SRandom({N, K});
-        if (fmt_name == "IQ2_XS")
-            return TestTensorFactory::createIQ2_XSRandom({N, K});
-        if (fmt_name == "IQ2_XXS")
-            return TestTensorFactory::createIQ2_XXSRandom({N, K});
-        if (fmt_name == "IQ1_S")
-            return TestTensorFactory::createIQ1_SRandom({N, K});
-        if (fmt_name == "IQ1_M")
-            return TestTensorFactory::createIQ1_MRandom({N, K});
-        if (fmt_name == "Q8_0")
-            return TestTensorFactory::createQ8_0Random({N, K});
-        if (fmt_name == "Q8_1")
-            return TestTensorFactory::createQ8_1Random({N, K});
+        for (const auto &format : quantizedVerifierFormats())
+        {
+            if (fmt_name == format.label)
+                return format.create({N, K}, 42u);
+        }
         return nullptr;
     }
 
-    // All formats with their cosine similarity thresholds.
-    // Nibble-LUT formats have higher thresholds (preserve more precision).
-    // Lower-bit formats (IQ1, IQ2) have lower thresholds due to quantization noise.
-    static const std::vector<FormatSpec> ALL_FORMATS = {
-        // Nibble-LUT path (4-bit: vpshufb decode)
-        {"Q4_0", 0.990f},
-        {"IQ4_NL", 0.985f},
-        {"Q4_1", 0.990f},
-        {"IQ4_XS", 0.985f},
-        // INT8 pre-decoded path (per-block formats)
-        {"Q5_0", 0.990f},
-        {"Q5_1", 0.990f},
-        // INT8 pre-decoded path (superblock formats)
-        {"Q4_K", 0.990f},
-        {"Q5_K", 0.990f},
-        {"Q6_K", 0.990f},
-        {"Q3_K", 0.980f},
-        {"Q2_K", 0.960f},
-        {"IQ3_S", 0.970f},
-        {"IQ3_XXS", 0.960f},
-        {"IQ2_S", 0.920f},
-        {"IQ2_XS", 0.900f},
-        {"IQ2_XXS", 0.880f},
-        {"IQ1_S", 0.800f},
-        {"IQ1_M", 0.800f},
-        // INT8 pre-decoded path (8-bit formats — trivial decode, highest precision)
-        {"Q8_0", 0.999f},
-        {"Q8_1", 0.999f},
-    };
+    /** @brief Diagnostic FP32-reference threshold for one native tensor type. */
+    float allFormatCosineThreshold(TensorType type)
+    {
+        switch (type)
+        {
+        case TensorType::IQ4_NL:
+        case TensorType::IQ4_XS:
+            return 0.985f;
+        case TensorType::Q3_K:
+            return 0.980f;
+        case TensorType::Q2_K:
+            return 0.960f;
+        case TensorType::IQ3_S:
+            return 0.970f;
+        case TensorType::IQ3_XXS:
+            return 0.960f;
+        case TensorType::IQ2_S:
+            return 0.920f;
+        case TensorType::IQ2_XS:
+            return 0.900f;
+        case TensorType::IQ2_XXS:
+            return 0.880f;
+        case TensorType::IQ1_S:
+        case TensorType::IQ1_M:
+            return 0.800f;
+        case TensorType::Q8_0:
+        case TensorType::Q8_1:
+        case TensorType::Q8_K:
+            return 0.999f;
+        default:
+            return 0.990f;
+        }
+    }
+
+    /**
+     * @brief Canonical all-format matrix augmented with reference diagnostics.
+     */
+    const std::vector<FormatSpec> ALL_FORMATS = []
+    {
+        std::vector<FormatSpec> formats;
+        formats.reserve(quantizedVerifierFormats().size());
+        for (const auto &format : quantizedVerifierFormats())
+            formats.push_back({format.label, allFormatCosineThreshold(format.tensor_type)});
+        return formats;
+    }();
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows)
     {

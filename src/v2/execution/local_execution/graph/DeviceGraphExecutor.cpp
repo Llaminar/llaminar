@@ -677,7 +677,16 @@ namespace llaminar2
     bool DeviceGraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
                                                 const std::unordered_set<std::string> *collective_nodes)
     {
-        return runStages(graph, ctx, StageRunPolicy::fastDecode(), collective_nodes);
+        StageRunPolicy policy = StageRunPolicy::fastDecode();
+        /*
+         * Eager fast decode has no captured D2D snapshot nodes.  When a parity
+         * diagnostic callback is armed, publish each stage immediately while
+         * its arena output still contains that stage's bytes.  Deferring these
+         * callbacks until the complete graph returns lets normal buffer aliasing
+         * overwrite early values such as EMBEDDING with a later residual.
+         */
+        policy.snapshot_callback = config_.snapshot_callback != nullptr;
+        return runStages(graph, ctx, policy, collective_nodes);
     }
 
     bool DeviceGraphExecutor::prepareSnapshotsForGraphCapture(
@@ -1184,13 +1193,25 @@ namespace llaminar2
         ComputeGraph &graph,
         int terminal_row,
         void *producer_stream_override,
-        const char *context)
+        const char *context,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width)
     {
-        if (terminal_row < 0)
+        const bool request_batched =
+            device_request_seq_lens != nullptr &&
+            request_count > 1 &&
+            request_row_width > 0;
+        if (!request_batched && terminal_row < 0)
         {
             LOG_ERROR("[DeviceGraphExecutor] Cannot publish captured terminal state"
                       << (context ? std::string(" during ") + context : std::string{})
                       << ": terminal row is negative (" << terminal_row << ")");
+            return false;
+        }
+        if (device_request_seq_lens && !request_batched)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Device request lengths require request_count > 1 and a positive request row width");
             return false;
         }
 
@@ -1200,6 +1221,7 @@ namespace llaminar2
 
         size_t restored_count = 0;
         size_t skipped_count = 0;
+        size_t direct_commit_count = 0;
         for (const auto &name : order)
         {
             ComputeNode *node = graph.getNode(name);
@@ -1207,6 +1229,14 @@ namespace llaminar2
                 continue;
 
             IComputeStage *stage = node->stage.get();
+            if (request_batched &&
+                stage->requestBatchedTerminalStateCommittedDuringExecution(
+                    request_count,
+                    request_row_width))
+            {
+                ++direct_commit_count;
+                continue;
+            }
             if (!stage->hasVerifierStateCapture())
             {
                 if (stage->requiresVerifierStateCaptureForPublication())
@@ -1236,11 +1266,23 @@ namespace llaminar2
                 return false;
             }
 
-            if (!stage->restoreVerifierStateCaptureRow(terminal_row, producer_stream))
+            const bool restored =
+                request_batched
+                    ? stage->restoreVerifierStateCaptureRequestTerminalRows(
+                          device_request_seq_lens,
+                          request_count,
+                          request_row_width,
+                          producer_stream)
+                    : stage->restoreVerifierStateCaptureRow(
+                          terminal_row,
+                          producer_stream);
+            if (!restored)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication"
                           << (context ? std::string(" during ") + context : std::string{})
-                          << " failed restoring row " << terminal_row
+                          << (request_batched
+                                  ? " failed restoring device-owned request terminal rows"
+                                  : " failed restoring row " + std::to_string(terminal_row))
                           << " for stage '" << name << "'");
                 return false;
             }
@@ -1259,7 +1301,26 @@ namespace llaminar2
                 "executor",
                 {{"context", context ? context : "unknown"},
                  {"terminal_row", std::to_string(terminal_row)},
+                 {"publication_policy", request_batched
+                                             ? "device_request_terminal_rows"
+                                             : "scalar_terminal_row"},
+                 {"request_count", std::to_string(request_count)},
                  {"skipped_stages", std::to_string(skipped_count)}});
+        }
+        if (direct_commit_count > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "request_batched_terminal_state_direct_commits",
+                static_cast<double>(direct_commit_count),
+                GraphExecutorStats::currentPhase() == ExecutionPhase::DECODE
+                    ? "decode"
+                    : "prefill",
+                "executor",
+                {{"context", context ? context : "unknown"},
+                 {"request_count", std::to_string(request_count)},
+                 {"request_row_width", std::to_string(request_row_width)},
+                 {"commit_policy", "grouped_kernel_live_state_bank"}});
         }
         return true;
     }

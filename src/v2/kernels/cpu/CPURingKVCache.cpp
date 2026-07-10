@@ -31,6 +31,7 @@
 #include "turboquant/TurboQuantDequantizeTQ4.h"
 #include "turboquant/TurboQuantDequantizeSplitTQ.h"
 #include "../../tensors/SIMDHelpers.h"
+#include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <array>
@@ -1269,6 +1270,25 @@ namespace llaminar2
         entry.head = next_head;
         entry.size = next_size;
         invalidateFP32Shadow(layer, seq_idx);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_kv_cache_grouped_verifier_append_calls",
+            1.0,
+            "verifier",
+            "cpu",
+            {{"k_format", activationPrecisionToString(KPrecision)},
+             {"v_format", activationPrecisionToString(VPrecision)},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"source_k_layout", k_source_head_major ? "head_major" : "position_major"},
+             {"source_v_layout", v_source_head_major ? "head_major" : "position_major"},
+             {"destination_layout", layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR
+                                        ? "head_major"
+                                        : "position_major"},
+             {"local_kv_heads", std::to_string(local_n_kv_heads_)},
+             {"head_dim", std::to_string(head_dim_)},
+             {"ring_size", std::to_string(entry.size)},
+             {"ring_head", std::to_string(entry.head)},
+             {"commit_policy", "single_grouped_metadata_commit"}});
         return true;
     }
 
@@ -1890,30 +1910,6 @@ namespace llaminar2
             invalidateFP32Shadow(layer, seq_idx);
         }
         return true;
-    }
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::advanceHead(int layer, int seq_idx, int num_tokens)
-    {
-        if (layer < 0 || layer >= n_layers_ ||
-            seq_idx < 0 || seq_idx >= batch_size_ ||
-            num_tokens <= 0)
-        {
-            return;
-        }
-
-        auto &entry = entries_[layer][seq_idx];
-        if (entry.size + num_tokens <= max_seq_len_)
-        {
-            entry.size += num_tokens;
-        }
-        else
-        {
-            const int to_evict = entry.size + num_tokens - max_seq_len_;
-            entry.head = (entry.head + to_evict) % max_seq_len_;
-            entry.size = max_seq_len_;
-        }
-        invalidateFP32Shadow(layer, seq_idx);
     }
 
     // =========================================================================

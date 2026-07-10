@@ -1,10 +1,16 @@
 /**
  * @file FusedResidualNormStage.cpp
- * @brief Fused Residual Add + RMSNorm stage (GPU optimization)
+ * @brief Backend-native implementation of fused residual-add plus RMSNorm.
  *
- * On GPU: Single kernel reads input+residual, writes updated residual AND
- *         normalized output. Saves one global memory round-trip per fusion point.
- * On CPU: Falls back to sequential KernelFactory dispatch.
+ * GPU execution is fully device-owned: all four tensor bindings are resolved
+ * through gpu_data_ptr(), launches use the graph executor's explicit stream, and
+ * both mutable tensors become device-authoritative only after a successful
+ * launch. FP32, BF16, and FP16 use matching one-block-per-row CUDA/HIP kernels.
+ *
+ * CPU execution retains the fused cache-resident FP32 decode primitive for
+ * M=1..4. Other native floating formats execute one typed residual-add call and
+ * one typed RMSNorm call under this stage. Neither backend implementation calls
+ * the serial runtime or replays M=1 stage executions in production.
  */
 
 #include "FusedResidualNormStage.h"
@@ -14,7 +20,10 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
+#include "../../local_execution/graph/GraphCaptureGuard.h"
 #include <cmath>
+#include <string>
 
 #ifdef HAVE_CUDA
 extern "C"
@@ -22,6 +31,18 @@ extern "C"
     bool cudaOps_fused_residual_rmsnorm_fp32(
         const float *input, const float *residual, const float *gamma,
         float *residual_output, float *norm_output,
+        int rows, int cols, float eps,
+        int device_idx, void *stream);
+
+    bool cudaOps_fused_residual_rmsnorm_bf16(
+        const uint16_t *input, const uint16_t *residual, const float *gamma,
+        uint16_t *residual_output, uint16_t *norm_output,
+        int rows, int cols, float eps,
+        int device_idx, void *stream);
+
+    bool cudaOps_fused_residual_rmsnorm_fp16(
+        const uint16_t *input, const uint16_t *residual, const float *gamma,
+        uint16_t *residual_output, uint16_t *norm_output,
         int rows, int cols, float eps,
         int device_idx, void *stream);
 }
@@ -35,11 +56,134 @@ extern "C"
         float *residual_output, float *norm_output,
         int rows, int cols, float eps,
         int device_idx, void *stream);
+
+    bool hipOps_fused_residual_rmsnorm_bf16(
+        const uint16_t *input, const uint16_t *residual, const float *gamma,
+        uint16_t *residual_output, uint16_t *norm_output,
+        int rows, int cols, float eps,
+        int device_idx, void *stream);
+
+    bool hipOps_fused_residual_rmsnorm_fp16(
+        const uint16_t *input, const uint16_t *residual, const float *gamma,
+        uint16_t *residual_output, uint16_t *norm_output,
+        int rows, int cols, float eps,
+        int device_idx, void *stream);
 }
 #endif
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Return whether a tensor format has a native fused stage route.
+         *
+         * Quantized weight codebooks are not activation formats for this stage.
+         * The graph must provide one of the three floating activation formats so
+         * the in-place residual and normalized output retain identical storage.
+         */
+        bool isSupportedActivationFormat(TensorType type)
+        {
+            return type == TensorType::FP32 ||
+                   type == TensorType::BF16 ||
+                   type == TensorType::FP16;
+        }
+
+        /**
+         * @brief Validate the native-format and active-shape contract.
+         *
+         * Explicit active rows may be smaller than arena capacity during decode,
+         * therefore capacity is checked with numel() rather than requiring exact
+         * tensor shapes. Gamma remains FP32 for every activation format.
+         */
+        bool validateTensorContract(
+            const TensorBase *input,
+            const TensorBase *residual,
+            const TensorBase *gamma,
+            const TensorBase *norm_output,
+            int rows,
+            int cols)
+        {
+            if (rows <= 0 || cols <= 0)
+            {
+                LOG_ERROR("[FusedResidualNormStage] Invalid active shape rows="
+                          << rows << " cols=" << cols);
+                return false;
+            }
+
+            const TensorType activation_type = input->native_type();
+            if (!isSupportedActivationFormat(activation_type))
+            {
+                LOG_ERROR("[FusedResidualNormStage] Unsupported activation format "
+                          << tensorTypeName(activation_type));
+                return false;
+            }
+
+            if (residual->native_type() != activation_type ||
+                norm_output->native_type() != activation_type)
+            {
+                LOG_ERROR("[FusedResidualNormStage] input/residual/norm_output formats must match: input="
+                          << tensorTypeName(activation_type)
+                          << " residual=" << tensorTypeName(residual->native_type())
+                          << " norm_output=" << tensorTypeName(norm_output->native_type()));
+                return false;
+            }
+
+            if (gamma->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[FusedResidualNormStage] gamma must be FP32, got "
+                          << tensorTypeName(gamma->native_type()));
+                return false;
+            }
+
+            const size_t active_elements = static_cast<size_t>(rows) *
+                                           static_cast<size_t>(cols);
+            if (input->numel() < active_elements ||
+                residual->numel() < active_elements ||
+                norm_output->numel() < active_elements ||
+                gamma->numel() < static_cast<size_t>(cols))
+            {
+                LOG_ERROR("[FusedResidualNormStage] Tensor capacity is smaller than the active shape");
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Publish one successful grouped production route to perfstats.
+         *
+         * M=1 serial witnesses intentionally do not emit this metric. Focused
+         * integration tests can therefore reset immediately before an M=2..4
+         * invocation and require exactly one record, proving the grouped stage
+         * actually ran instead of merely comparing precomputed bytes.
+         */
+        void recordGroupedRoute(
+            const char *backend,
+            const char *counter_name,
+            TensorType activation_type,
+            int rows,
+            int cols,
+            const char *implementation,
+            const char *invocation_policy)
+        {
+            if (rows < 2 || rows > 4)
+                return;
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                counter_name,
+                1.0,
+                "verifier",
+                backend,
+                {{"tensor_format", tensorTypeName(activation_type)},
+                 {"verifier_rows", std::to_string(rows)},
+                 {"cols", std::to_string(cols)},
+                 {"implementation", implementation},
+                 {"capture_mode", isGraphCaptureActive() ? "graph_capture" : "direct"},
+                 {"row_mapping", "independent_rows"},
+                 {"invocation_policy", invocation_policy}});
+        }
+    } // namespace
 
     FusedResidualNormStage::FusedResidualNormStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
@@ -70,6 +214,11 @@ namespace llaminar2
         const int hidden_dim = params_.hidden_dim > 0 ? params_.hidden_dim : static_cast<int>(input_base->cols());
         const size_t num_elements = static_cast<size_t>(seq_len) * hidden_dim;
 
+        if (!validateTensorContract(
+                input_base, residual_base, gamma_base, norm_output_base,
+                seq_len, hidden_dim))
+            return false;
+
         LOG_DEBUG("[FusedResidualNormStage] seq_len=" << seq_len
                                                       << " hidden_dim=" << hidden_dim
                                                       << " eps=" << params_.eps);
@@ -77,14 +226,13 @@ namespace llaminar2
 #if defined(HAVE_CUDA) || defined(HAVE_ROCM)
         if (params_.device_id.is_gpu())
         {
-            // GPU fused path: single kernel for residual add + RMSNorm
-            const float *d_input = static_cast<const float *>(input_base->gpu_data_ptr());
-            const float *d_residual = static_cast<const float *>(residual_base->gpu_data_ptr());
+            // Device ownership is strict: no active_data_ptr() bridge is legal
+            // here because graph capture and replay must never adopt host storage.
+            const void *d_input = input_base->gpu_data_ptr();
+            const void *d_residual = residual_base->gpu_data_ptr();
             const float *d_gamma = static_cast<const float *>(gamma_base->gpu_data_ptr());
-
-            // residual is updated in-place (output = residual buffer)
-            float *d_residual_out = static_cast<float *>(residual_base->gpu_data_ptr());
-            float *d_norm_out = static_cast<float *>(norm_output_base->gpu_data_ptr());
+            void *d_residual_out = residual_base->gpu_data_ptr();
+            void *d_norm_out = norm_output_base->gpu_data_ptr();
 
             if (!d_input || !d_residual || !d_gamma || !d_residual_out || !d_norm_out)
             {
@@ -93,26 +241,82 @@ namespace llaminar2
             }
 
             void *stream = gpuStream();
+            if (!stream)
+            {
+                LOG_ERROR("[FusedResidualNormStage] GPU execution requires an explicit non-default stream");
+                return false;
+            }
+
             bool ok = false;
+            const TensorType activation_type = input_base->native_type();
+            const int device_index = params_.device_id.toKernelDeviceIndex();
 
 #ifdef HAVE_CUDA
             if (params_.device_id.is_cuda())
             {
-                ok = cudaOps_fused_residual_rmsnorm_fp32(
-                    d_input, d_residual, d_gamma,
-                    d_residual_out, d_norm_out,
-                    seq_len, hidden_dim, params_.eps,
-                    params_.device_id.toKernelDeviceIndex(), stream);
+                switch (activation_type)
+                {
+                case TensorType::FP32:
+                    ok = cudaOps_fused_residual_rmsnorm_fp32(
+                        static_cast<const float *>(d_input),
+                        static_cast<const float *>(d_residual), d_gamma,
+                        static_cast<float *>(d_residual_out),
+                        static_cast<float *>(d_norm_out),
+                        seq_len, hidden_dim, params_.eps, device_index, stream);
+                    break;
+                case TensorType::BF16:
+                    ok = cudaOps_fused_residual_rmsnorm_bf16(
+                        static_cast<const uint16_t *>(d_input),
+                        static_cast<const uint16_t *>(d_residual), d_gamma,
+                        static_cast<uint16_t *>(d_residual_out),
+                        static_cast<uint16_t *>(d_norm_out),
+                        seq_len, hidden_dim, params_.eps, device_index, stream);
+                    break;
+                case TensorType::FP16:
+                    ok = cudaOps_fused_residual_rmsnorm_fp16(
+                        static_cast<const uint16_t *>(d_input),
+                        static_cast<const uint16_t *>(d_residual), d_gamma,
+                        static_cast<uint16_t *>(d_residual_out),
+                        static_cast<uint16_t *>(d_norm_out),
+                        seq_len, hidden_dim, params_.eps, device_index, stream);
+                    break;
+                default:
+                    break;
+                }
             }
 #endif
 #ifdef HAVE_ROCM
             if (params_.device_id.is_rocm())
             {
-                ok = hipOps_fused_residual_rmsnorm_fp32(
-                    d_input, d_residual, d_gamma,
-                    d_residual_out, d_norm_out,
-                    seq_len, hidden_dim, params_.eps,
-                    params_.device_id.toKernelDeviceIndex(), stream);
+                switch (activation_type)
+                {
+                case TensorType::FP32:
+                    ok = hipOps_fused_residual_rmsnorm_fp32(
+                        static_cast<const float *>(d_input),
+                        static_cast<const float *>(d_residual), d_gamma,
+                        static_cast<float *>(d_residual_out),
+                        static_cast<float *>(d_norm_out),
+                        seq_len, hidden_dim, params_.eps, device_index, stream);
+                    break;
+                case TensorType::BF16:
+                    ok = hipOps_fused_residual_rmsnorm_bf16(
+                        static_cast<const uint16_t *>(d_input),
+                        static_cast<const uint16_t *>(d_residual), d_gamma,
+                        static_cast<uint16_t *>(d_residual_out),
+                        static_cast<uint16_t *>(d_norm_out),
+                        seq_len, hidden_dim, params_.eps, device_index, stream);
+                    break;
+                case TensorType::FP16:
+                    ok = hipOps_fused_residual_rmsnorm_fp16(
+                        static_cast<const uint16_t *>(d_input),
+                        static_cast<const uint16_t *>(d_residual), d_gamma,
+                        static_cast<uint16_t *>(d_residual_out),
+                        static_cast<uint16_t *>(d_norm_out),
+                        seq_len, hidden_dim, params_.eps, device_index, stream);
+                    break;
+                default:
+                    break;
+                }
             }
 #endif
 
@@ -120,6 +324,21 @@ namespace llaminar2
             {
                 LOG_ERROR("[FusedResidualNormStage] GPU fused kernel failed");
                 return false;
+            }
+
+            if (params_.device_id.is_cuda())
+            {
+                recordGroupedRoute(
+                    "cuda", "cuda_fused_residual_rmsnorm_grouped_verifier_rows_calls",
+                    activation_type, seq_len, hidden_dim,
+                    "native_fused_kernel", "single_grouped_launch");
+            }
+            else
+            {
+                recordGroupedRoute(
+                    "rocm", "rocm_fused_residual_rmsnorm_grouped_verifier_rows_calls",
+                    activation_type, seq_len, hidden_dim,
+                    "native_fused_kernel", "single_grouped_launch");
             }
 
             // Mark both outputs as device-dirty (GPU is authoritative)
@@ -160,7 +379,8 @@ namespace llaminar2
                     params_.eps);
             }
 #else
-            // Scalar fallback: separate operations
+            // Portable scalar implementation preserves the same two-pass row
+            // arithmetic when this translation unit has no AVX-512 target.
             for (int r = 0; r < seq_len; ++r)
             {
                 float *res_row = res_data + r * hidden_dim;
@@ -197,10 +417,16 @@ namespace llaminar2
                 }
             }
 
+            recordGroupedRoute(
+                "cpu", "cpu_fused_residual_rmsnorm_grouped_verifier_rows_calls",
+                input_base->native_type(), seq_len, hidden_dim,
+                "fused_cache_resident_rows", "single_grouped_stage_call");
             return true;
         }
 
-        // CPU general path: use KernelFactory for sequential residual add + RMSNorm
+        // The BF16/FP16 implementation uses one grouped typed residual kernel
+        // followed by one grouped typed RMSNorm kernel. Both consume the full
+        // active M-row span; neither invokes or re-enters the stage row by row.
         auto *res_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateResidualAdd(
             input_base, params_.device_id);
         if (!res_kernel)
@@ -253,6 +479,11 @@ namespace llaminar2
         {
             traceOutput("residual", params_.residual);
             traceOutput("norm_output", params_.norm_output);
+
+            recordGroupedRoute(
+                "cpu", "cpu_fused_residual_rmsnorm_grouped_verifier_rows_calls",
+                input_base->native_type(), seq_len, hidden_dim,
+                "typed_residual_then_rmsnorm", "single_grouped_stage_call");
         }
         return ok;
     }

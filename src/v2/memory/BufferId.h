@@ -29,6 +29,7 @@ namespace llaminar2
         LOGITS_LOCAL, ///< Column-parallel partial logits (TP)
         ALL_POSITION_LOGITS,       ///< Verifier logits for every row [seq_len, vocab_size]
         ALL_POSITION_LOGITS_LOCAL, ///< Column-parallel verifier logits [seq_len, local_vocab]
+        REQUEST_SEQUENCE_LENGTHS,  ///< Device-owned valid row count for each request in a padded batch
 
         // ── Per-layer activation buffers (recycled across layers) ───────────
         NORMALIZED,  ///< RMSNorm output
@@ -143,6 +144,7 @@ namespace llaminar2
         MTP_FFN_OUTPUT,
         MTP_LOGITS,
         MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
+        MTP_POSITION_IDS, ///< Arena-owned INT32 request positions for device-resident batched MTP sidecar replay
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
 
         _COUNT ///< Sentinel – must be last
@@ -165,6 +167,8 @@ namespace llaminar2
             return "ALL_POSITION_LOGITS";
         case BufferId::ALL_POSITION_LOGITS_LOCAL:
             return "ALL_POSITION_LOGITS_LOCAL";
+        case BufferId::REQUEST_SEQUENCE_LENGTHS:
+            return "REQUEST_SEQUENCE_LENGTHS";
         case BufferId::NORMALIZED:
             return "NORMALIZED";
         case BufferId::RESIDUAL:
@@ -329,6 +333,8 @@ namespace llaminar2
             return "MTP_LOGITS";
         case BufferId::MTP_CONDITION_TOKEN:
             return "MTP_CONDITION_TOKEN";
+        case BufferId::MTP_POSITION_IDS:
+            return "MTP_POSITION_IDS";
         case BufferId::MTP_VERIFIER_INPUT_TOKENS:
             return "MTP_VERIFIER_INPUT_TOKENS";
         case BufferId::MOE_GATE_SCRATCH:

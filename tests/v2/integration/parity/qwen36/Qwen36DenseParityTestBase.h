@@ -247,9 +247,10 @@ namespace llaminar2::test::parity::qwen36
      * @brief Assert that a dense greedy MTP request used the expected verifier lane.
      *
      * Token equality proves the visible response, but not the performance path.
-     * This guard makes the parity matrix fail if a GPU LocalTP or single-device
-     * request silently falls back to row-serial decode-equivalent replay after
-     * grouped verifier rows have already been proven correct.
+     * This guard makes the parity matrix fail if a GPU LocalTP, single-device,
+     * CPU, or NodeLocalTP request silently drifts away from the grouped
+     * decode-equivalent verifier rows after those rows have already been proven
+     * correct.
      *
      * @param test_case Dense parity fixture under test.
      * @param records Perfstats snapshot captured immediately after the request.
@@ -260,10 +261,17 @@ namespace llaminar2::test::parity::qwen36
         const std::vector<PerfStatRecord> &records,
         const std::string &context)
     {
-        const bool used_serial_replay =
+        const bool used_retired_serial_replay =
             denseHasMTPPerfCounter(
                 records,
                 "decode_equivalent_sequential_verifier_runs");
+        const bool used_grouped_host_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_publication_uses") &&
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_state_publications");
         const bool used_grouped_device_publication =
             denseHasMTPPerfCounter(
                 records,
@@ -291,7 +299,7 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_TRUE(used_grouped_verifier)
                 << context << " should run the grouped greedy verifier rows.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_serial_replay)
+            EXPECT_FALSE(used_retired_serial_replay)
                 << context << " must not use row-serial verifier replay when "
                    "device-resident publication is available.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
@@ -302,9 +310,15 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
 
-        EXPECT_TRUE(used_serial_replay || used_grouped_device_publication)
-            << context << " should exercise an explicit decode-equivalent "
-               "MTP verifier path.\n"
+        EXPECT_TRUE(used_grouped_verifier)
+            << context << " should run grouped decode-equivalent verifier rows.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(used_grouped_device_publication || used_grouped_host_publication)
+            << context << " should publish grouped verifier state through an "
+               "explicit grouped publication path.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(used_retired_serial_replay)
+            << context << " must not use the retired row-serial verifier replay.\n"
             << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_FALSE(used_direct_all_position_publication)
             << context << " must not use unproven dense direct all-position "
@@ -747,6 +761,141 @@ namespace llaminar2::test::parity::qwen36
                << " symmetric_kl=" << metrics.symmetric_kl
                << " max_abs_diff=" << metrics.max_abs_diff
                << " max_abs_index=" << metrics.max_abs_index;
+    }
+
+    /**
+     * @brief Prove grouped verifier recurrent state is byte-identical to serial decode.
+     *
+     * Logit equality is necessary but not sufficient for MTP publication:
+     * accepted verifier rows also publish GDN recurrence and short-conv state
+     * that the next ordinary decode step consumes.  CPU stores that state in
+     * host vectors, while CUDA/ROCm own the production state in backend kernel
+     * buffers.  This helper therefore treats GPU device hashes as mandatory
+     * whenever either side exposes them, and only falls back to host-vector
+     * hashes for pure CPU probes.
+     */
+    inline ::testing::AssertionResult verifierGDNStateByteIdentical(
+        const PrefixRuntimeStateSnapshot &grouped,
+        const PrefixRuntimeStateSnapshot &serial,
+        const std::string &label)
+    {
+        if (grouped.gdn_layers.size() != serial.gdn_layers.size())
+        {
+            return ::testing::AssertionFailure()
+                   << label << " GDN layer count mismatch: grouped="
+                   << grouped.gdn_layers.size()
+                   << " serial=" << serial.gdn_layers.size();
+        }
+
+        auto boolString = [](bool value) -> const char *
+        {
+            return value ? "true" : "false";
+        };
+
+        for (size_t i = 0; i < grouped.gdn_layers.size(); ++i)
+        {
+            const PrefixGDNLayerProbe &g = grouped.gdn_layers[i];
+            const PrefixGDNLayerProbe &s = serial.gdn_layers[i];
+            const bool compare_device =
+                g.device_state_hash_available ||
+                s.device_state_hash_available;
+            const bool compare_local_device =
+                g.local_device_state_hash_available ||
+                s.local_device_state_hash_available;
+
+            if (g.global_layer != s.global_layer)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " GDN layer index mismatch at ordinal " << i
+                       << ": grouped=L" << g.global_layer
+                       << " serial=L" << s.global_layer;
+            }
+
+            if (compare_device)
+            {
+                if (!g.device_state_hash_available ||
+                    !s.device_state_hash_available ||
+                    g.recurrence_device_bytes != s.recurrence_device_bytes ||
+                    g.conv_device_bytes != s.conv_device_bytes ||
+                    g.recurrence_device_hash != s.recurrence_device_hash ||
+                    g.conv_device_hash != s.conv_device_hash)
+                {
+                    return ::testing::AssertionFailure()
+                           << label << " device GDN state mismatch at L"
+                           << g.global_layer
+                           << ": grouped_available="
+                           << boolString(g.device_state_hash_available)
+                           << " serial_available="
+                           << boolString(s.device_state_hash_available)
+                           << " grouped_rec_bytes="
+                           << g.recurrence_device_bytes
+                           << " serial_rec_bytes="
+                           << s.recurrence_device_bytes
+                           << " grouped_conv_bytes=" << g.conv_device_bytes
+                           << " serial_conv_bytes=" << s.conv_device_bytes
+                           << " grouped_rec_hash="
+                           << g.recurrence_device_hash
+                           << " serial_rec_hash="
+                           << s.recurrence_device_hash
+                           << " grouped_conv_hash=" << g.conv_device_hash
+                           << " serial_conv_hash=" << s.conv_device_hash;
+                }
+            }
+            else if (g.recurrence_values != s.recurrence_values ||
+                     g.conv_values != s.conv_values ||
+                     g.recurrence_hash != s.recurrence_hash ||
+                     g.conv_hash != s.conv_hash)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " host GDN state mismatch at L"
+                       << g.global_layer
+                       << ": grouped_rec_values=" << g.recurrence_values
+                       << " serial_rec_values=" << s.recurrence_values
+                       << " grouped_conv_values=" << g.conv_values
+                       << " serial_conv_values=" << s.conv_values
+                       << " grouped_rec_hash=" << g.recurrence_hash
+                       << " serial_rec_hash=" << s.recurrence_hash
+                       << " grouped_conv_hash=" << g.conv_hash
+                       << " serial_conv_hash=" << s.conv_hash;
+            }
+
+            if (compare_local_device &&
+                (!g.local_device_state_hash_available ||
+                 !s.local_device_state_hash_available ||
+                 g.recurrence_local_device_bytes !=
+                     s.recurrence_local_device_bytes ||
+                 g.conv_local_device_bytes != s.conv_local_device_bytes ||
+                 g.recurrence_local_device_hash !=
+                     s.recurrence_local_device_hash ||
+                 g.conv_local_device_hash != s.conv_local_device_hash))
+            {
+                return ::testing::AssertionFailure()
+                       << label << " local-device GDN state mismatch at L"
+                       << g.global_layer
+                       << ": grouped_available="
+                       << boolString(g.local_device_state_hash_available)
+                       << " serial_available="
+                       << boolString(s.local_device_state_hash_available)
+                       << " grouped_rec_bytes="
+                       << g.recurrence_local_device_bytes
+                       << " serial_rec_bytes="
+                       << s.recurrence_local_device_bytes
+                       << " grouped_conv_bytes="
+                       << g.conv_local_device_bytes
+                       << " serial_conv_bytes="
+                       << s.conv_local_device_bytes
+                       << " grouped_rec_hash="
+                       << g.recurrence_local_device_hash
+                       << " serial_rec_hash="
+                       << s.recurrence_local_device_hash
+                       << " grouped_conv_hash="
+                       << g.conv_local_device_hash
+                       << " serial_conv_hash="
+                       << s.conv_local_device_hash;
+            }
+        }
+
+        return ::testing::AssertionSuccess();
     }
 
     inline ::testing::AssertionResult tokenSequencesMatch(
@@ -1350,31 +1499,13 @@ namespace llaminar2::test::parity::qwen36
         return snapshots;
     }
 
-    inline ::testing::AssertionResult denseVerifierRowSnapshotsNear(
+    inline ::testing::AssertionResult denseVerifierRowSnapshotsByteIdentical(
         const std::map<std::string, DenseStageSnapshot> &verifier_snapshots,
         const std::map<std::string, DenseStageSnapshot> &single_row_snapshots,
         const std::string &label,
         int verifier_rows,
-        int verifier_row_index,
-        float abs_tolerance = 1.0e-6f,
-        float rel_tolerance = 1.0e-6f)
+        int verifier_row_index)
     {
-        if (const char *override_tolerance =
-                std::getenv("LLAMINAR_DENSE_VERIFIER_SNAPSHOT_TOLERANCE"))
-        {
-            char *parse_end = nullptr;
-            const float parsed = std::strtof(override_tolerance, &parse_end);
-            if (parse_end != override_tolerance && std::isfinite(parsed) && parsed >= 0.0f)
-            {
-                /*
-                 * Diagnostic only: the normal acceptance thresholds above stay
-                 * strict and stable, while this env var lets us hunt for the
-                 * earliest sub-micro drift without changing test semantics.
-                 */
-                abs_tolerance = parsed;
-                rel_tolerance = parsed;
-            }
-        }
         if (verifier_rows <= 0 ||
             verifier_row_index < 0 ||
             verifier_row_index >= verifier_rows)
@@ -1392,6 +1523,8 @@ namespace llaminar2::test::parity::qwen36
             size_t mismatches = 0;
             float first_actual = 0.0f;
             float first_expected = 0.0f;
+            uint32_t first_actual_bits = 0;
+            uint32_t first_expected_bits = 0;
             float first_abs = 0.0f;
             float first_rel = 0.0f;
             float max_abs = 0.0f;
@@ -1423,19 +1556,22 @@ namespace llaminar2::test::parity::qwen36
             {
                 const float a = verifier.data[verifier_row_offset + col];
                 const float e = single.data[col];
+                uint32_t actual_bits = 0;
+                uint32_t expected_bits = 0;
+                std::memcpy(&actual_bits, &a, sizeof(actual_bits));
+                std::memcpy(&expected_bits, &e, sizeof(expected_bits));
                 const float abs_diff = std::fabs(a - e);
                 const float scale = std::max(std::fabs(a), std::fabs(e));
                 const float rel_diff = scale > 0.0f ? abs_diff / scale : 0.0f;
-                const bool within_tolerance =
-                    std::isfinite(a) && std::isfinite(e) &&
-                    abs_diff <= abs_tolerance + rel_tolerance * scale;
-                if (!within_tolerance)
+                if (actual_bits != expected_bits)
                 {
                     if (mismatch.mismatches == 0)
                     {
                         mismatch.col = col;
                         mismatch.first_actual = a;
                         mismatch.first_expected = e;
+                        mismatch.first_actual_bits = actual_bits;
+                        mismatch.first_expected_bits = expected_bits;
                         mismatch.first_abs = abs_diff;
                         mismatch.first_rel = rel_diff;
                     }
@@ -1531,7 +1667,7 @@ namespace llaminar2::test::parity::qwen36
                   });
 
         std::ostringstream oss;
-        oss << label << " stage snapshot row mismatch across "
+        oss << label << " stage snapshot row byte mismatch across "
             << mismatches.size() << " / " << comparable
             << " comparable stages";
         const size_t limit = std::min<size_t>(mismatches.size(), 24);
@@ -1543,6 +1679,8 @@ namespace llaminar2::test::parity::qwen36
                 << " first_col=" << m.col
                 << " actual=" << m.first_actual
                 << " expected=" << m.first_expected
+                << " actual_bits=0x" << std::hex << m.first_actual_bits
+                << " expected_bits=0x" << m.first_expected_bits << std::dec
                 << " abs=" << m.first_abs
                 << " rel=" << m.first_rel
                 << " max_abs=" << m.max_abs
@@ -2576,7 +2714,11 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
         EXPECT_GE(mtp_state.mtp_verifier_token_count, 2u);
 
-        const bool used_decode_equivalent_greedy_verifier =
+        const bool used_grouped_decode_equivalent_greedy_verifier =
+            denseHasMTPPerfCounter(
+                mtp_records,
+                "grouped_decode_equivalent_greedy_verifier_runs");
+        const bool used_retired_serial_replay =
             denseHasMTPPerfCounter(
                 mtp_records,
                 "decode_equivalent_sequential_verifier_runs");
@@ -2590,7 +2732,7 @@ namespace llaminar2::test::parity::qwen36
                 mtp_records,
                 "verifier_policy_selections",
                 "reason",
-                "greedy_penalties_use_shared_decode_equivalent_verifier");
+                "greedy_penalties_use_grouped_decode_equivalent_outcome");
 
         if (denseCaseExpectsAllPositionSpecPublication(test_case))
         {
@@ -2598,15 +2740,19 @@ namespace llaminar2::test::parity::qwen36
                 << "Dense penalty-greedy MTP advertised all-position "
                    "publication support but did not use it.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_greedy_verifier)
+            EXPECT_FALSE(used_grouped_decode_equivalent_greedy_verifier)
                 << "Dense penalty-greedy MTP should not use the shared "
                    "verifier once direct publication is proven.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_retired_serial_replay)
+                << "Dense penalty-greedy MTP must not use retired row-serial "
+                   "verifier replay.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
         else
         {
-            EXPECT_TRUE(used_decode_equivalent_greedy_verifier)
-                << "Dense penalty-greedy MTP must use the shared "
+            EXPECT_TRUE(used_grouped_decode_equivalent_greedy_verifier)
+                << "Dense penalty-greedy MTP must use the grouped "
                    "decode-equivalent verifier while direct publication is "
                    "not advertised.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
@@ -2617,6 +2763,10 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_FALSE(used_all_position_publication)
                 << "Dense penalty-greedy MTP must not publish from an "
                    "unproven all-position verifier.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_retired_serial_replay)
+                << "Dense penalty-greedy MTP must not use retired row-serial "
+                   "verifier replay.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
     }
@@ -3891,14 +4041,12 @@ namespace llaminar2::test::parity::qwen36
         const int32_t restored_next = runner->sampleGreedyOnDevice();
 
         const ::testing::AssertionResult stage_match =
-            denseVerifierRowSnapshotsNear(
+            denseVerifierRowSnapshotsByteIdentical(
                 restored_snapshots,
                 sequential_snapshots,
                 "Restored one-row decode",
                 1,
-                0,
-                1.0e-5f,
-                1.0e-5f);
+                0);
         EXPECT_TRUE(stage_match)
             << stage_match.message();
         EXPECT_EQ(restored_next, sequential_next)
@@ -4691,7 +4839,6 @@ namespace llaminar2::test::parity::qwen36
             grouped_logits,
             grouped_logits + static_cast<size_t>(grouped_rows.size()) *
                                  static_cast<size_t>(vocab));
-
         EXPECT_EQ(grouped_rows.back(), expected_ready_token)
             << "final grouped verifier row must expose the same ready token as "
                "serial verifier replay";
@@ -4754,7 +4901,7 @@ namespace llaminar2::test::parity::qwen36
                 ::testing::AssertionSuccess();
             if (verifier_snapshot_diagnostic)
             {
-                snapshot_result = denseVerifierRowSnapshotsNear(
+                snapshot_result = denseVerifierRowSnapshotsByteIdentical(
                     grouped_snapshots,
                     serial_snapshots_by_row[row],
                     "dense grouped verifier diagnostic row " +
@@ -4936,10 +5083,10 @@ namespace llaminar2::test::parity::qwen36
                         1e-12);
         }
 
-        const bool used_decode_equivalent_stochastic_verifier =
+        const bool used_grouped_stochastic_verifier =
             denseHasMTPPerfCounter(
                 phase138_records,
-                "decode_equivalent_stochastic_verifier_runs");
+                "grouped_decode_equivalent_stochastic_verifier_runs");
         const bool used_all_position_publication =
             denseHasMTPPerfCounter(
                 phase138_records,
@@ -4961,10 +5108,10 @@ namespace llaminar2::test::parity::qwen36
                 << "GPU Qwen3.6 stochastic MTP must exercise vLLM-style "
                    "all-position state publication\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-                << "GPU Qwen3.6 stochastic MTP must not fall back to the "
-                   "decode-equivalent stochastic verifier once publication is "
-                   "available\n"
+            EXPECT_FALSE(used_grouped_stochastic_verifier)
+                << "GPU Qwen3.6 stochastic MTP must not also run grouped "
+                   "decode-equivalent stochastic verification once direct "
+                   "all-position publication is available\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
         else if (denseCaseExpectsGroupedDevicePublication(test_case))
@@ -4974,11 +5121,6 @@ namespace llaminar2::test::parity::qwen36
                    "rank-owned grouped verifier outcome and device-resident "
                    "publication path\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-                << "GPU LocalTP Qwen3.6 stochastic MTP must not fall back to "
-                   "row-serial stochastic verifier replay once the rank "
-                   "compact reducer is available\n"
-                << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_FALSE(used_all_position_publication)
                 << "GPU LocalTP Qwen3.6 stochastic MTP must not promote to a "
                    "single-owner all-position publication path\n"
@@ -4986,9 +5128,9 @@ namespace llaminar2::test::parity::qwen36
         }
         else
         {
-            EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
-                << "CPU Qwen3.6 stochastic MTP must use the shared "
-                   "decode-equivalent verifier while direct all-position "
+            EXPECT_TRUE(used_grouped_stochastic_verifier)
+                << "CPU Qwen3.6 stochastic MTP must use grouped "
+                   "decode-equivalent verification while direct all-position "
                    "publication is not advertised\n"
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_FALSE(used_all_position_publication)

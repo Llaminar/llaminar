@@ -84,37 +84,24 @@ namespace llaminar2
     }
 
     bool KVCacheAppendStage::shouldUseDecodeEquivalentVerifierAppend(
-        int total_tokens,
-        int batch_size,
-        int seq_len) const
+        int request_rows) const
     {
-        if (!params_.kv_cache)
-        {
+        if (params_.append_semantics !=
+            KVCacheAppendSemantics::DecodeEquivalentVerifier)
             return false;
-        }
 
-        if (batch_size != 1 || seq_len != total_tokens)
+        if (!params_.kv_cache || params_.layer_idx < 0 || params_.seq_idx < 0 ||
+            request_rows < 2 || request_rows > 4)
         {
-            return false;
+            LOG_ERROR("[KVCacheAppendStage] Invalid grouped verifier cache-publication contract"
+                      << " rows=" << request_rows
+                      << " layer=" << params_.layer_idx
+                      << " seq=" << params_.seq_idx
+                      << " cache=" << params_.kv_cache);
+            throw std::runtime_error(
+                "invalid grouped verifier KV cache-publication contract");
         }
-
-        // Phase 9.8 verifier rows are bounded by the production MTP draft
-        // depth.  Larger shapes are true prefill and must keep the normal
-        // throughput path.
-        if (total_tokens < 2 || total_tokens > 4)
-        {
-            return false;
-        }
-
-        if (params_.layer_idx < 0 || params_.seq_idx < 0)
-        {
-            return false;
-        }
-
-        // This row-equivalent path is for decode/verifier continuation over an
-        // existing prefix.  Tiny prompt prefills should not pay the serial row
-        // cost, and they have no serial decode cache state to match.
-        return params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx) > 0;
+        return true;
     }
 
     bool KVCacheAppendStage::execute(IDeviceContext *ctx)
@@ -134,10 +121,8 @@ namespace llaminar2
         }
 
         // Determine the graph-shaped token count first, then narrow to the real
-        // prefix for non-captured padded execution. Captured prefill records the
-        // fixed bucket kernel shape and advances host metadata by the real
-        // prefix while recording so later captured attention stages can see the
-        // just-appended cache view.
+        // prefix for non-captured padded execution. Captured GPU execution keeps
+        // head/count and real request lengths entirely in canonical device state.
         int total_tokens = params_.num_tokens;
         if (total_tokens <= 0)
         {
@@ -202,7 +187,7 @@ namespace llaminar2
                     static_cast<size_t>(std::max(0, cached_tokens + num_tokens));
             }
 
-            if (shouldUseDecodeEquivalentVerifierAppend(num_tokens, params_.batch_size, params_.seq_len))
+            if (shouldUseDecodeEquivalentVerifierAppend(num_tokens))
             {
                 success = params_.kv_cache->appendVerifierRowsDecodeEquivalent(
                     params_.layer_idx,
@@ -246,31 +231,6 @@ namespace llaminar2
                     estimateTensorAppendBytes(v_tensor, num_tokens));
                 const uint64_t tokens = static_cast<uint64_t>(num_tokens);
                 KVCacheProfiler::record(KVCacheOpType::APPEND, duration_ns, tokens, bytes);
-            }
-
-            if (success &&
-                isGraphCaptureActive() &&
-                isGraphCaptureHostBookkeepingActive() &&
-                params_.kv_cache->isGraphCaptureReady())
-            {
-                // Cached decode graph capture records GPU append kernels, but the
-                // immediate launch-after-capture deliberately skips
-                // onGraphReplayed(). Advance host metadata during recording so
-                // subsequent captured stages see the appended token in
-                // get_cached_tokens()/dynamic dequant params, matching normal
-                // execution. Prefill capture and collective Phase-2 capture keep
-                // this guard disabled and continue to use replay callbacks or
-                // real post-capture execution instead.
-                const int advance_tokens = replay_advance_tokens_ > 0
-                                               ? replay_advance_tokens_
-                                               : num_tokens;
-                if (advance_tokens > num_tokens)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Capture bookkeeping token count exceeds append token count: real="
-                              << advance_tokens << " append=" << num_tokens);
-                    return false;
-                }
-                params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, advance_tokens);
             }
 
             if (success)

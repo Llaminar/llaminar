@@ -631,12 +631,22 @@ TEST_F(Test__ROCmAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
     auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(kv_cache, nullptr);
 
+    int32_t *device_real_kv_len = nullptr;
+    ASSERT_EQ(hipMalloc(&device_real_kv_len, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_real_kv_len,
+            &real_kv_len,
+            sizeof(real_kv_len),
+            hipMemcpyHostToDevice,
+            static_cast<hipStream_t>(stream)),
+        hipSuccess);
+    ASSERT_TRUE(kv_cache->bindGraphAppendCountSource(
+        0, 0, device_real_kv_len, bucket_kv_len, stream));
     ASSERT_TRUE(kv_cache->appendWithStream(0, 0, key.get(), value.get(), bucket_kv_len, stream));
     gpu_ctx.synchronizeStream(stream);
-    ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), bucket_kv_len);
-    kv_cache->clear_sequence(0, 0);
-    kv_cache->advanceHead(0, 0, real_kv_len);
     ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), real_kv_len);
+    ASSERT_EQ(hipFree(device_real_kv_len), hipSuccess);
 
     const auto expected_real_prefix = referenceSingleQueryGQAAttention(
         query->data(), key->data(), value->data(), real_kv_len, n_heads, n_kv_heads, head_dim);

@@ -2,12 +2,13 @@
  * @file IHybridKVCache.h
  * @brief Interface for hybrid KV caches that combine FA and GDN layer state
  *
- * Extends IKVCache with GDN state access methods. Stages can dynamic_cast
- * an IKVCache* to IHybridKVCache* to access per-layer GDN state:
+ * Extends IKVCache with GDN state access methods. CPU caches expose their
+ * host-owned live vectors; GPU caches expose kernel resources while keeping
+ * all live recurrent state private to device-resident kernel banks.
  *
  *   auto* hybrid = dynamic_cast<IHybridKVCache*>(kv_cache);
  *   if (hybrid && hybrid->isGDNLayer(layer_idx)) {
- *       float* conv_state = hybrid->getConvState(layer_idx);
+ *       float* conv_state = hybrid->getConvState(layer_idx); // CPU only
  *       ITensorShortConvolution* kernel = hybrid->getConvKernel(layer_idx);
  *       ...
  *   }
@@ -42,18 +43,6 @@ namespace llaminar2
         bool synchronize = true;
         bool include_host_state = true;
         bool include_device_state = true;
-        /*
-         * Partial prefix hits resume with a suffix prefill. TP GDN graphs keep
-         * two resident recurrent-state shapes: a local suffix-prefill bank and
-         * a full decode-ready bank. Portable prefix blocks may contain both
-         * serialized logical/local state and captured full device state. These
-         * flags let GPU caches materialize the local bank from the serialized
-         * host payload while still restoring the captured full bank when
-         * present.  `include_host_state` controls the live host mirror; it is
-         * deliberately independent from using `src_host` as an import source.
-         */
-        bool import_host_state_into_device_state = false;
-        bool import_device_state_from_host_state = false;
     };
 
     /**
@@ -93,10 +82,12 @@ namespace llaminar2
         virtual HybridGDNLayerState *getGDNState(int layer) = 0;
         virtual const HybridGDNLayerState *getGDNState(int layer) const = 0;
 
-        /// Get mutable recurrence state [n_v_heads, d_k, d_v] (nullptr if FA)
+        /// Get CPU-owned recurrence state [n_v_heads, d_k, d_v].
+        /// Returns nullptr for FA layers and every GPU cache.
         virtual float *getRecurrenceState(int layer) = 0;
 
-        /// Get mutable conv state [qkv_dim, conv_kernel-1] (nullptr if FA)
+        /// Get CPU-owned conv state [qkv_dim, conv_kernel-1].
+        /// Returns nullptr for FA layers and every GPU cache.
         virtual float *getConvState(int layer) = 0;
 
         // =====================================================================

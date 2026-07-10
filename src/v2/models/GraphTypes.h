@@ -831,8 +831,18 @@ namespace llaminar2
          */
         const void *position_ids_device = nullptr;
         const std::vector<int> *sequence_lengths = nullptr;
+        const int32_t *sequence_lengths_device = nullptr;
         int batch_size = 1;
         int seq_len = 1;
+        /**
+         * @brief First request-local sequence slot addressed by this sidecar graph.
+         *
+         * Ordinary grouped decode starts at zero. Batched shifted-prefill may
+         * group several temporal rows from one request, so its one-request
+         * graph must append to that request's actual cache slot instead of
+         * silently publishing every payload into slot zero.
+         */
+        int first_sequence_index = 0;
         DeviceId device = DeviceId::cpu();
         BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         bool kv_cache_only = false;

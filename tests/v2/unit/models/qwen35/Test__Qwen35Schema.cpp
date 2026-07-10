@@ -116,7 +116,7 @@ namespace
                     s.d_k = d_k;
                     s.d_v = d_v;
                     s.conv_kernel_size = config.gdn.conv_kernel_size;
-                    s.initialize(qkv_dim);
+                    s.initializeCPUState(qkv_dim);
                     s.conv_kernel = std::make_shared<StubShortConvolution>();
                     s.rec_kernel = std::make_shared<StubGatedDeltaNet>();
                 }
@@ -176,7 +176,7 @@ namespace
         {
             size_t total = 0;
             for (const auto &s : gdn_states_)
-                total += s.memoryBytes();
+                total += s.cpuMemoryBytes();
             return total;
         }
         HybridPrefixStateMetadata hybridPrefixStateMetadata() const override

@@ -16,6 +16,7 @@
 #include <optional>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 namespace llaminar2
 {
@@ -27,6 +28,21 @@ namespace llaminar2
     class TensorBase;
     class TurboQuantContext;
     class ActivationRotation;
+
+    /**
+     * @brief Mathematical publication contract for one KV append stage.
+     *
+     * This policy is selected declaratively by the model graph.  In particular,
+     * a grouped MTP verifier append is not inferred from mutable cache length:
+     * doing so would make graph topology depend on a stale host observation of
+     * GPU-owned sequence state.  Both policies are economical backend kernels;
+     * neither permits stage-level row replay.
+     */
+    enum class KVCacheAppendSemantics
+    {
+        Standard,                 ///< Normal prompt/decode cache publication.
+        DecodeEquivalentVerifier ///< Grouped MTP rows with serial-decode semantics.
+    };
 
     /**
      * @brief Explicit KV cache append stage
@@ -59,6 +75,26 @@ namespace llaminar2
             int num_tokens = 0;
             int batch_size = 1;
             int seq_len = 0;
+
+            /**
+             * @brief Mathematical cache-publication policy selected by the graph.
+             *
+             * MTP verifier graphs must set DecodeEquivalentVerifier explicitly.
+             * The stage never guesses this policy from host cache metadata.
+             */
+            KVCacheAppendSemantics append_semantics =
+                KVCacheAppendSemantics::Standard;
+
+            /**
+             * @brief Persistent device row containing one real length per request.
+             *
+             * A request-batched prefill graph has fixed `seq_len` geometry, but
+             * each request may contain fewer real rows. The captured append and
+             * sequence-advance kernels consume this persistent row directly;
+             * there is no intermediate cache mailbox or pre-replay copy. This
+             * pointer must remain valid for the lifetime of the captured graph.
+             */
+            const int32_t *request_sequence_lengths_device = nullptr;
 
             /// [Hybrid mode] Optional output for dequantized V (FP32)
             ITensor *V_dequant_out = nullptr;
@@ -95,33 +131,43 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::KV_CACHE_APPEND; }
         StageBufferContract bufferContract() const override;
-        // KV cache append is graph-capturable when the KV cache supports
-        // device-side head parameters. updateDynamicParams() uploads the head
-        // to a stable device scalar before capture/replay; captured append
-        // records only the dynamic kernel that reads that scalar.
+        // KV cache append is graph-capturable when its kernels consume the
+        // cache's canonical device head/count allocations directly.
         bool isGraphCapturable() const override
         {
             return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
         }
         bool hasDynamicParams() const override
         {
-            return params_.kv_cache && params_.kv_cache->supportsDynamicAppendState();
+            return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
         }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
             return true;
         }
+        /**
+         * @brief Mark this append replay as consuming device-owned sequence state.
+         *
+         * KV append stages do not read absolute position IDs directly.  The
+         * device-position replay hook is still meaningful for them because it
+         * confirms that replay position and cache state have a common device
+         * owner. Canonical GPU append no longer has a host-owned alternative,
+         * so this hook intentionally performs no state transition.
+         */
+        void updateDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override
+        {
+            (void)seq_len;
+            (void)position_ids_device;
+        }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             (void)pos_offset;
             params_.seq_len = seq_len;
-            if (params_.kv_cache && params_.kv_cache->supportsDynamicAppendState())
+            if (params_.kv_cache && params_.kv_cache->isGraphCaptureReady())
             {
-                // Upload current ring state and the real append length to
-                // graph-owned device scalars. Padded prefill buckets keep a
-                // bucket-shaped kernel for reuse, but sequence metadata must
-                // advance by the real prompt length so padding never becomes
-                // visible cache state.
+                // Bind the graph-shaped append to canonical device metadata.
+                // Padded prefill buckets consume the persistent request-length
+                // row directly; exact-shape graphs use their captured row count.
                 void *stream = gpuStream();
                 int append_tokens = params_.seq_len > 0 ? params_.seq_len : params_.num_tokens;
                 if (params_.batch_size <= 1 && replay_advance_tokens_ > 0)
@@ -142,10 +188,39 @@ namespace llaminar2
                               << " seq_idx=" << params_.seq_idx);
                     throw std::runtime_error("invalid dynamic KV append token contract");
                 }
-                if (!params_.kv_cache->setDynamicAppendState(
-                        params_.layer_idx, params_.seq_idx, append_tokens, stream))
+                const int request_count = std::max(1, params_.batch_size);
+                const bool resident_request_lengths =
+                    params_.request_sequence_lengths_device != nullptr;
+                const int captured_request_tokens =
+                    params_.seq_len > 0
+                        ? params_.seq_len
+                        : std::max(1, bucket_tokens / request_count);
+                bool append_state_ready = true;
+                for (int request = 0; request < request_count; ++request)
                 {
-                    LOG_ERROR("[KVCacheAppendStage] KV cache refused dynamic append state for graph replay");
+                    const int seq_idx = params_.seq_idx + request;
+                    const int32_t *append_count_source =
+                        resident_request_lengths
+                            ? params_.request_sequence_lengths_device + request
+                            : nullptr;
+                    const bool request_ready =
+                        params_.kv_cache->bindGraphAppendCountSource(
+                            params_.layer_idx,
+                            seq_idx,
+                            append_count_source,
+                            captured_request_tokens,
+                            stream);
+                    append_state_ready = append_state_ready && request_ready;
+                }
+                if (!append_state_ready)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] KV cache refused dynamic append state for graph replay"
+                              << " resident_request_lengths="
+                              << (resident_request_lengths ? "true" : "false")
+                              << " layer=" << params_.layer_idx
+                              << " first_seq_idx=" << params_.seq_idx
+                              << " request_count=" << request_count
+                              << " append_tokens=" << append_tokens);
                 }
                 if (debugEnv().attention.debug_kv_cache_snapshot &&
                     debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx))
@@ -153,7 +228,8 @@ namespace llaminar2
                     const int cached_tokens =
                         params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
                     debug_cache_snapshot_rows_ =
-                        static_cast<size_t>(std::max(0, cached_tokens + append_tokens));
+                        static_cast<size_t>(
+                            std::max(0, cached_tokens + append_tokens));
                     invalidateDumpInfoCache();
                 }
             }
@@ -192,19 +268,6 @@ namespace llaminar2
                 invalidateDumpInfoCache();
             }
         }
-        void onGraphReplayed() override
-        {
-            // Advance the ring buffer head and count on the host side.
-            // Called by DeviceGraphExecutor AFTER the captured graph segment replays.
-            if (params_.kv_cache)
-            {
-                const int advance_tokens = replay_advance_tokens_ > 0
-                                               ? replay_advance_tokens_
-                                               : params_.num_tokens;
-                params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, advance_tokens);
-            }
-        }
-        bool needsOnGraphReplayed() const override { return true; }
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
@@ -244,8 +307,7 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Returns true when a tiny verifier append needs grouped
-         * decode-equivalent cache publication.
+         * @brief Validate and select grouped decode-equivalent publication.
          *
          * Grouped MTP verifier rows are mathematically decode rows, not prompt
          * prefill rows.  Cache publication must therefore use a dedicated
@@ -253,9 +315,7 @@ namespace llaminar2
          * updates ring metadata atomically.  Stage-level serial replay is not a
          * production implementation for Phase 9.8.
          */
-        bool shouldUseDecodeEquivalentVerifierAppend(int total_tokens,
-                                                     int batch_size,
-                                                     int seq_len) const;
+        bool shouldUseDecodeEquivalentVerifierAppend(int request_rows) const;
 
         Params params_;
         std::unique_ptr<FP16Tensor> fp16_k_scratch_;
@@ -282,6 +342,10 @@ namespace llaminar2
         /// Real token count to advance after prefill graph replay; 0 falls
         /// back to params_.num_tokens for decode and legacy exact-shape replay.
         int replay_advance_tokens_ = 0;
+
+        /// One-shot marker set by device-resident replay preparation.  When
+        /// true, updateDynamicParams() preserves GPU-owned cache head/count
+        /// metadata and uploads only the append-count scalar.
     };
 
 } // namespace llaminar2

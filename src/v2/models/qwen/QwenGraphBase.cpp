@@ -1014,6 +1014,8 @@ namespace llaminar2
         int bucket_seq_len,
         DeviceId device,
         std::string &dependency_out,
+        const int32_t *request_sequence_lengths_device,
+        int request_row_stride,
         BufferId input_buffer_id) const
     {
         dependency_out = dependency_node;
@@ -1061,10 +1063,29 @@ namespace llaminar2
             row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
             if (device.is_gpu())
             {
-                row_params.workspace_buffer_name =
-                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
-                row_params.declare_selected_rows_workspace = false;
-                row_params.upload_selected_rows_to_workspace = false;
+                if (request_sequence_lengths_device)
+                {
+                    /*
+                     * Request-batched prefill owns real lengths in the arena.
+                     * The row-select kernel derives terminal rows from that
+                     * device array, so compact logits cannot accidentally read
+                     * stale verifier metadata from an earlier transaction.
+                     */
+                    row_params.device_row_index_source =
+                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                            RequestTerminalLengths;
+                    row_params.request_sequence_lengths_device =
+                        request_sequence_lengths_device;
+                    row_params.request_row_stride = request_row_stride;
+                }
+                else
+                {
+                    row_params.device_row_index_source =
+                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                            ExternalDeviceIndices;
+                    row_params.workspace_buffer_name =
+                        MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                }
             }
 
             graph.addNode("lm_head_rows_select",
@@ -1154,6 +1175,7 @@ namespace llaminar2
         qwen_input.device = input.device;
         qwen_input.kv_cache = input.kv_cache;
         qwen_input.sequence_lengths = input.sequence_lengths;
+        qwen_input.sequence_lengths_device = input.sequence_lengths_device;
 
         // Adapt generic ForwardOutput to ForwardOutput
         ForwardOutput qwen_output;
@@ -1195,7 +1217,8 @@ namespace llaminar2
         ComputeGraph attn_graph = buildAttentionGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
             ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device,
-            ctx.sequence_lengths, ctx.position_ids_device);
+            ctx.sequence_lengths, ctx.position_ids_device,
+            ctx.sequence_lengths_device);
 
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
@@ -1328,7 +1351,8 @@ namespace llaminar2
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths, input.position_ids_device);
+                input.sequence_lengths, input.position_ids_device,
+                input.sequence_lengths_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -1385,7 +1409,9 @@ namespace llaminar2
             input.real_seq_len,
             input.bucket_seq_len,
             device,
-            lm_head_dependency);
+            lm_head_dependency,
+            input.sequence_lengths_device,
+            input.seq_len);
 
         // -------------------------------------------------------------------------
         // Stage 4: LM Head (with optional Column-Parallel + AllGather)
@@ -1686,7 +1712,8 @@ namespace llaminar2
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths, input.position_ids_device);
+                input.sequence_lengths, input.position_ids_device,
+                input.sequence_lengths_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -1753,7 +1780,9 @@ namespace llaminar2
                 input.real_seq_len,
                 input.bucket_seq_len,
                 device,
-                lm_head_dependency);
+                lm_head_dependency,
+                input.sequence_lengths_device,
+                input.seq_len);
 
             // LM Head (with optional Column-Parallel + AllGather)
             bool use_column_parallel =
@@ -2025,7 +2054,8 @@ namespace llaminar2
                 ComputeGraph attn_graph = buildAttentionGraph(
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                     input.batch_size, layer_kv_cache, position_ids, stage_device,
-                    input.sequence_lengths, input.position_ids_device);
+                    input.sequence_lengths, input.position_ids_device,
+                    input.sequence_lengths_device);
 
                 // Get the terminal node of attention sub-graph
                 std::string attn_last = attn_graph.terminalNode();
@@ -2147,7 +2177,9 @@ namespace llaminar2
                     input.real_seq_len,
                     input.bucket_seq_len,
                     stage_device,
-                    lm_head_dependency);
+                    lm_head_dependency,
+                    input.sequence_lengths_device,
+                    input.seq_len);
 
                 // LM Head
                 bool use_column_parallel = useColumnParallelLMHeadForGraph(buffers_.logits_local);
@@ -2252,11 +2284,17 @@ namespace llaminar2
         GraphResolverConfig config = getResolverConfig(input.seq_len);
         config.batch_size = input.batch_size;
 
-        // KV cache state
+        // KV cache topology is declarative. The admitted request range owns
+        // the graph-planning cursor; GPU cache contents remain device-owned and
+        // must never be observed while constructing a graph.
         config.has_kv_cache = (input.kv_cache != nullptr);
         if (config.has_kv_cache)
         {
-            config.cached_tokens = input.kv_cache->get_cached_tokens(0, 0);
+            config.cached_tokens = std::max(
+                0,
+                input.token_offset != 0
+                    ? input.token_offset
+                    : input.position_offset);
         }
 
         // Execution policy from debugEnv
@@ -2497,10 +2535,11 @@ namespace llaminar2
             row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
             if (device.is_gpu())
             {
+                row_params.device_row_index_source =
+                    HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                        ExternalDeviceIndices;
                 row_params.workspace_buffer_name =
                     MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
-                row_params.declare_selected_rows_workspace = false;
-                row_params.upload_selected_rows_to_workspace = false;
             }
 
             graph.addNode("lm_head_rows_select",
@@ -3377,10 +3416,12 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         IKVCache *kv_cache,
+        const int32_t *request_sequence_lengths_device,
         DeviceId device,
         const std::string &rope_dependency,
         const std::vector<std::string> &cache_source_dependencies,
-        bool layer_idx_is_cache_local)
+        bool layer_idx_is_cache_local,
+        int first_seq_idx)
     {
         int total_tokens = batch_size * seq_len;
         const int kv_stage_layer = kvCacheLayerForGraphStage(
@@ -3490,10 +3531,16 @@ namespace llaminar2
                               .V = append_V,
                               .kv_cache = kv_cache,
                               .layer_idx = kv_stage_layer,
-                              .seq_idx = 0,
+                              .seq_idx = first_seq_idx,
                               .num_tokens = total_tokens,
                               .batch_size = batch_size,
                               .seq_len = seq_len,
+                              .append_semantics =
+                                  config_.compute_all_position_logits &&
+                                          seq_len >= 2 && seq_len <= 4
+                                      ? KVCacheAppendSemantics::DecodeEquivalentVerifier
+                                      : KVCacheAppendSemantics::Standard,
+                              .request_sequence_lengths_device = request_sequence_lengths_device,
                               .kv_cache_scale_k = config_.kv_cache_scale_k,
                               .kv_cache_scale_v = config_.kv_cache_scale_v,
                               .head_dim = config_.head_dim,
@@ -3526,6 +3573,7 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         const void *position_ids_device,
+        const int32_t *request_sequence_lengths_device,
         DeviceId device,
         bool has_qkv_proj,
         const std::string &rope_dependency,
@@ -3548,6 +3596,7 @@ namespace llaminar2
                 seq_len,
                 batch_size,
                 kv_cache,
+                request_sequence_lengths_device,
                 device,
                 rope_dependency,
                 cache_source_dependencies,
@@ -3559,7 +3608,7 @@ namespace llaminar2
         int kv_len = total_tokens;
         bool use_gather_stage = false;
 
-        if (kv_cache)
+        if (kv_cache && !device.is_gpu())
         {
             int cached_tokens = kv_cache->get_cached_tokens(kv_stage_layer, 0);
             if (cached_tokens > 0 && batch_size == 1)
@@ -3585,6 +3634,22 @@ namespace llaminar2
                                                       << " batched decode but no gather buffers");
                 }
             }
+        }
+        else if (kv_cache && device.is_gpu())
+        {
+            /*
+             * GPU attention resolves the live cache through its captured
+             * device-state read. Keep only a host-known launch horizon here;
+             * neither cache metadata nor cache-sized tensor wrappers belong in
+             * graph construction. The first position ID is request geometry,
+             * not a mirror of the cache's canonical head/count allocation.
+             */
+            const int request_offset =
+                position_ids ? std::max(0, position_ids[0]) : 0;
+            kv_len = std::clamp(
+                request_offset + seq_len,
+                std::max(1, seq_len),
+                std::max(1, kv_cache->max_seq_len()));
         }
 
         // --- KV Cache Gather (batched decode) ---

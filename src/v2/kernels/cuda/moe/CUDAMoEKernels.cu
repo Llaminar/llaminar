@@ -9999,6 +9999,8 @@ namespace
     static constexpr int kWarpsPerQuantBlock = 8; // 8 warps = 256-thread block
     __global__ void grouped_prefill_gather_quantize_blockwise_kernel(
         const float *__restrict__ hidden,
+        const int8_t *__restrict__ prequantized_hidden,
+        const float *__restrict__ prequantized_hidden_scales,
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         const int *__restrict__ grouped_token_indices,
@@ -10036,6 +10038,19 @@ namespace
             fail_fast_incomplete_llep_transfer();
             return;
         }
+        if (prequantized_hidden && prequantized_hidden_scales)
+        {
+            A_int8[static_cast<size_t>(slot) * K + col] =
+                prequantized_hidden[static_cast<size_t>(source_token) * K + col];
+            if (lane == 0)
+            {
+                scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] =
+                    prequantized_hidden_scales[
+                        static_cast<size_t>(source_token) * blocks_per_row + block_idx];
+            }
+            return;
+        }
+
         const float value = hidden[static_cast<size_t>(source_token) * K + col];
 
         // Warp-local absmax reduction (each warp owns its own 32-element block).
@@ -13856,6 +13871,8 @@ extern "C"
 
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
+        const int8_t *d_prequantized_hidden,
+        const float *d_prequantized_hidden_scales,
         const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
         const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
         const DeviceNativeVNNIMatrixDesc *d_down_desc_table,
@@ -13944,7 +13961,8 @@ extern "C"
             dim3 grid((blocks_per_row + kWarpsPerQuantBlock - 1) / kWarpsPerQuantBlock, total_slots);
             dim3 block(kWarpsPerQuantBlock * 32);
             grouped_prefill_gather_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-                d_hidden, d_scratch_A_int8, d_scratch_scales,
+                d_hidden, d_prequantized_hidden, d_prequantized_hidden_scales,
+                d_scratch_A_int8, d_scratch_scales,
                 d_group_token_indices, total_slots, seq_len, top_k,
                 grouped_indices_are_route_slots, d_model);
             if (!finishGroupedPrefillLaunch("cudaMoE_grouped_prefill_gather_quantize", cuda_stream))

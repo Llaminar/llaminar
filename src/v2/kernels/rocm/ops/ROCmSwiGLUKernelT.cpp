@@ -15,10 +15,13 @@
 #include "ROCmSwiGLUKernelT.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/ROCmKernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <hip/hip_runtime.h>
 #include <cstdio>
+#include <string>
 
 // =========================================================================
 // Extern "C" declarations for HIP kernel wrappers
@@ -38,6 +41,38 @@ extern "C"
         int size, int device_idx, void *stream);
 }
 
+namespace
+{
+    /**
+     * @brief Record one successful production ROCm grouped SwiGLU launch.
+     *
+     * One flat HIP grid processes every element in all M verifier rows. Serial
+     * M=1 witnesses intentionally emit no record so hidden replay cannot satisfy
+     * the grouped route gate.
+     */
+    void recordROCmGroupedSwiGLUCall(
+        const char *tensor_format,
+        int verifier_rows,
+        int cols,
+        int device)
+    {
+        if (verifier_rows < 2 || verifier_rows > 4)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_swiglu_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            llaminar2::DeviceId::rocm(device).to_string(),
+            {{"tensor_format", tensor_format},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"cols", std::to_string(cols)},
+             {"capture_mode", llaminar2::isGraphCaptureActive() ? "graph_capture" : "direct"},
+             {"invocation_policy", "single_flat_launch"}});
+    }
+} // namespace
+
 namespace llaminar2
 {
     namespace rocm
@@ -54,8 +89,12 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual; // TODO: implement residual addition
             (void)mpi_ctx;
+            if (add_residual)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<FP32>] add_residual has no residual operand and is unsupported");
+                return false;
+            }
             int size = rows * cols;
             return apply_typed(gate, up, output, size, device_idx);
         }
@@ -69,11 +108,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
-            (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<FP32>] apply_tensor requires an explicit non-null HIP stream");
+                return false;
+            }
+            if (add_residual)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<FP32>] apply_tensor does not accept add_residual");
+                return false;
+            }
             if (gate->native_type() != TensorType::FP32 ||
                 up->native_type() != TensorType::FP32 ||
                 output->native_type() != TensorType::FP32)
@@ -97,8 +144,14 @@ namespace llaminar2
             float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_fp32(d_gate, d_up, d_output, size, dev, gpu_stream_);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::SWIGLU,
+                static_cast<hipStream_t>(gpu_stream_));
+            const bool ok = hipOps_swiglu_fp32(
+                d_gate, d_up, d_output, size, dev, gpu_stream_);
+            if (ok)
+                recordROCmGroupedSwiGLUCall("FP32", rows, cols, dev);
+            return ok;
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -124,8 +177,12 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
+            if (add_residual)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<BF16>] add_residual has no residual operand and is unsupported");
+                return false;
+            }
             int size = rows * cols;
             return apply_typed(gate, up, output, size, device_idx);
         }
@@ -139,11 +196,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
-            (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<BF16>] apply_tensor requires an explicit non-null HIP stream");
+                return false;
+            }
+            if (add_residual)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<BF16>] apply_tensor does not accept add_residual");
+                return false;
+            }
             if (gate->native_type() != TensorType::BF16 ||
                 up->native_type() != TensorType::BF16 ||
                 output->native_type() != TensorType::BF16)
@@ -165,8 +230,14 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_bf16(d_gate, d_up, d_output, size, dev, gpu_stream_);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::SWIGLU,
+                static_cast<hipStream_t>(gpu_stream_));
+            const bool ok = hipOps_swiglu_bf16(
+                d_gate, d_up, d_output, size, dev, gpu_stream_);
+            if (ok)
+                recordROCmGroupedSwiGLUCall("BF16", rows, cols, dev);
+            return ok;
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -192,8 +263,12 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            (void)add_residual;
             (void)mpi_ctx;
+            if (add_residual)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<FP16>] add_residual has no residual operand and is unsupported");
+                return false;
+            }
             int size = rows * cols;
             return apply_typed(gate, up, output, size, device_idx);
         }
@@ -207,11 +282,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
-            (void)add_residual;
             (void)mpi_ctx;
             if (!gate || !up || !output)
                 return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<FP16>] apply_tensor requires an explicit non-null HIP stream");
+                return false;
+            }
+            if (add_residual)
+            {
+                LOG_ERROR("[ROCmSwiGLUKernelT<FP16>] apply_tensor does not accept add_residual");
+                return false;
+            }
             if (gate->native_type() != TensorType::FP16 ||
                 up->native_type() != TensorType::FP16 ||
                 output->native_type() != TensorType::FP16)
@@ -233,8 +316,14 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             int size = rows * cols;
-            // No sync needed - coherence system handles sync when data is read
-            return hipOps_swiglu_fp16(d_gate, d_up, d_output, size, dev, gpu_stream_);
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::SWIGLU,
+                static_cast<hipStream_t>(gpu_stream_));
+            const bool ok = hipOps_swiglu_fp16(
+                d_gate, d_up, d_output, size, dev, gpu_stream_);
+            if (ok)
+                recordROCmGroupedSwiGLUCall("FP16", rows, cols, dev);
+            return ok;
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(

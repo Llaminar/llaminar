@@ -95,7 +95,6 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "utils/DebugEnv.h"
 #ifdef HAVE_CUDA
-#include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
 #include <cuda_runtime.h>
 // Parity should exercise the production CUDA prefill path unless a test opts in
 // to a deterministic-mode regression explicitly.
@@ -2186,13 +2185,9 @@ namespace llaminar2::test::parity
             // CRITICAL: Clear kernel caches at test start for clean state.
             // TearDown() also clears, but this guards against incomplete teardown
             // from a prior test (crash, skip, or assertion failure) leaving stale
-            // GEMM engines, embedding caches, or prepared-weight handles.
+            // GEMM engines or prepared-weight handles.
             if (!preserveParityPipelineCachesBetweenTests())
                 llaminar::v2::kernels::KernelFactory::clearCache();
-#ifdef HAVE_CUDA
-            if (!preserveParityPipelineCachesBetweenTests())
-                llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
-#endif
 
             // Device-specific setup first (may skip)
             setupDeviceSpecific();
@@ -2332,16 +2327,6 @@ namespace llaminar2::test::parity
                     auto scope = profileParityScope("tear_down.clear_kernel_cache");
                     llaminar::v2::kernels::KernelFactory::clearCache();
                 }
-
-                // CRITICAL: Clear embedding caches to prevent test pollution!
-                // The embedding kernels cache workspace-to-tensor mappings statically.
-                // Without clearing, subsequent tests may use stale cached pointers.
-#ifdef HAVE_CUDA
-                {
-                    auto scope = profileParityScope("tear_down.clear_embedding_cache");
-                    llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
-                }
-#endif
 
                 {
                     auto scope = profileParityScope("tear_down.clear_model_and_snapshots");

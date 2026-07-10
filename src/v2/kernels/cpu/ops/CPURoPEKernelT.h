@@ -301,6 +301,26 @@ namespace llaminar2
             int device_idx = -1,
             int pos_offset = 0,
             int rotary_dim = 0) override;
+
+        /**
+         * @brief Apply native BF16 verifier rows as one decode-equivalent group.
+         *
+         * Angle recurrence follows serial M=1 decode exactly, while native
+         * BF16 row/head work is scheduled together by the primitive layer.
+         */
+        bool apply_verifier_rows_decode_equivalent(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int verifier_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
     };
 
     // =========================================================================
@@ -363,6 +383,26 @@ namespace llaminar2
             TensorBase *K,
             const int *position_ids,
             int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
+
+        /**
+         * @brief Apply native FP16 verifier rows as one decode-equivalent group.
+         *
+         * The grouped primitive reuses serial-decode angle recurrence and the
+         * same FP16 SIMD conversion path, then parallelizes across all rows.
+         */
+        bool apply_verifier_rows_decode_equivalent(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int verifier_rows,
             int n_heads,
             int n_kv_heads,
             int head_dim,
@@ -443,6 +483,26 @@ namespace llaminar2
             TensorBase *K,
             const int *position_ids,
             int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
+
+        /**
+         * @brief Apply native Q8_1 verifier rows as one pure-integer group.
+         *
+         * The implementation preserves serial decode's Q15 angle conversion
+         * and directly rotates Q8 blocks; no FP32 tensor round trip is used.
+         */
+        bool apply_verifier_rows_decode_equivalent(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int verifier_rows,
             int n_heads,
             int n_kv_heads,
             int head_dim,
@@ -634,6 +694,28 @@ namespace llaminar2
             TensorBase *K,
             const int *position_ids,
             int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int pos_offset = 0,
+            int rotary_dim = 0) override;
+
+        /**
+         * @brief Apply native Q16_1 verifier rows with block-size dispatch.
+         *
+         * Q16 serial decode computes each absolute Q15 angle directly, so the
+         * existing multi-row primitive is already batch invariant. This entry
+         * point validates the verifier contract and dispatches one grouped call
+         * for 32-, 64-, or 128-value Q16 blocks.
+         */
+        bool apply_verifier_rows_decode_equivalent(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int verifier_rows,
             int n_heads,
             int n_kv_heads,
             int head_dim,

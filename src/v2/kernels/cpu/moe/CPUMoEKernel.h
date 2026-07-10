@@ -11,6 +11,9 @@
 
 #include "../../IMoEKernel.h"
 #include "../CPUKernelBase.h"
+#include "../../../tensors/BlockStructures.h"
+
+#include <vector>
 
 namespace llaminar2
 {
@@ -64,6 +67,28 @@ namespace llaminar2
 
         void swiGLU(float *gate, const float *up, int count) override;
 
+        /**
+         * @brief Return the router-owned Q8_1 rows for the next grouped expert pass.
+         *
+         * CPU NativeVNNI expert projections consume Q8_1 activations.  Routing
+         * and expert execution therefore share one canonical transform instead
+         * of quantizing the same hidden row again for every routed expert.  A
+         * publication is valid only for the exact FP32 source address, requested
+         * row count, and model width that produced it.  Callers must treat a null
+         * result as a broken production ordering contract; grouped CPU verifier
+         * execution has no requantization fallback.
+         *
+         * @param source FP32 hidden-row base passed to route().
+         * @param rows Number of contiguous verifier rows the consumer needs.
+         * @param d_model Number of FP32 values in each row.
+         * @return Contiguous `[rows, ceil(d_model / 32)]` Q8_1 blocks, or nullptr
+         *         when no matching router publication exists.
+         */
+        const Q8_1Block *publishedRouterQ8Hidden(
+            const float *source,
+            int rows,
+            int d_model) const noexcept;
+
         // =================================================================
         // ITensorKernel interface
         // =================================================================
@@ -77,6 +102,28 @@ namespace llaminar2
         {
             return KernelSnapshotInfo::passthrough();
         }
+
+    private:
+        /** Revoke publication metadata before beginning a new routing call. */
+        void invalidateRouterQ8HiddenPublication() noexcept;
+
+        /**
+         * @brief Quantize and publish M=1..4 router inputs for NativeVNNI experts.
+         *
+         * The implementation deliberately uses the same Q8_1 block primitives
+         * as serial NativeVNNI decode.  Keeping this transform in the router
+         * makes grouped expert execution both economical and byte-equivalent.
+         */
+        bool publishRouterQ8Hidden(
+            const float *source,
+            int rows,
+            int d_model);
+
+        std::vector<Q8_1Block> router_q8_hidden_; ///< Canonical contiguous verifier rows.
+        const float *router_q8_hidden_source_ = nullptr; ///< FP32 producer identity.
+        int router_q8_hidden_rows_ = 0; ///< Number of published rows.
+        int router_q8_hidden_d_model_ = 0; ///< Published row width.
+        bool router_q8_hidden_valid_ = false; ///< Metadata and payload are current.
     };
 
 } // namespace llaminar2

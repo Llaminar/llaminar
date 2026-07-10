@@ -28,10 +28,11 @@ GPU all-position verifier publication now hard-fails without resident compact
 outcome publication; host `MTPSpecStepPlanBatch` publication is CPU-only.
 Focused MTP/Rank/runner gates pass; full unit `517/517` passes for this slice.
 
-2026-07-09 grouped verifier proof: exact precommit/CI gate
-`^V2_Integration_GroupedVerifierRows_` passed `16/16` across CPU/CUDA/ROCm.
-CPU `AllFormats` now includes fused NativeVNNI K-parallel verifier rows; CPU/CUDA
-Qwen3.6 dense+MoE operation equivalence passed `4/4`.
+2026-07-10 grouped proof: canonical gate passed `43/43` (CPU 13, CUDA 13,
+ROCm 17). GPU request-batch accept/residual/recovery/bonus draws now consume
+resident positions in captured CUDA/ROCm kernels; scalar/resident outputs are
+byte-identical. Transition `125/125`, ownership policy `96/96`, full build
+`935/935`, and explicit CUDA/ROCm sampling lanes pass.
 
 ## Device And Topology Matrix
 
@@ -77,9 +78,6 @@ build time on both CUDA and ROCm.
   ROCm M4: `0.1778 ms` graph vs `4.7366 ms` row replay. CUDA M4:
   `0.1035 ms` graph vs `9.8135 ms` row replay.
 - ROCm verifier handoff reruns M4 after workspace rebind/reset.
-- CUDA/ROCm shared `SharedExpertFFNStage` now proves production grouped
-  table-prefill M=1..4 all-format rows against public M=1 table decode;
-  MoE expert-path sweeps and `V2_Perf_MoEVerifierPrefill` pass.
 - CUDA long-prompt MoE greedy parity and CUDA/ROCm stochastic verifier runs are
   green after pruning the broken combined owner.
 - Replay preservation gates pass:

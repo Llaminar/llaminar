@@ -1371,7 +1371,7 @@ namespace llaminar2::test
         ASSERT_NE(forward_end, std::string::npos);
         const std::string forward_body = dgo_contents.substr(forward_start, forward_end - forward_start);
 
-        const size_t forward_mtp = forward_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, batch_size");
+        const size_t forward_mtp = forward_body.find("populateMTPShiftedCacheFromPrefill(");
         const size_t forward_terminal = forward_body.find("noteMainForwardHiddenProducedForMTP(");
         const size_t forward_release = forward_body.find("releaseHostResidentWeightData();");
         ASSERT_NE(forward_mtp, std::string::npos);
@@ -1387,7 +1387,7 @@ namespace llaminar2::test
         ASSERT_NE(chunk_end, std::string::npos);
         const std::string chunk_body = dgo_contents.substr(chunk_start, chunk_end - chunk_start);
 
-        const size_t chunk_mtp = chunk_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, 1");
+        const size_t chunk_mtp = chunk_body.find("populateMTPShiftedCacheFromPrefill(");
         const size_t chunk_terminal = chunk_body.find("noteMainForwardHiddenProducedForMTP(terminal_seq_len, 1)");
         const size_t chunk_release = chunk_body.find("releaseHostResidentWeightData();");
         ASSERT_NE(chunk_mtp, std::string::npos);

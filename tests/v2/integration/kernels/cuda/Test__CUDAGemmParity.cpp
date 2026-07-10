@@ -56,6 +56,7 @@
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 
 #include <vector>
 #include <array>
@@ -259,27 +260,62 @@ namespace
 
     const std::vector<CUDASmallMFormatSpec> &cudaSmallMNativeFormats()
     {
-        static const std::vector<CUDASmallMFormatSpec> formats = {
-            {"Q4_0", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_0Random({n, k}); }},
-            {"IQ4_NL", 0.985, [](size_t n, size_t k) { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
-            {"Q4_1", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_1Random({n, k}); }},
-            {"IQ4_XS", 0.985, [](size_t n, size_t k) { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
-            {"Q5_0", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_0Random({n, k}); }},
-            {"Q5_1", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_1Random({n, k}); }},
-            {"Q4_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_KRandom({n, k}); }},
-            {"Q5_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_KRandom({n, k}); }},
-            {"Q6_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ6_KRandom({n, k}); }},
-            {"Q3_K", 0.980, [](size_t n, size_t k) { return TestTensorFactory::createQ3_KRandom({n, k}); }},
-            {"Q2_K", 0.960, [](size_t n, size_t k) { return TestTensorFactory::createQ2_KRandom({n, k}); }},
-            {"IQ3_S", 0.970, [](size_t n, size_t k) { return TestTensorFactory::createIQ3_SRandom({n, k}); }},
-            {"IQ3_XXS", 0.960, [](size_t n, size_t k) { return TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
-            {"IQ2_S", 0.920, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_SRandom({n, k}); }},
-            {"IQ2_XS", 0.900, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XSRandom({n, k}); }},
-            {"IQ2_XXS", 0.880, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
-            {"IQ1_S", 0.800, [](size_t n, size_t k) { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
-            {"IQ1_M", 0.800, [](size_t n, size_t k) { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
-            {"Q8_0", 0.999, [](size_t n, size_t k) { return TestTensorFactory::createQ8_0Random({n, k}); }},
-        };
+        static const std::vector<CUDASmallMFormatSpec> formats = []
+        {
+            std::vector<CUDASmallMFormatSpec> result;
+            result.reserve(quantizedVerifierFormats().size());
+            for (const auto &format : quantizedVerifierFormats())
+            {
+                double threshold = 0.990;
+                switch (format.tensor_type)
+                {
+                case TensorType::IQ4_NL:
+                case TensorType::IQ4_XS:
+                    threshold = 0.985;
+                    break;
+                case TensorType::Q3_K:
+                    threshold = 0.980;
+                    break;
+                case TensorType::Q2_K:
+                    threshold = 0.960;
+                    break;
+                case TensorType::IQ3_S:
+                    threshold = 0.970;
+                    break;
+                case TensorType::IQ3_XXS:
+                    threshold = 0.960;
+                    break;
+                case TensorType::IQ2_S:
+                    threshold = 0.920;
+                    break;
+                case TensorType::IQ2_XS:
+                    threshold = 0.900;
+                    break;
+                case TensorType::IQ2_XXS:
+                    threshold = 0.880;
+                    break;
+                case TensorType::IQ1_S:
+                case TensorType::IQ1_M:
+                    threshold = 0.800;
+                    break;
+                case TensorType::Q8_0:
+                case TensorType::Q8_1:
+                case TensorType::Q8_K:
+                    threshold = 0.999;
+                    break;
+                default:
+                    break;
+                }
+                result.push_back({
+                    format.label,
+                    threshold,
+                    [creator = format.create](size_t n, size_t k)
+                    {
+                        return creator({n, k}, 42u);
+                    }});
+            }
+            return result;
+        }();
         return formats;
     }
 

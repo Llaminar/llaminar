@@ -1209,6 +1209,8 @@ extern "C"
 
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
+        const int8_t *d_prequantized_hidden,
+        const float *d_prequantized_hidden_scales,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_down_desc_table,
@@ -1342,6 +1344,67 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::bindGroupedDescriptorTableSlot(
+        const char *buffer_name,
+        std::size_t slot,
+        int num_experts,
+        DeviceNativeVNNIMatrixDesc **device_descs,
+        const char *context)
+    {
+        if (!buffer_name || !device_descs || num_experts <= 0 ||
+            slot >= static_cast<std::size_t>(
+                        MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+        {
+            return false;
+        }
+
+        void *base = nullptr;
+        if (!bindWorkspaceBuffer(
+                &base,
+                buffer_name,
+                sizeof(DeviceNativeVNNIMatrixDesc),
+                context))
+        {
+            return false;
+        }
+
+        const std::size_t available = workspace_->getBufferSize(buffer_name);
+        const std::size_t slot_bytes =
+            available /
+            static_cast<std::size_t>(
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+        const std::size_t descriptor_stride =
+            slot_bytes / sizeof(DeviceNativeVNNIMatrixDesc);
+        if (descriptor_stride < static_cast<std::size_t>(num_experts))
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context
+                                           << " descriptor slot is too narrow in '"
+                                           << buffer_name << "': slot=" << slot
+                                           << " stride=" << descriptor_stride
+                                           << " requested_experts=" << num_experts
+                                           << " workspace_bytes=" << available);
+            return false;
+        }
+
+        const std::size_t descriptor_offset = slot * descriptor_stride;
+        const std::size_t descriptor_capacity =
+            available / sizeof(DeviceNativeVNNIMatrixDesc);
+        if (descriptor_offset + static_cast<std::size_t>(num_experts) >
+            descriptor_capacity)
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context
+                                           << " descriptor slot exceeds workspace capacity in '"
+                                           << buffer_name << "': offset=" << descriptor_offset
+                                           << " requested_experts=" << num_experts
+                                           << " capacity=" << descriptor_capacity);
+            return false;
+        }
+
+        *device_descs =
+            static_cast<DeviceNativeVNNIMatrixDesc *>(base) + descriptor_offset;
+        return true;
+    }
+
     void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
         d_staging_indices_ = nullptr;
@@ -1383,8 +1446,7 @@ namespace llaminar2
         runtime_prefill_desc_cap_ = 0;
         d_decode_hidden_int8_ = nullptr;
         d_decode_hidden_scales_ = nullptr;
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
         d_grouped_gateup_gate_partials_ = nullptr;
@@ -1454,20 +1516,17 @@ namespace llaminar2
             }
             const size_t desc_bytes =
                 static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-            void *base = nullptr;
-            const size_t table_bytes =
-                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
-            if (!bindWorkspaceBuffer(&base,
-                                     MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES,
-                                     table_bytes,
-                                     "CUDA grouped down descriptor table rebind"))
+            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES,
+                    slot,
+                    table.num_experts,
+                    &device_descs,
+                    "CUDA grouped down descriptor table rebind"))
             {
                 table.device_descs = nullptr;
                 return false;
             }
-            auto *device_descs =
-                static_cast<DeviceNativeVNNIMatrixDesc *>(base) +
-                slot * static_cast<std::size_t>(table.num_experts);
             const cudaError_t err = cudaMemcpyAsync(device_descs,
                                                     table.host_descs.data(),
                                                     desc_bytes,
@@ -1503,29 +1562,25 @@ namespace llaminar2
             }
             const size_t desc_bytes =
                 static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
-            const size_t table_bytes =
-                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
-            void *gate_base = nullptr;
-            void *up_base = nullptr;
-            if (!bindWorkspaceBuffer(&gate_base,
-                                     MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES,
-                                     table_bytes,
-                                     "CUDA grouped gate descriptor table rebind") ||
-                !bindWorkspaceBuffer(&up_base,
-                                     MoEWorkspaceBuffers::CUDA_GROUPED_UP_DESC_TABLES,
-                                     table_bytes,
-                                     "CUDA grouped up descriptor table rebind"))
+            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES,
+                    slot,
+                    table.num_experts,
+                    &device_gate_descs,
+                    "CUDA grouped gate descriptor table rebind") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_GROUPED_UP_DESC_TABLES,
+                    slot,
+                    table.num_experts,
+                    &device_up_descs,
+                    "CUDA grouped up descriptor table rebind"))
             {
                 table.device_gate_descs = nullptr;
                 table.device_up_descs = nullptr;
                 return false;
             }
-            auto *device_gate_descs =
-                static_cast<DeviceNativeVNNIMatrixDesc *>(gate_base) +
-                slot * static_cast<std::size_t>(table.num_experts);
-            auto *device_up_descs =
-                static_cast<DeviceNativeVNNIMatrixDesc *>(up_base) +
-                slot * static_cast<std::size_t>(table.num_experts);
             cudaError_t err = cudaMemcpyAsync(device_gate_descs,
                                               table.host_gate_descs.data(),
                                               desc_bytes,
@@ -1593,8 +1648,7 @@ namespace llaminar2
         runtime_prefill_desc_cap_ = 0;
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         router_q8_gate_cache_.clear();
         next_router_q8_gate_workspace_slot_ = 0;
         grouped_gateup_kpart_active_cap_ = 0;
@@ -1897,6 +1951,66 @@ namespace llaminar2
         return true;
     }
 
+    void CUDAMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
+    {
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_rows_ = 0;
+        router_q8_hidden_valid_ = false;
+        router_q8_hidden_capture_recorded_ = false;
+    }
+
+    void CUDAMoEKernel::publishRouterQ8Hidden(
+        const float *source,
+        int rows,
+        bool recorded_during_capture) noexcept
+    {
+        if (!source || rows <= 0 ||
+            rows > static_cast<int>(MoEWorkspaceBuffers::kMaxVerifierRows) ||
+            !d_decode_hidden_int8_ || !d_decode_hidden_scales_)
+        {
+            invalidateRouterQ8HiddenPublication();
+            return;
+        }
+
+        router_q8_hidden_source_ = source;
+        router_q8_hidden_rows_ = rows;
+        router_q8_hidden_valid_ = true;
+        router_q8_hidden_capture_recorded_ = recorded_during_capture;
+    }
+
+    bool CUDAMoEKernel::canReuseRouterQ8Hidden(
+        const float *source,
+        int rows,
+        int d_model) const noexcept
+    {
+        return routerQ8HiddenReuseBlockReason(source, rows, d_model) == nullptr;
+    }
+
+    const char *CUDAMoEKernel::routerQ8HiddenReuseBlockReason(
+        const float *source,
+        int rows,
+        int d_model) const noexcept
+    {
+        if (!debugEnv().gemm.cuda_moe_reuse_router_q8_hidden)
+            return "disabled";
+        if (!router_q8_hidden_valid_)
+            return "not_published";
+        if (router_q8_hidden_source_ != source)
+            return "source_changed";
+        if (rows <= 0 || router_q8_hidden_rows_ < rows)
+            return "insufficient_rows";
+        if (d_model <= 0 || decode_gateup_d_model_cap_ < d_model)
+            return "insufficient_d_model_capacity";
+        if (!d_decode_hidden_int8_ || !d_decode_hidden_scales_)
+            return "scratch_unbound";
+        if (router_q8_hidden_capture_recorded_ &&
+            !isCudaMoEDecodeCaptureActive(getStream()))
+        {
+            return "capture_provenance";
+        }
+        return nullptr;
+    }
+
     const CUDAMoEKernel::RouterQ8GateCacheEntry *CUDAMoEKernel::getOrCreateQ8RouterGateCache(
         ITensor *gate_weights,
         const float *gate_device_ptr,
@@ -2053,8 +2167,7 @@ namespace llaminar2
         int top_k,
         const char *context)
     {
-        router_q8_hidden_source_ = nullptr;
-        router_q8_hidden_valid_ = false;
+        invalidateRouterQ8HiddenPublication();
         if (!debugEnv().gemm.cuda_moe_router_q8)
         {
             LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router requested while disabled");
@@ -2096,17 +2209,10 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * During stream capture the logits/hidden-quant kernels are only
-         * recorded; they have not produced bytes in d_decode_hidden_int8_ yet.
-         * Leave the reuse marker invalid so a later host-side capture phase
-         * cannot consume stale scratch as if the recorded kernel had run.
-         */
-        if (!isCudaMoEDecodeCaptureActive(stream))
-        {
-            router_q8_hidden_source_ = d_hidden;
-            router_q8_hidden_valid_ = true;
-        }
+        publishRouterQ8Hidden(
+            d_hidden,
+            /*rows=*/1,
+            isCudaMoEDecodeCaptureActive(stream));
         PerfStatsCollector::addCounter(
             "kernel", "cuda_moe_router_q8_decode_calls", 1.0, {}, {},
             {{"num_experts", std::to_string(num_experts)},
@@ -3040,6 +3146,7 @@ namespace llaminar2
             LOG_ERROR("[" << kContext << "] route scratch allocation failed");
             return false;
         }
+        invalidateRouterQ8HiddenPublication();
 
         /*
          * Route all verifier rows as one grouped transaction while preserving
@@ -3078,23 +3185,10 @@ namespace llaminar2
                 return false;
             }
 
-            /*
-             * Single-row verifier buckets are ordinary decode and may reuse the
-             * router Q8 hidden scratch in the following gate/up decode.  For
-             * M>1 the scratch is laid out as [M,d_model], so a one-row gate/up
-             * reuse marker would be ambiguous; keep it invalid until the expert
-             * grouped path has an explicit row-slice reuse contract.
-             */
-            if (seq_len == 1 && !isCudaMoEDecodeCaptureActive(stream))
-            {
-                router_q8_hidden_source_ = d_hidden;
-                router_q8_hidden_valid_ = true;
-            }
-            else
-            {
-                router_q8_hidden_source_ = nullptr;
-                router_q8_hidden_valid_ = false;
-            }
+            publishRouterQ8Hidden(
+                d_hidden,
+                seq_len,
+                isCudaMoEDecodeCaptureActive(stream));
         }
         else if (gate_is_fp32)
         {
@@ -3263,8 +3357,7 @@ namespace llaminar2
         }
         if (!logits_ready)
         {
-            router_q8_hidden_source_ = nullptr;
-            router_q8_hidden_valid_ = false;
+            invalidateRouterQ8HiddenPublication();
             const bool route_ok = gate_is_fp32
                                       ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
                                                              /*seq_len=*/1, d_model, num_experts,
@@ -3403,8 +3496,7 @@ namespace llaminar2
         }
         if (!logits_ready)
         {
-            router_q8_hidden_source_ = nullptr;
-            router_q8_hidden_valid_ = false;
+            invalidateRouterQ8HiddenPublication();
             const bool route_ok = gate_is_fp32
                                       ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
                                                              /*seq_len=*/1, d_model, num_experts,
@@ -4927,22 +5019,17 @@ namespace llaminar2
                       << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
             return -1;
         }
-        void *device_desc_base = nullptr;
-        const size_t table_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+        DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
         cudaError_t err = cudaSuccess;
-        if (!bindWorkspaceBuffer(&device_desc_base,
-                                 MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES,
-                                 table_bytes,
-                                 "CUDA grouped down descriptor tables"))
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES,
+                slot,
+                num_experts,
+                &device_descs,
+                "CUDA grouped down descriptor tables"))
         {
             err = cudaErrorInvalidValue;
         }
-        DeviceNativeVNNIMatrixDesc *device_descs =
-            err == cudaSuccess
-                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_desc_base) +
-                      slot * static_cast<std::size_t>(num_experts)
-                : nullptr;
         if (err == cudaSuccess)
             err = cudaMemcpyAsync(device_descs, table.host_descs.data(),
                                   desc_bytes,
@@ -5074,32 +5161,24 @@ namespace llaminar2
                       << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
             return -1;
         }
-        void *device_gate_desc_base = nullptr;
-        void *device_up_desc_base = nullptr;
-        const size_t table_bytes =
-            static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+        DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
         cudaError_t err = cudaSuccess;
-        if (!bindWorkspaceBuffer(&device_gate_desc_base,
-                                 MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES,
-                                 table_bytes,
-                                 "CUDA grouped gate descriptor tables") ||
-            !bindWorkspaceBuffer(&device_up_desc_base,
-                                 MoEWorkspaceBuffers::CUDA_GROUPED_UP_DESC_TABLES,
-                                 table_bytes,
-                                 "CUDA grouped up descriptor tables"))
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES,
+                slot,
+                num_experts,
+                &device_gate_descs,
+                "CUDA grouped gate descriptor tables") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_GROUPED_UP_DESC_TABLES,
+                slot,
+                num_experts,
+                &device_up_descs,
+                "CUDA grouped up descriptor tables"))
         {
             err = cudaErrorInvalidValue;
         }
-        DeviceNativeVNNIMatrixDesc *device_gate_descs =
-            err == cudaSuccess
-                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_gate_desc_base) +
-                      slot * static_cast<std::size_t>(num_experts)
-                : nullptr;
-        DeviceNativeVNNIMatrixDesc *device_up_descs =
-            err == cudaSuccess
-                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_up_desc_base) +
-                      slot * static_cast<std::size_t>(num_experts)
-                : nullptr;
         if (err == cudaSuccess)
             err = cudaMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
                                   desc_bytes,
@@ -5374,10 +5453,12 @@ namespace llaminar2
             return false;
 
         uint64_t mask_hash = 1469598103934665603ull;
+        int mask_active_experts = 0;
         for (int i = 0; i < num_experts; ++i)
         {
             mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
             mask_hash *= 1099511628211ull;
+            mask_active_experts += expert_mask[i] != 0u ? 1 : 0;
         }
         mask_hash ^= static_cast<uint64_t>(num_experts);
         mask_hash *= 1099511628211ull;
@@ -5434,8 +5515,23 @@ namespace llaminar2
                                        d_group_token_indices_, d_group_weights_))
             return false;
 
-        group_active_expert_slots_ = std::min(total_slots, num_experts);
+        /*
+         * The active-id list is compacted in expert order and padded with -1.
+         * A LocalTP participant can never execute more distinct experts than
+         * its static ownership mask contains, so use that tighter graph-stable
+         * upper bound for the grouped expert grid.  The old num_experts bound
+         * launched known-nonlocal no-op expert planes and made masked telemetry
+         * indistinguishable from the unmasked route.
+         */
+        group_active_expert_slots_ = std::min(total_slots, mask_active_experts);
         prepared_num_experts_ = num_experts;
+        PerfStatsCollector::addCounter(
+            "kernel", "cuda_moe_masked_prefill_grouping_calls", 1.0, {}, {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"num_experts", std::to_string(num_experts)},
+             {"mask_active_experts", std::to_string(mask_active_experts)},
+             {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
         return true;
     }
 
@@ -5604,6 +5700,29 @@ namespace llaminar2
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         if (!d_hidden || !d_output)
             return false;
+        const char *router_q8_reuse_block_reason =
+            routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
+        const bool reuse_router_q8_hidden =
+            active_expert_slots > 0 &&
+            max_tokens_per_expert <= 4 &&
+            router_q8_reuse_block_reason == nullptr;
+        if (!reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_blocked_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "static_table"},
+                 {"reason", active_expert_slots <= 0
+                                ? "no_active_experts"
+                                : (max_tokens_per_expert > 4
+                                       ? "not_verifier_small_m"
+                                       : router_q8_reuse_block_reason)}});
+        }
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         /*
@@ -5633,6 +5752,8 @@ namespace llaminar2
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
+            reuse_router_q8_hidden ? d_decode_hidden_int8_ : nullptr,
+            reuse_router_q8_hidden ? d_decode_hidden_scales_ : nullptr,
             gateup_table.device_gate_descs,
             gateup_table.device_up_descs,
             down_table.device_descs,
@@ -5674,6 +5795,19 @@ namespace llaminar2
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] grouped CUDA pipeline failed");
             return false;
+        }
+
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "static_table"}});
         }
 
         markDeviceWritten(output, device, stream);
@@ -5826,6 +5960,29 @@ namespace llaminar2
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         if (!d_hidden || !d_output)
             return false;
+        const char *router_q8_reuse_block_reason =
+            routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
+        const bool reuse_router_q8_hidden =
+            active_expert_slots > 0 &&
+            max_tokens_per_expert <= 4 &&
+            router_q8_reuse_block_reason == nullptr;
+        if (!reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_blocked_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "runtime_table"},
+                 {"reason", active_expert_slots <= 0
+                                ? "no_active_experts"
+                                : (max_tokens_per_expert > 4
+                                       ? "not_verifier_small_m"
+                                       : router_q8_reuse_block_reason)}});
+        }
 
         if (!cudaMoE_build_active_expert_list_runtime(
                 device_runtime_layer,
@@ -5864,6 +6021,8 @@ namespace llaminar2
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
+            reuse_router_q8_hidden ? d_decode_hidden_int8_ : nullptr,
+            reuse_router_q8_hidden ? d_decode_hidden_scales_ : nullptr,
             d_runtime_prefill_gate_descs_,
             d_runtime_prefill_up_descs_,
             d_runtime_prefill_down_descs_,
@@ -5905,6 +6064,19 @@ namespace llaminar2
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] grouped CUDA pipeline failed");
             return false;
+        }
+
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "runtime_table"}});
         }
 
         markDeviceWritten(output, device, stream);
@@ -6736,13 +6908,7 @@ namespace llaminar2
         const bool use_runtime_descriptors =
             descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
         const bool reuse_router_q8_hidden =
-            debugEnv().gemm.cuda_moe_reuse_router_q8_hidden &&
-            !capture_active &&
-            router_q8_hidden_valid_ &&
-            router_q8_hidden_source_ == d_hidden &&
-            d_decode_hidden_int8_ &&
-            d_decode_hidden_scales_ &&
-            decode_gateup_d_model_cap_ >= d_model;
+            canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         if (reuse_router_q8_hidden)
         {
             PerfStatsCollector::addCounter(
@@ -7022,13 +7188,7 @@ namespace llaminar2
         }
 
         const bool reuse_router_q8_hidden =
-            debugEnv().gemm.cuda_moe_reuse_router_q8_hidden &&
-            !capture_active &&
-            router_q8_hidden_valid_ &&
-            router_q8_hidden_source_ == d_hidden &&
-            d_decode_hidden_int8_ &&
-            d_decode_hidden_scales_ &&
-            decode_gateup_d_model_cap_ >= d_model;
+            canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
         if (reuse_router_q8_hidden)
         {
             PerfStatsCollector::addCounter(

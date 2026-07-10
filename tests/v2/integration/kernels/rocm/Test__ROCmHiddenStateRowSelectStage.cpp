@@ -2,9 +2,9 @@
  * @file Test__ROCmHiddenStateRowSelectStage.cpp
  * @brief ROCm integration tests for graph-capturable hidden-state row selection.
  *
- * Captures one row-select stage into a HIP graph, replays it twice, and verifies
- * that replay metadata can be refreshed on the explicit launch stream without
- * recapturing the graph.
+ * Covers stage-owned rows, external verifier metadata, and request-terminal
+ * rows derived directly from device-resident unequal request lengths. Captured
+ * graph replays prove each mutable device source is observed without recapture.
  */
 
 #include <gtest/gtest.h>
@@ -327,9 +327,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
     params.d_model = d_model;
     params.selected_row_count = static_cast<int>(initial_rows.size());
     params.selected_row_indices = {0, 1, 2};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
     params.workspace_buffer_name = kExternalRows;
-    params.declare_selected_rows_workspace = false;
-    params.upload_selected_rows_to_workspace = false;
     HiddenStateRowsSelectStage stage(params);
 
     WorkspaceRequirements reqs;
@@ -387,6 +387,123 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayReadsExternalMetada
 
     EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
     EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReadsResidentUnequalRequestLengths)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const DeviceId device = DeviceId::rocm(0);
+    constexpr int request_count = 2;
+    constexpr int request_row_stride = 8;
+    constexpr int total_rows = request_count * request_row_stride;
+    constexpr int d_model = 32;
+    const std::vector<int32_t> initial_lengths{8, 3};
+    const std::vector<int32_t> replay_lengths{4, 8};
+    const std::vector<int> initial_terminal_rows{7, 10};
+    const std::vector<int> replay_terminal_rows{3, 15};
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    auto hidden = makeHiddenStates(total_rows, d_model, device, stream);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{request_count, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    int32_t *lengths_device = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&lengths_device),
+            initial_lengths.size() * sizeof(int32_t)),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            lengths_device,
+            initial_lengths.data(),
+            initial_lengths.size() * sizeof(int32_t),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = total_rows;
+    params.d_model = d_model;
+    params.selected_row_count = request_count;
+    params.selected_row_indices = initial_terminal_rows;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::RequestTerminalLengths;
+    params.request_sequence_lengths_device = lengths_device;
+    params.request_row_stride = request_row_stride;
+    HiddenStateRowsSelectStage stage(params);
+    stage.setGPUStream(stream);
+
+    ASSERT_TRUE(stage.getWorkspaceRequirements(total_rows, d_model, 0).buffers.empty())
+        << "Resident request lengths must not allocate or alias verifier-row metadata";
+    ASSERT_TRUE(stage.execute(nullptr));
+    expectRows(
+        downloadScratchRows(*scratch, request_count, d_model, stream),
+        *hidden,
+        initial_terminal_rows,
+        d_model);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+            hipSuccess);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        hipSuccess);
+
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    expectRows(
+        downloadScratchRows(*scratch, request_count, d_model, stream),
+        *hidden,
+        initial_terminal_rows,
+        d_model);
+
+    /*
+     * Only the device length array changes. The captured kernel must derive a
+     * new terminal row for each request without a host row-plan update.
+     */
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            lengths_device,
+            replay_lengths.data(),
+            replay_lengths.size() * sizeof(int32_t),
+            hipMemcpyHostToDevice,
+            stream),
+        hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    expectRows(
+        downloadScratchRows(*scratch, request_count, d_model, stream),
+        *hidden,
+        replay_terminal_rows,
+        d_model);
+
+    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipFree(lengths_device), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }

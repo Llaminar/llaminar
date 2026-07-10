@@ -1895,6 +1895,8 @@ TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarRunsOneRowPerRequ
 TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarPreservesPerRequestPositionIds)
 {
     DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
 
     TinyQwen35MTPForwardFixture fixture;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
@@ -1958,10 +1960,33 @@ TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarPreservesPerReque
         max_abs_diff = std::max(max_abs_diff, std::abs(row0 - row1));
     }
 
-    EXPECT_LT(max_abs_diff, 1e-5f)
-        << "identical request-batched sidecar rows must not drift through "
-           "contiguous RoPE positions";
+    EXPECT_EQ(
+        std::memcmp(
+            logits,
+            logits + fixture.config.vocab_size,
+            static_cast<size_t>(fixture.config.vocab_size) * sizeof(float)),
+        0)
+        << "identical request-batched sidecar rows must preserve both explicit "
+           "RoPE positions and request-local KV cache histories byte-for-byte; "
+           "max_abs_diff="
+        << max_abs_diff;
     EXPECT_EQ(draft_tokens[0], draft_tokens[1]);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    EXPECT_TRUE(std::any_of(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            const auto requests = record.tags.find("requests");
+            return record.kind == PerfStatRecord::Kind::Counter &&
+                   record.domain == "kernel" &&
+                   record.name == "cpu_attention_grouped_request_decode_calls" &&
+                   requests != record.tags.end() &&
+                   requests->second == "2";
+        }))
+        << "the regression must exercise the grouped request-cache attention path";
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__MTPGraphConstruction, RejectsMultiRowFullQwen35SidecarGraph)
@@ -2353,6 +2378,16 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
               static_cast<size_t>(allocated_capture_rows) * short_conv_state_floats * sizeof(float));
     EXPECT_EQ(short_conv_work->size_bytes,
               static_cast<size_t>(request_count) * short_conv_state_floats * sizeof(float));
+    const WorkspaceRequirements short_conv_dynamic_reqs =
+        short_conv->getWorkspaceRequirements(request_seq_len);
+    const WorkspaceDescriptor *short_conv_dynamic_scratch =
+        short_conv_dynamic_reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH);
+    ASSERT_NE(short_conv_dynamic_scratch, nullptr);
+    EXPECT_GE(short_conv_dynamic_scratch->size_bytes,
+              static_cast<size_t>(total_tokens) *
+                  static_cast<size_t>(short_conv->getParams().channels) *
+                  sizeof(float))
+        << "Per-request dynamic m must still reserve flattened in-place scratch.";
 
     const auto *recurrence_node = graph.getNode("layer0_gdn_recurrence");
     ASSERT_NE(recurrence_node, nullptr);
@@ -2380,6 +2415,17 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresRequestBatchedState
               static_cast<size_t>(allocated_capture_rows) * recurrence_state_floats * sizeof(float));
     EXPECT_EQ(recurrence_work->size_bytes,
               static_cast<size_t>(request_count) * recurrence_state_floats * sizeof(float));
+    const WorkspaceRequirements recurrence_dynamic_reqs =
+        recurrence->getWorkspaceRequirements(request_seq_len);
+    const WorkspaceDescriptor *recurrence_full_scratch =
+        recurrence_reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH);
+    const WorkspaceDescriptor *recurrence_dynamic_scratch =
+        recurrence_dynamic_reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH);
+    ASSERT_NE(recurrence_full_scratch, nullptr);
+    ASSERT_NE(recurrence_dynamic_scratch, nullptr);
+    EXPECT_EQ(recurrence_dynamic_scratch->size_bytes,
+              recurrence_full_scratch->size_bytes)
+        << "Per-request dynamic m must preserve flattened QKV deinterleave capacity.";
 }
 
 TEST(Test__MTPGraphConstruction, RejectsIncompleteMoESidecarWeights)
@@ -2694,6 +2740,96 @@ TEST(Test__MTPGraphConstruction, Qwen35PrefillPopulatesRealShiftedMTPKVPayload)
     };
     EXPECT_GT(payload_abs_sum(mtp.kvKData(), mtp.layout.bytes_per_fa_layer_k), 0.0f);
     EXPECT_GT(payload_abs_sum(mtp.kvVData(), mtp.layout.bytes_per_fa_layer_v), 0.0f);
+}
+
+/**
+ * @brief Prove padded request-batched prefill publishes real shifted payloads per slot.
+ *
+ * Request zero has two real prompt tokens while request one has three. The
+ * shifted MTP cache must therefore hold one and two rows respectively; writing
+ * metadata only, flattening both requests into sequence zero, or appending the
+ * padded row will all fail this regression.
+ */
+TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestShiftedPayloads)
+{
+    DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 2;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<std::vector<int>> requests = {
+        {1, 2},
+        {3, 4, 5},
+    };
+    ASSERT_TRUE(orchestrator.forward_batch(requests));
+
+    const auto &mtp_caches = orchestrator.inferenceState().mtp_kv_caches;
+    ASSERT_EQ(mtp_caches.size(), 1u);
+    ASSERT_NE(mtp_caches[0], nullptr);
+    EXPECT_EQ(mtp_caches[0]->get_cached_tokens(/*layer=*/0, /*seq_idx=*/0), 1);
+    EXPECT_EQ(mtp_caches[0]->get_cached_tokens(/*layer=*/0, /*seq_idx=*/1), 2);
+
+    for (int request = 0; request < 2; ++request)
+    {
+        const int shifted_rows = static_cast<int>(requests[static_cast<size_t>(request)].size()) - 1;
+        const auto layout = mtp_caches[0]->logicalBlockLayout(0, shifted_rows);
+        ASSERT_GT(layout.k_bytes, 0u);
+        ASSERT_GT(layout.v_bytes, 0u);
+        std::vector<uint8_t> k(layout.k_bytes, 0);
+        std::vector<uint8_t> v(layout.v_bytes, 0);
+        IKVCache::KVCacheLogicalBlockDescriptor descriptor;
+        descriptor.layer = 0;
+        descriptor.seq_idx = request;
+        descriptor.logical_token_start = 0;
+        descriptor.token_count = shifted_rows;
+        ASSERT_TRUE(mtp_caches[0]->exportLogicalBlock(
+            descriptor,
+            k.data(),
+            v.data()));
+        EXPECT_TRUE(std::any_of(k.begin(), k.end(), [](uint8_t byte) { return byte != 0; }))
+            << "request=" << request;
+        EXPECT_TRUE(std::any_of(v.begin(), v.end(), [](uint8_t byte) { return byte != 0; }))
+            << "request=" << request;
+    }
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    for (int request = 0; request < 2; ++request)
+    {
+        EXPECT_TRUE(std::any_of(
+            records.begin(),
+            records.end(),
+            [request](const PerfStatRecord &record)
+            {
+                const auto request_tag = record.tags.find("request");
+                const auto slot_tag = record.tags.find("first_seq_idx");
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "mtp" &&
+                       record.name == "shifted_prefill_request_group_payloads" &&
+                       request_tag != record.tags.end() &&
+                       slot_tag != record.tags.end() &&
+                       request_tag->second == std::to_string(request) &&
+                       slot_tag->second == std::to_string(request);
+            }))
+            << "missing grouped shifted-payload proof for request " << request;
+    }
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse)
@@ -4631,6 +4767,7 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifie
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
@@ -4770,6 +4907,7 @@ TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifier
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
@@ -4827,11 +4965,12 @@ TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifier
     ASSERT_THAT(state.sequence_lengths, ::testing::ElementsAre(2, 3));
 }
 
-TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationIsRejectedOnCPU)
+TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationIsRejectedWhenMTPIsDisabled)
 {
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
@@ -4915,8 +5054,7 @@ TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationIsRejectedOnCPU)
 
     std::string publication_error;
     EXPECT_FALSE(orchestrator.supportsMTPSpecStatePublication())
-        << "CPU batched publication must not be reachable through the production "
-           "runner capability boundary.";
+        << "a graph without an MTP head must not publish speculative state";
     EXPECT_FALSE(orchestrator.publishAcceptedMTPSpecStateBatch(
         batch,
         &publication_error));
@@ -4929,11 +5067,12 @@ TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationIsRejectedOnCPU)
     EXPECT_EQ(state.live_state_mutations, 0u);
 }
 
-TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsOnCPUBeforeMutation)
+TEST(Test__MTPGraphConstruction, BatchedSpecStatePublicationRejectsBeforeMutationWhenMTPIsDisabled)
 {
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.enabled = false;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);

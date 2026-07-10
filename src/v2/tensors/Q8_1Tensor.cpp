@@ -1285,4 +1285,18 @@ namespace llaminar2
         return row_scale;
     }
 
+    /**
+     * @brief Pack one Q8_1 source block into the normalized raw-INT8 layout.
+     *
+     * The source sum is derivable from `qs` and is not consumed by weight GEMM,
+     * so the device representation retains only exact values and scale.
+     */
+    void Q8_1Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const auto *block = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        std::memcpy(vnniPayloadDst(ctx, linear), block->qs, 32);
+        ctx.scales_array[linear] = block->d;
+    }
+
 } // namespace llaminar2

@@ -96,7 +96,8 @@ namespace llaminar2
     CUDATurboQuantRotations cuda_tq_create_rotations(
         int n_layers, int n_kv_heads, int head_dim,
         uint64_t rotation_seed, int device_id,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        int kv_head_start)
     {
         cudaSetDevice(device_id);
 
@@ -130,7 +131,7 @@ namespace llaminar2
                 const auto &head_ctx = layer_ctx.rotation();
                 // Each head within a layer uses for_layer(head) on the layer context
                 TurboQuantContext head_derived(head_dim, 0);
-                const auto &actual_ctx = layer_ctx.for_layer(head);
+                const auto &actual_ctx = layer_ctx.for_layer(kv_head_start + head);
                 const auto &rot = actual_ctx.rotation();
 
                 const size_t offset = (static_cast<size_t>(layer) * n_kv_heads + head) * mat_size;
@@ -432,16 +433,33 @@ namespace llaminar2
 
     template <int D>
     __global__ void tq_quantize_fused_ring_kernel(
-        const float *__restrict__ d_K_input,   // [n_kv_heads * D]
-        const float *__restrict__ d_V_input,   // [n_kv_heads * D]
+        const float *__restrict__ d_K_input,   // position-major or verifier head-major rows
+        const float *__restrict__ d_V_input,   // position-major or verifier head-major rows
         const float *__restrict__ d_rotations, // [n_kv_heads * D * D]
         uint8_t *__restrict__ d_K_ring,        // K ring buffer
         uint8_t *__restrict__ d_V_ring,        // V ring buffer
         int ring_pos_scalar,                   // Used when d_ring_pos_ptr is null
         const int *d_ring_pos_ptr,             // When non-null, read ring_pos from device memory
-        int n_kv_heads)
+        const int *d_row_count,                // Optional real rows inside fixed bucket geometry
+        int max_seq_len,
+        int verifier_rows,
+        int n_kv_heads,
+        bool k_head_major,
+        bool v_head_major)
     {
-        const int ring_pos = d_ring_pos_ptr ? *d_ring_pos_ptr : ring_pos_scalar;
+        const int verifier_row = blockIdx.z;
+        const int rows_to_write = d_row_count ? *d_row_count : verifier_rows;
+        const int source_start = rows_to_write > max_seq_len
+                                     ? rows_to_write - max_seq_len
+                                     : 0;
+        if (rows_to_write <= 0 || rows_to_write > verifier_rows ||
+            verifier_row < source_start || verifier_row >= rows_to_write)
+            return;
+
+        const int first_ring_pos = d_ring_pos_ptr ? *d_ring_pos_ptr : ring_pos_scalar;
+        const int ring_pos = max_seq_len > 0
+                                 ? (first_ring_pos + verifier_row) % max_seq_len
+                                 : first_ring_pos;
         const int head = blockIdx.x;
         const int phase = blockIdx.y; // 0=K(TQ8), 1=V(TQ4)
         const int tid = threadIdx.x;
@@ -449,9 +467,13 @@ namespace llaminar2
         if (tid >= D)
             return;
 
-        const float x = (phase == 0)
-                            ? d_K_input[head * D + tid]
-                            : d_V_input[head * D + tid];
+        const size_t k_index = k_head_major
+                                   ? (static_cast<size_t>(head) * verifier_rows + verifier_row) * D + tid
+                                   : (static_cast<size_t>(verifier_row) * n_kv_heads + head) * D + tid;
+        const size_t v_index = v_head_major
+                                   ? (static_cast<size_t>(head) * verifier_rows + verifier_row) * D + tid
+                                   : (static_cast<size_t>(verifier_row) * n_kv_heads + head) * D + tid;
+        const float x = (phase == 0) ? d_K_input[k_index] : d_V_input[v_index];
 
         // Block reduction for L2 norm
         __shared__ float s_reduce[32];
@@ -565,6 +587,60 @@ namespace llaminar2
                 high_ptr[pack_tid] = high1;
             }
         }
+    }
+
+    /**
+     * @brief Copy device-resident prepared TQ rows into wrapped ring slots.
+     *
+     * `blockIdx.y` selects K or V while the linear X dimension spans every
+     * byte of every row.  This replaces the old host loop of per-row H2D
+     * copies with one graph-capturable D2D launch.
+     */
+    __global__ void tq_copy_prepared_rows_ring_kernel(
+        const uint8_t *__restrict__ source_k,
+        const uint8_t *__restrict__ source_v,
+        uint8_t *__restrict__ ring_k,
+        uint8_t *__restrict__ ring_v,
+        int ring_head_scalar,
+        const int *__restrict__ d_ring_head,
+        const int *__restrict__ d_row_count,
+        int max_seq_len,
+        int rows,
+        size_t k_row_bytes,
+        size_t v_row_bytes,
+        bool k_head_major,
+        bool v_head_major,
+        int n_kv_heads)
+    {
+        const bool copy_v = blockIdx.y != 0;
+        const size_t row_bytes = copy_v ? v_row_bytes : k_row_bytes;
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total_bytes = static_cast<size_t>(rows) * row_bytes;
+        if (index >= total_bytes)
+            return;
+
+        const int source_row = static_cast<int>(index / row_bytes);
+        const int rows_to_write = d_row_count ? *d_row_count : rows;
+        const int source_start = rows_to_write > max_seq_len
+                                     ? rows_to_write - max_seq_len
+                                     : 0;
+        if (rows_to_write <= 0 || rows_to_write > rows ||
+            source_row < source_start || source_row >= rows_to_write)
+            return;
+        const size_t byte_in_row = index - static_cast<size_t>(source_row) * row_bytes;
+        const int first_ring_row = d_ring_head ? *d_ring_head : ring_head_scalar;
+        const int destination_row = (first_ring_row + source_row) % max_seq_len;
+        const bool head_major = copy_v ? v_head_major : k_head_major;
+        const size_t head_bytes = row_bytes / static_cast<size_t>(n_kv_heads);
+        const int head = static_cast<int>(byte_in_row / head_bytes);
+        const size_t byte_in_head = byte_in_row - static_cast<size_t>(head) * head_bytes;
+        const size_t source_index = head_major
+                                        ? (static_cast<size_t>(head) * rows + source_row) * head_bytes + byte_in_head
+                                        : index;
+        const uint8_t *source = copy_v ? source_v : source_k;
+        uint8_t *destination = copy_v ? ring_v : ring_k;
+        destination[static_cast<size_t>(destination_row) * row_bytes + byte_in_row] =
+            source[source_index];
     }
 
     // =========================================================================
@@ -798,18 +874,42 @@ namespace llaminar2
         int ring_pos_scalar, int out_offset_elems_scalar,
         int n_kv_heads,
         float rope_theta, int rope_position_scalar,
-        const TQDequantDynamicParams *d_params) // When non-null, override scalars
+        const int *__restrict__ d_ring_head,
+        const int *__restrict__ d_cached_count,
+        int max_seq_len, int kv_dim, int position_start)
     {
-        const int ring_pos = d_params ? d_params->ring_pos : ring_pos_scalar;
-        const int out_offset_elems = d_params ? d_params->out_offset_elems : out_offset_elems_scalar;
-        const int rope_position = d_params ? d_params->rope_position : rope_position_scalar;
+        int ring_pos = ring_pos_scalar;
+        int out_offset_elems = out_offset_elems_scalar;
+        int rope_position = rope_position_scalar;
+        if (d_ring_head && d_cached_count)
+        {
+            const int cached_count = *d_cached_count;
+            const int ring_head = *d_ring_head;
+            if (cached_count <= 0 || cached_count > max_seq_len ||
+                ring_head < 0 || ring_head >= max_seq_len || kv_dim <= 0)
+            {
+                return;
+            }
+
+            /*
+             * Append advances device head/count before this kernel executes on
+             * the same stream. The newest compressed row is therefore one slot
+             * behind head, and its linear scratch row is count - 1. Deriving
+             * these values here removes the former pinned-host dequant mailbox
+             * without adding a planning kernel or another graph node.
+             */
+            ring_pos = (ring_head + max_seq_len - 1) % max_seq_len;
+            out_offset_elems = (cached_count - 1) * kv_dim;
+            rope_position =
+                rope_theta > 0.0f ? position_start + cached_count - 1 : 0;
+        }
 
         const int head = blockIdx.x;
         const int tid = threadIdx.x;
         if (tid >= D)
             return;
 
-        const float inv_scale = rsqrtf(static_cast<float>(D));
+        const float inv_scale = 1.0f / sqrtf(static_cast<float>(D));
         __shared__ float s_cent[D];
 
         // ---- Phase 1: K (TQ8) ----
@@ -832,6 +932,16 @@ namespace llaminar2
             // Optional RoPE (reuses s_cent for pair exchange)
             if (rope_theta > 0.0f)
             {
+                /*
+                 * Every warp must finish reading the centroid vector for its
+                 * inverse-rotation dot products before any lane repurposes
+                 * s_cent for RoPE pair exchange. Without this phase boundary,
+                 * the four-warp D=128 specialization intermittently let an
+                 * early warp overwrite values still consumed by a later warp,
+                 * making graph replay neither deterministic nor serial-decode
+                 * equivalent.
+                 */
+                __syncthreads();
                 s_cent[tid] = val;
                 __syncthreads();
 
@@ -1075,6 +1185,35 @@ namespace llaminar2
     // Shared memory: D × TILE × 4B = 128 × 16 × 4 = 8KB (same as before)
     // Registers: TILE floats for accumulators + TILE floats for norms
 
+    /**
+     * @brief Canonical RoPE pair arithmetic shared by every CUDA cache format.
+     *
+     * Explicit `fmaf` calls fix the arithmetic contraction and rounding contract.
+     * That contract is used by serial TQ dequantization, grouped TQ
+     * dequantization, and ordinary converted cache reads.
+     */
+    __device__ __forceinline__ void canonical_rope_pair(
+        float x,
+        float y,
+        float rope_theta,
+        int pair,
+        int rope_dim,
+        int position,
+        float *rotated_x,
+        float *rotated_y)
+    {
+        const float frequency = 1.0f / powf(
+            rope_theta,
+            static_cast<float>(2 * pair) / static_cast<float>(rope_dim));
+        const float angle = static_cast<float>(position) * frequency;
+        const float cosine = cosf(angle);
+        const float sine = sinf(angle);
+        const float x_cosine = x * cosine;
+        const float y_cosine = y * cosine;
+        *rotated_x = fmaf(-y, sine, x_cosine);
+        *rotated_y = fmaf(x, sine, y_cosine);
+    }
+
     /// Store computed FP32 value to output buffer (float or __half)
     template <typename OutT>
     __device__ __forceinline__ void tq_store(OutT *dst, int idx, float val)
@@ -1091,7 +1230,7 @@ namespace llaminar2
         const float *__restrict__ d_rotations, // R (non-transposed, row-major) for coalesced access
         OutT *__restrict__ d_output,
         int count, int n_kv_heads,
-        float rope_theta, int position_start,
+        float rope_theta, int position_start, int rope_dim,
         int max_seq_len, int tail)
     {
         const int head = blockIdx.x;
@@ -1159,8 +1298,9 @@ namespace llaminar2
             // (partner thread is at ±D/2, which spans warps — can't use __shfl)
             __syncthreads(); // ensure Phase 2 is done before reusing s_cents
 
-            constexpr int HALF = D / 2;
-            const int pair_idx = (tid < HALF) ? tid : (tid - HALF);
+            const int effective_rope_dim =
+                rope_dim > 0 ? min(rope_dim, D) : D;
+            const int half_dim = effective_rope_dim / 2;
 
             for (int t = 0; t < tile_count; ++t)
             {
@@ -1168,16 +1308,34 @@ namespace llaminar2
                 s_cents[t * D + tid] = val; // reuse s_cents for RoPE exchange
                 __syncthreads();
 
-                const int actual_pos = position_start + tile_start + t;
-                const float angle = static_cast<float>(actual_pos) * d_ROPE_FREQS[pair_idx];
-                float cos_val, sin_val;
-                __sincosf(angle, &sin_val, &cos_val);
-
-                const float partner = s_cents[t * D + ((tid < HALF) ? (tid + HALF) : (tid - HALF))];
-                if (tid < HALF)
-                    vals[t] = val * cos_val - partner * sin_val;
-                else
-                    vals[t] = partner * sin_val + val * cos_val;
+                vals[t] = val;
+                if (tid < effective_rope_dim)
+                {
+                    const int pair = tid < half_dim ? tid : tid - half_dim;
+                    const float partner = s_cents[
+                        t * D +
+                        (tid < half_dim ? tid + half_dim : tid - half_dim)];
+                    float rotated_x = 0.0f;
+                    float rotated_y = 0.0f;
+                    if (tid < half_dim)
+                    {
+                        canonical_rope_pair(
+                            val, partner, rope_theta, pair,
+                            effective_rope_dim,
+                            position_start + tile_start + t,
+                            &rotated_x, &rotated_y);
+                        vals[t] = rotated_x;
+                    }
+                    else
+                    {
+                        canonical_rope_pair(
+                            partner, val, rope_theta, pair,
+                            effective_rope_dim,
+                            position_start + tile_start + t,
+                            &rotated_x, &rotated_y);
+                        vals[t] = rotated_y;
+                    }
+                }
 
                 tq_store(d_output, (tile_start + t) * kv_dim + head * D + tid, vals[t]);
                 __syncthreads();
@@ -1312,6 +1470,292 @@ namespace llaminar2
             tq_store(d_output, (tile_start + t) * kv_dim + head * D + tid, vals[t] * norms[t]);
     }
 
+    /**
+     * @brief Grouped TQ8 ring dequantization driven by resident cache metadata.
+     *
+     * The inner centroid load, loop-interchanged rotation multiply, and FP16
+     * rounding intentionally match `tq8_dequantize_tiled_kernel`. The only new
+     * dimension is `blockIdx.z`, which selects an independent request ring.
+     */
+    template <int D, int TILE>
+    __global__ void tq8_batched_ring_dequant_fp16_device_state_kernel(
+        __half *__restrict__ output,
+        const void *const *__restrict__ entry_table,
+        const int *__restrict__ heads,
+        const int *__restrict__ counts,
+        const float *__restrict__ rotations,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        float rope_theta,
+        int position_start,
+        int rope_dim)
+    {
+        const int head = static_cast<int>(blockIdx.x);
+        const int tile_start = static_cast<int>(blockIdx.y) * TILE;
+        const int request = static_cast<int>(blockIdx.z);
+        const int tid = static_cast<int>(threadIdx.x);
+        if (request >= request_count || head >= n_kv_heads || tid >= D)
+            return;
+
+        const int entry = entry_offset + request;
+        int ring_count = counts[entry];
+        ring_count = ring_count < 0
+                         ? 0
+                         : (ring_count > max_seq_len ? max_seq_len : ring_count);
+        const int visible_count =
+            ring_count < max_kv_len ? ring_count : max_kv_len;
+        const int skipped_rows = ring_count - visible_count;
+        int tail = heads[entry] - ring_count;
+        tail %= max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+
+        const auto *cache =
+            static_cast<const uint8_t *>(entry_table[entry]);
+        const float *rotation =
+            rotations + static_cast<size_t>(head) * D * D;
+        constexpr size_t block_size = sizeof(TQ8Block<D>);
+        const float inv_scale = 1.0f / sqrtf(static_cast<float>(D));
+        const int kv_dim = n_kv_heads * D;
+        __shared__ float centroids[D * TILE];
+        float norms[TILE];
+        const int output_tile_count =
+            min(TILE, max_kv_len - tile_start);
+
+#pragma unroll
+        for (int tile = 0; tile < TILE; ++tile)
+        {
+            const int output_token = tile_start + tile;
+            if (tile < output_tile_count && output_token < visible_count)
+            {
+                const int source_token =
+                    (tail + skipped_rows + output_token) % max_seq_len;
+                const uint8_t *block = cache +
+                    (static_cast<size_t>(source_token) * n_kv_heads + head) *
+                        block_size;
+                norms[tile] = reinterpret_cast<const float *>(block)[0];
+                const uint8_t index = block[2 * sizeof(float) + tid];
+                centroids[tid * TILE + tile] =
+                    d_TQ8_CENTROIDS[index] * inv_scale;
+            }
+            else
+            {
+                norms[tile] = 0.0f;
+                centroids[tid * TILE + tile] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float values[TILE];
+#pragma unroll
+        for (int tile = 0; tile < TILE; ++tile)
+            values[tile] = 0.0f;
+        for (int dimension = 0; dimension < D; ++dimension)
+        {
+            const float coefficient = rotation[dimension * D + tid];
+#pragma unroll
+            for (int tile = 0; tile < TILE; ++tile)
+                values[tile] +=
+                    coefficient * centroids[dimension * TILE + tile];
+        }
+
+        if (rope_theta > 0.0f)
+        {
+            __syncthreads();
+            const int effective_rope_dim =
+                rope_dim > 0 ? min(rope_dim, D) : D;
+            const int half_dim = effective_rope_dim / 2;
+            for (int tile = 0; tile < output_tile_count; ++tile)
+            {
+                const int output_token = tile_start + tile;
+                const size_t output_index =
+                    (static_cast<size_t>(request) * max_kv_len +
+                     static_cast<size_t>(output_token)) *
+                        static_cast<size_t>(kv_dim) +
+                    static_cast<size_t>(head * D + tid);
+                if (output_token >= visible_count)
+                {
+                    output[output_index] = __float2half_rn(0.0f);
+                    __syncthreads();
+                    continue;
+                }
+
+                float value = values[tile] * norms[tile];
+                centroids[tile * D + tid] = value;
+                __syncthreads();
+                if (tid < effective_rope_dim)
+                {
+                    const int pair = tid < half_dim ? tid : tid - half_dim;
+                    const float partner = centroids[
+                        tile * D +
+                        (tid < half_dim ? tid + half_dim : tid - half_dim)];
+                    float rotated_x = 0.0f;
+                    float rotated_y = 0.0f;
+                    if (tid < half_dim)
+                    {
+                        canonical_rope_pair(
+                            value, partner, rope_theta, pair,
+                            effective_rope_dim,
+                            position_start + output_token,
+                            &rotated_x, &rotated_y);
+                        value = rotated_x;
+                    }
+                    else
+                    {
+                        canonical_rope_pair(
+                            partner, value, rope_theta, pair,
+                            effective_rope_dim,
+                            position_start + output_token,
+                            &rotated_x, &rotated_y);
+                        value = rotated_y;
+                    }
+                }
+                output[output_index] = __float2half(value);
+                __syncthreads();
+            }
+        }
+        else
+        {
+            for (int tile = 0; tile < output_tile_count; ++tile)
+            {
+                const int output_token = tile_start + tile;
+                const size_t output_index =
+                    (static_cast<size_t>(request) * max_kv_len +
+                     static_cast<size_t>(output_token)) *
+                        static_cast<size_t>(kv_dim) +
+                    static_cast<size_t>(head * D + tid);
+                output[output_index] = output_token < visible_count
+                                           ? __float2half(values[tile] * norms[tile])
+                                           : __float2half_rn(0.0f);
+            }
+        }
+    }
+
+    /**
+     * @brief Grouped TQ4 ring dequantization driven by resident cache metadata.
+     */
+    template <int D, int TILE>
+    __global__ void tq4_batched_ring_dequant_fp16_device_state_kernel(
+        __half *__restrict__ output,
+        const void *const *__restrict__ entry_table,
+        const int *__restrict__ heads,
+        const int *__restrict__ counts,
+        const float *__restrict__ rotations,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads)
+    {
+        const int head = static_cast<int>(blockIdx.x);
+        const int tile_start = static_cast<int>(blockIdx.y) * TILE;
+        const int request = static_cast<int>(blockIdx.z);
+        const int tid = static_cast<int>(threadIdx.x);
+        if (request >= request_count || head >= n_kv_heads || tid >= D)
+            return;
+
+        const int entry = entry_offset + request;
+        int ring_count = counts[entry];
+        ring_count = ring_count < 0
+                         ? 0
+                         : (ring_count > max_seq_len ? max_seq_len : ring_count);
+        const int visible_count =
+            ring_count < max_kv_len ? ring_count : max_kv_len;
+        const int skipped_rows = ring_count - visible_count;
+        int tail = heads[entry] - ring_count;
+        tail %= max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+
+        const auto *cache =
+            static_cast<const uint8_t *>(entry_table[entry]);
+        const float *rotation =
+            rotations + static_cast<size_t>(head) * D * D;
+        constexpr size_t block_size = sizeof(TQ4Block<D>);
+        constexpr size_t mse_bytes = D * 3 / 8;
+        const float inv_scale = rsqrtf(static_cast<float>(D));
+        const int kv_dim = n_kv_heads * D;
+        const int group8 = tid / 8;
+        const int within = tid % 8;
+        const int byte_index = group8 * 3;
+        __shared__ float centroids[D * TILE];
+        float norms[TILE];
+        const int output_tile_count =
+            min(TILE, max_kv_len - tile_start);
+
+#pragma unroll
+        for (int tile = 0; tile < TILE; ++tile)
+        {
+            const int output_token = tile_start + tile;
+            if (tile < output_tile_count && output_token < visible_count)
+            {
+                const int source_token =
+                    (tail + skipped_rows + output_token) % max_seq_len;
+                const uint8_t *block = cache +
+                    (static_cast<size_t>(source_token) * n_kv_heads + head) *
+                        block_size;
+                norms[tile] = reinterpret_cast<const float *>(block)[0];
+                const uint8_t *mse = block + 2 * sizeof(float);
+                const uint8_t *high = mse + mse_bytes;
+                const uint8_t byte0 = mse[byte_index];
+                const uint8_t byte1 = mse[byte_index + 1];
+                const uint8_t byte2 = mse[byte_index + 2];
+                uint8_t low3 = 0;
+                switch (within)
+                {
+                case 0: low3 = byte0 & 0x07; break;
+                case 1: low3 = (byte0 >> 3) & 0x07; break;
+                case 2: low3 = ((byte0 >> 6) | (byte1 << 2)) & 0x07; break;
+                case 3: low3 = (byte1 >> 1) & 0x07; break;
+                case 4: low3 = (byte1 >> 4) & 0x07; break;
+                case 5: low3 = ((byte1 >> 7) | (byte2 << 1)) & 0x07; break;
+                case 6: low3 = (byte2 >> 2) & 0x07; break;
+                case 7: low3 = (byte2 >> 5) & 0x07; break;
+                }
+                const uint8_t high1 =
+                    (high[tid / 8] >> (tid % 8)) & 0x01;
+                const uint8_t index = low3 | (high1 << 3);
+                centroids[tid * TILE + tile] =
+                    d_TQ4_CENTROIDS[index] * inv_scale;
+            }
+            else
+            {
+                norms[tile] = 0.0f;
+                centroids[tid * TILE + tile] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float values[TILE];
+#pragma unroll
+        for (int tile = 0; tile < TILE; ++tile)
+            values[tile] = 0.0f;
+        for (int dimension = 0; dimension < D; ++dimension)
+        {
+            const float coefficient = rotation[dimension * D + tid];
+#pragma unroll
+            for (int tile = 0; tile < TILE; ++tile)
+                values[tile] +=
+                    coefficient * centroids[dimension * TILE + tile];
+        }
+
+        for (int tile = 0; tile < output_tile_count; ++tile)
+        {
+            const int output_token = tile_start + tile;
+            const size_t output_index =
+                (static_cast<size_t>(request) * max_kv_len +
+                 static_cast<size_t>(output_token)) *
+                    static_cast<size_t>(kv_dim) +
+                static_cast<size_t>(head * D + tid);
+            output[output_index] = output_token < visible_count
+                                       ? __float2half(values[tile] * norms[tile])
+                                       : __float2half_rn(0.0f);
+        }
+    }
+
     // =========================================================================
     // RoPE Kernels (for non-TQ caches)
     // =========================================================================
@@ -1342,12 +1786,6 @@ namespace llaminar2
         const int head = remaining / pairs_per_head;
         const int pair_idx = remaining % pairs_per_head;
 
-        const int actual_pos = position_start + pos;
-        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(effective_rope_dim));
-        const float angle = static_cast<float>(actual_pos) * freq;
-        const float cos_val = cosf(angle);
-        const float sin_val = sinf(angle);
-
         // Half-split: pair (i, i + half_dim)
         const int head_base = pos * kv_dim + head * head_dim;
         const int idx0 = head_base + pair_idx;
@@ -1355,8 +1793,13 @@ namespace llaminar2
         float x = __half2float(d_K[idx0]);
         float y = __half2float(d_K[idx1]);
 
-        d_K[idx0] = __float2half_rn(x * cos_val - y * sin_val);
-        d_K[idx1] = __float2half_rn(x * sin_val + y * cos_val);
+        float rotated_x = 0.0f;
+        float rotated_y = 0.0f;
+        canonical_rope_pair(
+            x, y, rope_theta, pair_idx, effective_rope_dim,
+            position_start + pos, &rotated_x, &rotated_y);
+        d_K[idx0] = __float2half_rn(rotated_x);
+        d_K[idx1] = __float2half_rn(rotated_y);
     }
 
     __global__ void rope_apply_fp32_kernel(
@@ -1381,12 +1824,6 @@ namespace llaminar2
         const int head = remaining / pairs_per_head;
         const int pair_idx = remaining % pairs_per_head;
 
-        const int actual_pos = position_start + pos;
-        const float freq = 1.0f / powf(rope_theta, static_cast<float>(2 * pair_idx) / static_cast<float>(effective_rope_dim));
-        const float angle = static_cast<float>(actual_pos) * freq;
-        const float cos_val = cosf(angle);
-        const float sin_val = sinf(angle);
-
         // Half-split: pair (i, i + half_dim)
         const int head_base = pos * kv_dim + head * head_dim;
         const int idx0 = head_base + pair_idx;
@@ -1394,8 +1831,114 @@ namespace llaminar2
         float x = d_K[idx0];
         float y = d_K[idx1];
 
-        d_K[idx0] = x * cos_val - y * sin_val;
-        d_K[idx1] = x * sin_val + y * cos_val;
+        canonical_rope_pair(
+            x, y, rope_theta, pair_idx, effective_rope_dim,
+            position_start + pos, &d_K[idx0], &d_K[idx1]);
+    }
+
+    __global__ void rope_apply_batched_fp16_device_state_kernel(
+        __half *__restrict__ d_K,
+        const int *__restrict__ counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim)
+    {
+        const int effective_rope_dim = rope_dim > 0 ? rope_dim : head_dim;
+        const int half_dim = effective_rope_dim / 2;
+        const int pairs_per_request = max_kv_len * n_kv_heads * half_dim;
+        const int global_pair = blockIdx.x * blockDim.x + threadIdx.x;
+        if (global_pair >= request_count * pairs_per_request)
+            return;
+
+        const int request = global_pair / pairs_per_request;
+        const int request_pair = global_pair % pairs_per_request;
+        const int pairs_per_token = n_kv_heads * half_dim;
+        const int token = request_pair / pairs_per_token;
+        const int token_pair = request_pair % pairs_per_token;
+        const int head = token_pair / half_dim;
+        const int pair = token_pair % half_dim;
+        const int ring_count = min(max(counts[entry_offset + request], 0),
+                                   max_seq_len);
+        if (token >= min(ring_count, max_kv_len))
+            return;
+
+        const int kv_dim = n_kv_heads * head_dim;
+        const size_t base =
+            (static_cast<size_t>(request) * max_kv_len + token) * kv_dim +
+            static_cast<size_t>(head) * head_dim;
+        const size_t first = base + pair;
+        const size_t second = base + pair + half_dim;
+        float rotated_x = 0.0f;
+        float rotated_y = 0.0f;
+        canonical_rope_pair(
+            __half2float(d_K[first]), __half2float(d_K[second]),
+            rope_theta, pair, effective_rope_dim, position_start + token,
+            &rotated_x, &rotated_y);
+        d_K[first] = __float2half_rn(rotated_x);
+        d_K[second] = __float2half_rn(rotated_y);
+    }
+
+    __global__ void rope_apply_batched_fp32_ring_to_fp16_device_state_kernel(
+        __half *__restrict__ d_K_out,
+        const float *const *__restrict__ entry_table,
+        const int *__restrict__ heads,
+        const int *__restrict__ counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim)
+    {
+        const int effective_rope_dim = rope_dim > 0 ? rope_dim : head_dim;
+        const int half_dim = effective_rope_dim / 2;
+        const int pairs_per_request = max_kv_len * n_kv_heads * half_dim;
+        const int global_pair = blockIdx.x * blockDim.x + threadIdx.x;
+        if (global_pair >= request_count * pairs_per_request)
+            return;
+
+        const int request = global_pair / pairs_per_request;
+        const int request_pair = global_pair % pairs_per_request;
+        const int pairs_per_token = n_kv_heads * half_dim;
+        const int output_token = request_pair / pairs_per_token;
+        const int token_pair = request_pair % pairs_per_token;
+        const int head = token_pair / half_dim;
+        const int pair = token_pair % half_dim;
+        const int entry = entry_offset + request;
+        const int ring_count = min(max(counts[entry], 0), max_seq_len);
+        const int visible_count = min(ring_count, max_kv_len);
+        if (output_token >= visible_count)
+            return;
+
+        const int skipped_rows = ring_count - visible_count;
+        const int tail = (heads[entry] - ring_count + max_seq_len) % max_seq_len;
+        const int source_token =
+            (tail + skipped_rows + output_token) % max_seq_len;
+        const int kv_dim = n_kv_heads * head_dim;
+        const size_t source_base =
+            static_cast<size_t>(source_token) * kv_dim +
+            static_cast<size_t>(head) * head_dim;
+        float rotated_x = 0.0f;
+        float rotated_y = 0.0f;
+        canonical_rope_pair(
+            entry_table[entry][source_base + pair],
+            entry_table[entry][source_base + pair + half_dim],
+            rope_theta, pair, effective_rope_dim,
+            position_start + output_token, &rotated_x, &rotated_y);
+        const size_t output_base =
+            (static_cast<size_t>(request) * max_kv_len + output_token) * kv_dim +
+            static_cast<size_t>(head) * head_dim;
+        d_K_out[output_base + pair] = __float2half_rn(rotated_x);
+        d_K_out[output_base + pair + half_dim] = __float2half_rn(rotated_y);
     }
 
     // =========================================================================
@@ -1470,79 +2013,158 @@ namespace llaminar2
         return cudaGetLastError() == cudaSuccess;
     }
 
-    extern "C" bool cuda_tq_quantize_fused_ring(
+    extern "C" bool cuda_tq_quantize_grouped_ring(
         const float *d_K_input, const float *d_V_input,
         const float *d_rotations,
         void *d_K_ring, void *d_V_ring,
-        int ring_pos, int n_kv_heads, int head_dim,
+        int ring_head, int max_seq_len,
+        int verifier_rows, int n_kv_heads, int head_dim,
+        bool k_head_major, bool v_head_major,
         cudaStream_t stream)
     {
+        if (!d_K_input || !d_V_input || !d_rotations || !d_K_ring || !d_V_ring ||
+            !stream || max_seq_len <= 0 || verifier_rows <= 0 || verifier_rows > 65535 ||
+            n_kv_heads <= 0)
+        {
+            return false;
+        }
+
         cuda_tq_upload_codebooks(stream);
-
-        // Grid: (n_kv_heads, 2) — y=0 for K(TQ8), y=1 for V(TQ4)
-        const dim3 grid(n_kv_heads, 2);
-
+        const dim3 grid(n_kv_heads, 2, verifier_rows);
         if (head_dim == 64)
         {
-            const dim3 block(64);
-            tq_quantize_fused_ring_kernel<64><<<grid, block, 0, stream>>>(
+            tq_quantize_fused_ring_kernel<64><<<grid, dim3(64), 0, stream>>>(
                 d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring),
-                static_cast<uint8_t *>(d_V_ring),
-                ring_pos, nullptr, n_kv_heads);
+                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                k_head_major, v_head_major);
         }
         else if (head_dim == 128)
         {
-            const dim3 block(128);
-            tq_quantize_fused_ring_kernel<128><<<grid, block, 0, stream>>>(
+            tq_quantize_fused_ring_kernel<128><<<grid, dim3(128), 0, stream>>>(
                 d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring),
-                static_cast<uint8_t *>(d_V_ring),
-                ring_pos, nullptr, n_kv_heads);
+                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                ring_head, nullptr, nullptr, max_seq_len, verifier_rows, n_kv_heads,
+                k_head_major, v_head_major);
         }
         else
         {
             return false;
         }
-
         return cudaGetLastError() == cudaSuccess;
     }
 
-    extern "C" bool cuda_tq_quantize_fused_ring_dynamic(
+    extern "C" bool cuda_tq_quantize_grouped_ring_dynamic(
         const float *d_K_input, const float *d_V_input,
         const float *d_rotations,
         void *d_K_ring, void *d_V_ring,
-        const int *d_ring_pos, int n_kv_heads, int head_dim,
+        const int *d_ring_head, const int *d_row_count, int max_seq_len,
+        int verifier_rows, int n_kv_heads, int head_dim,
+        bool k_head_major, bool v_head_major,
         cudaStream_t stream)
     {
+        if (!d_ring_head || !d_K_input || !d_V_input || !d_rotations ||
+            !d_K_ring || !d_V_ring || !stream || max_seq_len <= 0 ||
+            verifier_rows <= 0 || verifier_rows > 65535 || n_kv_heads <= 0)
+        {
+            return false;
+        }
+
         cuda_tq_upload_codebooks(stream);
-
-        const dim3 grid(n_kv_heads, 2);
-
+        const dim3 grid(n_kv_heads, 2, verifier_rows);
         if (head_dim == 64)
         {
-            const dim3 block(64);
-            tq_quantize_fused_ring_kernel<64><<<grid, block, 0, stream>>>(
+            tq_quantize_fused_ring_kernel<64><<<grid, dim3(64), 0, stream>>>(
                 d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring),
-                static_cast<uint8_t *>(d_V_ring),
-                0, d_ring_pos, n_kv_heads);
+                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                k_head_major, v_head_major);
         }
         else if (head_dim == 128)
         {
-            const dim3 block(128);
-            tq_quantize_fused_ring_kernel<128><<<grid, block, 0, stream>>>(
+            tq_quantize_fused_ring_kernel<128><<<grid, dim3(128), 0, stream>>>(
                 d_K_input, d_V_input, d_rotations,
-                static_cast<uint8_t *>(d_K_ring),
-                static_cast<uint8_t *>(d_V_ring),
-                0, d_ring_pos, n_kv_heads);
+                static_cast<uint8_t *>(d_K_ring), static_cast<uint8_t *>(d_V_ring),
+                0, d_ring_head, d_row_count, max_seq_len, verifier_rows, n_kv_heads,
+                k_head_major, v_head_major);
         }
         else
         {
             return false;
         }
-
         return cudaGetLastError() == cudaSuccess;
+    }
+
+    namespace
+    {
+        /** @brief Shared prepared-row launcher for static and device-resident heads. */
+        bool launch_cuda_tq_copy_prepared_rows_ring(
+            const void *source_k, const void *source_v,
+            void *ring_k, void *ring_v,
+            int ring_head, const int *d_ring_head,
+            const int *d_row_count,
+            int max_seq_len, int rows,
+            size_t k_row_bytes, size_t v_row_bytes,
+            bool k_head_major, bool v_head_major,
+            int n_kv_heads,
+            cudaStream_t stream)
+        {
+            if (!source_k || !source_v || !ring_k || !ring_v || !stream ||
+                max_seq_len <= 0 || rows <= 0 || k_row_bytes == 0 || v_row_bytes == 0 ||
+                n_kv_heads <= 0 || k_row_bytes % static_cast<size_t>(n_kv_heads) != 0 ||
+                v_row_bytes % static_cast<size_t>(n_kv_heads) != 0)
+            {
+                return false;
+            }
+            const size_t largest_row_bytes = k_row_bytes > v_row_bytes
+                                                 ? k_row_bytes
+                                                 : v_row_bytes;
+            const size_t largest_bytes = static_cast<size_t>(rows) * largest_row_bytes;
+            constexpr int threads = 256;
+            const dim3 grid(static_cast<unsigned>((largest_bytes + threads - 1) / threads), 2);
+            tq_copy_prepared_rows_ring_kernel<<<grid, threads, 0, stream>>>(
+                static_cast<const uint8_t *>(source_k),
+                static_cast<const uint8_t *>(source_v),
+                static_cast<uint8_t *>(ring_k), static_cast<uint8_t *>(ring_v),
+                ring_head, d_ring_head, d_row_count, max_seq_len, rows,
+                k_row_bytes, v_row_bytes, k_head_major, v_head_major, n_kv_heads);
+            return cudaGetLastError() == cudaSuccess;
+        }
+    } // namespace
+
+    extern "C" bool cuda_tq_copy_prepared_rows_ring(
+        const void *source_k, const void *source_v,
+        void *ring_k, void *ring_v,
+        int ring_head, int max_seq_len, int rows,
+        size_t k_row_bytes, size_t v_row_bytes,
+        bool k_head_major, bool v_head_major,
+        int n_kv_heads,
+        cudaStream_t stream)
+    {
+        return launch_cuda_tq_copy_prepared_rows_ring(
+            source_k, source_v, ring_k, ring_v,
+            ring_head, nullptr, nullptr, max_seq_len, rows,
+            k_row_bytes, v_row_bytes, k_head_major, v_head_major,
+            n_kv_heads, stream);
+    }
+
+    extern "C" bool cuda_tq_copy_prepared_rows_ring_dynamic(
+        const void *source_k, const void *source_v,
+        void *ring_k, void *ring_v,
+        const int *d_ring_head, const int *d_row_count,
+        int max_seq_len, int rows,
+        size_t k_row_bytes, size_t v_row_bytes,
+        bool k_head_major, bool v_head_major,
+        int n_kv_heads,
+        cudaStream_t stream)
+    {
+        if (!d_ring_head)
+            return false;
+        return launch_cuda_tq_copy_prepared_rows_ring(
+            source_k, source_v, ring_k, ring_v,
+            0, d_ring_head, d_row_count, max_seq_len, rows,
+            k_row_bytes, v_row_bytes, k_head_major, v_head_major,
+            n_kv_heads, stream);
     }
 
     extern "C" bool cuda_tq8_dequantize_fp32(
@@ -1621,87 +2243,6 @@ namespace llaminar2
         return cudaGetLastError() == cudaSuccess;
     }
 
-    extern "C" bool cuda_tq_ring_append(
-        void *d_K_cache, void *d_V_cache,
-        const float *d_K_new, const float *d_V_new,
-        const float *d_K_rotations, const float *d_V_rotations,
-        int head, int max_seq_len,
-        int n_kv_heads, int head_dim, int num_tokens,
-        cudaStream_t stream)
-    {
-        if (num_tokens <= 0)
-            return true;
-
-        // Quantize K → TQ8 into scratch, then copy to ring position
-        // For simplicity, quantize directly into ring buffer at correct position
-        // We need a intermediate buffer for the quantized blocks
-        // Actually, we can use a 2-pass approach:
-        // 1. Allocate temp TQ8/TQ4 blocks for num_tokens
-        // 2. Quantize into temp
-        // 3. Ring-append temp blocks
-
-        // Determine block sizes
-        size_t k_block_size, v_block_size;
-        if (head_dim == 64)
-        {
-            k_block_size = sizeof(TQ8Block<64>);
-            v_block_size = sizeof(TQ4Block<64>);
-        }
-        else if (head_dim == 128)
-        {
-            k_block_size = sizeof(TQ8Block<128>);
-            v_block_size = sizeof(TQ4Block<128>);
-        }
-        else
-        {
-            return false;
-        }
-
-        const size_t k_temp_bytes = static_cast<size_t>(num_tokens) * n_kv_heads * k_block_size;
-        const size_t v_temp_bytes = static_cast<size_t>(num_tokens) * n_kv_heads * v_block_size;
-
-        // Allocate temp buffers
-        void *d_k_temp = nullptr;
-        void *d_v_temp = nullptr;
-        cudaMalloc(&d_k_temp, k_temp_bytes);
-        cudaMalloc(&d_v_temp, v_temp_bytes);
-
-        // Quantize
-        bool ok = cuda_tq8_quantize(d_K_new, d_K_rotations, d_k_temp,
-                                    num_tokens, n_kv_heads, head_dim, stream);
-        if (ok)
-        {
-            ok = cuda_tq4_quantize(d_V_new, d_V_rotations, d_v_temp,
-                                   num_tokens, n_kv_heads, head_dim, stream);
-        }
-
-        if (ok)
-        {
-            // Copy quantized blocks to ring buffer positions
-            // Each position stores n_kv_heads blocks
-            for (int t = 0; t < num_tokens; ++t)
-            {
-                int dst_pos = (head + t) % max_seq_len;
-                size_t k_dst_offset = static_cast<size_t>(dst_pos) * n_kv_heads * k_block_size;
-                size_t k_src_offset = static_cast<size_t>(t) * n_kv_heads * k_block_size;
-                cudaMemcpyAsync(static_cast<uint8_t *>(d_K_cache) + k_dst_offset,
-                                static_cast<uint8_t *>(d_k_temp) + k_src_offset,
-                                n_kv_heads * k_block_size, cudaMemcpyDeviceToDevice, stream);
-
-                size_t v_dst_offset = static_cast<size_t>(dst_pos) * n_kv_heads * v_block_size;
-                size_t v_src_offset = static_cast<size_t>(t) * n_kv_heads * v_block_size;
-                cudaMemcpyAsync(static_cast<uint8_t *>(d_V_cache) + v_dst_offset,
-                                static_cast<uint8_t *>(d_v_temp) + v_src_offset,
-                                n_kv_heads * v_block_size, cudaMemcpyDeviceToDevice, stream);
-            }
-        }
-
-        cudaFree(d_k_temp);
-        cudaFree(d_v_temp);
-
-        return ok;
-    }
-
     extern "C" bool cuda_tq_ring_linearize_dequant(
         float *d_K_out, float *d_V_out,
         const void *d_K_cache, const void *d_V_cache,
@@ -1716,8 +2257,6 @@ namespace llaminar2
             return true;
 
         cuda_tq_upload_codebooks(stream);
-        if (rope_theta > 0.0f)
-            cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
 
         // Tiled kernels use R (non-transposed, row-major) for coalesced access:
         // R[j][tid] at offset j*D + tid → consecutive threads read consecutive addresses.
@@ -1730,7 +2269,8 @@ namespace llaminar2
             const dim3 block(64);
             tq8_dequantize_tiled_kernel<64, TILE><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
-                count, n_kv_heads, rope_theta, position_start, max_seq_len, tail);
+                count, n_kv_heads, rope_theta, position_start, head_dim,
+                max_seq_len, tail);
             tq4_dequantize_tiled_kernel<64, TILE><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
                 count, n_kv_heads, max_seq_len, tail);
@@ -1741,7 +2281,8 @@ namespace llaminar2
             const dim3 block(128);
             tq8_dequantize_tiled_kernel<128, TILE><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
-                count, n_kv_heads, rope_theta, position_start, max_seq_len, tail);
+                count, n_kv_heads, rope_theta, position_start, head_dim,
+                max_seq_len, tail);
             tq4_dequantize_tiled_kernel<128, TILE><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
                 count, n_kv_heads, max_seq_len, tail);
@@ -1761,16 +2302,13 @@ namespace llaminar2
         const float *d_K_rotations, const float *d_V_rotations,
         int tail, int count, int max_seq_len,
         int n_kv_heads, int head_dim,
-        float rope_theta, int position_start,
+        float rope_theta, int position_start, int rope_dim,
         cudaStream_t stream)
     {
         if (count <= 0)
             return true;
 
         cuda_tq_upload_codebooks(stream);
-        if (rope_theta > 0.0f)
-            cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
-
         constexpr int TILE = 16;
 
         if (head_dim == 64)
@@ -1779,7 +2317,8 @@ namespace llaminar2
             const dim3 block(64);
             tq8_dequantize_tiled_kernel<64, TILE, __half><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
-                count, n_kv_heads, rope_theta, position_start, max_seq_len, tail);
+                count, n_kv_heads, rope_theta, position_start, rope_dim,
+                max_seq_len, tail);
             tq4_dequantize_tiled_kernel<64, TILE, __half><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
                 count, n_kv_heads, max_seq_len, tail);
@@ -1790,7 +2329,8 @@ namespace llaminar2
             const dim3 block(128);
             tq8_dequantize_tiled_kernel<128, TILE, __half><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_K_cache), d_K_rotations, d_K_out,
-                count, n_kv_heads, rope_theta, position_start, max_seq_len, tail);
+                count, n_kv_heads, rope_theta, position_start, rope_dim,
+                max_seq_len, tail);
             tq4_dequantize_tiled_kernel<128, TILE, __half><<<grid, block, 0, stream>>>(
                 static_cast<const uint8_t *>(d_V_cache), d_V_rotations, d_V_out,
                 count, n_kv_heads, max_seq_len, tail);
@@ -1800,6 +2340,71 @@ namespace llaminar2
             return false;
         }
 
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    extern "C" bool cuda_tq_batched_ring_dequant_fp16_device_state(
+        __half *d_K_out,
+        __half *d_V_out,
+        const void *const *d_K_entry_table,
+        const void *const *d_V_entry_table,
+        const int *d_heads,
+        const int *d_counts,
+        const float *d_rotations,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        cudaStream_t stream)
+    {
+        if (!d_K_out || !d_V_out || !d_K_entry_table || !d_V_entry_table ||
+            !d_heads || !d_counts || !d_rotations || !stream ||
+            entry_offset < 0 || request_count <= 0 || max_kv_len <= 0 ||
+            max_seq_len <= 0 || n_kv_heads <= 0)
+        {
+            return false;
+        }
+
+        constexpr int tile = 16;
+        const dim3 grid(
+            static_cast<unsigned int>(n_kv_heads),
+            static_cast<unsigned int>((max_kv_len + tile - 1) / tile),
+            static_cast<unsigned int>(request_count));
+        if (head_dim == 64)
+        {
+            tq8_batched_ring_dequant_fp16_device_state_kernel<64, tile>
+                <<<grid, dim3(64), 0, stream>>>(
+                    d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads, rope_theta, position_start, rope_dim);
+            tq4_batched_ring_dequant_fp16_device_state_kernel<64, tile>
+                <<<grid, dim3(64), 0, stream>>>(
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads);
+        }
+        else if (head_dim == 128)
+        {
+            tq8_batched_ring_dequant_fp16_device_state_kernel<128, tile>
+                <<<grid, dim3(128), 0, stream>>>(
+                    d_K_out, d_K_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads, rope_theta, position_start, rope_dim);
+            tq4_batched_ring_dequant_fp16_device_state_kernel<128, tile>
+                <<<grid, dim3(128), 0, stream>>>(
+                    d_V_out, d_V_entry_table, d_heads, d_counts, d_rotations,
+                    entry_offset, request_count, max_kv_len, max_seq_len,
+                    n_kv_heads);
+        }
+        else
+        {
+            return false;
+        }
         return cudaGetLastError() == cudaSuccess;
     }
 
@@ -1827,7 +2432,8 @@ namespace llaminar2
                 d_K_out, d_V_out,
                 d_K_rotation, d_V_rotation,
                 ring_pos, out_offset_elems, n_kv_heads,
-                rope_theta, rope_position, nullptr);
+                rope_theta, rope_position,
+                nullptr, nullptr, 0, 0, 0);
         }
         else if (head_dim == 128)
         {
@@ -1838,7 +2444,8 @@ namespace llaminar2
                 d_K_out, d_V_out,
                 d_K_rotation, d_V_rotation,
                 ring_pos, out_offset_elems, n_kv_heads,
-                rope_theta, rope_position, nullptr);
+                rope_theta, rope_position,
+                nullptr, nullptr, 0, 0, 0);
         }
         else
         {
@@ -1852,11 +2459,19 @@ namespace llaminar2
         __half *d_K_base, __half *d_V_base,
         const void *d_K_cache, const void *d_V_cache,
         const float *d_K_rotation, const float *d_V_rotation,
-        const TQDequantDynamicParams *d_params,
+        const int *d_ring_head, const int *d_cached_count,
+        int max_seq_len, int kv_dim, int position_start,
         int n_kv_heads, int head_dim,
         float rope_theta,
         cudaStream_t stream)
     {
+        if (!d_K_base || !d_V_base || !d_K_cache || !d_V_cache ||
+            !d_K_rotation || !d_V_rotation ||
+            !d_ring_head || !d_cached_count ||
+            max_seq_len <= 0 || kv_dim <= 0 || n_kv_heads <= 0)
+        {
+            return false;
+        }
         cuda_tq_upload_codebooks(stream);
         if (rope_theta > 0.0f)
             cuda_tq_upload_rope_freqs(rope_theta, head_dim, stream);
@@ -1872,7 +2487,9 @@ namespace llaminar2
                 d_K_base, d_V_base,
                 d_K_rotation, d_V_rotation,
                 0, 0, n_kv_heads,
-                rope_theta, 0, d_params);
+                rope_theta, 0,
+                d_ring_head, d_cached_count,
+                max_seq_len, kv_dim, position_start);
         }
         else if (head_dim == 128)
         {
@@ -1883,7 +2500,9 @@ namespace llaminar2
                 d_K_base, d_V_base,
                 d_K_rotation, d_V_rotation,
                 0, 0, n_kv_heads,
-                rope_theta, 0, d_params);
+                rope_theta, 0,
+                d_ring_head, d_cached_count,
+                max_seq_len, kv_dim, position_start);
         }
         else
         {
@@ -1971,6 +2590,74 @@ namespace llaminar2
         rope_apply_fp32_kernel<<<grid, block, 0, stream>>>(
             d_K, count, n_kv_heads, head_dim, rope_theta, position_start, rope_dim);
 
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    extern "C" bool cuda_rope_apply_batched_fp16_device_state(
+        __half *d_K,
+        const int *d_counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        cudaStream_t stream)
+    {
+        const int effective_rope_dim = rope_dim > 0 ? rope_dim : head_dim;
+        if (!d_K || !d_counts || !stream || entry_offset < 0 ||
+            request_count <= 0 || max_kv_len <= 0 || max_seq_len <= 0 ||
+            n_kv_heads <= 0 || head_dim <= 0 || rope_theta <= 0.0f ||
+            effective_rope_dim <= 0 || effective_rope_dim > head_dim ||
+            (effective_rope_dim % 2) != 0)
+        {
+            return false;
+        }
+        const int pairs = request_count * max_kv_len * n_kv_heads *
+                          (effective_rope_dim / 2);
+        rope_apply_batched_fp16_device_state_kernel<<<
+            (pairs + 255) / 256, 256, 0, stream>>>(
+                d_K, d_counts, entry_offset, request_count, max_kv_len,
+                max_seq_len, n_kv_heads, head_dim, rope_theta,
+                position_start, effective_rope_dim);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    extern "C" bool cuda_rope_apply_batched_fp32_ring_to_fp16_device_state(
+        __half *d_K_out,
+        const float *const *d_K_entry_table,
+        const int *d_heads,
+        const int *d_counts,
+        int entry_offset,
+        int request_count,
+        int max_kv_len,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int position_start,
+        int rope_dim,
+        cudaStream_t stream)
+    {
+        const int effective_rope_dim = rope_dim > 0 ? rope_dim : head_dim;
+        if (!d_K_out || !d_K_entry_table || !d_heads || !d_counts || !stream ||
+            entry_offset < 0 || request_count <= 0 || max_kv_len <= 0 ||
+            max_seq_len <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+            rope_theta <= 0.0f || effective_rope_dim <= 0 ||
+            effective_rope_dim > head_dim || (effective_rope_dim % 2) != 0)
+        {
+            return false;
+        }
+        const int pairs = request_count * max_kv_len * n_kv_heads *
+                          (effective_rope_dim / 2);
+        rope_apply_batched_fp32_ring_to_fp16_device_state_kernel<<<
+            (pairs + 255) / 256, 256, 0, stream>>>(
+                d_K_out, d_K_entry_table, d_heads, d_counts, entry_offset,
+                request_count, max_kv_len, max_seq_len, n_kv_heads, head_dim,
+                rope_theta, position_start, effective_rope_dim);
         return cudaGetLastError() == cudaSuccess;
     }
 

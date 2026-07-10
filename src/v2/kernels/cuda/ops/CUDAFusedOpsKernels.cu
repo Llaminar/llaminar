@@ -427,6 +427,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         cudaSetDevice(device_idx);
 
         int threads_per_block = (cols <= 256) ? 256 : 1024;
@@ -457,6 +461,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         cudaSetDevice(device_idx);
 
         int threads_per_block = (cols <= 256) ? 256 : 1024;
@@ -487,6 +495,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         cudaSetDevice(device_idx);
 
         int threads_per_block = (cols <= 256) ? 256 : 1024;

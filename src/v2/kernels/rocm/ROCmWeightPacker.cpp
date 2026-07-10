@@ -21,6 +21,7 @@
 #include "tensors/VnniPackContext.h" // VnniPackContext, vnniLinearIdx, etc.
 #include "tensors/IQQuantTables.h"   // iq3s_grid, ksigns_iq2xs, etc. (for IQ grid init)
 #include "tensors/TensorType.h"      // isNativeVnniFormat, isInt8VnniFormat
+#include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 
@@ -166,7 +167,7 @@ namespace llaminar2
                 out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
             if (info->has_emins)
                 out.native_vnni_emins.resize(static_cast<size_t>(blocks_per_row) * N);
-            out.native_vnni_codebook_id = info->codebook_id;
+            out.native_vnni_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
             out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
 
             // Per-row max-abs for CK prefill INT8 requantization compatibility
@@ -510,7 +511,7 @@ namespace llaminar2
         batch->rows_per_expert = rows_per_expert;
         batch->K = K;
         batch->blocks_per_row = blocks_per_row;
-        batch->codebook_id = info->codebook_id;
+        batch->codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
 
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
         batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;

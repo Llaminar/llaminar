@@ -74,7 +74,8 @@ namespace llaminar2::cpu::native_vnni
             // Store the native block size for this format. VNNI engines are
             // fully eager: the packed interleaved representation stays owned
             // by the engine and is never rebuilt from raw tensor storage.
-            native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
+            native_block_size_ = native_block_bytes_for_format(
+                packed_.codebook_id, packed_.is_superblock);
 
             LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
                       << packed_.N << "×" << packed_.K
@@ -91,7 +92,8 @@ namespace llaminar2::cpu::native_vnni
         explicit CPUNativeVNNIGemmKernel(CPUNativeVNNIPackedWeights &&packed)
             : packed_(std::move(packed)), valid_(packed_.hasInterleavedData())
         {
-            native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
+            native_block_size_ = native_block_bytes_for_format(
+                packed_.codebook_id, packed_.is_superblock);
             if (!valid_)
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Pre-packed CPU_NATIVE_VNNI weights are missing eager interleaved data");
         }
@@ -1015,6 +1017,155 @@ namespace llaminar2::cpu::native_vnni
                         {"k", std::to_string(k)},
                         {"projections", std::to_string(projections.size())}});
             }
+            return true;
+        }
+
+        /**
+         * @brief Project router-published Q8_1 rows without requantizing hidden state.
+         *
+         * Routed MoE verifier execution groups route slots by expert.  A single
+         * hidden row can therefore appear in several expert chunks; quantizing
+         * each chunk independently is both redundant and a source of accidental
+         * divergence from serial decode.  The CPU router publishes the canonical
+         * Q8_1 row set once, and this method consumes gathered blocks from that
+         * publication directly.
+         *
+         * M=1 chunks use the ordinary fused decode GEMV kernel.  M=2..4 chunks
+         * use the fused verifier-row kernel, whose per-row K reduction order is
+         * identical to M=1 decode.  The method has no FP32 or per-projection
+         * fallback: every projection must be an eager, unrotated NativeVNNI
+         * kernel with a compatible matrix shape.
+         *
+         * @param input_q8 Contiguous Q8_1 rows in `[m, ceil(k / 32)]` layout.
+         * @param projections Gate/up projection bundle sharing the same rows.
+         * @param m Number of gathered route rows, in the range 1..4.
+         * @param k FP32 logical width represented by each Q8_1 row.
+         */
+        bool multiply_fused_router_q8_hidden_decode_equivalent(
+            const Q8_1Block *input_q8,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m,
+            int k)
+        {
+            if (!valid_ || !input_q8 || m < 1 || m > 4 || k <= 0 ||
+                projections.empty())
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] router-Q8 projection rejected: valid="
+                          << valid_ << " input_q8=" << (input_q8 != nullptr)
+                          << " m=" << m << " k=" << k
+                          << " projections=" << projections.size());
+                return false;
+            }
+
+            const int K_blocks = (k + Q8_1Block::BLOCK_SIZE - 1) /
+                                 Q8_1Block::BLOCK_SIZE;
+            std::vector<CPUNativeVNNIGemmKernel *> vnni_kernels;
+            vnni_kernels.reserve(projections.size());
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &projection = projections[i];
+                auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(projection.kernel);
+                if (!vnni || !vnni->valid_ || !projection.output || projection.n <= 0 ||
+                    vnni->packed_.K < k || vnni->packed_.N < projection.n)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] router-Q8 projection "
+                              "contract mismatch at index "
+                              << i);
+                    return false;
+                }
+                if (vnni->activation_rotation_ != nullptr)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] router-Q8 publication "
+                              "cannot feed a rotated activation contract at projection "
+                              << i);
+                    return false;
+                }
+                if (vnni->deferred_packing_)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] router-Q8 publication "
+                              "requires eager NativeVNNI weights at projection "
+                              << i);
+                    return false;
+                }
+                vnni_kernels.push_back(vnni);
+            }
+
+            const bool perf_enabled = PerfStatsCollector::isEnabled();
+            const auto perf_start = perf_enabled
+                                        ? PerfStatsCollector::Clock::now()
+                                        : PerfStatsCollector::Clock::time_point{};
+
+            if (m == 1)
+            {
+                std::vector<FusedGemvDesc> descriptors;
+                descriptors.reserve(projections.size());
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &projection = projections[i];
+                    auto &descriptor = descriptors.emplace_back();
+                    descriptor.packed = &vnni_kernels[i]->packed_;
+                    descriptor.output = projection.output->mutable_data();
+                    descriptor.bias = projection.bias ? projection.bias->data() : nullptr;
+                    descriptor.N = projection.n;
+                    descriptor.bpr = K_blocks;
+                    descriptor.q8_0_raw = nullptr;
+                    if (!descriptor.output || (projection.bias && !descriptor.bias))
+                        return false;
+                }
+                gemv_native_vnni_fused_preq(
+                    input_q8,
+                    descriptors.data(),
+                    static_cast<int>(descriptors.size()));
+            }
+            else
+            {
+                std::vector<FusedVerifierRowsDesc> descriptors;
+                descriptors.reserve(projections.size());
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &projection = projections[i];
+                    float *output = projection.output->mutable_data();
+                    const float *bias = projection.bias ? projection.bias->data() : nullptr;
+                    if (!output || (projection.bias && !bias))
+                        return false;
+                    descriptors.push_back({
+                        &vnni_kernels[i]->packed_,
+                        output,
+                        bias,
+                        projection.n,
+                        projection.n});
+                }
+
+                if (!gemm_native_vnni_fused_verifier_rows_preq(
+                        input_q8,
+                        descriptors.data(),
+                        static_cast<int>(descriptors.size()),
+                        m,
+                        K_blocks))
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] router-Q8 fused verifier "
+                              "kernel rejected an advertised NativeVNNI contract");
+                    return false;
+                }
+            }
+
+            recordVerifierTiming(
+                "cpu_native_vnni_router_q8_reused_projection_gemv",
+                perf_start,
+                m,
+                /*n=*/0,
+                k,
+                static_cast<int>(projections.size()));
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_native_vnni_router_q8_grouped_verifier_projection_calls",
+                1.0,
+                "gemm",
+                "cpu",
+                {{"m", std::to_string(m)},
+                 {"k", std::to_string(k)},
+                 {"projections", std::to_string(projections.size())},
+                 {"path", m == 1 ? "decode" : "grouped_verifier"}});
             return true;
         }
 

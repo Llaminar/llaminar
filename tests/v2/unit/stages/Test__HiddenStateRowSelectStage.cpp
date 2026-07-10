@@ -514,9 +514,9 @@ TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateW
     params.d_model = 32;
     params.selected_row_count = 3;
     params.selected_row_indices = {1, 2, 3};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
     params.workspace_buffer_name = "mtp_spec_decode_verifier_rows";
-    params.declare_selected_rows_workspace = false;
-    params.upload_selected_rows_to_workspace = false;
     HiddenStateRowsSelectStage stage(params);
 
     EXPECT_TRUE(stage.getWorkspaceRequirements(8, 32, 0).buffers.empty())

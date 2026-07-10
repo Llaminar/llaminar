@@ -143,11 +143,87 @@ codebook family, floating-point tensor format, or backend lane is added, extend
 the corresponding sweep in the same slice before tuning or claiming the lane is
 complete.
 
+Routed MoE format sweeps must enter through the production router before the
+grouped expert pass and validate the router-to-expert Q8 publication counter;
+precomputed host route IDs do not prove this optimization. The canonical
+counters are `cpu_moe_grouped_verifier_router_q8_reuse_calls`,
+`cuda_moe_grouped_prefill_router_q8_reuse_calls`, and
+`rocm_moe_grouped_prefill_router_q8_reuse_calls`. CPU serial-oracle rows must
+also observe `cpu_moe_decode_router_q8_reuse_calls`. A byte-equal result without
+the matching counter is a failed gate because it may only show that two
+independent quantizers happened to agree for the synthetic input.
+
 ```bash
-ctest --test-dir build_v2_integration -R "^(V2_Integration_GroupedVerifierRows_CPU_AllFormats|V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths)$" --output-on-failure --parallel
-ctest --test-dir build_v2_integration -R "^(V2_Integration_GroupedVerifierRows_CUDA_AllFormats|V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths|V2_Integration_GroupedVerifierRows_CUDA_LocalTPWo|V2_Integration_GroupedVerifierRows_CUDA_RMSNorm|V2_Integration_GroupedVerifierRows_CUDA_Attention)$" --output-on-failure --parallel
-ctest --test-dir build_v2_integration -R "^(V2_Integration_GroupedVerifierRows_ROCm_AllFormats|V2_Integration_GroupedVerifierRows_ROCm_MoEAllCodegroups|V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths|V2_Integration_GroupedVerifierRows_ROCm_LocalTPWo|V2_Integration_GroupedVerifierRows_ROCm_DenseQKV|V2_Integration_GroupedVerifierRows_ROCm_GDNProjection|V2_Integration_GroupedVerifierRows_ROCm_RMSNorm|V2_Integration_GroupedVerifierRows_ROCm_Attention)$" --output-on-failure --parallel
+# Discover the exact registered inventory first, then run every present and
+# future grouped-verifier lane. Do not replace this prefix gate with a hand list.
+ctest --test-dir build_v2_integration -N -R "^V2_Integration_GroupedVerifierRows_"
+ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_" --output-on-failure --parallel
+
+# Backend slices are useful while iterating, but all three remain mandatory
+# before a grouped-verifier slice is accepted.
+ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_CPU_" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_CUDA_" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_ROCm_" --output-on-failure --parallel
 ```
+
+As of 2026-07-10 the prefix gate discovers 43 substantive lanes: 13 CPU, 13
+CUDA, and 17 ROCm. The inventory includes all-format GEMM, MoE codegroups and
+expert paths, floating formats, dense QKV/GDN projections, replicated LocalTP
+output projection, embedding, RMSNorm, fused residual norm, residual add,
+SwiGLU, RoPE, attention, KV-cache append, GDN recurrence, and short-conv. The
+prefix command is canonical precisely so a newly registered operation cannot be
+omitted from an otherwise plausible-looking hand-maintained regex.
+
+The CUDA and ROCm `KVCacheAppend` gates each enumerate the same 288 production
+routes: every accepted cache/source format pair (including asymmetric prepared
+TQ8-K/TQ4-V), M=2/3/4, position-major and verifier-head-major inputs,
+replicated and LocalTP-sharded caches, and direct-static versus graph-captured
+device-dynamic ring metadata. They require native cache byte equality, sequence
+metadata equality, prefix-block export/import round trips, and exactly one
+grouped route-counter observation per matrix cell.
+
+The CPU `RoPE` gate covers FP32, BF16, FP16, pure-integer Q8_1, and Q16_1 with
+32/64/128-value native blocks at M=2/3/4. It compares native bytes against
+serial M=1 decode and checks the `single_grouped_row_head_workshare` route, so a
+row loop hidden behind the grouped interface is not an acceptable replacement.
+
+The explicit CUDA and ROCm `RoPE` gates mirror one 24-cell matrix per backend:
+FP32 full/partial plus BF16 and FP16, M=2/3/4, and both contiguous
+device-scalar and explicit device-row position owners. They compare native GPU
+bytes with the same backend's production M=1 decode kernel, require non-default
+streams, and reject a missing `single_grouped_launch` route counter.
+
+The explicit CUDA and ROCm `RMSNorm` gates each cover 18 positive production
+cells: FP32, BF16, and FP16 at M=2/3/4 for 128-column per-head Q/K normalization
+and 4096-column hidden-state normalization. Those widths cross the narrow and
+wide reduction launch policies. Every cell enters `apply_tensor` on a
+non-default stream, compares native output bytes with same-backend M=1 decode,
+and requires one `one_block_per_row` / `single_grouped_launch` counter. Three
+additional negative cells prove that every native format rejects an unbound
+default stream without publishing route telemetry.
+
+The CPU, CUDA, and ROCm `ResidualAdd` gates each cover FP32, BF16, and FP16 at
+M=2/3/4 for 128- and 4096-column rows. They require native byte equality against
+same-backend M=1 decode and exactly one flat workshare/launch counter. GPU gates
+also require device-only `gpu_data_ptr()` ownership and verify that every format
+rejects an unbound default stream; in particular, this guards ROCm BF16's stream
+setter, which must remain symmetric with FP32 and FP16.
+
+The CPU, CUDA, and ROCm `FusedResidualNorm` gates cover the same 18 positive
+cells per backend but enter `FusedResidualNormStage`, the actual graph operation
+at attention and FFN residual boundaries. Both the in-place residual publication
+and normalized output must match independent production M=1 stage executions in
+native bytes. CUDA and ROCm additionally run one null-stream rejection cell per
+format and require one device-resident fused launch; this prevents the separate
+ResidualAdd/RMSNorm suites from masking broken fused type dispatch or stale host
+ownership.
+
+The standalone `SwiGLU` gates cover M=2/3/4 at 544 and 4864 columns. CUDA and
+ROCm sweep FP32/BF16/FP16 with explicit streams and one flat launch; CPU adds
+Q8_1 and requires one native workshare. The 544-column case is deliberately 17
+Q8 blocks wide, so grouped execution cannot pair blocks across a row boundary
+without the native-byte oracle noticing. These gates complement, rather than
+duplicate, fused GEMM+SwiGLU-down coverage.
 
 Use the backend-specific all-format sweep as the minimum acceptance gate for a
 narrow kernel edit, then run the full backend group before claiming that grouped
@@ -159,9 +235,10 @@ Do not run only the easy backend. If CUDA has a deep PyTorch or layer-by-layer
 test, ROCm and CPU need the same semantic coverage unless the plan explicitly
 marks the lane as not implemented.
 
-Refresh the canonical list with `ctest --test-dir build_v2_integration -N -R
-"GroupedVerifierRows"` when adding tests, then update this section so the skill
-continues to enumerate the blocking CPU, CUDA, and ROCm gates directly.
+Refresh the inventory with `ctest --test-dir build_v2_integration -N -R
+"^V2_Integration_GroupedVerifierRows_"` when adding tests. Keep every canonical
+test under that namespace so the precommit, CI, and skill prefix gates include
+it automatically.
 
 ## Performance Methodology
 

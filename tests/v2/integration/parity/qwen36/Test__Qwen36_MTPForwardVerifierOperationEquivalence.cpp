@@ -292,13 +292,33 @@ namespace
                        tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
                        tag_is_one_of(record,
                                      "gateup_route",
-                                     {"decode_equiv_prefill",
+                                     {"decode_equiv_router_q8",
+                                      "decode_equiv_prefill",
                                       "kpart_prefill",
                                       "fused_prefill"});
             });
         ASSERT_NE(routed_grouped, records.end())
             << "ROCm MoE grouped verifier did not exercise the active-expert "
                "grouped prefill routed path for M="
+            << expected_seq_len << ".\n"
+            << PerfStatsCollector::summaryString({"kernel", "mtp"});
+
+        const auto router_q8_reuse = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name ==
+                           "rocm_moe_grouped_prefill_router_q8_reuse_calls" &&
+                       tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
+                       tag_equals(record, "top_k", "8") &&
+                       tag_equals(record,
+                                  "descriptor_source",
+                                  "static_table");
+            });
+        ASSERT_NE(router_q8_reuse, records.end())
+            << "ROCm MoE grouped verifier did not reuse the router-owned Q8 "
+               "hidden rows for M="
             << expected_seq_len << ".\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 
@@ -346,6 +366,7 @@ namespace
     {
         ScopedEnvironmentValues operation_diagnostics({
             {"LLAMINAR_DENSE_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
+            {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
         const auto test_case = denseSingleDeviceCase(backend);
@@ -370,6 +391,7 @@ namespace
     {
         ScopedEnvironmentValues operation_diagnostics({
             {"LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
+            {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
         const auto test_case = moeBenchmarkPromptCase(backend);
