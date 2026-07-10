@@ -141,10 +141,41 @@ namespace
             last_stream_ = stream;
             return restore_ok_;
         }
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override
+        {
+            ++restore_rows_calls_;
+            last_rows_.assign(
+                host_row_indices,
+                host_row_indices + request_count);
+            last_stream_ = stream;
+            return restore_ok_;
+        }
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override
+        {
+            ++restore_device_rows_calls_;
+            last_device_lengths_ = device_request_seq_lens;
+            last_request_count_ = request_count;
+            last_request_row_width_ = request_row_width;
+            last_stream_ = stream;
+            return restore_ok_;
+        }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
         int restore_calls_ = 0;
+        int restore_rows_calls_ = 0;
+        int restore_device_rows_calls_ = 0;
         int last_row_ = -1;
+        int last_request_count_ = 0;
+        int last_request_row_width_ = 0;
+        const int *last_device_lengths_ = nullptr;
+        std::vector<int> last_rows_;
         void *last_stream_ = nullptr;
 
     private:
@@ -782,6 +813,139 @@ TEST(Test__DeviceGraphExecutor, CapturedTerminalStatePublishesCapturedStages)
 
     EXPECT_EQ(stage_ptr->restore_calls_, 1);
     EXPECT_EQ(stage_ptr->last_row_, 7);
+    EXPECT_EQ(stage_ptr->last_stream_, stream);
+}
+
+/**
+ * @brief Capacity metadata must not turn an active scalar request into a batch.
+ *
+ * Request-batch-capable runners retain graph-stable device metadata at their
+ * configured capacity. During a scalar oracle prefill that allocation remains
+ * present, while the active request count is one. Publication must therefore
+ * restore the scalar terminal row and ignore the inactive capacity entries.
+ */
+TEST(Test__DeviceGraphExecutor, ScalarPublicationIgnoresCapacitySizedDeviceLengths)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cpu());
+
+    const int capacity_lengths[2] = {8, 0};
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        /*producer_stream_override=*/nullptr,
+        "scalar_with_batch_capacity",
+        capacity_lengths,
+        /*request_count=*/1,
+        /*request_row_width=*/8));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_row_, 7);
+}
+
+/**
+ * @brief A true request batch cannot silently use scalar publication.
+ */
+TEST(Test__DeviceGraphExecutor, RequestBatchRequiresHostOrDeviceLengths)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    graph.addNode(
+        "captured",
+        std::make_unique<FakeCapturedStateStage>(
+            DeviceId::cpu(),
+            /*has_capture=*/true),
+        DeviceId::cpu());
+
+    EXPECT_FALSE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        /*producer_stream_override=*/nullptr,
+        "missing_request_lengths",
+        /*device_request_seq_lens=*/nullptr,
+        /*request_count=*/2,
+        /*request_row_width=*/8));
+}
+
+/**
+ * @brief CPU request batches publish one real terminal row per request.
+ *
+ * CPU grouped recurrence kernels own their request-length metadata on the
+ * host. The executor must translate each real length into the flattened padded
+ * row domain and invoke the grouped publication primitive exactly once. This
+ * protects CPU request batching from accidentally inheriting the GPU-only
+ * device-length contract or publishing the scalar request-zero tail.
+ */
+TEST(Test__DeviceGraphExecutor, CPURequestBatchPublishesHostOwnedTerminalRows)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cpu());
+
+    const std::vector<int> real_lengths{8, 5};
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        /*producer_stream_override=*/nullptr,
+        "cpu_request_batch",
+        /*device_request_seq_lens=*/nullptr,
+        /*request_count=*/2,
+        /*request_row_width=*/8,
+        &real_lengths));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 0);
+    EXPECT_EQ(stage_ptr->restore_rows_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_rows_, (std::vector<int>{7, 12}));
+    EXPECT_EQ(stage_ptr->last_stream_, nullptr);
+}
+
+/**
+ * @brief GPU publication is governed only by resident request metadata.
+ *
+ * Serving may retain a host shadow for logging, but that shadow is not part of
+ * the GPU execution transaction and may lag resident metadata. The executor
+ * must neither validate nor dereference it while a GPU stage publishes from
+ * the graph-stable device length vector.
+ */
+TEST(Test__DeviceGraphExecutor, GPURequestBatchIgnoresHostLengthShadow)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cuda(0),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cuda(0));
+
+    const int resident_lengths[2] = {8, 5};
+    const std::vector<int> intentionally_stale_host_shadow{0};
+    int stream_token = 0;
+    void *stream = &stream_token;
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        stream,
+        "gpu_request_batch",
+        resident_lengths,
+        /*request_count=*/2,
+        /*request_row_width=*/8,
+        &intentionally_stale_host_shadow));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 0);
+    EXPECT_EQ(stage_ptr->restore_rows_calls_, 0);
+    EXPECT_EQ(stage_ptr->restore_device_rows_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_device_lengths_, resident_lengths);
+    EXPECT_EQ(stage_ptr->last_request_count_, 2);
+    EXPECT_EQ(stage_ptr->last_request_row_width_, 8);
     EXPECT_EQ(stage_ptr->last_stream_, stream);
 }
 
@@ -2258,6 +2422,13 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
     DeviceGraphExecutor executor;
     DeviceGraphExecutor::GraphSegmentCache cache;
     FakeReplayGPUContext gpu_ctx;
+    int worker_resolver_calls = 0;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            ++worker_resolver_calls;
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
@@ -2298,6 +2469,8 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
     EXPECT_EQ(cache.decode_step, 1u);
     EXPECT_EQ(cache.variant_recapture_count, 1u);
     EXPECT_NE(cache.capture_variant_signature, first_signature);
+    EXPECT_EQ(worker_resolver_calls, 0)
+        << "Variant recapture already owns an explicit worker and must not resolve a second physical context.";
 }
 
 TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)

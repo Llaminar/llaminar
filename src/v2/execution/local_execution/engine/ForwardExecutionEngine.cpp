@@ -15,7 +15,6 @@
 #include "ForwardExecutionEngine.h"
 #include "PrefillBucketUtils.h"
 #include "../graph/GraphCaptureGuard.h"
-#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
@@ -85,6 +84,52 @@ namespace llaminar2
             static std::mutex mutex;
             return mutex;
         }
+
+        /**
+         * @brief Install a host-owned worker resolver for one engine call.
+         *
+         * DeviceGraphExecutor also supports standalone use, where it resolves
+         * the process GPU pool directly. ForwardExecutionEngine has a stronger
+         * host boundary, so every nested eager/captured executor operation must
+         * use the same host-selected worker. Restoring the prior resolver on all
+         * returns prevents a short-lived test host from remaining captured by a
+         * long-lived executor.
+         */
+        class ScopedWorkerGPUContextResolver
+        {
+        public:
+            ScopedWorkerGPUContextResolver(
+                DeviceGraphExecutor &executor,
+                IForwardExecutionHost &host,
+                DeviceId device)
+                : executor_(executor),
+                  previous_resolver_(executor.config().worker_gpu_context_resolver),
+                  previous_uses_process_pool_(
+                      executor.config().worker_gpu_context_uses_process_pool)
+            {
+                executor_.setWorkerGPUContextResolver(
+                    [&host](DeviceId requested_device)
+                    {
+                        return host.getWorkerGPUContext(requested_device);
+                    },
+                    host.workerGPUContextUsesProcessPool(device));
+            }
+
+            ~ScopedWorkerGPUContextResolver()
+            {
+                executor_.setWorkerGPUContextResolver(
+                    std::move(previous_resolver_),
+                    previous_uses_process_pool_);
+            }
+
+            ScopedWorkerGPUContextResolver(const ScopedWorkerGPUContextResolver &) = delete;
+            ScopedWorkerGPUContextResolver &operator=(const ScopedWorkerGPUContextResolver &) = delete;
+
+        private:
+            DeviceGraphExecutor &executor_;
+            std::function<IWorkerGPUContext *(DeviceId)> previous_resolver_;
+            bool previous_uses_process_pool_ = false;
+        };
 
         /// @brief Return the absolute logical-token offset for prefill-style inputs.
         ///
@@ -888,6 +933,10 @@ namespace llaminar2
         ForwardOutput &output,
         IForwardExecutionHost &host)
     {
+        ScopedWorkerGPUContextResolver worker_resolver_scope(
+            executor_,
+            host,
+            input.device);
         last_executed_forward_graph_ = {};
 
         auto start = std::chrono::high_resolution_clock::now();
@@ -1545,8 +1594,14 @@ namespace llaminar2
             {
                 try
                 {
-                    auto &pool = GPUDeviceContextPool::instance();
-                    stream_gpu_ctx = &pool.getContext(stream_ctx->deviceId());
+                    stream_gpu_ctx = host.getWorkerGPUContext(stream_ctx->deviceId());
+                    if (!stream_gpu_ctx)
+                    {
+                        LOG_ERROR("[ForwardExecutionEngine] Host did not provide a worker GPU context for "
+                                  << stream_ctx->deviceId().toString()
+                                  << " before cached dynamic params");
+                        return false;
+                    }
                     forward_cache.gpu_ctx = stream_gpu_ctx;
                     if (!forward_cache.gpu_stream)
                         forward_cache.gpu_stream = stream_gpu_ctx->defaultStream();
@@ -1932,10 +1987,15 @@ namespace llaminar2
                 DeviceId dev_id = ctx->deviceId();
                 if (dev_id.is_gpu())
                 {
-                    auto &pool = GPUDeviceContextPool::instance();
-                    IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
-                    forward_cache.gpu_stream = gpu_ctx.defaultStream();
-                    forward_cache.gpu_ctx = &gpu_ctx;
+                    IWorkerGPUContext *gpu_ctx = host.getWorkerGPUContext(dev_id);
+                    if (!gpu_ctx)
+                    {
+                        LOG_ERROR("[ForwardExecutionEngine] Host did not provide a worker GPU context for captured decode on "
+                                  << dev_id.toString());
+                        return false;
+                    }
+                    forward_cache.gpu_stream = gpu_ctx->defaultStream();
+                    forward_cache.gpu_ctx = gpu_ctx;
                 }
             }
 
@@ -2098,7 +2158,7 @@ namespace llaminar2
                            ? "main_decode"
                            : forward_cache.segment_cache.perf_context)
                     : "prefill";
-            collectTimeline(ctx, is_decode, input, start, stage_context);
+            collectTimeline(host, ctx, is_decode, input, start, stage_context);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -2352,8 +2412,7 @@ namespace llaminar2
         {
             if (!ctx || !ctx->deviceId().is_gpu())
                 return nullptr;
-            auto &pool = GPUDeviceContextPool::instance();
-            return &pool.getContext(ctx->deviceId());
+            return host.getWorkerGPUContext(ctx->deviceId());
         };
 
         auto bindPrefillStreamToStages = [&](void *stream)
@@ -2409,7 +2468,8 @@ namespace llaminar2
                     context,
                     input.sequence_lengths_device,
                     input.batch_size,
-                    input.seq_len))
+                    input.seq_len,
+                    input.sequence_lengths))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph terminal state publication failed"
                           << (context ? std::string(" during ") + context : std::string{})
@@ -3017,7 +3077,13 @@ namespace llaminar2
             {
                 try
                 {
-                    execution_gpu_ctx = &GPUDeviceContextPool::instance().getContext(ctx->deviceId());
+                    execution_gpu_ctx = host.getWorkerGPUContext(ctx->deviceId());
+                    if (!execution_gpu_ctx)
+                    {
+                        LOG_ERROR("[ForwardExecutionEngine] Host did not provide a worker GPU context for "
+                                  << ctx->deviceId().toString());
+                        return false;
+                    }
                     execution_stream = execution_gpu_ctx->defaultStream();
                 }
                 catch (const std::exception &e)
@@ -3202,7 +3268,8 @@ namespace llaminar2
                             : "prefill_eager",
                         effective_input.sequence_lengths_device,
                         effective_input.batch_size,
-                        effective_input.seq_len))
+                        effective_input.seq_len,
+                        effective_input.sequence_lengths))
                 {
                     LOG_ERROR("[ForwardExecutionEngine] Failed to publish captured terminal prefill state after cache miss");
                     return false;
@@ -3220,6 +3287,7 @@ namespace llaminar2
                     ? forwardGraphPerfContext(signature)
                     : (is_decode ? "main_decode" : "prefill");
             collectTimeline(
+                host,
                 host.getDeviceContext(effective_input.device),
                 is_decode, effective_input, start, stage_context);
         }
@@ -3317,6 +3385,7 @@ namespace llaminar2
     // =========================================================================
 
     void ForwardExecutionEngine::collectTimeline(
+        IForwardExecutionHost &host,
         IDeviceContext *ctx,
         bool is_decode,
         const ForwardInput &input,
@@ -3344,9 +3413,14 @@ namespace llaminar2
             return;
         }
 
-        auto &pool = GPUDeviceContextPool::instance();
-        IWorkerGPUContext &gpu_ctx = pool.getContext(ctx->deviceId());
-        timeline.collect(&gpu_ctx);
+        IWorkerGPUContext *gpu_ctx = host.getWorkerGPUContext(ctx->deviceId());
+        if (!gpu_ctx)
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Host did not provide a worker GPU context for timeline collection on "
+                      << ctx->deviceId().toString());
+            return;
+        }
+        timeline.collect(gpu_ctx);
 
         double wall_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::high_resolution_clock::now() - start)

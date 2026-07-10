@@ -4936,11 +4936,35 @@ Current status:
   probabilities, thresholds, and both compact/processed bonus samples on CUDA
   and ROCm. Validation: transition `125/125`, GPU ownership policy `96/96`,
   explicit CUDA and ROCm sampling suites, full Integration build `935/935`, and
-  canonical grouped verifier `43/43` substantive lanes. Current architecture
-  estimate: LocalTP 86%, ExpertParallel 73%. Remaining ownership work includes
-  host-computed stochastic prefill draws, rank-level request batching, and
-  stable recurrent live-state indirection so accepted publication can keep GPU
-  graph executables warm without risking stale verifier-scratch bindings.
+  the then-current canonical grouped verifier `43/43` substantive lanes.
+- GPU recurrent graph lifetime is now byte-proven rather than guarded by a
+  reset-all policy. CUDA and ROCm GDN/short-conv regressions capture the ordinary
+  M=1 decode graph once, run grouped M=2/3/4 verifier state, publish every
+  accepted row by device index, detach verifier bindings, and replay without
+  recapture. Continuation output and complete live recurrent state match serial
+  M=1 decode byte-for-byte. `DeviceGraphOrchestrator` now applies the typed
+  correction-boundary policy: stable single-token decode and all-position
+  verifier captures remain warm, while live-state-versioned multi-row ordinary
+  decode resets. Validation passed the focused policy/orchestration suite
+  `9/9` and canonical grouped verifier gate `47/47` substantive cells (`48/48`
+  including the fixture).
+- LocalTP request-batched prefill now remains resident through its first sampled
+  decode token. Compact row-indexed prefill selects the mirrored full-vocabulary
+  head on every child, `RankOrchestrator` samples all child-resident logits in
+  parallel, and each child publishes its own logical-state mailbox. The host
+  compares only tiny response token shadows; it neither gathers logits nor owns
+  the sampled continuation. CUDA2 and ROCm2 greedy/stochastic unequal-length
+  regressions passed in `45.77 s` and `63.18 s` respectively and require the
+  mirrored-head, resident sampling, grouped GDN/short-conv commit, and rank
+  fan-out counters. CPU request batches now publish captured recurrent terminal
+  rows from host-owned lengths, while GPU publication ignores stale host shadows
+  and consumes resident lengths only. ForwardExecutionEngine obtains worker
+  streams/graphs through its host, so GPU-shaped unit tests use a hardware-free
+  worker instead of initializing a physical backend. Validation: focused `9/9`,
+  full unit `518/518`, CUDA2/ROCm2 production cells `2/2`. Current architecture
+  estimate: LocalTP 95%, ExpertParallel 80%. Remaining ownership work is the
+  complete captured collective/remote-participant lifecycle and equivalent
+  mirrored-head request-batch proof across ExpertParallel modes.
 
 ## Iteration Gates
 

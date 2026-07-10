@@ -1857,7 +1857,8 @@ namespace
      */
     void runQwen36MTPGpuRequestBatchResidentPrefill(
         GlobalDeviceAddress device,
-        const std::string &backend_name)
+        const std::string &backend_name,
+        const std::vector<GlobalDeviceAddress> &local_tp_devices = {})
     {
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -1882,9 +1883,21 @@ namespace
         config.model_path = model_path;
         config.max_seq_len = 128;
         config.batch_size = 2;
-        config.tp_degree = 1;
         config.pp_degree = 1;
-        config.device_for_this_rank = device;
+        if (local_tp_devices.empty())
+        {
+            config.tp_degree = 1;
+            config.device_for_this_rank = device;
+        }
+        else
+        {
+            config.tp_degree = static_cast<int>(local_tp_devices.size());
+            config.tp_scope = TPScope::LOCAL;
+            config.tp_devices = local_tp_devices;
+            config.default_backend = device.isCUDA()
+                                         ? CollectiveBackendType::NCCL
+                                         : CollectiveBackendType::RCCL;
+        }
         config.kv_cache_precision = "auto";
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 1;
@@ -1905,6 +1918,9 @@ namespace
         const std::vector<int32_t> short_prompt(
             long_prompt.begin(),
             long_prompt.begin() + 11);
+        const double participant_count =
+            static_cast<double>(
+                local_tp_devices.empty() ? 1 : local_tp_devices.size());
 
         SamplingParams stochastic;
         stochastic.temperature = 0.6f;
@@ -2028,16 +2044,25 @@ namespace
                 "mtp",
                 "request_batch_prefill_device_position_admissions",
                 "prefill"),
-            2.0)
+            2.0 * participant_count)
             << backend_name << " must admit one device position per request";
         EXPECT_EQ(
             mtp_decode_counter("request_batch_prefill_resident_position_threshold_rows"),
-            2.0)
+            2.0 * participant_count)
             << backend_name << " must derive both first-token draws on device";
         EXPECT_EQ(
             mtp_decode_counter("request_batch_prefill_device_logical_state_publications"),
-            1.0)
+            participant_count)
             << backend_name << " must publish one complete request-batch mailbox";
+        if (!local_tp_devices.empty())
+        {
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_request_batch_prefill_samples"),
+                2.0)
+                << backend_name
+                << " LocalTP must sample the batch through child-resident mirrored heads";
+        }
         EXPECT_GE(mtp_decode_counter("device_resident_logical_state_mailboxes"), 1.0);
         EXPECT_EQ(mtp_decode_counter("first_token_stochastic_samples"), 0.0)
             << backend_name << " must not route batched GPU prefill through host logits";
@@ -3428,6 +3453,21 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRequestBatchResidentPrefill)
         "ROCm");
 }
 
+TEST(Test__KVPrefixMTPStateProbe,
+     Qwen36ROCm2LocalTPMTPRequestBatchResidentPrefill)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need two ROCm devices for Qwen3.6 LocalTP request-batch prefill";
+    }
+    runQwen36MTPGpuRequestBatchResidentPrefill(
+        GlobalDeviceAddress::rocm(0),
+        "ROCm2 LocalTP",
+        {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepeatabilityLong)
 {
     auto &dm = DeviceManager::instance();
@@ -3498,6 +3538,21 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPRequestBatchResidentPrefill)
     runQwen36MTPGpuRequestBatchResidentPrefill(
         GlobalDeviceAddress::cuda(cuda_ordinal),
         "CUDA");
+}
+
+TEST(Test__KVPrefixMTPStateProbe,
+     Qwen36CUDA2LocalTPMTPRequestBatchResidentPrefill)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need two CUDA devices for Qwen3.6 LocalTP request-batch prefill";
+    }
+    runQwen36MTPGpuRequestBatchResidentPrefill(
+        GlobalDeviceAddress::cuda(0),
+        "CUDA2 LocalTP",
+        {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticClearCacheRepeatabilityLong)

@@ -24,6 +24,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 using namespace llaminar2;
 
@@ -106,6 +107,7 @@ namespace
         // ----- Tracking Counters -----
         int build_forward_graph_calls = 0;
         int get_device_context_calls = 0;
+        int get_worker_gpu_context_calls = 0;
         int ensure_workspace_calls = 0;
         int last_workspace_seq_len = -1;
         int sync_logits_calls = 0;
@@ -216,6 +218,16 @@ namespace
             get_device_context_calls++;
             return ctx_;
         }
+
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId device) override
+        {
+            ++get_worker_gpu_context_calls;
+            if (!ctx_ || device != ctx_->deviceId())
+                return nullptr;
+            return &llaminar2::testing::sharedMockWorkerGPUContext();
+        }
+
+        bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
 
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
         {
@@ -474,6 +486,20 @@ TEST(ForwardExecutionEngineSourceScan, DecodeSegmentCaptureFencesAfterStreamSync
     ASSERT_NE(recapture_begin, std::string::npos);
     EXPECT_LT(recapture_boundary, recapture_begin)
         << "Forced recapture must use the same pre-beginCapture domain fence.";
+}
+
+/**
+ * @brief The engine must not initialize a physical GPU behind its host boundary.
+ */
+TEST(ForwardExecutionEngineSourceScan, WorkerGPUContextIsHostOwned)
+{
+    const std::string source = readTextFile(LLAMINAR_FORWARD_EXECUTION_ENGINE_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    EXPECT_EQ(source.find("GPUDeviceContextPool"), std::string::npos)
+        << "ForwardExecutionEngine must not bypass its host and initialize a physical GPU context.";
+    EXPECT_NE(source.find("ScopedWorkerGPUContextResolver"), std::string::npos);
+    EXPECT_NE(source.find("host.getWorkerGPUContext("), std::string::npos);
 }
 
 // =========================================================================
@@ -1518,6 +1544,8 @@ TEST_F(Test__ForwardExecutionEngine, Execute_BatchedGpuPrefillSkipsBucketedAdapt
     EXPECT_EQ(host.last_forward_input.real_seq_len, 0);
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0);
     EXPECT_EQ(host.last_workspace_seq_len, 3);
+    EXPECT_GT(host.get_worker_gpu_context_calls, 0)
+        << "GPU-shaped unit execution must use the host's hardware-free worker context.";
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucketedGraphCache)

@@ -604,8 +604,7 @@ namespace llaminar2
         int request_count,
         int request_row_width) const
     {
-        if (!params_.device_id.is_gpu() ||
-            !params_.kernel ||
+        if (!params_.kernel ||
             request_count <= 1 ||
             request_row_width <= 0 ||
             params_.request_count != request_count ||

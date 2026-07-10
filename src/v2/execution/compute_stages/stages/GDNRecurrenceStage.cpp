@@ -673,8 +673,7 @@ namespace llaminar2
         int request_count,
         int request_row_width) const
     {
-        if (!params_.device_id.is_gpu() ||
-            !params_.kernel ||
+        if (!params_.kernel ||
             request_count <= 1 ||
             request_row_width <= 0 ||
             params_.request_count != request_count ||
@@ -1015,9 +1014,17 @@ namespace llaminar2
             !alog_base || !dtbias_base || !out_base)
             return false;
 
-        if (!params_.recurrence_state)
+        /*
+         * A raw recurrence pointer is part of the CPU execution contract only.
+         * CUDA and ROCm implementations select and, before capture, allocate
+         * their own persistent device state inside ITensorGatedDeltaNet. Their
+         * graph params therefore carry a null pointer by design. Rejecting that
+         * null here would prevent the backend owner from resolving its resident
+         * state and would reintroduce the obsolete host-mirror dependency.
+         */
+        if (!device().is_gpu() && !params_.recurrence_state)
         {
-            LOG_ERROR("[GDNRecurrenceStage] recurrence_state is null");
+            LOG_ERROR("[GDNRecurrenceStage] CPU recurrence_state is null");
             return false;
         }
 

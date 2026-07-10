@@ -594,6 +594,17 @@ namespace llaminar2
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
         /**
+         * @brief Whether shutdown may resolve a physical backend for runner_.
+         *
+         * Production constructors keep this true. Constructors that accept an
+         * injected IInferenceRunner are unit-test seams: their CUDA/ROCm-shaped
+         * DeviceIds exercise policy only and must never initialize a physical
+         * backend during teardown. Injected RankOrchestrator instances still
+         * receive synchronizeDevices(); that object independently knows whether
+         * its children own physical devices.
+         */
+        bool physical_runner_backend_access_enabled_ = true;
+        /**
          * @brief Owns TP-combined snapshot views returned through the orchestration API.
          *
          * RankOrchestrator keeps per-device snapshots and can assemble a semantic

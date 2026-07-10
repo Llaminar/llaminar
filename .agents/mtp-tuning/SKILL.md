@@ -166,13 +166,24 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_CU
 ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_ROCm_" --output-on-failure --parallel
 ```
 
-As of 2026-07-10 the prefix gate discovers 43 substantive lanes: 13 CPU, 13
-CUDA, and 17 ROCm. The inventory includes all-format GEMM, MoE codegroups and
+As of 2026-07-10 the prefix gate discovers 47 substantive lanes: 13 CPU, 15
+CUDA, and 19 ROCm. The inventory includes all-format GEMM, MoE codegroups and
 expert paths, floating formats, dense QKV/GDN projections, replicated LocalTP
 output projection, embedding, RMSNorm, fused residual norm, residual add,
 SwiGLU, RoPE, attention, KV-cache append, GDN recurrence, and short-conv. The
 prefix command is canonical precisely so a newly registered operation cannot be
 omitted from an otherwise plausible-looking hand-maintained regex.
+
+The CUDA and ROCm `GDNRecurrence` and `ShortConv` lanes also prove captured
+graph lifetime across accepted-state publication. Each backend captures the
+ordinary M=1 decode graph once, runs grouped verifier M=2/3/4 into isolated
+speculative state, publishes every possible accepted row by a device-owned row
+index, detaches verifier bindings, and replays the original graph without
+recapture. Both the continuation output and complete recurrent live state must
+match serial M=1 decode in native bytes. This proof is what permits the typed
+correction-boundary policy to retain single-token decode and all-position
+verifier captures; a blanket CUDA/ROCm graph reset is a regression, not a
+conservative fallback.
 
 The CUDA and ROCm `KVCacheAppend` gates each enumerate the same 288 production
 routes: every accepted cache/source format pair (including asymmetric prepared

@@ -26,6 +26,7 @@
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 using namespace llaminar2;
 
@@ -110,6 +111,15 @@ namespace
             call_sequence.push_back("getDeviceContext");
             return ctx_;
         }
+
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId device) override
+        {
+            if (!ctx_ || device != ctx_->deviceId())
+                return nullptr;
+            return &llaminar2::testing::sharedMockWorkerGPUContext();
+        }
+
+        bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
 
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
         {

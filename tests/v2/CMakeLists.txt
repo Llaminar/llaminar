@@ -5106,14 +5106,14 @@ add_v2_test(V2_Integration_CUDAGDNPaddedRealLength
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
-            --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedRecurrenceDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ShortConv
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
-            --gtest_filter=Test__CUDAGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedShortConvDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression"
     MPI_PROCS 1
@@ -7259,6 +7259,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmRequestBatchResidentPrefill
     MPI_PROCS 1
     TIMEOUT 600
 )
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCm2LocalTPRequestBatchResidentPrefill
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCm2LocalTPMTPRequestBatchResidentPrefill
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP;Degree2;Sampling;RequestBatch;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticClearCacheRepeatabilityLong
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsStochasticClearCacheRepeatabilityLong
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Sampling;Regression"
@@ -7276,6 +7282,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDARequestBatchResidentPrefill
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;Sampling;RequestBatch;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression"
     MPI_PROCS 1
     TIMEOUT 600
+)
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDA2LocalTPRequestBatchResidentPrefill
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDA2LocalTPMTPRequestBatchResidentPrefill
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;LocalTP;Degree2;Sampling;RequestBatch;DeviceResident;UnequalRequestLengths;BatchInvariant;Regression"
+    MPI_PROCS 1
+    TIMEOUT 1200
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticClearCacheRepeatabilityLong
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAMTPGpuGraphsStochasticClearCacheRepeatabilityLong
@@ -10708,14 +10720,14 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNRecurrence
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
-                --gtest_filter=Test__ROCmGDNPaddedRealLength.MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM4Qwen36DenseShapeVerifierCaptureIsolatesLiveState
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM4Qwen36DenseShapeVerifierCaptureIsolatesLiveState:Test__ROCmGDNPaddedRealLength.CapturedRecurrenceDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression;gfx906"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_ShortConv
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
-                --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.CapturedShortConvDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression;gfx906"
         MPI_PROCS 1

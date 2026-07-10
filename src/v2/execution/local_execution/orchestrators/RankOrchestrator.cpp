@@ -727,7 +727,9 @@ namespace llaminar2
         std::shared_ptr<IModelContext> model_ctx,
         const Config &config,
         std::unique_ptr<ILocalTPContext> tp_ctx)
-        : model_ctx_(std::move(model_ctx)), config_(config)
+        : model_ctx_(std::move(model_ctx)),
+          config_(config),
+          current_batch_size_(std::max(1, config.batch_size))
     {
         if (!config_.validate())
         {
@@ -814,7 +816,8 @@ namespace llaminar2
           device_runners_(std::move(device_runners)),
           config_(config),
           logits_backend_resolver_(resolveNoBackendForInjectedUnitTest),
-          external_device_backend_access_enabled_(false)
+          external_device_backend_access_enabled_(false),
+          current_batch_size_(std::max(1, config.batch_size))
     {
         // Initialize stage sharding map from model architecture (if registered)
         const auto arch = model_ctx_->architecture();
@@ -3125,6 +3128,134 @@ namespace llaminar2
                 logical_position);
         }
         return -1;
+    }
+
+    bool RankOrchestrator::sampleMainLogitsBatchRowsOnDevice(
+        int request_count,
+        const SamplingParams &params,
+        int32_t *out_tokens,
+        const uint64_t *stochastic_position_seeds)
+    {
+        if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
+        {
+            return pp_sidecar->sampleMainLogitsBatchRowsOnDevice(
+                request_count,
+                params,
+                out_tokens,
+                stochastic_position_seeds);
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->sampleMainLogitsBatchRowsOnDevice(
+                request_count,
+                params,
+                out_tokens,
+                stochastic_position_seeds);
+        }
+        if (request_count <= 0 ||
+            !out_tokens ||
+            device_runners_.size() < 2 ||
+            !usesMirroredLocalTPMTPHeadForVerifier() ||
+            !supportsDeviceResidentMTPSpecStatePublication())
+        {
+            return false;
+        }
+
+        /*
+         * Every child must execute the sampler. Besides selecting the response
+         * token, DeviceGraphOrchestrator publishes that child's initial target
+         * position, sequence length, condition token, and accepted-count row
+         * into its resident mailbox. Sampling only child zero and broadcasting
+         * the token would leave the remaining publication transactions without
+         * authoritative device-owned logical state.
+         *
+         * This is a prefill-only boundary, so the compact host vectors below
+         * are response shadows rather than planning state. No full logits or
+         * threshold rows cross the host, and decode consumes only the resident
+         * child mailboxes initialized by these calls.
+         */
+        std::vector<std::vector<int32_t>> child_token_shadows(
+            device_runners_.size(),
+            std::vector<int32_t>(static_cast<size_t>(request_count), -1));
+        std::vector<std::future<bool>> futures;
+        futures.reserve(device_runners_.size());
+        for (size_t child_index = 0;
+             child_index < device_runners_.size();
+             ++child_index)
+        {
+            IInferenceRunner *child = device_runners_[child_index].get();
+            if (!child ||
+                !child->primaryDeviceId().is_gpu() ||
+                !child->usesMirroredLocalTPMTPHeadForVerifier() ||
+                !child->supportsDeviceResidentMTPSpecStatePublication())
+            {
+                return false;
+            }
+
+            futures.push_back(std::async(
+                std::launch::async,
+                [child,
+                 request_count,
+                 &params,
+                 stochastic_position_seeds,
+                 &child_token_shadows,
+                 child_index]()
+                {
+                    return child->sampleMainLogitsBatchRowsOnDevice(
+                        request_count,
+                        params,
+                        child_token_shadows[child_index].data(),
+                        stochastic_position_seeds);
+                }));
+        }
+
+        for (size_t child_index = 0; child_index < futures.size(); ++child_index)
+        {
+            try
+            {
+                if (!futures[child_index].get())
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP request-batch "
+                              "prefill sampling failed on child "
+                              << child_index);
+                    return false;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP request-batch "
+                          "prefill sampling threw on child "
+                          << child_index << ": " << e.what());
+                return false;
+            }
+        }
+
+        const std::vector<int32_t> &primary_tokens = child_token_shadows.front();
+        for (size_t child_index = 1;
+             child_index < child_token_shadows.size();
+             ++child_index)
+        {
+            if (child_token_shadows[child_index] != primary_tokens)
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP request-batch "
+                          "prefill children produced different sampled tokens");
+                return false;
+            }
+        }
+        std::copy(primary_tokens.begin(), primary_tokens.end(), out_tokens);
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_request_batch_prefill_samples",
+            static_cast<double>(request_count),
+            /*phase=*/"decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"sampling", params.is_greedy() ? "greedy" : "stochastic"},
+             {"logical_state_owner", "child_device_mailboxes"},
+             {"host_payload", "response_token_shadows_only"},
+             {"boundary", "first_decode_step_after_request_prefill"}});
+        return true;
     }
 
     bool RankOrchestrator::requiresMPICoordinatedDecodeSampling(

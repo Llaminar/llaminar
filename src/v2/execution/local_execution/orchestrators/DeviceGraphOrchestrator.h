@@ -1618,6 +1618,24 @@ namespace llaminar2
             return state_.prefix_terminal_hidden.get();
         }
 
+        /**
+         * @brief Mark the active compact request-prefill logits transaction.
+         *
+         * Production code sets this count while `forward_batch()` owns one
+         * terminal full-vocabulary row per request and clears it after the
+         * resident sampler consumes those rows. Unit tests use this hook to
+         * exercise LM-head ownership classification without performing GPU
+         * work or manufacturing device tensors.
+         *
+         * @param row_count Active compact row count, or zero to end the test
+         *        transaction.
+         */
+        void markRequestBatchedPrefillLogitsForTesting(int row_count)
+        {
+            request_batched_prefill_logits_row_count_ =
+                std::max(0, row_count);
+        }
+
         // =====================================================================
         // IInferenceRunner: Device & Logits Local API overrides
         // =====================================================================
@@ -2380,6 +2398,10 @@ namespace llaminar2
          * @return Device context pointer (owned by orchestrator)
          */
         IDeviceContext *getDeviceContext(DeviceId device) override;
+
+        /** @brief Resolve the production worker that owns a GPU device runtime. */
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId device) override;
+        bool workerGPUContextUsesProcessPool(DeviceId device) const override;
 
         /** Check whether MoE dynamic rebalancing is active for this forward domain. */
         bool isMoeRebalancingActive() const override;

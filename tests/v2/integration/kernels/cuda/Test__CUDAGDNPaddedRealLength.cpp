@@ -160,6 +160,60 @@ namespace
         CudaStreamHandle &operator=(const CudaStreamHandle &) = delete;
     };
 
+    /**
+     * @brief Own a CUDA graph executable whose captured node addresses stay fixed.
+     *
+     * The accepted-state publication regression needs to mutate recurrent state
+     * between launches without recapturing the ordinary decode graph.  Keeping
+     * the graph and executable alive in one RAII object makes that lifetime
+     * explicit and guarantees cleanup even when a byte-equality assertion fails.
+     */
+    struct CudaCapturedGraph
+    {
+        cudaGraph_t graph = nullptr;           ///< Captured graph definition.
+        cudaGraphExec_t executable = nullptr; ///< Instantiated reusable graph.
+
+        template <typename RecordWork>
+        CudaCapturedGraph(cudaStream_t stream, RecordWork &&record_work)
+        {
+            checkCuda(
+                cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed),
+                "cudaStreamBeginCapture(persistent recurrent graph)");
+            bool recorded = false;
+            {
+                GraphCaptureGuard guard;
+                recorded = record_work();
+            }
+            checkCuda(
+                cudaStreamEndCapture(stream, &graph),
+                "cudaStreamEndCapture(persistent recurrent graph)");
+            if (!recorded || !graph)
+                throw std::runtime_error("CUDA recurrent wrapper rejected persistent graph capture");
+            checkCuda(
+                cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                "cudaGraphInstantiate(persistent recurrent graph)");
+        }
+
+        ~CudaCapturedGraph()
+        {
+            if (executable)
+                (void)cudaGraphExecDestroy(executable);
+            if (graph)
+                (void)cudaGraphDestroy(graph);
+        }
+
+        CudaCapturedGraph(const CudaCapturedGraph &) = delete;
+        CudaCapturedGraph &operator=(const CudaCapturedGraph &) = delete;
+
+        /// @brief Enqueue one replay of the original captured executable.
+        void launch(cudaStream_t stream) const
+        {
+            checkCuda(
+                cudaGraphLaunch(executable, stream),
+                "cudaGraphLaunch(persistent recurrent graph)");
+        }
+    };
+
     /// @brief Captures already-preallocated CUDA work, instantiates the graph, and launches it once.
     template <typename Fn>
     void captureAndLaunchOnce(cudaStream_t stream, Fn &&record_work)
@@ -3285,6 +3339,368 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
     EXPECT_LT(out_diff.second, 1e-5);
     EXPECT_LT(state_diff.first, 1e-5f);
     EXPECT_LT(state_diff.second, 1e-5);
+}
+
+/**
+ * @brief Prove a captured decode graph reads GDN state published after capture.
+ *
+ * This is the lifetime transition exercised by device-resident MTP: an ordinary
+ * M=1 decode executable is captured against the backend-owned live state,
+ * grouped verifier work advances isolated speculative state, and a device row
+ * index publishes the accepted snapshot back into live state.  Replaying the
+ * original executable must then be byte-identical to serial decode without a
+ * recapture.  Every accepted row at verifier depths 2, 3, and 4 is covered so
+ * the test cannot accidentally validate only the final-row fast path.
+ */
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDeviceIndexedPublicationM2ToM4)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_heads = 2;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int max_verifier_rows = 4;
+    constexpr int qk_width = n_heads * d_k;
+    constexpr int value_width = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+
+    const auto q_rows = makeSequenceRows(
+        max_verifier_rows, qk_width, max_verifier_rows,
+        max_verifier_rows, 0.0023f, 0.0f, 0.0023f);
+    const auto k_rows = makeSequenceRows(
+        max_verifier_rows, qk_width, max_verifier_rows,
+        max_verifier_rows, -0.0017f, 0.0f, -0.0017f);
+    const auto v_rows = makeSequenceRows(
+        max_verifier_rows, value_width, max_verifier_rows,
+        max_verifier_rows, 0.0029f, 0.0f, 0.0029f);
+    const auto alpha_rows = makeSequenceRows(
+        max_verifier_rows, n_heads, max_verifier_rows,
+        max_verifier_rows, 0.019f, 0.0f, 0.019f);
+    const auto beta_rows = makeSequenceRows(
+        max_verifier_rows, n_heads, max_verifier_rows,
+        max_verifier_rows, -0.017f, 0.0f, -0.017f);
+    const auto continuation_q = makeSequenceRows(1, qk_width, 1, 1, 0.0037f, 0.0f, 0.0037f);
+    const auto continuation_k = makeSequenceRows(1, qk_width, 1, 1, -0.0021f, 0.0f, -0.0021f);
+    const auto continuation_v = makeSequenceRows(1, value_width, 1, 1, 0.0041f, 0.0f, 0.0041f);
+    const auto continuation_alpha = makeSequenceRows(1, n_heads, 1, 1, 0.023f, 0.0f, 0.023f);
+    const auto continuation_beta = makeSequenceRows(1, n_heads, 1, 1, -0.013f, 0.0f, -0.013f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00073f);
+    const std::vector<float> a_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_q_rows(q_rows);
+    CudaFloatBuffer d_k_rows(k_rows);
+    CudaFloatBuffer d_v_rows(v_rows);
+    CudaFloatBuffer d_alpha_rows(alpha_rows);
+    CudaFloatBuffer d_beta_rows(beta_rows);
+    CudaFloatBuffer d_continuation_q(continuation_q);
+    CudaFloatBuffer d_continuation_k(continuation_k);
+    CudaFloatBuffer d_continuation_v(continuation_v);
+    CudaFloatBuffer d_continuation_alpha(continuation_alpha);
+    CudaFloatBuffer d_continuation_beta(continuation_beta);
+    CudaFloatBuffer d_a_log(a_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_grouped_output(
+        static_cast<size_t>(max_verifier_rows) * value_width, 0.0f);
+    CudaFloatBuffer d_replay_output(static_cast<size_t>(value_width), 0.0f);
+    CudaFloatBuffer d_oracle_output(static_cast<size_t>(value_width), 0.0f);
+    CudaFloatBuffer d_oracle_row_output(static_cast<size_t>(value_width), 0.0f);
+    CudaFloatBuffer d_snapshots(
+        static_cast<size_t>(max_verifier_rows) * state_floats, -77.0f);
+    CudaFloatBuffer d_speculative_state(static_cast<size_t>(state_floats), 0.0f);
+    CudaStreamHandle stream;
+
+    CUDAGatedDeltaNet live_kernel(cuda_ordinal_);
+    live_kernel.allocateGPUState(state_floats);
+    live_kernel.setGPUStream(stream.stream);
+    live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+
+    CudaCapturedGraph captured_decode(
+        stream.stream,
+        [&]()
+        {
+            return live_kernel.recurrent_step(
+                d_continuation_q.ptr,
+                d_continuation_k.ptr,
+                d_continuation_v.ptr,
+                d_continuation_alpha.ptr,
+                d_continuation_beta.ptr,
+                d_a_log.ptr,
+                d_dt_bias.ptr,
+                d_replay_output.ptr,
+                nullptr,
+                n_heads,
+                d_k,
+                d_v,
+                /*use_qk_l2norm=*/true);
+        });
+
+    CUDAGatedDeltaNet oracle_kernel(cuda_ordinal_);
+    oracle_kernel.allocateGPUState(state_floats);
+    oracle_kernel.setGPUStream(stream.stream);
+
+    for (int verifier_rows = 2; verifier_rows <= max_verifier_rows; ++verifier_rows)
+    {
+        for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
+        {
+            SCOPED_TRACE(
+                "verifier_rows=" + std::to_string(verifier_rows) +
+                " accepted_row=" + std::to_string(accepted_row));
+
+            ASSERT_TRUE(live_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            live_kernel.bindVerifierStateCaptureWorkspace(
+                d_snapshots.ptr, verifier_rows, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(
+                d_speculative_state.ptr, state_floats);
+            ASSERT_TRUE(live_kernel.chunk_forward(
+                d_q_rows.ptr,
+                d_k_rows.ptr,
+                d_v_rows.ptr,
+                d_alpha_rows.ptr,
+                d_beta_rows.ptr,
+                d_a_log.ptr,
+                d_dt_bias.ptr,
+                d_grouped_output.ptr,
+                nullptr,
+                verifier_rows,
+                n_heads,
+                d_k,
+                d_v,
+                /*chunk_size=*/64,
+                /*use_qk_l2norm=*/true));
+
+            CudaIntBuffer d_accepted_row(accepted_row);
+            ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                nullptr, d_accepted_row.ptr, stream.stream));
+            live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+
+            d_replay_output.fill(0.0f);
+            captured_decode.launch(stream.stream);
+            checkCuda(
+                cudaStreamSynchronize(stream.stream),
+                "cudaStreamSynchronize(persistent GDN decode replay)");
+            std::vector<float> replay_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(live_kernel.exportState(
+                replay_state.data(), nullptr, stream.stream));
+
+            ASSERT_TRUE(oracle_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            for (int row = 0; row <= accepted_row; ++row)
+            {
+                ASSERT_TRUE(oracle_kernel.recurrent_step(
+                    d_q_rows.ptr + static_cast<size_t>(row) * qk_width,
+                    d_k_rows.ptr + static_cast<size_t>(row) * qk_width,
+                    d_v_rows.ptr + static_cast<size_t>(row) * value_width,
+                    d_alpha_rows.ptr + static_cast<size_t>(row) * n_heads,
+                    d_beta_rows.ptr + static_cast<size_t>(row) * n_heads,
+                    d_a_log.ptr,
+                    d_dt_bias.ptr,
+                    d_oracle_row_output.ptr,
+                    nullptr,
+                    n_heads,
+                    d_k,
+                    d_v,
+                    /*use_qk_l2norm=*/true));
+            }
+            ASSERT_TRUE(oracle_kernel.recurrent_step(
+                d_continuation_q.ptr,
+                d_continuation_k.ptr,
+                d_continuation_v.ptr,
+                d_continuation_alpha.ptr,
+                d_continuation_beta.ptr,
+                d_a_log.ptr,
+                d_dt_bias.ptr,
+                d_oracle_output.ptr,
+                nullptr,
+                n_heads,
+                d_k,
+                d_v,
+                /*use_qk_l2norm=*/true));
+            checkCuda(
+                cudaStreamSynchronize(stream.stream),
+                "cudaStreamSynchronize(serial GDN continuation oracle)");
+            std::vector<float> oracle_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(oracle_kernel.exportState(
+                oracle_state.data(), nullptr, stream.stream));
+
+            const auto replay_output = d_replay_output.toHost();
+            const auto oracle_output = d_oracle_output.toHost();
+            expectByteExactEquivalent(
+                "CUDA captured GDN continuation output",
+                replay_output,
+                oracle_output,
+                0,
+                replay_output.size());
+            expectByteExactEquivalent(
+                "CUDA captured GDN continuation state",
+                replay_state,
+                oracle_state,
+                0,
+                replay_state.size());
+        }
+    }
+}
+
+/**
+ * @brief Prove captured in-place short-conv decode survives accepted-row publication.
+ *
+ * Qwen3.6 feeds its 10,240-wide merged QKV projection through short-conv in
+ * place.  The captured graph therefore includes both the convolution kernel
+ * and its scratch-to-output copy.  This sweep publishes every possible row for
+ * M=2/3/4 through a device scalar, then requires the original executable and
+ * resulting live history bytes to match serial M=1 continuation exactly.
+ */
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedShortConvDecodeReplaysAfterDeviceIndexedPublicationM2ToM4)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int max_verifier_rows = 4;
+    constexpr int state_floats = channels * (kernel_size - 1);
+
+    const auto verifier_input = makeSequenceRows(
+        max_verifier_rows, channels, max_verifier_rows,
+        max_verifier_rows, 0.0095f, 0.0f, 0.0095f);
+    const auto continuation_input = makeSequenceRows(
+        1, channels, 1, 1, 0.0113f, 0.0f, 0.0113f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state = makeInitialState(
+        static_cast<size_t>(state_floats), 0.0027f);
+
+    CudaFloatBuffer d_live_verifier(verifier_input);
+    CudaFloatBuffer d_oracle_verifier(verifier_input);
+    CudaFloatBuffer d_replay_continuation(continuation_input);
+    CudaFloatBuffer d_oracle_continuation(continuation_input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaFloatBuffer d_snapshots(
+        static_cast<size_t>(max_verifier_rows) * state_floats, -77.0f);
+    CudaFloatBuffer d_speculative_state(static_cast<size_t>(state_floats), 0.0f);
+    CudaStreamHandle stream;
+
+    CUDAShortConvolution live_kernel(cuda_ordinal_);
+    live_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(live_kernel.allocateGPUScratch(max_verifier_rows * channels));
+    live_kernel.setGPUStream(stream.stream);
+    live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+
+    CudaCapturedGraph captured_decode(
+        stream.stream,
+        [&]()
+        {
+            return live_kernel.forward(
+                d_replay_continuation.ptr,
+                d_weight.ptr,
+                d_bias.ptr,
+                d_replay_continuation.ptr,
+                nullptr,
+                1,
+                channels,
+                kernel_size,
+                /*apply_silu=*/true);
+        });
+
+    CUDAShortConvolution oracle_kernel(cuda_ordinal_);
+    oracle_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(oracle_kernel.allocateGPUScratch(max_verifier_rows * channels));
+    oracle_kernel.setGPUStream(stream.stream);
+
+    for (int verifier_rows = 2; verifier_rows <= max_verifier_rows; ++verifier_rows)
+    {
+        for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
+        {
+            SCOPED_TRACE(
+                "verifier_rows=" + std::to_string(verifier_rows) +
+                " accepted_row=" + std::to_string(accepted_row));
+
+            d_live_verifier.copyFrom(verifier_input);
+            d_replay_continuation.copyFrom(continuation_input);
+            ASSERT_TRUE(live_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            live_kernel.bindVerifierStateCaptureWorkspace(
+                d_snapshots.ptr, verifier_rows, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(
+                d_speculative_state.ptr, state_floats);
+            ASSERT_TRUE(live_kernel.forward(
+                d_live_verifier.ptr,
+                d_weight.ptr,
+                d_bias.ptr,
+                d_live_verifier.ptr,
+                nullptr,
+                verifier_rows,
+                channels,
+                kernel_size,
+                /*apply_silu=*/true));
+
+            CudaIntBuffer d_accepted_row(accepted_row);
+            ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                nullptr, d_accepted_row.ptr, stream.stream));
+            live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+            captured_decode.launch(stream.stream);
+            checkCuda(
+                cudaStreamSynchronize(stream.stream),
+                "cudaStreamSynchronize(persistent short-conv decode replay)");
+            std::vector<float> replay_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(live_kernel.exportState(
+                replay_state.data(), nullptr, stream.stream));
+
+            d_oracle_verifier.copyFrom(verifier_input);
+            d_oracle_continuation.copyFrom(continuation_input);
+            ASSERT_TRUE(oracle_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            for (int row = 0; row <= accepted_row; ++row)
+            {
+                float *row_ptr =
+                    d_oracle_verifier.ptr + static_cast<size_t>(row) * channels;
+                ASSERT_TRUE(oracle_kernel.forward(
+                    row_ptr,
+                    d_weight.ptr,
+                    d_bias.ptr,
+                    row_ptr,
+                    nullptr,
+                    1,
+                    channels,
+                    kernel_size,
+                    /*apply_silu=*/true));
+            }
+            ASSERT_TRUE(oracle_kernel.forward(
+                d_oracle_continuation.ptr,
+                d_weight.ptr,
+                d_bias.ptr,
+                d_oracle_continuation.ptr,
+                nullptr,
+                1,
+                channels,
+                kernel_size,
+                /*apply_silu=*/true));
+            checkCuda(
+                cudaStreamSynchronize(stream.stream),
+                "cudaStreamSynchronize(serial short-conv continuation oracle)");
+            std::vector<float> oracle_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(oracle_kernel.exportState(
+                oracle_state.data(), nullptr, stream.stream));
+
+            const auto replay_output = d_replay_continuation.toHost();
+            const auto oracle_output = d_oracle_continuation.toHost();
+            expectByteExactEquivalent(
+                "CUDA captured short-conv continuation output",
+                replay_output,
+                oracle_output,
+                0,
+                replay_output.size());
+            expectByteExactEquivalent(
+                "CUDA captured short-conv continuation state",
+                replay_state,
+                oracle_state,
+                0,
+                replay_state.size());
+        }
+    }
 }
 
 #endif

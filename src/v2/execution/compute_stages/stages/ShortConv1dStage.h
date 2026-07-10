@@ -222,6 +222,15 @@ namespace llaminar2
             int request_count,
             int request_row_width,
             void *stream) override;
+        /**
+         * @brief Report direct grouped publication into request-owned live banks.
+         *
+         * When a CPU or GPU request matrix is larger than the bounded verifier
+         * snapshot window, the grouped short-convolution kernel advances each
+         * request's dedicated live bank in place. The executor must recognize
+         * that completed transaction instead of attempting a nonexistent
+         * terminal-row restore.
+         */
         bool requestBatchedTerminalStateCommittedDuringExecution(
             int request_count,
             int request_row_width) const override;

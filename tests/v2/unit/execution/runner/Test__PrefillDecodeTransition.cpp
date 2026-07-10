@@ -5678,7 +5678,8 @@ namespace
                                                  std::vector<GlobalDeviceAddress> devices = {},
                                                  int mtp_draft_tokens = 1,
                                                  MTPDepthPolicyConfig depth_policy = {},
-                                                 bool spec_state_publication = false)
+                                                 bool spec_state_publication = false,
+                                                 int max_request_batch = 1)
         {
             if (devices.empty())
             {
@@ -5688,6 +5689,8 @@ namespace
             auto child1 = std::make_unique<MockInferenceRunner>();
             child0->setMTPDraftTokens(mtp_draft_tokens);
             child1->setMTPDraftTokens(mtp_draft_tokens);
+            child0->setBatchCapacity(max_request_batch);
+            child1->setBatchCapacity(max_request_batch);
             child0->enableMTP(mtp_accept);
             child1->enableMTP(mtp_accept);
             if (mtp_draft_tokens > 1)
@@ -5721,8 +5724,10 @@ namespace
             RankOrchestrator::Config rank_config;
             rank_config.mode = RankOrchestrator::ParallelismMode::TP;
             rank_config.devices = devices;
+            rank_config.batch_size = max_request_batch;
             rank_config.mtp.enabled = true;
             rank_config.mtp.draft_tokens = mtp_draft_tokens;
+            rank_config.mtp.max_request_batch = max_request_batch;
             rank_config.mtp.verify_mode = MTPVerifyMode::Greedy;
             rank_config.mtp.depth_policy = depth_policy;
 
@@ -5746,8 +5751,10 @@ namespace
 
             OrchestrationConfig config;
             config.device_for_this_rank = devices.front();
+            config.batch_size = max_request_batch;
             config.mtp.enabled = true;
             config.mtp.draft_tokens = mtp_draft_tokens;
+            config.mtp.max_request_batch = max_request_batch;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
             config.mtp.depth_policy = depth_policy;
 
@@ -5946,6 +5953,78 @@ namespace
         EXPECT_EQ(mock->lastMainLogitsBatchRequestCount(), 2);
         EXPECT_EQ(mock->getLogitsCallCount(), 0)
             << "The CPU Sampler must never receive GPU logits pointers";
+    }
+
+    TEST_F(Test__PrefillDecodeTransition,
+           RequestBatchedLocalTPGpuPrefillPublishesEveryChildResidentMailbox)
+    {
+        ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+        PerfStatsCollector::reset();
+        auto harness = createLocalTPRunner(
+            /*mtp_accept=*/true,
+            /*column_parallel_logits=*/true,
+            {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+            /*mtp_draft_tokens=*/1,
+            MTPDepthPolicyConfig{},
+            /*spec_state_publication=*/false,
+            /*max_request_batch=*/2);
+
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            child->enableMainLogitsBatchRowsOnDevice();
+            child->enableStochasticDeviceSampling();
+            child->enableDeviceResidentMTPSpecStatePublication();
+            child->enableMTPDeviceDraftTokenInput();
+            child->enableMirroredLocalTPMTPHeadForVerifier();
+        }
+
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.seed = 1234;
+        harness.runner->setSamplingParams(stochastic);
+
+        ASSERT_TRUE(harness.runner->supportsPrefillBatch(/*request_batch=*/2))
+            << "LocalTP with mirrored full-vocab terminal heads must advertise "
+               "request-batched prefill.";
+        ASSERT_TRUE(harness.runner->prefillBatch({{1, 2, 3}, {4, 5}}))
+            << harness.runner->lastError();
+
+        GenerationBatchResult batch_step =
+            harness.runner->decodeStepBatch(/*request_batch=*/2);
+        ASSERT_TRUE(batch_step.error.empty()) << batch_step.error;
+        ASSERT_THAT(batch_step.requests, SizeIs(2));
+        EXPECT_THAT(batch_step.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_THAT(batch_step.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+
+        for (MockInferenceRunner *child : {harness.child0, harness.child1})
+        {
+            EXPECT_EQ(child->forwardBatchCallCount(), 1);
+            EXPECT_EQ(child->sampleMainLogitsBatchRowsCount(), 1)
+                << "Every child must sample and publish its own initial resident mailbox.";
+            EXPECT_THAT(child->lastMainLogitsBatchPositionSeeds(),
+                        ElementsAre(stochastic.seed, stochastic.seed));
+            EXPECT_THAT(child->lastMainLogitsBatchResidentPositions(),
+                        ElementsAre(3, 2));
+            EXPECT_EQ(child->getLogitsCallCount(), 0)
+                << "Rank-level response comparison must never materialize full logits.";
+        }
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        const PerfStatRecord *rank_samples = findPerfRecord(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "rank_mirrored_localtp_request_batch_prefill_samples");
+        ASSERT_NE(rank_samples, nullptr)
+            << "The canonical path counter must prove rank-level mirrored-head fan-out.";
+        EXPECT_EQ(rank_samples->phase, "decode")
+            << "Initial resident sampling occurs in decodeStepBatch(), after prefill has published logits.";
+        EXPECT_EQ(rank_samples->value, 2.0)
+            << "The counter records one sampled mailbox row per request, not per host call.";
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticGpuPrefillUsesResidentPositionKeyedThresholds)

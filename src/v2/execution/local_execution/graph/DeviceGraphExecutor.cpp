@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <print>
 #include "fort.hpp"
@@ -45,7 +46,9 @@ namespace llaminar2
 {
     namespace
     {
-        IWorkerGPUContext *tryGetWorkerContext(const DeviceId &device)
+        IWorkerGPUContext *tryGetWorkerContext(
+            const DeviceId &device,
+            const GraphExecutorConfig &config)
         {
             if (!device.is_gpu())
             {
@@ -54,6 +57,8 @@ namespace llaminar2
 
             try
             {
+                if (config.worker_gpu_context_resolver)
+                    return config.worker_gpu_context_resolver(device);
                 return &GPUDeviceContextPool::instance().getContext(device);
             }
             catch (const std::exception &e)
@@ -64,9 +69,11 @@ namespace llaminar2
             }
         }
 
-        void *resolveWorkerDefaultStream(const DeviceId &device)
+        void *resolveWorkerDefaultStream(
+            const DeviceId &device,
+            const GraphExecutorConfig &config)
         {
-            if (auto *gpu_ctx = tryGetWorkerContext(device))
+            if (auto *gpu_ctx = tryGetWorkerContext(device, config))
             {
                 return gpu_ctx->defaultStream();
             }
@@ -132,7 +139,10 @@ namespace llaminar2
             return false;
         }
 
-        bool ensureStageGPUStreamBound(ComputeNode &node, IDeviceContext *ctx)
+        bool ensureStageGPUStreamBound(
+            ComputeNode &node,
+            IDeviceContext *ctx,
+            const GraphExecutorConfig &config)
         {
             if (!node.stage || node.stage->gpuStream() != nullptr)
             {
@@ -150,7 +160,7 @@ namespace llaminar2
                 return true;
             }
 
-            void *stream = resolveWorkerDefaultStream(device);
+            void *stream = resolveWorkerDefaultStream(device, config);
             if (stream)
             {
                 node.stage->setGPUStream(stream);
@@ -176,7 +186,8 @@ namespace llaminar2
          */
         bool bindScheduleToWorkerStreams(
             const std::vector<ComputeGraph::FastScheduleEntry> &schedule,
-            IDeviceContext *ctx)
+            IDeviceContext *ctx,
+            const GraphExecutorConfig &config)
         {
             if (!ctx || !ctx->isGPU())
             {
@@ -231,7 +242,7 @@ namespace llaminar2
                     continue;
                 }
 
-                auto *gpu_ctx = tryGetWorkerContext(device);
+                auto *gpu_ctx = tryGetWorkerContext(device, config);
                 if (!gpu_ctx)
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Could not resolve GPU context while binding stage '"
@@ -1196,12 +1207,101 @@ namespace llaminar2
         const char *context,
         const int *device_request_seq_lens,
         int request_count,
-        int request_row_width)
+        int request_row_width,
+        const std::vector<int> *host_request_seq_lens)
     {
-        const bool request_batched =
-            device_request_seq_lens != nullptr &&
-            request_count > 1 &&
-            request_row_width > 0;
+        if (request_count <= 0)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication requires a positive request count");
+            return false;
+        }
+
+        /*
+         * Logical shape, rather than metadata allocation, decides whether this
+         * is a request-batched publication. A runner initialized with capacity
+         * B may retain a stable B-entry device-length buffer while executing a
+         * scalar request. That pointer is intentionally graph-stable storage;
+         * its mere presence must not reinterpret an active batch of one as a
+         * grouped request transaction.
+        */
+        const bool request_batched = request_count > 1;
+        bool request_shape_validated = false;
+        auto validateRequestShape = [&]() -> bool
+        {
+            if (request_shape_validated)
+                return true;
+            if (request_row_width <= 0)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Request-batched terminal state publication requires a positive request row width"
+                          << " (request_count=" << request_count
+                          << ", request_row_width=" << request_row_width << ")");
+                return false;
+            }
+            if (request_count > std::numeric_limits<int>::max() / request_row_width)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Request-batched terminal state publication shape overflows "
+                          "the flat row index domain"
+                          << " (request_count=" << request_count
+                          << ", request_row_width=" << request_row_width << ")");
+                return false;
+            }
+            request_shape_validated = true;
+            return true;
+        };
+        std::vector<int> host_terminal_rows;
+        auto prepareHostTerminalRows = [&](const std::string &stage_name) -> bool
+        {
+            if (!host_request_seq_lens)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] CPU request-batched terminal state publication"
+                          << (context ? std::string(" during ") + context : std::string{})
+                          << " for stage '" << stage_name
+                          << "' requires host-owned request lengths");
+                return false;
+            }
+            if (host_terminal_rows.size() == static_cast<size_t>(request_count))
+                return true;
+            if (host_request_seq_lens->size() < static_cast<size_t>(request_count))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Host request-length metadata is smaller than the active request batch"
+                          << " (request_count=" << request_count
+                          << ", host_length_count=" << host_request_seq_lens->size() << ")");
+                return false;
+            }
+
+            host_terminal_rows.reserve(static_cast<size_t>(request_count));
+            for (int request = 0; request < request_count; ++request)
+            {
+                const int real_length = (*host_request_seq_lens)[request];
+                if (real_length <= 0 || real_length > request_row_width)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Host request length is outside the active padded row domain"
+                              << " (request=" << request
+                              << ", real_length=" << real_length
+                              << ", request_row_width=" << request_row_width << ")");
+                    return false;
+                }
+                host_terminal_rows.push_back(
+                    request * request_row_width + real_length - 1);
+            }
+            return true;
+        };
+        auto validateRequestMetadataOwner = [&](const DeviceId &stage_device,
+                                                const std::string &stage_name) -> bool
+        {
+            if (!validateRequestShape())
+                return false;
+            if (!stage_device.is_gpu())
+                return prepareHostTerminalRows(stage_name);
+            if (device_request_seq_lens)
+                return true;
+
+            LOG_ERROR("[DeviceGraphExecutor] GPU request-batched terminal state publication"
+                      << (context ? std::string(" during ") + context : std::string{})
+                      << " for stage '" << stage_name
+                      << "' requires device-owned request lengths");
+            return false;
+        };
         if (!request_batched && terminal_row < 0)
         {
             LOG_ERROR("[DeviceGraphExecutor] Cannot publish captured terminal state"
@@ -1209,17 +1309,13 @@ namespace llaminar2
                       << ": terminal row is negative (" << terminal_row << ")");
             return false;
         }
-        if (device_request_seq_lens && !request_batched)
-        {
-            LOG_ERROR("[DeviceGraphExecutor] Device request lengths require request_count > 1 and a positive request row width");
-            return false;
-        }
-
         const auto &order = graph.getExecutionOrder();
         if (order.empty())
             return true;
 
         size_t restored_count = 0;
+        size_t host_restored_count = 0;
+        size_t device_restored_count = 0;
         size_t skipped_count = 0;
         size_t direct_commit_count = 0;
         for (const auto &name : order)
@@ -1229,11 +1325,16 @@ namespace llaminar2
                 continue;
 
             IComputeStage *stage = node->stage.get();
+            DeviceId stage_device = stage->device();
+            if (!stage_device.is_valid())
+                stage_device = node->device;
             if (request_batched &&
                 stage->requestBatchedTerminalStateCommittedDuringExecution(
                     request_count,
                     request_row_width))
             {
+                if (!validateRequestMetadataOwner(stage_device, name))
+                    return false;
                 ++direct_commit_count;
                 continue;
             }
@@ -1254,9 +1355,6 @@ namespace llaminar2
             void *producer_stream = producer_stream_override
                                         ? producer_stream_override
                                         : stage->gpuStream();
-            DeviceId stage_device = stage->device();
-            if (!stage_device.is_valid())
-                stage_device = node->device;
             if (stage_device.is_gpu() && !producer_stream)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication"
@@ -1266,22 +1364,44 @@ namespace llaminar2
                 return false;
             }
 
-            const bool restored =
-                request_batched
-                    ? stage->restoreVerifierStateCaptureRequestTerminalRows(
-                          device_request_seq_lens,
-                          request_count,
-                          request_row_width,
-                          producer_stream)
-                    : stage->restoreVerifierStateCaptureRow(
-                          terminal_row,
-                          producer_stream);
+            bool restored = false;
+            if (!request_batched)
+            {
+                restored = stage->restoreVerifierStateCaptureRow(
+                    terminal_row,
+                    producer_stream);
+            }
+            else if (stage_device.is_gpu())
+            {
+                if (!validateRequestMetadataOwner(stage_device, name))
+                    return false;
+                restored = stage->restoreVerifierStateCaptureRequestTerminalRows(
+                    device_request_seq_lens,
+                    request_count,
+                    request_row_width,
+                    producer_stream);
+                if (restored)
+                    ++device_restored_count;
+            }
+            else
+            {
+                if (!validateRequestMetadataOwner(stage_device, name))
+                    return false;
+                restored = stage->restoreVerifierStateCaptureRows(
+                    host_terminal_rows.data(),
+                    request_count,
+                    producer_stream);
+                if (restored)
+                    ++host_restored_count;
+            }
             if (!restored)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Captured terminal state publication"
                           << (context ? std::string(" during ") + context : std::string{})
                           << (request_batched
-                                  ? " failed restoring device-owned request terminal rows"
+                                  ? stage_device.is_gpu()
+                                        ? " failed restoring device-owned request terminal rows"
+                                        : " failed restoring host-owned request terminal rows"
                                   : " failed restoring row " + std::to_string(terminal_row))
                           << " for stage '" << name << "'");
                 return false;
@@ -1301,9 +1421,14 @@ namespace llaminar2
                 "executor",
                 {{"context", context ? context : "unknown"},
                  {"terminal_row", std::to_string(terminal_row)},
-                 {"publication_policy", request_batched
-                                             ? "device_request_terminal_rows"
-                                             : "scalar_terminal_row"},
+                 {"publication_policy",
+                  !request_batched
+                      ? "scalar_terminal_row"
+                      : device_restored_count > 0 && host_restored_count > 0
+                            ? "mixed_backend_request_terminal_rows"
+                            : device_restored_count > 0
+                                  ? "device_request_terminal_rows"
+                                  : "host_request_terminal_rows"},
                  {"request_count", std::to_string(request_count)},
                  {"skipped_stages", std::to_string(skipped_count)}});
         }
@@ -1375,7 +1500,7 @@ namespace llaminar2
             return true;
 
         if (!policy.preserve_gpu_streams &&
-            !bindScheduleToWorkerStreams(schedule, ctx))
+            !bindScheduleToWorkerStreams(schedule, ctx, config_))
         {
             return false;
         }
@@ -1394,7 +1519,7 @@ namespace llaminar2
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         if (timeline_active)
         {
-            timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId());
+            timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId(), config_);
             if (timeline_gpu_ctx)
             {
                 stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
@@ -1431,7 +1556,7 @@ namespace llaminar2
             if (cancellationRequested(node->name))
                 return false;
 
-            if (!ensureStageGPUStreamBound(*node, ctx))
+            if (!ensureStageGPUStreamBound(*node, ctx, config_))
             {
                 notifyStageFailure(node->name, "GPU stage has no explicit stream");
                 return false;
@@ -1634,7 +1759,7 @@ namespace llaminar2
 
             if (!policy.coherence && !force_contract_coherence)
             {
-                if (!ensureStageGPUStreamBound(node, ctx))
+                if (!ensureStageGPUStreamBound(node, ctx, config_))
                     return false;
 
                 const bool profiling_fast = policy.profiling && config_.enable_profiling;
@@ -1661,7 +1786,7 @@ namespace llaminar2
                     DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
                     if (target_device.is_gpu())
                     {
-                        if (auto *gpu_ctx = tryGetWorkerContext(target_device); gpu_ctx && !gpu_ctx->debugSynchronize())
+                        if (auto *gpu_ctx = tryGetWorkerContext(target_device, config_); gpu_ctx && !gpu_ctx->debugSynchronize())
                         {
                             LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
                                                                   << "' device=" << target_device.to_string()
@@ -1764,7 +1889,7 @@ namespace llaminar2
         // Bind GPU stream early so coherence operations (H2D/D2H) run on
         // the same stream as the stage's compute kernels. Debug paths that
         // materialize GPU outputs also require this explicit stream.
-        if (!ensureStageGPUStreamBound(node, ctx))
+        if (!ensureStageGPUStreamBound(node, ctx, config_))
             return false;
         void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
 
@@ -1980,7 +2105,7 @@ namespace llaminar2
             if (target_device.is_gpu())
             {
                 const int expected_ordinal = target_device.toKernelDeviceIndex();
-                auto *gpu_ctx = tryGetWorkerContext(target_device);
+                auto *gpu_ctx = tryGetWorkerContext(target_device, config_);
                 bool ptr_validation_failed = false;
                 auto validatePtr = [&](const char *label, const char *tensor_name, ITensor *tensor)
                 {
@@ -2034,7 +2159,7 @@ namespace llaminar2
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
             if (target_device.is_gpu())
             {
-                if (auto *gpu_ctx = tryGetWorkerContext(target_device); gpu_ctx && !gpu_ctx->debugSynchronize())
+                if (auto *gpu_ctx = tryGetWorkerContext(target_device, config_); gpu_ctx && !gpu_ctx->debugSynchronize())
                 {
                     LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
                                                           << "' device=" << target_device.to_string()
@@ -2091,7 +2216,9 @@ namespace llaminar2
                 logWatchedPointerProducer(
                     node.name,
                     post_execute_dump_info,
-                    tryGetWorkerContext(node.device.is_valid() ? node.device : node.stage->device()));
+                    tryGetWorkerContext(
+                        node.device.is_valid() ? node.device : node.stage->device(),
+                        config_));
                 printStageOutputs(node.name, post_execute_dump_info, node.stage->gpuStream());
             }
         }

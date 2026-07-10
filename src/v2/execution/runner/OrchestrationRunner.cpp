@@ -647,7 +647,9 @@ namespace llaminar2
             bool installed_ = false;
         };
 
-        void synchronizeRunnerDevicesBeforeRelease(IInferenceRunner *runner)
+        void synchronizeRunnerDevicesBeforeRelease(
+            IInferenceRunner *runner,
+            bool physical_backend_access_enabled)
         {
             if (!runner)
                 return;
@@ -657,6 +659,15 @@ namespace llaminar2
                 rank->synchronizeDevices();
                 return;
             }
+
+            /*
+             * Injected unit-test runners use GPU-shaped DeviceIds to exercise
+             * orchestration policy but do not own CUDA/HIP resources. Resolving
+             * BackendManager here would turn a CPU-only unit into physical GPU
+             * work merely because its mock was destroyed.
+             */
+            if (!physical_backend_access_enabled)
+                return;
 
             const DeviceId device = runner->primaryDeviceId();
             if (!device.is_gpu())
@@ -899,7 +910,9 @@ namespace llaminar2
         RankExecutionPlan plan,
         std::unique_ptr<IInferenceRunner> runner)
         : config_(std::move(config)), plan_(std::move(plan)), plan_built_(true),
-          runner_(std::move(runner)), initialized_(true), sampler_(0)
+          runner_(std::move(runner)),
+          physical_runner_backend_access_enabled_(false),
+          initialized_(true), sampler_(0)
     {
     }
 
@@ -910,6 +923,7 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx)
         : config_(std::move(config)), plan_(std::move(plan)), plan_built_(true),
           mpi_ctx_(std::move(mpi_ctx)), runner_(std::move(runner)),
+          physical_runner_backend_access_enabled_(false),
           initialized_(true), sampler_(0)
     {
     }
@@ -1248,7 +1262,9 @@ namespace llaminar2
                 if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
                     rank->clearPendingGpuDirectExpertTransfersForAllDevices();
             }
-            synchronizeRunnerDevicesBeforeRelease(runner_.get());
+            synchronizeRunnerDevicesBeforeRelease(
+                runner_.get(),
+                physical_runner_backend_access_enabled_);
         }
 
         // Release resources in reverse order
@@ -1857,8 +1873,7 @@ namespace llaminar2
         if (prefix_cache_enabled)
             return false;
 
-        if (plan_.usesLocalTP() ||
-            plan_.usesLocalPP() ||
+        if (plan_.usesLocalPP() ||
             plan_.usesGlobalTP() ||
             plan_.usesPipelineParallel())
         {
@@ -1909,14 +1924,13 @@ namespace llaminar2
                 "common-prefix coordination");
         }
 
-        if (plan_.usesLocalTP() ||
-            plan_.usesLocalPP() ||
+        if (plan_.usesLocalPP() ||
             plan_.usesGlobalTP() ||
             plan_.usesPipelineParallel())
         {
             return setError(
-                "Request-batched prefill is currently implemented only for "
-                "SingleDevice runners");
+                "Request-batched prefill is currently implemented for "
+                "SingleDevice and LocalTP runners");
         }
 
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)

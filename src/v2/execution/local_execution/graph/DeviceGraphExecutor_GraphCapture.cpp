@@ -52,26 +52,10 @@ namespace llaminar2
         return gpu_ctx_ref;
     }
 
-    namespace
-    {
-        bool graphSegmentContextIsPoolOwned(IWorkerGPUContext *ctx, const DeviceId &device)
-        {
-            if (!ctx || !device.is_gpu())
-                return false;
-            try
-            {
-                return &GPUDeviceContextPool::instance().getContext(device) == ctx;
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
-        }
-    }
-
     bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureStream(
         IWorkerGPUContext *ctx,
-        DeviceId device)
+        DeviceId device,
+        bool context_from_process_pool)
     {
         if (capture_stream)
         {
@@ -87,8 +71,9 @@ namespace llaminar2
             if (!capture_device.is_valid() && device.is_gpu())
             {
                 capture_device = device;
-                capture_context_from_pool = graphSegmentContextIsPoolOwned(ctx, device);
             }
+            capture_context_from_pool =
+                capture_context_from_pool || context_from_process_pool;
             if (!gpu_ctx_ref)
                 gpu_ctx_ref = ctx;
             return true;
@@ -106,7 +91,7 @@ namespace llaminar2
         }
         gpu_ctx_ref = ctx;
         capture_device = device.is_gpu() ? device : DeviceId::invalid();
-        capture_context_from_pool = graphSegmentContextIsPoolOwned(ctx, capture_device);
+        capture_context_from_pool = context_from_process_pool;
         LOG_DEBUG("[GraphSegmentCache] Created local capture stream"
                   << (capture_device.is_valid()
                           ? std::string(" for ") + capture_device.toString()
@@ -819,7 +804,10 @@ namespace llaminar2
             // Create the capture stream early so warmup runs on it.
             if (segment_cache.ensureCaptureStream(
                     gpu_ctx,
-                    ctx ? ctx->deviceId() : DeviceId::invalid()))
+                    ctx ? ctx->deviceId() : DeviceId::invalid(),
+                    config_.worker_gpu_context_resolver
+                        ? config_.worker_gpu_context_uses_process_pool
+                        : true))
             {
                 void *warmup_stream = segment_cache.capture_stream;
 

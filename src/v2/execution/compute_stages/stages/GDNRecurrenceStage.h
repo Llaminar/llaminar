@@ -80,7 +80,16 @@ namespace llaminar2
 
             ITensor *output = nullptr; ///< Output [seq_len, n_heads * d_v]
 
-            // Recurrence state [n_heads, d_k, d_v] — persistent across decode steps
+            /**
+             * @brief CPU-owned live recurrence state, or null for a GPU stage.
+             *
+             * CPU kernels receive this stable host pointer directly. CUDA and
+             * ROCm kernels own their persistent live state internally, so GPU
+             * graph parameters deliberately leave this pointer null. This
+             * separation prevents a graph-captured GPU stage from adopting a
+             * host mirror whose lifetime or contents can diverge from the
+             * backend's resident state bank.
+             */
             float *recurrence_state = nullptr;
 
             int seq_len = 0;
@@ -259,6 +268,15 @@ namespace llaminar2
             int request_count,
             int request_row_width,
             void *stream) override;
+        /**
+         * @brief Report direct grouped publication into request-owned live banks.
+         *
+         * CPU, CUDA, and ROCm grouped request kernels all execute directly
+         * against their request state bank when the bounded verifier snapshot
+         * window cannot cover the complete padded request matrix. In that
+         * geometry the terminal states are already live when execution returns,
+         * so a second snapshot restore would be both redundant and incorrect.
+         */
         bool requestBatchedTerminalStateCommittedDuringExecution(
             int request_count,
             int request_row_width) const override;

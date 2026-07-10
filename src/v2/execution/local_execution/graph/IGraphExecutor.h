@@ -30,6 +30,7 @@ namespace llaminar2
 
     // Forward declarations
     class ComputeGraph;
+    class IWorkerGPUContext;
     struct StageDumpInfo;
 
     /**
@@ -89,6 +90,17 @@ namespace llaminar2
         /// Callback queried before each stage. Return true to cancel this graph
         /// pass because a peer worker or rank already failed.
         ExecutionCancellationCallback cancellation_requested = nullptr;
+
+        /**
+         * @brief Optional worker-context resolver supplied by an execution host.
+         *
+         * Production standalone executors leave this empty and resolve the
+         * process-owned GPU context pool. Higher-level engines install a scoped
+         * resolver so hardware-free unit hosts can provide an in-memory worker
+         * without any CUDA or ROCm initialization.
+         */
+        std::function<IWorkerGPUContext *(DeviceId)> worker_gpu_context_resolver;
+        bool worker_gpu_context_uses_process_pool = false;
 
         // Context for stage dumping (set by pipeline before each layer)
         int current_layer_idx = -1; ///< Current layer being executed

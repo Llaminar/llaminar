@@ -212,6 +212,14 @@ namespace llaminar2
 
         void setStageFailureCallback(StageFailureCallback callback) { config_.stage_failure_callback = std::move(callback); }
         void setCancellationCallback(ExecutionCancellationCallback callback) { config_.cancellation_requested = std::move(callback); }
+        /** @brief Override worker GPU context resolution for this executor. */
+        void setWorkerGPUContextResolver(
+            std::function<IWorkerGPUContext *(DeviceId)> resolver,
+            bool uses_process_pool = false)
+        {
+            config_.worker_gpu_context_resolver = std::move(resolver);
+            config_.worker_gpu_context_uses_process_pool = uses_process_pool;
+        }
 
         /**
          * @brief Set the current layer context for stage dumping
@@ -381,6 +389,27 @@ namespace llaminar2
          * and future runtime-state transactions should all depend on the same
          * publication primitive instead of each feature inventing its own GDN
          * state side path.
+         *
+         * @param graph Graph whose mutable-state stages have just completed.
+         * @param terminal_row Flat terminal row for a scalar request. Ignored
+         *        for a logical request batch, where terminal rows are derived
+         *        from the metadata owner appropriate to each stage backend.
+         * @param producer_stream_override Stream that produced graph outputs,
+         *        or null to use each stage's bound stream.
+         * @param context Optional diagnostic label.
+         * @param device_request_seq_lens Stable device metadata allocation.
+         *        This pointer may remain non-null when request capacity exceeds
+         *        the active scalar request count; `request_count`, not pointer
+         *        presence, selects grouped publication.
+         * @param request_count Active logical request count for this execution.
+         * @param request_row_width Padded rows per request for grouped state.
+         * @param host_request_seq_lens Host-owned real lengths for CPU request
+         *        batches. GPU stages never consume this vector; they derive
+         *        terminal rows from @p device_request_seq_lens without a host
+         *        synchronization. At least one length owner is required for a
+         *        logical request batch, and each stage requires the owner that
+         *        matches its backend.
+         * @return true when every captured state owner is committed.
          */
         bool publishCapturedTerminalStateAfterGraphExecution(
             ComputeGraph &graph,
@@ -389,7 +418,8 @@ namespace llaminar2
             const char *context = nullptr,
             const int *device_request_seq_lens = nullptr,
             int request_count = 1,
-            int request_row_width = 0);
+            int request_row_width = 0,
+            const std::vector<int> *host_request_seq_lens = nullptr);
 
         /**
          * @brief Pre-register graph-stable snapshot buffers before GPU graph capture.
@@ -584,8 +614,10 @@ namespace llaminar2
 
             /// Create a local blocking stream for graph capture via the GPU context.
             /// @param ctx GPU context that creates the stream (stored for cleanup)
-            bool ensureCaptureStream(IWorkerGPUContext *ctx,
-                                     DeviceId device = DeviceId::invalid());
+            bool ensureCaptureStream(
+                IWorkerGPUContext *ctx,
+                DeviceId device = DeviceId::invalid(),
+                bool context_from_process_pool = false);
 
             /// Wait for queued replay/capture work before graph resources are torn down.
             void synchronizeCaptureStream();

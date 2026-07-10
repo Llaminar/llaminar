@@ -112,6 +112,25 @@ namespace
         bool abort_requested_ = false;
     };
 
+    /**
+     * @brief Expose the protected mirrored-head policy for graph-policy tests.
+     *
+     * The production decision remains encapsulated in QwenGraphBase. This thin
+     * test subclass lets the unit suite prove that compact row-indexed output
+     * geometry, rather than padded prefill activation size, controls whether
+     * the mirrored full-vocabulary head is selected.
+     */
+    class InspectableQwen35Graph final : public Qwen35Graph
+    {
+    public:
+        using Qwen35Graph::Qwen35Graph;
+
+        bool mirroredHeadActiveForProjectedRows(int total_tokens) const
+        {
+            return mirroredMTPHeadActiveForVerifierTokens(total_tokens);
+        }
+    };
+
     class ScriptedGlobalTPContext : public IGlobalTPContext
     {
     public:
@@ -1442,6 +1461,43 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
         << "Mirrored LocalTP MTP sidecars must project the replicated full-vocab head.";
 }
 
+TEST(Test__MTPGraphConstruction,
+     LocalTPRequestBatchPrefillMirrorsCompactTerminalHead)
+{
+    DenseMTPGraphFixture fixture;
+    auto local_tp = std::make_unique<MockLocalTPContext>();
+    local_tp->setDevices(
+        {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    local_tp->setBackend(CollectiveBackendType::NCCL);
+
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.draft_tokens = 1;
+    fixture.config.mtp.max_request_batch = 2;
+    fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    fixture.config.tp_ctx = local_tp.get();
+
+    InspectableQwen35Graph builder(fixture.config, fixture.mpi);
+    ASSERT_TRUE(builder.setComputeAllPositionLogits(true));
+    ASSERT_TRUE(builder.setComputeRowIndexedAllPositionLogits(
+        true,
+        /*row_count=*/2));
+
+    constexpr int padded_prefill_rows = 64;
+    ASSERT_GT(
+        padded_prefill_rows,
+        resolveMTPMaxTargetQueryRows(fixture.config.mtp));
+    EXPECT_TRUE(builder.mirroredHeadActiveForProjectedRows(padded_prefill_rows))
+        << "Two compact request-terminal rows must use the mirrored full-vocab "
+           "head even when their padded prefill activation contains many rows.";
+
+    ASSERT_TRUE(builder.setComputeRowIndexedAllPositionLogits(false, 0));
+    EXPECT_FALSE(builder.mirroredHeadActiveForProjectedRows(padded_prefill_rows))
+        << "Without compact row selection, a large ordinary prefill remains on "
+           "the column-parallel LM-head path.";
+}
+
 TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
 {
     DenseMTPGraphFixture fixture;
@@ -2257,6 +2313,54 @@ TEST(Test__MTPGraphConstruction, PhaseSplitDecodeDoesNotExposeStaleColumnParalle
     EXPECT_FALSE(orchestrator.hasLogitsLocal());
     EXPECT_FALSE(orchestrator.getLogitsLocalInfo());
     EXPECT_FALSE(orchestrator.consumeLogitsLocalInfoForSampling());
+}
+
+/**
+ * @brief Compact LocalTP prefill rows advertise their mirrored full head.
+ *
+ * The runner keeps `logits_local` allocated at maximum capacity even while a
+ * temporary request-batched graph writes compact terminal rows through the
+ * mirrored full-vocabulary head. This regression proves runtime sampling
+ * classifies the active output transaction, not the dormant arena allocation.
+ * It is CPU-only: the LocalTP context and transaction marker are policy mocks.
+ */
+TEST(Test__MTPGraphConstruction,
+     LocalTPCompactPrefillDoesNotExposeDormantColumnParallelLogits)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    auto local_tp = std::make_unique<MockLocalTPContext>();
+    local_tp->setDevices(
+        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
+    local_tp->setBackend(CollectiveBackendType::HOST);
+
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.mirror_full_head_for_local_tp = true;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    fixture.config.tp_ctx = local_tp.get();
+
+    auto graph_builder =
+        std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/2,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    orchestrator.setPhase(InferencePhase::PREFILL);
+    ASSERT_TRUE(orchestrator.hasLogitsLocal())
+        << "Ordinary LocalTP prefill starts with a column-parallel LM head.";
+
+    orchestrator.markRequestBatchedPrefillLogitsForTesting(/*row_count=*/2);
+    EXPECT_FALSE(orchestrator.hasLogitsLocal())
+        << "The active compact prefill transaction writes mirrored full-vocab rows.";
+    EXPECT_FALSE(orchestrator.getLogitsLocalInfo());
+
+    orchestrator.markRequestBatchedPrefillLogitsForTesting(/*row_count=*/0);
+    EXPECT_TRUE(orchestrator.hasLogitsLocal())
+        << "Ending the compact transaction restores ordinary prefill policy.";
 }
 
 TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspace)

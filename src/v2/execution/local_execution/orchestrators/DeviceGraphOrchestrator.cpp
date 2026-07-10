@@ -3110,6 +3110,18 @@ namespace llaminar2
         return raw_ptr;
     }
 
+    IWorkerGPUContext *DeviceGraphOrchestrator::getWorkerGPUContext(DeviceId device)
+    {
+        if (!device.is_gpu())
+            return nullptr;
+        return &GPUDeviceContextPool::instance().getContext(device);
+    }
+
+    bool DeviceGraphOrchestrator::workerGPUContextUsesProcessPool(DeviceId device) const
+    {
+        return device.is_gpu();
+    }
+
     bool DeviceGraphOrchestrator::isMoeRebalancingActive() const
     {
         if (!moe_rebalance_controller_)
@@ -4528,6 +4540,26 @@ namespace llaminar2
         const auto &config = graph_builder_->config();
         if (!config.lm_head_column_parallel)
             return false;
+
+        /*
+         * A request-batched GPU prefill temporarily turns on row-indexed
+         * all-position logits and projects one compact terminal row per
+         * request. Under mirrored LocalTP MTP policy, that temporary graph
+         * binds the replicated full-vocabulary head and writes
+         * `all_position_logits`; the ordinary `logits_local` allocation still
+         * exists only because it belongs to the runner's maximum-capacity
+         * arena. Classify the output that was actually produced, rather than
+         * inferring ownership from that dormant allocation.
+         *
+         * The compact-row count remains positive from successful prefill until
+         * `sampleMainLogitsBatchRowsOnDevice()` consumes the rows, so it is the
+         * transaction-lifetime proof that the full-vocabulary result is active.
+         */
+        if (request_batched_prefill_logits_row_count_ > 0 &&
+            usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            return false;
+        }
 
         /*
          * Phase-split TP/EP reserves LOGITS_LOCAL with full-width storage so
@@ -6522,7 +6554,10 @@ namespace llaminar2
             }
         }
 
-        if (!active_cache.segment_cache.ensureCaptureStream(gpu_ctx, state_.device_id))
+        if (!active_cache.segment_cache.ensureCaptureStream(
+                gpu_ctx,
+                state_.device_id,
+                /*context_from_process_pool=*/true))
         {
             LOG_ERROR("[DGO] Device MoE rebalance maintenance graph could not create an explicit capture stream for "
                       << device_key);
@@ -11163,7 +11198,8 @@ namespace llaminar2
         {
             if (sidecar_cache.segment_cache.ensureCaptureStream(
                     sidecar_gpu_ctx,
-                    state_.device_id))
+                    state_.device_id,
+                    /*context_from_process_pool=*/true))
             {
                 void *capture_stream = sidecar_cache.segment_cache.capture_stream;
                 sidecar_dynamic_stream = capture_stream;
@@ -21326,59 +21362,46 @@ namespace llaminar2
                  * Accepted/rejected MTP publication is a live-state boundary:
                  * KV, GDN, short-conv, terminal hidden, and shifted sidecar
                  * caches have just been advanced to a compact verifier row.
-                 * CUDA/HIP graph executables record raw pointer arguments.  The
-                 * verifier graph intentionally binds shared recurrent kernels
-                 * to speculative work/capture buffers, while ordinary decode
-                 * must use the backend-owned live buffers restored below.
+                 * The capture lifetime is determined by the graph signature,
+                 * not by the backend alone. Single-token ordinary decode reads
+                 * backend-owned live buffers at stable addresses, while GDN and
+                 * short-conv verifier work lives in separate speculative slots.
+                 * CUDA and ROCm integration regressions capture the ordinary
+                 * graph once, publish every accepted row at M=2/3/4, and prove
+                 * the replayed continuation plus full recurrent state byte-equal
+                 * to serial M=1 decode. All-position verifier graphs similarly
+                 * refresh their stage-owned row metadata before every launch.
                  *
-                 * A previous policy kept all-position verifier and selected
-                 * single-token captures hot by rebinding streams after
-                 * publication.  That is only valid once every graph-captured
-                 * recurrent stage uses stable live-state indirection that is
-                 * independent of verifier scratch binding.  Until that target
-                 * architecture is fully implemented and byte-proven, GPU MTP
-                 * publication must recapture all forward replay segments after
-                 * the grouped device-resident restore.  This is not a serial
-                 * publication fallback: the accepted state is still restored
-                 * by the grouped/device metadata path, and the next graph replay
-                 * simply captures the correct live device pointers.
+                 * Multi-row ordinary decode remains live-state-versioned: its
+                 * captured executable encodes progression across several live
+                 * rows, so publication invalidates that replay state. Delegate
+                 * this distinction to the typed cache policy and retain every
+                 * executable whose device-state ownership contract is proven.
                  */
-                if (state_.device_id.is_gpu())
-                {
-                    forward_engine_->resetCapturedReplayState();
-                    tags["forward_replay_reset_scope"] =
-                        "correction_replay_all_gpu_segments";
-                    tags["forward_replay_single_token_decode_replay"] =
-                        "reset_until_device_state_indirection_proven";
-                    tags["forward_replay_reset_cache_count"] = "all";
-                    tags["forward_replay_stream_rebind_cache_count"] = "0";
-                    tags["forward_replay_ordinary_decode_reset_count"] = "all_gpu";
-                    tags["forward_replay_all_position_verifier_rebind_count"] = "0";
-                    tags["forward_replay_other_rebind_count"] = "0";
-                }
-                else
-                {
-                    const ForwardExecutionEngine::ReplayStateResetSummary summary =
-                        forward_engine_->resetCapturedReplayStateForCorrectionReplay(
-                            live_replay_state_epoch_,
-                            /*preserve_single_token_decode_replay=*/false);
-                    preserves_correction_graph_replay =
-                        summary.preserved_for_stream_rebind > 0;
-                    tags["forward_replay_reset_scope"] =
-                        "correction_replay_decode_only";
-                    tags["forward_replay_single_token_decode_replay"] =
-                        "reset_for_publication_boundary";
-                    tags["forward_replay_reset_cache_count"] =
-                        std::to_string(summary.reset_replay_state);
-                    tags["forward_replay_stream_rebind_cache_count"] =
-                        std::to_string(summary.preserved_for_stream_rebind);
-                    tags["forward_replay_ordinary_decode_reset_count"] =
-                        std::to_string(summary.ordinary_decode_reset);
-                    tags["forward_replay_all_position_verifier_rebind_count"] =
-                        std::to_string(summary.all_position_verifier_preserved);
-                    tags["forward_replay_other_rebind_count"] =
-                        std::to_string(summary.other_preserved);
-                }
+                const bool preserve_single_token_decode_replay =
+                    state_.device_id.is_gpu();
+                const ForwardExecutionEngine::ReplayStateResetSummary summary =
+                    forward_engine_->resetCapturedReplayStateForCorrectionReplay(
+                        live_replay_state_epoch_,
+                        preserve_single_token_decode_replay);
+                preserves_correction_graph_replay =
+                    summary.preserved_for_stream_rebind > 0;
+                tags["forward_replay_reset_scope"] =
+                    "correction_replay_typed_live_state";
+                tags["forward_replay_single_token_decode_replay"] =
+                    preserve_single_token_decode_replay
+                        ? "preserved_byte_proven_device_state"
+                        : "reset_for_publication_boundary";
+                tags["forward_replay_reset_cache_count"] =
+                    std::to_string(summary.reset_replay_state);
+                tags["forward_replay_stream_rebind_cache_count"] =
+                    std::to_string(summary.preserved_for_stream_rebind);
+                tags["forward_replay_ordinary_decode_reset_count"] =
+                    std::to_string(summary.ordinary_decode_reset);
+                tags["forward_replay_all_position_verifier_rebind_count"] =
+                    std::to_string(summary.all_position_verifier_preserved);
+                tags["forward_replay_other_rebind_count"] =
+                    std::to_string(summary.other_preserved);
             }
             else
             {

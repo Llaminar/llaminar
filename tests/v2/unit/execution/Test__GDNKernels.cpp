@@ -2985,6 +2985,66 @@ TEST(Test__GDNKernels, Recurrence_NullPointers_Fails)
     EXPECT_FALSE(stage.execute(ctx.get()));
 }
 
+/**
+ * @brief Proves GPU-shaped stages delegate null host state to device owners.
+ *
+ * This is intentionally a hardware-free unit test. CPU tensors expose null
+ * GPU data pointers and the recording kernel performs no device work; the
+ * mock contexts merely select the CUDA and ROCm branches in the stage. The
+ * contract under test is that a GPU stage must reach the backend with a null
+ * `recurrence_state`, because the real GPU kernels own the only live state.
+ */
+TEST(Test__GDNKernels, Recurrence_DeviceOwnedGPUStateDoesNotRequireHostPointer)
+{
+    constexpr int n_heads = 2;
+    constexpr int d_k = 4;
+    constexpr int d_v = 4;
+
+    auto q = makeFP32({1, static_cast<size_t>(n_heads * d_k)});
+    auto k = makeFP32({1, static_cast<size_t>(n_heads * d_k)});
+    auto v = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
+    auto alpha = makeFP32({1, static_cast<size_t>(n_heads)});
+    auto beta = makeFP32({1, static_cast<size_t>(n_heads)});
+    auto a_log = makeFP32({static_cast<size_t>(n_heads)});
+    auto dt_bias = makeFP32({static_cast<size_t>(n_heads)});
+    auto output = makeFP32({1, static_cast<size_t>(n_heads * d_v)});
+
+    const std::array<std::pair<DeviceId, ComputeBackendType>, 2> gpu_backends{{
+        {DeviceId::cuda(0), ComputeBackendType::GPU_CUDA},
+        {DeviceId::rocm(0), ComputeBackendType::GPU_ROCM},
+    }};
+
+    for (const auto &[device, backend] : gpu_backends)
+    {
+        MockGatedDeltaNet kernel;
+        EXPECT_CALL(kernel,
+                    recurrent_step(_, _, _, _, _, _, _, _, nullptr,
+                                   n_heads, d_k, d_v, true))
+            .WillOnce(Return(true));
+
+        GDNRecurrenceStage::Params p;
+        p.device_id = device;
+        p.Q = q.get();
+        p.K = k.get();
+        p.V = v.get();
+        p.alpha = alpha.get();
+        p.beta = beta.get();
+        p.A_log = a_log.get();
+        p.dt_bias = dt_bias.get();
+        p.output = output.get();
+        p.recurrence_state = nullptr;
+        p.seq_len = 1;
+        p.n_heads = n_heads;
+        p.d_k = d_k;
+        p.d_v = d_v;
+        p.kernel = &kernel;
+
+        GDNRecurrenceStage stage(p);
+        llaminar2::testing::MockDeviceContext ctx(device, backend);
+        EXPECT_TRUE(stage.execute(&ctx)) << "device=" << device.toString();
+    }
+}
+
 TEST(Test__GDNKernels, Recurrence_Decode_ZeroState)
 {
     // With zero initial state and specific inputs, verify output

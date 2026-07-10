@@ -664,6 +664,29 @@ namespace llaminar2
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
         bool supportsRowLocalAllPositionPenaltyApplication() const override;
+        /**
+         * @brief Sample compact request-batched prefill rows on every LocalTP child.
+         *
+         * Mirrored LocalTP MTP heads produce one full-vocabulary terminal row
+         * per logical request on every GPU participant. Each child samples its
+         * own row batch and initializes its child-local resident logical-state
+         * mailbox. The rank compares only the small response-token shadows;
+         * verifier planning and accepted-state publication continue to consume
+         * the child-resident mailboxes.
+         *
+         * @param request_count Number of compact terminal rows per child.
+         * @param params Shared sampling policy for the request batch.
+         * @param out_tokens Host response-token shadow written from child zero.
+         * @param stochastic_position_seeds Immutable per-request seeds. Draws
+         *        remain device-generated from each child's resident positions.
+         * @return true when every child sampled matching tokens and published
+         *         its resident logical-state mailbox.
+         */
+        bool sampleMainLogitsBatchRowsOnDevice(
+            int request_count,
+            const SamplingParams &params,
+            int32_t *out_tokens,
+            const uint64_t *stochastic_position_seeds = nullptr) override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
             int draft_sample_slot,

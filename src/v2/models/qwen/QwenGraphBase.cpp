@@ -366,10 +366,24 @@ namespace llaminar2
     {
         const int max_decode_like_rows =
             std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
+
+        /*
+         * Request-batched prefill can have a large padded activation tensor but
+         * projects only one compact terminal row per request.  The LM-head
+         * policy must follow the number of rows actually projected, not the
+         * padded transformer input size.  Otherwise LocalTP falls back to
+         * column-parallel terminal logits and needs a tiny rank-level sampling
+         * collective precisely where the mirrored MTP head is intended to
+         * remove it.
+         */
+        const int projected_rows =
+            config_.compute_row_indexed_logits
+                ? config_.row_indexed_logits_row_count
+                : total_tokens;
         return localTPMirroredMTPHeadConfigured() &&
                config_.compute_all_position_logits &&
-               total_tokens > 0 &&
-               total_tokens <= max_decode_like_rows;
+               projected_rows > 0 &&
+               projected_rows <= max_decode_like_rows;
     }
 
     bool QwenGraphBase::useMirroredMTPHeadWeights() const

@@ -512,6 +512,18 @@ namespace
             return device == device_ ? ctx_ : nullptr;
         }
 
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId device) override
+        {
+            if (device != device_ || !device.is_gpu())
+                return nullptr;
+            return &GPUDeviceContextPool::instance().getContext(device);
+        }
+
+        bool workerGPUContextUsesProcessPool(DeviceId device) const override
+        {
+            return device == device_ && device.is_gpu();
+        }
+
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
         {
             return {{device_, ctx_}};

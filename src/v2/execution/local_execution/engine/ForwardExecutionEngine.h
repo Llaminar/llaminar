@@ -36,7 +36,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
-    class GPUDeviceContextPool;
+    class IWorkerGPUContext;
 
     /**
      * @brief Host interface for ForwardExecutionEngine callbacks
@@ -67,6 +67,29 @@ namespace llaminar2
 
         /** Get or create a device context for the given device. */
         virtual IDeviceContext *getDeviceContext(DeviceId device) = 0;
+
+        /**
+         * @brief Resolve the worker-owned GPU runtime context for a device.
+         *
+         * ForwardExecutionEngine must not reach through a global backend pool:
+         * the host owns device lifecycle and is the only component that can
+         * distinguish a production physical context from a hardware-free test
+         * double. GPU execution requires a non-null result. CPU devices return
+         * null because they have no stream, event, or graph-capture runtime.
+         *
+         * @param device Logical GPU device whose worker owns execution.
+         * @return Host-owned worker context, or null for a non-GPU device.
+         */
+        virtual IWorkerGPUContext *getWorkerGPUContext(DeviceId device) = 0;
+
+        /**
+         * @brief Report whether worker cleanup may re-resolve through the process pool.
+         *
+         * Production DGO and physical GPU integration hosts return true. Unit
+         * hosts return false so cached stream/event cleanup continues to use
+         * the process-lifetime in-memory worker without probing CUDA or ROCm.
+         */
+        virtual bool workerGPUContextUsesProcessPool(DeviceId device) const = 0;
 
         /** Get device contexts for all devices in a unified PP pipeline. */
         virtual std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() = 0;
@@ -714,9 +737,13 @@ namespace llaminar2
          * immediately replay the corrected token through the ordinary main
          * decode path. Any capture that encodes multi-row live-state progression
          * must be fresh. Dense single-token decode can preserve its executable
-         * because every dynamic input is rebound before launch; MoE callers may
-         * set @p preserve_single_token_decode_replay to false until routed
-         * scratch/expert metadata preservation has its own equivalence proof.
+         * because every dynamic input is rebound before launch and its recurrent
+         * kernels read backend-owned live buffers at stable addresses. CUDA and
+         * ROCm GDN/short-conv integration regressions prove that contract by
+         * publishing every accepted row at M=2/3/4 and requiring byte-identical
+         * captured-graph continuation versus serial M=1 decode. Callers may set
+         * @p preserve_single_token_decode_replay to false only for execution
+         * domains that have not established the same ownership contract.
          * Preserved caches still have their stage stream bindings dirtied so a
          * KernelFactory dynamic-state reset cannot leave backend kernels with
          * null streams before the next updateDynamicParams() call.
@@ -859,6 +886,7 @@ namespace llaminar2
 
         // ----- GPU Stage Timeline collection -----
         void collectTimeline(
+            IForwardExecutionHost &host,
             IDeviceContext *ctx,
             bool is_decode,
             const ForwardInput &input,

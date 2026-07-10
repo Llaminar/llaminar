@@ -4956,11 +4956,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationSeparatesSidecar
      * MTP spec-state publication replaces live main/MTP KV and recurrent state
      * with verifier-captured rows. Main/verifier replay caches need their own
      * correction boundary, and sidecar replay can only stay warm when the
-     * sidecar transaction proves it does not capture stale metadata. Main graph
-     * replay is currently reset on every GPU publication boundary because raw
-     * captured recurrent pointers are not yet independently indirected; this
-     * guard prevents that correctness rule from needlessly invalidating the
-     * separately proven sidecar graph.
+     * sidecar transaction proves it does not capture stale metadata. GPU main
+     * graph replay uses a typed lifetime policy: byte-proven single-token decode
+     * and all-position verifier captures remain warm, while genuinely
+     * live-state-versioned multi-row ordinary decode is invalidated. This guard
+     * prevents blanket graph resets from returning and keeps sidecar safety an
+     * independent decision.
      */
     EXPECT_NE(header.find("preservesMTPSidecarReplayAfterSpecPublication"),
               std::string::npos)
@@ -4985,19 +4986,29 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSpecStatePublicationSeparatesSidecar
               std::string::npos)
         << "Spec-state publication must preserve sidecar replay only through "
            "the narrow replay-safety capability.";
-    EXPECT_NE(executable_mutation_body.find(
+    EXPECT_EQ(executable_mutation_body.find(
                   "if(state_.device_id.is_gpu()){forward_engine_->resetCapturedReplayState();"),
               std::string::npos)
-        << "GPU publication must reset every graph segment until recurrent live-state pointers use proven stable indirection.";
-    EXPECT_NE(mutation_body.find("correction_replay_all_gpu_segments"),
-              std::string::npos);
-    EXPECT_NE(mutation_body.find("reset_until_device_state_indirection_proven"),
-              std::string::npos)
-        << "Perfstats must expose the remaining graph-indirection performance debt.";
+        << "A GPU publication boundary must not blanket-reset byte-proven graph captures.";
     EXPECT_NE(executable_mutation_body.find(
-                  "resetCapturedReplayStateForCorrectionReplay(live_replay_state_epoch_,false)"),
+                  "constboolpreserve_single_token_decode_replay=state_.device_id.is_gpu();"),
               std::string::npos)
-        << "The non-GPU path must also treat accepted publication as a replay boundary.";
+        << "Only GPU domains with byte-proven stable device state may retain ordinary single-token replay.";
+    EXPECT_NE(executable_mutation_body.find(
+                  "resetCapturedReplayStateForCorrectionReplay(live_replay_state_epoch_,preserve_single_token_decode_replay)"),
+              std::string::npos)
+        << "Accepted publication must use the typed replay-lifetime policy on every backend.";
+    EXPECT_NE(mutation_body.find("correction_replay_typed_live_state"),
+              std::string::npos);
+    EXPECT_NE(mutation_body.find("preserved_byte_proven_device_state"),
+              std::string::npos)
+        << "Perfstats must identify preservation backed by the persistent graph replay regressions.";
+    EXPECT_EQ(mutation_body.find("correction_replay_all_gpu_segments"),
+              std::string::npos)
+        << "The obsolete blanket GPU reset policy must not return.";
+    EXPECT_EQ(mutation_body.find("reset_until_device_state_indirection_proven"),
+              std::string::npos)
+        << "The device-state indirection debt was retired by byte-exact CUDA/ROCm lifetime tests.";
     EXPECT_NE(mutation_body.find("prefix_restore_discard_cached_graphs"),
               std::string::npos)
         << "Prefix restore is a full live-state replacement and must discard "

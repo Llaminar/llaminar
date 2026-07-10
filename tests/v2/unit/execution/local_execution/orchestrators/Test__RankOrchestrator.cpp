@@ -4164,8 +4164,11 @@ TEST_F(Test__RankOrchestrator, ShutdownSynchronizesAllRankDevicesBeforeRelease)
         runner_source.substr(shutdown_helper, helper_end - shutdown_helper);
     EXPECT_NE(helper_body.find("dynamic_cast<IRankOrchestrator *>"), std::string::npos);
     EXPECT_NE(helper_body.find("rank->synchronizeDevices()"), std::string::npos);
-    EXPECT_NE(runner_source.find("synchronizeRunnerDevicesBeforeRelease(runner_.get())"),
+    EXPECT_NE(runner_source.find("synchronizeRunnerDevicesBeforeRelease(\n                runner_.get(),\n                physical_runner_backend_access_enabled_)"),
               std::string::npos);
+    EXPECT_NE(helper_body.find("if (!physical_backend_access_enabled)"),
+              std::string::npos)
+        << "Injected GPU-shaped unit runners must not initialize physical backends during teardown.";
 
     const auto sync_fn =
         rank_source.find("void RankOrchestrator::synchronizeDevices()");
