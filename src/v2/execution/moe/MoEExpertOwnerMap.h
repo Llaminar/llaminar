@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "MoEExpertParallelPlan.h"
+#include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 #include "backends/GlobalDeviceAddress.h"
 
@@ -47,14 +47,17 @@ namespace llaminar2
 
     struct MoEExpertOwnerMapBuildOptions
     {
-        bool reject_sharded_experts = true;
+        /// A whole-expert owner map cannot describe multiple tensor-shard
+        /// owners unless the caller is deliberately using it only as a
+        /// placement/residency index.
+        bool reject_tensor_sharded_domains = true;
     };
 
     class MoEExpertOwnerMap
     {
     public:
         static MoEExpertOwnerMap build(
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             const MoEExpertOwnerMapBuildOptions &options = {});
 
         const std::vector<MoEExpertOwner> &owners() const { return owners_; }

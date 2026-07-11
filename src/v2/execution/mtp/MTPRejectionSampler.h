@@ -1,6 +1,6 @@
 /**
  * @file MTPRejectionSampler.h
- * @brief Shared vLLM-style speculative rejection-sampling contract.
+ * @brief Shared speculative sampling contracts for grouped MTP verification.
  *
  * The helpers in this file describe *what* speculative verification means.
  * CPU, CUDA, and ROCm implementations should match these semantics even when
@@ -25,10 +25,12 @@ namespace llaminar2
     /**
      * @brief Result for one target-verifier row in stochastic MTP.
      *
-     * The row compares one draft token against the target distribution. On
-     * accept, `token` is exactly the draft token. On reject, `token` is sampled
-     * from the residual distribution `max(target - draft, 0)`, falling back to
-     * the target distribution if the residual is empty.
+     * The row compares one draft token against the target distribution. For
+     * vLLM probability rejection, an accepted `token` is the draft token and a
+     * rejected `token` is sampled from `max(target - draft, 0)`. For seeded
+     * serial-sample-equivalent verification, `token` is instead the target row
+     * sampled with the serial decoder's position-keyed threshold, and
+     * `accepted` reports whether that exact token equals the draft proposal.
      */
     struct MTPRejectionSampleRowResult
     {
@@ -224,6 +226,33 @@ namespace llaminar2
     int32_t sampleMTPDistributionWithThreshold(
         const std::vector<SamplingDistributionEntry> &distribution,
         float threshold);
+
+    /**
+     * @brief Couple one grouped verifier row to the exact serial target sample.
+     *
+     * Seeded MTP must be pathwise equivalent to serial stochastic decode, not
+     * merely distributionally equivalent. The caller therefore supplies the
+     * same position-keyed `sample_threshold` that serial decode uses for this
+     * logical output position. This helper samples the target distribution
+     * exactly once with that threshold and accepts the speculative proposal
+     * only when the proposal is byte-for-byte the same token.
+     *
+     * Unlike vLLM probability-ratio rejection, the correction token does not
+     * depend on the proposal distribution or on how many speculative rows were
+     * grouped. Changing MTP depth can change work performed, but it cannot
+     * change the seeded output stream. The operation remains economical: it is
+     * one cumulative walk over the already-built compact target distribution
+     * and does not replay a model row.
+     *
+     * @param target_distribution Processed target distribution for this row.
+     * @param draft_token Token proposed by the MTP sidecar for this position.
+     * @param sample_threshold Serial decoder threshold for the logical position.
+     * @return Row decision containing the exact serial target token.
+     */
+    MTPRejectionSampleRowResult sampleMTPSerialEquivalentTargetRow(
+        const std::vector<SamplingDistributionEntry> &target_distribution,
+        int32_t draft_token,
+        float sample_threshold);
 
     /**
      * @brief Summarize verified stochastic rows into the backend-neutral batch contract.

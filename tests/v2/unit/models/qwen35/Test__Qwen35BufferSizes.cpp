@@ -28,6 +28,20 @@ static const BufferDescriptor *findBuf(
     return nullptr;
 }
 
+/**
+ * @brief Configure the non-GlobalTP placeholder for gathered MTP logits.
+ *
+ * Production resolver configuration reserves the full gathered buffer only for
+ * CPU GlobalTP, where the MTP head remains column-sharded. Single-device and
+ * mirrored LocalTP lanes need the descriptor for one declarative schema, but a
+ * 1x1 placeholder prevents them from wasting a full-vocabulary arena region.
+ */
+static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
+{
+    config.custom_formulas["mtp_global_gather_rows"] = 1;
+    config.custom_formulas["mtp_global_gather_vocab"] = 1;
+}
+
 // ============================================================================
 // Layer Buffer Size Lock-in (Qwen3.5-4B dimensions, non-TP)
 // ============================================================================
@@ -64,13 +78,14 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.custom_formulas["gdn_time_step_rank"] = 32;
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
     // Qwen3.5 has the main layer buffers, compact LM-head verifier row
-    // scratch, and 19 MTP verifier sidecar buffers including the phase-split
-    // full-prefill KV handoff rows.
-    EXPECT_EQ(reqs.buffers.size(), 40u) << "Expected 40 layer buffers";
+    // scratch, and 20 MTP verifier sidecar buffers including the phase-split
+    // full-prefill KV handoff rows and conditional CPU GlobalTP gather arena.
+    EXPECT_EQ(reqs.buffers.size(), 41u) << "Expected 41 layer buffers";
 
     // ── Shared buffers ──
 
@@ -260,6 +275,12 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     ASSERT_NE(mtp_logits, nullptr);
     EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 248320u);
+
+    auto *mtp_logits_gathered = findBuf(reqs, "mtp_logits_gathered");
+    ASSERT_NE(mtp_logits_gathered, nullptr);
+    EXPECT_EQ(mtp_logits_gathered->shape[0], 1u);
+    EXPECT_EQ(mtp_logits_gathered->shape[1], 1u)
+        << "Single-device MTP must not reserve a redundant gathered vocabulary.";
 }
 
 TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
@@ -285,6 +306,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
     config.custom_formulas["mtp_target_query_rows"] = 8;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
     auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
@@ -322,6 +344,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPAttnOutputUsesHybridAttnOutputDim)
     config.custom_formulas["gdn_time_step_rank"] = 48;
     config.custom_formulas["fa_q_full_dim"] = 10240;
     config.custom_formulas["attn_output_dim"] = 6144;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -410,7 +433,7 @@ TEST(Test__Qwen35BufferSizes, ModelBuffers_TP2)
 // Layer Buffer Sizes with TP=2
 // ============================================================================
 
-TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
+TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
 {
     Qwen35SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -440,10 +463,12 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     config.custom_formulas["gdn_time_step_rank"] = 16;
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
+    config.custom_formulas["mtp_global_gather_rows"] = 4;
+    config.custom_formulas["mtp_global_gather_vocab"] = 248320;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 40u);
+    EXPECT_EQ(reqs.buffers.size(), 41u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -501,6 +526,12 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     ASSERT_NE(mtp_logits, nullptr);
     EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 124160u);
+
+    auto *mtp_logits_gathered = findBuf(reqs, "mtp_logits_gathered");
+    ASSERT_NE(mtp_logits_gathered, nullptr);
+    EXPECT_EQ(mtp_logits_gathered->shape[0], 4u);
+    EXPECT_EQ(mtp_logits_gathered->shape[1], 248320u)
+        << "CPU GlobalTP must gather only compact MTP rows into a full-vocabulary buffer.";
 }
 
 TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLogits)
@@ -526,6 +557,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLog
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
     config.custom_formulas["mtp_vocab"] = 248320;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -534,6 +566,12 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLog
     EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 248320u)
         << "Mirrored LocalTP MTP heads must have full-vocab sidecar storage.";
+
+    auto *mtp_logits_gathered = findBuf(reqs, "mtp_logits_gathered");
+    ASSERT_NE(mtp_logits_gathered, nullptr);
+    EXPECT_EQ(mtp_logits_gathered->shape[0], 1u);
+    EXPECT_EQ(mtp_logits_gathered->shape[1], 1u)
+        << "Mirrored LocalTP must not also reserve the CPU GlobalTP gather arena.";
 
     auto model_reqs = BufferAllocator::resolveModelBuffers(schema, config);
     auto *logits_local = findBuf(model_reqs, "logits_local");

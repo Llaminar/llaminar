@@ -4,7 +4,7 @@
  *
  * Extracted from MoEExpertComputeStage to enable independent routing computation.
  * Outputs raw routing results (expert indices as float, normalized weights)
- * without any EP masking — downstream MoEExpertComputeStage handles that.
+ * without any expert-ID ownership masking; MoEExpertComputeStage handles that.
  */
 
 #pragma once
@@ -27,7 +27,7 @@ namespace llaminar2
      * @brief MoE routing stage: compute expert selection via softmax top-k
      *
      * Calls IMoEKernel::route() to compute routing, then writes results
-     * to output tensors as FP32. Does NOT apply EP masking — that is
+     * to output tensors as FP32. It does not apply expert-ID ownership masking;
      * the responsibility of MoEExpertComputeStage.
      *
      * Outputs:
@@ -75,7 +75,7 @@ namespace llaminar2
              *
              * Single-device GPU decode must use the device-routed runtime table
              * so graph capture, route metadata, and expert execution share one
-             * device-owned source of truth.  LocalTP ExpertParallel runners are
+             * device-owned source of truth. LocalTP expert-id-apportioned runners are
              * different: each participant owns only a subset of experts and the
              * current runtime table is a full-owner contract.  Until the sharded
              * runtime-table reducer exists, those TP participants use the explicit

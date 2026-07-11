@@ -170,7 +170,7 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Distribute experts across devices (Expert Parallelism)
+         * @brief Apportion whole expert IDs across devices.
          *
          * Maps each expert to a device based on device weights/capacity.
          * Used at model load time to determine expert placement.

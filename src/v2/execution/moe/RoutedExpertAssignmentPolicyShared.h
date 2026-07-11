@@ -25,7 +25,7 @@ namespace llaminar2::routed_expert_assignment
     enum class Algorithm : uint32_t
     {
         StaticOwner = 0,
-        LeastLoadedEP = 1,
+        LeastLoadedResident = 1,
     };
 
     using AssignmentWorkspace = least_loaded_ep::LeastLoadedExpertAssignmentWorkspace;
@@ -153,7 +153,7 @@ namespace llaminar2::routed_expert_assignment
                 spans,
                 span_capacity,
                 status_out);
-        case Algorithm::LeastLoadedEP:
+        case Algorithm::LeastLoadedResident:
             return least_loaded_ep::planLeastLoadedExpertAssignment(
                 expert_loads,
                 expert_owner_participants,

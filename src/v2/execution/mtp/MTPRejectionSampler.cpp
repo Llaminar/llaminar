@@ -124,6 +124,40 @@ namespace llaminar2
             threshold);
     }
 
+    MTPRejectionSampleRowResult sampleMTPSerialEquivalentTargetRow(
+        const std::vector<SamplingDistributionEntry> &target_distribution,
+        int32_t draft_token,
+        float sample_threshold)
+    {
+        if (draft_token < 0)
+            return rejectionSampleFailure(draft_token, "draft token is invalid");
+        if (target_distribution.empty())
+        {
+            return rejectionSampleFailure(
+                draft_token,
+                "target distribution is empty");
+        }
+
+        MTPRejectionSampleRowResult result;
+        result.ok = true;
+        result.draft_token = draft_token;
+        result.accept_threshold =
+            sampling_math::clamp_unit_threshold(sample_threshold);
+        result.token = sampleMTPDistributionWithThreshold(
+            target_distribution,
+            result.accept_threshold);
+        if (result.token < 0)
+        {
+            return rejectionSampleFailure(
+                draft_token,
+                "serial-equivalent target distribution sampling produced no token");
+        }
+
+        result.accepted = result.token == draft_token;
+        result.accept_probability = result.accepted ? 1.0f : 0.0f;
+        return result;
+    }
+
     MTPRejectionSampleRowResult sampleMTPRejectionRowFromDistributions(
         const std::vector<SamplingDistributionEntry> &target_distribution,
         const std::vector<SamplingDistributionEntry> &draft_distribution,

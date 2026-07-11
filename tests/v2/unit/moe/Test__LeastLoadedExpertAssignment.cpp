@@ -1,6 +1,6 @@
 /**
  * @file Test__LeastLoadedExpertAssignment.cpp
- * @brief Unit tests for the backend-neutral Least-Loaded EP assignment helper.
+ * @brief Unit tests for backend-neutral least-loaded-resident assignment.
  */
 
 #include <gtest/gtest.h>
@@ -216,7 +216,7 @@ TEST(Test__LeastLoadedExpertAssignment, PolicyDispatcherTreatsStaticOwnerAsFirst
     EXPECT_EQ(fixture.spans[2].destination_participant, 0u);
 }
 
-TEST(Test__LeastLoadedExpertAssignment, PolicyDispatcherRoutesLeastLoadedEPToSharedAlgorithm)
+TEST(Test__LeastLoadedExpertAssignment, PolicyDispatcherRoutesLLEPToSharedAlgorithm)
 {
     std::vector<uint64_t> loads{80, 20, 0, 0};
     std::vector<uint32_t> owners{0, 0, 1, 1};
@@ -226,7 +226,7 @@ TEST(Test__LeastLoadedExpertAssignment, PolicyDispatcherRoutesLeastLoadedEPToSha
     ASSERT_TRUE(direct.plan(loads, owners, config));
 
     routed_expert_assignment::PolicyConfig policy;
-    policy.algorithm = routed_expert_assignment::Algorithm::LeastLoadedEP;
+    policy.algorithm = routed_expert_assignment::Algorithm::LeastLoadedResident;
     policy.least_loaded = config;
     PlannerFixture dispatched(config.expert_count, config.participant_count);
     ASSERT_TRUE(dispatched.planPolicy(loads, owners, policy));

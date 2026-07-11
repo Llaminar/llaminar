@@ -558,7 +558,7 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.mtp.enabled = true;
-    moe_config.moe.expert_mode = MoEExpertMode::ApportionedExperts;
+    moe_config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     moe_config.moe.local_expert_start = 0;
     moe_config.moe.local_expert_count = -1;
     DeviceGraphOrchestrator moe_orchestrator(

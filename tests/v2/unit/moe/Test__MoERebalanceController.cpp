@@ -1288,7 +1288,7 @@ TEST(Test__MoERebalanceController, ReplicaProposalPreservesExistingReplicasWitho
     EXPECT_EQ(ctrl.placementEpoch(), epoch_after_first);
 }
 
-TEST(Test__MoERebalanceController, ReplicaPrefillMaskKeepsReplicatedExpertsOnOwnerOnly)
+TEST(Test__MoERebalanceController, ReplicaPrefillMaskKeepsReplicatedComputeOnOwnerOnly)
 {
     ExpertReplicaSet replicas;
     replicas.is_replicated = {true, false, false, false, true, false, false, false};

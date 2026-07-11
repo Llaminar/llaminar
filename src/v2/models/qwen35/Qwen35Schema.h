@@ -350,6 +350,7 @@ namespace llaminar2
                 {"mtp_up", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
                 {"mtp_ffn_output", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
                 {"mtp_logits", {"4", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits rows; local shard normally, full vocab when LocalTP mirrors the MTP head"},
+                {"mtp_logits_gathered", {"mtp_global_gather_rows", "mtp_global_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary CPU GlobalTP MTP rows; conditionally 1x1 outside GlobalTP"},
             };
 
             schema.model_buffers = {

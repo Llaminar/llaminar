@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "MoEExpertParallelPlan.h"
+#include "MoERoutedExpertPlacementPlan.h"
 
 #include <cstddef>
 #include <string>
@@ -25,7 +25,7 @@ namespace llaminar2
 
     struct MoEExpertOverlayDenseReduceRequest
     {
-        const MoEExpertParallelPlan *plan = nullptr;
+        const MoERoutedExpertPlacementPlan *plan = nullptr;
         std::vector<MoEExpertOverlayDensePartial> partials;
         ITensor *output = nullptr;
         size_t rows = 0;
@@ -38,7 +38,7 @@ namespace llaminar2
     * The production Bridge Phase 7A GPU/ROCm path is intentionally not wired here. This
      * helper validates that dense FP32 partials are returned from the domains
      * declared by the overlay plan, then reduces them into the continuation
-     * output through MoEExpertParallelReduceStage.
+     * output through MoERoutedExpertPartialReduceStage.
      */
     class MoEExpertOverlayDenseReduce
     {

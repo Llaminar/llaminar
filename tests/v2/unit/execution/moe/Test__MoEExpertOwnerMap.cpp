@@ -11,35 +11,35 @@ namespace llaminar2::test
 {
     namespace
     {
-        ExpertComputeDomain rocmWarmDomain(ExpertDomainComputeKind compute_kind)
+        RoutedExpertDomain rocmWarmDomain(RoutedExpertComputePolicy routed_compute_policy)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "rocm_warm";
-            domain.kind = ExpertDomainKind::LocalTP;
+            domain.scope = ExecutionDomainScope::LOCAL;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0),
                                    GlobalDeviceAddress::rocm(1, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = compute_kind;
+            domain.routed_compute_policy = routed_compute_policy;
             return domain;
         }
 
-        ExpertComputeDomain cpuColdDomain()
+        RoutedExpertDomain cpuColdDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "cpu_cold";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::MPI;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.world_ranks = {2};
             domain.owner_rank = 2;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier tier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
+        RoutedExpertTier tier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
         {
-            ExpertRoutedTier result;
+            RoutedExpertTier result;
             result.name = name;
             result.domain = domain;
             result.priority = priority;
@@ -47,21 +47,21 @@ namespace llaminar2::test
             return result;
         }
 
-        MoEExpertParallelPlan disjointRocmPlan(ExpertDomainComputeKind compute_kind)
+        MoERoutedExpertPlacementPlan disjointRocmPlan(RoutedExpertComputePolicy routed_compute_policy)
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "rocm_warm";
             plan.shared_expert_domain = "rocm_warm";
-            plan.residency_policy = ExpertResidencyPolicy::StaticById;
-            plan.domains = {rocmWarmDomain(compute_kind), cpuColdDomain()};
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            plan.domains = {rocmWarmDomain(routed_compute_policy), cpuColdDomain()};
             plan.routed_tiers = {
                 tier("warm", "rocm_warm", 0),
                 tier("cold", "cpu_cold", 1, true),
             };
             plan.placements = {
-                ExpertLayerPlacement{.layer = 0,
+                RoutedExpertLayerPlacement{.layer = 0,
                                      .routed_expert_tier = {0, 0, 0, 0, 0, 0}},
             };
             return plan;
@@ -83,7 +83,7 @@ namespace llaminar2::test
 
     TEST(Test__MoEExpertOwnerMap, DisjointAcceleratorParticipantsOwnWholeExperts)
     {
-        const auto plan = disjointRocmPlan(ExpertDomainComputeKind::ApportionedExperts);
+        const auto plan = disjointRocmPlan(RoutedExpertComputePolicy::Apportioned);
         const auto owner_map = MoEExpertOwnerMap::build(plan);
 
         ASSERT_EQ(owner_map.participants().size(), 3u);
@@ -117,9 +117,9 @@ namespace llaminar2::test
             EXPECT_TRUE(first_mask[expert] || second_mask[expert]) << "expert=" << expert;
     }
 
-    TEST(Test__MoEExpertOwnerMap, RejectsShardedExpertsForGraphNativeRoutedTiers)
+    TEST(Test__MoEExpertOwnerMap, RejectsTensorShardedComputeForWholeExpertOwnerMap)
     {
-        const auto plan = disjointRocmPlan(ExpertDomainComputeKind::ShardedExperts);
+        const auto plan = disjointRocmPlan(RoutedExpertComputePolicy::TensorSharded);
         EXPECT_THROW((void)MoEExpertOwnerMap::build(plan), std::invalid_argument);
     }
 

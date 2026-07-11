@@ -134,16 +134,16 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertIn("--tp-scope node_local", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
 
-    def test_expert_overlay_topology_uses_moe_overlay_flags(self) -> None:
+    def test_tiered_routed_expert_topology_uses_explicit_policy_flags(self) -> None:
         result = self.run_matrix(
             "baseline",
-            topologies="expert_overlay_rocm2_cpu2",
+            topologies="routed_expert_tiered_rocm2_cpu2",
             models="moe",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--moe-expert-overlay tiered", result.stdout)
-        self.assertIn("--moe-expert-overlay-continuation qwen36_moe_rocm_hot", result.stdout)
+        self.assertIn("--moe-routed-expert-placement tiered-overlay", result.stdout)
+        self.assertIn("--moe-routed-expert-continuation-domain qwen36_moe_rocm_hot", result.stdout)
         self.assertIn("qwen36_moe_rocm_hot=rocm:0\\,rocm:1", result.stdout)
         self.assertIn("qwen36_moe_cpu_cold=cpu:0\\,cpu:1", result.stdout)
         self.assertIn("cold@qwen36_moe_cpu_cold\\;priority=1", result.stdout)

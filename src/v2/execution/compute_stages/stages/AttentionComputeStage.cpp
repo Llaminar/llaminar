@@ -14,6 +14,7 @@
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../kernels/attention/AttentionDeviceParams.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
@@ -36,8 +37,6 @@ namespace llaminar2
 
     namespace
     {
-        constexpr int kMTPVerifierSmallDecodeMaxRows = 4;
-
         int rocmAttentionRequestedDecodeSplitCap(int kv_len)
         {
             if (debugEnv().gemm.deterministic)
@@ -357,7 +356,7 @@ namespace llaminar2
                 params_.causal &&
                 !rocm_env.fa_decode_via_prefill &&
                 logical_seq_len > 1 &&
-                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+                logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
                 kv_len > logical_seq_len;
             return small_native_decode ? logical_seq_len : 1;
         }
@@ -382,7 +381,7 @@ namespace llaminar2
             params_.batch_size == 1 &&
             params_.causal &&
             logical_seq_len > 1 &&
-            logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             kv_len > logical_seq_len;
         return cuda_small_fp16_decode ? logical_seq_len : 1;
     }
@@ -430,8 +429,8 @@ namespace llaminar2
             return;
         }
 
-        // Propagate current stage stream to the kernel so device-side dynamic
-        // params are uploaded on the same explicit stream used for capture/replay.
+        // Propagate the current stage stream so every device-side parameter
+        // writer is ordered with the attention graph that consumes it.
         cached_kernel_->setGPUStream(gpuStream());
 
         const int kv_len = dynamic_post_append_kv_len_;
@@ -532,15 +531,18 @@ namespace llaminar2
          */
         const bool multirow_verifier_decode =
             params_.seq_len > 1 &&
-            params_.seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            params_.seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             params_.seq_len < effective_kv_len;
         if (!multirow_verifier_decode && params_.device_id.is_cuda())
         {
             return 0;
         }
 
-        const int decode_rows = std::min(params_.seq_len, kMTPVerifierSmallDecodeMaxRows);
-        if (decode_rows <= 0 || params_.seq_len > kMTPVerifierSmallDecodeMaxRows)
+        const int decode_rows = std::min(
+            params_.seq_len,
+            attention::kMaxGroupedVerifierAttentionRows);
+        if (decode_rows <= 0 ||
+            params_.seq_len > attention::kMaxGroupedVerifierAttentionRows)
         {
             return 0;
         }
@@ -661,22 +663,37 @@ namespace llaminar2
             return WorkspaceRequirements{};
         }
 
-        // The generic workspace allocator only has model-level sizing hints.
-        // Qwen3.5 MoE uses local/tensor-parallel attention dimensions that can
-        // differ from those hints.  Size attention scratch from the stage's
-        // actual runtime shape so split-decode partial buffers cannot be
-        // undersized and overlap PARTIAL_M/PARTIAL_L.
-        const int workspace_batch = std::max({1, m, params_.batch_size});
+        /*
+         * The generic workspace allocator visits the ordinary one-row decode
+         * graph.  That same graph is later replayed for an MTP verifier group,
+         * however, and split attention indexes its partial-output/M/L buffers
+         * by every query row.  Reserve the complete production verifier span
+         * even when the allocator's model-level M hint is one.  Stage-local
+         * head dimensions remain authoritative because TP/MoE graph hints can
+         * describe a smaller shard than the concrete attention stage.
+         */
+        const int workspace_sequence_count = std::max({1, m, params_.batch_size});
+        const int workspace_partial_rows = std::max(
+            workspace_sequence_count,
+            attention::kMaxGroupedVerifierAttentionRows);
         const int workspace_heads = std::max(n, params_.n_heads);
         const int workspace_head_dim = std::max(k, params_.head_dim);
 
         auto reqs = consumer->getWorkspaceRequirements(
-            workspace_batch,
+            workspace_partial_rows,
             workspace_heads,
             workspace_head_dim);
 
+        /*
+         * Mixed-precision KV conversion has a different index space from the
+         * split-attention partials: it stores one cache per independent request,
+         * not one cache per verifier query row.  Restore these two descriptors
+         * to the real request count after asking the backend for conservatively
+         * grouped partial buffers.  This preserves correctness without paying
+         * four complete 4096-token KV conversion buffers for one request.
+         */
         const int workspace_kv_heads = std::max(1, params_.n_kv_heads);
-        const size_t kv_convert_bytes = static_cast<size_t>(workspace_batch) *
+        const size_t kv_convert_bytes = static_cast<size_t>(workspace_sequence_count) *
                                         4096ULL *
                                         static_cast<size_t>(workspace_kv_heads) *
                                         static_cast<size_t>(workspace_head_dim) *
@@ -1085,6 +1102,24 @@ namespace llaminar2
         }
         bindStageStream(kernel);
 
+        /*
+         * Independent GPU requests use separate KV banks and separate live
+         * device counts.  They must never enter the ordinary batch path, whose
+         * single AttentionDeviceParams row describes only equal-length batches.
+         * The explicit request contract below supports compact per-request rows
+         * up to the same four-row bound used by grouped MTP verification.
+         */
+        const bool gpu_grouped_request_decode =
+            gpu_stage &&
+            params_.kv_cache &&
+            params_.layer_idx >= 0 &&
+            params_.batch_size > 1 &&
+            logical_seq_len > 0 &&
+            params_.batch_size * logical_seq_len <=
+                attention::kMaxGroupedVerifierAttentionRows &&
+            effective_kv_len > logical_seq_len &&
+            params_.causal;
+
         if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)
         {
             const int *device_cached_tokens =
@@ -1094,17 +1129,20 @@ namespace llaminar2
                 effective_kv_len > logical_seq_len;
             if (device_cached_tokens && needs_device_sequence_params)
             {
-                const int query_rows_for_params =
-                    dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
-                if (!kernel->prepareDynamicAttnParamsFromDeviceSequenceState(
-                        device_cached_tokens,
-                        logical_seq_len,
-                        query_rows_for_params,
-                        gpuStream()))
+                if (!gpu_grouped_request_decode)
                 {
-                    LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
-                              << params_.layer_idx << " on " << params_.device_id.toString());
-                    return false;
+                    const int query_rows_for_params =
+                        dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
+                    if (!kernel->prepareDynamicAttnParamsFromDeviceSequenceState(
+                            device_cached_tokens,
+                            logical_seq_len,
+                            query_rows_for_params,
+                            gpuStream()))
+                    {
+                        LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
+                                  << params_.layer_idx << " on " << params_.device_id.toString());
+                        return false;
+                    }
                 }
             }
             else
@@ -1120,7 +1158,8 @@ namespace llaminar2
                  *
                  * During capture, updateDynamicParams() has already prepared
                  * this identical row before beginCapture(), so this call only
-                 * validates the existing device buffer and records no H2D copy.
+                 * validates the existing device buffer and records no duplicate
+                 * parameter writer.
                  */
                 const int query_rows_for_params =
                     dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
@@ -1154,7 +1193,8 @@ namespace llaminar2
         }
 
         // Dispatch to kernel's compute method. Decode kernels get the logical
-        // query start through setDynamicAttnParams()/kv_len-seq_len fallback.
+        // query start through setDynamicAttnParams() or canonical kv_len-seq_len
+        // geometry.
         const bool kernel_causal = params_.causal;
 
         // Device-agnostic unified path using compute_tensor()
@@ -1374,8 +1414,19 @@ namespace llaminar2
         if (debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
-            const size_t k_rows = static_cast<size_t>(effective_kv_len);
-            const size_t v_rows = static_cast<size_t>(effective_kv_len);
+            /*
+             * GPU request gathers are request-major fixed-stride tensors.  A
+             * diagnostic snapshot must retain every request bank; recording
+             * only `effective_kv_len` rows silently captured request zero and
+             * made unequal-length batch failures impossible to localize.
+             */
+            const size_t effective_request_count =
+                gpu_stage ? static_cast<size_t>(std::max(1, params_.batch_size))
+                          : size_t{1};
+            const size_t k_rows =
+                effective_request_count * static_cast<size_t>(effective_kv_len);
+            const size_t v_rows =
+                effective_request_count * static_cast<size_t>(effective_kv_len);
             // CPU get_kv_converted() shadows are flat [max_seq_len * kv_dim]
             // tensors, while ROCm cache views are [kv_len, kv_dim]. Compare
             // the logical attention layout consumed by the kernel.
@@ -1400,7 +1451,7 @@ namespace llaminar2
             params_.batch_size == 1 &&
             params_.causal &&
             params_.seq_len > 1 &&
-            params_.seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            params_.seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             effective_kv_len > params_.seq_len;
         bool success = false;
         if (cpu_grouped_request_cache)
@@ -1431,6 +1482,53 @@ namespace llaminar2
                 LOG_ERROR("[AttentionComputeStage] Backend lacks grouped request-cache decode attention"
                           << " layer=" << params_.layer_idx
                           << " requests=" << params_.batch_size
+                          << " device=" << params_.device_id.to_string());
+            }
+        }
+        else if (gpu_grouped_request_decode)
+        {
+            const int *device_request_counts =
+                params_.kv_cache->deviceCachedTokenCountPtr(
+                    params_.layer_idx,
+                    /*seq_idx=*/0);
+            if (!device_request_counts)
+            {
+                LOG_ERROR("[AttentionComputeStage] Grouped GPU request attention requires canonical device KV counts"
+                          << " layer=" << params_.layer_idx
+                          << " requests=" << params_.batch_size
+                          << " device=" << params_.device_id.to_string());
+                return false;
+            }
+
+            LOG_DEBUG("[AttentionComputeStage] Using device-owned grouped GPU request-cache attention"
+                      << " layer=" << params_.layer_idx
+                      << " requests=" << params_.batch_size
+                      << " query_rows=" << logical_seq_len
+                      << " max_kv_len=" << effective_kv_len);
+            success = kernel->compute_device_request_batch_decode_equivalent(
+                params_.Q,
+                effective_K,
+                effective_V,
+                device_request_counts,
+                params_.output,
+                params_.batch_size,
+                logical_seq_len,
+                effective_kv_len,
+                params_.n_heads,
+                params_.n_kv_heads,
+                params_.head_dim,
+                kernel_causal,
+                params_.window_size,
+                params_.mpi_ctx,
+                device_idx,
+                params_.head_start,
+                params_.gqa_n_rep);
+            if (!success)
+            {
+                LOG_ERROR("[AttentionComputeStage] Backend lacks grouped device request-cache decode attention"
+                          << " layer=" << params_.layer_idx
+                          << " requests=" << params_.batch_size
+                          << " query_rows=" << logical_seq_len
                           << " device=" << params_.device_id.to_string());
             }
         }
@@ -1641,11 +1739,19 @@ namespace llaminar2
                                                 ? total_kv_tokens
                                                 : static_cast<size_t>(params_.seq_len > 0 ? params_.seq_len : 0);
             const size_t expected_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
-            const bool recording_graph_snapshot_copy = isGraphCaptureActive();
+            /*
+             * execute() resolves the exact cache-owned view consumed by the
+             * attention kernel.  Keep that pointer for both eager and captured
+             * snapshot publication.  Falling back to dump_K/dump_V after a
+             * captured replay selects sequence zero's raw cache view; labeling
+             * that storage as `request_count * max_kv_len` rows makes every
+             * later request appear zero even though the grouped kernel consumed
+             * the correctly gathered request-major tensor.
+             */
             const ITensor *effective_k_tensor =
-                (recording_graph_snapshot_copy && debug_effective_k_tensor_) ? debug_effective_k_tensor_ : dump_K;
+                debug_effective_k_tensor_ ? debug_effective_k_tensor_ : dump_K;
             const ITensor *effective_v_tensor =
-                (recording_graph_snapshot_copy && debug_effective_v_tensor_) ? debug_effective_v_tensor_ : dump_V;
+                debug_effective_v_tensor_ ? debug_effective_v_tensor_ : dump_V;
             const size_t effective_k_rows = debug_effective_k_rows_ > 0 ? debug_effective_k_rows_ : expected_kv_rows;
             const size_t effective_v_rows = debug_effective_v_rows_ > 0 ? debug_effective_v_rows_ : expected_kv_rows;
             const size_t effective_k_cols = debug_effective_k_cols_ > 0 ? debug_effective_k_cols_ : expected_kv_cols;

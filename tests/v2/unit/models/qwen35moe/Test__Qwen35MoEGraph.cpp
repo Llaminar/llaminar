@@ -134,40 +134,40 @@ namespace
         domain.scope = scope;
         domain.backend = backend;
         domain.participants = std::move(participants);
-        domain.compute_kind = ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         domain.owner_rank = 0;
         domain.ranks = {0};
         return domain;
     }
 
-    ExpertComputeDomain expertDomain(
+    RoutedExpertDomain expertDomain(
         std::string name,
-        ExpertDomainKind kind,
+        ExecutionDomainScope kind,
         CollectiveBackendType backend,
-        ExpertDomainComputeKind compute_kind,
+        RoutedExpertComputePolicy routed_compute_policy,
         std::vector<GlobalDeviceAddress> participants,
         std::vector<int> ranks)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = std::move(name);
-        domain.kind = kind;
+        domain.scope = kind;
         domain.backend = backend;
-        domain.compute_kind = compute_kind;
+        domain.routed_compute_policy = routed_compute_policy;
         domain.participants = std::move(participants);
         domain.world_ranks = std::move(ranks);
         domain.owner_rank = 0;
         return domain;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeOverlayPlan(const std::string &routed_domain)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeOverlayPlan(const std::string &routed_domain)
     {
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = "continuation";
         plan->base_model_domain = "base";
         plan->shared_expert_domain = "shared";
-        plan->residency_policy = ExpertResidencyPolicy::RoutedTierRebalanced;
+        plan->residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
         plan->continuation_domain_spec.domain = "continuation";
         plan->continuation_domain_spec.logical_root_participant = 0;
         plan->continuation_domain_spec.dense_tp_enabled = false;
@@ -192,13 +192,13 @@ namespace
 
         plan->domains.push_back(expertDomain(
             routed_domain,
-            ExpertDomainKind::NodeLocalTP,
+            ExecutionDomainScope::NODE_LOCAL,
             CollectiveBackendType::HOST,
-            ExpertDomainComputeKind::ApportionedExperts,
+            RoutedExpertComputePolicy::Apportioned,
             {GlobalDeviceAddress::cpu(0, "node0"), GlobalDeviceAddress::cpu(1, "node0")},
             {0, 1}));
 
-        plan->routed_tiers.push_back(ExpertRoutedTier{
+        plan->routed_tiers.push_back(RoutedExpertTier{
             .name = "cold",
             .domain = routed_domain,
             .priority = 10,
@@ -206,22 +206,22 @@ namespace
             .memory_budget_bytes = 4096,
             .fallback = true,
         });
-        plan->placements.push_back(ExpertLayerPlacement{
+        plan->placements.push_back(RoutedExpertLayerPlacement{
             .layer = 0,
             .routed_expert_tier = {0, 0},
         });
         return plan;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeLocalTPApportionedOverlayPlan(const std::string &domain_name)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeLocalTPApportionedOverlayPlan(const std::string &domain_name)
     {
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = domain_name;
         plan->base_model_domain = domain_name;
         plan->shared_expert_domain = domain_name;
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->continuation_domain_spec.domain = domain_name;
         plan->continuation_domain_spec.logical_root_participant = 0;
         plan->continuation_domain_spec.dense_tp_enabled = false;
@@ -230,13 +230,13 @@ namespace
 
         plan->domains.push_back(expertDomain(
             domain_name,
-            ExpertDomainKind::LocalTP,
+            ExecutionDomainScope::LOCAL,
             CollectiveBackendType::HOST,
-            ExpertDomainComputeKind::ApportionedExperts,
+            RoutedExpertComputePolicy::Apportioned,
             {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
             {}));
 
-        plan->routed_tiers.push_back(ExpertRoutedTier{
+        plan->routed_tiers.push_back(RoutedExpertTier{
             .name = "hot",
             .domain = domain_name,
             .priority = 0,
@@ -244,7 +244,7 @@ namespace
             .memory_budget_bytes = 4096,
             .fallback = true,
         });
-        plan->placements.push_back(ExpertLayerPlacement{
+        plan->placements.push_back(RoutedExpertLayerPlacement{
             .layer = 0,
             .routed_expert_tier = {0, 0},
         });
@@ -725,7 +725,7 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     tp_ctx->setBackend(CollectiveBackendType::HOST);
 
     GraphConfig config = makeMoEConfig(tp_ctx.get());
-    config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+    config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     config.moe.local_expert_count = -1;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
@@ -779,7 +779,7 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
     tp_ctx->setBackend(CollectiveBackendType::HOST);
 
     GraphConfig config = makeMoEConfig(tp_ctx.get());
-    config.moe.expert_mode = MoEExpertMode::ApportionedExperts;
+    config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     config.moe.local_expert_start = 0;
     config.moe.local_expert_count = 1;
     Qwen35MoEGraph graph_builder(config, nullptr);
@@ -792,7 +792,7 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
     ASSERT_NE(graph.getNode("layer0_moe_expert_allreduce"), nullptr)
-        << "Expert-parallel MoE owns only a local expert range, so routed output is partial until allreduce";
+        << "Expert-ID-apportioned MoE owns only a local expert range, so routed output is partial until allreduce";
     ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
 
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_expert_allreduce", "layer0_moe_expert_ffn"));
@@ -806,9 +806,9 @@ TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayCombinesMoEBranchesBeforeAll
     tp_ctx->setBackend(CollectiveBackendType::HOST);
 
     GraphConfig config = makeMoEConfig(tp_ctx.get());
-    config.moe.expert_parallel_plan = makeLocalTPApportionedOverlayPlan("hot_localtp");
+    config.moe.routed_expert_plan = makeLocalTPApportionedOverlayPlan("hot_localtp");
     config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-        config.moe.expert_parallel_plan,
+        config.moe.routed_expert_plan,
         MoEExpertOverlayRuntimeResolverOptions{
             .current_world_rank = 0,
             .validate_mvp_root_reachability = false,
@@ -882,9 +882,9 @@ TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
     {
         GraphConfig moe_config = makeMoEConfig(tp_ctx.get());
         moe_config.dense_tp_enabled = false;
-        moe_config.moe.expert_parallel_plan = makeLocalTPApportionedOverlayPlan("hot_localtp");
+        moe_config.moe.routed_expert_plan = makeLocalTPApportionedOverlayPlan("hot_localtp");
         moe_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-            moe_config.moe.expert_parallel_plan,
+            moe_config.moe.routed_expert_plan,
             MoEExpertOverlayRuntimeResolverOptions{
                 .current_world_rank = 0,
                 .validate_mvp_root_reachability = false,
@@ -1934,9 +1934,9 @@ TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)
     Qwen35MoESchemaFactory factory;
     WeightShardingConfig sharding = factory.getWeightShardingConfig();
 
-    EXPECT_EQ(sharding.getMode("blk.0.ffn_gate_exps.weight"), WeightShardingMode::ExpertParallel);
-    EXPECT_EQ(sharding.getMode("blk.0.ffn_up_exps.weight"), WeightShardingMode::ExpertParallel);
-    EXPECT_EQ(sharding.getMode("blk.0.ffn_down_exps.weight"), WeightShardingMode::ExpertParallel);
+    EXPECT_EQ(sharding.getMode("blk.0.ffn_gate_exps.weight"), WeightShardingMode::ExpertIdApportioned);
+    EXPECT_EQ(sharding.getMode("blk.0.ffn_up_exps.weight"), WeightShardingMode::ExpertIdApportioned);
+    EXPECT_EQ(sharding.getMode("blk.0.ffn_down_exps.weight"), WeightShardingMode::ExpertIdApportioned);
 }
 
 TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresPostCollectiveMoEKeys)
@@ -2245,9 +2245,9 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedAtt
 TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopology)
 {
     GraphConfig config = makeMoEConfig();
-    config.moe.expert_parallel_plan = makeOverlayPlan("cold_cpu");
+    config.moe.routed_expert_plan = makeOverlayPlan("cold_cpu");
     config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-        config.moe.expert_parallel_plan,
+        config.moe.routed_expert_plan,
         MoEExpertOverlayRuntimeResolverOptions{
             .current_world_rank = 0,
             .validate_mvp_root_reachability = false,
@@ -2271,9 +2271,9 @@ TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopolog
     const uint64_t original_hash = hashPrefixFingerprintFields("moe", material.moe);
 
     GraphConfig changed_config = makeMoEConfig();
-    changed_config.moe.expert_parallel_plan = makeOverlayPlan("warm_rocm");
+    changed_config.moe.routed_expert_plan = makeOverlayPlan("warm_rocm");
     changed_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-        changed_config.moe.expert_parallel_plan,
+        changed_config.moe.routed_expert_plan,
         MoEExpertOverlayRuntimeResolverOptions{
             .current_world_rank = 0,
             .validate_mvp_root_reachability = false,

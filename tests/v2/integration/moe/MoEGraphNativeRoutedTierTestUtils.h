@@ -152,7 +152,7 @@ namespace llaminar2::test::moe_graph_native_routed_tier
                                                  TensorBase *hidden,
                                                  TensorBase *routing_indices,
                                                  TensorBase *routing_weights,
-                                                 const MoEExpertParallelPlan &plan)
+                                                 const MoERoutedExpertPlacementPlan &plan)
     {
         MoEExpertDispatchOutput dispatch;
         MoEExpertDispatchStage::Params params;

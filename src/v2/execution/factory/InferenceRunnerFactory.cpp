@@ -38,7 +38,7 @@
 #include "../../execution/moe/DecodeExpertHistogram.h"
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
-#include "../../execution/moe/MoEExpertParallelPlanner.h"
+#include "../../execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "../../execution/mtp/MTPWeightManifest.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../loaders/WeightLoadProgress.h"
@@ -127,12 +127,12 @@ namespace llaminar2
             }
         }
 
-        MoEExpertModelMetadata moEExpertMetadataForModel(IModelContext &model_ctx)
+        MoERoutedExpertModelMetadata moEExpertMetadataForModel(IModelContext &model_ctx)
         {
             auto loader = model_ctx.loader();
             const std::string &arch = model_ctx.architecture();
 
-            MoEExpertModelMetadata metadata;
+            MoERoutedExpertModelMetadata metadata;
             metadata.num_layers = std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
             metadata.num_experts = loader ? loader->getInt(arch + ".expert_count", 0) : 0;
             metadata.d_model = model_ctx.embeddingLength();
@@ -322,7 +322,7 @@ namespace llaminar2
             return participants;
         }
 
-        std::vector<std::string> denseMoEDomainNames(const MoEExpertParallelPlan &plan)
+        std::vector<std::string> denseMoEDomainNames(const MoERoutedExpertPlacementPlan &plan)
         {
             std::vector<std::string> names;
             std::unordered_set<std::string> seen;
@@ -341,7 +341,7 @@ namespace llaminar2
         }
 
         const ExecutionDomainDefinition *findDenseMoEDomain(
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             const std::string &name)
         {
             auto it = std::find_if(plan.dense_domains.begin(), plan.dense_domains.end(),
@@ -352,8 +352,8 @@ namespace llaminar2
             return it == plan.dense_domains.end() ? nullptr : &*it;
         }
 
-        const ExpertComputeDomain *findMoEExpertDomain(
-            const MoEExpertParallelPlan &plan,
+        const RoutedExpertDomain *findMoEExpertDomain(
+            const MoERoutedExpertPlacementPlan &plan,
             const std::string &name)
         {
             auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
@@ -364,7 +364,7 @@ namespace llaminar2
             return it == plan.domains.end() ? nullptr : &*it;
         }
 
-        bool allRoutedOverlayDomainsUseApportionedExperts(const MoEExpertParallelPlan &plan)
+        bool allRoutedOverlayDomainsUseExpertIdApportionment(const MoERoutedExpertPlacementPlan &plan)
         {
             if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
                 return false;
@@ -372,14 +372,14 @@ namespace llaminar2
             for (const auto &tier : plan.routed_tiers)
             {
                 const auto *domain = findMoEExpertDomain(plan, tier.domain);
-                if (!domain || domain->compute_kind != ExpertDomainComputeKind::ApportionedExperts)
+                if (!domain || domain->routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
                     return false;
             }
             return true;
         }
 
         std::optional<RoutedExpertAssignmentPolicy> routedOverlayAssignmentPolicy(
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             std::string *error)
         {
             RoutedExpertAssignmentPolicy policy = RoutedExpertAssignmentPolicy::StaticOwner;
@@ -393,19 +393,19 @@ namespace llaminar2
 
                 if (!saw_policy)
                 {
-                    policy = domain->assignment_policy;
+                    policy = domain->routed_assignment_policy;
                     saw_policy = true;
                     continue;
                 }
 
-                if (domain->assignment_policy != policy)
+                if (domain->routed_assignment_policy != policy)
                 {
                     if (error)
                     {
                         *error = "mixed routed expert assignment policies are not supported in one graph-native overlay: " +
                                  std::string(routedExpertAssignmentPolicyToString(policy)) +
                                  " and " +
-                                 routedExpertAssignmentPolicyToString(domain->assignment_policy);
+                                 routedExpertAssignmentPolicyToString(domain->routed_assignment_policy);
                     }
                     return std::nullopt;
                 }
@@ -415,8 +415,8 @@ namespace llaminar2
                               : std::optional<RoutedExpertAssignmentPolicy>(RoutedExpertAssignmentPolicy::StaticOwner);
         }
 
-        bool routedOverlayDomainsSupportLeastLoadedEP(
-            const MoEExpertParallelPlan &plan,
+        bool routedOverlayDomainsSupportLeastLoadedResidentAssignment(
+            const MoERoutedExpertPlacementPlan &plan,
             std::string *error)
         {
             if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
@@ -435,12 +435,12 @@ namespace llaminar2
                         *error = "routed tier '" + tier.name + "' references missing domain '" + tier.domain + "'";
                     return false;
                 }
-                if (!domain->supportsLeastLoadedEP())
+                if (!domain->supportsLeastLoadedResidentAssignment())
                 {
                     if (error)
                     {
                         *error = "domain '" + domain->name +
-                                 "' must be a multi-participant LocalTP/NodeLocalTP ApportionedExperts domain for LLEP";
+                                 "' must be a multi-participant LocalTP/NodeLocalTP expert-ID-apportioned domain for LLEP";
                     }
                     return false;
                 }
@@ -449,7 +449,7 @@ namespace llaminar2
             return true;
         }
 
-        void promoteRoutedOverlayDomainsToLeastLoadedEP(MoEExpertParallelPlan &plan)
+        void setRoutedOverlayLeastLoadedResidentAssignment(MoERoutedExpertPlacementPlan &plan)
         {
             for (const auto &tier : plan.routed_tiers)
             {
@@ -461,11 +461,12 @@ namespace llaminar2
                         return domain.name == tier.domain;
                     });
                 if (it != plan.domains.end())
-                    it->assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+                    it->routed_assignment_policy =
+                        RoutedExpertAssignmentPolicy::LeastLoadedResident;
             }
         }
 
-        bool overlayPlanDisablesDenseTP(const MoEExpertParallelPlan &plan)
+        bool overlayPlanDisablesDenseTP(const MoERoutedExpertPlacementPlan &plan)
         {
             return plan.isTieredOverlay() &&
                    !plan.continuation_domain_spec.dense_tp_enabled;
@@ -528,7 +529,7 @@ namespace llaminar2
             const std::string &log_prefix,
             const InferenceRunnerConfig *runner_config)
         {
-            const auto &plan = graph_config.moe.expert_parallel_plan;
+            const auto &plan = graph_config.moe.routed_expert_plan;
             if (!plan || !plan->isTieredOverlay())
                 return true;
 
@@ -582,7 +583,7 @@ namespace llaminar2
             DomainTPContextMap &owned_domain_tp_contexts,
             const std::string &log_prefix)
         {
-            auto plan = resolveMoEExpertParallelPlanForModel(model_ctx, config);
+            auto plan = resolveMoERoutedExpertPlacementPlanForModel(model_ctx, config);
             if (!plan)
             {
                 if (graph_config.moe.enabled() &&
@@ -597,16 +598,16 @@ namespace llaminar2
             if (graph_config.moe.rebalance_config.mode == MoERebalanceRuntimeMode::LLEP)
             {
                 std::string llep_error;
-                if (!routedOverlayDomainsSupportLeastLoadedEP(*plan, &llep_error))
+                if (!routedOverlayDomainsSupportLeastLoadedResidentAssignment(*plan, &llep_error))
                 {
                     LOG_ERROR(log_prefix << " invalid LLEP overlay: " << llep_error);
                     return false;
                 }
-                plan = std::make_shared<MoEExpertParallelPlan>(*plan);
-                promoteRoutedOverlayDomainsToLeastLoadedEP(*plan);
+                plan = std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
+                setRoutedOverlayLeastLoadedResidentAssignment(*plan);
             }
 
-            graph_config.moe.expert_parallel_plan = plan;
+            graph_config.moe.routed_expert_plan = plan;
             graph_config.moe.overlay_mpi_ctx = config.moe_expert_overlay_mpi_ctx
                                                    ? config.moe_expert_overlay_mpi_ctx
                                                    : runner_mpi_ctx;
@@ -627,21 +628,21 @@ namespace llaminar2
                 return false;
             }
 
-            graph_config.moe.routed_expert_assignment_policy = *assignment_policy;
-            graph_config.refreshMoEParallelPolicies();
+            graph_config.moe.routed_assignment_policy = *assignment_policy;
+            graph_config.refreshMoEExecutionPolicy();
 
             if (plan->isTieredOverlay())
             {
-                if (allRoutedOverlayDomainsUseApportionedExperts(*plan))
+                if (allRoutedOverlayDomainsUseExpertIdApportionment(*plan))
                 {
-                    graph_config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
-                    graph_config.refreshMoEParallelPolicies();
-                    graph_config.moe.routed_expert_parallel_policy =
-                        RoutedExpertParallelPolicy::ApportionedExperts;
-                    graph_config.moe.parallel_policy = deriveMoEParallelPolicy(
+                    graph_config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+                    graph_config.refreshMoEExecutionPolicy();
+                    graph_config.moe.routed_compute_policy =
+                        RoutedExpertComputePolicy::Apportioned;
+                    graph_config.moe.execution_policy = makeMoEExecutionPolicy(
                         graph_config.dense_parallel_policy,
-                        graph_config.moe.routed_expert_parallel_policy,
-                        graph_config.moe.routed_expert_assignment_policy);
+                        graph_config.moe.routed_compute_policy,
+                        graph_config.moe.routed_assignment_policy);
                 }
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
@@ -666,7 +667,7 @@ namespace llaminar2
             const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
             const std::string &log_prefix)
         {
-            auto plan = graph_config.moe.expert_parallel_plan;
+            auto plan = graph_config.moe.routed_expert_plan;
             if (!plan || !plan->isTieredOverlay())
                 return nullptr;
 
@@ -996,20 +997,20 @@ namespace llaminar2
         return controller;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
+    std::shared_ptr<MoERoutedExpertPlacementPlan> resolveMoERoutedExpertPlacementPlanForModel(
         IModelContext &model_ctx,
         const InferenceRunnerConfig &config)
     {
-        auto plan = config.moe_expert_parallel_plan;
+        auto plan = config.moe_routed_expert_plan;
         if (!plan)
             return nullptr;
         if (!plan->enabled || !plan->isTieredOverlay() || !plan->placements.empty())
             return plan;
 
-        auto planner_result = MoEExpertParallelPlanner::plan(
+        auto planner_result = MoERoutedExpertPlacementPlanner::plan(
             *plan,
             moEExpertMetadataForModel(model_ctx));
-        return std::make_shared<MoEExpertParallelPlan>(std::move(planner_result.planned_plan));
+        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planner_result.planned_plan));
     }
 
     static PreparedWeightKind expectedGemmPreparedKind(DeviceId device)
@@ -1051,9 +1052,9 @@ namespace llaminar2
         bool include_tp_config)
     {
         const WeightShardingMode expert_mode =
-            graph_config.moe.expert_mode == MoEExpertMode::ReplicatedExperts
+            graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::Replicated
                 ? WeightShardingMode::Replicate
-                : WeightShardingMode::ExpertParallel;
+                : WeightShardingMode::ExpertIdApportioned;
 
         WeightManagerConfig wm_config;
         wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
@@ -1066,7 +1067,7 @@ namespace llaminar2
                     pattern.pattern == "ffn_down_exps.weight")
                 {
                     pattern.mode = expert_mode;
-                    pattern.description = graph_config.moe.expert_mode == MoEExpertMode::ReplicatedExperts
+                    pattern.description = graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::Replicated
                                               ? "MoE routed expert weights - replicated"
                                               : "MoE routed expert weights - expert-id parallel";
                 }
@@ -1632,13 +1633,13 @@ namespace llaminar2
         if (!graph_config.moe.enabled())
             return true;
 
-        if (graph_config.moe.expert_mode == MoEExpertMode::ShardedExperts)
+        if (graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)
         {
-            LOG_ERROR("[InferenceRunner] Not Implemented: MoE sharded-experts mode is not implemented for the standard Qwen3.5 MoE path.");
+            LOG_ERROR("[InferenceRunner] Not Implemented: MoE tensor-sharded mode is not implemented for the standard Qwen3.5 MoE path.");
             return false;
         }
 
-        if (graph_config.moe.expert_mode != MoEExpertMode::ApportionedExperts)
+        if (graph_config.moe.routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
             return true;
 
         int participants = 1;
@@ -1681,7 +1682,7 @@ namespace llaminar2
         graph_config.moe.local_expert_count = count;
 
         LOG_DEBUG("[InferenceRunner] MoE expert mode="
-                  << moeExpertModeToString(graph_config.moe.expert_mode)
+                  << routedExpertComputePolicyToString(graph_config.moe.routed_compute_policy)
                   << " participant=" << participant_index << "/" << participants
                   << " expert_range=[" << start << ", " << (start + count) << ")"
                   << " count=" << count << "/" << graph_config.moe.num_experts);
@@ -2128,7 +2129,7 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
-        graph_config.moe.expert_mode = config.moe_expert_mode;
+        graph_config.moe.routed_compute_policy = config.routed_expert_compute_policy;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
         DomainTPContextMap owned_domain_tp_contexts;
@@ -2142,12 +2143,12 @@ namespace llaminar2
         {
             return nullptr;
         }
-        graph_config.refreshMoEParallelPolicies();
+        graph_config.refreshMoEExecutionPolicy();
         LOG_DEBUG("[InferenceRunner] MoE semantic policy="
-                  << moeParallelPolicyToString(graph_config.moe.parallel_policy)
+                  << describeMoEExecutionPolicy(graph_config.moe.execution_policy)
                   << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
-                  << " routed=" << routedExpertParallelPolicyToString(graph_config.moe.routed_expert_parallel_policy)
-                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_expert_assignment_policy)
+                  << " routed=" << routedExpertComputePolicyToString(graph_config.moe.routed_compute_policy)
+                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_assignment_policy)
                   << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try
@@ -2979,15 +2980,15 @@ namespace llaminar2
         }
 
         const bool has_tiered_overlay_plan =
-            graph_config.moe.expert_parallel_plan &&
-            graph_config.moe.expert_parallel_plan->isTieredOverlay();
+            graph_config.moe.routed_expert_plan &&
+            graph_config.moe.routed_expert_plan->isTieredOverlay();
         auto overlay_runtime_plan_for_weight_prep = graph_config.moe.expert_overlay_runtime_plan;
         const MoEExpertOverlayExecutionPlan *overlay_execution_plan_for_weight_prep =
             graph_config.moe.expert_overlay_execution_plan.get();
         if (has_tiered_overlay_plan && !overlay_runtime_plan_for_weight_prep)
         {
             overlay_runtime_plan_for_weight_prep = resolveMoEExpertOverlayRuntimePlan(
-                graph_config.moe.expert_parallel_plan,
+                graph_config.moe.routed_expert_plan,
                 MoEExpertOverlayRuntimeResolverOptions{
                     .current_world_rank = overlayRankFor(graph_config.moe.overlay_mpi_ctx, nullptr),
                 });
@@ -3750,7 +3751,7 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
-        graph_config.moe.expert_mode = config.moe_expert_mode;
+        graph_config.moe.routed_compute_policy = config.routed_expert_compute_policy;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
         DomainTPContextMap owned_domain_tp_contexts;
@@ -3765,12 +3766,12 @@ namespace llaminar2
         {
             return nullptr;
         }
-        graph_config.refreshMoEParallelPolicies();
+        graph_config.refreshMoEExecutionPolicy();
         LOG_DEBUG("[InferenceRunner] MoE semantic policy="
-                  << moeParallelPolicyToString(graph_config.moe.parallel_policy)
+                  << describeMoEExecutionPolicy(graph_config.moe.execution_policy)
                   << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
-                  << " routed=" << routedExpertParallelPolicyToString(graph_config.moe.routed_expert_parallel_policy)
-                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_expert_assignment_policy)
+                  << " routed=" << routedExpertComputePolicyToString(graph_config.moe.routed_compute_policy)
+                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_assignment_policy)
                   << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try

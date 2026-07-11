@@ -1,6 +1,6 @@
 /**
  * @file MoEExpertDispatchStage.cpp
- * @brief Implementation of host-side MoE expert-parallel dispatch descriptor stage.
+ * @brief Implementation of the host-side routed-row dispatch descriptor stage.
  */
 
 #include "MoEExpertDispatchStage.h"
@@ -145,8 +145,8 @@ namespace
     }
 
     void dumpPlacementIfRequested(
-        const ExpertLayerPlacement &placement,
-        const std::vector<ExpertRoutedTier> &tiers)
+        const RoutedExpertLayerPlacement &placement,
+        const std::vector<RoutedExpertTier> &tiers)
     {
         if (!debugEnv().moe_expert_overlay.dump_placement)
             return;

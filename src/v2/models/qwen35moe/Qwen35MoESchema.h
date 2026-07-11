@@ -59,15 +59,15 @@ namespace llaminar2
 
             // Routed MoE expert weights default to expert-id parallelism in TP.
             // InferenceRunnerFactory can override this to Replicate for explicit
-            // --moe-expert-mode replicated compatibility/debug runs.
+            // --moe-routed-expert-compute replicated compatibility/debug runs.
             config.patterns.push_back(
-                {"ffn_gate_exps.weight", WeightShardingMode::ExpertParallel, WeightDimensionType::FFNHidden,
+                {"ffn_gate_exps.weight", WeightShardingMode::ExpertIdApportioned, WeightDimensionType::FFNHidden,
                  "MoE expert gate weights - expert-id parallel"});
             config.patterns.push_back(
-                {"ffn_up_exps.weight", WeightShardingMode::ExpertParallel, WeightDimensionType::FFNHidden,
+                {"ffn_up_exps.weight", WeightShardingMode::ExpertIdApportioned, WeightDimensionType::FFNHidden,
                  "MoE expert up weights - expert-id parallel"});
             config.patterns.push_back(
-                {"ffn_down_exps.weight", WeightShardingMode::ExpertParallel, WeightDimensionType::FFNHidden,
+                {"ffn_down_exps.weight", WeightShardingMode::ExpertIdApportioned, WeightDimensionType::FFNHidden,
                  "MoE expert down weights - expert-id parallel"});
             config.patterns.push_back(
                 {"ffn_gate_inp.weight", WeightShardingMode::Replicate, WeightDimensionType::FFNHidden,

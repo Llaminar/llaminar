@@ -133,10 +133,10 @@ namespace llaminar2
             WeightPrecision weight_precision = WeightPrecision::NATIVE) = 0;
 
         /**
-         * @brief Load an expert slice of a 3D MoE tensor (for expert parallelism)
+         * @brief Load an expert-ID slice of a 3D MoE tensor.
          *
          * Only reads/returns experts [expert_start, expert_end) from a 3D tensor
-         * with shape [ne0, ne1, num_experts]. Used for MoE expert parallelism
+         * with shape [ne0, ne1, num_experts]. Used for expert-ID apportionment
          * where each rank loads only its assigned expert subset.
          *
          * @param name Tensor name (must be 3D: [cols, rows_per_expert, num_experts])

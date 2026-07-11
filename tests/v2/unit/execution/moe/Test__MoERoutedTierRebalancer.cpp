@@ -1,6 +1,6 @@
 /**
  * @file Test__MoERoutedTierRebalancer.cpp
- * @brief Phase 13 unit tests for MoEExpertParallelPlanner RoutedTierRebalanced policy.
+ * @brief Phase 13 unit tests for MoERoutedExpertPlacementPlanner RoutedTierRebalanced policy.
  *
  * Tests:
  *  - AllGPU: all-GPU cuda_hot/rocm_warm plan with histogram; no CPU fallback.
@@ -10,7 +10,7 @@
 
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include <gtest/gtest.h>
 
@@ -33,50 +33,50 @@ namespace llaminar2::test
         // Domain helpers
         // -------------------------------------------------------------------------
 
-        ExpertComputeDomain cudaDomain(const std::string &name)
+        RoutedExpertDomain cudaDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain rocmDomain(const std::string &name)
+        RoutedExpertDomain rocmDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::LocalTP;
+            domain.scope = ExecutionDomainScope::LOCAL;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(0, 1)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain cpuDomain(const std::string &name)
+        RoutedExpertDomain cpuDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::MPI;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier tier(
+        RoutedExpertTier tier(
             const std::string &name,
             const std::string &domain,
             int priority,
             int max_experts_per_layer,
             bool fallback = false)
         {
-            ExpertRoutedTier result;
+            RoutedExpertTier result;
             result.name = name;
             result.domain = domain;
             result.priority = priority;
@@ -85,9 +85,9 @@ namespace llaminar2::test
             return result;
         }
 
-        MoEExpertModelMetadata metadata()
+        MoERoutedExpertModelMetadata metadata()
         {
-            MoEExpertModelMetadata model;
+            MoERoutedExpertModelMetadata model;
             model.num_layers = kLayers;
             model.num_experts = kExperts;
             model.d_model = kDModel;
@@ -98,14 +98,14 @@ namespace llaminar2::test
         }
 
         // All-GPU plan: cuda_hot + rocm_warm, no fallback, total capacity == kExperts.
-        MoEExpertParallelPlan allGpuPlan(int cuda_capacity = 4, int rocm_capacity = 4)
+        MoERoutedExpertPlacementPlan allGpuPlan(int cuda_capacity = 4, int rocm_capacity = 4)
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "cuda_hot";
             plan.shared_expert_domain = "cuda_hot";
-            plan.residency_policy = ExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
             plan.domains = {cudaDomain("cuda_hot"), rocmDomain("rocm_warm")};
             plan.routed_tiers = {
                 tier("cuda_hot_tier", "cuda_hot", 0, cuda_capacity),   // highest priority (0)
@@ -115,14 +115,14 @@ namespace llaminar2::test
         }
 
         // Mixed GPU+CPU plan: cuda_hot + rocm_warm + cpu_cold (fallback).
-        MoEExpertParallelPlan mixedPlan(int cuda_capacity, int rocm_capacity)
+        MoERoutedExpertPlacementPlan mixedPlan(int cuda_capacity, int rocm_capacity)
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "cuda_hot";
             plan.shared_expert_domain = "cuda_hot";
-            plan.residency_policy = ExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
             plan.domains = {cudaDomain("cuda_hot"), rocmDomain("rocm_warm"), cpuDomain("cpu_cold")};
             plan.routed_tiers = {
                 tier("cuda_hot_tier", "cuda_hot", 0, cuda_capacity),
@@ -199,18 +199,18 @@ namespace llaminar2::test
         std::vector<std::vector<uint64_t>> counts(kLayers, std::vector<uint64_t>(kExperts, 0));
         for (int e = 0; e < kExperts; ++e)
         {
-            counts[0][static_cast<size_t>(e)] = static_cast<uint64_t>(kExperts - e); // 8,7,6,5,4,3,2,1
-            counts[1][static_cast<size_t>(e)] = static_cast<uint64_t>(e + 1);        // 1,2,3,4,5,6,7,8
+            counts[0][static_cast<size_t>(e)] = static_cast<uint64_t>(e + 1);        // 1,2,3,4,5,6,7,8
+            counts[1][static_cast<size_t>(e)] = static_cast<uint64_t>(kExperts - e); // 8,7,6,5,4,3,2,1
         }
         auto hist = makeHistogram(counts);
 
-        MoEExpertParallelPlannerOptions opts;
+        MoERoutedExpertPlacementPlannerOptions opts;
         opts.decode_histogram = hist.get();
 
-        const auto result = MoEExpertParallelPlanner::plan(allGpuPlan(), metadata(), opts);
+        const auto result = MoERoutedExpertPlacementPlanner::plan(allGpuPlan(), metadata(), opts);
 
         // Plan must be valid.
-        EXPECT_TRUE(validateMoEExpertParallelPlan(
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
                         result.planned_plan,
                         {.layer_count = kLayers, .routed_expert_count = kExperts})
                         .ok());
@@ -278,7 +278,7 @@ namespace llaminar2::test
         // cuda=2 + rocm=2 = 4 < kExperts=8 with no fallback: must throw.
         const auto plan = allGpuPlan(2, 2);
         EXPECT_THROW(
-            (void)MoEExpertParallelPlanner::plan(plan, metadata()),
+            (void)MoERoutedExpertPlacementPlanner::plan(plan, metadata()),
             std::invalid_argument);
 
         // With fallback tier it should succeed.
@@ -287,7 +287,7 @@ namespace llaminar2::test
         plan_with_fallback.routed_tiers.push_back(
             tier("cpu_cold_tier", "cpu_cold", 3, 0, true));
         EXPECT_NO_THROW(
-            (void)MoEExpertParallelPlanner::plan(plan_with_fallback, metadata()));
+            (void)MoERoutedExpertPlacementPlanner::plan(plan_with_fallback, metadata()));
     }
 
     // =============================================================================
@@ -303,13 +303,13 @@ namespace llaminar2::test
 
         auto hist = makeHistogram(counts);
 
-        MoEExpertParallelPlannerOptions opts;
+        MoERoutedExpertPlacementPlannerOptions opts;
         opts.decode_histogram = hist.get();
 
         // cuda=2 + rocm=2 = 4 GPU slots; remaining 4 go to CPU fallback.
-        const auto result = MoEExpertParallelPlanner::plan(mixedPlan(2, 2), metadata(), opts);
+        const auto result = MoERoutedExpertPlacementPlanner::plan(mixedPlan(2, 2), metadata(), opts);
 
-        EXPECT_TRUE(validateMoEExpertParallelPlan(
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
                         result.planned_plan,
                         {.layer_count = kLayers, .routed_expert_count = kExperts})
                         .ok());
@@ -359,12 +359,12 @@ namespace llaminar2::test
         // Uniform histogram (all experts equally hot) — capacity is the only factor.
         std::vector<std::vector<uint64_t>> counts(kLayers, std::vector<uint64_t>(kExperts, 10));
         auto hist = makeHistogram(counts);
-        MoEExpertParallelPlannerOptions opts;
+        MoERoutedExpertPlacementPlannerOptions opts;
         opts.decode_histogram = hist.get();
 
         auto countCPUFallback = [&](int cuda_cap, int rocm_cap) -> int
         {
-            const auto r = MoEExpertParallelPlanner::plan(mixedPlan(cuda_cap, rocm_cap), metadata(), opts);
+            const auto r = MoERoutedExpertPlacementPlanner::plan(mixedPlan(cuda_cap, rocm_cap), metadata(), opts);
             const auto owner_map = MoEExpertOwnerMap::build(r.planned_plan);
             expectExactlyOneOwnerPerExpert(owner_map, kLayers, kExperts);
             return countFallbackOwners(owner_map, kLayers, kExperts, "cpu_cold");

@@ -33,8 +33,6 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         assignment_policy: str | None = None,
         allreduce_precision: str | None = None,
         allreduce_fp16_min_elements: str | None = None,
-        small_gpu_allreduce: bool = False,
-        small_gpu_allreduce_max_elements: str | None = None,
         no_require_prefill_graph: bool = False,
         n_predict_list: str | None = None,
         seeds: str | None = None,
@@ -98,20 +96,13 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
             if dense_policy is not None:
                 args.extend(["--dense-policy", dense_policy])
             if assignment_policy is not None:
-                args.extend(["--assignment-policy", assignment_policy])
+                args.extend(["--routed-assignment-policy", assignment_policy])
             if allreduce_precision is not None:
                 args.extend(["--allreduce-precision", allreduce_precision])
             if allreduce_fp16_min_elements is not None:
                 args.extend([
                     "--allreduce-fp16-min-elements",
                     allreduce_fp16_min_elements,
-                ])
-            if small_gpu_allreduce:
-                args.append("--small-gpu-allreduce")
-            if small_gpu_allreduce_max_elements is not None:
-                args.extend([
-                    "--small-gpu-allreduce-max-elements",
-                    small_gpu_allreduce_max_elements,
                 ])
             if no_require_prefill_graph:
                 args.append("--no-require-prefill-graph")
@@ -135,16 +126,16 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertNotIn("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1", result.stdout)
         self.assertNotIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
         self.assertNotIn("tp_allreduce_bom", result.stdout)
-        self.assertIn("--moe-expert-overlay", result.stdout)
+        self.assertIn("--moe-routed-expert-placement", result.stdout)
         self.assertIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
-        self.assertNotIn("assignment=least_loaded_ep", result.stdout)
+        self.assertNotIn("routed_assignment=least-loaded-resident", result.stdout)
 
     def test_twocard_dry_run_can_request_llep_assignment_policy(self) -> None:
-        result = self.run_script(assignment_policy="least_loaded_ep")
+        result = self.run_script(assignment_policy="least-loaded-resident")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("compute=apportioned_experts", result.stdout)
-        self.assertIn("assignment=least_loaded_ep", result.stdout)
+        self.assertIn("routed_compute=apportioned", result.stdout)
+        self.assertIn("routed_assignment=least-loaded-resident", result.stdout)
         self.assertIn("owner=0", result.stdout)
 
     def test_no_capture_collectives_dry_run_forces_segmented_collective_graphs(self) -> None:
@@ -410,7 +401,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "--moe-expert-overlay-dense-policy tensor-parallel",
+            "--moe-continuation-dense-policy tensor-parallel",
             result.stdout,
         )
 
@@ -418,14 +409,14 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         result = self.run_script(placement="single", dense_tp=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("--moe-expert-overlay-dense-policy", result.stdout)
+        self.assertNotIn("--moe-continuation-dense-policy", result.stdout)
 
     def test_dense_decode_replicated_dry_run_opts_two_card_overlay_into_decode_full_dense(self) -> None:
         result = self.run_script(dense_tp=True, dense_decode_replicated=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "--moe-expert-overlay-dense-policy phase-split-hybrid-tp-ae",
+            "--moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated",
             result.stdout,
         )
 
@@ -437,7 +428,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("--moe-expert-overlay-dense-policy", result.stdout)
+        self.assertNotIn("--moe-continuation-dense-policy", result.stdout)
 
     def test_dense_policy_dry_run_overrides_legacy_dense_flags_for_twocard_overlay(self) -> None:
         result = self.run_script(
@@ -448,11 +439,11 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "--moe-expert-overlay-dense-policy tensor-parallel-decode-mirrored-embedding",
+            "--moe-continuation-dense-policy tensor-parallel-decode-mirrored-embedding",
             result.stdout,
         )
         self.assertNotIn(
-            "--moe-expert-overlay-dense-policy phase-split-hybrid-tp-ae",
+            "--moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated",
             result.stdout,
         )
 
@@ -463,7 +454,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("--moe-expert-overlay-dense-policy", result.stdout)
+        self.assertNotIn("--moe-continuation-dense-policy", result.stdout)
 
     def test_allreduce_precision_dry_run_sets_collective_precision_flag(self) -> None:
         result = self.run_script(allreduce_precision="fp16")
@@ -493,43 +484,6 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--allreduce-fp16-min-elements must be a non-negative integer", result.stderr)
-
-    def test_small_gpu_allreduce_dry_run_sets_twocard_env(self) -> None:
-        result = self.run_script(
-            small_gpu_allreduce=True,
-            small_gpu_allreduce_max_elements="4096",
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE=1", result.stdout)
-        self.assertIn(
-            "LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS=4096",
-            result.stdout,
-        )
-
-    def test_small_gpu_allreduce_dry_run_does_not_affect_single_card_baseline(self) -> None:
-        result = self.run_script(
-            placement="single",
-            small_gpu_allreduce=True,
-            small_gpu_allreduce_max_elements="4096",
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE=1", result.stdout)
-        self.assertNotIn(
-            "LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS=4096",
-            result.stdout,
-        )
-
-    def test_invalid_small_gpu_allreduce_max_elements_is_rejected(self) -> None:
-        result = self.run_script(small_gpu_allreduce_max_elements="-1")
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "--small-gpu-allreduce-max-elements must be a non-negative integer",
-            result.stderr,
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

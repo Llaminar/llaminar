@@ -144,9 +144,9 @@ namespace llaminar2::test
             return stage.execute(ctx);
         }
 
-        ExpertRoutedTier routedTier(const std::string &name, const std::string &domain)
+        RoutedExpertTier routedTier(const std::string &name, const std::string &domain)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             return tier;
@@ -243,7 +243,7 @@ namespace llaminar2::test
             dp.top_k = kTopK;
             dp.d_model = kDModel;
             dp.continuation_domain = "local";
-            dp.placement = ExpertLayerPlacement{.layer = kLayer, .routed_expert_tier = {0, 0, 0, 0}};
+            dp.placement = RoutedExpertLayerPlacement{.layer = kLayer, .routed_expert_tier = {0, 0, 0, 0}};
             dp.routed_tiers = {routedTier("local", "local")};
             dp.output = &dispatch;
             MoEExpertDispatchStage ds(std::move(dp));
@@ -413,7 +413,7 @@ namespace llaminar2::test
             dp.top_k = kTopK;
             dp.d_model = kDModel;
             dp.continuation_domain = "local";
-            dp.placement = ExpertLayerPlacement{.layer = kLayer, .routed_expert_tier = {0, 1, 0, 1}};
+            dp.placement = RoutedExpertLayerPlacement{.layer = kLayer, .routed_expert_tier = {0, 1, 0, 1}};
             dp.routed_tiers = {routedTier("local", "local"), routedTier("remote", "remote")};
             dp.output = &dispatch;
             MoEExpertDispatchStage ds(std::move(dp));

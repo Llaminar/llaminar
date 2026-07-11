@@ -20,7 +20,7 @@
 #include "collective/BackendRouter.h"
 #include "collective/LocalTPContext.h"
 #include "execution/config/RuntimeConfig.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
@@ -48,7 +48,7 @@ using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    using PlanFactory = std::shared_ptr<MoEExpertParallelPlan> (*)();
+    using PlanFactory = std::shared_ptr<MoERoutedExpertPlacementPlan> (*)();
 
     const std::vector<std::string> kOverlayExcludedStages = {
         "Q_PROJECTION",
@@ -343,12 +343,12 @@ namespace
         return std::nullopt;
     }
 
-    MoEExpertModelMetadata metadataFromModel(const ModelContext &ctx)
+    MoERoutedExpertModelMetadata metadataFromModel(const ModelContext &ctx)
     {
         const auto &loader = ctx.concreteLoader();
         const std::string &arch = ctx.architecture();
 
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = mainLayerCountExcludingMTP(
             loader,
             arch,
@@ -368,7 +368,7 @@ namespace
         return metadata;
     }
 
-    std::string validationErrors(const MoEExpertParallelValidationResult &validation)
+    std::string validationErrors(const MoERoutedExpertPlacementValidationResult &validation)
     {
         std::ostringstream message;
         for (const auto &error : validation.errors)
@@ -376,7 +376,7 @@ namespace
         return message.str();
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makePlannedOverlayPlan(
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makePlannedOverlayPlan(
         const TestConfig &config,
         const ModelContext &ctx)
     {
@@ -385,12 +385,12 @@ namespace
         if (!requested)
             throw std::invalid_argument("overlay parity plan factory returned null");
 
-        auto planned = MoEExpertParallelPlanner::plan(*requested, metadata).planned_plan;
+        auto planned = MoERoutedExpertPlacementPlanner::plan(*requested, metadata).planned_plan;
 
-        MoEExpertParallelValidationOptions options;
+        MoERoutedExpertPlacementValidationOptions options;
         options.layer_count = metadata.num_layers;
         options.routed_expert_count = metadata.num_experts;
-        auto validation = validateMoEExpertParallelPlan(planned, options);
+        auto validation = validateMoERoutedExpertPlacementPlan(planned, options);
         if (!validation.ok())
         {
             throw std::invalid_argument(
@@ -398,10 +398,10 @@ namespace
                 validationErrors(validation));
         }
 
-        return std::make_shared<MoEExpertParallelPlan>(std::move(planned));
+        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
     }
 
-    DeviceId continuationRootDevice(const MoEExpertParallelPlan &plan)
+    DeviceId continuationRootDevice(const MoERoutedExpertPlacementPlan &plan)
     {
         for (const auto &domain : plan.domains)
         {
@@ -427,7 +427,7 @@ namespace
             "' was not found in overlay plan");
     }
 
-    const ExpertComputeDomain &continuationDomain(const MoEExpertParallelPlan &plan)
+    const RoutedExpertDomain &continuationDomain(const MoERoutedExpertPlacementPlan &plan)
     {
         for (const auto &domain : plan.domains)
         {
@@ -450,7 +450,7 @@ namespace
     struct CachedExpertOverlayPipeline
     {
         std::shared_ptr<ModelContext> model_ctx;
-        std::shared_ptr<MoEExpertParallelPlan> overlay_plan;
+        std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan;
         std::unique_ptr<IInferenceRunner> runner;
         std::string key;
     };
@@ -819,11 +819,11 @@ protected:
         // FA layers use FP32 allreduce, later GDN layers use FP16 transport.
         inf_config.tp_allreduce_precision_override = "schema";
         inf_config.use_mapped_memory = true;
-        inf_config.moe_expert_parallel_plan = overlay_plan_;
+        inf_config.moe_routed_expert_plan = overlay_plan_;
         inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
         inf_config.moe_rebalance = GetParam().moe_rebalance;
 
-        const ExpertComputeDomain *domain = nullptr;
+        const RoutedExpertDomain *domain = nullptr;
         try
         {
             (void)continuationRootDevice(*overlay_plan_);
@@ -835,7 +835,7 @@ protected:
             return false;
         }
 
-        if (!domain || domain->kind != ExpertDomainKind::LocalTP || domain->participants.size() < 2)
+        if (!domain || domain->scope != ExecutionDomainScope::LOCAL || domain->participants.size() < 2)
         {
             LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] continuation domain must be a multi-device LocalTP domain");
             return false;
@@ -867,7 +867,7 @@ protected:
         rank_config.kv_cache_precision = inf_config.kv_cache_precision;
         rank_config.tp_allreduce_precision_override = inf_config.tp_allreduce_precision_override;
         rank_config.use_mapped_memory = inf_config.use_mapped_memory;
-        rank_config.moe_expert_parallel_plan = overlay_plan_;
+        rank_config.moe_routed_expert_plan = overlay_plan_;
         rank_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
         rank_config.moe_rebalance = GetParam().moe_rebalance;
 
@@ -926,7 +926,7 @@ protected:
                !readDecodeTokensFromMetadata().empty();
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> overlay_plan_;
+    std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan_;
 };
 
 TEST(Qwen36MoEExpertOverlayPipelineCacheKey, IncludesResolvedPrefillShapeAndGraphBucketPolicy)

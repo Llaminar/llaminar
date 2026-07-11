@@ -13,6 +13,7 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/Logger.h"
+#include "RoutedExpertPolicy.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <cctype>
@@ -746,50 +747,12 @@ namespace llaminar2
     }
 
     /**
-     * @brief Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
+     * @brief Physical distribution of dense and shared-always-on model work.
+     *
+     * Routed-expert distribution is deliberately absent from this enum.  It is
+     * described independently by RoutedExpertComputePolicy, preventing a dense
+     * policy from silently implying apportioned or tensor-sharded experts.
      */
-    enum class MoEExpertMode
-    {
-        ApportionedExperts, ///< Split whole expert ids across participants
-        ShardedExperts,     ///< Shard every selected expert internally (not implemented yet)
-        ReplicatedExperts,  ///< Keep routed expert tensors/execution fully replicated
-    };
-
-    inline const char *moeExpertModeToString(MoEExpertMode mode)
-    {
-        switch (mode)
-        {
-        case MoEExpertMode::ApportionedExperts:
-            return "apportioned-experts";
-        case MoEExpertMode::ShardedExperts:
-            return "sharded-experts";
-        case MoEExpertMode::ReplicatedExperts:
-            return "replicated-experts";
-        default:
-            return "unknown";
-        }
-    }
-
-    inline std::optional<MoEExpertMode> parseMoEExpertMode(const std::string &value)
-    {
-        std::string lower = value;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
-        std::replace(lower.begin(), lower.end(), '_', '-');
-
-        if (lower == "apportioned-experts" ||
-            lower == "apportioned")
-            return MoEExpertMode::ApportionedExperts;
-        if (lower == "sharded-experts" ||
-            lower == "sharded")
-            return MoEExpertMode::ShardedExperts;
-        if (lower == "replicated-experts" ||
-            lower == "replicated")
-            return MoEExpertMode::ReplicatedExperts;
-        return std::nullopt;
-    }
-
     enum class DenseParallelPolicy
     {
         /// Dense/shared weights are fully present on each participant.
@@ -805,76 +768,42 @@ namespace llaminar2
 
         /// Prefill uses dense tensor parallelism. Decode uses replicated
         /// dense/shared weights to avoid small per-token dense collectives.
-        PhaseSplitHybridTP_AE
-    };
-
-    enum class RoutedExpertParallelPolicy
-    {
-        ReplicatedExperts,  ///< Every participant can execute every routed expert
-        ApportionedExperts, ///< Whole routed expert ids are divided across participants
-        ShardedExperts,     ///< Each routed expert GEMM is internally sharded across participants
-    };
-
-    enum class RoutedExpertAssignmentPolicy
-    {
-        /// Router-selected rows execute on the canonical owner/resident participant.
-        StaticOwner,
-
-        /// Preserve router top-k choices, but assign selected rows to the
-        /// least-loaded resident participant for the same expert when possible.
-        LeastLoadedEP,
+        PrefillTensorParallelDecodeReplicated
     };
 
     /**
-     * @brief Derived composite summary of dense/shared and routed-expert policy axes.
+     * @brief Explicit composite of the three independent MoE execution axes.
      *
-     * This value is intentionally derived from DenseParallelPolicy and
-     * RoutedExpertParallelPolicy. The graph still branches on the underlying
-     * axes and overlay plan fields; this enum gives logs/tests one canonical
-     * name for the combined strategy.
+     * This is a value object rather than a combinatorial enum.  Callers can
+     * inspect each policy directly, so adding a dense policy cannot accidentally
+     * invent another ambiguous composite abbreviation.
      */
-    enum class MoEParallelPolicy
+    struct MoEExecutionPolicy
     {
-        /// Dense/shared: replicated on every participant.
-        /// Routed experts: replicated on every participant.
-        ReplicatedExperts,
+        ///< Distribution of dense and shared-always-on model work.
+        DenseParallelPolicy dense = DenseParallelPolicy::Replicated;
 
-        /// Dense/shared: tensor-parallel sharded with collectives as needed.
-        /// Routed experts: sharded within each selected expert, so each
-        /// participant computes a tensor shard of every routed expert output.
-        TensorParallel,
+        ///< Physical distribution of routed-expert weights and GEMMs.
+        RoutedExpertComputePolicy routed_compute =
+            RoutedExpertComputePolicy::Apportioned;
 
-        /// Dense/shared: replicated on every participant.
-        /// Routed experts: apportioned as whole expert ids across participants;
-        /// an owner computes the complete selected expert output.
-        ApportionedExperts,
+        ///< Scheduling among eligible complete routed-expert residents.
+        RoutedExpertAssignmentPolicy routed_assignment =
+            RoutedExpertAssignmentPolicy::StaticOwner;
 
-        /// Dense/shared: replicated on every participant.
-        /// Routed experts: Least-Loaded EP current-window row assignment over
-        /// apportioned whole-expert ownership.
-        LeastLoadedEP,
+        /** @brief Compare all three independent policy axes. */
+        bool operator==(const MoEExecutionPolicy &other) const
+        {
+            return dense == other.dense &&
+                   routed_compute == other.routed_compute &&
+                   routed_assignment == other.routed_assignment;
+        }
 
-        /// Dense/shared: tensor-parallel sharded with collectives as needed.
-        /// Routed experts: apportioned as whole expert ids across participants.
-        HybridTP_AE,
-
-        /// Dense/shared: tensor-parallel sharded with collectives as needed.
-        /// Routed experts: Least-Loaded EP current-window row assignment.
-        HybridTP_LLEP,
-
-        /// Dense/shared: tensor-parallel sharded with collectives as needed.
-        /// Routed experts: replicated on every participant.
-        HybridTP_RE,
-
-        /// Prefill dense/shared: tensor-parallel sharded with collectives.
-        /// Decode dense/shared: replicated to avoid tiny decode collectives.
-        /// Routed experts: apportioned as whole expert ids across participants.
-        PhaseSplitHybridTP_AE,
-
-        /// Prefill dense/shared: tensor-parallel sharded with collectives.
-        /// Decode dense/shared: replicated to avoid tiny decode collectives.
-        /// Routed experts: Least-Loaded EP current-window row assignment.
-        PhaseSplitHybridTP_LLEP,
+        /** @brief Return true when any independent policy axis differs. */
+        bool operator!=(const MoEExecutionPolicy &other) const
+        {
+            return !(*this == other);
+        }
     };
 
     enum class ExpertReplicaPolicy
@@ -903,31 +832,36 @@ namespace llaminar2
             return "tensor-parallel";
         case DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding:
             return "tensor-parallel-decode-mirrored-embedding";
-        case DenseParallelPolicy::PhaseSplitHybridTP_AE:
-            return "phase-split-hybrid-tp-ae";
+        case DenseParallelPolicy::PrefillTensorParallelDecodeReplicated:
+            return "prefill-tensor-parallel-decode-replicated";
         default:
             return "unknown";
         }
     }
 
-    inline std::optional<DenseParallelPolicy> parseDenseParallelPolicy(const std::string &value)
+    /**
+     * @brief Parse one canonical dense/shared-model distribution policy.
+     * @param value CLI or YAML token to parse.
+     * @return Typed dense policy, or `std::nullopt` for an obsolete alias or
+     *         otherwise unknown value.
+     *
+     * Only the spellings emitted by `denseParallelPolicyToString()` are
+     * accepted. In particular, abbreviations such as `tp` and `full` are not
+     * retained as compatibility paths because they conceal which model phase
+     * or weight family is being distributed.
+     */
+    inline std::optional<DenseParallelPolicy> parseDenseParallelPolicy(
+        const std::string &value)
     {
         const std::string lower = normalizeParallelPolicyToken(value);
-        if (lower == "replicated" || lower == "replicate" || lower == "full")
+        if (lower == "replicated")
             return DenseParallelPolicy::Replicated;
-        if (lower == "tensor-parallel" || lower == "tp" || lower == "dense-tp")
+        if (lower == "tensor-parallel")
             return DenseParallelPolicy::TensorParallel;
-        if (lower == "tensor-parallel-decode-mirrored-embedding" ||
-            lower == "tp-decode-mirrored-embedding" ||
-            lower == "decode-mirrored-embedding" ||
-            lower == "decode-mirror-embedding")
+        if (lower == "tensor-parallel-decode-mirrored-embedding")
             return DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding;
-        if (lower == "phase-split" ||
-            lower == "phase-split-tp" ||
-            lower == "phase-split-dense-tp" ||
-            lower == "phase-split-hybrid-tp-ae" ||
-            lower == "phasesplithybridtp-ae")
-            return DenseParallelPolicy::PhaseSplitHybridTP_AE;
+        if (lower == "prefill-tensor-parallel-decode-replicated")
+            return DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
         return std::nullopt;
     }
 
@@ -939,7 +873,7 @@ namespace llaminar2
         if (!dense_tp_enabled)
             return DenseParallelPolicy::Replicated;
         if (dense_decode_replicated)
-            return DenseParallelPolicy::PhaseSplitHybridTP_AE;
+            return DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
         if (dense_decode_mirrored_embedding)
             return DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding;
         return DenseParallelPolicy::TensorParallel;
@@ -949,177 +883,54 @@ namespace llaminar2
     {
         return policy == DenseParallelPolicy::TensorParallel ||
                policy == DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding ||
-               policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+               policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
     }
 
     inline bool denseParallelPolicyReplicatesDecode(DenseParallelPolicy policy)
     {
-        return policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+        return policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
     }
 
     inline bool denseParallelPolicyMirrorsDecodeEmbedding(DenseParallelPolicy policy)
     {
         return policy == DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding ||
-               policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+               policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
     }
 
-    inline const char *routedExpertParallelPolicyToString(RoutedExpertParallelPolicy policy)
-    {
-        switch (policy)
-        {
-        case RoutedExpertParallelPolicy::ReplicatedExperts:
-            return "replicated-experts";
-        case RoutedExpertParallelPolicy::ApportionedExperts:
-            return "apportioned-experts";
-        case RoutedExpertParallelPolicy::ShardedExperts:
-            return "sharded-experts";
-        default:
-            return "unknown";
-        }
-    }
-
-    inline std::optional<RoutedExpertParallelPolicy> parseRoutedExpertParallelPolicy(const std::string &value)
-    {
-        const std::string lower = normalizeParallelPolicyToken(value);
-        if (lower == "replicated-experts" || lower == "replicated")
-            return RoutedExpertParallelPolicy::ReplicatedExperts;
-        if (lower == "apportioned-experts" ||
-            lower == "apportioned")
-            return RoutedExpertParallelPolicy::ApportionedExperts;
-        if (lower == "sharded-experts" ||
-            lower == "sharded")
-            return RoutedExpertParallelPolicy::ShardedExperts;
-        return std::nullopt;
-    }
-
-    inline const char *routedExpertAssignmentPolicyToString(RoutedExpertAssignmentPolicy policy)
-    {
-        switch (policy)
-        {
-        case RoutedExpertAssignmentPolicy::StaticOwner:
-            return "static-owner";
-        case RoutedExpertAssignmentPolicy::LeastLoadedEP:
-            return "least-loaded-ep";
-        default:
-            return "unknown";
-        }
-    }
-
-    inline std::optional<RoutedExpertAssignmentPolicy> parseRoutedExpertAssignmentPolicy(const std::string &value)
-    {
-        const std::string lower = normalizeParallelPolicyToken(value);
-        if (lower == "static-owner" ||
-            lower == "static" ||
-            lower == "owner" ||
-            lower == "canonical-owner")
-            return RoutedExpertAssignmentPolicy::StaticOwner;
-        if (lower == "least-loaded-ep" ||
-            lower == "least-loaded-experts" ||
-            lower == "least-loaded" ||
-            lower == "llep")
-            return RoutedExpertAssignmentPolicy::LeastLoadedEP;
-        return std::nullopt;
-    }
-
-    inline RoutedExpertParallelPolicy routedExpertParallelPolicyFromMode(MoEExpertMode mode)
-    {
-        switch (mode)
-        {
-        case MoEExpertMode::ReplicatedExperts:
-            return RoutedExpertParallelPolicy::ReplicatedExperts;
-        case MoEExpertMode::ShardedExperts:
-            return RoutedExpertParallelPolicy::ShardedExperts;
-        case MoEExpertMode::ApportionedExperts:
-        default:
-            return RoutedExpertParallelPolicy::ApportionedExperts;
-        }
-    }
-
-    inline const char *moeParallelPolicyToString(MoEParallelPolicy policy)
-    {
-        switch (policy)
-        {
-        case MoEParallelPolicy::ReplicatedExperts:
-            return "replicated-experts";
-        case MoEParallelPolicy::TensorParallel:
-            return "tensor-parallel";
-        case MoEParallelPolicy::ApportionedExperts:
-            return "apportioned-experts";
-        case MoEParallelPolicy::LeastLoadedEP:
-            return "least-loaded-ep";
-        case MoEParallelPolicy::HybridTP_AE:
-            return "hybrid-tp-ae";
-        case MoEParallelPolicy::HybridTP_LLEP:
-            return "hybrid-tp-llep";
-        case MoEParallelPolicy::HybridTP_RE:
-            return "hybrid-tp-re";
-        case MoEParallelPolicy::PhaseSplitHybridTP_AE:
-            return "phase-split-hybrid-tp-ae";
-        case MoEParallelPolicy::PhaseSplitHybridTP_LLEP:
-            return "phase-split-hybrid-tp-llep";
-        default:
-            return "unknown";
-        }
-    }
-
-    inline std::optional<MoEParallelPolicy> parseMoEParallelPolicy(const std::string &value)
-    {
-        const std::string lower = normalizeParallelPolicyToken(value);
-        if (lower == "replicated-experts" || lower == "replicated" || lower == "replicate" || lower == "full")
-            return MoEParallelPolicy::ReplicatedExperts;
-        if (lower == "tensor-parallel" || lower == "tp")
-            return MoEParallelPolicy::TensorParallel;
-        if (lower == "apportioned-experts" ||
-            lower == "apportioned")
-            return MoEParallelPolicy::ApportionedExperts;
-        if (lower == "least-loaded-ep" ||
-            lower == "least-loaded-experts" ||
-            lower == "llep")
-            return MoEParallelPolicy::LeastLoadedEP;
-        if (lower == "hybrid-tp-ae" ||
-            lower == "hybridtpae")
-            return MoEParallelPolicy::HybridTP_AE;
-        if (lower == "hybrid-tp-llep" ||
-            lower == "hybridtpllep")
-            return MoEParallelPolicy::HybridTP_LLEP;
-        if (lower == "hybrid-tp-re" ||
-            lower == "hybridtpre")
-            return MoEParallelPolicy::HybridTP_RE;
-        if (lower == "phase-split-hybrid-tp-ae" ||
-            lower == "phase-split" ||
-            lower == "phasesplithybridtp-ae")
-            return MoEParallelPolicy::PhaseSplitHybridTP_AE;
-        if (lower == "phase-split-hybrid-tp-llep" ||
-            lower == "phasesplithybridtp-llep")
-            return MoEParallelPolicy::PhaseSplitHybridTP_LLEP;
-        return std::nullopt;
-    }
-
-    inline MoEParallelPolicy deriveMoEParallelPolicy(
+    /**
+     * @brief Build an explicit MoE execution policy without deriving aliases.
+     * @param dense_policy Dense/shared-model distribution policy.
+     * @param routed_compute Routed-expert weight and GEMM distribution policy.
+     * @param routed_assignment Complete-resident row scheduling policy.
+     * @return Value object containing the three arguments unchanged.
+     */
+    inline MoEExecutionPolicy makeMoEExecutionPolicy(
         DenseParallelPolicy dense_policy,
-        RoutedExpertParallelPolicy routed_policy,
-        RoutedExpertAssignmentPolicy assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner)
+        RoutedExpertComputePolicy routed_compute,
+        RoutedExpertAssignmentPolicy routed_assignment =
+            RoutedExpertAssignmentPolicy::StaticOwner)
     {
-        if (routed_policy == RoutedExpertParallelPolicy::ShardedExperts)
-            return MoEParallelPolicy::TensorParallel;
-        if (routed_policy == RoutedExpertParallelPolicy::ReplicatedExperts)
-            return dense_policy == DenseParallelPolicy::Replicated
-                       ? MoEParallelPolicy::ReplicatedExperts
-                       : MoEParallelPolicy::HybridTP_RE;
-        if (routed_policy == RoutedExpertParallelPolicy::ApportionedExperts &&
-            assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
-        {
-            if (dense_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE)
-                return MoEParallelPolicy::PhaseSplitHybridTP_LLEP;
-            return denseParallelPolicyEnablesTP(dense_policy)
-                       ? MoEParallelPolicy::HybridTP_LLEP
-                       : MoEParallelPolicy::LeastLoadedEP;
-        }
-        if (dense_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE)
-            return MoEParallelPolicy::PhaseSplitHybridTP_AE;
-        if (denseParallelPolicyEnablesTP(dense_policy))
-            return MoEParallelPolicy::HybridTP_AE;
-        return MoEParallelPolicy::ApportionedExperts;
+        return MoEExecutionPolicy{
+            .dense = dense_policy,
+            .routed_compute = routed_compute,
+            .routed_assignment = routed_assignment,
+        };
+    }
+
+    /**
+     * @brief Render every MoE execution axis for logs and diagnostics.
+     * @param policy Explicit policy value object to describe.
+     * @return Comma-separated canonical key/value pairs for all three axes.
+     */
+    inline std::string describeMoEExecutionPolicy(const MoEExecutionPolicy &policy)
+    {
+        std::ostringstream out;
+        out << "dense=" << denseParallelPolicyToString(policy.dense)
+            << ",routed_compute="
+            << routedExpertComputePolicyToString(policy.routed_compute)
+            << ",routed_assignment="
+            << routedExpertAssignmentPolicyToString(policy.routed_assignment);
+        return out.str();
     }
 
     inline const char *expertReplicaPolicyToString(ExpertReplicaPolicy policy)
@@ -1242,7 +1053,7 @@ namespace llaminar2
             return MoERebalanceRuntimeMode::Observe;
         if (lower == "dynamic" || lower == "on" || lower == "true")
             return MoERebalanceRuntimeMode::Dynamic;
-        if (lower == "llep" || lower == "least-loaded-ep" || lower == "least-loaded")
+        if (lower == "llep" || lower == "least-loaded-resident")
             return MoERebalanceRuntimeMode::LLEP;
         return std::nullopt;
     }
@@ -1271,7 +1082,7 @@ namespace llaminar2
         uint32_t device_min_router_spread_improvement_per_payload_slot = 128;
         uint32_t device_max_post_wave_load_spread_per_mille = 100;
         /**
-         * @brief Least-Loaded EP capacity multiplier numerator for device planners.
+         * @brief Least-loaded-resident capacity multiplier numerator.
          *
          * LLEP computes a per-participant routed-row capacity of
          * ceil(total_rows * alpha_numerator / (participants * alpha_denominator)).
@@ -1281,23 +1092,23 @@ namespace llaminar2
          */
         uint32_t device_llep_alpha_numerator = 1;
         /**
-         * @brief Least-Loaded EP capacity multiplier denominator for device planners.
+         * @brief Least-loaded-resident capacity multiplier denominator.
          *
          * Must remain non-zero.  Larger denominators make the planner spill more
          * rows to non-owner participants, which is useful for deterministic
          * migration coverage but should be tuned carefully for production.
          */
         uint32_t device_llep_alpha_denominator = 1;
-        /// Lambda numerator used by the balanced-standard-EP skip check.
+        /// Lambda numerator used by the balanced-static-owner skip check.
         uint32_t device_llep_lambda_numerator = 13;
-        /// Lambda denominator used by the balanced-standard-EP skip check.
+        /// Lambda denominator used by the balanced-static-owner skip check.
         uint32_t device_llep_lambda_denominator = 10;
         /**
          * @brief Permit LLEP to select the standard owner policy when loads are already balanced.
          *
          * The default preserves the economical production behavior.  Tests that
          * are specifically named as LLEP migration coverage disable this so a
-         * green result cannot silently be a standard-EP no-op.
+         * green result cannot silently be a static-owner no-op.
          */
         bool device_llep_enable_balanced_skip = true;
         int device_maintenance_slack_tokens = -1;
@@ -1306,7 +1117,7 @@ namespace llaminar2
         /**
          * @brief Fixed request-local prefill assignment window for LLEP.
          *
-         * A value greater than zero makes OrchestrationRunner split LeastLoadedEP
+         * A value greater than zero makes OrchestrationRunner split LLEP
          * prefill into deterministic windows of this many real tokens.  The
          * window is the first-class owner of current-window LLEP model-runtime
          * state; prefix cache restores must align cached blocks to it.  Zero
@@ -1355,9 +1166,9 @@ namespace llaminar2
         std::string tp_allreduce_precision_override;
 
         /// Routed MoE expert execution mode.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
+        RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-        /// Bounded remote hot-expert cache configuration for dynamic EP.
+        /// Bounded remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
         /// MoE rebalance runtime configuration.
@@ -1382,7 +1193,7 @@ namespace llaminar2
             const std::string &activation_precision_str,
             const std::string &kv_cache_precision_str,
             FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
-            MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts,
+            RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned,
             MoEHotExpertCacheConfig moe_hot_expert_cache = {},
             MoERebalanceRuntimeConfig moe_rebalance = {},
             PrefixCacheRuntimeConfig prefix_cache = {},
@@ -1396,7 +1207,7 @@ namespace llaminar2
             rc.kv_cache_precision = parseKVCachePrecision(kv_cache_precision_str);
             rc.tp_allreduce_precision_override = std::move(tp_allreduce_precision_override);
             rc.fused_attention_backend = fused_backend;
-            rc.moe_expert_mode = moe_expert_mode;
+            rc.routed_expert_compute_policy = routed_expert_compute_policy;
             rc.moe_hot_expert_cache = moe_hot_expert_cache;
             rc.moe_rebalance = moe_rebalance;
             rc.prefix_cache = prefix_cache;

@@ -42,7 +42,7 @@ namespace llaminar2
         COLUMN_PARALLEL,  ///< Split output dimension (rows of weight) - for Gate/Up, QKV
         ROW_PARALLEL,     ///< Split output dimension (rows of weight) + allreduce - for Wo
         INPUT_PARALLEL,   ///< Split input dimension (columns of weight) + allreduce - for Down
-        EXPERT_PARALLEL   ///< Split expert dimension of 3D MoE tensors - for expert weights
+        EXPERT_ID_APPORTIONED ///< Split the expert-id axis of 3D MoE tensors
     };
 
     /**

@@ -9,7 +9,7 @@
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPStateTransaction.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "kernels/KernelFactory.h"
@@ -81,6 +81,7 @@ namespace
     std::vector<std::string> requestBatchPrefillSnapshotKeys()
     {
         static const std::vector<std::string> kLayerStageOrder = {
+            "ATTENTION_NORM_RESIDUAL_OUT",
             "ATTENTION_NORM",
             "QKV_PROJECTION",
             "GDN_Z_PROJECTION",
@@ -100,12 +101,15 @@ namespace
             "ATTENTION_CONTEXT",
             "ATTENTION_CONTEXT_GATED",
             "ATTENTION_OUTPUT",
+            "ATTENTION_OUTPUT_ALLREDUCED",
             "ATTENTION_RESIDUAL",
+            "FFN_NORM_RESIDUAL_OUT",
             "FFN_NORM",
             "FFN_GATE",
             "FFN_UP",
             "FFN_SWIGLU",
             "FFN_DOWN",
+            "FFN_DOWN_ALLREDUCED",
             "FFN_RESIDUAL",
         };
 
@@ -135,19 +139,25 @@ namespace
      * row geometry from the isolated and request-batched execution contracts.
      */
     std::map<std::string, RequestBatchStageSnapshot> captureRequestBatchSnapshots(
-        const IOrchestrationRunner &runner)
+        const IOrchestrationRunner &runner,
+        const std::vector<std::string> &semantic_keys,
+        const std::string &context = {})
     {
         std::map<std::string, RequestBatchStageSnapshot> snapshots;
-        for (const std::string &key : runner.getSnapshotKeys())
+        const std::string context_prefix =
+            context.empty() ? std::string{} : context + "_";
+        for (const std::string &semantic_key : semantic_keys)
         {
             size_t size = 0;
-            const float *data = runner.getSnapshot(key, size);
+            const float *data = runner.getSnapshot(
+                context_prefix + semantic_key,
+                size);
             if (!data || size == 0)
                 continue;
 
             RequestBatchStageSnapshot snapshot;
             snapshot.data.assign(data, data + size);
-            snapshots.emplace(key, std::move(snapshot));
+            snapshots.emplace(semantic_key, std::move(snapshot));
         }
         return snapshots;
     }
@@ -271,6 +281,106 @@ namespace
                    << label << " captured no comparable scalar/batched stage rows";
         }
         return ::testing::AssertionSuccess();
+    }
+
+    /**
+     * @brief Compare one active request prefix in a fixed-stride grouped KV view.
+     *
+     * Scalar attention snapshots contain exactly `scalar_kv_rows` rows.  A GPU
+     * request-batch snapshot stores every bank with `grouped_kv_stride` rows,
+     * zero-padding the suffix of shorter requests.  Comparing only the active
+     * prefix isolates cache append/gather/RoPE correctness from the subsequent
+     * softmax and value reduction.
+     */
+    ::testing::AssertionResult requestBatchEffectiveKVBankByteIdentical(
+        const std::map<std::string, RequestBatchStageSnapshot> &scalar,
+        const std::map<std::string, RequestBatchStageSnapshot> &grouped,
+        const std::string &key,
+        size_t scalar_kv_rows,
+        size_t grouped_kv_stride,
+        size_t request_index,
+        const std::string &label)
+    {
+        const auto scalar_it = scalar.find(key);
+        const auto grouped_it = grouped.find(key);
+        if (scalar_it == scalar.end() || grouped_it == grouped.end())
+        {
+            return ::testing::AssertionFailure()
+                   << label << " is missing effective-KV snapshot " << key
+                   << " scalar_present=" << (scalar_it != scalar.end())
+                   << " grouped_present=" << (grouped_it != grouped.end());
+        }
+        if (scalar_kv_rows == 0 || grouped_kv_stride < scalar_kv_rows ||
+            scalar_it->second.data.size() % scalar_kv_rows != 0)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " has invalid KV row geometry for " << key
+                   << " scalar_values=" << scalar_it->second.data.size()
+                   << " scalar_rows=" << scalar_kv_rows
+                   << " grouped_stride=" << grouped_kv_stride;
+        }
+
+        const size_t cols =
+            scalar_it->second.data.size() / scalar_kv_rows;
+        const size_t grouped_row_start = request_index * grouped_kv_stride;
+        const size_t grouped_value_start = grouped_row_start * cols;
+        const size_t compared_values = scalar_kv_rows * cols;
+        if (cols == 0 ||
+            grouped_it->second.data.size() <
+                grouped_value_start + compared_values)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " grouped KV snapshot is undersized for " << key
+                   << " grouped_values=" << grouped_it->second.data.size()
+                   << " required_values="
+                   << grouped_value_start + compared_values
+                   << " cols=" << cols;
+        }
+
+        const float *expected = scalar_it->second.data.data();
+        const float *actual =
+            grouped_it->second.data.data() + grouped_value_start;
+        if (std::memcmp(
+                actual,
+                expected,
+                compared_values * sizeof(float)) == 0)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        size_t first = 0;
+        size_t mismatch_count = 0;
+        double max_abs = 0.0;
+        for (size_t i = 0; i < compared_values; ++i)
+        {
+            uint32_t expected_bits = 0;
+            uint32_t actual_bits = 0;
+            std::memcpy(&expected_bits, expected + i, sizeof(expected_bits));
+            std::memcpy(&actual_bits, actual + i, sizeof(actual_bits));
+            if (expected_bits == actual_bits)
+                continue;
+            if (mismatch_count == 0)
+                first = i;
+            ++mismatch_count;
+            max_abs = std::max(
+                max_abs,
+                std::fabs(static_cast<double>(actual[i]) - expected[i]));
+        }
+
+        uint32_t expected_bits = 0;
+        uint32_t actual_bits = 0;
+        std::memcpy(&expected_bits, expected + first, sizeof(expected_bits));
+        std::memcpy(&actual_bits, actual + first, sizeof(actual_bits));
+        return ::testing::AssertionFailure()
+               << label << " effective KV bank differs at " << key
+               << " mismatches=" << mismatch_count << "/" << compared_values
+               << " first_row=" << first / cols
+               << " first_col=" << first % cols
+               << " grouped=" << actual[first]
+               << " scalar=" << expected[first]
+               << " grouped_bits=0x" << std::hex << actual_bits
+               << " scalar_bits=0x" << expected_bits << std::dec
+               << " max_abs=" << max_abs;
     }
 
     class ScopedDebugEnv
@@ -821,29 +931,29 @@ namespace
             0);
     }
 
-    ExpertComputeDomain qwen36MoELocalTPDomainForProbe(
+    RoutedExpertDomain qwen36MoELocalTPDomainForProbe(
         const std::string &name,
         CollectiveBackendType backend,
         std::vector<GlobalDeviceAddress> participants)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = name;
-        domain.kind = ExpertDomainKind::LocalTP;
+        domain.scope = ExecutionDomainScope::LOCAL;
         domain.backend = backend;
         domain.participants = std::move(participants);
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertRoutedTier qwen36MoERoutedTierForProbe(
+    RoutedExpertTier qwen36MoERoutedTierForProbe(
         const std::string &name,
         const std::string &domain,
         int priority,
         int max_experts_per_layer,
         size_t memory_budget_bytes)
     {
-        ExpertRoutedTier tier;
+        RoutedExpertTier tier;
         tier.name = name;
         tier.domain = domain;
         tier.priority = priority;
@@ -852,16 +962,16 @@ namespace
         return tier;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayRocm2TPHotOnlyForProbe(
-        RoutedExpertAssignmentPolicy assignment_policy =
+    std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayRocm2TPHotOnlyForProbe(
+        RoutedExpertAssignmentPolicy routed_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner)
     {
         constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
 
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->continuation_domain = kRocmHotDomain;
         plan->shared_expert_domain = kRocmHotDomain;
         plan->domains = {
@@ -870,7 +980,7 @@ namespace
                 CollectiveBackendType::RCCL,
                 {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
         };
-        plan->domains.front().assignment_policy = assignment_policy;
+        plan->domains.front().routed_assignment_policy = routed_assignment_policy;
         plan->routed_tiers = {
             qwen36MoERoutedTierForProbe(
                 "hot",
@@ -880,20 +990,20 @@ namespace
                 8ull * 1024ull * 1024ull * 1024ull),
         };
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         return plan;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayCuda2TPHotOnlyForProbe(
-        RoutedExpertAssignmentPolicy assignment_policy =
+    std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayCuda2TPHotOnlyForProbe(
+        RoutedExpertAssignmentPolicy routed_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner)
     {
         constexpr const char *kCudaHotDomain = "qwen36_moe_cuda_hot";
 
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->continuation_domain = kCudaHotDomain;
         plan->shared_expert_domain = kCudaHotDomain;
         plan->domains = {
@@ -902,7 +1012,7 @@ namespace
                 CollectiveBackendType::NCCL,
                 {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
         };
-        plan->domains.front().assignment_policy = assignment_policy;
+        plan->domains.front().routed_assignment_policy = routed_assignment_policy;
         plan->routed_tiers = {
             qwen36MoERoutedTierForProbe(
                 "hot",
@@ -912,7 +1022,7 @@ namespace
                 8ull * 1024ull * 1024ull * 1024ull),
         };
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         return plan;
     }
 
@@ -1323,7 +1433,7 @@ namespace
     {
         const char *label = "overlay";
         MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::LLEP;
-        RoutedExpertAssignmentPolicy assignment_policy =
+        RoutedExpertAssignmentPolicy routed_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner;
         bool prefix_cache = true;
         int prefill_window_tokens = 0;
@@ -1843,17 +1953,20 @@ namespace
     }
 
     /**
-     * @brief Prove request-batched stochastic prefill is position-owned on GPU.
+     * @brief Prove request-batched prefill and its first MTP transaction remain GPU-owned.
      *
      * This regression deliberately uses two prefixes with unequal lengths. A
      * row-indexing bug, stale host length, or batch-index-keyed RNG draw therefore
      * changes at least one first token. Scalar one-request generation supplies the
-     * production decode oracle; the request-batched path must return the same token
-     * for each request and must report every device-resident ownership transition.
+     * production decode oracle; the request-batched path must return the same
+     * prefill token and the same first grouped-verifier continuation for each
+     * request, then report every device-resident ownership transition.
      *
      * Only the immutable prompt-length row crosses H2D during admission. Compact
      * terminal logits, position-keyed threshold derivation, sampled token slots,
-     * and first mailbox publication remain on one explicitly ordered GPU stream.
+     * compact accept/reject outcomes, collective outcome publication, and live
+     * state mutation remain on explicitly ordered GPU streams. The host-visible
+     * response tokens are inspected only after resident state publication.
      */
     void runQwen36MTPGpuRequestBatchResidentPrefill(
         GlobalDeviceAddress device,
@@ -1864,6 +1977,8 @@ namespace
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
             {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
+            {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER", "3"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_request_batch_prefill_stats.json"},
             {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
         });
@@ -1937,6 +2052,24 @@ namespace
             SCOPED_TRACE(
                 backend_name + " request-batched prefill " + sampling_mode);
 
+            const bool capture_stage_diagnostics = params.temperature == 0.0f;
+            const std::vector<std::string> stage_comparison_keys =
+                capture_stage_diagnostics
+                    ? requestBatchPrefillSnapshotKeys()
+                    : std::vector<std::string>{};
+            std::vector<std::string> diagnostic_keys = stage_comparison_keys;
+            if (capture_stage_diagnostics)
+            {
+                diagnostic_keys.push_back("layer3_ATTENTION_EFFECTIVE_K");
+                diagnostic_keys.push_back("layer3_ATTENTION_EFFECTIVE_V");
+            }
+            if (capture_stage_diagnostics)
+            {
+                runner->setSnapshotCaptureFilter(diagnostic_keys);
+                runner->enableSnapshotCapture();
+                runner->clearSnapshots();
+            }
+
             runner->clearCache();
             runner->setSamplingParams(params);
             ASSERT_TRUE(runner->prefill(long_prompt)) << runner->lastError();
@@ -1945,18 +2078,24 @@ namespace
             runner->setDecodeStepTokenBudget(0);
             ASSERT_TRUE(scalar_long.error.empty()) << scalar_long.error;
             ASSERT_EQ(scalar_long.tokens.size(), 1u);
-
-            const bool capture_stage_diagnostics = params.temperature == 0.0f;
-            const std::vector<std::string> diagnostic_keys =
+            const GenerationResult scalar_long_mtp = runner->decodeStep();
+            ASSERT_TRUE(scalar_long_mtp.error.empty()) << scalar_long_mtp.error;
+            ASSERT_FALSE(scalar_long_mtp.tokens.empty())
+                << "Scalar long-prompt oracle must execute one MTP verifier transaction";
+            std::vector<int32_t> scalar_long_tokens = scalar_long.tokens;
+            scalar_long_tokens.insert(
+                scalar_long_tokens.end(),
+                scalar_long_mtp.tokens.begin(),
+                scalar_long_mtp.tokens.end());
+            const auto scalar_long_condition_snapshots =
                 capture_stage_diagnostics
-                    ? requestBatchPrefillSnapshotKeys()
-                    : std::vector<std::string>{};
+                    ? captureRequestBatchSnapshots(
+                          *runner,
+                          diagnostic_keys,
+                          "MTP_SCALAR_CONDITION")
+                    : std::map<std::string, RequestBatchStageSnapshot>{};
             if (capture_stage_diagnostics)
-            {
-                runner->setSnapshotCaptureFilter(diagnostic_keys);
-                runner->enableSnapshotCapture();
                 runner->clearSnapshots();
-            }
 
             runner->clearCache();
             runner->setSamplingParams(params);
@@ -1969,13 +2108,29 @@ namespace
              */
             const auto scalar_short_snapshots =
                 capture_stage_diagnostics
-                    ? captureRequestBatchSnapshots(*runner)
+                    ? captureRequestBatchSnapshots(*runner, diagnostic_keys)
                     : std::map<std::string, RequestBatchStageSnapshot>{};
             runner->setDecodeStepTokenBudget(1);
             const GenerationResult scalar_short = runner->decodeStep();
             runner->setDecodeStepTokenBudget(0);
             ASSERT_TRUE(scalar_short.error.empty()) << scalar_short.error;
             ASSERT_EQ(scalar_short.tokens.size(), 1u);
+            const GenerationResult scalar_short_mtp = runner->decodeStep();
+            ASSERT_TRUE(scalar_short_mtp.error.empty()) << scalar_short_mtp.error;
+            ASSERT_FALSE(scalar_short_mtp.tokens.empty())
+                << "Scalar short-prompt oracle must execute one MTP verifier transaction";
+            std::vector<int32_t> scalar_short_tokens = scalar_short.tokens;
+            scalar_short_tokens.insert(
+                scalar_short_tokens.end(),
+                scalar_short_mtp.tokens.begin(),
+                scalar_short_mtp.tokens.end());
+            const auto scalar_short_condition_snapshots =
+                capture_stage_diagnostics
+                    ? captureRequestBatchSnapshots(
+                          *runner,
+                          diagnostic_keys,
+                          "MTP_SCALAR_CONDITION")
+                    : std::map<std::string, RequestBatchStageSnapshot>{};
 
             runner->clearCache();
             if (capture_stage_diagnostics)
@@ -1986,24 +2141,59 @@ namespace
                 << runner->lastError();
             const auto batch_snapshots =
                 capture_stage_diagnostics
-                    ? captureRequestBatchSnapshots(*runner)
+                    ? captureRequestBatchSnapshots(*runner, diagnostic_keys)
                     : std::map<std::string, RequestBatchStageSnapshot>{};
             ASSERT_TRUE(runner->supportsDecodeStepBatch(/*request_batch=*/2));
             runner->setDecodeStepTokenBudget(1);
-            const GenerationBatchResult batched =
+            const GenerationBatchResult batched_prefill =
                 runner->decodeStepBatch(/*request_batch=*/2);
             runner->setDecodeStepTokenBudget(0);
-            ASSERT_TRUE(batched.error.empty()) << batched.error;
-            ASSERT_EQ(batched.requests.size(), 2u);
-            ASSERT_EQ(batched.requests[0].tokens.size(), 1u);
-            ASSERT_EQ(batched.requests[1].tokens.size(), 1u);
+            ASSERT_TRUE(batched_prefill.error.empty()) << batched_prefill.error;
+            ASSERT_EQ(batched_prefill.requests.size(), 2u);
+            ASSERT_EQ(batched_prefill.requests[0].tokens.size(), 1u);
+            ASSERT_EQ(batched_prefill.requests[1].tokens.size(), 1u);
+
+            /*
+             * The first call consumes terminal prefill logits only. The second
+             * call is the proof that matters for resident MTP: it launches the
+             * grouped sidecar/verifier, reduces child-local compact outcomes,
+             * broadcasts one common NCCL/RCCL decision, and publishes every
+             * child's KV/recurrent/logical state before returning response tokens.
+             */
+            ASSERT_TRUE(runner->supportsDecodeStepBatch(/*request_batch=*/2));
+            const GenerationBatchResult batched_mtp =
+                runner->decodeStepBatch(/*request_batch=*/2);
+            ASSERT_TRUE(batched_mtp.error.empty()) << batched_mtp.error;
+            ASSERT_EQ(batched_mtp.requests.size(), 2u);
+            ASSERT_FALSE(batched_mtp.requests[0].tokens.empty());
+            ASSERT_FALSE(batched_mtp.requests[1].tokens.empty());
+            const auto grouped_condition_snapshots =
+                capture_stage_diagnostics
+                    ? captureRequestBatchSnapshots(
+                          *runner,
+                          diagnostic_keys,
+                          "MTP_REQUEST_BATCH_CONDITION")
+                    : std::map<std::string, RequestBatchStageSnapshot>{};
+
+            std::vector<int32_t> batched_long_tokens =
+                batched_prefill.requests[0].tokens;
+            batched_long_tokens.insert(
+                batched_long_tokens.end(),
+                batched_mtp.requests[0].tokens.begin(),
+                batched_mtp.requests[0].tokens.end());
+            std::vector<int32_t> batched_short_tokens =
+                batched_prefill.requests[1].tokens;
+            batched_short_tokens.insert(
+                batched_short_tokens.end(),
+                batched_mtp.requests[1].tokens.begin(),
+                batched_mtp.requests[1].tokens.end());
 
             if (capture_stage_diagnostics)
             {
                 EXPECT_TRUE(requestBatchTerminalRowsByteIdentical(
                     scalar_short_snapshots,
                     batch_snapshots,
-                    diagnostic_keys,
+                    stage_comparison_keys,
                     /*scalar_total_rows=*/short_prompt.size(),
                     /*batch_total_rows=*/long_prompt.size() * 2,
                     /*scalar_terminal_row=*/short_prompt.size() - 1,
@@ -2011,21 +2201,64 @@ namespace
                     /*request_index=*/1,
                     /*request_count=*/2,
                     backend_name + " unequal-length request-batch prefill"));
+
+                EXPECT_TRUE(requestBatchTerminalRowsByteIdentical(
+                    scalar_long_condition_snapshots,
+                    grouped_condition_snapshots,
+                    stage_comparison_keys,
+                    /*scalar_total_rows=*/1,
+                    /*batch_total_rows=*/2,
+                    /*scalar_terminal_row=*/0,
+                    /*batch_terminal_row=*/0,
+                    /*request_index=*/0,
+                    /*request_count=*/2,
+                    backend_name +
+                        " long-request grouped condition versus serial condition"));
+                EXPECT_TRUE(requestBatchTerminalRowsByteIdentical(
+                    scalar_short_condition_snapshots,
+                    grouped_condition_snapshots,
+                    stage_comparison_keys,
+                    /*scalar_total_rows=*/1,
+                    /*batch_total_rows=*/2,
+                    /*scalar_terminal_row=*/0,
+                    /*batch_terminal_row=*/1,
+                    /*request_index=*/1,
+                    /*request_count=*/2,
+                    backend_name +
+                        " short-request grouped condition versus serial condition"));
+
+                for (const std::string &kv_key : {
+                         std::string("layer3_ATTENTION_EFFECTIVE_K"),
+                         std::string("layer3_ATTENTION_EFFECTIVE_V")})
+                {
+                    EXPECT_TRUE(requestBatchEffectiveKVBankByteIdentical(
+                        scalar_long_condition_snapshots,
+                        grouped_condition_snapshots,
+                        kv_key,
+                        /*scalar_kv_rows=*/long_prompt.size() + 1,
+                        /*grouped_kv_stride=*/long_prompt.size() + 1,
+                        /*request_index=*/0,
+                        backend_name + " long-request grouped condition"));
+                    EXPECT_TRUE(requestBatchEffectiveKVBankByteIdentical(
+                        scalar_short_condition_snapshots,
+                        grouped_condition_snapshots,
+                        kv_key,
+                        /*scalar_kv_rows=*/short_prompt.size() + 1,
+                        /*grouped_kv_stride=*/long_prompt.size() + 1,
+                        /*request_index=*/1,
+                        backend_name + " short-request grouped condition"));
+                }
                 runner->disableSnapshotCapture();
             }
 
-            EXPECT_EQ(batched.requests[0].tokens[0], scalar_long.tokens[0])
+            EXPECT_EQ(batched_long_tokens, scalar_long_tokens)
                 << backend_name << " " << sampling_mode
-                << " request row zero must be batch-invariant against scalar decode; "
-                << "batch={" << batched.requests[0].tokens[0] << ","
-                << batched.requests[1].tokens[0] << "} scalar={"
-                << scalar_long.tokens[0] << "," << scalar_short.tokens[0] << "}";
-            EXPECT_EQ(batched.requests[1].tokens[0], scalar_short.tokens[0])
+                << " request row zero must remain batch-invariant through its "
+                   "first grouped MTP verifier transaction";
+            EXPECT_EQ(batched_short_tokens, scalar_short_tokens)
                 << backend_name << " " << sampling_mode
-                << " request row one must use its own resident logical position; "
-                << "batch={" << batched.requests[0].tokens[0] << ","
-                << batched.requests[1].tokens[0] << "} scalar={"
-                << scalar_long.tokens[0] << "," << scalar_short.tokens[0] << "}";
+                << " request row one must use its own resident logical position "
+                   "through its first grouped MTP verifier transaction";
         };
 
         SamplingParams greedy;
@@ -2054,6 +2287,24 @@ namespace
             mtp_decode_counter("request_batch_prefill_device_logical_state_publications"),
             participant_count)
             << backend_name << " must publish one complete request-batch mailbox";
+        EXPECT_EQ(
+            mtp_decode_counter(
+                "request_batch_prefill_device_mtp_transaction_publications"),
+            participant_count)
+            << backend_name
+            << " must establish one canonical request-batch shifted-KV transaction per participant";
+        EXPECT_EQ(
+            mtp_decode_counter("request_batched_verifier_transactions"),
+            1.0)
+            << backend_name << " must execute one grouped request-batch verifier transaction";
+        EXPECT_EQ(
+            mtp_decode_counter("request_batch_device_resident_state_publications"),
+            1.0)
+            << backend_name << " must publish accepted request state from compact device outcomes";
+        EXPECT_EQ(
+            mtp_decode_counter("request_batch_resident_plan_checks"),
+            1.0)
+            << backend_name << " must validate the resident logical-state mailbox after publication";
         if (!local_tp_devices.empty())
         {
             EXPECT_EQ(
@@ -2062,8 +2313,43 @@ namespace
                 2.0)
                 << backend_name
                 << " LocalTP must sample the batch through child-resident mirrored heads";
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_resident_request_batch_sidecars"),
+                1.0)
+                << backend_name
+                << " LocalTP must execute one true grouped child sidecar transaction";
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_resident_request_batch_draft_slot_publications"),
+                2.0)
+                << backend_name
+                << " LocalTP must collectively publish one resident draft slot per request";
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_stochastic_resident_outcomes"),
+                2.0)
+                << backend_name
+                << " LocalTP must reduce one child-resident stochastic outcome per request";
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_common_outcome_broadcasts"),
+                1.0)
+                << backend_name
+                << " LocalTP must publish one common compact outcome through NCCL/RCCL";
+            EXPECT_EQ(
+                mtp_decode_counter(
+                    "rank_mirrored_localtp_stochastic_device_outcome_publications"),
+                1.0)
+                << backend_name
+                << " LocalTP must publish the common outcome on every child device";
         }
         EXPECT_GE(mtp_decode_counter("device_resident_logical_state_mailboxes"), 1.0);
+        EXPECT_GE(
+            mtp_decode_counter("device_resident_logical_state_arena_publications"),
+            participant_count)
+            << backend_name
+            << " must publish request-lifetime logical state from arena-owned rows";
         EXPECT_EQ(mtp_decode_counter("first_token_stochastic_samples"), 0.0)
             << backend_name << " must not route batched GPU prefill through host logits";
         EXPECT_GT(
@@ -4366,7 +4652,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
-        config.moe_expert_parallel_plan = qwen36MoEOverlayRocm2TPHotOnlyForProbe();
+        config.moe_routed_expert_plan = qwen36MoEOverlayRocm2TPHotOnlyForProbe();
         config.moe_rebalance.mode = MoERebalanceRuntimeMode::LLEP;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
@@ -4597,7 +4883,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
-        config.moe_expert_parallel_plan = qwen36MoEOverlayCuda2TPHotOnlyForProbe();
+        config.moe_routed_expert_plan = qwen36MoEOverlayCuda2TPHotOnlyForProbe();
         config.moe_rebalance.mode = MoERebalanceRuntimeMode::LLEP;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
@@ -4826,8 +5112,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
         config.kv_cache_precision = "auto";
         config.tp_allreduce_precision_override = "schema";
         configure_prefix_cache(config, probe.prefix_cache);
-        config.moe_expert_parallel_plan =
-            qwen36MoEOverlayRocm2TPHotOnlyForProbe(probe.assignment_policy);
+        config.moe_routed_expert_plan =
+            qwen36MoEOverlayRocm2TPHotOnlyForProbe(probe.routed_assignment_policy);
         config.moe_rebalance.mode = probe.mode;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
@@ -4884,7 +5170,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
     OverlayRecallProbeConfig static_probe;
     static_probe.label = "static-overlay";
     static_probe.mode = MoERebalanceRuntimeMode::Off;
-    static_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
     static_probe.prefix_cache = true;
     static_probe.prefill_window_tokens = 0;
     static_probe.require_transfer_backing = false;
@@ -4892,7 +5178,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
     OverlayRecallProbeConfig llep_probe;
     llep_probe.label = "llep-overlay-prefix-window";
     llep_probe.mode = MoERebalanceRuntimeMode::LLEP;
-    llep_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
     llep_probe.prefix_cache = true;
     llep_probe.prefill_window_tokens = 0;
     llep_probe.require_transfer_backing = true;
@@ -5032,8 +5318,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
         config.kv_cache_precision = "auto";
         config.tp_allreduce_precision_override = "schema";
         configure_prefix_cache(config, probe.prefix_cache);
-        config.moe_expert_parallel_plan =
-            qwen36MoEOverlayCuda2TPHotOnlyForProbe(probe.assignment_policy);
+        config.moe_routed_expert_plan =
+            qwen36MoEOverlayCuda2TPHotOnlyForProbe(probe.routed_assignment_policy);
         config.moe_rebalance.mode = probe.mode;
         config.moe_rebalance.window_size = 4;
         config.moe_rebalance.max_window_size = 4;
@@ -5090,7 +5376,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
     OverlayRecallProbeConfig static_probe;
     static_probe.label = "static-overlay";
     static_probe.mode = MoERebalanceRuntimeMode::Off;
-    static_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    static_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
     static_probe.prefix_cache = true;
     static_probe.prefill_window_tokens = 0;
     static_probe.require_transfer_backing = false;
@@ -5098,7 +5384,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
     OverlayRecallProbeConfig llep_probe;
     llep_probe.label = "llep-overlay-prefix-window";
     llep_probe.mode = MoERebalanceRuntimeMode::LLEP;
-    llep_probe.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+    llep_probe.routed_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
     llep_probe.prefix_cache = true;
     llep_probe.prefill_window_tokens = 0;
     llep_probe.require_transfer_backing = true;

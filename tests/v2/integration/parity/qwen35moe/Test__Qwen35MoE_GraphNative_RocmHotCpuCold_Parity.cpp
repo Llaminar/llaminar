@@ -1,20 +1,20 @@
 /**
  * @file Test__Qwen35MoE_GraphNative_RocmHotCpuCold_Parity.cpp
  * @brief Phase 15: Production-path PyTorch parity gate for Qwen3.5 MoE graph-native
- *        overlay with `rocm_hot` (ROCm device 0, ApportionedExperts) and
- *        `cpu_cold` (CPU fallback tier, ApportionedExperts) two-tier layout.
+ *        placement with `rocm_hot` (ROCm device 0, apportioned routed compute)
+ *        and `cpu_cold` (CPU fallback tier, apportioned routed compute).
  *
  * Topology:
- *   rocm_hot   — single ROCm device (rocm:0), world rank 0, ApportionedExperts.
+ *   rocm_hot   — single ROCm device (rocm:0), world rank 0, apportioned compute.
  *                This is the continuation domain and shared expert domain.
  *                Hot experts (first num_experts/2 by ID) reside here.
- *   cpu_cold   — single CPU participant, world rank 1, ApportionedExperts, fallback=true.
+ *   cpu_cold   — single CPU participant, world rank 1, apportioned compute, fallback=true.
  *                Cold experts (remaining num_experts/2 by ID) fall back here.
  *
  * Key differences from legacy ExpertOverlay tests (Test__Qwen35MoE_ExpertOverlay_Parity.cpp):
- *   - Both domains use ApportionedExperts, NOT ShardedExperts.
- *   - rocm_hot is ExpertDomainKind::SingleDevice (not LocalTP).
- *   - cpu_cold is ExpertDomainKind::SingleDevice CPU on rank 1 (not NodeLocalTP cross-socket).
+ *   - Both domains use `routed_compute=apportioned`, not `tensor-sharded`.
+ *   - rocm_hot is ExecutionDomainScope::SINGLE (not LocalTP).
+ *   - cpu_cold is ExecutionDomainScope::SINGLE CPU on rank 1 (not NodeLocalTP cross-socket).
  *   - Parity bodies are NOT unconditionally skipped — Phase 14 graph-native is implemented.
  *   - Asserts LLAMINAR_MOE_LEGACY_OVERLAY_DOMAIN_RUNTIME is NOT set.
  *   - Verifies MoEExpertOverlayProfiler cpu_fallback_rows > 0 in the
@@ -48,7 +48,7 @@
 #include "collective/BackendRouter.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/moe/MoEExpertOverlayProfiler.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -90,52 +90,52 @@ namespace
     }
 
     /**
-     * @brief rocm_hot domain: single ROCm device (rocm:0), world rank 0, ApportionedExperts.
+     * @brief rocm_hot domain: single ROCm device with apportioned routed compute.
      *
-     * Uses ExpertDomainKind::SingleDevice and ApportionedExperts so that the
+     * Uses `ExecutionDomainScope::SINGLE` and apportioned routed compute so the
      * graph-native path treats each domain as a whole-expert owner (one expert
      * per node in the MoEExpertOwnerMap), exercising gn_sparse_dispatch /
      * gn_local_expert / gn_return_reduce stages introduced in Phase 14.
      */
-    ExpertComputeDomain rocmHotDomain()
+    RoutedExpertDomain rocmHotDomain()
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = kRocmHotDomain;
-        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.scope = ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0)};
         domain.world_ranks = {0};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
     /**
-     * @brief cpu_cold domain: single CPU on world rank 1, ApportionedExperts, fallback tier.
+     * @brief cpu_cold domain: single CPU with apportioned compute and fallback placement.
      *
      * When the hot tier is exhausted, remaining experts fall back to this domain.
-     * Uses ApportionedExperts — each expert is fully owned by rank 1's CPU rather
-     * than tensor-parallel sharded across sockets. This is the graph-native whole-expert
-     * owner path for the cold tier.
+     * Apportioned compute gives rank 1's CPU complete ownership of each assigned
+     * expert instead of tensor-sharding that expert across sockets. This is the
+     * graph-native whole-expert owner path for the cold tier.
      *
-     * NOTE: ExpertDomainKind::SingleDevice with HOST backend is chosen because this
+     * NOTE: ExecutionDomainScope::SINGLE with HOST backend is chosen because this
      * is a single logical CPU device (one participant, rank 1). The cross-rank return
      * reduction is handled by the graph-native sparse collective infrastructure.
      */
-    ExpertComputeDomain cpuColdDomain()
+    RoutedExpertDomain cpuColdDomain()
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = kCpuColdDomain;
-        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.scope = ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::HOST;
         domain.participants = {GlobalDeviceAddress::cpu(0)};
         domain.world_ranks = {1};
         domain.owner_rank = 1;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertRoutedTier makeTier(
+    RoutedExpertTier makeTier(
         const std::string &name,
         const std::string &domain,
         int priority,
@@ -143,7 +143,7 @@ namespace
         size_t memory_budget_bytes,
         bool fallback = false)
     {
-        ExpertRoutedTier t;
+        RoutedExpertTier t;
         t.name = name;
         t.domain = domain;
         t.priority = priority;
@@ -153,9 +153,9 @@ namespace
         return t;
     }
 
-    MoEExpertModelMetadata topologyOnlyMetadata()
+    MoERoutedExpertModelMetadata topologyOnlyMetadata()
     {
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_experts = kQwen35MoENumExperts;
         metadata.num_layers = kQwen35MoENumLayers;
         metadata.d_model = 4096;
@@ -167,12 +167,12 @@ namespace
         return metadata;
     }
 
-    MoEExpertModelMetadata metadataFromModel(const ModelContext &ctx)
+    MoERoutedExpertModelMetadata metadataFromModel(const ModelContext &ctx)
     {
         const auto &loader = ctx.concreteLoader();
         const std::string &arch = ctx.architecture();
 
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = ctx.totalBlockCount();
         metadata.num_experts = loader.getInt(arch + ".expert_count", 0);
         metadata.d_model = ctx.embeddingLength();
@@ -189,22 +189,22 @@ namespace
     }
 
     /**
-     * @brief Build the requested (unplanned) MoEExpertParallelPlan for the
+     * @brief Build the requested (unplanned) MoERoutedExpertPlacementPlan for the
      *        rocm_hot / cpu_cold two-tier graph-native layout.
      *
      * Hot capacity = num_experts / 2 (StaticById assigns by expert-ID range).
      * Cold tier is unbounded fallback.
      */
-    MoEExpertParallelPlan requestedPlan(const MoEExpertModelMetadata &metadata)
+    MoERoutedExpertPlacementPlan requestedPlan(const MoERoutedExpertModelMetadata &metadata)
     {
         const int hot_capacity = std::max(1, metadata.num_experts / 2);
 
-        MoEExpertParallelPlan plan;
+        MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
-        plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan.continuation_domain = kRocmHotDomain;
         plan.shared_expert_domain = kRocmHotDomain;
-        plan.residency_policy = ExpertResidencyPolicy::StaticById;
+        plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan.domains = {
             rocmHotDomain(),
             cpuColdDomain(),
@@ -216,7 +216,7 @@ namespace
         return plan;
     }
 
-    std::string planValidationErrors(const MoEExpertParallelValidationResult &validation)
+    std::string planValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
     {
         std::ostringstream message;
         for (const auto &error : validation.errors)
@@ -224,26 +224,26 @@ namespace
         return message.str();
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makePlannedOverlayPlan(
-        const MoEExpertModelMetadata &metadata)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makePlannedOverlayPlan(
+        const MoERoutedExpertModelMetadata &metadata)
     {
-        auto result = MoEExpertParallelPlanner::plan(requestedPlan(metadata), metadata);
+        auto result = MoERoutedExpertPlacementPlanner::plan(requestedPlan(metadata), metadata);
         auto planned = result.planned_plan;
 
-        MoEExpertParallelValidationOptions options;
+        MoERoutedExpertPlacementValidationOptions options;
         options.layer_count = metadata.num_layers;
         options.routed_expert_count = metadata.num_experts;
-        auto validation = validateMoEExpertParallelPlan(planned, options);
+        auto validation = validateMoERoutedExpertPlacementPlan(planned, options);
         if (!validation.ok())
         {
             throw std::invalid_argument(
                 "Graph-native RocmHot/CpuCold plan is invalid:" +
                 planValidationErrors(validation));
         }
-        return std::make_shared<MoEExpertParallelPlan>(std::move(planned));
+        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
     }
 
-    std::vector<size_t> tierExpertCounts(const MoEExpertParallelPlan &plan)
+    std::vector<size_t> tierExpertCounts(const MoERoutedExpertPlacementPlan &plan)
     {
         std::vector<size_t> counts(plan.routed_tiers.size(), 0);
         for (const auto &placement : plan.placements)
@@ -483,7 +483,7 @@ protected:
         inf_config.force_graph = true;
         inf_config.activation_precision = cfg().activation_precision;
         inf_config.kv_cache_precision = cfg().kv_cache_precision;
-        inf_config.moe_expert_parallel_plan = overlay_plan_;
+        inf_config.moe_routed_expert_plan = overlay_plan_;
         inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
 
         runner_ = createInferenceRunner(model_ctx_, nullptr, DeviceId::rocm(0), inf_config);
@@ -660,7 +660,7 @@ protected:
         assertDecodeParity(summary);
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> overlay_plan_;
+    std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan_;
 };
 
 // =============================================================================
@@ -672,7 +672,7 @@ protected:
  *        without loading the real model or requiring ROCm hardware.
  *
  * Asserts (rank 0 only):
- *   - Both domains use ApportionedExperts (graph-native whole-expert owner path)
+ *   - Both domains use apportioned routed compute (whole-expert owner path)
  *   - cpu_cold routed tier has fallback=true
  *   - All layers have placements
  *   - Both hot and cold tiers have expert assignments (cpu_fallback path is reachable)
@@ -692,11 +692,11 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, TopologySmoke)
 
     const auto metadata = topologyOnlyMetadata();
 
-    std::shared_ptr<MoEExpertParallelPlan> plan;
+    std::shared_ptr<MoERoutedExpertPlacementPlan> plan;
     ASSERT_NO_THROW(plan = makePlannedOverlayPlan(metadata))
-        << "Plan construction threw — check ExpertComputeDomain definitions for "
-           "rocm_hot (SingleDevice, RCCL, ApportionedExperts) and "
-           "cpu_cold (SingleDevice, HOST, ApportionedExperts, fallback)";
+        << "Plan construction threw — check RoutedExpertDomain definitions for "
+           "rocm_hot (single device, RCCL, routed_compute=apportioned) and "
+           "cpu_cold (single device, HOST, routed_compute=apportioned, fallback)";
     ASSERT_NE(plan, nullptr);
 
     // Basic plan structure
@@ -706,19 +706,19 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, TopologySmoke)
     ASSERT_EQ(plan->domains.size(), 2u);
     ASSERT_EQ(plan->routed_tiers.size(), 2u);
 
-    // CRITICAL: both domains must use ApportionedExperts for the graph-native path.
-    // ShardedExperts would select the legacy expert-sharded GEMM path.
+    // Both domains feed a whole-expert owner map, so their compute policy must
+    // apportion complete expert IDs rather than tensor-shard each expert.
     for (const auto &domain : plan->domains)
     {
-        EXPECT_EQ(domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts)
+        EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned)
             << "Domain '" << domain.name
-            << "' must use ApportionedExperts (whole-expert graph-native owner), "
-               "not ShardedExperts (legacy sharded GEMM path)";
+            << "' must use routed_compute=apportioned for whole-expert ownership, "
+               "not routed_compute=tensor-sharded";
     }
 
     // rocm_hot domain must be SingleDevice (not LocalTP/NodeLocalTP)
     const auto *hot_domain = &plan->domains[0];
-    EXPECT_EQ(hot_domain->kind, ExpertDomainKind::SingleDevice)
+    EXPECT_EQ(hot_domain->scope, ExecutionDomainScope::SINGLE)
         << "rocm_hot must be SingleDevice, not LocalTP/NodeLocalTP";
     EXPECT_FALSE(hot_domain->participants.empty());
 

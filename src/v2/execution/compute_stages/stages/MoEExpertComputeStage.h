@@ -79,11 +79,11 @@ namespace llaminar2
             TensorBase *down_exps = nullptr; ///< [num_experts, d_model, intermediate]
             int expert_intermediate = 0;
 
-            // Expert Parallelism (EP): partition experts across TP ranks.
+            // Whole-expert-ID apportionment across participants.
             // When active, this rank only computes experts in
             // [local_expert_start, local_expert_start + local_expert_count).
             // Set by graph builder when TP degree > 1.
-            // -1 means all experts (no EP, single-device mode).
+            // -1 means all expert IDs are local (replicated or single-device mode).
             int local_expert_start = 0;
             int local_expert_count = -1;
 
@@ -113,10 +113,10 @@ namespace llaminar2
 
             /// Policy for assigning already-selected routed expert rows to
             /// domain participants. StaticOwner follows the placement owner;
-            /// LeastLoadedEP preserves router top-k choices and balances routed
+            /// LLEP preserves router top-k choices and balances routed
             /// row spans across resident owners/replicas through runtime
             /// prefill grouping.
-            RoutedExpertAssignmentPolicy routed_expert_assignment_policy =
+            RoutedExpertAssignmentPolicy routed_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
 
             // Per-expert 2D tensor views — used by GPU path
@@ -288,7 +288,7 @@ namespace llaminar2
         int replicaParticipantForTesting() const { return params_.my_socket_id; }
         RoutedExpertAssignmentPolicy routedExpertAssignmentPolicyForTesting() const
         {
-            return params_.routed_expert_assignment_policy;
+            return params_.routed_assignment_policy;
         }
         bool usesRuntimePrefillGroupingForTesting() const
         {
@@ -306,7 +306,7 @@ namespace llaminar2
             return params_.prefill_llep_workspace_name;
         }
 
-        /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
+        /// With expert-ID apportionment, a participant's output can be all zeros
         /// when no selected experts fall in its local range. The downstream
         /// AllReduce combines partial results across ranks.
         bool allowsZeroOutput() const override
@@ -654,7 +654,7 @@ namespace llaminar2
         /**
          * @brief Revalidates the graph-owned one-token MoE runtime placement.
          *
-         * Dynamic ExpertParallel and overlay decode stages may receive a
+         * Dynamic routed-expert and overlay decode stages may receive a
          * graph-initialized runtime table from Qwen35MoEGraph instead of
          * synthesizing a full-owner table inside the stage.  This refresh keeps
          * descriptor-table readiness, the active placement bank, and the

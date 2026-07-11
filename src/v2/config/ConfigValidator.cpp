@@ -237,14 +237,14 @@ namespace llaminar2
         });
 
         v.addRule({
-            .id = "moe-sharded-experts-not-implemented",
-            .description = "MoE sharded-experts mode is recognized but not implemented",
-            .fix_hint = "Use --moe-expert-mode apportioned-experts for the standard Qwen3.5 MoE path",
+            .id = "moe-routed-tensor-sharding-not-implemented",
+            .description = "Routed-expert tensor sharding is not implemented by the standard Qwen3.5 MoE path",
+            .fix_hint = "Use --moe-routed-expert-compute apportioned for the standard Qwen3.5 MoE path",
             .applies = [](const OrchestrationConfig &c)
-            { return c.moe_expert_mode == MoEExpertMode::ShardedExperts; },
+            { return c.routed_expert_compute_policy == RoutedExpertComputePolicy::TensorSharded; },
             .check = [](const OrchestrationConfig &) -> std::optional<std::string>
             {
-                return "MoE expert mode 'sharded-experts' is recognized but not implemented for the standard Qwen3.5 MoE execution path yet. Use --moe-expert-mode apportioned-experts.";
+                return "Routed-expert compute policy 'tensor-sharded' is not implemented for the standard Qwen3.5 MoE execution path. Use --moe-routed-expert-compute apportioned.";
             },
         });
 

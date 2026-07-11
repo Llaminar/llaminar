@@ -24,7 +24,7 @@
 namespace llaminar2
 {
 
-    /// Describes resident hot-expert replicas in an ExpertParallel domain.
+    /// Describes resident hot-expert replicas in a routed-expert domain.
     ///
     /// Base ownership stays in owner_socket: exactly one participant owns each
     /// routed expert id.  Hot replicas are additional resident copies.  The
@@ -34,7 +34,7 @@ namespace llaminar2
     /// "has any replica anywhere" mirror for older call sites and diagnostics.
     struct ExpertReplicaSet
     {
-        std::string domain_id;           ///< ExpertParallel domain this replica set belongs to.
+        std::string domain_id;           ///< Routed-expert domain this replica set belongs to.
         std::vector<bool> is_replicated; ///< [num_experts] true if any layer has a non-owner replica.
         std::vector<int> owner_socket;   ///< [num_experts] primary owner participant.
         int num_replicated = 0;          ///< Count of resident replica slots, or aggregate experts for legacy sets.
@@ -168,7 +168,7 @@ namespace llaminar2
         /// Get current global expert-to-socket mapping (used by swap-based rebalance)
         const std::vector<int> &currentPlacement() const { return current_placement_; }
 
-        /// Domain/participant vocabulary alias for new ExpertParallel call sites.
+        /// Domain/participant vocabulary alias for routed-expert call sites.
         const std::vector<int> &currentParticipantPlacement() const { return current_placement_; }
 
         /// Number of participants in this rebalance domain.
@@ -254,7 +254,7 @@ namespace llaminar2
         /// When replicas are active, the mask includes both owned and replicated experts.
         std::vector<std::vector<bool>> computeExpertMasks(int socket_id) const;
 
-        /// Domain/participant vocabulary alias for new ExpertParallel call sites.
+        /// Domain/participant vocabulary alias for routed-expert call sites.
         std::vector<std::vector<bool>> computeExpertMasksForParticipant(int participant_id) const
         {
             return computeExpertMasks(participant_id);

@@ -14,73 +14,73 @@ namespace llaminar2::test
     namespace
     {
 
-        ExpertComputeDomain cudaSingleDomain(const std::string &name)
+        RoutedExpertDomain cudaSingleDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0)};
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain rocmLocalTPDomain(const std::string &name)
+        RoutedExpertDomain rocmLocalTPDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::LocalTP;
+            domain.scope = ExecutionDomainScope::LOCAL;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
             return domain;
         }
 
-        ExpertComputeDomain cpuNodeLocalTPDomain(const std::string &name)
+        RoutedExpertDomain cpuNodeLocalTPDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::NodeLocalTP;
+            domain.scope = ExecutionDomainScope::NODE_LOCAL;
             domain.backend = CollectiveBackendType::UPI;
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
             domain.world_ranks = {0, 1};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
             return domain;
         }
 
-        ExpertComputeDomain cpuSingleFallbackDomain(const std::string &name, int owner_rank)
+        RoutedExpertDomain cpuSingleFallbackDomain(const std::string &name, int owner_rank)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::UPI;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.world_ranks = {owner_rank};
             domain.owner_rank = owner_rank;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain remoteCudaDomain(const std::string &name)
+        RoutedExpertDomain remoteCudaDomain(const std::string &name)
         {
-            ExpertComputeDomain domain = cudaSingleDomain(name);
+            RoutedExpertDomain domain = cudaSingleDomain(name);
             domain.participants = {GlobalDeviceAddress::cuda(0, 0, "remote-node")};
             return domain;
         }
 
-        ExpertComputeDomain remoteCudaWorkerDomain(const std::string &name, int owner_rank)
+        RoutedExpertDomain remoteCudaWorkerDomain(const std::string &name, int owner_rank)
         {
-            ExpertComputeDomain domain = remoteCudaDomain(name);
+            RoutedExpertDomain domain = remoteCudaDomain(name);
             domain.owner_rank = owner_rank;
             domain.world_ranks = {owner_rank};
             return domain;
         }
 
-        ExpertRoutedTier tier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
+        RoutedExpertTier tier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
         {
-            ExpertRoutedTier result;
+            RoutedExpertTier result;
             result.name = name;
             result.domain = domain;
             result.priority = priority;
@@ -88,14 +88,14 @@ namespace llaminar2::test
             return result;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> layoutAPlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> layoutAPlan()
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "rocm_hot";
             plan->shared_expert_domain = "rocm_hot";
-            plan->residency_policy = ExpertResidencyPolicy::StaticById;
+            plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan->domains = {
                 rocmLocalTPDomain("rocm_hot"),
                 cpuNodeLocalTPDomain("cpu_cold"),
@@ -107,14 +107,14 @@ namespace llaminar2::test
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> layoutBPlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> layoutBPlan()
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "cuda_fast";
             plan->shared_expert_domain = "cuda_fast";
-            plan->residency_policy = ExpertResidencyPolicy::StaticById;
+            plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan->domains = {
                 cudaSingleDomain("cuda_fast"),
                 rocmLocalTPDomain("rocm_warm"),
@@ -126,12 +126,12 @@ namespace llaminar2::test
                 tier("cold", "cpu_cold", 2, true),
             };
             plan->placements = {
-                ExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 2, 2}},
+                RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 2, 2}},
             };
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> layoutBThreeRankPlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> layoutBThreeRankPlan()
         {
             auto plan = layoutBPlan();
             plan->domains[0].world_ranks = {0};
@@ -141,14 +141,14 @@ namespace llaminar2::test
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> remoteExpertWorkerPlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> remoteExpertWorkerPlan()
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "cuda_fast";
             plan->shared_expert_domain = "cuda_fast";
-            plan->residency_policy = ExpertResidencyPolicy::StaticById;
+            plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan->domains = {
                 cudaSingleDomain("cuda_fast"),
                 remoteCudaWorkerDomain("remote_experts", 1),
@@ -164,14 +164,14 @@ namespace llaminar2::test
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> continuationOnlyDensePlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> continuationOnlyDensePlan()
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "dense_cont";
             plan->shared_expert_domain = "dense_cont";
-            plan->residency_policy = ExpertResidencyPolicy::StaticById;
+            plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan->domains = {
                 cudaSingleDomain("dense_cont"),
                 cpuSingleFallbackDomain("cpu_routed", 0),
@@ -183,7 +183,7 @@ namespace llaminar2::test
         }
 
         std::string thrownMessageFor(
-            std::shared_ptr<MoEExpertParallelPlan> plan,
+            std::shared_ptr<MoERoutedExpertPlacementPlan> plan,
             MoEExpertOverlayRuntimeResolverOptions options = {.current_world_rank = 0})
         {
             try
@@ -198,7 +198,7 @@ namespace llaminar2::test
         }
 
         std::string executionPlanThrownMessageFor(
-            std::shared_ptr<MoEExpertParallelPlan> plan,
+            std::shared_ptr<MoERoutedExpertPlacementPlan> plan,
             MoEExpertOverlayExecutionPlanResolverOptions options)
         {
             try
@@ -241,8 +241,8 @@ namespace llaminar2::test
         ASSERT_NE(cpu_domain, nullptr);
         EXPECT_EQ(rocm_domain->backend, CollectiveBackendType::RCCL);
         EXPECT_EQ(cpu_domain->backend, CollectiveBackendType::UPI);
-        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::ShardedExperts);
-        EXPECT_EQ(cpu_domain->compute_kind, ExpertDomainComputeKind::ShardedExperts);
+        EXPECT_EQ(rocm_domain->routed_compute_policy, RoutedExpertComputePolicy::TensorSharded);
+        EXPECT_EQ(cpu_domain->routed_compute_policy, RoutedExpertComputePolicy::TensorSharded);
         EXPECT_TRUE(rocm_domain->routed_rebalance_controller_eligible);
         EXPECT_EQ(rocm_domain->rebalance_domain_id, "overlay_routed_rocm_hot");
         EXPECT_EQ(rocm_domain->routed_tier_count, 1);
@@ -267,18 +267,18 @@ namespace llaminar2::test
         EXPECT_NE(diagnostics.find("routed_rebalance=overlay_routed_cpu_cold"), std::string::npos);
     }
 
-    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPApportionedExpertsDomainIsGraphNativeReady)
+    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPApportionedRoutedComputeIsGraphNativeReady)
     {
         auto plan = layoutAPlan();
-        plan->domains[0].compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        plan->domains[0].routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
         auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
 
         ASSERT_NE(runtime_plan, nullptr);
         const auto *rocm_domain = runtime_plan->domainForName("rocm_hot");
         ASSERT_NE(rocm_domain, nullptr);
-        EXPECT_EQ(rocm_domain->kind, ExpertDomainKind::LocalTP);
-        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::ApportionedExperts);
+        EXPECT_EQ(rocm_domain->scope, ExecutionDomainScope::LOCAL);
+        EXPECT_EQ(rocm_domain->routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
         EXPECT_FALSE(rocm_domain->multi_participant_execution_pending);
         EXPECT_TRUE(rocm_domain->domain_scoped_collective_context_ready);
         EXPECT_TRUE(rocm_domain->pending_reason.empty());
@@ -365,7 +365,7 @@ namespace llaminar2::test
         auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(layoutBPlan());
 
         ASSERT_NE(runtime_plan, nullptr);
-        EXPECT_EQ(runtime_plan->sourcePlan().execution_kind, MoEExpertExecutionKind::TieredExpertOverlay);
+        EXPECT_EQ(runtime_plan->sourcePlan().topology, RoutedExpertPlacementTopology::TieredOverlay);
         ASSERT_EQ(runtime_plan->sourcePlan().placements.size(), 1u);
         EXPECT_EQ(runtime_plan->sourcePlan().placements[0].layer, 0);
         EXPECT_EQ(runtime_plan->routedTiers()[0].domain_name, "cuda_fast");

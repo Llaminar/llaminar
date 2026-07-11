@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
+#include "tensors/GpuTensorView.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
@@ -1083,7 +1084,15 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     LOG_INFO("[FlashDecode_FP32_LargeKVLen_GQA] PASSED");
 }
 
-TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedKVLenWithinBucket)
+/**
+ * @brief Prove a captured HIP decode consumes a later device KV-length update.
+ *
+ * The replayed graph and direct execution use the same backend kernel and
+ * reduction order, so this is an exact ownership test rather than an
+ * approximate cross-backend parity check. Any stale descriptor or host-owned
+ * update path changes the visible KV prefix and fails byte equality.
+ */
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDeviceKVLenByteExact)
 {
     if (!hasROCm())
     {
@@ -1131,7 +1140,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedKV
     rocm_kernel.setGPUStream(stream);
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
 
-    // Warmup allocates pinned dynamic-param storage before capture.
+    // Warmup establishes the stream-owned device parameter block before capture.
     ASSERT_TRUE(rocm_kernel.compute_tensor(
         &q_tensor, &k_tensor, &v_tensor, &captured_output,
         1, seq_len, capture_kv_len, n_heads, n_kv_heads, head_dim,
@@ -1152,7 +1161,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedKV
     ASSERT_NE(graph, nullptr);
     ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
 
-    rocm_kernel.setDynamicAttnParams(replay_kv_len, replay_kv_len - 1, 1);
+    ASSERT_TRUE(rocm_kernel.prepareDynamicAttnParams(
+        replay_kv_len, replay_kv_len - 1, 1, stream));
     ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -1177,14 +1187,11 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedKV
     ASSERT_FALSE(hasNaNOrInf(captured.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(direct.data(), out_size));
 
-    const double cosine = cosineSimilarity(captured.data(), direct.data(), out_size);
-    const double l2_error = relativeL2Error(captured.data(), direct.data(), out_size);
-    const double max_error = maxAbsError(captured.data(), direct.data(), out_size);
-    printComparisonStats("FlashDecode FP32 graph replay updated kv_len", cosine, l2_error, max_error, out_size);
-
-    EXPECT_GE(cosine, 0.9999);
-    EXPECT_LE(l2_error, 1e-4);
-    EXPECT_LE(max_error, 1e-4);
+    EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+        captured.data(),
+        direct.data(),
+        out_size,
+        "ROCm captured replay after device KV-length update"));
 
     (void)hipGraphExecDestroy(graph_exec);
     (void)hipGraphDestroy(graph);
@@ -1806,6 +1813,28 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
     config.head_dim = head_dim;
     auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(kv_cache, nullptr);
+    std::unique_ptr<DeviceWorkspaceManager> kv_workspace;
+    if (auto *cache_workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kv_cache.get()))
+    {
+        /*
+         * Production graph construction binds the cache workspace before any
+         * forward or graph capture. The bind publishes immutable per-request
+         * K/V pointer tables and reserves the fixed-stride FP16 conversion
+         * output consumed by the device-owned grouped attention read. Keeping
+         * this explicit prevents the regression from passing through a hidden
+         * allocation or a legacy scalar cache shadow.
+         */
+        const WorkspaceRequirements kv_reqs =
+            cache_workspace_consumer->getWorkspaceRequirements(
+                kv_len,
+                /*n=*/1,
+                head_dim);
+        kv_workspace = std::make_unique<DeviceWorkspaceManager>(
+            device, kv_reqs.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(kv_workspace->allocate(kv_reqs));
+        cache_workspace_consumer->bindWorkspace(kv_workspace.get());
+    }
     ASSERT_TRUE(kv_cache->appendWithStream(0, 0, k_tensor.get(), v_tensor.get(), kv_len, stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), kv_len);
@@ -1836,11 +1865,25 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
     AttentionComputeStage stage(params);
     stage.setGPUStream(stream);
     const WorkspaceRequirements stage_reqs =
-        stage.getWorkspaceRequirements(/*m=*/1, /*n=*/n_heads, /*k=*/head_dim);
+        stage.getWorkspaceRequirements(
+            /*m=*/seq_len,
+            /*n=*/n_heads,
+            /*k=*/head_dim);
     DeviceWorkspaceManager stage_workspace(
         device, stage_reqs.total_bytes_with_alignment() + 4096);
     ASSERT_TRUE(stage_workspace.allocate(stage_reqs));
     stage.bindWorkspace(&stage_workspace);
+
+    /*
+     * The grouped verifier rows represent the final `seq_len` positions in the
+     * already-populated cache. Publish the same pre/post append horizon that the
+     * production KV-append stage supplies; the attention stage then derives
+     * per-row lengths from canonical device cache state without reading a host
+     * mirror.
+     */
+    stage.updateDynamicParams(
+        /*pre_append_cached_tokens=*/kv_len - seq_len,
+        /*logical_seq_len=*/seq_len);
 
     ASSERT_TRUE(stage.execute(nullptr));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -3662,6 +3705,365 @@ TEST_F(
                 expected.data(),
                 request_q_elements,
                 std::string("captured ROCm request-batch cache ") +
+                    format.name + " request=" + std::to_string(request)));
+        }
+
+        ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    }
+}
+
+/**
+ * @brief Prove captured unequal-history request decode across every ROCm cache format.
+ *
+ * Request-batched decode differs from ordinary attention batching in two ways:
+ * each request owns an independent physical ring and each ring has its own live
+ * post-append length.  The production gather therefore emits fixed-stride
+ * request banks while the grouped decode kernel consumes cache-owned device
+ * counts.  A host length, request-zero-only pointer, or one-row replay can all
+ * pass an equal-length prefill test and still corrupt this path.
+ *
+ * Lengths 512 and 93 deliberately exercise different scalar launch policies on
+ * gfx906: the long row selects a four-split, four-wavefront decode while the
+ * short row selects a two-split, two-wavefront decode for this head geometry.
+ * The grouped graph has one fixed physical launch but must reproduce both M=1
+ * arithmetic orders byte-for-byte.  FP32, FP16, BF16, and Q8_1 cover every
+ * standard ROCm ring format, including the grouped BF16 conversion route.
+ */
+TEST_F(
+    Test__ROCmFlashAttentionParity,
+    CapturedVariableLengthRequestBatchAllStandardKVFormatsDecodeMatchesSerialByteExact)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int request_count = 2;
+    constexpr int query_rows = 1;
+    constexpr std::array<int, request_count> kv_lens{512, 93};
+    constexpr int max_kv_len = kv_lens[0];
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 256;
+    const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+    const size_t q_elements = static_cast<size_t>(request_count) * q_cols;
+    const DeviceId device = DeviceId::rocm(0);
+
+    const std::vector<float> q_host = randomFP32Scaled(q_elements, 0.25f);
+    std::array<std::vector<float>, request_count> k_host;
+    std::array<std::vector<float>, request_count> v_host;
+    for (int request = 0; request < request_count; ++request)
+    {
+        const size_t elements =
+            static_cast<size_t>(kv_lens[request]) * kv_cols;
+        k_host[request] = randomFP32Scaled(elements, 0.25f);
+        v_host[request] = randomFP32Scaled(elements, 0.25f);
+        for (size_t index = 0; index < elements; ++index)
+        {
+            /* Request offsets expose accidental request-zero bank reuse. */
+            k_host[request][index] +=
+                static_cast<float>(request) * 0.375f;
+            v_host[request][index] -=
+                static_cast<float>(request) * 0.625f;
+        }
+    }
+
+    auto makeFP32 = [](const std::vector<float> &values, size_t rows, size_t cols)
+        -> std::shared_ptr<TensorBase>
+    {
+        auto tensor = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{rows, cols});
+        std::copy(values.begin(), values.end(), tensor->mutable_data());
+        return tensor;
+    };
+    auto makeNativeKV = [](
+                            const std::vector<float> &values,
+                            size_t rows,
+                            size_t cols,
+                            ActivationPrecision precision)
+        -> std::shared_ptr<TensorBase>
+    {
+        const std::vector<size_t> shape{rows, cols};
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case ActivationPrecision::FP16:
+        {
+            std::vector<uint16_t> fp16(values.size());
+            quantizeToFP16(values.data(), fp16.data(), values.size());
+            return std::make_shared<FP16Tensor>(shape, fp16);
+        }
+        case ActivationPrecision::BF16:
+        {
+            auto tensor = std::make_shared<BF16Tensor>(shape);
+            tensor->from_fp32(values.data(), values.size());
+            return tensor;
+        }
+        case ActivationPrecision::Q8_1:
+            return Q8_1Tensor::quantize_from_fp32(values.data(), shape);
+        default:
+            return nullptr;
+        }
+    };
+
+    struct FormatCase
+    {
+        ActivationPrecision precision;
+        const char *name;
+    };
+    constexpr std::array<FormatCase, 4> formats{{
+        {ActivationPrecision::FP32, "FP32"},
+        {ActivationPrecision::FP16, "FP16"},
+        {ActivationPrecision::BF16, "BF16"},
+        {ActivationPrecision::Q8_1, "Q8_1"},
+    }};
+
+    auto &transfer = TransferEngine::instance();
+    for (const FormatCase &format : formats)
+    {
+        SCOPED_TRACE(format.name);
+
+        auto q_tensor = makeFP32(q_host, request_count, q_cols);
+        auto grouped_output = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(request_count), q_cols});
+        auto serial_output = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(request_count), q_cols});
+        std::array<std::shared_ptr<TensorBase>, request_count> k_by_request;
+        std::array<std::shared_ptr<TensorBase>, request_count> v_by_request;
+        for (int request = 0; request < request_count; ++request)
+        {
+            k_by_request[request] = makeNativeKV(
+                k_host[request], kv_lens[request], kv_cols, format.precision);
+            v_by_request[request] = makeNativeKV(
+                v_host[request], kv_lens[request], kv_cols, format.precision);
+            ASSERT_NE(k_by_request[request], nullptr);
+            ASSERT_NE(v_by_request[request], nullptr);
+        }
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+        ASSERT_TRUE(transfer.uploadFull(q_tensor.get(), device, stream).success);
+        ASSERT_TRUE(
+            transfer.uploadFull(grouped_output.get(), device, stream).success);
+        ASSERT_TRUE(
+            transfer.uploadFull(serial_output.get(), device, stream).success);
+        for (int request = 0; request < request_count; ++request)
+        {
+            ASSERT_TRUE(transfer.uploadFull(
+                k_by_request[request].get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(
+                v_by_request[request].get(), device, stream).success);
+        }
+
+        llaminar::v2::kernels::KVCacheConfig cache_config;
+        cache_config.precision = format.precision;
+        cache_config.device = device;
+        cache_config.num_layers = 1;
+        cache_config.batch_size = request_count;
+        cache_config.max_seq_len = max_kv_len + 8;
+        cache_config.n_kv_heads = n_kv_heads;
+        cache_config.head_dim = head_dim;
+        auto kv_cache =
+            llaminar::v2::kernels::KernelFactory::createKVCache(cache_config);
+        ASSERT_NE(kv_cache, nullptr);
+
+        auto *cache_workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kv_cache.get());
+        ASSERT_NE(cache_workspace_consumer, nullptr);
+        const WorkspaceRequirements cache_requirements =
+            cache_workspace_consumer->getWorkspaceRequirements(
+                max_kv_len, request_count, head_dim);
+        DeviceWorkspaceManager cache_workspace(
+            device,
+            cache_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(cache_workspace.allocate(cache_requirements));
+        cache_workspace_consumer->bindWorkspace(&cache_workspace);
+
+        for (int request = 0; request < request_count; ++request)
+        {
+            ASSERT_TRUE(kv_cache->appendWithStream(
+                /*layer=*/0,
+                request,
+                k_by_request[request].get(),
+                v_by_request[request].get(),
+                kv_lens[request],
+                stream));
+        }
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        for (int request = 0; request < request_count; ++request)
+        {
+            ASSERT_EQ(
+                kv_cache->get_cached_tokens(/*layer=*/0, request),
+                kv_lens[request]);
+        }
+
+        /*
+         * K/V fields are declarative placeholders.  The production cache read
+         * must replace them with the fixed-stride, request-major resident view.
+         * Request zero's variable allocation is intentionally too short to be
+         * mistaken for a contiguous two-request tensor.
+         */
+        AttentionComputeStage attention_stage({
+            .device_id = device,
+            .mpi_ctx = &mpi_ctx_,
+            .Q = q_tensor.get(),
+            .K = k_by_request[0].get(),
+            .V = v_by_request[0].get(),
+            .output = grouped_output.get(),
+            .batch_size = request_count,
+            .seq_len = query_rows,
+            .kv_len = max_kv_len,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .causal = true,
+            .auto_detect_mode = true,
+            .kv_cache = kv_cache.get(),
+            .layer_idx = 0,
+            .read_kv_from_cache = true,
+        });
+        attention_stage.setGPUStream(stream);
+        const WorkspaceRequirements attention_requirements =
+            attention_stage.getWorkspaceRequirements(
+                request_count * query_rows, n_heads, head_dim);
+        DeviceWorkspaceManager attention_workspace(
+            device,
+            attention_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(attention_workspace.allocate(attention_requirements));
+        attention_stage.bindWorkspace(&attention_workspace);
+
+        /*
+         * The host position is fixed launch geometry only.  The captured body
+         * derives both unequal live lengths from cache-owned device state.
+         */
+        attention_stage.updateDynamicParams(
+            max_kv_len - query_rows,
+            query_rows);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        /* Materialize stable cache views before entering global capture. */
+        ASSERT_TRUE(attention_stage.execute(nullptr));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok = attention_stage.execute(nullptr);
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+        ASSERT_NE(graph_exec, nullptr);
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
+            serial_kernel(0);
+        serial_kernel.setGPUStream(stream);
+        const WorkspaceRequirements serial_requirements =
+            serial_kernel.getWorkspaceRequirements(
+                /*m=*/1, n_heads, head_dim);
+        DeviceWorkspaceManager serial_workspace(
+            device,
+            serial_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(serial_workspace.allocate(serial_requirements));
+        serial_kernel.bindWorkspace(&serial_workspace);
+
+        auto *q_device = static_cast<float *>(q_tensor->gpu_data_ptr());
+        auto *serial_device =
+            static_cast<float *>(serial_output->gpu_data_ptr());
+        ASSERT_NE(q_device, nullptr);
+        ASSERT_NE(serial_device, nullptr);
+        for (int request = 0; request < request_count; ++request)
+        {
+            GpuTensorView q_view(
+                q_device + static_cast<size_t>(request) * q_cols,
+                /*rows=*/1,
+                q_cols,
+                TensorType::FP32,
+                /*device_id=*/0);
+            GpuTensorView output_view(
+                serial_device + static_cast<size_t>(request) * q_cols,
+                /*rows=*/1,
+                q_cols,
+                TensorType::FP32,
+                /*device_id=*/0);
+
+            ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(
+                kv_lens[request],
+                kv_lens[request] - 1,
+                /*query_rows=*/1,
+                stream));
+            ASSERT_TRUE(serial_kernel.compute_tensor(
+                &q_view,
+                k_by_request[request].get(),
+                v_by_request[request].get(),
+                &output_view,
+                /*batch_size=*/1,
+                /*seq_len=*/1,
+                kv_lens[request],
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                /*causal=*/true,
+                /*window_size=*/-1,
+                /*workspace_scores=*/nullptr,
+                /*workspace_mask=*/nullptr,
+                &mpi_ctx_,
+                /*device_idx=*/0,
+                /*head_start=*/0,
+                /*local_n_heads=*/n_heads,
+                /*local_n_kv_heads=*/n_kv_heads,
+                /*gqa_n_rep=*/n_heads / n_kv_heads));
+        }
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> actual(q_elements, 0.0f);
+        std::vector<float> expected(q_elements, 0.0f);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                actual.data(),
+                grouped_output->gpu_data_ptr(),
+                q_elements * sizeof(float),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                expected.data(),
+                serial_output->gpu_data_ptr(),
+                q_elements * sizeof(float),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        for (int request = 0; request < request_count; ++request)
+        {
+            const size_t offset = static_cast<size_t>(request) * q_cols;
+            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                actual.data() + offset,
+                expected.data() + offset,
+                q_cols,
+                std::string("captured variable-length ROCm request decode ") +
                     format.name + " request=" + std::to_string(request)));
         }
 

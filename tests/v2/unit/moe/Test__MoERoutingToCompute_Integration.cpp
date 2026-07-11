@@ -6,7 +6,7 @@
  * 1. MoERoutingStage produces routing_indices and routing_weights
  * 2. MoEExpertComputeStage consumes routing results + expert weights → combined output
  *
- * Tests prefill (multi-token), decode (single-token), expert-parallel partial output,
+ * Tests prefill, decode, expert-ID-apportioned partial output,
  * and normalized weight flow.
  */
 
@@ -149,7 +149,7 @@ protected:
         EXPECT_TRUE(any_nonzero) << label << ": output is all zeros";
     }
 
-    /// Check no NaN/Inf (but allow all-zeros for EP partial output)
+    /// Check no NaN/Inf, while allowing an all-zero local routed partial.
     void verifyNoNaN(const float *data, int count, const std::string &label)
     {
         for (int i = 0; i < count; ++i)
@@ -278,7 +278,7 @@ TEST_F(MoERoutingToComputeTest, EPPartialOutput)
                            routing_indices.get(), routing_weights.get(),
                            seq_len, D_MODEL, NUM_EXPERTS, TOP_K));
 
-    // === Stage 2: Expert compute with EP (only experts 2,3) ===
+    // === Stage 2: expert-ID-apportioned compute (only experts 2 and 3) ===
     ASSERT_TRUE(runExpertCompute(input.get(), routing_indices.get(), routing_weights.get(),
                                  gate_exps.get(), up_exps.get(), down_exps.get(),
                                  output.get(), seq_len, D_MODEL, NUM_EXPERTS, TOP_K, INTERMEDIATE,
@@ -288,7 +288,7 @@ TEST_F(MoERoutingToComputeTest, EPPartialOutput)
     // But it must not contain NaN/Inf.
     verifyNoNaN(output->data(), seq_len * D_MODEL, "EPPartialOutput");
 
-    // Verify allowsZeroOutput() returns true for EP configuration
+    // A participant with no selected local expert rows may produce zero output.
     MoEExpertComputeStage::Params ep_params;
     ep_params.device_id = DeviceId::cpu();
     ep_params.local_expert_count = local_expert_count;

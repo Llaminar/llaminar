@@ -19,7 +19,7 @@ namespace llaminar2
     inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
     inline constexpr uint32_t kDeviceMoERebalanceVersion = 1;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentStaticOwner = 0;
-    inline constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedEP = 1;
+    inline constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1;
 
     enum class DeviceMoERebalanceFlags : uint32_t
     {
@@ -360,7 +360,7 @@ namespace llaminar2
         uint32_t llep_alpha_numerator = 1;
         uint32_t llep_alpha_denominator = 1;
         /**
-         * @brief Balanced-load standard-EP skip threshold for LLEP.
+         * @brief Balanced-load static-owner skip threshold for LLEP.
          *
          * When `llep_enable_balanced_skip` is non-zero, LLEP may intentionally
          * publish no transfers if max_expert_load / mean_expert_load is below

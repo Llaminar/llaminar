@@ -11,11 +11,11 @@
 
 namespace llaminar2
 {
-    struct ExpertComputeDomain;
-    struct ExpertLayerPlacement;
-    struct ExpertRoutedTier;
+    struct RoutedExpertDomain;
+    struct RoutedExpertLayerPlacement;
+    struct RoutedExpertTier;
     struct MoEExpertDispatchOutput;
-    struct MoEExpertParallelReduceDiagnostics;
+    struct MoERoutedExpertPartialReduceDiagnostics;
 
     struct MoEExpertOverlayProfileRow
     {
@@ -69,12 +69,12 @@ namespace llaminar2
         static void recordDispatch(
             int layer,
             const MoEExpertDispatchOutput &output,
-            const ExpertLayerPlacement &placement,
-            const std::vector<ExpertRoutedTier> &routed_tiers);
+            const RoutedExpertLayerPlacement &placement,
+            const std::vector<RoutedExpertTier> &routed_tiers);
 
         static void recordFinalReduce(
             int layer,
-            const MoEExpertParallelReduceDiagnostics &diagnostics);
+            const MoERoutedExpertPartialReduceDiagnostics &diagnostics);
 
         // Graph-native stage profiling (Phase 14)
         static void recordGraphNativeSparseDispatch(

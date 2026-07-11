@@ -127,8 +127,7 @@ namespace llaminar2
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
                 total_tokens <= 4 &&
-                config_.compute_all_position_logits &&
-                config_.mtp.enabled;
+                config_.usesMTPGroupedDecodeEquivalentRows();
 
             LOG_DEBUG("[QwenStandardGraph] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                             << " k_n=" << k_n << " v_n=" << v_n

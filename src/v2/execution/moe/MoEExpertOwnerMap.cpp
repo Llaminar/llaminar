@@ -15,7 +15,7 @@ namespace llaminar2
 {
     namespace
     {
-        std::string formatValidationErrors(const MoEExpertParallelValidationResult &validation)
+        std::string formatValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
         {
             std::ostringstream message;
             message << "Invalid MoE expert owner map plan:";
@@ -24,8 +24,8 @@ namespace llaminar2
             return message.str();
         }
 
-        const ExpertComputeDomain &requireDomain(
-            const MoEExpertParallelPlan &plan,
+        const RoutedExpertDomain &requireDomain(
+            const MoERoutedExpertPlacementPlan &plan,
             const std::string &domain_name,
             const char *context)
         {
@@ -39,26 +39,26 @@ namespace llaminar2
             return *it;
         }
 
-        int participantWorldRank(const ExpertComputeDomain &domain, size_t participant_index)
+        int participantWorldRank(const RoutedExpertDomain &domain, size_t participant_index)
         {
             if (participant_index < domain.world_ranks.size())
                 return domain.world_ranks[participant_index];
-            if (domain.kind == ExpertDomainKind::NodeLocalTP)
+            if (domain.scope == ExecutionDomainScope::NODE_LOCAL)
                 return static_cast<int>(participant_index);
             if (domain.owner_rank >= 0)
                 return domain.owner_rank;
             return -1;
         }
 
-        bool participantWorldRankKnown(const ExpertComputeDomain &domain, size_t participant_index)
+        bool participantWorldRankKnown(const RoutedExpertDomain &domain, size_t participant_index)
         {
             return participant_index < domain.world_ranks.size() ||
-                   domain.kind == ExpertDomainKind::NodeLocalTP ||
+                   domain.scope == ExecutionDomainScope::NODE_LOCAL ||
                    domain.owner_rank >= 0;
         }
 
         std::vector<MoEExpertOwnerParticipant> buildTierParticipants(
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             size_t tier_index,
             const MoEExpertOwnerMapBuildOptions &options,
             int first_participant_id)
@@ -66,12 +66,12 @@ namespace llaminar2
             const auto &tier = plan.routed_tiers[tier_index];
             const auto &domain = requireDomain(plan, tier.domain, "routed tier");
 
-            if (options.reject_sharded_experts &&
-                domain.compute_kind == ExpertDomainComputeKind::ShardedExperts)
+            if (options.reject_tensor_sharded_domains &&
+                domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)
             {
                 std::ostringstream message;
                 message << "Graph-native routed tier '" << tier.name << "' in domain '" << domain.name
-                        << "' requests ShardedExperts; graph-native whole-expert owner maps reject routed expert GEMM sharding";
+                        << "' uses routed_compute=tensor-sharded; a whole-expert owner map cannot represent within-expert tensor shards";
                 throw std::invalid_argument(message.str());
             }
 
@@ -96,7 +96,7 @@ namespace llaminar2
             return participants;
         }
 
-        std::vector<int> sortedExpertIdsForTier(const ExpertLayerPlacement &placement, int tier_idx)
+        std::vector<int> sortedExpertIdsForTier(const RoutedExpertLayerPlacement &placement, int tier_idx)
         {
             std::vector<int> experts;
             for (size_t expert_id = 0; expert_id < placement.routed_expert_tier.size(); ++expert_id)
@@ -110,7 +110,7 @@ namespace llaminar2
 
         std::vector<MoEExpertOwner> buildLayerTierOwners(
             const MoEExpertOwnerMap &owner_map,
-            const ExpertLayerPlacement &placement,
+            const RoutedExpertLayerPlacement &placement,
             int tier_idx)
         {
             const auto expert_ids = sortedExpertIdsForTier(placement, tier_idx);
@@ -166,19 +166,16 @@ namespace llaminar2
     } // namespace
 
     MoEExpertOwnerMap MoEExpertOwnerMap::build(
-        const MoEExpertParallelPlan &plan,
+        const MoERoutedExpertPlacementPlan &plan,
         const MoEExpertOwnerMapBuildOptions &options)
     {
         if (!plan.isTieredOverlay())
-            throw std::invalid_argument("MoEExpertOwnerMap requires an enabled TieredExpertOverlay plan");
+            throw std::invalid_argument(
+                "MoEExpertOwnerMap requires an enabled tiered routed-expert placement plan");
         if (plan.placements.empty())
             throw std::invalid_argument("MoEExpertOwnerMap requires explicit layer expert placements");
 
-        const auto validation = validateMoEExpertParallelPlan(
-            plan,
-            MoEExpertParallelValidationOptions{
-                .allow_routed_sharded_experts = !options.reject_sharded_experts,
-            });
+        const auto validation = validateMoERoutedExpertPlacementPlan(plan);
         if (!validation.ok())
             throw std::invalid_argument(formatValidationErrors(validation));
 

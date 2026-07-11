@@ -250,8 +250,8 @@ namespace llaminar2
                    normalizedScope(lhs) == normalizedScope(rhs) &&
                    lhs.owner_rank == rhs.owner_rank &&
                    lhs.ranks == rhs.ranks &&
-                   lhs.compute_kind == rhs.compute_kind &&
-                   lhs.assignment_kind == rhs.assignment_kind;
+                   lhs.routed_compute_policy == rhs.routed_compute_policy &&
+                   lhs.routed_assignment_policy == rhs.routed_assignment_policy;
         }
 
         void addUniqueName(std::vector<std::string> &names, const std::string &name)
@@ -262,7 +262,8 @@ namespace llaminar2
                 names.push_back(name);
         }
 
-        std::vector<std::string> overlayDenseDomainNames(const MoEExpertParallelPlan &plan)
+        std::vector<std::string> routedPlacementDenseDomainNames(
+            const MoERoutedExpertPlacementPlan &plan)
         {
             std::vector<std::string> names;
             addUniqueName(names, plan.continuation_domain);
@@ -273,7 +274,8 @@ namespace llaminar2
             return names;
         }
 
-        std::vector<std::string> overlayRoutedDomainNames(const MoEExpertParallelPlan &plan)
+        std::vector<std::string> routedPlacementDomainNames(
+            const MoERoutedExpertPlacementPlan &plan)
         {
             std::vector<std::string> names;
             for (const auto &tier : plan.routed_tiers)
@@ -317,8 +319,8 @@ namespace llaminar2
         domain.scope = toExecutionDomainScope(scope);
         domain.owner_rank = owner_rank;
         domain.ranks = explicit_ranks;
-        domain.compute_kind = compute_kind;
-        domain.assignment_kind = assignment_kind;
+        domain.routed_compute_policy = routed_compute_policy;
+        domain.routed_assignment_policy = routed_assignment_policy;
         return domain;
     }
 
@@ -329,8 +331,8 @@ namespace llaminar2
         def.devices = domain.participants;
         def.weights = domain.weights;
         def.backend = domain.backend;
-        def.compute_kind = domain.compute_kind;
-        def.assignment_kind = domain.assignment_kind;
+        def.routed_compute_policy = domain.routed_compute_policy;
+        def.routed_assignment_policy = domain.routed_assignment_policy;
         def.scope = toTPScope(domain.scope);
         def.owner_rank = domain.owner_rank;
         def.explicit_ranks = domain.ranks;
@@ -475,8 +477,8 @@ namespace llaminar2
     {
         std::vector<ExecutionDomainDefinition> domains;
         domains.reserve(domain_definitions.size() +
-                        (moe_expert_parallel_plan ? moe_expert_parallel_plan->dense_domains.size() +
-                                                        moe_expert_parallel_plan->domains.size()
+                        (moe_routed_expert_plan ? moe_routed_expert_plan->dense_domains.size() +
+                                                        moe_routed_expert_plan->domains.size()
                                                   : 0));
 
         std::unordered_map<std::string, size_t> index_by_name;
@@ -488,11 +490,11 @@ namespace llaminar2
             domains.push_back(domain);
         };
 
-        if (moe_expert_parallel_plan)
+        if (moe_routed_expert_plan)
         {
-            for (const auto &domain : moe_expert_parallel_plan->dense_domains)
+            for (const auto &domain : moe_routed_expert_plan->dense_domains)
                 appendIfNew(domain);
-            for (const auto &domain : moe_expert_parallel_plan->domains)
+            for (const auto &domain : moe_routed_expert_plan->domains)
                 appendIfNew(domain.toExecutionDomainDefinition());
         }
 
@@ -502,10 +504,11 @@ namespace llaminar2
         return domains;
     }
 
-    std::vector<std::string> normalizeMoEExpertOverlayDomains(OrchestrationConfig &config)
+    std::vector<std::string> normalizeMoERoutedExpertPlacementDomains(
+        OrchestrationConfig &config)
     {
         std::vector<std::string> errors;
-        auto &plan_ptr = config.moe_expert_parallel_plan;
+        auto &plan_ptr = config.moe_routed_expert_plan;
         if (!plan_ptr)
             return errors;
 
@@ -529,8 +532,8 @@ namespace llaminar2
                 {
                     errors.push_back("Conflicting execution domain definition for '" + domain.name +
                                      "'. Define each hardware domain once with --define-domain; "
-                                     "--moe-expert-overlay-domain is a strict alias and must not "
-                                     "redefine a domain with different devices, scope, backend, ranks, weights, or compute kind");
+                                     "--moe-routed-expert-domain is a strict domain declaration and must not "
+                                     "redefine a domain with different devices, scope, backend, ranks, weights, or routed-expert policies");
                 }
                 else if (prior.scope == ExecutionDomainScope::AUTO && domain.scope != ExecutionDomainScope::AUTO)
                 {
@@ -550,7 +553,7 @@ namespace llaminar2
             addDomain(domain, "MoE continuation dense domain");
 
         for (const auto &domain : plan.domains)
-            addDomain(domain.toExecutionDomainDefinition(), "--moe-expert-overlay-domain");
+            addDomain(domain.toExecutionDomainDefinition(), "--moe-routed-expert-domain");
 
         if (!errors.empty())
             return errors;
@@ -561,7 +564,7 @@ namespace llaminar2
             config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain));
 
         std::vector<ExecutionDomainDefinition> normalized_dense_domains;
-        for (const auto &name : overlayDenseDomainNames(plan))
+        for (const auto &name : routedPlacementDenseDomainNames(plan))
         {
             auto it = index_by_name.find(name);
             if (it == index_by_name.end())
@@ -572,8 +575,8 @@ namespace llaminar2
         if (!normalized_dense_domains.empty() || !plan.dense_domains.empty())
             plan.dense_domains = std::move(normalized_dense_domains);
 
-        std::vector<ExpertComputeDomain> normalized_plan_domains;
-        for (const auto &name : overlayRoutedDomainNames(plan))
+        std::vector<RoutedExpertDomain> normalized_plan_domains;
+        for (const auto &name : routedPlacementDomainNames(plan))
         {
             auto it = index_by_name.find(name);
             if (it == index_by_name.end())
@@ -581,11 +584,11 @@ namespace llaminar2
             try
             {
                 normalized_plan_domains.push_back(
-                    ExpertComputeDomain::fromExecutionDomainDefinition(inventory[it->second]));
+                    RoutedExpertDomain::fromExecutionDomainDefinition(inventory[it->second]));
             }
             catch (const std::exception &e)
             {
-                errors.push_back("MoE expert overlay domain '" + name + "': " + e.what());
+                errors.push_back("MoE routed-expert domain '" + name + "': " + e.what());
             }
         }
 
@@ -595,21 +598,22 @@ namespace llaminar2
         return errors;
     }
 
-    std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config)
+    std::vector<std::string> validateMoERoutedExpertPlacementConfig(
+        const OrchestrationConfig &config)
     {
         std::vector<std::string> errors;
-        const auto &plan_ptr = config.moe_expert_parallel_plan;
+        const auto &plan_ptr = config.moe_routed_expert_plan;
         if (!plan_ptr)
         {
             return errors;
         }
 
         const auto &plan = *plan_ptr;
-        const bool has_overlay_details =
+        const bool has_routed_placement_details =
             !plan.continuation_domain.empty() ||
             !plan.base_model_domain.empty() ||
             !plan.shared_expert_domain.empty() ||
-            plan.residency_policy != ExpertResidencyPolicy::Disabled ||
+            plan.residency_policy != RoutedExpertResidencyPolicy::Disabled ||
             !plan.continuation_domain_spec.domain.empty() ||
             plan.continuation_domain_spec.dense_tp_enabled ||
             !plan.dense_domains.empty() ||
@@ -619,18 +623,18 @@ namespace llaminar2
 
         if (!plan.enabled)
         {
-            if (has_overlay_details)
+            if (has_routed_placement_details)
             {
-                errors.push_back("MoE expert overlay is off/disabled but overlay domain, tier, continuation, shared-domain, residency, or placement settings were also provided");
+                errors.push_back("MoE routed-expert placement is off but domain, tier, continuation, shared-domain, residency, or placement settings were also provided");
             }
             return errors;
         }
 
-        MoEExpertParallelValidationOptions validation_options;
-        auto plan_result = validateMoEExpertParallelPlan(plan, validation_options);
+        MoERoutedExpertPlacementValidationOptions validation_options;
+        auto plan_result = validateMoERoutedExpertPlacementPlan(plan, validation_options);
         for (const auto &error : plan_result.errors)
         {
-            errors.push_back("MoE expert overlay: " + error);
+            errors.push_back("MoE routed-expert placement: " + error);
         }
 
         if (config.device_for_this_rank.has_value() && !plan.continuation_domain.empty())
@@ -639,9 +643,9 @@ namespace llaminar2
                                                 ? "cpu"
                                                 : config.device_for_this_rank->toShortString();
             errors.push_back("Conflicting options: --device/-d " + device_spec +
-                             " and --moe-expert-overlay-continuation " +
+                             " and --moe-routed-expert-continuation-domain " +
                              plan.continuation_domain +
-                             ". Overlay continuation is the root/base placement; remove -d or disable overlay");
+                             ". Routed-expert continuation placement is explicit; remove -d or disable routed-expert placement");
         }
 
         if (config.device_for_this_rank.has_value() && !plan.base_model_domain.empty())
@@ -650,12 +654,12 @@ namespace llaminar2
                                                 ? "cpu"
                                                 : config.device_for_this_rank->toShortString();
             errors.push_back("Conflicting options: --device/-d " + device_spec +
-                             " and --moe-expert-overlay-base-domain " +
+                             " and --moe-routed-expert-base-model-domain " +
                              plan.base_model_domain +
-                             ". Overlay base/non-expert placement is explicit; remove -d or disable overlay");
+                             ". Base/non-expert placement is explicit; remove -d or disable routed-expert placement");
         }
 
-        auto domainByName = [&](const std::string &name) -> const ExpertComputeDomain *
+        auto domainByName = [&](const std::string &name) -> const RoutedExpertDomain *
         {
             auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
                                    [&](const auto &domain)
@@ -675,11 +679,11 @@ namespace llaminar2
             const int base_owner = base_domain->owner_rank;
             if (base_owner >= 0 && base_owner != continuation_owner)
             {
-                errors.push_back("MoE expert overlay base/non-expert model domain '" + base_domain_name +
+                errors.push_back("MoE routed-expert placement base/non-expert model domain '" + base_domain_name +
                                  "' owner rank " + std::to_string(base_owner) +
                                  " does not match continuation root rank " +
                                  std::to_string(continuation_owner) +
-                                 "; current overlay root execution requires base and continuation placement on the same root rank");
+                                 "; current routed-placement root execution requires base and continuation placement on the same root rank");
             }
         }
 
@@ -693,20 +697,20 @@ namespace llaminar2
                 continue;
 
             const bool remote_single_device =
-                domain->kind == ExpertDomainKind::SingleDevice &&
+                domain->scope == ExecutionDomainScope::SINGLE &&
                 domain->owner_rank >= 0 &&
                 continuation_owner >= 0 &&
                 domain->owner_rank != continuation_owner;
             if (remote_single_device)
             {
-                errors.push_back("MoE expert overlay auxiliary domain '" + domain->name +
-                                 "' has no Phase 6 worker implementation for remote single-device replicated experts");
+                errors.push_back("MoE routed-expert placement auxiliary domain '" + domain->name +
+                                 "' has no Phase 6 worker implementation for remote single-device replicated routed compute");
             }
         }
 
         if (!config.pp_stage_definitions.empty())
         {
-            errors.push_back("MoE expert overlay cannot be combined with --pp-stage in Phase 2: overlay domains are same-layer expert roles, not PP layer ownership");
+            errors.push_back("MoE routed-expert placement cannot be combined with --pp-stage in Phase 2: routed domains are same-layer expert roles, not PP layer ownership");
         }
 
         return errors;
@@ -828,21 +832,21 @@ namespace llaminar2
             errors.push_back("CPU layers must be >= 0, got " + std::to_string(cpu_layers));
         }
 
-        // Validate optional same-layer MoE expert overlay plan.
+        // Validate the optional same-layer routed-expert placement plan.
         {
             OrchestrationConfig normalized = *this;
-            if (normalized.moe_expert_parallel_plan)
+            if (normalized.moe_routed_expert_plan)
             {
-                normalized.moe_expert_parallel_plan =
-                    std::make_shared<MoEExpertParallelPlan>(*normalized.moe_expert_parallel_plan);
+                normalized.moe_routed_expert_plan =
+                    std::make_shared<MoERoutedExpertPlacementPlan>(*normalized.moe_routed_expert_plan);
             }
-            auto normalize_errors = normalizeMoEExpertOverlayDomains(normalized);
+            auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(normalized);
             for (const auto &error : normalize_errors)
             {
-                errors.push_back("MoE expert overlay: " + error);
+                errors.push_back("MoE routed-expert placement: " + error);
             }
-            auto overlay_errors = validateMoEExpertOverlayConfig(normalized);
-            errors.insert(errors.end(), overlay_errors.begin(), overlay_errors.end());
+            auto placement_errors = validateMoERoutedExpertPlacementConfig(normalized);
+            errors.insert(errors.end(), placement_errors.begin(), placement_errors.end());
         }
 
         if (moe_hot_expert_cache.kind == MoEHotExpertCacheConfig::Kind::Count &&
@@ -1051,14 +1055,15 @@ namespace llaminar2
             }
         }
 
-        if (moe_expert_parallel_plan && moe_expert_parallel_plan->enabled)
+        if (moe_routed_expert_plan && moe_routed_expert_plan->enabled)
         {
-            const auto &plan = *moe_expert_parallel_plan;
-            oss << renderMoEExpertParallelPlanExplanation(plan);
+            const auto &plan = *moe_routed_expert_plan;
+            oss << renderMoERoutedExpertPlacementPlanExplanation(plan);
         }
 
         oss << "  moe:\n";
-        oss << "    expert_mode: " << moeExpertModeToString(moe_expert_mode) << "\n";
+        oss << "    routed_expert_compute_policy: "
+            << routedExpertComputePolicyToString(routed_expert_compute_policy) << "\n";
         oss << "    rebalance: " << moeRebalanceRuntimeModeToString(moe_rebalance.mode) << "\n";
         oss << "    hot_expert_cache: " << moe_hot_expert_cache.toString() << "\n";
         oss << "    rebalance_window: " << moe_rebalance.window_size << "\n";

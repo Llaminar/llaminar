@@ -438,6 +438,15 @@ namespace llaminar2
                       .force_full_vocabulary_head = mirror_mtp_lm_head,
                       .compute_all_positions = true,
                   });
+        const bool gather_global_tp_mtp_logits =
+            !kv_cache_only &&
+            mtp_final_projection.column_parallel &&
+            ((config_.tp_ctx != nullptr &&
+              !config_.tp_ctx->isLocal() &&
+              config_.tp_ctx->degree() > 1) ||
+             (config_.tp_ctx == nullptr &&
+              mpi_ctx_ != nullptr &&
+              mpi_ctx_->world_size() > 1));
 
         if (missing("embedding table", modelEmbeddingTable()) ||
             (!kv_cache_only &&
@@ -457,6 +466,8 @@ namespace llaminar2
             missing("output.projected", output.projected) ||
             (!kv_cache_only && missing("output.hidden", output.hidden)) ||
             (!kv_cache_only && missing("output.logits", output.logits)) ||
+            (gather_global_tp_mtp_logits &&
+             missing("output.gathered_logits", output.gathered_logits)) ||
             missing("output.q", output.q) ||
             missing("output.k", output.k) ||
             missing("output.v", output.v) ||
@@ -721,8 +732,7 @@ namespace llaminar2
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
 
         graph.addNode(prefix + "lm_head",
                       ComputeStageFactory::createLMHead({
@@ -757,7 +767,35 @@ namespace llaminar2
                       }),
                       device);
         graph.addDependency(prefix + "lm_head", prefix + "final_norm");
-        graph.setTerminalNode(prefix + "lm_head");
+
+        std::string terminal_node = prefix + "lm_head";
+        if (gather_global_tp_mtp_logits)
+        {
+            /*
+             * GlobalTP deliberately keeps the 248k-vocabulary MTP head sharded:
+             * duplicating that projection on every CPU socket would double its
+             * compute and weight traffic.  Stochastic verification nevertheless
+             * needs one exact full distribution.  Gather only the compact
+             * one-to-four sidecar rows after the local projection, matching the
+             * ordinary target-verifier LM-head ownership contract.
+             */
+            AllGatherStage::Params gather_params;
+            gather_params.local_input = output.logits;
+            gather_params.full_output = output.gathered_logits;
+            gather_params.mpi_ctx = mpi_ctx_.get();
+            gather_params.actual_seq_len = total_tokens;
+            gather_params.domain = nullptr;
+            gather_params.input_buffer_id = BufferId::MTP_LOGITS;
+            gather_params.output_buffer_id = BufferId::MTP_LOGITS_GATHERED;
+
+            terminal_node = prefix + "lm_head_allgather";
+            graph.addNode(
+                terminal_node,
+                ComputeStageFactory::createAllGather(gather_params),
+                device);
+            graph.addDependency(terminal_node, prefix + "lm_head");
+        }
+        graph.setTerminalNode(terminal_node);
 
         return graph;
     }
@@ -929,7 +967,7 @@ namespace llaminar2
         const int verifier_state_capture_rows =
             per_request_verifier_state_capture_rows * std::max(1, batch_size);
         const bool force_decode_equivalent_gdn_verifier_prefill =
-            verifier_state_capture_supported &&
+            config_.usesMTPGroupedDecodeEquivalentRows() &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4;
@@ -1320,8 +1358,7 @@ namespace llaminar2
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
 
         graph.addNode(prefix + "qkv_proj",
                       ComputeStageFactory::createFusedQKVGEMM({
@@ -1488,8 +1525,7 @@ namespace llaminar2
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
                 total_tokens <= 4 &&
-                config_.compute_all_position_logits &&
-                config_.mtp.enabled;
+                config_.usesMTPGroupedDecodeEquivalentRows();
 
             LOG_DEBUG("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                                 << " k_n=" << k_n << " v_n=" << v_n);

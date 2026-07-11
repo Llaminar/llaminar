@@ -698,6 +698,57 @@ TEST_F(Test__TPAllreduceStage, BillOfMaterialsHonorsFP16MinimumElementThreshold)
 }
 
 /**
+ * @test Grouped rows cannot cross the FP16 threshold when one serial row does not.
+ *
+ * Qwen3.6 exposes this with a 5120-wide hidden state: serial decode reduces
+ * 5120 elements, while a two-request grouped condition reduces 10240 elements.
+ * Applying the 8192 cutoff to the aggregate silently changed the grouped path
+ * to FP16 even though each row's serial witness used FP32.  The production
+ * stage must make the choice from one logical row and publish that decision in
+ * its bill of materials.
+ */
+TEST_F(Test__TPAllreduceStage,
+       BillOfMaterialsFP16ThresholdIsInvariantToGroupedRowCount)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv fp16_min("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", "8192");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto grouped_tensor =
+        std::make_unique<FP32Tensor>(std::vector<size_t>{2u, 5120u});
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = grouped_tensor.get();
+    params.count = grouped_tensor->numel();
+    params.stage_name = "layer8_gdn_wo_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
+    EXPECT_EQ(bytes->tags.at("logical_row_elements"), "5120");
+    EXPECT_EQ(bytes->tags.at("precision_decision_elements"), "5120");
+    EXPECT_EQ(bytes->tags.at("elements"), "10240");
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_DOUBLE_EQ(bytes->value, 10240.0 * sizeof(float));
+
+    PerfStatsCollector::reset();
+}
+
+/**
  * @test Captured graph replay records the same allreduce BOM without re-entering execute()
  */
 TEST_F(Test__TPAllreduceStage, GraphReplayRecordsBillOfMaterials)

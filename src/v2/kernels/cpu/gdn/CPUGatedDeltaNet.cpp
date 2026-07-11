@@ -204,9 +204,7 @@ namespace llaminar2
     {
         (void)stream;
         if (!dst_state || !host_row_indices || request_count <= 0 ||
-            request_count > request_state_capacity_ ||
-            request_state_size_ <= 0 || !verifier_state_capture_ ||
-            verifier_state_capture_size_ < request_state_size_)
+            !verifier_state_capture_ || verifier_state_capture_size_ <= 0)
         {
             return false;
         }
@@ -221,6 +219,43 @@ namespace llaminar2
             const int row = host_row_indices[request];
             if (row >= verifier_state_capture_rows_)
                 return false;
+        }
+
+        if (request_count == 1)
+        {
+            /*
+             * A one-request transaction still arrives through the grouped row
+             * vector API, but its live recurrence state is the public state
+             * tensor rather than an internal request bank.  Commit the selected
+             * post-row snapshot directly.  This is a native byte copy only; it
+             * never replays a recurrent row or changes arithmetic ordering.
+             */
+            const int row = host_row_indices[0];
+            if (row >= 0)
+            {
+                std::memcpy(
+                    dst_state,
+                    verifier_state_capture_ +
+                        static_cast<size_t>(row) * verifier_state_capture_size_,
+                    static_cast<size_t>(verifier_state_capture_size_) * sizeof(float));
+            }
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_gdn_request_batched_state_publications",
+                1.0,
+                "decode",
+                "cpu",
+                {{"request_count", "1"},
+                 {"publication_policy", "single_request_snapshot_copy"}});
+            return true;
+        }
+
+        if (request_count > request_state_capacity_ ||
+            request_state_size_ <= 0 ||
+            verifier_state_capture_size_ < request_state_size_)
+        {
+            return false;
         }
 
         for (int request = 0; request < request_count; ++request)

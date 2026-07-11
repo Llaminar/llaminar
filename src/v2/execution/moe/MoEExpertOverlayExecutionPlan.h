@@ -91,11 +91,11 @@ namespace llaminar2
         int world_size = 0);
 
     MoEExpertOverlayExecutionPlan resolveMoEExpertOverlayExecutionPlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         int current_world_rank);
 
     MoEExpertOverlayExecutionPlan resolveMoEExpertOverlayExecutionPlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         const MoEExpertOverlayExecutionPlanResolverOptions &options);
 
     std::optional<std::string> graphNativeMoEOverlayBuildBlocker(

@@ -46,17 +46,6 @@ static __global__ void fp16_to_fp32_kernel(const __half* __restrict__ input,
     }
 }
 
-static __global__ void fp32_peer_add_kernel(float *__restrict__ dst,
-                                            const float *__restrict__ peer,
-                                            const size_t count)
-{
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx < count)
-    {
-        dst[idx] += peer[idx];
-    }
-}
-
 // ============================================================================
 // Host API — called from LocalTPContext
 // ============================================================================
@@ -144,39 +133,4 @@ extern "C"
         (void)hipFree(buf);
     }
 
-    int rocmLocalTPSmallFP32AllreduceScratchAlloc(void **buf, size_t bytes, int ordinal)
-    {
-        if (!buf || bytes == 0)
-            return static_cast<int>(hipErrorInvalidValue);
-        hipError_t err = hipSetDevice(ordinal);
-        if (err != hipSuccess)
-            return static_cast<int>(err);
-        return static_cast<int>(hipMalloc(buf, bytes));
-    }
-
-    void rocmLocalTPSmallFP32AllreduceScratchFree(void *buf, int ordinal)
-    {
-        if (!buf)
-            return;
-        (void)hipSetDevice(ordinal);
-        (void)hipFree(buf);
-    }
-
-    int rocmLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,
-                                            size_t count, int ordinal, void *stream)
-    {
-        if (!dst || !peer || !stream)
-            return static_cast<int>(hipErrorInvalidValue);
-        if (count == 0)
-            return static_cast<int>(hipSuccess);
-        hipError_t err = hipSetDevice(ordinal);
-        if (err != hipSuccess)
-            return static_cast<int>(err);
-
-        constexpr int BLOCK_SIZE = 256;
-        const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        hipLaunchKernelGGL(fp32_peer_add_kernel, dim3(grid_size), dim3(BLOCK_SIZE), 0,
-                           static_cast<hipStream_t>(stream), dst, peer, count);
-        return static_cast<int>(hipGetLastError());
-    }
 }

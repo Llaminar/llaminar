@@ -1,6 +1,6 @@
 /**
  * @file MoEExpertDispatchStage.h
- * @brief Host-side MoE expert-parallel dispatch descriptor stage.
+ * @brief Host-side routed-row dispatch descriptor stage.
  */
 
 #pragma once
@@ -8,7 +8,7 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
-#include "../../moe/MoEExpertParallelPlan.h"
+#include "../../moe/MoERoutedExpertPlacementPlan.h"
 #include "../../moe/MoEExpertTokenRowTransfer.h"
 
 #include <cstddef>
@@ -98,8 +98,8 @@ namespace llaminar2
             std::string continuation_domain; ///< Empty means transfer metadata is informational only
             MoEExpertTransferMode transfer_mode = MoEExpertTransferMode::Auto;
 
-            std::optional<ExpertLayerPlacement> placement;
-            std::vector<ExpertRoutedTier> routed_tiers;
+            std::optional<RoutedExpertLayerPlacement> placement;
+            std::vector<RoutedExpertTier> routed_tiers;
             MoEExpertDispatchOutput *output = nullptr;
             std::shared_ptr<MoEExpertDispatchOutput> output_lifetime;
         };

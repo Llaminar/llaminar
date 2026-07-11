@@ -81,7 +81,7 @@ namespace llaminar2
      * @brief Common-prefix decision for one speculative decode step.
      *
      * Multi-device MTP must make one publication decision for the whole
-     * topology.  A TP shard, PP stage, or ExpertParallel participant is not
+     * topology. A TP shard, PP stage, or routed-expert participant is not
      * allowed to publish a verifier state row that another participant cannot
      * publish. This result records the minimum accepted prefix, a per-
      * participant clamped publication plan, and whether any participant-local

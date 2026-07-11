@@ -135,31 +135,31 @@ TEST(Test__ConfigValidator, DefaultConfig_NoErrors)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_DefaultApportionedExperts_NoErrors)
+TEST(Test__ConfigValidator, MoE_DefaultApportionedRoutedCompute_NoErrors)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::ApportionedExperts;
+    cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_ReplicatedExperts_NoErrors)
+TEST(Test__ConfigValidator, MoE_ReplicatedRoutedCompute_NoErrors)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::ReplicatedExperts;
+    cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::Replicated;
 
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_ShardedExperts_NotImplemented)
+TEST(Test__ConfigValidator, MoE_RoutedExpertTensorSharding_NotImplemented)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::ShardedExperts;
+    cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
 
-    EXPECT_TRUE(ruleFiresFor(v, "moe-sharded-experts-not-implemented", cfg));
+    EXPECT_TRUE(ruleFiresFor(v, "moe-routed-tensor-sharding-not-implemented", cfg));
 }
 
 TEST(Test__ConfigValidator, StandardValidator_HasRules)
@@ -706,32 +706,32 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
 {
     OrchestrationConfig cfg;
     cfg.device_for_this_rank = GlobalDeviceAddress::cuda(0);
-    cfg.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>();
-    cfg.moe_expert_parallel_plan->enabled = true;
-    cfg.moe_expert_parallel_plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-    cfg.moe_expert_parallel_plan->continuation_domain = "cuda_fast";
-    cfg.moe_expert_parallel_plan->shared_expert_domain = "cuda_fast";
-    cfg.moe_expert_parallel_plan->domains = {
-        ExpertComputeDomain{
+    cfg.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    cfg.moe_routed_expert_plan->enabled = true;
+    cfg.moe_routed_expert_plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+    cfg.moe_routed_expert_plan->continuation_domain = "cuda_fast";
+    cfg.moe_routed_expert_plan->shared_expert_domain = "cuda_fast";
+    cfg.moe_routed_expert_plan->domains = {
+        RoutedExpertDomain{
             .name = "cuda_fast",
-            .kind = ExpertDomainKind::SingleDevice,
+            .scope = ExecutionDomainScope::SINGLE,
             .backend = CollectiveBackendType::AUTO,
             .participants = {GlobalDeviceAddress::cuda(0)},
             .owner_rank = 0,
-            .compute_kind = ExpertDomainComputeKind::ApportionedExperts,
+            .routed_compute_policy = RoutedExpertComputePolicy::Apportioned,
         },
-        ExpertComputeDomain{
+        RoutedExpertDomain{
             .name = "cpu_cold",
-            .kind = ExpertDomainKind::NodeLocalTP,
+            .scope = ExecutionDomainScope::NODE_LOCAL,
             .backend = CollectiveBackendType::UPI,
             .participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
             .world_ranks = {0, 1},
-            .compute_kind = ExpertDomainComputeKind::ShardedExperts,
+            .routed_compute_policy = RoutedExpertComputePolicy::TensorSharded,
         },
     };
-    cfg.moe_expert_parallel_plan->routed_tiers = {
-        ExpertRoutedTier{.name = "fast", .domain = "cuda_fast", .priority = 0},
-        ExpertRoutedTier{.name = "cold", .domain = "cpu_cold", .priority = 1, .fallback = true},
+    cfg.moe_routed_expert_plan->routed_tiers = {
+        RoutedExpertTier{.name = "fast", .domain = "cuda_fast", .priority = 0},
+        RoutedExpertTier{.name = "cold", .domain = "cpu_cold", .priority = 1, .fallback = true},
     };
 
     const auto errors = cfg.validate();
@@ -739,7 +739,7 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
     bool found_overlay_conflict = false;
     for (const auto &error : errors)
     {
-        if (error.find("Conflicting options: --device/-d cuda:0 and --moe-expert-overlay-continuation cuda_fast") != std::string::npos)
+        if (error.find("Conflicting options: --device/-d cuda:0 and --moe-routed-expert-continuation-domain cuda_fast") != std::string::npos)
         {
             found_overlay_conflict = true;
             break;

@@ -155,9 +155,9 @@ namespace llaminar2::test
             return stage.execute(ctx);
         }
 
-        ExpertRoutedTier routedTier(const std::string &name, const std::string &domain)
+        RoutedExpertTier routedTier(const std::string &name, const std::string &domain)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             return tier;
@@ -191,7 +191,7 @@ namespace llaminar2::test
             params.top_k = kTopK;
             params.d_model = kDModel;
             params.continuation_domain = "hot";
-            params.placement = ExpertLayerPlacement{.layer = kLayer, .routed_expert_tier = {0, 0, 1, 1}};
+            params.placement = RoutedExpertLayerPlacement{.layer = kLayer, .routed_expert_tier = {0, 0, 1, 1}};
             params.routed_tiers = {routedTier("hot", "hot"), routedTier("cold", "cold")};
             params.output = &dispatch;
 

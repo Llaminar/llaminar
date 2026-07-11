@@ -4988,7 +4988,16 @@ namespace llaminar2::test::parity::qwen36
         const bool dynamic_depth =
             depth_policy.mode == MTPDepthPolicyMode::Dynamic;
         constexpr int block_size = 2;
-        constexpr int stochastic_decode_steps = 3;
+        /*
+         * One decode-step output slot belongs to the already-sampled first
+         * token.  The remaining budget must still fit every requested draft
+         * token, otherwise a nominal depth-3 cell is silently clamped to depth
+         * 2 and dynamic policy observations are intentionally discarded as
+         * budget-limited.  Keep three outputs for the shallow cells and add the
+         * fourth output required to exercise a complete depth-3 verifier.
+         */
+        const int stochastic_decode_steps =
+            std::max(3, requested_draft_depth + 1);
         auto factory = createOrchestrationRunnerFactory();
 
         SamplingParams stochastic;
@@ -5055,7 +5064,12 @@ namespace llaminar2::test::parity::qwen36
             /*allow_transaction_rollbacks=*/true);
         EXPECT_GE(after_reused_mtp.mtp_draft_steps, 1u);
         EXPECT_GE(after_reused_mtp.mtp_verifier_runs, 1u);
-        EXPECT_GE(after_reused_mtp.mtp_verifier_token_count, 2u);
+        EXPECT_GE(
+            after_reused_mtp.mtp_verifier_token_count,
+            static_cast<uint64_t>(requested_draft_depth + 1))
+            << "The stochastic depth cell must execute one complete verifier "
+               "at its requested depth instead of passing through a "
+               "budget-clamped shallower draft.";
         EXPECT_GE(after_reused_mtp.mtp_stochastic_accept_tests, 1u);
         EXPECT_EQ(after_reused_mtp.mtp_stochastic_accept_tests,
                   after_reused_mtp.mtp_stochastic_accepts +

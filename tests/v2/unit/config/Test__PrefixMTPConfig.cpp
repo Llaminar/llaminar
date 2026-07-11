@@ -411,7 +411,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
         source.activation_precision,
         source.kv_cache_precision,
         source.fused_attention_backend,
-        source.moe_expert_mode,
+        source.routed_expert_compute_policy,
         source.moe_hot_expert_cache,
         source.moe_rebalance,
         source.prefix_cache,

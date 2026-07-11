@@ -25,8 +25,8 @@ Options:
   --moe-model PATH       MoE Qwen3.6 GGUF
   --topologies LIST      Comma list: single,localtp_rocm2,localtp_cuda2,
                          localpp_rocm2,nodelocaltp_cpu2,
-                         expert_overlay_rocm2_hot,
-                         expert_overlay_rocm2_cpu2
+                         routed_expert_tiered_rocm2_hot,
+                         routed_expert_tiered_rocm2_cpu2
   --devices LIST         Comma list, e.g. cuda:0,rocm:0,cpu:0
                          Used only by the single topology.
   --models LIST          Comma list: dense,moe
@@ -258,7 +258,7 @@ topology_model_supported() {
       [[ "${model}" == "dense" ]]
       return
       ;;
-    expert_overlay_rocm2_hot|expert_overlay_rocm2_cpu2)
+    routed_expert_tiered_rocm2_hot|routed_expert_tiered_rocm2_cpu2)
       [[ "${model}" == "moe" ]]
       return
       ;;
@@ -275,7 +275,7 @@ topology_lane_devices() {
     single)
       split_csv "${devices}"
       ;;
-    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2|expert_overlay_rocm2_hot|expert_overlay_rocm2_cpu2)
+    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2|routed_expert_tiered_rocm2_hot|routed_expert_tiered_rocm2_cpu2)
       echo "${topology}"
       ;;
     *)
@@ -336,30 +336,30 @@ describe_topology() {
         --backend mpi
       )
       ;;
-    expert_overlay_rocm2_hot)
+    routed_expert_tiered_rocm2_hot)
       topology_device_label="rocm:0+rocm:1"
       topology_args=(
-        --moe-expert-overlay tiered
-        --moe-expert-overlay-continuation qwen36_moe_rocm_hot
-        --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-residency static-by-id
-        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=apportioned_experts"
-        --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+        --moe-routed-expert-placement tiered-overlay
+        --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-shared-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-residency static-by-id
+        --moe-routed-expert-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned"
+        --moe-routed-expert-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
       )
       ;;
-    expert_overlay_rocm2_cpu2)
+    routed_expert_tiered_rocm2_cpu2)
       topology_device_label="rocm:0+rocm:1+cpu:0+cpu:1"
       topology_args=(
-        --moe-expert-overlay tiered
-        --moe-expert-overlay-continuation qwen36_moe_rocm_hot
-        --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-residency static-by-id
-        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=apportioned_experts"
-        --moe-expert-overlay-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;compute=apportioned_experts"
-        --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096"
-        --moe-expert-overlay-tier "cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+        --moe-routed-expert-placement tiered-overlay
+        --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-shared-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-residency static-by-id
+        --moe-routed-expert-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;routed_compute=apportioned"
+        --moe-routed-expert-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;routed_compute=apportioned"
+        --moe-routed-expert-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096"
+        --moe-routed-expert-tier "cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
       )
       ;;
     *)

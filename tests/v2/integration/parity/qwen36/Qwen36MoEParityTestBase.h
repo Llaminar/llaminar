@@ -20,8 +20,8 @@
 #include "collective/LocalTPContext.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
-#include "execution/moe/MoEExpertParallelPlan.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/mtp/MTPStateTransaction.h"
 #include "execution/mtp/MTPSpecStateContract.h"
@@ -89,7 +89,7 @@ namespace llaminar2::test::parity::qwen36
         int required_rocm_devices = 0;
         int required_cpu_sockets = 0;
         int mpi_ranks = 1;
-        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+        std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
         std::optional<MoERebalanceRuntimeConfig> moe_rebalance;
         std::vector<std::pair<std::string, std::string>> env_overrides;
     };
@@ -444,22 +444,22 @@ namespace llaminar2::test::parity::qwen36
         return runner.maybeApplyMoERebalance();
     }
 
-    inline ExpertComputeDomain localTPMoEDomain(
+    inline RoutedExpertDomain localTPMoEDomain(
         const std::string &name,
         CollectiveBackendType backend,
         std::vector<GlobalDeviceAddress> participants)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = name;
-        domain.kind = ExpertDomainKind::LocalTP;
+        domain.scope = ExecutionDomainScope::LOCAL;
         domain.backend = backend;
         domain.participants = std::move(participants);
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    inline ExpertRoutedTier routedTier(
+    inline RoutedExpertTier routedTier(
         const std::string &name,
         const std::string &domain,
         int priority,
@@ -467,7 +467,7 @@ namespace llaminar2::test::parity::qwen36
         size_t memory_budget_bytes,
         bool fallback = false)
     {
-        ExpertRoutedTier tier;
+        RoutedExpertTier tier;
         tier.name = name;
         tier.domain = domain;
         tier.priority = priority;
@@ -514,11 +514,11 @@ namespace llaminar2::test::parity::qwen36
     /**
      * @brief Format MoE overlay validation failures for assertion messages.
      *
-     * @param validation Result returned by validateMoEExpertParallelPlan().
+     * @param validation Result returned by validateMoERoutedExpertPlacementPlan().
      * @return Human-readable bullet list of validation errors.
      */
     inline std::string formatMoEOverlayValidationErrors(
-        const MoEExpertParallelValidationResult &validation)
+        const MoERoutedExpertPlacementValidationResult &validation)
     {
         std::ostringstream message;
         for (const auto &error : validation.errors)
@@ -537,13 +537,13 @@ namespace llaminar2::test::parity::qwen36
      * @param ctx Loaded Qwen3.6 MoE model context.
      * @return Planner metadata for routed/shared expert capacity decisions.
      */
-    inline MoEExpertModelMetadata qwen36MoEPlannerMetadataFromModel(
+    inline MoERoutedExpertModelMetadata qwen36MoEPlannerMetadataFromModel(
         const ModelContext &ctx)
     {
         const auto &loader = ctx.concreteLoader();
         const std::string arch = ctx.architecture();
 
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = ctx.totalBlockCount();
         metadata.num_experts = loader.getInt(arch + ".expert_count", 0);
         metadata.d_model = ctx.embeddingLength();
@@ -570,8 +570,8 @@ namespace llaminar2::test::parity::qwen36
      * @param error Optional error sink.
      * @return Planned overlay with explicit layer placements, or nullptr on error.
      */
-    inline std::shared_ptr<MoEExpertParallelPlan> planMoEOverlayForVerifierProof(
-        const std::shared_ptr<MoEExpertParallelPlan> &requested,
+    inline std::shared_ptr<MoERoutedExpertPlacementPlan> planMoEOverlayForVerifierProof(
+        const std::shared_ptr<MoERoutedExpertPlacementPlan> &requested,
         const ModelContext &ctx,
         std::string *error)
     {
@@ -582,13 +582,13 @@ namespace llaminar2::test::parity::qwen36
         {
             const auto metadata = qwen36MoEPlannerMetadataFromModel(ctx);
             auto planned =
-                MoEExpertParallelPlanner::plan(*requested, metadata).planned_plan;
+                MoERoutedExpertPlacementPlanner::plan(*requested, metadata).planned_plan;
 
-            MoEExpertParallelValidationOptions options;
+            MoERoutedExpertPlacementValidationOptions options;
             options.layer_count = metadata.num_layers;
             options.routed_expert_count = metadata.num_experts;
             const auto validation =
-                validateMoEExpertParallelPlan(planned, options);
+                validateMoERoutedExpertPlacementPlan(planned, options);
             if (!validation.ok())
             {
                 if (error)
@@ -599,7 +599,7 @@ namespace llaminar2::test::parity::qwen36
                 }
                 return nullptr;
             }
-            return std::make_shared<MoEExpertParallelPlan>(std::move(planned));
+            return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
         }
         catch (const std::exception &e)
         {
@@ -622,7 +622,7 @@ namespace llaminar2::test::parity::qwen36
         const DeviceId &execution_device)
     {
         MoEContinuationLocalTPHarness harness;
-        const auto &plan = test_case.moe_expert_parallel_plan;
+        const auto &plan = test_case.moe_routed_expert_plan;
         if (!plan ||
             !plan->continuation_domain_spec.dense_tp_enabled ||
             plan->continuation_domain.empty())
@@ -633,7 +633,7 @@ namespace llaminar2::test::parity::qwen36
         const auto domain_it = std::find_if(
             plan->domains.begin(),
             plan->domains.end(),
-            [&](const ExpertComputeDomain &domain)
+            [&](const RoutedExpertDomain &domain)
             {
                 return domain.name == plan->continuation_domain;
             });
@@ -644,7 +644,7 @@ namespace llaminar2::test::parity::qwen36
                 plan->continuation_domain + "' but no matching domain exists";
             return harness;
         }
-        if (domain_it->kind != ExpertDomainKind::LocalTP ||
+        if (domain_it->scope != ExecutionDomainScope::LOCAL ||
             domain_it->participants.size() <= 1)
         {
             return harness;
@@ -719,7 +719,7 @@ namespace llaminar2::test::parity::qwen36
         const bool use_rank_orchestrator =
             [&]()
         {
-            const auto &plan = test_case.moe_expert_parallel_plan;
+            const auto &plan = test_case.moe_routed_expert_plan;
             if (!plan ||
                 !plan->continuation_domain_spec.dense_tp_enabled ||
                 plan->continuation_domain.empty())
@@ -729,12 +729,12 @@ namespace llaminar2::test::parity::qwen36
             const auto domain_it = std::find_if(
                 plan->domains.begin(),
                 plan->domains.end(),
-                [&](const ExpertComputeDomain &domain)
+                [&](const RoutedExpertDomain &domain)
                 {
                     return domain.name == plan->continuation_domain;
                 });
             return domain_it != plan->domains.end() &&
-                   domain_it->kind == ExpertDomainKind::LocalTP &&
+                   domain_it->scope == ExecutionDomainScope::LOCAL &&
                    domain_it->participants.size() > 1;
         }();
         const WeightDistributionStrategy weight_strategy =
@@ -754,12 +754,12 @@ namespace llaminar2::test::parity::qwen36
 
         InferenceRunnerConfig effective_config = config;
         MoEPrefixRestoreParityCase effective_case = test_case;
-        if (test_case.moe_expert_parallel_plan)
+        if (test_case.moe_routed_expert_plan)
         {
             std::string plan_error;
             auto planned_plan =
                 planMoEOverlayForVerifierProof(
-                    test_case.moe_expert_parallel_plan,
+                    test_case.moe_routed_expert_plan,
                     *result.model_ctx,
                     &plan_error);
             if (!planned_plan)
@@ -768,8 +768,8 @@ namespace llaminar2::test::parity::qwen36
                     "failed to plan MoE verifier overlay: " + plan_error;
                 return result;
             }
-            effective_case.moe_expert_parallel_plan = planned_plan;
-            effective_config.moe_expert_parallel_plan = planned_plan;
+            effective_case.moe_routed_expert_plan = planned_plan;
+            effective_config.moe_routed_expert_plan = planned_plan;
         }
 
         if (!use_rank_orchestrator)
@@ -816,13 +816,13 @@ namespace llaminar2::test::parity::qwen36
             config.tp_allreduce_precision_override;
         rank_config.prefix_cache = config.prefix_cache;
         rank_config.mtp = config.mtp;
-        rank_config.moe_expert_mode = config.moe_expert_mode;
+        rank_config.routed_expert_compute_policy = config.routed_expert_compute_policy;
         rank_config.moe_hot_expert_cache = config.moe_hot_expert_cache;
         rank_config.moe_rebalance = config.moe_rebalance;
         rank_config.use_mapped_memory = config.use_mapped_memory;
         rank_config.prepared_weight_store = config.prepared_weight_store;
-        rank_config.moe_expert_parallel_plan =
-            effective_config.moe_expert_parallel_plan;
+        rank_config.moe_routed_expert_plan =
+            effective_config.moe_routed_expert_plan;
         rank_config.moe_expert_overlay_mpi_ctx =
             effective_config.moe_expert_overlay_mpi_ctx;
 
@@ -836,15 +836,15 @@ namespace llaminar2::test::parity::qwen36
         return result;
     }
 
-    inline std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayPlanRocm2TPHotCpu2LocalTPCold()
+    inline std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayPlanRocm2TPHotCpu2LocalTPCold()
     {
         constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
         constexpr const char *kCpuColdDomain = "qwen36_moe_cpu_cold";
 
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->continuation_domain = kRocmHotDomain;
         plan->shared_expert_domain = kRocmHotDomain;
         plan->domains = {
@@ -869,18 +869,18 @@ namespace llaminar2::test::parity::qwen36
          * the CPU domain remains responsible only for cold routed expert rows.
          */
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         return plan;
     }
 
-    inline std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayPlanRocm2TPHotOnly()
+    inline std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayPlanRocm2TPHotOnly()
     {
         constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
 
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->continuation_domain = kRocmHotDomain;
         plan->shared_expert_domain = kRocmHotDomain;
         plan->domains = {
@@ -893,18 +893,18 @@ namespace llaminar2::test::parity::qwen36
             routedTier("hot", kRocmHotDomain, 0, 256, gib(8)),
         };
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         return plan;
     }
 
-    inline std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayPlanCuda2TPHotOnly()
+    inline std::shared_ptr<MoERoutedExpertPlacementPlan> qwen36MoEOverlayPlanCuda2TPHotOnly()
     {
         constexpr const char *kCudaHotDomain = "qwen36_moe_cuda_hot";
 
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->continuation_domain = kCudaHotDomain;
         plan->shared_expert_domain = kCudaHotDomain;
         plan->domains = {
@@ -917,7 +917,7 @@ namespace llaminar2::test::parity::qwen36
             routedTier("hot", kCudaHotDomain, 0, 256, gib(8)),
         };
         plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         return plan;
     }
 
@@ -1232,7 +1232,7 @@ namespace llaminar2::test::parity::qwen36
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = std::max(1, mtp_draft_tokens);
         config.mtp.depth_policy = mtp_depth_policy;
-        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+        config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
         if (test_case.moe_rebalance)
         {
             config.moe_rebalance = *test_case.moe_rebalance;
@@ -1366,7 +1366,7 @@ namespace llaminar2::test::parity::qwen36
             };
             test_case.required_cuda_devices = 2;
             test_case.tp_allreduce_precision_override = "schema";
-            test_case.moe_expert_parallel_plan =
+            test_case.moe_routed_expert_plan =
                 qwen36MoEOverlayPlanCuda2TPHotOnly();
             break;
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:
@@ -1376,7 +1376,7 @@ namespace llaminar2::test::parity::qwen36
             };
             test_case.required_rocm_devices = 2;
             test_case.tp_allreduce_precision_override = "schema";
-            test_case.moe_expert_parallel_plan =
+            test_case.moe_routed_expert_plan =
                 qwen36MoEOverlayPlanRocm2TPHotOnly();
             break;
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
@@ -1388,7 +1388,7 @@ namespace llaminar2::test::parity::qwen36
             };
             test_case.required_rocm_devices = 2;
             test_case.required_cpu_sockets = 2;
-            test_case.moe_expert_parallel_plan =
+            test_case.moe_routed_expert_plan =
                 qwen36MoEOverlayPlanRocm2TPHotCpu2LocalTPCold();
             break;
         }
@@ -1707,6 +1707,32 @@ namespace llaminar2::test::parity::qwen36
                 "rocm_native_vnni_small_m_calls",
                 context);
         }
+    }
+
+    /**
+     * @brief Prove the topology-specific MTP-head ownership policy at runtime.
+     *
+     * CPU NodeLocalTP deliberately keeps the very large MTP head column-sharded
+     * and graph-allgathers only the compact verifier-row logits.  GPU LocalTP
+     * mirrors the head on every child, while single-device execution already
+     * owns the full vocabulary.  This assertion prevents token parity from
+     * passing if NodeLocalTP silently skips its required gather, and also guards
+     * against reintroducing a tiny collective into the mirrored ownership modes.
+     */
+    inline void expectMoEMTPHeadOwnershipPerfPath(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        constexpr const char *counter_name =
+            "global_tp_sidecar_logit_allgathers";
+        if (test_case.topology == MoEPrefixParityTopology::NodeLocalTP)
+        {
+            expectPerfCounterPositive(records, "mtp", counter_name, context);
+            return;
+        }
+
+        expectPerfCounterZero(records, "mtp", counter_name, context);
     }
 
     inline bool hasMTPPerfRecordTag(
@@ -2995,7 +3021,14 @@ namespace llaminar2::test::parity::qwen36
         const int requested_draft_depth = std::max(1, draft_depth);
         const bool dynamic_depth =
             mtp_depth_policy.mode == MTPDepthPolicyMode::Dynamic;
-        const int stochastic_decode_steps = std::max(2, test_case.decode_steps);
+        /*
+         * Reserve one output slot for the first sampled token plus the full
+         * requested draft.  Without this lower bound, depth-3 and dynamic-depth
+         * matrix cells can be budget-clamped to depth 2 while still reporting
+         * successful stochastic generation and token parity.
+         */
+        const int stochastic_decode_steps = std::max(
+            {2, test_case.decode_steps, requested_draft_depth + 1});
         auto factory = createOrchestrationRunnerFactory();
 
         SamplingParams stochastic = qwen36MoEStochasticVerifierSamplingParams();
@@ -3091,6 +3124,16 @@ namespace llaminar2::test::parity::qwen36
             expectMoEPrefixCachePerfPath(
                 restored_records,
                 test_case.name + " stochastic restored-prefix request");
+            if (test_case.topology == MoEPrefixParityTopology::NodeLocalTP &&
+                !moEPrefixCaseUsesGPU(test_case))
+            {
+                expectPerfCounterPositive(
+                    restored_records,
+                    "prefix_cache",
+                    "cpu_global_tp_terminal_logits_allgathers",
+                    test_case.name +
+                        " stochastic restored-prefix terminal logits");
+            }
             expectMoERebalancePerfPath(
                 test_case,
                 restored_records,
@@ -3099,6 +3142,46 @@ namespace llaminar2::test::parity::qwen36
                 test_case,
                 restored_records,
                 test_case.name + " stochastic restored-prefix request");
+            expectMoEMTPHeadOwnershipPerfPath(
+                test_case,
+                restored_records,
+                test_case.name + " stochastic restored-prefix request");
+            if (test_case.topology ==
+                    MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
+                test_case.topology ==
+                    MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly)
+            {
+                EXPECT_TRUE(hasMTPPerfRecordTag(
+                    restored_records,
+                    "gpu_decode_transaction_position_initializations",
+                    "source",
+                    "prefix_terminal_restore"))
+                    << "GPU prefix restore must initialize MTP graph planning "
+                       "from the scheduler-known prompt length, never from a "
+                       "backend host position mirror.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_TRUE(hasMTPPerfRecordTag(
+                    restored_records,
+                    "rank_resident_logical_state_aggregate_invalidations",
+                    "lifecycle",
+                    "populate_prefix"))
+                    << "LocalTP prefix replacement must explicitly retire the "
+                       "rank aggregate that named the previous request's child "
+                       "logical-state mailboxes.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_TRUE(hasMTPPerfCounter(
+                    restored_records,
+                    "gpu_decode_transaction_position_reads"))
+                    << "GPU MTP after prefix restore must consume the "
+                       "orchestration-owned transaction position.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+                EXPECT_FALSE(hasMTPPerfCounter(
+                    restored_records,
+                    "cpu_decode_position_planning_reads"))
+                    << "GPU MTP planning must never fall through to the CPU "
+                       "runner-position path.\n"
+                    << PerfStatsCollector::summaryString({"mtp"});
+            }
         }
 
         mtp->clearCache();
@@ -3109,7 +3192,8 @@ namespace llaminar2::test::parity::qwen36
         logMoEParityPhase(test_case, "stochastic-mtp.reused-generate", phase_start);
         const auto after_reused_mtp = mtp->prefixStateProbe();
         const auto phase138_records =
-            PerfStatsCollector::snapshot({"mtp", "moe_rebalance", "kernel"});
+            PerfStatsCollector::snapshot(
+                {"mtp", "prefix_cache", "moe_rebalance", "kernel"});
         mtp->shutdown();
 
         ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
@@ -3119,6 +3203,21 @@ namespace llaminar2::test::parity::qwen36
                "stochastic decode for the same seed";
         EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
             << "MoE stochastic MTP with the same seed must be reproducible after clearCache()";
+        expectMoEMTPHeadOwnershipPerfPath(
+            test_case,
+            phase138_records,
+            test_case.name + " stochastic post-clearCache request");
+        if (enable_prefix_cache &&
+            test_case.topology == MoEPrefixParityTopology::NodeLocalTP &&
+            !moEPrefixCaseUsesGPU(test_case))
+        {
+            expectPerfCounterPositive(
+                phase138_records,
+                "prefix_cache",
+                "cpu_global_tp_terminal_logits_allgathers",
+                test_case.name +
+                    " stochastic post-clearCache terminal logits");
+        }
         EXPECT_FALSE(after_reused_mtp.mtp_bypassed)
             << after_reused_mtp.mtp_bypass_reason;
         EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
@@ -3143,7 +3242,12 @@ namespace llaminar2::test::parity::qwen36
             << " MoE stochastic MTP hit MTP transaction validation failures";
         EXPECT_GE(after_reused_mtp.mtp_draft_steps, 1u);
         EXPECT_GE(after_reused_mtp.mtp_verifier_runs, 1u);
-        EXPECT_GE(after_reused_mtp.mtp_verifier_token_count, 2u);
+        EXPECT_GE(
+            after_reused_mtp.mtp_verifier_token_count,
+            static_cast<uint64_t>(requested_draft_depth + 1))
+            << test_case.name
+            << " stochastic depth coverage must include one complete verifier "
+               "at the requested depth, not only a budget-clamped prefix";
         EXPECT_GE(after_reused_mtp.mtp_stochastic_accept_tests, 1u);
         EXPECT_EQ(after_reused_mtp.mtp_stochastic_accept_tests,
                   after_reused_mtp.mtp_stochastic_accepts +
@@ -3261,10 +3365,22 @@ namespace llaminar2::test::parity::qwen36
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_TRUE(hasMTPPerfCounter(
                 phase138_records,
-                "device_resident_shifted_mtp_kv_state_mailbox_retargets"))
-                << "A LocalTP shifted-cache suffix append must carry its "
-                   "canonical device count and readiness event into the new "
-                   "live-state epoch.\n"
+                "device_resident_logical_state_mailboxes"))
+                << "After a LocalTP shifted-cache suffix append advances the "
+                   "live-state epoch, grouped accepted-state publication must "
+                   "create a fresh arena-backed logical-state mailbox. The "
+                   "retired shifted-KV mailbox was not the owner of this "
+                   "request-lifetime state.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(hasMTPPerfCounter(
+                phase138_records,
+                "device_resident_logical_state_mailbox_retargets"))
+                << "Grouped device-outcome commits are followed immediately "
+                   "by accepted-state publication, which owns a fresh logical "
+                   "mailbox for the new epoch. Retargeting the pre-publication "
+                   "mailbox would add a redundant event and preserve a stale "
+                   "lifecycle instead of exercising the economical production "
+                   "path.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_TRUE(hasMTPPerfCounter(
                 phase138_records,
@@ -5631,7 +5747,7 @@ namespace llaminar2::test::parity::qwen36
         config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 1;
-        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+        config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
 
         auto proof_runner =
             createMoEVerifierProofRunner(test_case, model_path, device, config);
@@ -6683,7 +6799,7 @@ namespace llaminar2::test::parity::qwen36
         config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = verifier_row_count;
-        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+        config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
 
         auto proof_runner =
             createMoEVerifierProofRunner(test_case, model_path, device, config);
@@ -6977,7 +7093,7 @@ namespace llaminar2::test::parity::qwen36
         config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = verifier_row_count;
-        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+        config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
 
         auto proof_runner =
             createMoEVerifierProofRunner(test_case, model_path, device, config);
@@ -8024,22 +8140,16 @@ namespace llaminar2::test::parity::qwen36
             << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_TRUE(hasMTPPerfCounter(
             records,
-            "device_resident_shifted_mtp_kv_state_mailboxes"))
-            << "GPU MoE MTP must publish the shifted cache's canonical device "
-               "count after a resident sidecar or accepted-state transaction.\n"
+            "device_resident_logical_state_mailboxes"))
+            << "GPU MoE MTP must publish an arena-backed logical-state mailbox "
+               "after the accepted-state transaction advances the live epoch.\n"
             << PerfStatsCollector::summaryString({"mtp"});
-        const bool consumed_shifted_boundary = hasMTPPerfCounter(
+        EXPECT_FALSE(hasMTPPerfCounter(
             records,
-            "device_resident_shifted_mtp_kv_commit_boundaries");
-        const bool retargeted_shifted_boundary = hasMTPPerfCounter(
-            records,
-            "device_resident_shifted_mtp_kv_state_mailbox_retargets");
-        EXPECT_EQ(consumed_shifted_boundary, retargeted_shifted_boundary)
-            << "When a depth-1 trajectory needs a separate shifted-row commit, "
-               "the same transaction must both consume the canonical boundary "
-               "and carry it across the resulting live-state epoch. Fully "
-               "accepted trajectories may publish atomically without either "
-               "extra operation.\n"
+            "device_resident_logical_state_mailbox_retargets"))
+            << "The grouped device-outcome path must publish a fresh mailbox "
+               "after any shifted-row mutation instead of retargeting the "
+               "pre-publication logical-state handle.\n"
             << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_FALSE(hasMTPPerfCounter(
             records,

@@ -1739,7 +1739,7 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
  *
  * The inverse map lets the kernel find the grouped SwiGLU row for each original
  * route.  Masked or non-local routes keep a -1 map entry and are skipped, which
- * is exactly what a LocalTP ExpertParallel participant does before the output
+ * is exactly what a LocalTP expert-id-apportioned participant does before the output
  * allreduce combines contributions from its peers.
  */
 template <NativeVNNIFormatPrefill FMT>

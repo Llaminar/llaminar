@@ -128,6 +128,15 @@ namespace llaminar2
 
         explicit KVCacheAppendStage(Params params);
 
+        /**
+         * @brief Return the immutable graph-declared append policy.
+         *
+         * This accessor is intended for graph construction tests and
+         * diagnostics. Runtime mutation remains confined to the stage's
+         * dynamic replay fields; callers must not cast away constness.
+         */
+        const Params &getParams() const { return params_; }
+
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::KV_CACHE_APPEND; }
         StageBufferContract bufferContract() const override;
@@ -303,7 +312,6 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
         bool producesVDequant() const { return params_.V_dequant_out != nullptr; }
-        const Params &getParams() const { return params_; }
 
     private:
         /**

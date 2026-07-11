@@ -264,7 +264,13 @@ namespace llaminar2::test::gpu_fused_residual_norm_verifier
         const char *counter_name,
         const char *format_label)
     {
-        constexpr std::array<int, 2> column_counts = {128, 4096};
+        // Keep the narrow reduction and the established 4096-wide lane, then
+        // exercise Qwen3.6/Qwen2.5-32B's real 5120-wide hidden state.  The
+        // latter is intentionally not represented by a nearby power of two:
+        // it assigns five values to each 1024-thread reduction lane and has
+        // previously exposed model-only grouped verifier drift that a 4096
+        // matrix could not detect.
+        constexpr std::array<int, 3> column_counts = {128, 4096, 5120};
 
         for (int cols : column_counts)
         {

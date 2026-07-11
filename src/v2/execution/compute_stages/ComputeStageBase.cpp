@@ -78,8 +78,8 @@ namespace llaminar2
             return "MOE_SHARED_EXPERT_GATE";
         case ComputeStageType::MOE_EXPERT_DISPATCH:
             return "MOE_EXPERT_DISPATCH";
-        case ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE:
-            return "MOE_EXPERT_PARALLEL_REDUCE";
+        case ComputeStageType::MOE_ROUTED_EXPERT_PARTIAL_REDUCE:
+            return "MOE_ROUTED_EXPERT_PARTIAL_REDUCE";
         case ComputeStageType::MOE_SPARSE_DISPATCH:
             return "MOE_SPARSE_DISPATCH";
         case ComputeStageType::MOE_LOCAL_EXPERT:

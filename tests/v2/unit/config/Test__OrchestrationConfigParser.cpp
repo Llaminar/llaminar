@@ -74,7 +74,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
     EXPECT_FALSE(config.dry_run);
-    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ApportionedExperts);
+    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
     EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
     EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
@@ -440,23 +440,23 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
     ArgvHelper named_args{"llaminar2",
                           "--define-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;owner=0"};
     ArgvHelper overlay_args{"llaminar2",
-                            "--moe-expert-overlay", "tiered",
-                            "--moe-expert-overlay-continuation", "rocm_hot",
-                            "--moe-expert-overlay-shared-domain", "rocm_hot",
-                            "--moe-expert-overlay-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;compute=apportioned_experts;owner=0",
-                            "--moe-expert-overlay-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=apportioned_experts;ranks=0,1",
-                            "--moe-expert-overlay-tier", "hot@rocm_hot;priority=0",
-                            "--moe-expert-overlay-tier", "cold@cpu_cold;priority=1;fallback=true"};
+                            "--moe-routed-expert-placement", "tiered-overlay",
+                            "--moe-routed-expert-continuation-domain", "rocm_hot",
+                            "--moe-routed-expert-shared-domain", "rocm_hot",
+                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;routed_compute=apportioned;owner=0",
+                            "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1",
+                            "--moe-routed-expert-tier", "hot@rocm_hot;priority=0",
+                            "--moe-routed-expert-tier", "cold@cpu_cold;priority=1;fallback=true"};
 
     const auto named_config = parser.parseArgs(named_args.argc(), named_args.argv());
     const auto overlay_config = parser.parseArgs(overlay_args.argc(), overlay_args.argv());
 
     ASSERT_EQ(named_config.domain_definitions.size(), 1u);
-    ASSERT_NE(overlay_config.moe_expert_parallel_plan, nullptr);
-    ASSERT_EQ(overlay_config.moe_expert_parallel_plan->domains.size(), 2u);
+    ASSERT_NE(overlay_config.moe_routed_expert_plan, nullptr);
+    ASSERT_EQ(overlay_config.moe_routed_expert_plan->domains.size(), 2u);
 
     const auto named_domain = named_config.domain_definitions[0].toExecutionDomainDefinition();
-    const auto overlay_domain = overlay_config.moe_expert_parallel_plan->domains[0].toExecutionDomainDefinition();
+    const auto overlay_domain = overlay_config.moe_routed_expert_plan->domains[0].toExecutionDomainDefinition();
 
     EXPECT_EQ(named_domain.name, overlay_domain.name);
     EXPECT_EQ(named_domain.participants, overlay_domain.participants);
@@ -465,8 +465,8 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
     EXPECT_EQ(named_domain.backend, overlay_domain.backend);
     EXPECT_EQ(named_domain.owner_rank, overlay_domain.owner_rank);
     EXPECT_EQ(named_domain.ranks, overlay_domain.ranks);
-    EXPECT_EQ(named_domain.compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
-    EXPECT_EQ(overlay_domain.compute_kind, ExecutionDomainComputeKind::APPORTIONED_EXPERTS);
+    EXPECT_EQ(named_domain.routed_compute_policy, RoutedExpertComputePolicy::Unspecified);
+    EXPECT_EQ(overlay_domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
 
     const auto inventory = overlay_config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 2u);
@@ -478,25 +478,25 @@ TEST(Test__OrchestrationConfigParser, Phase9B_OverlayDenseTPOptIn)
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
-                    "--moe-expert-overlay", "tiered",
-                    "--moe-expert-overlay-continuation", "cuda_hot",
-                    "--moe-expert-overlay-base-domain", "cuda_hot",
-                    "--moe-expert-overlay-shared-domain", "cuda_hot",
-                    "--moe-expert-overlay-dense-tp", "true",
-                    "--moe-expert-overlay-dense-decode-replicated", "true",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=apportioned_experts;owner=0",
-                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+                    "--moe-routed-expert-placement", "tiered-overlay",
+                    "--moe-routed-expert-continuation-domain", "cuda_hot",
+                    "--moe-routed-expert-base-model-domain", "cuda_hot",
+                    "--moe-routed-expert-shared-domain", "cuda_hot",
+                    "--moe-continuation-dense-tp", "true",
+                    "--moe-continuation-dense-decode-replicated", "true",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
 
-    ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
-    EXPECT_TRUE(config.moe_expert_parallel_plan->continuation_domain_spec.dense_tp_enabled);
-    EXPECT_TRUE(config.moe_expert_parallel_plan->continuation_domain_spec.dense_decode_replicated);
-    EXPECT_EQ(config.moe_expert_parallel_plan->continuation_domain_spec.dense_policy,
-              DenseParallelPolicy::PhaseSplitHybridTP_AE);
-    EXPECT_EQ(config.moe_expert_parallel_plan->continuation_domain_spec.effectiveDensePolicy(),
-              DenseParallelPolicy::PhaseSplitHybridTP_AE);
-    EXPECT_EQ(config.moe_expert_parallel_plan->continuation_domain, "cuda_hot");
+    ASSERT_NE(config.moe_routed_expert_plan, nullptr);
+    EXPECT_TRUE(config.moe_routed_expert_plan->continuation_domain_spec.dense_tp_enabled);
+    EXPECT_TRUE(config.moe_routed_expert_plan->continuation_domain_spec.dense_decode_replicated);
+    EXPECT_EQ(config.moe_routed_expert_plan->continuation_domain_spec.dense_policy,
+              DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+    EXPECT_EQ(config.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy(),
+              DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+    EXPECT_EQ(config.moe_routed_expert_plan->continuation_domain, "cuda_hot");
 
     const auto inventory = config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 1u);
@@ -507,44 +507,44 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesPhaseSplitHybrid
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
-                    "--moe-expert-overlay", "tiered",
-                    "--moe-expert-overlay-continuation", "cuda_hot",
-                    "--moe-expert-overlay-base-domain", "cuda_hot",
-                    "--moe-expert-overlay-shared-domain", "cuda_hot",
-                    "--moe-expert-overlay-dense-policy", "phase_split_hybrid_tp_ae",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=apportioned_experts;owner=0",
-                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+                    "--moe-routed-expert-placement", "tiered-overlay",
+                    "--moe-routed-expert-continuation-domain", "cuda_hot",
+                    "--moe-routed-expert-base-model-domain", "cuda_hot",
+                    "--moe-routed-expert-shared-domain", "cuda_hot",
+                    "--moe-continuation-dense-policy", "prefill-tensor-parallel-decode-replicated",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
 
-    ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
-    const auto &spec = config.moe_expert_parallel_plan->continuation_domain_spec;
-    EXPECT_EQ(spec.dense_policy, DenseParallelPolicy::PhaseSplitHybridTP_AE);
-    EXPECT_EQ(spec.effectiveDensePolicy(), DenseParallelPolicy::PhaseSplitHybridTP_AE);
+    ASSERT_NE(config.moe_routed_expert_plan, nullptr);
+    const auto &spec = config.moe_routed_expert_plan->continuation_domain_spec;
+    EXPECT_EQ(spec.dense_policy, DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+    EXPECT_EQ(spec.effectiveDensePolicy(), DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
     EXPECT_TRUE(spec.dense_tp_enabled);
     EXPECT_TRUE(spec.dense_decode_replicated);
 
     const auto inventory = config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 1u);
-    EXPECT_EQ(inventory[0].compute_kind, ExecutionDomainComputeKind::APPORTIONED_EXPERTS);
+    EXPECT_EQ(inventory[0].routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
 }
 
 TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesDecodeMirroredEmbedding)
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
-                    "--moe-expert-overlay", "tiered",
-                    "--moe-expert-overlay-continuation", "cuda_hot",
-                    "--moe-expert-overlay-base-domain", "cuda_hot",
-                    "--moe-expert-overlay-shared-domain", "cuda_hot",
-                    "--moe-expert-overlay-dense-policy", "tensor-parallel-decode-mirrored-embedding",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=apportioned_experts;owner=0",
-                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+                    "--moe-routed-expert-placement", "tiered-overlay",
+                    "--moe-routed-expert-continuation-domain", "cuda_hot",
+                    "--moe-routed-expert-base-model-domain", "cuda_hot",
+                    "--moe-routed-expert-shared-domain", "cuda_hot",
+                    "--moe-continuation-dense-policy", "tensor-parallel-decode-mirrored-embedding",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
 
-    ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
-    const auto &spec = config.moe_expert_parallel_plan->continuation_domain_spec;
+    ASSERT_NE(config.moe_routed_expert_plan, nullptr);
+    const auto &spec = config.moe_routed_expert_plan->continuation_domain_spec;
     EXPECT_EQ(spec.dense_policy, DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding);
     EXPECT_EQ(spec.effectiveDensePolicy(), DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding);
     EXPECT_TRUE(spec.dense_tp_enabled);
@@ -552,122 +552,80 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesDecodeMirroredEm
     EXPECT_TRUE(spec.dense_decode_mirrored_embedding);
 }
 
-TEST(Test__OrchestrationConfigParser, MoEParallelPolicyDerivesPhaseSplitHybrid)
+TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyKeepsAllAxesIndependent)
 {
-    EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE,
-            RoutedExpertParallelPolicy::ApportionedExperts),
-        MoEParallelPolicy::PhaseSplitHybridTP_AE);
+    const auto policy = makeMoEExecutionPolicy(
+        DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
+        RoutedExpertComputePolicy::Apportioned,
+        RoutedExpertAssignmentPolicy::LeastLoadedResident);
 
     EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::TensorParallel,
-            RoutedExpertParallelPolicy::ApportionedExperts),
-        MoEParallelPolicy::HybridTP_AE);
-
+        policy.dense,
+        DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+    EXPECT_EQ(policy.routed_compute, RoutedExpertComputePolicy::Apportioned);
     EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding,
-            RoutedExpertParallelPolicy::ApportionedExperts),
-        MoEParallelPolicy::HybridTP_AE);
-
-    EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::TensorParallel,
-            RoutedExpertParallelPolicy::ReplicatedExperts),
-        MoEParallelPolicy::HybridTP_RE);
-
-    EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::TensorParallel,
-            RoutedExpertParallelPolicy::ShardedExperts),
-        MoEParallelPolicy::TensorParallel);
-
-    EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::Replicated,
-            RoutedExpertParallelPolicy::ApportionedExperts),
-        MoEParallelPolicy::ApportionedExperts);
-
-    EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::PhaseSplitHybridTP_AE,
-            RoutedExpertParallelPolicy::ApportionedExperts,
-            RoutedExpertAssignmentPolicy::LeastLoadedEP),
-        MoEParallelPolicy::PhaseSplitHybridTP_LLEP);
-
-    EXPECT_EQ(
-        deriveMoEParallelPolicy(
-            DenseParallelPolicy::TensorParallel,
-            RoutedExpertParallelPolicy::ApportionedExperts,
-            RoutedExpertAssignmentPolicy::LeastLoadedEP),
-        MoEParallelPolicy::HybridTP_LLEP);
+        policy.routed_assignment,
+        RoutedExpertAssignmentPolicy::LeastLoadedResident);
 }
 
-TEST(Test__OrchestrationConfigParser, MoEParallelPolicyNamesHybridTPRE)
+TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyDescriptionNamesEveryAxis)
 {
-    EXPECT_STREQ(
-        moeParallelPolicyToString(MoEParallelPolicy::HybridTP_RE),
-        "hybrid-tp-re");
+    const auto policy = makeMoEExecutionPolicy(
+        DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding,
+        RoutedExpertComputePolicy::TensorSharded,
+        RoutedExpertAssignmentPolicy::StaticOwner);
 
-    const auto parsed = parseMoEParallelPolicy("hybrid-tp-re");
-    ASSERT_TRUE(parsed.has_value());
-    EXPECT_EQ(*parsed, MoEParallelPolicy::HybridTP_RE);
+    EXPECT_EQ(
+        describeMoEExecutionPolicy(policy),
+        "dense=tensor-parallel-decode-mirrored-embedding,"
+        "routed_compute=tensor-sharded,routed_assignment=static-owner");
 }
 
-TEST(Test__OrchestrationConfigParser, MoEParallelPolicyNamesApportionedAndHybridTPAE)
+TEST(Test__OrchestrationConfigParser, AmbiguousCompositePolicyAliasesAreRejected)
 {
-    EXPECT_STREQ(
-        moeParallelPolicyToString(MoEParallelPolicy::ApportionedExperts),
-        "apportioned-experts");
-    EXPECT_STREQ(
-        moeParallelPolicyToString(MoEParallelPolicy::HybridTP_AE),
-        "hybrid-tp-ae");
-
-    const auto apportioned = parseMoEParallelPolicy("apportioned-experts");
-    ASSERT_TRUE(apportioned.has_value());
-    EXPECT_EQ(*apportioned, MoEParallelPolicy::ApportionedExperts);
-
-    const auto hybrid_ae = parseMoEParallelPolicy("hybrid-tp-ae");
-    ASSERT_TRUE(hybrid_ae.has_value());
-    EXPECT_EQ(*hybrid_ae, MoEParallelPolicy::HybridTP_AE);
+    EXPECT_FALSE(parseDenseParallelPolicy("phase-split-hybrid-tp-ae").has_value());
+    EXPECT_FALSE(parseDenseParallelPolicy("tp").has_value());
+    EXPECT_FALSE(parseDenseParallelPolicy("dense-tp").has_value());
+    EXPECT_FALSE(parseDenseParallelPolicy("full").has_value());
+    EXPECT_FALSE(parseDenseParallelPolicy("decode-mirrored-embedding").has_value());
+    EXPECT_FALSE(parseRoutedExpertComputePolicy("apportioned-experts").has_value());
+    EXPECT_FALSE(parseRoutedExpertComputePolicy("expert-parallel").has_value());
 }
 
 TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesLeastLoadedAssignmentSeparatelyFromCompute)
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
-                    "--moe-expert-overlay", "tiered",
-                    "--moe-expert-overlay-continuation", "cuda_hot",
-                    "--moe-expert-overlay-shared-domain", "cuda_hot",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=apportioned_experts;assignment=least_loaded_ep;owner=0",
-                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+                    "--moe-routed-expert-placement", "tiered-overlay",
+                    "--moe-routed-expert-continuation-domain", "cuda_hot",
+                    "--moe-routed-expert-shared-domain", "cuda_hot",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_assignment=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
 
-    ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
-    ASSERT_EQ(config.moe_expert_parallel_plan->domains.size(), 1u);
-    EXPECT_EQ(config.moe_expert_parallel_plan->domains[0].compute_kind,
-              ExpertDomainComputeKind::ApportionedExperts);
-    EXPECT_EQ(config.moe_expert_parallel_plan->domains[0].assignment_policy,
-              RoutedExpertAssignmentPolicy::LeastLoadedEP);
+    ASSERT_NE(config.moe_routed_expert_plan, nullptr);
+    ASSERT_EQ(config.moe_routed_expert_plan->domains.size(), 1u);
+    EXPECT_EQ(config.moe_routed_expert_plan->domains[0].routed_compute_policy,
+              RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(config.moe_routed_expert_plan->domains[0].routed_assignment_policy,
+              RoutedExpertAssignmentPolicy::LeastLoadedResident);
 
     const auto inventory = config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 1u);
-    EXPECT_EQ(inventory[0].compute_kind, ExecutionDomainComputeKind::APPORTIONED_EXPERTS);
-    EXPECT_EQ(inventory[0].assignment_kind, ExecutionDomainAssignmentKind::LEAST_LOADED_EP);
+    EXPECT_EQ(inventory[0].routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(inventory[0].routed_assignment_policy, RoutedExpertAssignmentPolicy::LeastLoadedResident);
 }
 
 TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLeastLoadedAsComputeKind)
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
-                    "--moe-expert-overlay", "tiered",
-                    "--moe-expert-overlay-continuation", "cuda_hot",
-                    "--moe-expert-overlay-shared-domain", "cuda_hot",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=least_loaded_ep;owner=0",
-                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+                    "--moe-routed-expert-placement", "tiered-overlay",
+                    "--moe-routed-expert-continuation-domain", "cuda_hot",
+                    "--moe-routed-expert-shared-domain", "cuda_hot",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
 }
@@ -676,11 +634,11 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
 {
     OrchestrationConfigParser parser;
     ArgvHelper args{"llaminar2",
-                    "--moe-expert-overlay", "tiered",
-                    "--moe-expert-overlay-continuation", "cuda_hot",
-                    "--moe-expert-overlay-shared-domain", "cuda_hot",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=expert_parallel;owner=0",
-                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+                    "--moe-routed-expert-placement", "tiered-overlay",
+                    "--moe-routed-expert-continuation-domain", "cuda_hot",
+                    "--moe-routed-expert-shared-domain", "cuda_hot",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=expert_parallel;owner=0",
+                    "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
 }
@@ -688,9 +646,9 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
 TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForSharedParticipants)
 {
     const auto first = ExecutionDomainDefinition::parse(
-        "continuation=0:cuda:0;scope=single;backend=auto;compute=apportioned_experts");
+        "continuation=0:cuda:0;scope=single;backend=auto;routed_compute=apportioned");
     const auto second = ExecutionDomainDefinition::parse(
-        "shared_experts=0:cuda:0;scope=single;backend=auto;compute=apportioned_experts");
+        "shared_experts=0:cuda:0;scope=single;backend=auto;routed_compute=apportioned");
 
     EXPECT_TRUE(first.samePhysicalParticipants(second));
     EXPECT_NE(first.logicalIdentity(), second.logicalIdentity());
@@ -710,12 +668,12 @@ TEST(Test__OrchestrationConfigParser, Phase9B_PPStageRemainsLayerPlacementNotMoE
     EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "gpu_tp");
     EXPECT_EQ(config.pp_stage_definitions[0].first_layer, 0);
     EXPECT_EQ(config.pp_stage_definitions[0].last_layer, 3);
-    EXPECT_EQ(config.moe_expert_parallel_plan, nullptr);
+    EXPECT_EQ(config.moe_routed_expert_plan, nullptr);
 
     const auto inventory = config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 1u);
     EXPECT_EQ(inventory[0].logicalIdentity(), "gpu_tp");
-    EXPECT_EQ(inventory[0].compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
+    EXPECT_EQ(inventory[0].routed_compute_policy, RoutedExpertComputePolicy::Unspecified);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPStage)
@@ -1047,7 +1005,7 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_EmptyString_ReturnsDefault
 
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
-    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ApportionedExperts);
+    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
     EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
     EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
 }
@@ -1058,7 +1016,7 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_MoENestedBlock)
 
     std::string yaml = R"(
 moe:
-    expert_mode: replicated
+    routed_expert_compute_policy: replicated
     hot_expert_cache: 12
     rebalance: observe
     rebalance_window: 64
@@ -1081,7 +1039,7 @@ moe:
 
     auto config = parser.parseYamlString(yaml);
 
-    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ReplicatedExperts);
+    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Replicated);
     EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Count);
     EXPECT_EQ(config.moe_hot_expert_cache.count, 12);
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 12);
@@ -1109,7 +1067,7 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_MoEFlatKeys)
     OrchestrationConfigParser parser;
 
     std::string yaml = R"(
-moe_expert_mode: apportioned-experts
+routed_expert_compute_policy: apportioned
 moe_hot_expert_cache: 25%
 moe_rebalance: off
 moe_rebalance_window: 128
@@ -1132,7 +1090,7 @@ moe_release_raw_expert_weights: false
 
     auto config = parser.parseYamlString(yaml);
 
-    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ApportionedExperts);
+    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
     EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
     EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 25.0f);
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 64);
@@ -1153,6 +1111,50 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 512u);
     EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 80u);
     EXPECT_FALSE(config.moe_rebalance.release_raw_expert_weights);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseYamlString_RoutedExpertPlacementBlock)
+{
+    OrchestrationConfigParser parser;
+    const std::string yaml = R"(
+moe_routed_expert_placement:
+    enabled: true
+    topology: tiered-overlay
+    continuation_domain: gpu_hot
+    base_model_domain: gpu_hot
+    shared_expert_domain: gpu_hot
+    domains:
+        - "gpu_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_assignment=static-owner;owner=0"
+    routed_tiers:
+        - "hot@gpu_hot;priority=0;fallback=true"
+    )";
+
+    const auto config = parser.parseYamlString(yaml);
+
+    ASSERT_NE(config.moe_routed_expert_plan, nullptr);
+    EXPECT_TRUE(config.moe_routed_expert_plan->enabled);
+    EXPECT_EQ(
+        config.moe_routed_expert_plan->topology,
+        RoutedExpertPlacementTopology::TieredOverlay);
+    ASSERT_EQ(config.moe_routed_expert_plan->domains.size(), 1u);
+    EXPECT_EQ(
+        config.moe_routed_expert_plan->domains.front().routed_compute_policy,
+        RoutedExpertComputePolicy::Apportioned);
+}
+
+TEST(Test__OrchestrationConfigParser, RejectsObsoleteRoutedExpertYamlNames)
+{
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(
+        parser.parseYamlString("moe:\n  expert_mode: replicated\n"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        parser.parseYamlString("moe_expert_parallel:\n  enabled: true\n"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        parser.parseYamlString("moe_expert_mode: apportioned-experts\n"),
+        std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_QuotedValues)
@@ -1193,8 +1195,12 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsKeyOptions)
     EXPECT_TRUE(help.find("--pp-stage") != std::string::npos);
     EXPECT_TRUE(help.find("--backend") != std::string::npos);
     EXPECT_TRUE(help.find("--config") != std::string::npos);
-    EXPECT_TRUE(help.find("--moe-expert-mode") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-routed-expert-compute") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-routed-expert-placement") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-routed-expert-domain") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-hot-expert-cache") != std::string::npos);
+    EXPECT_EQ(help.find("--moe-expert-mode"), std::string::npos);
+    EXPECT_EQ(help.find("--moe-expert-overlay"), std::string::npos);
 }
 // ============================================================================
 // CLI Parsing - Model Configuration
@@ -1649,32 +1655,57 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoESparseCPU)
     EXPECT_TRUE(config.moe_sparse_experts_cpu);
 }
 
-TEST(Test__OrchestrationConfigParser, ParseArgs_MoEExpertMode)
+TEST(Test__OrchestrationConfigParser, ParseArgs_RoutedExpertComputePolicy)
 {
     {
-        ArgvHelper args{"llaminar2", "--moe-expert-mode", "apportioned-experts"};
+        ArgvHelper args{"llaminar2", "--moe-routed-expert-compute", "apportioned"};
         OrchestrationConfigParser parser;
 
         auto config = parser.parseArgs(args.argc(), args.argv());
 
-        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ApportionedExperts);
+        EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
     }
     {
-        ArgvHelper args{"llaminar2", "--moe-expert-mode", "replicated-experts"};
+        ArgvHelper args{"llaminar2", "--moe-routed-expert-compute", "replicated"};
         OrchestrationConfigParser parser;
 
         auto config = parser.parseArgs(args.argc(), args.argv());
 
-        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ReplicatedExperts);
+        EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Replicated);
     }
     {
-        ArgvHelper args{"llaminar2", "--moe-expert-mode", "sharded-experts"};
+        ArgvHelper args{"llaminar2", "--moe-routed-expert-compute", "tensor-sharded"};
         OrchestrationConfigParser parser;
 
         auto config = parser.parseArgs(args.argc(), args.argv());
 
-        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ShardedExperts);
+        EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::TensorSharded);
     }
+}
+
+TEST(Test__OrchestrationConfigParser, RejectsObsoleteRoutedExpertCliNamesAndValues)
+{
+    OrchestrationConfigParser parser;
+
+    ArgvHelper old_option{
+        "llaminar2", "--moe-expert-mode", "apportioned-experts"};
+    EXPECT_THROW(
+        parser.parseArgs(old_option.argc(), old_option.argv()),
+        std::invalid_argument);
+
+    ArgvHelper old_placement_option{
+        "llaminar2", "--moe-expert-overlay", "tiered"};
+    EXPECT_THROW(
+        parser.parseArgs(
+            old_placement_option.argc(),
+            old_placement_option.argv()),
+        std::invalid_argument);
+
+    ArgvHelper old_value{
+        "llaminar2", "--moe-routed-expert-compute", "sharded-experts"};
+    EXPECT_THROW(
+        parser.parseArgs(old_value.argc(), old_value.argv()),
+        std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_MoEHotExpertCache)
@@ -1767,7 +1798,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalanceLLEP)
 TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
 {
     {
-        ArgvHelper args{"llaminar2", "--moe-expert-mode", "mystery"};
+        ArgvHelper args{"llaminar2", "--moe-routed-expert-compute", "mystery"};
         OrchestrationConfigParser parser;
         EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }

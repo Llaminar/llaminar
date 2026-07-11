@@ -467,9 +467,10 @@ namespace llaminar2
             return allgather;
         }
 
-        case TPMode::ExpertParallel:
+        case TPMode::RoutedExpertTensorSharded:
         {
-            // Expert-parallel projection: allreduce the partial expert outputs
+            // Within-expert tensor sharding produces one partial routed output
+            // per participant, so the graph combines those partials in place.
             ResolvedStage allreduce;
             allreduce.name = resolved.name + "_allreduce";
             allreduce.type = StageType::Allreduce;
@@ -490,7 +491,7 @@ namespace llaminar2
             allreduce.int_params["count"] = static_cast<int>(count);
 
             LOG_TRACE("[GraphResolver] Inserting allreduce after " << resolved.name
-                      << " (ExpertParallel)");
+                      << " (RoutedExpertTensorSharded)");
             return allreduce;
         }
 

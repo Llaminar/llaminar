@@ -298,7 +298,10 @@ namespace llaminar2::test::gpu_rmsnorm_verifier
         const char *format_label)
     {
         constexpr float epsilon = 1e-6f;
-        constexpr std::array<int, 2> column_counts = {128, 4096};
+        // The 5120-wide lane is a production Qwen hidden-state geometry, not a
+        // synthetic approximation.  Its five values per 1024-thread lane make
+        // it a materially different reduction tree from the 4096-wide case.
+        constexpr std::array<int, 3> column_counts = {128, 4096, 5120};
 
         for (int cols : column_counts)
         {

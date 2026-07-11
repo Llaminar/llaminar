@@ -209,10 +209,10 @@ namespace llaminar2
         (void)payload_slot_capacity;
         (void)layer_idx;
         (void)command_buffer_count;
-        LOG_ERROR("[IMoEKernel] LeastLoadedEP prefill transfer command materialization "
+        LOG_ERROR("[IMoEKernel] LLEP prefill transfer command materialization "
                   "was requested on a backend that does not implement it");
         throw std::logic_error(
-            "LeastLoadedEP prefill transfer command materialization is not implemented by this MoE kernel");
+            "LLEP prefill transfer command materialization is not implemented by this MoE kernel");
     }
 
     // =================================================================
@@ -271,10 +271,10 @@ namespace llaminar2
         (void)num_experts;
         (void)top_k;
         (void)config;
-        LOG_ERROR("[IMoEKernel] LeastLoadedEP prefill route planning was requested "
+        LOG_ERROR("[IMoEKernel] LLEP prefill route planning was requested "
                   "on a backend that does not implement current-batch LLEP");
         throw std::logic_error(
-            "LeastLoadedEP current-batch prefill route planning is not implemented by this MoE kernel");
+            "LLEP current-batch prefill route planning is not implemented by this MoE kernel");
     }
 
     bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
@@ -287,10 +287,10 @@ namespace llaminar2
         (void)max_tokens;
         (void)num_experts;
         (void)top_k;
-        LOG_ERROR("[IMoEKernel] LeastLoadedEP resident-only prefill route assignment "
+        LOG_ERROR("[IMoEKernel] LLEP resident-only prefill route assignment "
                   "was requested on a backend that does not implement current-batch LLEP");
         throw std::logic_error(
-            "LeastLoadedEP resident-only current-batch prefill assignment is not implemented by this MoE kernel");
+            "LLEP resident-only current-batch prefill assignment is not implemented by this MoE kernel");
     }
 
     bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
@@ -307,10 +307,10 @@ namespace llaminar2
         (void)top_k;
         (void)transfer_status;
         (void)apply_status;
-        LOG_ERROR("[IMoEKernel] LeastLoadedEP transfer-backed prefill route assignment "
+        LOG_ERROR("[IMoEKernel] LLEP transfer-backed prefill route assignment "
                   "was requested on a backend that does not implement current-batch LLEP");
         throw std::logic_error(
-            "LeastLoadedEP transfer-backed current-batch prefill assignment is not implemented by this MoE kernel");
+            "LLEP transfer-backed current-batch prefill assignment is not implemented by this MoE kernel");
     }
 
     int IMoEKernel::getExpertTokenCount(int expert_id) const

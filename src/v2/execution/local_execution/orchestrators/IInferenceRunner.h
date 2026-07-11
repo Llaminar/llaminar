@@ -69,9 +69,10 @@ namespace llaminar2
 
     enum class DeviceLogitsSource : uint8_t
     {
-        Main,
-        MTP,
-        AllPosition
+        Main,             ///< Ordinary one-row main-model terminal logits.
+        MTP,              ///< NextN/MTP sidecar terminal logits.
+        AllPosition,      ///< Speculative verifier target rows.
+        MainRequestBatch, ///< Live grouped main-condition rows, one per request.
     };
 
     enum class DeviceDistributionBuffer : uint8_t
@@ -428,18 +429,17 @@ namespace llaminar2
     };
 
     /**
-     * @brief Device-owned stochastic draft-token mailbox slot.
+     * @brief Device-owned sampled-token mailbox slot.
      *
-     * LocalTP MTP keeps draft proposals in runner-owned device mailboxes so the
-     * next sidecar and the verifier can consume the exact same token without a
-     * host round trip.  Rank-level coordination still needs a typed way to name
-     * one child slot when broadcasting the primary mirrored-head proposal to the
-     * rest of the TP participants.  This handle is that narrow contract: it
-     * exposes only the token pointer, the explicit stream that must order the
-     * next operation, and enough ownership metadata to catch stale or cross-device
-     * use in tests.
+     * LocalTP MTP keeps target and draft samples in runner-owned device
+     * mailboxes so the next sidecar and verifier can consume the exact same
+     * token without a host round trip. Rank-level coordination needs a narrow
+     * way to name one child slot while broadcasting the primary mirrored-head
+     * sample to the rest of the TP participants. This handle exposes only the
+     * token pointer, the explicit ordering stream, and ownership metadata that
+     * catches stale or cross-device use.
      */
-    struct DeviceStochasticDraftSampleSlotHandle
+    struct DeviceStochasticSampleSlotHandle
     {
         int32_t *token_device = nullptr;
         int slot = -1;
@@ -454,6 +454,12 @@ namespace llaminar2
                    stream != nullptr;
         }
     };
+
+    /// Buffer-specific spellings keep target and draft publication APIs explicit.
+    using DeviceStochasticDraftSampleSlotHandle =
+        DeviceStochasticSampleSlotHandle;
+    using DeviceStochasticTargetSampleSlotHandle =
+        DeviceStochasticSampleSlotHandle;
 
     /**
      * @brief Authority that supplies logical positions for seeded GPU MTP draws.
@@ -504,10 +510,26 @@ namespace llaminar2
         int first_draft_slot = -1;    ///< First sampled draft-token slot.
         int row_count = 0;            ///< Number of speculative rows to compare.
         int32_t first_token = -1;     ///< First main-model token, if host-owned.
-        bool first_token_from_device = false; ///< Read first token from a device-owned source.
-        int first_target_sample_slot = -1;    ///< STOCHASTIC_TARGET_SAMPLE_TOKENS source slot.
-        int token_row_offset = -1;            ///< Prepared verifier-token row entry 0.
-        int token_row_stride = 0;             ///< Prepared verifier-token row stride.
+        bool first_token_from_device = false; ///< Read first token from exactly one device-owned source.
+        /**
+         * @brief Source slot while the first token is still owned by the target sampler.
+         *
+         * A device-owned first token names either this slot or @ref token_row_offset,
+         * never both. Once verifier-input preparation copies a deferred sample into
+         * entry zero of a materialized verifier row, ownership transfers to that row
+         * and this field must return to `-1`.
+         */
+        int first_target_sample_slot = -1;
+        /**
+         * @brief Entry zero of the materialized `[first_token, draft...]` row.
+         *
+         * This offset is both the first-token source after materialization and the
+         * row base consumed by serial-equivalent compact summaries. It is mutually
+         * exclusive with @ref first_target_sample_slot when
+         * @ref first_token_from_device is true.
+         */
+        int token_row_offset = -1;
+        int token_row_stride = 0; ///< Prepared verifier-token row stride.
         int bonus_target_slot = -1;           ///< Bonus row slot, or -1.
         float bonus_threshold = 0.0f;         ///< Explicit bonus draw; ignored for seeded device-position draws.
         uint64_t inverse_sample_seed = 0;     ///< Shared seed for verifier draws and rejection inverse sampling.
@@ -547,8 +569,9 @@ namespace llaminar2
      * laid out as `[request_count, padded_seq_len]`.  Each descriptor tells the
      * runner how to compose one logical row on the graph replay stream:
      *
-     * - entry 0 is either a host-owned condition-token shadow, a resident
-     *   logical-state next-condition token, or a device target sample slot;
+     * - entry 0 is either a host-owned condition-token shadow, a row in a
+     *   value-owned resident logical-state mailbox, or a device target sample
+     *   slot;
      * - entries 1..N are copied from runner-owned draft sample slots;
      * - the returned matrix pointer is the only token source used by the verifier
      *   embedding graph.
@@ -558,7 +581,8 @@ namespace llaminar2
         int request_id = -1; ///< Logical request id for diagnostics.
         int32_t first_token = -1; ///< Host shadow for row entry 0.
         bool first_token_from_device = false; ///< Read row entry 0 from device memory.
-        const int32_t *first_token_device = nullptr; ///< Resident logical-state row entry 0.
+        DeviceResidentLogicalSequenceStateHandle first_token_logical_state; ///< Mailbox owning row entry 0.
+        int first_token_request_index = -1; ///< Row in first_token_logical_state.
         int first_target_sample_slot = -1; ///< Device target-sample slot for row entry 0.
         int first_draft_slot = -1; ///< First device draft slot copied into row entry 1.
         int draft_token_count = 0; ///< Number of draft tokens copied after entry 0.
@@ -1370,6 +1394,50 @@ namespace llaminar2
             (void)position_ids;
             (void)request_batch;
             (void)out_tokens;
+            return false;
+        }
+
+        /**
+         * @brief Advance a resident request batch through its serial condition row.
+         *
+         * A grouped MTP transaction begins at the same boundary as scalar
+         * decode: the main graph first consumes the last token already returned
+         * to each request, then samples the transaction's first new target
+         * token. GPU implementations must perform the complete transition on
+         * device:
+         *
+         * 1. append one shifted-MTP KV row per request from the current terminal
+         *    hidden rows;
+         * 2. run one grouped main-model decode from the mailbox condition tokens
+         *    and logical positions;
+         * 3. sample one target token per row into persistent target slots; and
+         * 4. republish the mailbox with positions advanced by one and those
+         *    sampled tokens as the next MTP conditions.
+         *
+         * @param logical_state Live device-owned mailbox before the condition
+         *        forward. The handle must cover every request in the batch.
+         * @param request_batch Number of active request rows.
+         * @param params Sampling policy for the newly produced main logits.
+         * @param stochastic_position_seeds Optional immutable seed row. It is
+         *        required for non-greedy sampling and ignored for greedy
+         *        sampling. Mutable positions remain exclusively in
+         *        @p logical_state.
+         * @return true when the advanced mailbox and target slots are ready.
+         *
+         * The default hard-fails. There is no scalar, host-token, or stale-logit
+         * compatibility path because any such path changes the MTP transaction
+         * boundary and breaks decode equivalence.
+         */
+        virtual bool advanceMTPRequestBatchConditionOnDevice(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds = nullptr)
+        {
+            (void)logical_state;
+            (void)request_batch;
+            (void)params;
+            (void)stochastic_position_seeds;
             return false;
         }
 
@@ -2738,6 +2806,43 @@ namespace llaminar2
         }
 
         /**
+         * @brief Return the runner-owned device mailbox for one target sample.
+         *
+         * The primary mirrored LocalTP child samples the first main-model target
+         * into this slot. RankOrchestrator then broadcasts the slot directly
+         * through NCCL/RCCL and records the collective stream as the producer on
+         * every child. `require_ready` therefore applies only to the primary
+         * source; destination slots need valid storage and an explicit stream.
+         */
+        virtual DeviceStochasticTargetSampleSlotHandle
+        deviceStochasticTargetSampleSlot(
+            int slot,
+            bool require_ready = false)
+        {
+            (void)slot;
+            (void)require_ready;
+            return {};
+        }
+
+        /**
+         * @brief Publish a device collective as one target slot's producer.
+         *
+         * Implementations record a fresh readiness event after the collective
+         * write so verifier token materialization waits on the common rank-owned
+         * target rather than a pre-broadcast child-local sampler event.
+         */
+        virtual bool recordStochasticTargetSampleSlotReadyFromDevice(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true)
+        {
+            (void)slot;
+            (void)producer_stream;
+            (void)verifier_consumer_pending;
+            return false;
+        }
+
+        /**
          * @brief Stage sampled draft tokens into verifier-owned device slots.
          *
          * Request-batched stochastic verification amortizes the target
@@ -3708,7 +3813,7 @@ namespace llaminar2
         virtual std::vector<MoERebalanceController *> moeRebalanceControllers() const { return {}; }
 
         /**
-         * @brief Lookup a MoE rebalance controller by ExpertParallel domain id.
+         * @brief Lookup a MoE rebalance controller by routed-expert domain id.
          */
         virtual MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const

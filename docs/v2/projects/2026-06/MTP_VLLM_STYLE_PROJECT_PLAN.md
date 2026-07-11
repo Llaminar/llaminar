@@ -4962,9 +4962,41 @@ Current status:
   streams/graphs through its host, so GPU-shaped unit tests use a hardware-free
   worker instead of initializing a physical backend. Validation: focused `9/9`,
   full unit `518/518`, CUDA2/ROCm2 production cells `2/2`. Current architecture
-  estimate: LocalTP 95%, ExpertParallel 80%. Remaining ownership work is the
+  estimate after that slice was LocalTP 95%, ExpertParallel 80%. Remaining ownership work is the
   complete captured collective/remote-participant lifecycle and equivalent
   mirrored-head request-batch proof across ExpertParallel modes.
+- ROCm request-cache decode now has the same fully device-owned grouped
+  contract as CUDA. One captured metadata kernel derives every request/query
+  row from contiguous cache-owned counts; one phase grid and one reduction grid
+  cover the complete request batch. The existing MI50 FP32/FP16/Q8_1 decode
+  body is parameterized by shared-verifier versus independent-request cache
+  ownership, and inactive split/wavefront planes reproduce each row's ordinary
+  scalar split and TPB policy byte-for-byte. BF16 uses one flat device
+  conversion before the grouped FP32 body. The old ROCm verifier compute-row
+  loop is removed. A captured unequal-history regression uses lengths 512/93
+  to exercise 4-split/256-thread and 2-split/128-thread rows in one graph and
+  sweeps FP32, FP16, BF16, and Q8_1. Validation: all ROCm attention `54/54`,
+  canonical ROCm grouped verifier `19/19`, exact ROCm2 resident request-batch
+  model green twice (`66.4 s`, `66.2 s`), full build, and unit `528/528`.
+  Current architecture estimate: LocalTP 97%, ExpertParallel 80%; LocalTP's
+  remaining work is legacy host-parameter retirement plus performance/full-tier
+  E2E acceptance, while mirrored-head EP request batching remains unproven.
+- CUDA and ROCm attention parameter publication is now fully stream/device
+  owned. CUDA's fixed host arrays, ROCm's pinned `hipHostMalloc` lifecycle, all
+  parameter H2D copies, and the associated host-valid state are deleted.
+  Explicit geometry is written by tiny graph-capturable CUDA/HIP kernels;
+  production cache replay continues to derive geometry from the live device
+  count. Changing streams or workspaces invalidates the recorded parameter
+  state, preventing an unordered writer from being reused. A source-policy unit
+  forbids either backend from reintroducing host mirrors or parameter H2D
+  transfers. Symmetric captured replay regressions update KV length after graph
+  instantiation and match direct same-backend decode byte-for-byte. Validation:
+  source contract `3/3`, CUDA attention `46/46`, ROCm attention `54/54`, CUDA2
+  resident request batch `54.32 s`, and ROCm2 resident request batch `70.37 s`.
+  Current architecture estimate: LocalTP 98%, ExpertParallel 80%; the remaining
+  LocalTP work is full-tier E2E/performance acceptance and captured collective
+  lifecycle, while ExpertParallel still needs mirrored-head request batching
+  and matched remote-participant graphs.
 
 ## Iteration Gates
 

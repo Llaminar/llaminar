@@ -221,7 +221,7 @@ namespace llaminar2::test::parity
         std::vector<std::string> excluded_stages;
 
         /// Stages whose snapshots should be allreduced (SUM) across MPI ranks before
-        /// comparing to PyTorch reference. Used for EP/TP partial sums (e.g., MoE expert
+        /// comparing to PyTorch reference. Used for routed/TP partial sums (e.g., MoE expert
         /// output, shared expert output) where each rank holds a partial contribution.
         /// Requires mpi_ctx_ to be set. Stages listed here should NOT also be excluded.
         std::vector<std::string> allreduce_stages;
@@ -4543,7 +4543,7 @@ namespace llaminar2::test::parity
                     const float *compare_data = permuted.empty() ? llaminar_data : permuted.data();
 
                     StageComparisonResult result;
-                    // EP/TP allreduce: reconstruct full output from partial sums across ranks
+                    // Routed/TP allreduce: reconstruct full output from rank partials.
                     bool did_allreduce = false;
                     std::vector<float> allreduced_buf;
                     if (is_allreduce_stage &&
@@ -5820,7 +5820,7 @@ namespace llaminar2::test::parity
                             const float *decode_compare = permuted_decode.empty() ? llaminar_data : permuted_decode.data();
 
                             StageComparisonResult result;
-                            // EP/TP allreduce: reconstruct full output from partial sums across ranks
+                            // Routed/TP allreduce: reconstruct full output from rank partials.
                             bool did_allreduce_decode = false;
                             std::vector<float> allreduced_decode_buf;
                             if (is_allreduce_stage &&

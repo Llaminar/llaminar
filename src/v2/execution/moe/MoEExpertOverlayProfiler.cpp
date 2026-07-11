@@ -7,7 +7,7 @@
 
 #include "MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
-#include "execution/compute_stages/stages/MoEExpertParallelReduceStage.h"
+#include "execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -132,7 +132,7 @@ namespace llaminar2
             return out.str();
         }
 
-        int countAssignedExperts(const ExpertLayerPlacement &placement, int tier_index)
+        int countAssignedExperts(const RoutedExpertLayerPlacement &placement, int tier_index)
         {
             return static_cast<int>(std::count(
                 placement.routed_expert_tier.begin(),
@@ -140,7 +140,7 @@ namespace llaminar2
                 tier_index));
         }
 
-        std::string finalReduceTransportMode(const MoEExpertParallelReduceDiagnostics &diagnostics)
+        std::string finalReduceTransportMode(const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
         {
             if (diagnostics.host_staged)
                 return "host-staged";
@@ -149,7 +149,7 @@ namespace llaminar2
             return "direct";
         }
 
-        std::string accumulationPathSummary(const MoEExpertParallelReduceDiagnostics &diagnostics)
+        std::string accumulationPathSummary(const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
         {
             std::set<std::string> paths;
             for (const auto &partial : diagnostics.partials)
@@ -476,8 +476,8 @@ namespace llaminar2
     void MoEExpertOverlayProfiler::recordDispatch(
         int layer,
         const MoEExpertDispatchOutput &output,
-        const ExpertLayerPlacement &placement,
-        const std::vector<ExpertRoutedTier> &routed_tiers)
+        const RoutedExpertLayerPlacement &placement,
+        const std::vector<RoutedExpertTier> &routed_tiers)
     {
         if (!isEnabled())
             return;
@@ -513,7 +513,7 @@ namespace llaminar2
 
     void MoEExpertOverlayProfiler::recordFinalReduce(
         int layer,
-        const MoEExpertParallelReduceDiagnostics &diagnostics)
+        const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
     {
         if (!isEnabled())
             return;

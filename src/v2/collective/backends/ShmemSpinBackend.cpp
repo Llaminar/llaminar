@@ -10,6 +10,7 @@
  */
 
 #include "ShmemSpinBackend.h"
+#include "../CollectiveTimeoutPolicy.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/DebugEnv.h"
@@ -32,17 +33,15 @@ namespace llaminar2
     namespace
     {
         constexpr uint64_t kAbortEpoch = std::numeric_limits<uint64_t>::max();
-        constexpr int kDefaultReleaseTimeoutMs = 300000;
         constexpr int kMaxCreateAttempts = 64;
 
         std::atomic<uint64_t> g_shmem_name_counter{0};
 
         int shmemSpinTimeoutMs()
         {
-            const int configured = debugEnv().tp_collect_timeout_ms;
-            if (configured < 0)
-                return 0;
-            return configured > 0 ? configured : kDefaultReleaseTimeoutMs;
+            return collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms,
+                /*cold_start_completed=*/true);
         }
 
         std::string makeUniqueShmemName(int domain_id)

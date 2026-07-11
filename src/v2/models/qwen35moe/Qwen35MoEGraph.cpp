@@ -14,7 +14,7 @@
 #include "../../execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "../../execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "../../execution/compute_stages/stages/MoESparseReturnReduceStage.h"
-#include "../../execution/moe/MoEExpertParallelPlan.h"
+#include "../../execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "../../execution/moe/MoEExpertOwnerMap.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEOverlaySparseCollective.h"
@@ -120,12 +120,12 @@ namespace llaminar2
             return true;
         }
 
-        const ExpertLayerPlacement *findExpertOverlayPlacement(
-            const MoEExpertParallelPlan &plan,
+        const RoutedExpertLayerPlacement *findExpertOverlayPlacement(
+            const MoERoutedExpertPlacementPlan &plan,
             int layer_idx)
         {
             auto it = std::find_if(plan.placements.begin(), plan.placements.end(),
-                                   [layer_idx](const ExpertLayerPlacement &placement)
+                                   [layer_idx](const RoutedExpertLayerPlacement &placement)
                                    {
                                        return placement.layer == layer_idx;
                                    });
@@ -133,8 +133,8 @@ namespace llaminar2
         }
 
         bool isUsableExpertOverlayPlacement(
-            const ExpertLayerPlacement &placement,
-            const MoEExpertParallelPlan &plan,
+            const RoutedExpertLayerPlacement &placement,
+            const MoERoutedExpertPlacementPlan &plan,
             int num_experts,
             int layer_idx)
         {
@@ -161,7 +161,7 @@ namespace llaminar2
         }
 
         std::vector<bool> expertMaskForTier(
-            const ExpertLayerPlacement &placement,
+            const RoutedExpertLayerPlacement &placement,
             int num_experts,
             int tier_index)
         {
@@ -174,7 +174,7 @@ namespace llaminar2
             return mask;
         }
 
-        std::string nodeSuffixForTier(const ExpertRoutedTier &tier, int tier_index)
+        std::string nodeSuffixForTier(const RoutedExpertTier &tier, int tier_index)
         {
             std::string suffix = "tier" + std::to_string(tier_index);
             if (!tier.name.empty())
@@ -191,12 +191,12 @@ namespace llaminar2
         {
             if (config.moe.expert_overlay_runtime_plan)
                 return config.moe.expert_overlay_runtime_plan;
-            if (!config.moe.expert_parallel_plan)
+            if (!config.moe.routed_expert_plan)
                 return nullptr;
-            return resolveMoEExpertOverlayRuntimePlan(config.moe.expert_parallel_plan);
+            return resolveMoEExpertOverlayRuntimePlan(config.moe.routed_expert_plan);
         }
 
-        int continuationRootParticipant(const MoEExpertParallelPlan &plan)
+        int continuationRootParticipant(const MoERoutedExpertPlacementPlan &plan)
         {
             return std::max(0, plan.continuation_domain_spec.logical_root_participant);
         }
@@ -957,8 +957,8 @@ namespace llaminar2
             fields.push_back({prefix + ".name", domain.name});
             fields.push_back({prefix + ".scope", executionDomainScopeToString(domain.scope)});
             fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
-            fields.push_back({prefix + ".compute_kind", executionDomainComputeKindToString(domain.compute_kind)});
-            fields.push_back({prefix + ".assignment_kind", executionDomainAssignmentKindToString(domain.assignment_kind)});
+            fields.push_back({prefix + ".routed_compute_policy", routedExpertComputePolicyToString(domain.routed_compute_policy)});
+            fields.push_back({prefix + ".routed_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)});
             fields.push_back({prefix + ".owner_rank", domain.owner_rank ? std::to_string(*domain.owner_rank) : "-1"});
             appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
             appendRankVectorFields(fields, prefix + ".rank", domain.ranks);
@@ -967,14 +967,14 @@ namespace llaminar2
 
         void appendExpertDomainFingerprintFields(
             std::vector<PrefixFingerprintField> &fields,
-            const ExpertComputeDomain &domain,
+            const RoutedExpertDomain &domain,
             const std::string &prefix)
         {
             fields.push_back({prefix + ".name", domain.name});
-            fields.push_back({prefix + ".kind", toString(domain.kind)});
+            fields.push_back({prefix + ".scope", executionDomainScopeToString(domain.scope)});
             fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
-            fields.push_back({prefix + ".compute_kind", toString(domain.compute_kind)});
-            fields.push_back({prefix + ".assignment_policy", routedExpertAssignmentPolicyToString(domain.assignment_policy)});
+            fields.push_back({prefix + ".routed_compute_policy", routedExpertComputePolicyToString(domain.routed_compute_policy)});
+            fields.push_back({prefix + ".routed_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)});
             fields.push_back({prefix + ".owner_rank", std::to_string(domain.owner_rank)});
             appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
             appendRankVectorFields(fields, prefix + ".rank", domain.world_ranks);
@@ -983,11 +983,11 @@ namespace llaminar2
 
         void appendExpertOverlayPlanFingerprintFields(
             std::vector<PrefixFingerprintField> &fields,
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             const std::string &scope)
         {
             fields.push_back({scope + ".enabled", boolField(plan.enabled)});
-            fields.push_back({scope + ".execution_kind", toString(plan.execution_kind)});
+            fields.push_back({scope + ".topology", toString(plan.topology)});
             fields.push_back({scope + ".continuation_domain", plan.continuation_domain});
             fields.push_back({scope + ".base_model_domain", plan.base_model_domain});
             fields.push_back({scope + ".effective_base_model_domain", plan.effectiveBaseModelDomain()});
@@ -1058,10 +1058,10 @@ namespace llaminar2
                 const auto &domain = runtime_plan.domains()[domain_index];
                 const std::string prefix = scope + ".domain." + std::to_string(domain_index);
                 fields.push_back({prefix + ".name", domain.name});
-                fields.push_back({prefix + ".kind", toString(domain.kind)});
+                fields.push_back({prefix + ".scope", executionDomainScopeToString(domain.scope)});
                 fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
-                fields.push_back({prefix + ".compute_kind", toString(domain.compute_kind)});
-                fields.push_back({prefix + ".assignment_policy", routedExpertAssignmentPolicyToString(domain.assignment_policy)});
+                fields.push_back({prefix + ".routed_compute_policy", routedExpertComputePolicyToString(domain.routed_compute_policy)});
+                fields.push_back({prefix + ".routed_assignment_policy", routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)});
                 fields.push_back({prefix + ".primary_participant", domain.primary_participant.toString()});
                 fields.push_back({prefix + ".primary_device", domain.primary_device.to_string()});
                 fields.push_back({prefix + ".primary_world_rank", std::to_string(domain.primary_world_rank)});
@@ -1124,33 +1124,33 @@ namespace llaminar2
             return participant->device;
         }
 
-        const ExpertComputeDomain *expertDomainForTier(
-            const MoEExpertParallelPlan &plan,
-            const ExpertRoutedTier &tier)
+        const RoutedExpertDomain *expertDomainForTier(
+            const MoERoutedExpertPlacementPlan &plan,
+            const RoutedExpertTier &tier)
         {
             auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
-                                   [&](const ExpertComputeDomain &domain)
+                                   [&](const RoutedExpertDomain &domain)
                                    {
                                        return domain.name == tier.domain;
                                    });
             return it == plan.domains.end() ? nullptr : &(*it);
         }
 
-        bool isLocalTPApportionedExpertsTier(
-            const MoEExpertParallelPlan &plan,
-            const ExpertRoutedTier &tier)
+        bool isLocalTPExpertIdApportionedTier(
+            const MoERoutedExpertPlacementPlan &plan,
+            const RoutedExpertTier &tier)
         {
             const auto *domain = expertDomainForTier(plan, tier);
             return domain &&
-                   domain->kind == ExpertDomainKind::LocalTP &&
-                   domain->compute_kind == ExpertDomainComputeKind::ApportionedExperts &&
+                   domain->scope == ExecutionDomainScope::LOCAL &&
+                   domain->routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
                    domain->participants.size() > 1;
         }
 
-        bool canUseLocalTPApportionedExpertsFastPath(
-            const MoEExpertParallelPlan &plan,
+        bool canUseLocalTPExpertIdApportionedFastPath(
+            const MoERoutedExpertPlacementPlan &plan,
             const DeviceId &device,
-            const ExpertRoutedTier **out_tier = nullptr)
+            const RoutedExpertTier **out_tier = nullptr)
         {
             if (!plan.isTieredOverlay() ||
                 plan.routed_tiers.size() != 1 ||
@@ -1159,8 +1159,8 @@ namespace llaminar2
                 return false;
             }
 
-            const ExpertRoutedTier &tier = plan.routed_tiers.front();
-            if (!isLocalTPApportionedExpertsTier(plan, tier))
+            const RoutedExpertTier &tier = plan.routed_tiers.front();
+            if (!isLocalTPExpertIdApportionedTier(plan, tier))
                 return false;
 
             const auto *domain = expertDomainForTier(plan, tier);
@@ -1183,11 +1183,11 @@ namespace llaminar2
         }
 
         bool planHasLocalTPApportionedExpertDomain(
-            const MoEExpertParallelPlan &plan)
+            const MoERoutedExpertPlacementPlan &plan)
         {
             for (const auto &tier : plan.routed_tiers)
             {
-                if (isLocalTPApportionedExpertsTier(plan, tier))
+                if (isLocalTPExpertIdApportionedTier(plan, tier))
                     return true;
             }
             return false;
@@ -1200,11 +1200,11 @@ namespace llaminar2
             if (!local_tp_ctx || local_tp_ctx->degree() <= 1)
                 return std::nullopt;
 
-            const bool apportioned_experts =
-                config.moe.expert_mode == MoEExpertMode::ApportionedExperts ||
-                (config.moe.expert_parallel_plan &&
-                 planHasLocalTPApportionedExpertDomain(*config.moe.expert_parallel_plan));
-            if (!apportioned_experts)
+            const bool expert_id_apportioned =
+                config.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
+                (config.moe.routed_expert_plan &&
+                 planHasLocalTPApportionedExpertDomain(*config.moe.routed_expert_plan));
+            if (!expert_id_apportioned)
                 return std::nullopt;
 
             return static_cast<uint32_t>(local_tp_ctx->degree());
@@ -1963,11 +1963,11 @@ namespace llaminar2
         material.moe.push_back({"graph.num_experts", std::to_string(config_.moe.num_experts)});
         material.moe.push_back({"graph.top_k", std::to_string(config_.moe.top_k)});
 
-        if (config_.moe.expert_parallel_plan)
+        if (config_.moe.routed_expert_plan)
         {
             appendExpertOverlayPlanFingerprintFields(
                 material.moe,
-                *config_.moe.expert_parallel_plan,
+                *config_.moe.routed_expert_plan,
                 "expert_overlay.plan");
         }
         else
@@ -2532,7 +2532,7 @@ namespace llaminar2
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
         const auto &overlay_plan = overlay_runtime_plan
                                        ? overlay_runtime_plan->sourcePlanPtr()
-                                       : config_.moe.expert_parallel_plan;
+                                       : config_.moe.routed_expert_plan;
         auto domainContainsDevice = [](const MoEOverlayRuntimeDomain &domain, DeviceId candidate)
         {
             return std::any_of(domain.participants.begin(), domain.participants.end(),
@@ -2558,7 +2558,7 @@ namespace llaminar2
         }
 
         const bool overlay_requested = overlay_plan && overlay_plan->isTieredOverlay();
-        const ExpertLayerPlacement *overlay_placement = overlay_requested
+        const RoutedExpertLayerPlacement *overlay_placement = overlay_requested
                                                             ? findExpertOverlayPlacement(*overlay_plan, layer_idx)
                                                             : nullptr;
         const bool use_expert_overlay = overlay_requested && overlay_placement &&
@@ -2679,7 +2679,7 @@ namespace llaminar2
         const bool llep_prefill_requested =
             !mtp_sidecar_context &&
             total_tokens > 1 &&
-            config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
+            config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
         const uint64_t llep_prefill_routed_rows =
             llep_prefill_requested
                 ? static_cast<uint64_t>(std::max(0, total_tokens)) *
@@ -2707,14 +2707,14 @@ namespace llaminar2
             !llep_prefill_transport_supported)
         {
             throw std::runtime_error(
-                "Qwen35 MoE LeastLoadedEP prefill transfer mode 'full' requires "
+                "Qwen35 MoE LLEP prefill transfer mode 'full' requires "
                 "a homogeneous graph-capturable NCCL/RCCL LocalTP domain for " +
                 device.to_string() + "; refusing resident-only or host fallback");
         }
         const RoutedExpertAssignmentPolicy prefill_routed_expert_assignment_policy =
             (total_tokens > 1 && !llep_prefill_enabled)
                 ? RoutedExpertAssignmentPolicy::StaticOwner
-                : config_.moe.routed_expert_assignment_policy;
+                : config_.moe.routed_assignment_policy;
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
             hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
         const bool device_side_graph_rebalance_candidate =
@@ -2741,7 +2741,7 @@ namespace llaminar2
              * Device-routed one-token MoE decode captures a full layer-local
              * runtime table: router output, local-compute mask, and prepared
              * gate/up/down descriptors for every logical expert.  LocalTP
-             * ExpertParallel runners own only a contiguous expert range, so
+             * Expert-id-apportioned runners own only a contiguous expert range, so
              * handing them this table would make the expert stage fail at graph
              * build or, worse, capture a single-device contract for a sharded
              * topology. Tiered overlays and graph-side rebalance use masked
@@ -2751,7 +2751,7 @@ namespace llaminar2
             if (use_expert_overlay)
                 return false;
 
-            if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts)
+            if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
             {
                 const int local_count = config_.moe.local_expert_count < 0
                                             ? config_.moe.num_experts
@@ -2775,11 +2775,11 @@ namespace llaminar2
             (total_tokens == 1 || forceGroupedMoEVerifierPrefill(device)) &&
             use_expert_overlay &&
             overlay_plan &&
-            canUseLocalTPApportionedExpertsFastPath(*overlay_plan, device);
+            canUseLocalTPExpertIdApportionedFastPath(*overlay_plan, device);
         const bool masked_local_tp_apportioned_decode_runtime_table =
             device_side_graph_rebalance_candidate &&
             !use_expert_overlay &&
-            config_.moe.expert_mode == MoEExpertMode::ApportionedExperts &&
+            config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
             config_.moe.local_expert_count >= 0 &&
             local_tp_ctx &&
             local_tp_ctx->degree() > 1;
@@ -2791,7 +2791,7 @@ namespace llaminar2
             device.is_gpu() &&
             total_tokens == 1 &&
             !static_full_local_expert_ownership &&
-            (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts ||
+            (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
              use_expert_overlay);
         if (total_tokens == 1 &&
             rocm_env.moe_grouped_decode &&
@@ -2925,8 +2925,8 @@ namespace llaminar2
                     config_.moe.rebalance_config.dynamic_min_window_activations,
                     static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
             rebalance_config.routed_assignment_policy =
-                config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP
-                    ? kDeviceMoERebalanceAssignmentLeastLoadedEP
+                config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident
+                    ? kDeviceMoERebalanceAssignmentLeastLoadedResident
                     : kDeviceMoERebalanceAssignmentStaticOwner;
             rebalance_config.min_load_spread_improvement = deviceRebalanceConfigOrEnv(
                 config_.moe.rebalance_config.device_min_load_spread_improvement,
@@ -3050,7 +3050,7 @@ namespace llaminar2
                 const bool dynamic_ownership_transfers =
                     config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC;
                 const bool routed_assignment_payload_transfers =
-                    config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
+                    config_.moe.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
                 graph_rebalance_transfer_mode =
                     selectGraphRebalanceTransferMode(
                         *local_tp_ctx,
@@ -3136,7 +3136,7 @@ namespace llaminar2
                     DeviceMoERebalanceTransferMode::CompactTransferSlots)
             {
                 throw std::runtime_error(
-                    "Qwen35 MoE LeastLoadedEP prefill requires compact transfer-slot payload movement for " +
+                    "Qwen35 MoE LLEP prefill requires compact transfer-slot payload movement for " +
                     device.to_string() + "; refusing fixed-payload/host fallback");
             }
             if (deviceMoERebalanceModePlansMissingArrivals(
@@ -3270,7 +3270,7 @@ namespace llaminar2
             if (!layer_transfer_specs.has_value())
             {
                 throw std::runtime_error(
-                    "Qwen35 MoE LeastLoadedEP prefill could not derive NativeVNNI transfer slot specs for layer " +
+                    "Qwen35 MoE LLEP prefill could not derive NativeVNNI transfer slot specs for layer " +
                     std::to_string(layer_idx) + " on " + device.to_string());
             }
             graph_rebalance_transfer_specs = std::move(layer_transfer_specs);
@@ -3279,7 +3279,7 @@ namespace llaminar2
             if (!binding)
             {
                 throw std::runtime_error(
-                    "Qwen35 MoE LeastLoadedEP prefill could not create transfer binding for layer " +
+                    "Qwen35 MoE LLEP prefill could not create transfer binding for layer " +
                     std::to_string(layer_idx) + " on " + device.to_string());
             }
             expert_params.prefill_llep_tp_ctx = binding->decode_tp_ctx;
@@ -4061,7 +4061,7 @@ namespace llaminar2
                     spec_params.down_exps = layer.moe_down_exps;
                     spec_params.expert_intermediate = expert_intermediate;
                     spec_params.layer_idx = layer_idx;
-                    if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts)
+                    if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
                     {
                         spec_params.local_expert_start = config_.moe.local_expert_start;
                         spec_params.local_expert_count = config_.moe.local_expert_count;
@@ -4221,25 +4221,25 @@ namespace llaminar2
                     local_tp_ctx && local_tp_ctx->degree() > 0
                         ? local_tp_ctx->degree()
                         : std::max(1, expert_params.my_socket_id + 1);
-                expert_params.routed_expert_assignment_policy =
+                expert_params.routed_assignment_policy =
                     prefill_routed_expert_assignment_policy;
                 if (local_tp_ctx &&
                     total_tokens > 1 &&
-                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
                     expert_params.prefill_llep_require_transfer_backing =
                         require_full_llep_prefill_transfer;
                 }
 
-                if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts)
+                if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
                 {
                     expert_params.local_expert_start = config_.moe.local_expert_start;
                     expert_params.local_expert_count = config_.moe.local_expert_count;
                     if (expert_params.local_expert_count >= 0 &&
                         expert_params.expert_mask.empty())
                     {
-                        // LocalTP expert-parallel runners own a contiguous
+                        // LocalTP expert-id-apportioned runners own a contiguous
                         // global expert-id range. Express that static range as
                         // the same explicit mask used by dynamic rebalance and
                         // overlay paths so GPU graph construction only
@@ -4404,10 +4404,10 @@ namespace llaminar2
             */
             const bool can_combine_shared_verifier = false;
 
-            const ExpertRoutedTier *local_tp_fast_tier = nullptr;
+            const RoutedExpertTier *local_tp_fast_tier = nullptr;
             const bool local_tp_apportioned_fast_candidate =
                 use_expert_overlay &&
-                canUseLocalTPApportionedExpertsFastPath(
+                canUseLocalTPExpertIdApportionedFastPath(
                     *overlay_plan,
                     device,
                     &local_tp_fast_tier);
@@ -4415,7 +4415,7 @@ namespace llaminar2
                 local_tp_apportioned_fast_candidate &&
                 device.is_gpu() &&
                 total_tokens > 1 &&
-                config_.dense_parallel_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+                config_.dense_parallel_policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
             const bool use_local_tp_apportioned_fast_path =
                 local_tp_apportioned_fast_candidate ||
                 phase_split_local_tp_apportioned_gpu_prefill;
@@ -4437,7 +4437,7 @@ namespace llaminar2
                 if (local_participant < 0)
                 {
                     throw std::runtime_error(
-                        "Qwen35 MoE LocalTP apportioned-experts fast path could not find graph-local participant for " +
+                        "Qwen35 MoE LocalTP expert-ID-apportioned fast path could not find graph-local participant for " +
                         device.to_string() + " in layer " + std::to_string(layer_idx));
                 }
 
@@ -4448,7 +4448,7 @@ namespace llaminar2
                 if (!hasActiveExpertMask(participant_mask))
                 {
                     throw std::runtime_error(
-                        "Qwen35 MoE LocalTP apportioned-experts fast path produced an empty expert mask for participant " +
+                        "Qwen35 MoE LocalTP expert-ID-apportioned fast path produced an empty expert mask for participant " +
                         std::to_string(local_participant) + " in layer " + std::to_string(layer_idx));
                 }
 
@@ -4464,7 +4464,7 @@ namespace llaminar2
                         continuationRootParticipant(*overlay_plan));
                 if (local_tp_ctx &&
                     total_tokens > 1 &&
-                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
                     expert_params.prefill_llep_require_transfer_backing =
@@ -4474,12 +4474,12 @@ namespace llaminar2
                 if (!prepareExpertParams(
                         expert_params,
                         device,
-                        "LocalTP apportioned-experts fast path participant " +
+                        "LocalTP expert-ID-apportioned fast path participant " +
                             std::to_string(local_participant),
                         domain_name))
                 {
                     throw std::runtime_error(
-                        "Qwen35 MoE graph failed to prepare LocalTP apportioned-experts fast-path parameters for layer " +
+                        "Qwen35 MoE graph failed to prepare LocalTP expert-ID-apportioned fast-path parameters for layer " +
                         std::to_string(layer_idx) + " on " + device.to_string());
                 }
                 if (shouldCollectGraphRebalanceTransferSpecs())
@@ -4491,7 +4491,7 @@ namespace llaminar2
                 const bool least_loaded_prefill_runtime_grouping =
                     moe_runtime_table &&
                     total_tokens > 1 &&
-                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
                 if (least_loaded_prefill_runtime_grouping)
                 {
                     const int participant_count = expert_params.participant_count;
@@ -4515,8 +4515,8 @@ namespace llaminar2
                             expert_params.prepared_up_gemm,
                             expert_params.prepared_down_gemm,
                             nullptr,
-                            prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP,
-                            "LocalTP apportioned-experts LLEP grouped prefill runtime bank"))
+                            prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident,
+                            "LocalTP expert-ID-apportioned LLEP grouped prefill runtime bank"))
                     {
                         throw std::runtime_error(
                             "Qwen35 MoE graph failed to initialize masked LocalTP LLEP prefill runtime table for layer " +
@@ -4530,7 +4530,7 @@ namespace llaminar2
                 {
                     attachPrefillLLEPTransferBinding(
                         expert_params,
-                        "LocalTP apportioned-experts LLEP grouped prefill");
+                        "LocalTP expert-ID-apportioned LLEP grouped prefill");
                 }
 
                 if (moe_runtime_table &&
@@ -4559,7 +4559,7 @@ namespace llaminar2
                             expert_params.prepared_down_gemm,
                             nullptr,
                             /*allow_existing_dynamic_bank=*/true,
-                            "LocalTP apportioned-experts masked GPU decode graph build"))
+                            "LocalTP expert-ID-apportioned masked GPU decode graph build"))
                     {
                         throw std::runtime_error(
                             "Qwen35 MoE graph failed to initialize masked LocalTP decode runtime table for layer " +
@@ -4576,7 +4576,7 @@ namespace llaminar2
                               device);
                 const std::string rebalance_apply_dependency =
                     maybeInsertGraphSideRebalance(
-                        "LocalTP apportioned-experts fast path",
+                        "LocalTP expert-ID-apportioned fast path",
                         prefix + "moe_expert_ffn_overlay_fast");
                 graph.addDependency(prefix + "moe_expert_ffn_overlay_fast",
                                     rebalance_apply_dependency.empty()
@@ -4639,7 +4639,7 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
-                                                    << " using LocalTP apportioned-experts fast path on "
+                                                    << " using LocalTP expert-ID-apportioned fast path on "
                                                     << device.to_string()
                                                     << " participant=" << local_participant
                                                     << " domain=" << domain_name);
@@ -4721,7 +4721,7 @@ namespace llaminar2
                     std::vector<int> target_participants = owner_map_lifetime->participantIdsForTier(
                         static_cast<int>(tier_index));
                     const bool local_tp_apportioned_tier =
-                        isLocalTPApportionedExpertsTier(*overlay_plan, tier);
+                        isLocalTPExpertIdApportionedTier(*overlay_plan, tier);
                     const int graph_local_participant =
                         local_tp_apportioned_tier
                             ? participantIdForTierDevice(
@@ -4756,7 +4756,7 @@ namespace llaminar2
                                 std::to_string(target_participant) + " on " +
                                 target_device.to_string() + " from graph device " +
                                 device.to_string() +
-                                ". LocalTP ApportionedExperts GPU domains must lower only the graph-local participant; "
+                                ". LocalTP expert-ID-apportioned GPU domains must lower only the graph-local participant; "
                                 "other cross-device GPU expert execution requires a real participant/domain executor.");
                         }
                         const std::string participant_suffix =
@@ -5029,7 +5029,7 @@ namespace llaminar2
                                                       device);
                 if (local_tp_ctx &&
                     total_tokens > 1 &&
-                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
                 {
                     expert_params.prefill_llep_tp_ctx = local_tp_ctx;
                     expert_params.prefill_llep_require_transfer_backing =
@@ -5085,7 +5085,7 @@ namespace llaminar2
                                 expert_params.prepared_down_gemm,
                                 nullptr,
                                 /*allow_existing_dynamic_bank=*/true,
-                                "LocalTP apportioned-experts masked GPU decode graph build"))
+                                "LocalTP expert-ID-apportioned masked GPU decode graph build"))
                         {
                             throw std::runtime_error(
                                 "Qwen35 MoE graph failed to initialize masked LocalTP decode "
@@ -5309,7 +5309,7 @@ namespace llaminar2
                 buffers.attn_proj;
 
             // Allreduce after shared expert down projection (InputParallel sharding),
-            // unless the LocalTP apportioned-experts path will combine routed and
+            // unless the LocalTP expert-ID-apportioned path will combine routed and
             // gated shared partials locally and reduce that single combined buffer.
             if (needsTPAllreduce() && !fuse_shared_gate_then_combined_allreduce)
             {

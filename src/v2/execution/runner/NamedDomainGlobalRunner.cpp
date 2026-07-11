@@ -251,7 +251,7 @@ namespace llaminar2
                 config_.activation_precision,
                 config_.kv_cache_precision,
                 config_.fused_attention_backend,
-                config_.moe_expert_mode,
+                config_.routed_expert_compute_policy,
                 config_.moe_hot_expert_cache,
                 config_.moe_rebalance,
                 config_.prefix_cache,
@@ -265,7 +265,7 @@ namespace llaminar2
             base_runner_cfg.tp_allreduce_precision_override =
                 runtime_cfg.tp_allreduce_precision_override;
             base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;
-            base_runner_cfg.moe_expert_mode = runtime_cfg.moe_expert_mode;
+            base_runner_cfg.routed_expert_compute_policy = runtime_cfg.routed_expert_compute_policy;
             base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;
             base_runner_cfg.moe_rebalance = runtime_cfg.moe_rebalance;
             base_runner_cfg.prefix_cache = runtime_cfg.prefix_cache;

@@ -6,13 +6,13 @@
  * for Qwen3.5 MoE, where TP spans multiple MPI ranks on the same physical node.
  *
  * TP strategy for MoE:
- *   - Expert Parallelism (EP): Each rank has ALL expert weights (replicated) but
- *     only COMPUTES its assigned subset. Output is a partial sum.
+ *   - Static-owner routed-row assignment: each rank has replicated expert
+ *     weights but computes only its assigned subset. Output is a partial sum.
  *   - Shared Expert: Standard Megatron TP (gate/up = ColumnParallel, down = InputParallel).
  *     Output is a partial sum.
  *   - Shared Expert Sigmoid Gate: Distributes over partial sums (s⊙(y₀+y₁) = s⊙y₀ + s⊙y₁),
  *     so gating happens before allreduce.
- *   - Single allreduce per layer on attn_proj (combines EP partial + shared expert TP partial).
+ *   - Single allreduce per layer on attn_proj combines routed and shared TP partials.
  *
  * NOTE: CPU TP MUST use NodeLocalTP (MPI), not LocalTP, because
  * DeviceId::cpu() is a singleton. Each MPI rank gets its own process
@@ -68,13 +68,13 @@ static const std::vector<std::string> kNodeLocalTPMoEExcludedStages = {
     "GDN_NORM_GATE_OUTPUT",
 };
 
-// MoE EP/TP partial-sum stages: each rank holds a partial contribution.
+// Routed/dense-TP partial-sum stages: each rank holds a partial contribution.
 // Allreduce (SUM) across ranks before comparing to PyTorch reference.
 static const std::vector<std::string> kNodeLocalTPMoEAllreduceStages = {
-    "MOE_EXPERT_OUTPUT",        // EP partial sum (only local experts computed)
+    "MOE_EXPERT_OUTPUT",        // Routed partial (only locally assigned rows)
     "MOE_SHARED_EXPERT_OUTPUT", // Shared expert TP partial sum (down_proj row-parallel)
     "MOE_SHARED_GATE_OUTPUT",   // Sigmoid-gated partial sum (s⊙y distributes over partials)
-    "MOE_COMBINED_OUTPUT",      // Total partial (expert EP + shared TP + gate)
+    "MOE_COMBINED_OUTPUT",      // Total routed + shared TP + gate partial
 };
 
 // =============================================================================
@@ -86,7 +86,7 @@ static const std::vector<TestConfig> kNodeLocalTPMoETestConfigs = {
     // Qwen3.5-35B MoE (Q4_K_XL) — 2-way Node-Local TP with CPU (UPI interconnect)
     //
     // This is the primary TP parity configuration for MoE. Each MPI rank
-    // computes half the experts (EP) and half the shared expert intermediate
+    // computes half the routed expert rows and half the shared intermediate
     // (Megatron TP), then allreduces attn_proj once per layer.
     //
     // Thresholds calibrated from observed results (2026-04-26):
@@ -160,7 +160,7 @@ TEST_P(Qwen35MoENodeLocalTPParityTest, NodeLocalTPContextInitialization)
 /**
  * @brief Prefill parity test with NodeLocalTP for MoE
  *
- * Runs prefill inference with cross-rank EP + shared expert TP sharding and
+ * Runs prefill with cross-rank static-owner routing plus shared-expert TP and
  * compares against PyTorch reference. Post-allreduce activations (norms,
  * residuals) and post-allgather logits should match PyTorch.
  */
@@ -217,7 +217,7 @@ int main(int argc, char **argv)
         std::cout << "╠══════════════════════════════════════════════════════════════════╣\n";
         std::cout << "║  MPI world size: " << world_size << " ranks" << std::string(42 - std::to_string(world_size).length(), ' ') << "║\n";
         std::cout << "║  Thread support: " << (provided >= MPI_THREAD_MULTIPLE ? "MPI_THREAD_MULTIPLE" : "limited") << std::string(26, ' ') << "║\n";
-        std::cout << "║  TP strategy:   EP (experts) + Megatron (shared expert)" << std::string(7, ' ') << "║\n";
+        std::cout << "║  TP strategy:   static routed rows + Megatron shared expert" << std::string(2, ' ') << "║\n";
         std::cout << "╚══════════════════════════════════════════════════════════════════╝\n";
     }
 

@@ -528,7 +528,7 @@ The schema system provides a **declarative** specification of the compute graph,
 
 **StageType Enum:** RMSNorm, LayerNorm, GEMM, FusedQKVGEMM, FusedGateUpGEMM, RoPE, KVCacheAppend, KVCacheGather, AttentionCompute, SwiGLU, GELU, ResidualAdd, Embedding, LMHead, Allreduce, Allgather, MoERouter, MoEFFN, Quantize, Dequantize, QKNorm
 
-**TPMode Enum:** None, ColumnParallel, RowParallel, ExpertParallel
+**TPMode Enum:** None, ColumnParallel, RowParallel, RoutedExpertTensorSharded
 
 **ISchemaFactory Interface:**
 ```cpp

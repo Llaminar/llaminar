@@ -20,8 +20,11 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/MPIContext.h"
 
+#ifdef HAVE_CUDA
+#include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
+#endif
+
 #ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
 #endif
 
@@ -30,15 +33,6 @@ using namespace llaminar2;
 namespace
 {
     constexpr float TOLERANCE = 1e-4f;
-
-#ifdef HAVE_ROCM
-    bool hasROCm()
-    {
-        int count = 0;
-        hipError_t err = hipGetDeviceCount(&count);
-        return (err == hipSuccess && count > 0);
-    }
-#endif
 
     class Test__AttentionComputeStage : public ::testing::Test
     {
@@ -767,21 +761,17 @@ namespace
     }
 
 #ifdef HAVE_ROCM
-    TEST_F(Test__AttentionComputeStage, ROCmWorkspaceRequirementsUseStageAttentionShape)
+    TEST_F(Test__AttentionComputeStage, ROCmWorkspaceRequirementsCoverStageShapeAndGroupedVerifierRows)
     {
-        if (!hasROCm())
-        {
-            GTEST_SKIP() << "ROCm not available";
-        }
-
         TensorFactory factory(mpi_ctx_);
 
-        // Regression for Qwen3.5 MoE long-context decode: the graph-level
-        // workspace hints can describe the model-local shard as 8 heads, while
-        // the concrete attention stage executes a 16-head local Q projection.
-        // Split decode needs partial buffers sized by the stage shape.  If this
-        // delegates the allocator hint through unchanged, attn_partial_output is
-        // half-sized and overwrites PARTIAL_M/PARTIAL_L during 8-way reduction.
+        /*
+         * Regressions for Qwen3.5 MoE long-context MTP: graph-level hints can
+         * describe eight heads while this stage executes sixteen, and the same
+         * one-request graph later executes up to four verifier rows.  Split
+         * decode scratch must cover both maxima.  This test only asks for pure
+         * workspace descriptors; it never initializes or executes a GPU.
+         */
         constexpr int seq_len = 1;
         constexpr int kv_len = 513;
         constexpr int stage_heads = 16;
@@ -789,6 +779,7 @@ namespace
         constexpr int n_kv_heads = 2;
         constexpr int head_dim = 256;
         constexpr int default_decode_splits = 8;
+        constexpr int grouped_verifier_rows = 4;
 
         auto Q = factory.createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(stage_heads * head_dim)},
@@ -831,12 +822,12 @@ namespace
         ASSERT_NE(partial_m, nullptr);
         ASSERT_NE(partial_l, nullptr);
 
-        const size_t expected_partial_output = static_cast<size_t>(seq_len) *
+        const size_t expected_partial_output = static_cast<size_t>(grouped_verifier_rows) *
                                                static_cast<size_t>(stage_heads) *
                                                static_cast<size_t>(default_decode_splits) *
                                                static_cast<size_t>(head_dim) *
                                                sizeof(float);
-        const size_t expected_partial_meta = static_cast<size_t>(seq_len) *
+        const size_t expected_partial_meta = static_cast<size_t>(grouped_verifier_rows) *
                                              static_cast<size_t>(stage_heads) *
                                              static_cast<size_t>(default_decode_splits) *
                                              sizeof(float);
@@ -850,8 +841,85 @@ namespace
         EXPECT_GE(partial_m->size_bytes, expected_partial_meta);
         EXPECT_GE(partial_l->size_bytes, expected_partial_meta);
         EXPECT_GT(partial_output->size_bytes, old_underallocated_partial_output)
-            << "Attention workspace must be sized from the stage's n_heads, "
-               "not a smaller graph-level model hint";
+            << "Attention workspace must cover both the stage's real head count "
+               "and the maximum grouped verifier row span";
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    TEST_F(Test__AttentionComputeStage, CUDAWorkspaceRequirementsCoverStageShapeAndGroupedVerifierRows)
+    {
+        TensorFactory factory(mpi_ctx_);
+
+        /*
+         * Mirror the ROCm production-shape proof for CUDA.  CUDA uses a larger
+         * conservative split bound, but it has the same M=2..4 verifier-row
+         * lifetime and must not depend on an unrelated graph hint happening to
+         * request a multi-row workspace first.
+         */
+        constexpr int seq_len = 1;
+        constexpr int kv_len = 513;
+        constexpr int stage_heads = 16;
+        constexpr int hinted_heads = 8;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 256;
+        constexpr int max_decode_splits = 32;
+        constexpr int grouped_verifier_rows = 4;
+
+        auto Q = factory.createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(stage_heads * head_dim)},
+            DeviceId::cpu());
+        auto K = factory.createFP32(
+            {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)},
+            DeviceId::cpu());
+        auto V = factory.createFP32(
+            {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)},
+            DeviceId::cpu());
+        auto output = factory.createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(stage_heads * head_dim)},
+            DeviceId::cpu());
+
+        AttentionComputeStage::Params params;
+        params.Q = Q.get();
+        params.K = K.get();
+        params.V = V.get();
+        params.output = output.get();
+        params.batch_size = 1;
+        params.seq_len = seq_len;
+        params.kv_len = kv_len;
+        params.n_heads = stage_heads;
+        params.n_kv_heads = n_kv_heads;
+        params.head_dim = head_dim;
+        params.causal = false;
+        params.device_id = DeviceId::cuda(0);
+        params.mpi_ctx = &mpi_ctx_;
+
+        AttentionComputeStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(
+            /*m=*/seq_len,
+            /*n=*/hinted_heads,
+            /*k=*/head_dim);
+
+        const auto *partial_output = reqs.find(cuda::AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+        const auto *partial_m = reqs.find(cuda::AttentionWorkspaceBuffers::PARTIAL_M);
+        const auto *partial_l = reqs.find(cuda::AttentionWorkspaceBuffers::PARTIAL_L);
+        ASSERT_NE(partial_output, nullptr);
+        ASSERT_NE(partial_m, nullptr);
+        ASSERT_NE(partial_l, nullptr);
+
+        const size_t expected_partial_output =
+            static_cast<size_t>(grouped_verifier_rows) *
+            static_cast<size_t>(stage_heads) *
+            static_cast<size_t>(max_decode_splits) *
+            static_cast<size_t>(head_dim) * sizeof(float);
+        const size_t expected_partial_meta =
+            static_cast<size_t>(grouped_verifier_rows) *
+            static_cast<size_t>(stage_heads) *
+            static_cast<size_t>(max_decode_splits) * sizeof(float);
+
+        EXPECT_GE(partial_output->size_bytes, expected_partial_output);
+        EXPECT_GE(partial_m->size_bytes, expected_partial_meta);
+        EXPECT_GE(partial_l->size_bytes, expected_partial_meta);
     }
 #endif
 

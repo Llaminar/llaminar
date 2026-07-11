@@ -764,6 +764,9 @@ TEST(Test__BufferId, NameRoundTrips)
     EXPECT_STREQ(bufferIdName(BufferId::ALLREDUCE_STAGING), "ALLREDUCE_STAGING");
     EXPECT_STREQ(bufferIdName(BufferId::MTP_PROJECTED), "MTP_PROJECTED");
     EXPECT_STREQ(bufferIdName(BufferId::MTP_LOGITS), "MTP_LOGITS");
+    EXPECT_STREQ(
+        bufferIdName(BufferId::MTP_LOGITS_GATHERED),
+        "MTP_LOGITS_GATHERED");
 }
 
 TEST(Test__BufferId, CountIsReasonable)

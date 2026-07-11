@@ -197,9 +197,7 @@ namespace llaminar2
     {
         (void)stream;
         if (!dst_state || !host_row_indices || request_count <= 0 ||
-            request_count > request_state_capacity_ ||
-            request_state_size_ <= 0 || !verifier_state_capture_ ||
-            verifier_state_capture_size_ < request_state_size_)
+            !verifier_state_capture_ || verifier_state_capture_size_ <= 0)
         {
             return false;
         }
@@ -215,6 +213,45 @@ namespace llaminar2
             const int row = host_row_indices[request];
             if (row >= verifier_state_capture_rows_)
                 return false;
+        }
+
+        if (request_count == 1)
+        {
+            /*
+             * The scheduler represents every host publication as a row vector,
+             * including the common single-request case.  Ordinary grouped MTP
+             * execution uses the public conv_state directly and therefore has
+             * no reason to allocate or initialize a request-state bank.  Its
+             * one selected snapshot can be committed straight into that live
+             * state.  This is state publication only: no convolution row is
+             * replayed and no floating-point operation is repeated.
+             */
+            const int row = host_row_indices[0];
+            if (row >= 0)
+            {
+                std::memcpy(
+                    dst_state,
+                    verifier_state_capture_ +
+                        static_cast<size_t>(row) * verifier_state_capture_size_,
+                    static_cast<size_t>(verifier_state_capture_size_) * sizeof(float));
+            }
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_shortconv_request_batched_state_publications",
+                1.0,
+                "decode",
+                "cpu",
+                {{"request_count", "1"},
+                 {"publication_policy", "single_request_snapshot_copy"}});
+            return true;
+        }
+
+        if (request_count > request_state_capacity_ ||
+            request_state_size_ <= 0 ||
+            verifier_state_capture_size_ < request_state_size_)
+        {
+            return false;
         }
 
         for (int request = 0; request < request_count; ++request)

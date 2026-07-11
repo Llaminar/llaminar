@@ -241,15 +241,6 @@ TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsLocalTPWhenNoCollectiveGraphPa
     EXPECT_EQ(reason, "gpu_graphs_without_collective_capture_or_segmented_replay");
 }
 
-TEST_F(Test__LocalTPContext, DebugEnvParsesSmallGpuAllreduceKnobs)
-{
-    ScopedEnvVar enabled("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE", "1");
-    ScopedEnvVar max_elements("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS", "4096");
-
-    EXPECT_TRUE(debugEnv().localtp_small_gpu_allreduce);
-    EXPECT_EQ(debugEnv().localtp_small_gpu_allreduce_max_elements, 4096u);
-}
-
 TEST_F(Test__LocalTPContext, AllreduceOnStreamRejectsNullStream)
 {
     auto ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::HOST);
@@ -436,20 +427,20 @@ TEST_F(Test__LocalTPContext, OnStreamGpuCollectivesStayGroupedDuringGraphCapture
            "explicit-stream launcher, not independent per-device captures.";
 }
 
-TEST_F(Test__LocalTPContext, CollectTimeoutPolicyUsesConfiguredCollectiveTimeout)
+TEST_F(Test__LocalTPContext, CollectTimeoutPolicySeparatesCollectivesFromWorkerJoins)
 {
     using collective_timeout_policy::effectiveCollectTimeoutMs;
     using collective_timeout_policy::effectiveWorkerJoinTimeoutMs;
 
-    EXPECT_EQ(effectiveCollectTimeoutMs(0, false), 0);
+    EXPECT_EQ(effectiveCollectTimeoutMs(0, false), 30000);
     EXPECT_EQ(effectiveCollectTimeoutMs(30000, false), 30000);
     EXPECT_EQ(effectiveCollectTimeoutMs(450000, false), 450000);
     EXPECT_EQ(effectiveCollectTimeoutMs(30000, true), 30000);
 
     EXPECT_EQ(effectiveWorkerJoinTimeoutMs(0), 0);
     EXPECT_EQ(effectiveWorkerJoinTimeoutMs(30000), 0)
-        << "LLAMINAR_TP_COLLECT_TIMEOUT_MS is a per-collective timeout, "
-           "not a whole-forward TP worker wall-clock limit.";
+        << "The collective deadline must not become a wall-clock deadline for "
+           "a complete participant forward containing many collectives.";
     EXPECT_EQ(effectiveWorkerJoinTimeoutMs(450000), 0);
 }
 

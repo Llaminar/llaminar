@@ -3723,30 +3723,12 @@ namespace llaminar2
         /// cost more than the bandwidth savings.
         size_t allreduce_fp16_min_elements = 8192;
 
-        /// Production LocalTP fast path for tiny two-GPU FP32/SUM allreduces.
-        /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE, default: enabled)
-        /// Homogeneous two-card CUDA/ROCm LocalTP domains use a graph-capturable
-        /// peer-add kernel instead of NCCL/RCCL for small decode reductions.  This
-        /// is both an economy path (tiny library collectives are expensive) and a
-        /// decode-equivalence path: MTP verifier M=2..4 row reductions perform the
-        /// same per-element FP32 add as serial M=1 decode.
-        bool localtp_small_gpu_allreduce = true;
-
-        /// Maximum element count for the small peer-add allreduce fast path.
-        /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS, default: 8192)
-        size_t localtp_small_gpu_allreduce_max_elements = 8192;
-
-        /// Timeout in ms for tensor-parallel collective/rendezvous waits and
-        /// blocking MPI collectives. This is not a wall-clock limit for an
-        /// entire per-device forward worker operation.
+        /// Timeout in ms for tensor-parallel collective/rendezvous waits,
+        /// blocking MPI collectives, and their enclosing participant-worker
+        /// joins. The canonical default is 30 seconds; non-positive overrides
+        /// are normalized back to that safety bound by CollectiveTimeoutPolicy.
         /// (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS).
-        /// Debug/Integration builds default to a 30s safety net to avoid deadlocked tests;
-        /// Release builds default to 0 (wait forever) for production runs.
-#if LLAMINAR_ASSERTIONS_ACTIVE
         int tp_collect_timeout_ms = 30000;
-#else
-        int tp_collect_timeout_ms = 0;
-#endif
 
         /// Enable model weight lifecycle trace events (env: LLAMINAR_WEIGHT_LIFECYCLE_TRACE=1)
         bool weight_lifecycle_trace = false;
@@ -3880,11 +3862,6 @@ namespace llaminar2
             allreduce_fp16_min_elements = 8192;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
-            if (const char *small_ar = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"))
-                localtp_small_gpu_allreduce = isTruthyEnvValue(small_ar);
-            localtp_small_gpu_allreduce_max_elements = 8192;
-            if (const char *small_ar_max = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS"))
-                localtp_small_gpu_allreduce_max_elements = static_cast<size_t>(std::max(0, std::atoi(small_ar_max)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
@@ -4064,11 +4041,6 @@ namespace llaminar2
             allreduce_fp16_min_elements = 8192;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
-            if (const char *small_ar = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"))
-                localtp_small_gpu_allreduce = isTruthyEnvValue(small_ar);
-            localtp_small_gpu_allreduce_max_elements = 8192;
-            if (const char *small_ar_max = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS"))
-                localtp_small_gpu_allreduce_max_elements = static_cast<size_t>(std::max(0, std::atoi(small_ar_max)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);

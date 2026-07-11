@@ -197,14 +197,14 @@ namespace llaminar2
             return megabytes * MiB;
         }
 
-        MoEExpertMode parseMoEExpertModeValue(const std::string &value)
+        RoutedExpertComputePolicy parseRoutedExpertComputePolicyValue(const std::string &value)
         {
-            auto parsed = parseMoEExpertMode(value);
+            auto parsed = parseRoutedExpertComputePolicy(value);
             if (!parsed)
             {
                 throw std::invalid_argument(
-                    "Invalid MoE expert mode: '" + value +
-                    "' (valid: apportioned-experts, sharded-experts, replicated-experts)");
+                    "Invalid routed-expert compute policy: '" + value +
+                    "' (valid: replicated, apportioned, tensor-sharded)");
             }
             return *parsed;
         }
@@ -216,7 +216,7 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "Invalid MoE dense parallel policy: '" + value +
-                    "' (valid: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, phase-split-hybrid-tp-ae)");
+                    "' (valid: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, prefill-tensor-parallel-decode-replicated)");
             }
             return *parsed;
         }
@@ -291,7 +291,14 @@ namespace llaminar2
             const std::string normalized_key = normalizeToken(key);
             if (normalized_key == "expert_mode")
             {
-                config.moe_expert_mode = parseMoEExpertModeValue(value);
+                throw std::invalid_argument(
+                    "Obsolete MoE YAML key 'expert_mode'; use "
+                    "'routed_expert_compute_policy' with replicated, "
+                    "apportioned, or tensor-sharded");
+            }
+            if (normalized_key == "routed_expert_compute_policy")
+            {
+                config.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(value);
             }
             else if (normalized_key == "hot_expert_cache")
             {
@@ -568,76 +575,82 @@ namespace llaminar2
             }
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> ensureMoEExpertParallelPlan(OrchestrationConfig &config)
+        std::shared_ptr<MoERoutedExpertPlacementPlan> ensureMoERoutedExpertPlacementPlan(OrchestrationConfig &config)
         {
-            if (!config.moe_expert_parallel_plan)
+            if (!config.moe_routed_expert_plan)
             {
-                config.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>();
+                config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             }
-            return config.moe_expert_parallel_plan;
+            return config.moe_routed_expert_plan;
         }
 
-        MoEExpertExecutionKind parseMoEExpertExecutionKind(const std::string &value, bool &enabled)
+        RoutedExpertPlacementTopology parseRoutedExpertPlacementTopologyValue(
+            const std::string &value,
+            bool &enabled)
         {
             const std::string normalized = normalizeToken(value);
             if (normalized == "off" || normalized == "disabled" || normalized == "false")
             {
                 enabled = false;
-                return MoEExpertExecutionKind::TieredExpertOverlay;
+                return RoutedExpertPlacementTopology::TieredOverlay;
             }
-            if (normalized == "tiered" || normalized == "tiered_expert_overlay")
+            if (normalized == "tiered_overlay")
             {
                 enabled = true;
-                return MoEExpertExecutionKind::TieredExpertOverlay;
+                return RoutedExpertPlacementTopology::TieredOverlay;
             }
-            if (normalized == "single_domain" || normalized == "single_domain_expert_sharded")
+            if (normalized == "single_domain")
             {
                 enabled = true;
-                return MoEExpertExecutionKind::SingleDomainExpertSharded;
+                return RoutedExpertPlacementTopology::SingleDomain;
             }
-            throw std::invalid_argument("Invalid MoE expert overlay kind: '" + value + "' (valid: off, single-domain, tiered)");
+            throw std::invalid_argument(
+                "Invalid routed-expert placement topology: '" + value +
+                "' (valid: off, single-domain, tiered-overlay)");
         }
 
-        void applyMoEExpertOverlayKind(OrchestrationConfig &config, const std::string &value)
+        void applyRoutedExpertPlacementTopology(
+            OrchestrationConfig &config,
+            const std::string &value)
         {
             bool enabled = false;
-            const auto kind = parseMoEExpertExecutionKind(value, enabled);
-            auto plan = ensureMoEExpertParallelPlan(config);
+            const auto topology = parseRoutedExpertPlacementTopologyValue(value, enabled);
+            auto plan = ensureMoERoutedExpertPlacementPlan(config);
             plan->enabled = enabled;
             if (enabled)
             {
-                plan->execution_kind = kind;
+                plan->topology = topology;
             }
         }
 
-        ExpertResidencyPolicy parseExpertResidencyPolicyValue(const std::string &value)
+        RoutedExpertResidencyPolicy parseRoutedExpertResidencyPolicyValue(const std::string &value)
         {
             const std::string normalized = normalizeToken(value);
             if (normalized == "disabled" || normalized == "off" || normalized == "none")
-                return ExpertResidencyPolicy::Disabled;
+                return RoutedExpertResidencyPolicy::Disabled;
             if (normalized == "static_by_id")
-                return ExpertResidencyPolicy::StaticById;
+                return RoutedExpertResidencyPolicy::StaticById;
             if (normalized == "histogram" || normalized == "histogram_tiered_cache")
-                return ExpertResidencyPolicy::HistogramTieredCache;
+                return RoutedExpertResidencyPolicy::HistogramTieredCache;
             if (normalized == "explicit_masks")
-                return ExpertResidencyPolicy::ExplicitMasks;
+                return RoutedExpertResidencyPolicy::ExplicitMasks;
             if (normalized == "rebalanced" || normalized == "routed_tier_rebalanced" || normalized == "routed_tier_rebalance")
-                return ExpertResidencyPolicy::RoutedTierRebalanced;
-            throw std::invalid_argument("Invalid MoE expert overlay residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks, rebalanced)");
+                return RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            throw std::invalid_argument("Invalid routed-expert residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks, rebalanced)");
         }
 
-        ExpertComputeDomain parseMoEExpertOverlayDomainSpec(const std::string &spec)
+        RoutedExpertDomain parseMoERoutedExpertDomainSpec(const std::string &spec)
         {
             ExecutionDomainParseOptions options;
-            options.context = "MoE expert overlay domain";
+            options.context = "MoE routed-expert domain";
             options.require_scope = true;
             options.allow_global_scope = false;
-            options.require_compute = true;
-            return ExpertComputeDomain::fromExecutionDomainDefinition(
+            options.require_routed_expert_compute = true;
+            return RoutedExpertDomain::fromExecutionDomainDefinition(
                 ExecutionDomainDefinition::parse(spec, options));
         }
 
-        ExpertRoutedTier parseMoEExpertOverlayTierSpec(const std::string &spec)
+        RoutedExpertTier parseMoERoutedExpertTierSpec(const std::string &spec)
         {
             const auto sections = split(spec, ';');
             if (sections.empty())
@@ -651,7 +664,7 @@ namespace llaminar2
                 throw std::invalid_argument("Invalid MoE expert overlay tier spec: '" + spec + "' (expected name@domain;priority=N)");
             }
 
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = trim(sections[0].substr(0, at_pos));
             tier.domain = trim(sections[0].substr(at_pos + 1));
             if (tier.name.empty() || tier.domain.empty())
@@ -714,10 +727,11 @@ namespace llaminar2
             return tier;
         }
 
-        std::string formatMoEOverlayValidationErrors(const std::vector<std::string> &errors)
+        std::string formatMoERoutedExpertPlacementValidationErrors(
+            const std::vector<std::string> &errors)
         {
             std::ostringstream message;
-            message << "Invalid MoE expert overlay configuration:";
+            message << "Invalid MoE routed-expert placement configuration:";
             for (const auto &error : errors)
             {
                 message << "\n - " << error;
@@ -725,7 +739,7 @@ namespace llaminar2
             return message.str();
         }
 
-        void parseMoEExpertParallelYamlBlock(const std::string &yaml, OrchestrationConfig &config)
+        void parseMoERoutedExpertPlacementYamlBlock(const std::string &yaml, OrchestrationConfig &config)
         {
             std::istringstream stream(yaml);
             std::string line;
@@ -741,13 +755,19 @@ namespace llaminar2
                 }
 
                 const size_t indent = leadingWhitespace(line);
+                if (indent == 0 && trimmed == "moe_expert_parallel:")
+                {
+                    throw std::invalid_argument(
+                        "Obsolete YAML block 'moe_expert_parallel'; use "
+                        "'moe_routed_expert_placement'");
+                }
                 if (!in_moe_block)
                 {
-                    if (indent == 0 && trimmed == "moe_expert_parallel:")
+                    if (indent == 0 && trimmed == "moe_routed_expert_placement:")
                     {
                         in_moe_block = true;
                         current_moe_section.clear();
-                        ensureMoEExpertParallelPlan(config);
+                        ensureMoERoutedExpertPlacementPlan(config);
                     }
                     continue;
                 }
@@ -756,26 +776,26 @@ namespace llaminar2
                 {
                     in_moe_block = false;
                     current_moe_section.clear();
-                    if (trimmed == "moe_expert_parallel:")
+                    if (trimmed == "moe_routed_expert_placement:")
                     {
                         in_moe_block = true;
-                        ensureMoEExpertParallelPlan(config);
+                        ensureMoERoutedExpertPlacementPlan(config);
                     }
                     continue;
                 }
 
-                auto plan = ensureMoEExpertParallelPlan(config);
+                auto plan = ensureMoERoutedExpertPlacementPlan(config);
 
                 if (trimmed.rfind("-", 0) == 0)
                 {
                     const std::string item = stripOuterQuotes(trim(trimmed.substr(1)));
                     if (current_moe_section == "domains")
                     {
-                        plan->domains.push_back(parseMoEExpertOverlayDomainSpec(item));
+                        plan->domains.push_back(parseMoERoutedExpertDomainSpec(item));
                     }
                     else if (current_moe_section == "routed_tiers")
                     {
-                        plan->routed_tiers.push_back(parseMoEExpertOverlayTierSpec(item));
+                        plan->routed_tiers.push_back(parseMoERoutedExpertTierSpec(item));
                     }
                     continue;
                 }
@@ -797,7 +817,7 @@ namespace llaminar2
 
                 if (current_moe_section == "residency" && key == "mode")
                 {
-                    plan->residency_policy = parseExpertResidencyPolicyValue(value);
+                    plan->residency_policy = parseRoutedExpertResidencyPolicyValue(value);
                     continue;
                 }
 
@@ -805,9 +825,9 @@ namespace llaminar2
                 {
                     plan->enabled = parseBoolValue(value);
                 }
-                else if (key == "execution_kind" || key == "kind")
+                else if (key == "topology")
                 {
-                    applyMoEExpertOverlayKind(config, value);
+                    applyRoutedExpertPlacementTopology(config, value);
                 }
                 else if (key == "continuation_domain")
                 {
@@ -823,7 +843,7 @@ namespace llaminar2
                 }
                 else if (key == "residency_mode")
                 {
-                    plan->residency_policy = parseExpertResidencyPolicyValue(value);
+                    plan->residency_policy = parseRoutedExpertResidencyPolicyValue(value);
                 }
             }
         }
@@ -1529,15 +1549,15 @@ namespace llaminar2
             .setter = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
         });
         spec.add({
-            .long_name = "--moe-expert-mode",
+            .long_name = "--moe-routed-expert-compute",
             .category = "MoE Configuration",
-            .value_label = "<mode>",
-            .description = "Routed expert execution: apportioned-experts (default), sharded-experts, replicated-experts",
-            .valid_values = {"apportioned-experts", "sharded-experts", "replicated-experts"},
+            .value_label = "<policy>",
+            .description = "Routed-expert compute distribution: apportioned (default), replicated, tensor-sharded",
+            .valid_values = {"apportioned", "replicated", "tensor-sharded"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.moe_expert_mode = parseMoEExpertModeValue(v);
+                    c.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(v);
                 }),
         });
         spec.add({
@@ -1758,7 +1778,7 @@ namespace llaminar2
             .long_name = "--moe-device-llep-alpha-numerator",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Least-loaded EP device capacity alpha numerator (default: 1)",
+            .description = "Least-loaded-resident device capacity alpha numerator (default: 1)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1770,7 +1790,7 @@ namespace llaminar2
             .long_name = "--moe-device-llep-alpha-denominator",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Least-loaded EP device capacity alpha denominator (default: 1)",
+            .description = "Least-loaded-resident device capacity alpha denominator (default: 1)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1782,7 +1802,7 @@ namespace llaminar2
             .long_name = "--moe-device-llep-lambda-numerator",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Least-loaded EP balanced-skip lambda numerator (default: 13)",
+            .description = "Least-loaded-resident balanced-skip lambda numerator (default: 13)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1794,7 +1814,7 @@ namespace llaminar2
             .long_name = "--moe-device-llep-lambda-denominator",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Least-loaded EP balanced-skip lambda denominator (default: 10)",
+            .description = "Least-loaded-resident balanced-skip lambda denominator (default: 10)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1805,7 +1825,7 @@ namespace llaminar2
         spec.add({
             .long_name = "--moe-device-llep-disable-balanced-skip",
             .category = "MoE Configuration",
-            .description = "Require LLEP assignment planning even when standard EP is load-balanced",
+            .description = "Require LLEP assignment planning even when static-owner apportionment is load-balanced",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &)
                 {
@@ -1823,127 +1843,125 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay",
+            .long_name = "--moe-routed-expert-placement",
             .category = "MoE Configuration",
-            .value_label = "<kind>",
-            .description = "Same-layer MoE expert overlay: off, single-domain, tiered",
-            .valid_values = {"off", "single-domain", "tiered"},
+            .value_label = "<topology>",
+            .description = "Same-layer routed-expert placement topology: off, single-domain, tiered-overlay",
+            .valid_values = {"off", "single-domain", "tiered-overlay"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    applyMoEExpertOverlayKind(c, v);
+                    applyRoutedExpertPlacementTopology(c, v);
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-continuation",
-            .category = "MoE Configuration",
-            .value_label = "<domain>",
-            .description = "MoE overlay domain that receives the final reduced output",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v)
-                {
-                    ensureMoEExpertParallelPlan(c)->continuation_domain = v;
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-expert-overlay-base-domain",
-            .aliases = {"--base-model-domain"},
+            .long_name = "--moe-routed-expert-continuation-domain",
             .category = "MoE Configuration",
             .value_label = "<domain>",
-            .description = "MoE overlay domain for dense/non-expert model placement (defaults to continuation)",
+            .description = "Continuation domain that receives the final routed-expert reduction",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->base_model_domain = v;
+                    ensureMoERoutedExpertPlacementPlan(c)->continuation_domain = v;
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-shared-domain",
+            .long_name = "--moe-routed-expert-base-model-domain",
             .category = "MoE Configuration",
             .value_label = "<domain>",
-            .description = "MoE overlay domain where shared experts execute",
+            .description = "Dense/non-expert base-model domain (defaults to the continuation domain)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->shared_expert_domain = v;
+                    ensureMoERoutedExpertPlacementPlan(c)->base_model_domain = v;
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-dense-tp",
+            .long_name = "--moe-routed-expert-shared-domain",
+            .category = "MoE Configuration",
+            .value_label = "<domain>",
+            .description = "Domain where shared experts execute",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoERoutedExpertPlacementPlan(c)->shared_expert_domain = v;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-continuation-dense-tp",
             .category = "MoE Configuration",
             .value_label = "<bool>",
-            .description = "Enable dense/non-expert tensor parallelism inside the MoE overlay continuation domain",
+            .description = "Enable dense/non-expert tensor parallelism inside the continuation domain",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    auto plan = ensureMoEExpertParallelPlan(c);
+                    auto plan = ensureMoERoutedExpertPlacementPlan(c);
                     plan->continuation_domain_spec.dense_tp_enabled = parseBoolValue(v);
                     plan->continuation_domain_spec.refreshDensePolicyFromFlags();
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-dense-decode-replicated",
+            .long_name = "--moe-continuation-dense-decode-replicated",
             .category = "MoE Configuration",
             .value_label = "<bool>",
-            .description = "Use replicated full dense weights for MoE overlay decode while retaining dense TP for prefill",
+            .description = "Use replicated full dense weights for decode while retaining dense TP for prefill",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    auto plan = ensureMoEExpertParallelPlan(c);
+                    auto plan = ensureMoERoutedExpertPlacementPlan(c);
                     plan->continuation_domain_spec.dense_decode_replicated = parseBoolValue(v);
                     plan->continuation_domain_spec.refreshDensePolicyFromFlags();
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-dense-policy",
+            .long_name = "--moe-continuation-dense-policy",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "Dense/shared MoE overlay policy: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, phase-split-hybrid-tp-ae",
+            .description = "Dense/shared continuation policy: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, prefill-tensor-parallel-decode-replicated",
             .valid_values = {
                 "replicated",
                 "tensor-parallel",
                 "tensor-parallel-decode-mirrored-embedding",
-                "phase-split-hybrid-tp-ae",
-                "phase_split_hybrid_tp_ae"},
+                "prefill-tensor-parallel-decode-replicated"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    auto plan = ensureMoEExpertParallelPlan(c);
+                    auto plan = ensureMoERoutedExpertPlacementPlan(c);
                     plan->continuation_domain_spec.setDensePolicy(parseDenseParallelPolicyValue(v));
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-residency",
+            .long_name = "--moe-routed-expert-residency",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "MoE overlay residency: static-by-id, histogram, explicit-masks, rebalanced",
+            .description = "Routed-expert residency policy: static-by-id, histogram, explicit-masks, rebalanced",
             .valid_values = {"static-by-id", "histogram", "explicit-masks", "rebalanced"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->residency_policy = parseExpertResidencyPolicyValue(v);
+                    ensureMoERoutedExpertPlacementPlan(c)->residency_policy = parseRoutedExpertResidencyPolicyValue(v);
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-domain",
+            .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|apportioned_experts|sharded_experts[;assignment=static_owner|least_loaded_ep][;owner=N][;ranks=0,1]\"",
+            .description = "Define a routed-expert domain: \"name=devices;scope=single|local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,1]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->domains.push_back(parseMoEExpertOverlayDomainSpec(v));
+                    ensureMoERoutedExpertPlacementPlan(c)->domains.push_back(parseMoERoutedExpertDomainSpec(v));
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-tier",
+            .long_name = "--moe-routed-expert-tier",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define MoE overlay routed tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto][;fallback=true]\"",
+            .description = "Define a routed-expert placement tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto][;fallback=true]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->routed_tiers.push_back(parseMoEExpertOverlayTierSpec(v));
+                    ensureMoERoutedExpertPlacementPlan(c)->routed_tiers.push_back(parseMoERoutedExpertTierSpec(v));
                 }),
         });
 
@@ -2634,16 +2652,16 @@ namespace llaminar2
                 "Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp");
         }
 
-        auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+        auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
         if (!normalize_errors.empty())
         {
-            throw std::invalid_argument(formatMoEOverlayValidationErrors(normalize_errors));
+            throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(normalize_errors));
         }
 
-        auto overlay_errors = validateMoEExpertOverlayConfig(config);
+        auto overlay_errors = validateMoERoutedExpertPlacementConfig(config);
         if (!overlay_errors.empty())
         {
-            throw std::invalid_argument(formatMoEOverlayValidationErrors(overlay_errors));
+            throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(overlay_errors));
         }
 
         return config;
@@ -2674,7 +2692,7 @@ namespace llaminar2
     {
         OrchestrationConfig config;
 
-        parseMoEExpertParallelYamlBlock(yaml, config);
+        parseMoERoutedExpertPlacementYamlBlock(yaml, config);
 
         // Simple line-by-line YAML parser (sufficient for our flat structure)
         // For production, consider using a proper YAML library like yaml-cpp
@@ -2704,7 +2722,7 @@ namespace llaminar2
                 skipping_moe_block = false;
             }
 
-            if (indent == 0 && trimmed == "moe_expert_parallel:")
+            if (indent == 0 && trimmed == "moe_routed_expert_placement:")
             {
                 skipping_moe_block = true;
                 current_section.clear();
@@ -2958,9 +2976,16 @@ namespace llaminar2
             {
                 applyMTPYamlKey(config, normalized_key.substr(std::string("mtp_").size()), value);
             }
-            else if (normalized_key == "moe_expert_mode")
+            else if (normalized_key == "expert_mode" ||
+                     normalized_key == "moe_expert_mode")
             {
-                config.moe_expert_mode = parseMoEExpertModeValue(value);
+                throw std::invalid_argument(
+                    "Obsolete MoE YAML key '" + key + "'; use "
+                    "'routed_expert_compute_policy'");
+            }
+            else if (normalized_key == "routed_expert_compute_policy")
+            {
+                config.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(value);
             }
             else if (normalized_key == "moe_hot_expert_cache")
             {
@@ -3094,10 +3119,10 @@ namespace llaminar2
             }
         }
 
-        auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+        auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
         if (!normalize_errors.empty())
         {
-            throw std::invalid_argument(formatMoEOverlayValidationErrors(normalize_errors));
+            throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(normalize_errors));
         }
 
         return config;

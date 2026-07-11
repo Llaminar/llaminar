@@ -87,6 +87,48 @@ namespace llaminar2::test
         EXPECT_EQ(sampleMTPDistributionWithThreshold(distribution, 2.0f), 4);
     }
 
+    TEST(Test__MTPRejectionSampler, SerialEquivalentRowAcceptsMatchingDraft)
+    {
+        const auto target = dist({{3, 0.25f}, {4, 0.75f}});
+
+        const MTPRejectionSampleRowResult result =
+            sampleMTPSerialEquivalentTargetRow(
+                target,
+                /*draft_token=*/4,
+                /*sample_threshold=*/0.5f);
+
+        ASSERT_TRUE(result.ok) << result.error;
+        EXPECT_TRUE(result.accepted);
+        EXPECT_EQ(result.token, 4);
+        EXPECT_EQ(result.draft_token, 4);
+        EXPECT_FLOAT_EQ(result.accept_probability, 1.0f);
+        EXPECT_FLOAT_EQ(result.accept_threshold, 0.5f);
+    }
+
+    TEST(Test__MTPRejectionSampler, SerialEquivalentCorrectionIgnoresDraftChoice)
+    {
+        const auto target = dist({{3, 0.25f}, {4, 0.75f}});
+
+        const MTPRejectionSampleRowResult matching =
+            sampleMTPSerialEquivalentTargetRow(
+                target,
+                /*draft_token=*/4,
+                /*sample_threshold=*/0.5f);
+        const MTPRejectionSampleRowResult mismatching =
+            sampleMTPSerialEquivalentTargetRow(
+                target,
+                /*draft_token=*/3,
+                /*sample_threshold=*/0.5f);
+
+        ASSERT_TRUE(matching.ok) << matching.error;
+        ASSERT_TRUE(mismatching.ok) << mismatching.error;
+        EXPECT_EQ(matching.token, 4);
+        EXPECT_EQ(mismatching.token, matching.token);
+        EXPECT_TRUE(matching.accepted);
+        EXPECT_FALSE(mismatching.accepted);
+        EXPECT_FLOAT_EQ(mismatching.accept_probability, 0.0f);
+    }
+
     TEST(Test__MTPRejectionSampler, SharedDistributionSamplerReportsSelectedProbability)
     {
         const int token_ids[] = {7, 11, 13, -1};

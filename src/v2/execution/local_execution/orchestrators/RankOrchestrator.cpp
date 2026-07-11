@@ -58,6 +58,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #ifdef __linux__
 #include <malloc.h> // malloc_trim for deferred host weight release
@@ -357,8 +358,8 @@ namespace llaminar2
             return ok;
         }
 
-        const ExpertComputeDomain *findMoEExpertDomain(
-            const MoEExpertParallelPlan &plan,
+        const RoutedExpertDomain *findMoEExpertDomain(
+            const MoERoutedExpertPlacementPlan &plan,
             const std::string &name)
         {
             auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
@@ -369,7 +370,7 @@ namespace llaminar2
             return it == plan.domains.end() ? nullptr : &*it;
         }
 
-        bool routedOverlayUsesApportionedExperts(const std::shared_ptr<MoEExpertParallelPlan> &plan)
+        bool routedOverlayUsesExpertIdApportionment(const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan)
         {
             if (!plan || !plan->isTieredOverlay())
                 return false;
@@ -377,13 +378,14 @@ namespace llaminar2
             for (const auto &tier : plan->routed_tiers)
             {
                 const auto *domain = findMoEExpertDomain(*plan, tier.domain);
-                if (domain && domain->compute_kind == ExpertDomainComputeKind::ApportionedExperts)
+                if (domain &&
+                    domain->routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
                     return true;
             }
             return false;
         }
 
-        bool moeOverlayDenseTPEnabled(const std::shared_ptr<MoEExpertParallelPlan> &plan)
+        bool moeOverlayDenseTPEnabled(const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan)
         {
             if (!plan || !plan->isTieredOverlay())
                 return true;
@@ -619,7 +621,7 @@ namespace llaminar2
             plan.runtime.tp_allreduce_precision_override;
         config.prefix_cache = plan.runtime.prefix_cache;
         config.mtp = plan.runtime.mtp;
-        config.moe_expert_mode = plan.runtime.moe_expert_mode;
+        config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
         config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
         config.moe_rebalance = plan.runtime.moe_rebalance;
 
@@ -938,7 +940,7 @@ namespace llaminar2
                 }
 
                 const bool dense_tp_enabled =
-                    moeOverlayDenseTPEnabled(config_.moe_expert_parallel_plan);
+                    moeOverlayDenseTPEnabled(config_.moe_routed_expert_plan);
 
                 std::shared_ptr<TensorParallelConfig> tp_config;
                 if (dense_tp_enabled)
@@ -952,7 +954,7 @@ namespace llaminar2
                 WeightManagerConfig wm_config;
                 wm_config.tp_config = dense_tp_enabled ? tp_config : nullptr;
                 wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(model_ctx_->architecture());
-                if (routedOverlayUsesApportionedExperts(config_.moe_expert_parallel_plan))
+                if (routedOverlayUsesExpertIdApportionment(config_.moe_routed_expert_plan))
                 {
                     forceRoutedMoEExpertParentsReplicated(wm_config.sharding);
                     LOG_DEBUG("RankOrchestrator: forcing routed MoE expert parent weights replicated for graph-native overlay");
@@ -1127,8 +1129,8 @@ namespace llaminar2
                 else
                 {
                     const bool include_expert_jobs =
-                        !(config_.moe_expert_parallel_plan &&
-                          config_.moe_expert_parallel_plan->isTieredOverlay());
+                        !(config_.moe_routed_expert_plan &&
+                          config_.moe_routed_expert_plan->isTieredOverlay());
                     LOG_DEBUG("RankOrchestrator: Finalizing weights for "
                               << device_ids.size() << " devices"
                               << " (release_host_data=false, deferred until after graph build"
@@ -1141,8 +1143,8 @@ namespace llaminar2
                         LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
                     }
 
-                    if (config_.moe_expert_parallel_plan &&
-                        config_.moe_expert_parallel_plan->isTieredOverlay())
+                    if (config_.moe_routed_expert_plan &&
+                        config_.moe_routed_expert_plan->isTieredOverlay())
                     {
                         if (auto concrete_weight_mgr = std::dynamic_pointer_cast<WeightManager>(weight_mgr))
                         {
@@ -1150,7 +1152,7 @@ namespace llaminar2
                                                          ? config_.moe_expert_overlay_mpi_ctx->rank()
                                                          : 0;
                             auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-                                config_.moe_expert_parallel_plan,
+                                config_.moe_routed_expert_plan,
                                 MoEExpertOverlayRuntimeResolverOptions{
                                     .current_world_rank = overlay_rank,
                                 });
@@ -1216,12 +1218,12 @@ namespace llaminar2
                                                      config_.tp_allreduce_precision_override;
                                                  runner_config.prefix_cache = config_.prefix_cache;
                                                  runner_config.mtp = config_.mtp;
-                                                 runner_config.moe_expert_mode = config_.moe_expert_mode;
+                                                 runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
                                                  runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
                                                  runner_config.moe_rebalance = config_.moe_rebalance;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
-                                                 runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
+                                                 runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
                                                  runner_config.moe_expert_overlay_weights_prepared_by_parent =
                                                      overlay_weights_prepared_by_parent;
                                                  runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
@@ -1502,12 +1504,12 @@ namespace llaminar2
                 config_.tp_allreduce_precision_override;
             runner_config.prefix_cache = config_.prefix_cache;
             runner_config.mtp = config_.mtp;
-            runner_config.moe_expert_mode = config_.moe_expert_mode;
+            runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
             runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
             runner_config.moe_rebalance = config_.moe_rebalance;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
             runner_config.prepared_weight_store = config_.prepared_weight_store;
-            runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
+            runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
             runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
             // =====================================================================
             // Build FactoryPPStageConfig for the createPPStageRunner factory
@@ -1545,12 +1547,12 @@ namespace llaminar2
                     config_.tp_allreduce_precision_override;
                 nested_config.prefix_cache = config_.prefix_cache;
                 nested_config.mtp = config_.mtp;
-                nested_config.moe_expert_mode = config_.moe_expert_mode;
+                nested_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
                 nested_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
                 nested_config.moe_rebalance = config_.moe_rebalance;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.prepared_weight_store = config_.prepared_weight_store;
-                nested_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
+                nested_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
                 nested_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would
@@ -3242,6 +3244,17 @@ namespace llaminar2
                 return false;
             }
         }
+        std::string mailbox_error;
+        if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
+                request_count,
+                "request_batch_prefill_sample",
+                &mailbox_error))
+        {
+            LOG_ERROR("[RankOrchestrator] Mirrored LocalTP request-batch "
+                      "prefill could not adopt child logical-state mailboxes: "
+                      << mailbox_error);
+            return false;
+        }
         std::copy(primary_tokens.begin(), primary_tokens.end(), out_tokens);
 
         PerfStatsCollector::addCounter(
@@ -4229,6 +4242,575 @@ namespace llaminar2
         return all_success;
     }
 
+    bool RankOrchestrator::forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_batch,
+        int first_draft_slot,
+        int slot_stride)
+    {
+        if (finalPPSidecarRunner())
+        {
+            LOG_ERROR("[RankOrchestrator] Resident request-batched MTP is a LocalTP operation and cannot cross a LocalPP sidecar boundary");
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+                    logical_state,
+                    request_batch,
+                    first_draft_slot,
+                    slot_stride);
+        }
+
+        return dispatchMirroredLocalTPResidentMTPRequestBatch(
+            logical_state,
+            request_batch,
+            first_draft_slot,
+            slot_stride,
+            "forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots",
+            "resident_logical_state",
+            [request_batch,
+             first_draft_slot,
+             slot_stride](
+                IInferenceRunner &child,
+                const DeviceResidentLogicalSequenceStateHandle &child_state)
+            {
+                return child
+                    .forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+                        child_state,
+                        request_batch,
+                        first_draft_slot,
+                        slot_stride);
+            });
+    }
+
+    bool RankOrchestrator::advanceMTPRequestBatchConditionOnDevice(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_batch,
+        const SamplingParams &params,
+        const uint64_t *stochastic_position_seeds)
+    {
+        if (finalPPSidecarRunner())
+        {
+            LOG_ERROR("[RankOrchestrator] Resident request-batch condition advance cannot cross a LocalPP sidecar boundary");
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]->advanceMTPRequestBatchConditionOnDevice(
+                logical_state,
+                request_batch,
+                params,
+                stochastic_position_seeds);
+        }
+
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            LOG_ERROR("[RankOrchestrator] Resident request-batch condition advance failed: "
+                      << reason);
+            return false;
+        };
+        const DeviceResidentLogicalSequenceStateHandle current_rank_state =
+            deviceResidentLogicalSequenceState();
+        if (device_runners_.size() < 2 || !tp_ctx_ ||
+            !current_rank_state.valid() ||
+            !logical_state.sameMailboxAs(current_rank_state) ||
+            logical_state.request_count != request_batch ||
+            rank_resident_child_logical_state_handles_.size() !=
+                device_runners_.size())
+        {
+            return fail("rank or child logical-state mailbox is stale or incomplete");
+        }
+        if (tp_ctx_->backend() != CollectiveBackendType::NCCL &&
+            tp_ctx_->backend() != CollectiveBackendType::RCCL)
+        {
+            return fail("LocalTP condition advance requires NCCL/RCCL collectives");
+        }
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            if (!device_runners_[participant] ||
+                !rank_resident_child_logical_state_handles_[participant].valid() ||
+                rank_resident_child_logical_state_handles_[participant]
+                        .request_count != request_batch)
+            {
+                return fail(
+                    "participant " + std::to_string(participant) +
+                    " has no matching resident mailbox");
+            }
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_->setFailureCallback([this]()
+                                                {
+                LOG_WARN("[TPWorkerPool] resident request-batch condition advance failed; aborting collective backend");
+                if (tp_ctx_)
+                    tp_ctx_->requestAbort(); });
+        }
+
+        const auto kernel_phase = KernelProfiler::getCurrentPhase();
+        const auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        const auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        const auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        const auto executor_phase = GraphExecutorStats::currentPhase();
+
+        /*
+         * Main and sidecar graphs contain LocalTP collectives, so every child
+         * must enter the grouped condition transition concurrently. Request
+         * rows remain grouped inside each participant; the worker pool is only
+         * the device-participant fanout.
+         */
+        tp_worker_pool_->dispatch(
+            [this,
+             request_batch,
+             &params,
+             stochastic_position_seeds,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t participant) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                const DeviceId device_id =
+                    device_runners_[participant]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+                return device_runners_[participant]
+                    ->advanceMTPRequestBatchConditionOnDevice(
+                        rank_resident_child_logical_state_handles_[participant],
+                        request_batch,
+                        params,
+                        stochastic_position_seeds);
+            });
+
+        bool all_success = true;
+        bool worker_timeout = false;
+        std::exception_ptr first_exception;
+        size_t first_exception_participant = 0;
+        const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+        auto results = tp_worker_pool_->collectAll(collect_timeout_ms);
+        for (auto &result : results)
+        {
+            if (!result.completed)
+            {
+                worker_timeout = true;
+                all_success = false;
+                continue;
+            }
+            if (result.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = result.exception;
+                    first_exception_participant = result.worker_index;
+                }
+                continue;
+            }
+            all_success = all_success && result.success;
+        }
+        if (worker_timeout && collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "advanceMTPRequestBatchConditionOnDevice",
+                collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("[RankOrchestrator] Resident request-batch condition advance rethrowing exception from participant "
+                      << first_exception_participant);
+            std::rethrow_exception(first_exception);
+        }
+        if (!all_success)
+            return false;
+
+        std::string mailbox_error;
+        if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
+                request_batch,
+                "request_batch_condition_advance",
+                &mailbox_error))
+        {
+            return fail("could not adopt advanced child mailboxes: " + mailbox_error);
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_request_batch_condition_advances",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"requests", std::to_string(request_batch)},
+             {"sampling", params.is_greedy() ? "greedy" : "stochastic"},
+             {"logical_state_owner", "child_device_mailboxes"}});
+        return true;
+    }
+
+    bool RankOrchestrator::forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_batch,
+        int first_condition_slot,
+        int condition_slot_stride,
+        int position_offset,
+        int first_draft_slot,
+        int draft_slot_stride)
+    {
+        const int64_t last_condition_slot =
+            static_cast<int64_t>(first_condition_slot) +
+            static_cast<int64_t>(request_batch - 1) *
+                static_cast<int64_t>(condition_slot_stride);
+        if (request_batch <= 1 ||
+            first_condition_slot < 0 ||
+            condition_slot_stride <= 0 ||
+            last_condition_slot < 0 ||
+            last_condition_slot >= kRankStochasticMaxSlots ||
+            position_offset <= 0)
+        {
+            LOG_ERROR("[RankOrchestrator] Chained resident request-batched MTP received invalid source-slot or depth geometry"
+                      << " request_batch=" << request_batch
+                      << " first_condition_slot=" << first_condition_slot
+                      << " condition_slot_stride=" << condition_slot_stride
+                      << " position_offset=" << position_offset);
+            return false;
+        }
+        if (finalPPSidecarRunner())
+        {
+            LOG_ERROR("[RankOrchestrator] Chained resident request-batched MTP is a LocalTP operation and cannot cross a LocalPP sidecar boundary");
+            return false;
+        }
+        if (device_runners_.size() == 1 && device_runners_[0])
+        {
+            return device_runners_[0]
+                ->forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+                    logical_state,
+                    request_batch,
+                    first_condition_slot,
+                    condition_slot_stride,
+                    position_offset,
+                    first_draft_slot,
+                    draft_slot_stride);
+        }
+
+        return dispatchMirroredLocalTPResidentMTPRequestBatch(
+            logical_state,
+            request_batch,
+            first_draft_slot,
+            draft_slot_stride,
+            "forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots",
+            "device_draft_slots",
+            [request_batch,
+             first_condition_slot,
+             condition_slot_stride,
+             position_offset,
+             first_draft_slot,
+             draft_slot_stride](
+                IInferenceRunner &child,
+                const DeviceResidentLogicalSequenceStateHandle &child_state)
+            {
+                return child
+                    .forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+                        child_state,
+                        request_batch,
+                        first_condition_slot,
+                        condition_slot_stride,
+                        position_offset,
+                        first_draft_slot,
+                        draft_slot_stride);
+            });
+    }
+
+    bool RankOrchestrator::dispatchMirroredLocalTPResidentMTPRequestBatch(
+        const DeviceResidentLogicalSequenceStateHandle &logical_state,
+        int request_batch,
+        int first_draft_slot,
+        int draft_slot_stride,
+        const char *operation_name,
+        const char *source_name,
+        const std::function<bool(
+            IInferenceRunner &,
+            const DeviceResidentLogicalSequenceStateHandle &)> &child_operation)
+    {
+        const std::string operation =
+            operation_name && operation_name[0] != '\0'
+                ? operation_name
+                : "resident_request_batch_mtp";
+        const std::string source =
+            source_name && source_name[0] != '\0'
+                ? source_name
+                : "unspecified";
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            LOG_ERROR("RankOrchestrator::" << operation << ": " << reason);
+            return false;
+        };
+
+        const int64_t last_draft_slot =
+            static_cast<int64_t>(first_draft_slot) +
+            static_cast<int64_t>(request_batch - 1) *
+                static_cast<int64_t>(draft_slot_stride);
+        if (request_batch <= 1 ||
+            first_draft_slot < 0 ||
+            draft_slot_stride <= 0 ||
+            last_draft_slot < 0 ||
+            last_draft_slot >= kRankStochasticMaxSlots)
+        {
+            return fail(
+                "invalid destination-slot geometry: request_batch=" +
+                std::to_string(request_batch) +
+                " first_draft_slot=" + std::to_string(first_draft_slot) +
+                " draft_slot_stride=" + std::to_string(draft_slot_stride));
+        }
+        if (!child_operation)
+            return fail("missing grouped child operation");
+        if (device_runners_.size() < 2 || !tp_ctx_)
+            return fail("requires at least two LocalTP participants and a live collective context");
+        if (tp_ctx_->backend() != CollectiveBackendType::NCCL &&
+            tp_ctx_->backend() != CollectiveBackendType::RCCL)
+        {
+            return fail(
+                std::string(
+                    "requires NCCL/RCCL device-slot publication, got backend=") +
+                collectiveBackendTypeToString(tp_ctx_->backend()));
+        }
+        if (!usesMirroredLocalTPMTPHeadForVerifier() ||
+            !supportsMTPDeviceDraftTokenInput() ||
+            !supportsDeviceStochasticMTPVerification())
+        {
+            return fail(
+                "requires mirrored full-vocabulary MTP heads and device-resident draft/verifier support on every participant");
+        }
+
+        /*
+         * The rank handle is deliberately opaque. Comparing it with a freshly
+         * materialized aggregate checks every pointer, stream, event, epoch, and
+         * request-count field without dereferencing child device memory.
+         */
+        const DeviceResidentLogicalSequenceStateHandle current_rank_state =
+            deviceResidentLogicalSequenceState();
+        if (!current_rank_state.valid() ||
+            !logical_state.sameMailboxAs(current_rank_state) ||
+            logical_state.request_count != request_batch)
+        {
+            return fail(
+                "received a stale, foreign, or shape-mismatched rank logical-state mailbox");
+        }
+        if (rank_resident_child_logical_state_handles_.size() !=
+            device_runners_.size())
+        {
+            return fail("rank aggregate no longer has one child mailbox per participant");
+        }
+
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *child = device_runners_[participant].get();
+            const DeviceResidentLogicalSequenceStateHandle &child_state =
+                rank_resident_child_logical_state_handles_[participant];
+            if (!child ||
+                !child->primaryDeviceId().is_gpu() ||
+                !child->usesMirroredLocalTPMTPHeadForVerifier() ||
+                !child->supportsMTPDeviceDraftTokenInput() ||
+                !child->supportsDeviceStochasticMTPVerification())
+            {
+                return fail(
+                    "participant " + std::to_string(participant) +
+                    " does not expose the mirrored device-resident MTP contract");
+            }
+            if (!child_state.valid() ||
+                child_state.request_count != request_batch ||
+                child_state.device != child->primaryDeviceId())
+            {
+                return fail(
+                    "participant " + std::to_string(participant) +
+                    " has a stale, foreign, or shape-mismatched child mailbox");
+            }
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ =
+                std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_->setFailureCallback([this, operation]()
+                                                {
+                LOG_WARN("[TPWorkerPool] " << operation
+                         << " failure detected - aborting collective backend");
+                if (tp_ctx_)
+                    tp_ctx_->requestAbort(); });
+        }
+
+        const auto kernel_phase = KernelProfiler::getCurrentPhase();
+        const auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        const auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        const auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        const auto executor_phase = GraphExecutorStats::currentPhase();
+
+        /*
+         * The worker callback is participant-parallel and invokes exactly one
+         * grouped child operation. Request rows remain a batch inside the child
+         * graph; there is intentionally no rank-side loop over sidecar rows.
+         */
+        tp_worker_pool_->dispatch(
+            [this,
+             child_operation,
+             kernel_phase,
+             rocm_phase,
+             cuda_phase,
+             kv_phase,
+             executor_phase](size_t participant) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                const DeviceId device_id =
+                    device_runners_[participant]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+                return child_operation(
+                    *device_runners_[participant],
+                    rank_resident_child_logical_state_handles_[participant]);
+            });
+
+        bool all_success = true;
+        bool worker_timeout = false;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_participant = 0;
+        const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+        auto results = tp_worker_pool_->collectAll(collect_timeout_ms);
+        for (auto &result : results)
+        {
+            if (!result.completed)
+            {
+                LOG_ERROR("RankOrchestrator::" << operation
+                          << ": participant " << result.worker_index
+                          << " did not complete");
+                worker_timeout = true;
+                all_success = false;
+                continue;
+            }
+            if (result.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = result.exception;
+                    first_exception_participant = result.worker_index;
+                }
+                continue;
+            }
+            if (!result.success)
+            {
+                LOG_ERROR("RankOrchestrator::" << operation
+                          << ": participant " << result.worker_index
+                          << " rejected the grouped sidecar");
+                all_success = false;
+            }
+        }
+        if (worker_timeout && collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                operation.c_str(),
+                collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::" << operation
+                      << ": rethrowing primary exception from participant "
+                      << first_exception_participant);
+            std::rethrow_exception(first_exception);
+        }
+        if (!all_success)
+            return false;
+
+        /*
+         * Every mirrored child has produced a full-vocabulary proposal, but the
+         * rank publishes child zero as the one authoritative value. Broadcasting
+         * the compact INT32 slots keeps later chained sidecars and the verifier
+         * bitwise aligned without an MTP-logit allreduce or any host comparison.
+         */
+        for (int request = 0; request < request_batch; ++request)
+        {
+            const int slot = first_draft_slot + request * draft_slot_stride;
+            if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
+                    DeviceDistributionBuffer::Draft,
+                    slot))
+            {
+                return fail(
+                    "could not collectively publish primary proposal slot " +
+                    std::to_string(slot));
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_resident_request_batch_sidecars",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"requests", std::to_string(request_batch)},
+             {"source", source},
+             {"implementation", "grouped_child_graphs"}});
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_resident_request_batch_draft_slot_publications",
+            static_cast<double>(request_batch),
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"requests", std::to_string(request_batch)},
+             {"source", source},
+             {"first_slot", std::to_string(first_draft_slot)},
+             {"slot_stride", std::to_string(draft_slot_stride)},
+             {"collective", "nccl_rccl_int32_broadcast"}});
+        return true;
+    }
+
+    void RankOrchestrator::invalidateRankResidentLogicalStateAggregate(
+        const char *lifecycle,
+        const char *reason,
+        int participant) const
+    {
+        const bool had_aggregate =
+            !rank_resident_child_logical_state_handles_.empty();
+        rank_resident_child_logical_state_handles_.clear();
+        ++rank_resident_logical_state_epoch_;
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_resident_logical_state_aggregate_invalidations",
+            1.0,
+            "decode",
+            "rank",
+            {{"lifecycle", lifecycle && lifecycle[0] != '\0'
+                               ? lifecycle
+                               : "unspecified"},
+             {"reason", reason && reason[0] != '\0'
+                            ? reason
+                            : "unspecified"},
+             {"participant", std::to_string(participant)},
+             {"had_aggregate", had_aggregate ? "true" : "false"},
+             {"rank_epoch", std::to_string(rank_resident_logical_state_epoch_)}});
+    }
+
     DeviceResidentLogicalSequenceStateHandle
     RankOrchestrator::deviceResidentLogicalSequenceState() const
     {
@@ -4252,12 +4834,43 @@ namespace llaminar2
         {
             const DeviceResidentLogicalSequenceStateHandle &child =
                 rank_resident_child_logical_state_handles_[i];
-            if (!child.valid())
+            if (!device_runners_[i] || !child.valid())
+            {
+                invalidateRankResidentLogicalStateAggregate(
+                    "aggregate_observation",
+                    "cached_child_handle_invalid",
+                    static_cast<int>(i));
                 return {};
+            }
+
+            /*
+             * A cached handle is only a rank-local ownership token. Ask the
+             * child for its current mailbox before exposing the aggregate so a
+             * prefix replacement, reset, workspace rebind, or publication epoch
+             * change cannot leave a structurally valid but stale rank handle.
+             * This compares pointers and events only; it performs no GPU work
+             * and introduces no host synchronization.
+             */
+            const DeviceResidentLogicalSequenceStateHandle current_child =
+                device_runners_[i]->deviceResidentLogicalSequenceState();
+            if (!current_child.sameMailboxAs(child))
+            {
+                invalidateRankResidentLogicalStateAggregate(
+                    "aggregate_observation",
+                    "child_mailbox_no_longer_current",
+                    static_cast<int>(i));
+                return {};
+            }
             if (request_count < 0)
                 request_count = child.request_count;
             if (child.request_count != request_count)
+            {
+                invalidateRankResidentLogicalStateAggregate(
+                    "aggregate_observation",
+                    "child_request_count_mismatch",
+                    static_cast<int>(i));
                 return {};
+            }
         }
         if (request_count <= 0)
             return {};
@@ -5768,6 +6381,66 @@ namespace llaminar2
                 target_sample_slot,
                 out_token);
         }
+
+        if (usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            if (target_sample_slot < 0 ||
+                target_sample_slot >= kRankStochasticMaxSlots ||
+                device_runners_.size() < 2)
+            {
+                return false;
+            }
+            for (size_t child = 0; child < device_runners_.size(); ++child)
+            {
+                const IInferenceRunner *runner = device_runners_[child].get();
+                if (!runner ||
+                    !runner->usesMirroredLocalTPMTPHeadForVerifier() ||
+                    !runner->supportsDeviceStochasticMTPVerification())
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax requires a full-head device sampler on participant "
+                              << child);
+                    return false;
+                }
+            }
+
+            /*
+             * The mirrored rows are identical, so one argmax is sufficient.
+             * Keep the normal serving path entirely device-owned by requesting
+             * no host shadow from child zero, then broadcast its target mailbox
+             * slot through the configured LocalTP collective. A host value is
+             * materialized only for callers that explicitly request one.
+             */
+            int32_t primary_shadow = -1;
+            if (!device_runners_.front()
+                     ->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                         target_sample_slot,
+                         out_token ? &primary_shadow : nullptr))
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax failed on primary participant");
+                return false;
+            }
+            if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
+                    DeviceDistributionBuffer::Target,
+                    target_sample_slot))
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax could not broadcast the primary device slot");
+                return false;
+            }
+            if (out_token)
+                *out_token = primary_shadow;
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_main_target_argmax_samples",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"slot", std::to_string(target_sample_slot)},
+                 {"host_shadow", out_token ? "true" : "false"},
+                 {"implementation", "primary_child_device_slot_broadcast"}});
+            return true;
+        }
         return sampleRankGreedyMainLogitsToLocalTPTargetSlot(
             target_sample_slot,
             out_token);
@@ -6761,6 +7434,10 @@ namespace llaminar2
                     return false;
                 info = runner->consumeAllPositionLogitsLocalInfoForSampling();
                 break;
+            case DeviceLogitsSource::MainRequestBatch:
+                // Live request-batch condition rows are mirrored and child-owned.
+                // They must never enter the legacy rank-side shard reducer.
+                return false;
             }
             if (!info || info.vocab_local == 0)
                 return false;
@@ -7450,19 +8127,25 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren(
+    bool RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
+        DeviceDistributionBuffer buffer,
         int slot)
     {
         if (device_runners_.size() < 2 ||
             !tp_ctx_ ||
             !usesMirroredLocalTPMTPHeadForVerifier() ||
+            (buffer != DeviceDistributionBuffer::Target &&
+             buffer != DeviceDistributionBuffer::Draft) ||
             slot < 0 ||
             slot >= kRankStochasticMaxSlots)
         {
             return false;
         }
 
-        std::vector<DeviceStochasticDraftSampleSlotHandle> child_slots(
+        const bool target_slot = buffer == DeviceDistributionBuffer::Target;
+        const char *slot_name = target_slot ? "target" : "draft";
+
+        std::vector<DeviceStochasticSampleSlotHandle> child_slots(
             device_runners_.size());
         for (size_t child = 0; child < device_runners_.size(); ++child)
         {
@@ -7471,17 +8154,26 @@ namespace llaminar2
                 !runner->usesMirroredLocalTPMTPHeadForVerifier() ||
                 !runner->supportsDeviceStochasticMTPVerification())
             {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft slot broadcast requires every child to expose mirrored device stochastic support; participant "
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP "
+                          << slot_name
+                          << " slot broadcast requires every child to expose mirrored device stochastic support; participant "
                           << child << " is not ready");
                 return false;
             }
 
-            child_slots[child] = runner->deviceStochasticDraftSampleSlot(
-                slot,
-                /*require_ready=*/child == 0);
+            child_slots[child] =
+                target_slot
+                    ? runner->deviceStochasticTargetSampleSlot(
+                          slot,
+                          /*require_ready=*/child == 0)
+                    : runner->deviceStochasticDraftSampleSlot(
+                          slot,
+                          /*require_ready=*/child == 0);
             if (!child_slots[child].valid())
             {
-                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft slot broadcast could not acquire "
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP "
+                          << slot_name
+                          << " slot broadcast could not acquire "
                           << (child == 0 ? "ready primary" : "destination")
                           << " slot=" << slot
                           << " for participant " << child);
@@ -7497,7 +8189,7 @@ namespace llaminar2
             {
                 tp_worker_pool_->setFailureCallback([this]()
                                                     {
-                    LOG_WARN("[TPWorkerPool] mirrored stochastic draft slot broadcast failure detected - aborting collective backend");
+                    LOG_WARN("[TPWorkerPool] mirrored sample slot broadcast failure detected - aborting collective backend");
                     tp_ctx_->requestAbort(); });
             }
         }
@@ -7510,6 +8202,7 @@ namespace llaminar2
         tp_worker_pool_->dispatch(
             [this,
              slot,
+             target_slot,
              &child_slots,
              kernel_phase,
              rocm_phase,
@@ -7527,36 +8220,46 @@ namespace llaminar2
                 ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
                 CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
 
-                LocalTPCollectiveSidebandBuffer draft_token;
-                draft_token.kind = LocalTPCollectiveSidebandKind::Broadcast;
-                draft_token.send_buffer =
+                LocalTPCollectiveSidebandBuffer sampled_token;
+                sampled_token.kind = LocalTPCollectiveSidebandKind::Broadcast;
+                sampled_token.send_buffer =
                     child == 0 ? child_slots[0].token_device : nullptr;
-                draft_token.recv_buffer = child_slots[child].token_device;
-                draft_token.element_count = 1;
-                draft_token.dtype = CollectiveDataType::INT32;
-                draft_token.root_device_index = 0;
-                draft_token.name = "mtp_mirrored_stochastic_draft_token";
+                sampled_token.recv_buffer = child_slots[child].token_device;
+                sampled_token.element_count = 1;
+                sampled_token.dtype = CollectiveDataType::INT32;
+                sampled_token.root_device_index = 0;
+                sampled_token.name = target_slot
+                                         ? "mtp_mirrored_main_target_token"
+                                         : "mtp_mirrored_stochastic_draft_token";
 
                 const bool broadcast_ok = tp_ctx_->collectiveSidebandOnStream(
-                    {draft_token},
+                    {sampled_token},
                     static_cast<int>(child),
                     child_slots[child].stream,
-                    "mtp_rank_mirrored_stochastic_draft_token_broadcast");
+                    target_slot
+                        ? "mtp_rank_mirrored_main_target_token_broadcast"
+                        : "mtp_rank_mirrored_stochastic_draft_token_broadcast");
                 if (!broadcast_ok)
                     return false;
 
                 /*
                  * The collective write is now the producer for every participant's
                  * slot, including the root.  Record a fresh event after the
-                 * broadcast so chained sidecars and verifier reducers wait on the
-                 * common rank-owned draft token rather than any pre-broadcast
+                 * broadcast so sidecars and verifier reducers wait on the
+                 * common rank-owned token rather than any pre-broadcast
                  * child-local sampler event.
                  */
-                return device_runners_[child]
-                    ->recordStochasticDraftSampleSlotReadyFromDevice(
-                        slot,
-                        child_slots[child].stream,
-                        /*verifier_consumer_pending=*/true);
+                return target_slot
+                           ? device_runners_[child]
+                                 ->recordStochasticTargetSampleSlotReadyFromDevice(
+                                     slot,
+                                     child_slots[child].stream,
+                                     /*verifier_consumer_pending=*/true)
+                           : device_runners_[child]
+                                 ->recordStochasticDraftSampleSlotReadyFromDevice(
+                                     slot,
+                                     child_slots[child].stream,
+                                     /*verifier_consumer_pending=*/true);
             });
 
         bool all_success = true;
@@ -7569,7 +8272,7 @@ namespace llaminar2
         {
             if (!r.completed)
             {
-                LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren: participant "
+                LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren: participant "
                           << r.worker_index << " did not complete");
                 worker_timeout = true;
                 all_success = false;
@@ -7587,7 +8290,7 @@ namespace llaminar2
             }
             if (!r.success)
             {
-                LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren: participant "
+                LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren: participant "
                           << r.worker_index << " failed");
                 all_success = false;
             }
@@ -7595,14 +8298,14 @@ namespace llaminar2
         if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
-                "broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren",
+                "broadcastPrimaryMirroredLocalTPSampleSlotToChildren",
                 collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
         if (first_exception)
         {
-            LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren: rethrowing primary exception from participant "
+            LOG_ERROR("RankOrchestrator::broadcastPrimaryMirroredLocalTPSampleSlotToChildren: rethrowing primary exception from participant "
                       << first_exception_child);
             std::rethrow_exception(first_exception);
         }
@@ -7610,12 +8313,15 @@ namespace llaminar2
         {
             PerfStatsCollector::addCounter(
                 "mtp",
-                "rank_mirrored_localtp_stochastic_draft_slot_broadcasts",
+                target_slot
+                    ? "rank_mirrored_localtp_main_target_slot_broadcasts"
+                    : "rank_mirrored_localtp_stochastic_draft_slot_broadcasts",
                 1.0,
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
                  {"slot", std::to_string(slot)},
+                 {"buffer", slot_name},
                  {"implementation", "primary_child_device_slot_broadcast"}});
         }
         return all_success;
@@ -7855,6 +8561,69 @@ namespace llaminar2
                 slot,
                 params,
                 vocab_size);
+        }
+        if (slot >= 0 && slot < kRankStochasticMaxSlots)
+        {
+            rank_mirrored_target_distribution_ready_[
+                static_cast<size_t>(slot)] = false;
+        }
+        if ((source == DeviceLogitsSource::Main ||
+             source == DeviceLogitsSource::MainRequestBatch) &&
+            usesMirroredLocalTPMTPHeadForVerifier())
+        {
+            if (buffer != DeviceDistributionBuffer::Target ||
+                slot < 0 ||
+                slot >= kRankStochasticMaxSlots ||
+                device_runners_.size() < 2)
+            {
+                return false;
+            }
+            for (size_t child = 0; child < device_runners_.size(); ++child)
+            {
+                const IInferenceRunner *runner = device_runners_[child].get();
+                if (!runner ||
+                    !runner->usesMirroredLocalTPMTPHeadForVerifier() ||
+                    !runner->supportsDeviceStochasticMTPVerification())
+                {
+                    LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic main-target distribution requires full-head device support on participant "
+                              << child);
+                    return false;
+                }
+            }
+
+            /*
+             * Main-target sampling needs one distribution and one common token,
+             * not one independently sampled token per mirrored participant.
+             * Build on child zero now; sampleStochasticDistributionOnDevice*()
+             * will publish that child's target slot through NCCL/RCCL.
+             */
+            if (!device_runners_.front()->buildStochasticDistributionOnDevice(
+                    source,
+                    row,
+                    buffer,
+                    slot,
+                    params,
+                    vocab_size))
+            {
+                LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic main-target distribution build failed on primary participant");
+                return false;
+            }
+            rank_mirrored_target_distribution_ready_[
+                static_cast<size_t>(slot)] = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_stochastic_distribution_builds",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"source",
+                  source == DeviceLogitsSource::MainRequestBatch
+                      ? "main_request_batch"
+                      : "main"},
+                 {"rows", "1"},
+                 {"implementation", "primary_child_full_vocab"}});
+            return true;
         }
         if (source == DeviceLogitsSource::AllPosition &&
             usesMirroredLocalTPMTPHeadForVerifier())
@@ -8225,7 +8994,9 @@ namespace llaminar2
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft proposal primary child failed device proposal sampling");
                 return false;
             }
-            if (!broadcastPrimaryMirroredLocalTPDraftSampleSlotToChildren(slot))
+            if (!broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
+                    DeviceDistributionBuffer::Draft,
+                    slot))
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft proposal could not broadcast primary child device slot="
                           << slot << " to all participants");
@@ -8281,6 +9052,41 @@ namespace llaminar2
                 threshold);
         }
 
+        if (buffer == DeviceDistributionBuffer::Target &&
+            slot >= 0 &&
+            slot < kRankStochasticMaxSlots &&
+            rank_mirrored_target_distribution_ready_[
+                static_cast<size_t>(slot)])
+        {
+            const int token = device_runners_.front()
+                                  ->sampleStochasticDistributionOnDevice(
+                                      buffer,
+                                      slot,
+                                      threshold);
+            if (token < 0 ||
+                !broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
+                    DeviceDistributionBuffer::Target,
+                    slot))
+            {
+                return -1;
+            }
+            rank_mirrored_target_distribution_ready_[
+                static_cast<size_t>(slot)] = false;
+            rank_stochastic_target_sample_tokens_[
+                static_cast<size_t>(slot)] = static_cast<int32_t>(token);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_stochastic_main_target_samples",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"slot", std::to_string(slot)},
+                 {"host_shadow", "true"},
+                 {"implementation", "primary_child_device_slot_broadcast"}});
+            return token;
+        }
+
         int32_t token = -1;
         if (!sampleRankStochasticDistribution(
                 buffer,
@@ -8311,6 +9117,39 @@ namespace llaminar2
                 buffer,
                 slot,
                 threshold);
+        }
+        if (buffer == DeviceDistributionBuffer::Target &&
+            slot >= 0 &&
+            slot < kRankStochasticMaxSlots &&
+            rank_mirrored_target_distribution_ready_[
+                static_cast<size_t>(slot)])
+        {
+            if (!device_runners_.front()
+                     ->sampleStochasticDistributionOnDeviceDeferred(
+                         buffer,
+                         slot,
+                         threshold) ||
+                !broadcastPrimaryMirroredLocalTPSampleSlotToChildren(
+                    DeviceDistributionBuffer::Target,
+                    slot))
+            {
+                return false;
+            }
+            rank_mirrored_target_distribution_ready_[
+                static_cast<size_t>(slot)] = false;
+            rank_stochastic_target_sample_tokens_[
+                static_cast<size_t>(slot)] = -1;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_mirrored_localtp_stochastic_main_target_samples",
+                1.0,
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())},
+                 {"slot", std::to_string(slot)},
+                 {"host_shadow", "false"},
+                 {"implementation", "primary_child_device_slot_broadcast"}});
+            return true;
         }
         return sampleRankStochasticDistribution(
             buffer,
@@ -8506,6 +9345,63 @@ namespace llaminar2
             return nullptr;
         }
 
+        const DeviceResidentLogicalSequenceStateHandle current_rank_state =
+            deviceResidentLogicalSequenceState();
+        if (!current_rank_state.valid() ||
+            rank_resident_child_logical_state_handles_.size() !=
+                device_runners_.size())
+        {
+            LOG_ERROR("[RankOrchestrator] Request-batched verifier token preparation requires a current aggregate and one child logical-state mailbox per participant");
+            return nullptr;
+        }
+
+        /*
+         * A caller of the rank API carries the opaque rank aggregate, never a
+         * child device pointer. Validate that identity once before translating
+         * each resident source to the corresponding child mailbox below. This
+         * prevents host marker addresses from leaking into a child graph while
+         * preserving a fully device-owned token source on every participant.
+         */
+        for (int row_index = 0; row_index < request_count; ++row_index)
+        {
+            const DeviceMTPVerifierInputBatchRequest &row =
+                requests[row_index];
+            if (!row.first_token_from_device)
+                continue;
+
+            const bool has_resident_state =
+                row.first_token_logical_state.valid();
+            const bool has_resident_index =
+                row.first_token_request_index >= 0;
+            const bool uses_resident_state =
+                has_resident_state && has_resident_index;
+            const bool uses_target_slot =
+                row.first_target_sample_slot >= 0;
+            if (has_resident_state != has_resident_index ||
+                uses_resident_state == uses_target_slot)
+            {
+                LOG_ERROR("[RankOrchestrator] Request-batched verifier token row "
+                          << row_index
+                          << " must name exactly one complete device first-token source");
+                return nullptr;
+            }
+            if (uses_resident_state &&
+                (!row.first_token_logical_state.sameMailboxAs(
+                     current_rank_state) ||
+                 !row.first_token_logical_state.coversRequest(
+                     row.first_token_request_index) ||
+                 row.request_id != row.first_token_request_index))
+            {
+                LOG_ERROR("[RankOrchestrator] Request-batched verifier token row "
+                          << row_index
+                          << " carries a stale, foreign, or mismatched rank logical-state identity"
+                          << " request_id=" << row.request_id
+                          << " resident_request_index="
+                          << row.first_token_request_index);
+                return nullptr;
+            }
+        }
+
         rank_mtp_verifier_child_token_inputs_.assign(
             device_runners_.size(),
             nullptr);
@@ -8514,9 +9410,34 @@ namespace llaminar2
         {
             if (!device_runners_[i])
                 return nullptr;
+
+            const DeviceResidentLogicalSequenceStateHandle &child_state =
+                rank_resident_child_logical_state_handles_[i];
+            if (!child_state.valid() ||
+                child_state.request_count != current_rank_state.request_count ||
+                child_state.device != device_runners_[i]->primaryDeviceId())
+            {
+                LOG_ERROR("[RankOrchestrator] Request-batched verifier token preparation found a stale or foreign mailbox on participant "
+                          << i);
+                rank_mtp_verifier_child_token_inputs_.clear();
+                rank_mtp_verifier_child_token_count_ = 0;
+                return nullptr;
+            }
+
+            std::vector<DeviceMTPVerifierInputBatchRequest> child_requests(
+                requests,
+                requests + request_count);
+            for (DeviceMTPVerifierInputBatchRequest &row : child_requests)
+            {
+                if (row.first_token_from_device &&
+                    row.first_token_logical_state.valid())
+                {
+                    row.first_token_logical_state = child_state;
+                }
+            }
             rank_mtp_verifier_child_token_inputs_[i] =
                 device_runners_[i]->prepareMTPVerifierInputTokenBatchOnDevice(
-                    requests,
+                    child_requests.data(),
                     request_count,
                     padded_seq_len);
             if (!rank_mtp_verifier_child_token_inputs_[i])
@@ -9416,6 +10337,83 @@ namespace llaminar2
             "GPU LocalTP MTP publication refuses rank-owned compact metadata; run mirrored child verifier reduction first");
     }
 
+    bool RankOrchestrator::adoptMirroredLocalTPResidentLogicalStateMailboxes(
+        int expected_request_count,
+        const char *lifecycle,
+        std::string *error)
+    {
+        const std::string lifecycle_name =
+            lifecycle && lifecycle[0] != '\0' ? lifecycle : "unspecified";
+        auto invalidate_and_fail = [&](const std::string &reason) -> bool
+        {
+            invalidateRankResidentLogicalStateAggregate(
+                lifecycle_name.c_str(),
+                reason.c_str());
+            if (error)
+                *error = reason;
+            return false;
+        };
+
+        if (expected_request_count <= 0 || device_runners_.size() < 2)
+        {
+            return invalidate_and_fail(
+                "resident mailbox adoption requires a non-empty multi-device request batch");
+        }
+
+        std::vector<DeviceResidentLogicalSequenceStateHandle> next_handles;
+        next_handles.reserve(device_runners_.size());
+        for (size_t participant = 0;
+             participant < device_runners_.size();
+             ++participant)
+        {
+            IInferenceRunner *child = device_runners_[participant].get();
+            if (!child)
+            {
+                return invalidate_and_fail(
+                    "resident mailbox adoption lost participant " +
+                    std::to_string(participant));
+            }
+
+            DeviceResidentLogicalSequenceStateHandle child_handle =
+                child->deviceResidentLogicalSequenceState();
+            if (!child_handle.valid())
+            {
+                return invalidate_and_fail(
+                    "resident mailbox adoption found no live child mailbox on participant " +
+                    std::to_string(participant));
+            }
+            if (child_handle.request_count != expected_request_count)
+            {
+                return invalidate_and_fail(
+                    "resident mailbox adoption found request-count mismatch on participant " +
+                    std::to_string(participant) + ": expected " +
+                    std::to_string(expected_request_count) + ", got " +
+                    std::to_string(child_handle.request_count));
+            }
+            if (child_handle.device != child->primaryDeviceId())
+            {
+                return invalidate_and_fail(
+                    "resident mailbox adoption found cross-device ownership on participant " +
+                    std::to_string(participant));
+            }
+            next_handles.push_back(child_handle);
+        }
+
+        rank_resident_child_logical_state_handles_.swap(next_handles);
+        ++rank_resident_logical_state_epoch_;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_mirrored_localtp_resident_mailbox_adoptions",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())},
+             {"request_count", std::to_string(expected_request_count)},
+             {"lifecycle", lifecycle_name},
+             {"payload_owner", "child_device_mailboxes"}});
+        return true;
+    }
+
     bool RankOrchestrator::publishMirroredLocalTPDeviceResidentMTPSpecStateBatch(
         const DeviceSpeculativePublicationRequest &request,
         std::string *error)
@@ -9483,30 +10481,16 @@ namespace llaminar2
             }
         }
 
-        rank_resident_child_logical_state_handles_.clear();
-        rank_resident_child_logical_state_handles_.reserve(
-            device_runners_.size());
-        int child_request_count = -1;
-        for (size_t i = 0; i < device_runners_.size(); ++i)
+        std::string mailbox_error;
+        if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
+                request.request_count,
+                "accepted_state_publication",
+                &mailbox_error))
         {
-            DeviceResidentLogicalSequenceStateHandle child_handle =
-                device_runners_[i]->deviceResidentLogicalSequenceState();
-            if (!child_handle.valid())
-            {
-                return fail(
-                    "mirrored LocalTP MTP resident publication did not produce a resident logical-state mailbox on participant " +
-                    std::to_string(i));
-            }
-            if (child_request_count < 0)
-                child_request_count = child_handle.request_count;
-            if (child_handle.request_count != child_request_count)
-            {
-                return fail(
-                    "mirrored LocalTP MTP resident publication produced mismatched resident mailbox request counts");
-            }
-            rank_resident_child_logical_state_handles_.push_back(child_handle);
+            return fail(
+                "mirrored LocalTP MTP resident publication could not adopt child logical-state mailboxes: " +
+                mailbox_error);
         }
-        ++rank_resident_logical_state_epoch_;
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -9664,7 +10648,7 @@ namespace llaminar2
          * Build one participant plan per child even though the current
          * rank-level verifier has a single accepted-count decision.  Keeping
          * this path on the shared common-prefix helper prevents the LocalTP,
-         * NodeLocalTP, PP, and ExpertParallel implementations from drifting
+         * NodeLocalTP, PP, and routed-expert implementations from drifting
          * once participant-local accepted-state availability is introduced.
          */
         std::vector<MTPSpecStepPlan> participant_plans(
@@ -11027,6 +12011,7 @@ namespace llaminar2
         rank_stochastic_target_top_k_.fill(0);
         rank_stochastic_target_sample_tokens_.fill(-1);
         rank_stochastic_draft_sample_tokens_.fill(-1);
+        rank_mirrored_target_distribution_ready_.fill(false);
         rank_stochastic_staged_draft_tokens_.clear();
         rank_compact_output_tokens_.fill(-1);
         rank_compact_output_meta_.fill(0);
@@ -11039,8 +12024,9 @@ namespace llaminar2
         rank_mirrored_child_outcomes_.clear();
         rank_mirrored_primary_outcome_ = DeviceSpeculativeOutcomeHandle{};
         rank_mirrored_child_outcomes_valid_ = false;
-        rank_resident_child_logical_state_handles_.clear();
-        ++rank_resident_logical_state_epoch_;
+        invalidateRankResidentLogicalStateAggregate(
+            "request_reset",
+            request.reason ? request.reason : "request_boundary");
         stats_dirty_ = true;
     }
 
@@ -11227,6 +12213,17 @@ namespace llaminar2
         if (common_tokens <= 0)
             return true;
 
+        /*
+         * Prefix population replaces every child runner's live request state.
+         * Retire the aggregate before the first child crosses that boundary so
+         * no observer can carry a mailbox from the previous request into the
+         * restored transaction, even if child population later reports an
+         * error.
+         */
+        invalidateRankResidentLogicalStateAggregate(
+            "populate_prefix",
+            "prefix_replaces_child_live_state");
+
         auto populate_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
                                     const std::vector<PrefixLookupResult> &hits)
         {
@@ -11323,6 +12320,56 @@ namespace llaminar2
             restore_runners(pp_stage_runners_, last_pp_prefix_hits_);
         if (!restored)
             return false;
+
+        if (device_runners_.size() > 1 &&
+            logits_gatherer_ &&
+            logits_gatherer_->isAllocated())
+        {
+            const bool has_gpu_child =
+                std::any_of(
+                    device_runners_.begin(),
+                    device_runners_.end(),
+                    [](const std::unique_ptr<IInferenceRunner> &runner)
+                    {
+                        return runner && runner->primaryDeviceId().is_gpu();
+                    });
+
+            if (!has_gpu_child)
+            {
+                /*
+                 * A TP prefix hit restores terminal logits into each child
+                 * shard. The rank-level CPU sampling surface is a separate
+                 * full-vocabulary aggregate that may still contain the final
+                 * row from the previous request. Rebuild that aggregate in the
+                 * same restore transaction so no caller can observe restored
+                 * KV/terminal state paired with stale logits.
+                 *
+                 * GPU TP deliberately does not enter this path. Its production
+                 * sampler consumes device-owned child logits directly, and a
+                 * restore must not manufacture a D2H host mirror merely to keep
+                 * an obsolete aggregate warm.
+                 */
+                if (!logits_gatherer_->gather(
+                        device_runners_,
+                        /*seq_len=*/1,
+                        vocab_size()))
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator::restorePrefixTerminalState could not "
+                        "refresh CPU TP terminal logits after child restore");
+                    return false;
+                }
+                PerfStatsCollector::addCounter(
+                    "prefix_cache",
+                    "cpu_tp_terminal_logits_aggregate_refreshes",
+                    1.0,
+                    "restore",
+                    "rank",
+                    {{"participants", std::to_string(device_runners_.size())},
+                     {"cached_tokens", std::to_string(common_tokens)},
+                     {"ownership", "cpu_rank_aggregate"}});
+            }
+        }
 
         if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
         {
@@ -11945,7 +12992,7 @@ namespace llaminar2
             return false;
         }
 
-        const auto &plan = config_.moe_expert_parallel_plan;
+        const auto &plan = config_.moe_routed_expert_plan;
         if (!plan || !plan->isTieredOverlay())
             return false;
 
@@ -11966,7 +13013,41 @@ namespace llaminar2
 
     SnapshotShardingMode RankOrchestrator::resolveSnapshotShardingMode(const std::string &key) const
     {
-        SnapshotShardingMode mode = getStageShardingMode(key, stage_sharding_map_);
+        /*
+         * Snapshot scopes describe transaction timing, not tensor layout.
+         * Resolve the underlying semantic stage through the ordinary model
+         * schema so column- and row-parallel LocalTP intermediates are combined
+         * exactly as their unscoped counterparts.  Only the terminal LM head
+         * is special: MTP explicitly mirrors that full-vocabulary projection on
+         * every participant, even while the transformer body remains TP.
+         */
+        static constexpr std::array<std::string_view, 2> kConditionScopes = {
+            "MTP_REQUEST_BATCH_CONDITION_",
+            "MTP_SCALAR_CONDITION_",
+        };
+        std::string_view condition_scope;
+        for (const std::string_view candidate : kConditionScopes)
+        {
+            if (key.rfind(candidate, 0) == 0)
+            {
+                condition_scope = candidate;
+                break;
+            }
+        }
+        const bool condition_snapshot = !condition_scope.empty();
+        const std::string_view semantic_key_view =
+            condition_snapshot
+                ? std::string_view(key).substr(condition_scope.size())
+                : std::string_view(key);
+        const std::string semantic_key(semantic_key_view);
+        if (condition_snapshot &&
+            extractStageType(semantic_key) == "LM_HEAD")
+        {
+            return SnapshotShardingMode::REPLICATED;
+        }
+
+        SnapshotShardingMode mode =
+            getStageShardingMode(semantic_key, stage_sharding_map_);
 
         /*
          * Phase-split MoE overlay uses DenseTP for prefill but switches dense and
@@ -11977,7 +13058,7 @@ namespace llaminar2
          */
         if (mode == SnapshotShardingMode::ROW_PARALLEL &&
             phaseSplitReplicatedDecodeSnapshotsActive() &&
-            isPhaseSplitReplicatedDecodeSnapshotKey(key))
+            isPhaseSplitReplicatedDecodeSnapshotKey(semantic_key))
         {
             return SnapshotShardingMode::REPLICATED;
         }

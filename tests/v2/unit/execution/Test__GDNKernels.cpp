@@ -1938,6 +1938,25 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
             initial_state.data(),
             initial_state.size(),
             "CPU grouped GDN live-state preservation rows=" + std::to_string(rows));
+
+        /*
+         * Exercise the production host transaction shape.  A single active
+         * request is still represented by the grouped row-vector API, so the
+         * recurrence kernel must publish its accepted snapshot without relying
+         * on a multi-request forward having initialized a request-state bank.
+         */
+        const int restore_row = rows - 1;
+        ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRows(
+            verifier_state.data(),
+            &restore_row,
+            /*request_count=*/1,
+            /*stream=*/nullptr))
+            << "rows=" << rows;
+        expectByteExactFP32(
+            verifier_state.data(),
+            serial_state.data(),
+            serial_state.size(),
+            "CPU grouped GDN published state rows=" + std::to_string(rows));
     }
 }
 

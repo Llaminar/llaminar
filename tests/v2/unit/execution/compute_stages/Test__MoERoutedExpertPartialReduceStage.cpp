@@ -1,5 +1,5 @@
 #include "execution/compute_stages/ComputeStageFactory.h"
-#include "execution/compute_stages/stages/MoEExpertParallelReduceStage.h"
+#include "execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 
@@ -38,13 +38,13 @@ namespace llaminar2::test
             }
         }
 
-        MoEExpertParallelReduceStage::Params reduceParams(
+        MoERoutedExpertPartialReduceStage::Params reduceParams(
             std::vector<const ITensor *> partials,
             ITensor *output,
             size_t rows = 0,
             size_t cols = 0)
         {
-            MoEExpertParallelReduceStage::Params params;
+            MoERoutedExpertPartialReduceStage::Params params;
             params.device_id = DeviceId::cpu();
             params.partials = std::move(partials);
             params.output = output;
@@ -55,7 +55,7 @@ namespace llaminar2::test
 
     } // namespace
 
-    class Test__MoEExpertParallelReduceStage : public ::testing::Test
+    class Test__MoERoutedExpertPartialReduceStage : public ::testing::Test
     {
     protected:
         void SetUp() override
@@ -66,7 +66,7 @@ namespace llaminar2::test
         std::unique_ptr<llaminar2::testing::MockDeviceContext> ctx_;
     };
 
-    TEST_F(Test__MoEExpertParallelReduceStage, SharedAndThreeRoutedTierPartialsSumExactlyAndInputsStayUnchanged)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, SharedAndThreeRoutedTierPartialsSumExactlyAndInputsStayUnchanged)
     {
         auto shared = fp32Tensor(2, 3, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
         auto routed0 = fp32Tensor(2, 3, {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f});
@@ -80,11 +80,11 @@ namespace llaminar2::test
         const auto before_routed2 = snapshot(*routed2);
 
         auto params = reduceParams({shared.get(), routed0.get(), routed1.get(), routed2.get()}, output.get(), 2, 3);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
-        EXPECT_EQ(stage.type(), ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE);
+        EXPECT_EQ(stage.type(), ComputeStageType::MOE_ROUTED_EXPERT_PARTIAL_REDUCE);
         EXPECT_EQ(output->shape(), (std::vector<size_t>{2, 3}));
         expectTensorValues(*output, {10.5f, 21.5f, 32.5f,
                                      43.5f, 54.5f, 65.5f});
@@ -95,16 +95,16 @@ namespace llaminar2::test
         EXPECT_EQ(snapshot(*routed2), before_routed2);
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, HostStagedModeRecordsCrossDomainDiagnostics)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, HostStagedModeRecordsCrossDomainDiagnostics)
     {
         auto shared = fp32Tensor(2, 2, {1.0f, 2.0f, 3.0f, 4.0f});
         auto rocm = fp32Tensor(2, 2, {10.0f, 20.0f, 30.0f, 40.0f});
         auto cpu = fp32Tensor(2, 2, {-1.0f, -2.0f, -3.0f, -4.0f});
         auto output = fp32Tensor(2, 2, {0.0f, 0.0f, 0.0f, 0.0f});
-        MoEExpertParallelReduceDiagnostics diagnostics;
+        MoERoutedExpertPartialReduceDiagnostics diagnostics;
 
         auto params = reduceParams({shared.get(), rocm.get(), cpu.get()}, output.get(), 2, 2);
-        params.mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        params.mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         params.continuation_domain = "cuda_fast";
         params.continuation_device = DeviceId::cpu();
         params.partial_infos = {
@@ -113,13 +113,13 @@ namespace llaminar2::test
             {.name = "cold", .source_domain = "cpu_cold", .source_device = DeviceId::cpu()},
         };
         params.diagnostics = &diagnostics;
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         expectTensorValues(*output, {10.0f, 20.0f,
                                      30.0f, 40.0f});
-        EXPECT_EQ(diagnostics.mode, MoEExpertParallelReduceMode::HostStagedCorrectness);
+        EXPECT_EQ(diagnostics.mode, MoERoutedExpertPartialReduceMode::HostStagedCorrectness);
         EXPECT_TRUE(diagnostics.host_staged);
         EXPECT_EQ(diagnostics.continuation_domain, "cuda_fast");
         EXPECT_EQ(diagnostics.partial_count, 3u);
@@ -134,22 +134,22 @@ namespace llaminar2::test
         EXPECT_FALSE(diagnostics.partials[1].source_is_continuation);
         EXPECT_FALSE(diagnostics.partials[2].source_is_continuation);
         EXPECT_EQ(diagnostics.partials[0].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
         EXPECT_EQ(diagnostics.partials[1].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
         EXPECT_EQ(diagnostics.partials[2].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, OptimizedContinuationModeFallsBackToHostStagedForCpuContinuation)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, OptimizedContinuationModeFallsBackToHostStagedForCpuContinuation)
     {
         auto partial = fp32Tensor(1, 2, {1.0f, 2.0f});
         auto second = fp32Tensor(1, 2, {3.0f, 4.0f});
         auto output = fp32Tensor(1, 2, {0.0f, 0.0f});
-        MoEExpertParallelReduceDiagnostics diagnostics;
+        MoERoutedExpertPartialReduceDiagnostics diagnostics;
 
         auto params = reduceParams({partial.get(), second.get()}, output.get(), 1, 2);
-        params.mode = MoEExpertParallelReduceMode::ContinuationDeviceOptimized;
+        params.mode = MoERoutedExpertPartialReduceMode::ContinuationDeviceOptimized;
         params.continuation_domain = "cpu_continuation";
         params.continuation_device = DeviceId::cpu();
         params.partial_infos = {
@@ -157,12 +157,12 @@ namespace llaminar2::test
             {.name = "second", .source_domain = "cpu_cold", .source_device = DeviceId::cpu()},
         };
         params.diagnostics = &diagnostics;
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         expectTensorValues(*output, {4.0f, 6.0f});
-        EXPECT_EQ(diagnostics.mode, MoEExpertParallelReduceMode::HostStagedCorrectness);
+        EXPECT_EQ(diagnostics.mode, MoERoutedExpertPartialReduceMode::HostStagedCorrectness);
         EXPECT_TRUE(diagnostics.host_staged);
         EXPECT_EQ(diagnostics.continuation_domain, "cpu_continuation");
         EXPECT_EQ(diagnostics.continuation_device, DeviceId::cpu());
@@ -172,16 +172,16 @@ namespace llaminar2::test
         EXPECT_EQ(diagnostics.host_to_device_bytes, 0u);
         ASSERT_EQ(diagnostics.partials.size(), 2u);
         EXPECT_EQ(diagnostics.partials[0].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
         EXPECT_EQ(diagnostics.partials[1].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, ZeroPartialsFillOutputWithZerosAndPreserveShape)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, ZeroPartialsFillOutputWithZerosAndPreserveShape)
     {
         auto output = fp32Tensor(2, 2, {7.0f, 8.0f, 9.0f, 10.0f});
         auto params = reduceParams({}, output.get(), 2, 2);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
@@ -190,14 +190,14 @@ namespace llaminar2::test
                                      0.0f, 0.0f});
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, CapacitySizedOutputReducesIntoLivePrefix)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, CapacitySizedOutputReducesIntoLivePrefix)
     {
         auto partial0 = fp32Tensor(2, 3, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
         auto partial1 = fp32Tensor(4, 3, {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f, 70.0f, 80.0f, 90.0f, 100.0f, 110.0f, 120.0f});
         auto output = fp32Tensor(4, 3, {99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 77.0f, 77.0f, 77.0f, 77.0f, 77.0f, 77.0f});
 
         auto params = reduceParams({partial0.get(), partial1.get()}, output.get(), 2, 3);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
@@ -207,89 +207,89 @@ namespace llaminar2::test
                                      77.0f, 77.0f, 77.0f});
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, ShapeMismatchFailsClearly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, ShapeMismatchFailsClearly)
     {
         auto partial = fp32Tensor(1, 4, {1.0f, 2.0f, 3.0f, 4.0f});
         auto output = fp32Tensor(2, 2, {0.0f, 0.0f, 0.0f, 0.0f});
         auto params = reduceParams({partial.get()}, output.get(), 2, 2);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, TypeMismatchFailsClearly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, TypeMismatchFailsClearly)
     {
         auto partial = TestTensorFactory::createFP16({2, 2});
         auto output = fp32Tensor(2, 2, {0.0f, 0.0f, 0.0f, 0.0f});
         auto params = reduceParams({partial.get()}, output.get(), 2, 2);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, ExpectedOutputShapeMismatchFailsClearly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, ExpectedOutputShapeMismatchFailsClearly)
     {
         auto partial = fp32Tensor(2, 2, {1.0f, 2.0f, 3.0f, 4.0f});
         auto output = fp32Tensor(2, 2, {0.0f, 0.0f, 0.0f, 0.0f});
         auto params = reduceParams({partial.get()}, output.get(), 2, 3);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, AdvertisesCrossDomainBackendSupport)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, AdvertisesCrossDomainBackendSupport)
     {
         auto output = fp32Tensor(1, 1, {0.0f});
         auto params = reduceParams({}, output.get(), 1, 1);
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
         EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
         EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_ROCM));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, ManualCoherenceBridgeDoesNotAdvertiseArenaContract)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, ManualCoherenceBridgeDoesNotAdvertiseArenaContract)
     {
         auto output = fp32Tensor(1, 1, {0.0f});
         auto params = reduceParams({}, output.get(), 1, 1);
         params.device_id = DeviceId::cuda(0);
         params.continuation_device = DeviceId::cuda(0);
-        params.mode = MoEExpertParallelReduceMode::ContinuationDeviceOptimized;
+        params.mode = MoERoutedExpertPartialReduceMode::ContinuationDeviceOptimized;
 
-        MoEExpertParallelReduceStage stage(params);
+        MoERoutedExpertPartialReduceStage stage(params);
 
         EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
         EXPECT_TRUE(stage.bufferContract().empty());
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, FactoryCreatesReduceStage)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, FactoryCreatesReduceStage)
     {
         auto output = fp32Tensor(1, 1, {0.0f});
         auto params = reduceParams({}, output.get(), 1, 1);
 
-        auto stage = ComputeStageFactory::createMoEExpertParallelReduce(params);
+        auto stage = ComputeStageFactory::createMoERoutedExpertPartialReduce(params);
         ASSERT_NE(stage, nullptr);
-        EXPECT_EQ(stage->type(), ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE);
-        EXPECT_STREQ(computeStageTypeName(stage->type()), "MOE_EXPERT_PARALLEL_REDUCE");
+        EXPECT_EQ(stage->type(), ComputeStageType::MOE_ROUTED_EXPERT_PARTIAL_REDUCE);
+        EXPECT_STREQ(computeStageTypeName(stage->type()), "MOE_ROUTED_EXPERT_PARTIAL_REDUCE");
     }
 
     // ============================================================================
     // Bridge Phase 7A: sparse partial row interface tests
     // ============================================================================
 
-    TEST_F(Test__MoEExpertParallelReduceStage, SparsePartialScatterAddsSelectedRowsAndLeavesOtherRowsZero)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, SparsePartialScatterAddsSelectedRowsAndLeavesOtherRowsZero)
     {
         // Partial covers only rows 1 and 3 out of [0..3] in a 4-row, 3-col output.
         // The partial tensor has shape [2, 3] (compact: only selected rows).
         auto sparse_partial = fp32Tensor(2, 3, {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f});
         auto output = fp32Tensor(4, 3, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
 
-        MoEExpertParallelReduceDiagnostics diagnostics;
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceDiagnostics diagnostics;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.partials = {sparse_partial.get()};
         params.partial_infos = {
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "cold_sparse",
                 .source_domain = "cpu_cold",
                 .source_device = DeviceId::cpu(),
@@ -299,10 +299,10 @@ namespace llaminar2::test
         params.output = output.get();
         params.rows = 4;
         params.cols = 3;
-        params.mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        params.mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         params.diagnostics = &diagnostics;
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         // Row 0 and Row 2 must remain zero (not selected).
@@ -317,12 +317,12 @@ namespace llaminar2::test
         EXPECT_EQ(diagnostics.partials[0].sparse_row_count, 2u);
         EXPECT_EQ(diagnostics.sparse_partial_count, 1u);
         EXPECT_EQ(diagnostics.partials[0].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
         // Bytes reported should reflect compact layout (2 rows not 4).
         EXPECT_EQ(diagnostics.partials[0].bytes, 2u * 3u * sizeof(float));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, MixedSparseAndDensePartialsReduceCorrectly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, MixedSparseAndDensePartialsReduceCorrectly)
     {
         // Dense partial covers all rows (continuation tier output).
         auto dense = fp32Tensor(3, 2, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
@@ -330,17 +330,17 @@ namespace llaminar2::test
         auto sparse = fp32Tensor(1, 2, {10.0f, 20.0f});
         auto output = fp32Tensor(3, 2, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
 
-        MoEExpertParallelReduceDiagnostics diagnostics;
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceDiagnostics diagnostics;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.partials = {dense.get(), sparse.get()};
         params.partial_infos = {
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "continuation",
                 .source_domain = "cuda_fast",
                 .source_device = DeviceId::cpu(),
             },
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "cold_tier",
                 .source_domain = "cpu_cold",
                 .source_device = DeviceId::cpu(),
@@ -350,10 +350,10 @@ namespace llaminar2::test
         params.output = output.get();
         params.rows = 3;
         params.cols = 2;
-        params.mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        params.mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         params.diagnostics = &diagnostics;
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         // Row 0: only dense contributes.
@@ -376,17 +376,17 @@ namespace llaminar2::test
         EXPECT_EQ(diagnostics.partials[1].bytes, 1u * 2u * sizeof(float));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, SparsePartialShapeMismatchFailsClearly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, SparsePartialShapeMismatchFailsClearly)
     {
         // Partial claims 2 selected rows, but the tensor only has 1 row.
         auto bad_sparse = fp32Tensor(1, 3, {1.0f, 2.0f, 3.0f});
         auto output = fp32Tensor(4, 3, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
 
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.partials = {bad_sparse.get()};
         params.partial_infos = {
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "bad",
                 .source_domain = "cpu_cold",
                 .source_device = DeviceId::cpu(),
@@ -397,20 +397,20 @@ namespace llaminar2::test
         params.rows = 4;
         params.cols = 3;
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, SparsePartialOutOfRangeSelectedRowFailsClearly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, SparsePartialOutOfRangeSelectedRowFailsClearly)
     {
         auto sparse = fp32Tensor(1, 3, {1.0f, 2.0f, 3.0f});
         auto output = fp32Tensor(4, 3, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
 
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.partials = {sparse.get()};
         params.partial_infos = {
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "bad_row",
                 .source_domain = "cpu_cold",
                 .source_device = DeviceId::cpu(),
@@ -421,20 +421,20 @@ namespace llaminar2::test
         params.rows = 4;
         params.cols = 3;
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, SparsePartialDuplicateSelectedRowFailsClearly)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, SparsePartialDuplicateSelectedRowFailsClearly)
     {
         auto sparse = fp32Tensor(2, 3, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
         auto output = fp32Tensor(4, 3, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
 
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.partials = {sparse.get()};
         params.partial_infos = {
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "duplicate_row",
                 .source_domain = "cpu_cold",
                 .source_device = DeviceId::cpu(),
@@ -445,11 +445,11 @@ namespace llaminar2::test
         params.rows = 4;
         params.cols = 3;
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
-    TEST_F(Test__MoEExpertParallelReduceStage, DiagnosticsDistinguishesHostStagedTransportFromHostSummedCorrectness)
+    TEST_F(Test__MoERoutedExpertPartialReduceStage, DiagnosticsDistinguishesHostStagedTransportFromHostSummedCorrectness)
     {
         // HostStagedCorrectness mode: all paths are HostSummedCorrectnessFallback.
         // This verifies the diagnostic label distinction:
@@ -460,12 +460,12 @@ namespace llaminar2::test
         auto partial = fp32Tensor(2, 4, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f});
         auto output = fp32Tensor(2, 4, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
 
-        MoEExpertParallelReduceDiagnostics diagnostics;
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceDiagnostics diagnostics;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.partials = {partial.get()};
         params.partial_infos = {
-            MoEExpertParallelReducePartialInfo{
+            MoERoutedExpertPartialReducePartialInfo{
                 .name = "hot_rocm",
                 .source_domain = "rocm_hot",
                 .source_device = DeviceId::rocm(0),
@@ -474,20 +474,20 @@ namespace llaminar2::test
         params.output = output.get();
         params.rows = 2;
         params.cols = 4;
-        params.mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        params.mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         params.continuation_domain = "cuda_fast";
         params.continuation_device = DeviceId::cpu(); // CPU proxy; real CUDA tested by LayoutB integration test.
         params.diagnostics = &diagnostics;
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         // Host-staged correctness: summation on host, path is HostSummedCorrectnessFallback.
-        EXPECT_EQ(diagnostics.mode, MoEExpertParallelReduceMode::HostStagedCorrectness);
+        EXPECT_EQ(diagnostics.mode, MoERoutedExpertPartialReduceMode::HostStagedCorrectness);
         EXPECT_TRUE(diagnostics.host_staged);
         ASSERT_EQ(diagnostics.partials.size(), 1u);
         EXPECT_EQ(diagnostics.partials[0].accumulation_path,
-                  MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback)
+                  MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback)
             << "HostStagedCorrectness must label all paths HostSummedCorrectnessFallback to "
                "distinguish from HostStagedThenDeviceAccumulated (transport via host, "
                "accumulation on continuation device), which requires real GPU hardware.";

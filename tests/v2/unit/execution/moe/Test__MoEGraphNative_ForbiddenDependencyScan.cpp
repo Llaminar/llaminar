@@ -236,7 +236,7 @@ namespace llaminar2::test
         EXPECT_NE(gate.find("phase_split_local_tp_apportioned_gpu_prefill"), std::string::npos)
             << "Phase-split LocalTP GPU prefill must be allowed to use the grouped expert fast path; "
                "otherwise prefill falls back to the CPU sparse dispatch stage and rejects graph capture.";
-        EXPECT_NE(gate.find("DenseParallelPolicy::PhaseSplitHybridTP_AE"), std::string::npos);
+        EXPECT_NE(gate.find("DenseParallelPolicy::PrefillTensorParallelDecodeReplicated"), std::string::npos);
         EXPECT_NE(gate.find("total_tokens > 1"), std::string::npos);
         EXPECT_NE(gate.find("phase_split_local_tp_apportioned_gpu_prefill"), std::string::npos);
         EXPECT_EQ(gate.find("(!device.is_gpu() || total_tokens == 1) &&"), std::string::npos)
@@ -411,7 +411,7 @@ namespace llaminar2::test
                 EXPECT_NE(contents.find("ownership_transfer\n                                       ? kDeviceMoERebalancePlanOwnershipTransfer"),
                           std::string::npos)
                     << relative_path
-                    << " LeastLoadedEP without HotExpertReplicaCache must publish durable ownership transfers.";
+                    << " LLEP without HotExpertReplicaCache must publish durable ownership transfers.";
             }
 
             size_t body_start = contents.find("applyDeviceMoERebalancePolicyHost(");
@@ -825,8 +825,8 @@ namespace llaminar2::test
             "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp",
             "src/v2/execution/compute_stages/ComputeStageFactory.h",
             "src/v2/execution/compute_stages/ComputeStageFactory.cpp",
-            "src/v2/execution/compute_stages/stages/MoEExpertParallelReduceStage.h",
-            "src/v2/execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp",
+            "src/v2/execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.h",
+            "src/v2/execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.cpp",
             "src/v2/execution/moe/MoEExpertOverlayProfiler.h",
             "src/v2/execution/moe/MoEExpertOverlayProfiler.cpp",
         };
@@ -1522,7 +1522,7 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("masked_local_tp_apportioned_decode_runtime_table"),
                   std::string::npos)
             << "Plain homogeneous LocalTP apportioned decode must build masked runtime tables for graph-side rebalance.";
-        EXPECT_NE(ffn_body.find("\"LocalTP apportioned-experts masked GPU decode graph build\""),
+        EXPECT_NE(ffn_body.find("\"LocalTP expert-ID-apportioned masked GPU decode graph build\""),
                   std::string::npos)
             << "The standard LocalTP path must initialize the same masked runtime-table contract as overlay.";
         EXPECT_NE(contents.find("contiguousApportionedExpertOwners"),
@@ -4133,17 +4133,17 @@ namespace llaminar2::test
                    "backends must fail explicitly.";
         }
 
-        EXPECT_NE(impl.find("LeastLoadedEP prefill transfer command materialization is not implemented"),
+        EXPECT_NE(impl.find("LLEP prefill transfer command materialization is not implemented"),
                   std::string::npos);
-        EXPECT_NE(impl.find("LeastLoadedEP current-batch prefill route planning is not implemented"),
+        EXPECT_NE(impl.find("LLEP current-batch prefill route planning is not implemented"),
                   std::string::npos);
-        EXPECT_NE(impl.find("LeastLoadedEP resident-only current-batch prefill assignment is not implemented"),
+        EXPECT_NE(impl.find("LLEP resident-only current-batch prefill assignment is not implemented"),
                   std::string::npos);
-        EXPECT_NE(impl.find("LeastLoadedEP transfer-backed current-batch prefill assignment is not implemented"),
+        EXPECT_NE(impl.find("LLEP transfer-backed current-batch prefill assignment is not implemented"),
                   std::string::npos);
         EXPECT_NE(impl.find("throw std::logic_error"),
                   std::string::npos)
-            << "Unsupported current-batch LeastLoadedEP hooks must fail fast, not return false.";
+            << "Unsupported current-batch LLEP hooks must fail fast, not return false.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixRuntimeStateDoesNotSerializeMoEPlacementPointers)
@@ -4533,6 +4533,88 @@ namespace llaminar2::test
         EXPECT_EQ(fast_collective_body.find("config_.snapshot_callback(node.name"),
                   std::string::npos)
             << "Fast collective capture must defer host callbacks until post-graph publication.";
+    }
+
+    /**
+     * @brief Prevent the retired umbrella terminology from returning.
+     *
+     * Routed-expert compute distribution, row assignment, placement topology,
+     * and weight slicing are independent contracts. Reintroducing one generic
+     * name for those contracts makes configuration and collective behavior
+     * caller-dependent again, so this scan covers production sources, active
+     * contributor guidance, and executable benchmark/E2E scripts. Parser tests
+     * intentionally contain obsolete spellings as negative inputs and are
+     * therefore outside this scan.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, RoutedExpertPoliciesRemainExplicitlyNamed)
+    {
+        const fs::path root = findRepoRoot();
+        std::vector<fs::path> files;
+
+        const fs::path source_root = root / "src/v2";
+        ASSERT_TRUE(fs::exists(source_root)) << source_root;
+        for (const auto &entry : fs::recursive_directory_iterator(source_root))
+        {
+            if (!entry.is_regular_file())
+                continue;
+
+            const std::string extension = entry.path().extension().string();
+            if (extension == ".h" || extension == ".hpp" ||
+                extension == ".cpp" || extension == ".cu" ||
+                extension == ".hip" ||
+                entry.path().filename() == "CMakeLists.txt")
+            {
+                files.push_back(entry.path());
+            }
+        }
+
+        files.push_back(
+            root / ".github/instructions/llaminar-v2-architecture.instructions.md");
+        files.push_back(root / "AGENTS.md");
+        files.push_back(root / "README.md");
+        files.push_back(root / ".agents/mtp-tuning/SKILL.md");
+        files.push_back(root / "scripts/run_mtp_iteration_benchmark_matrix.sh");
+        files.push_back(root / "scripts/run_qwen36_moe_gpu_rebalance_sprint.sh");
+        files.push_back(root / "tests/v2/e2e/server/test_server_e2e.sh");
+
+        const std::vector<std::string> retired_literals = {
+            "ExpertParallel",
+            "expert_parallel",
+            "EXPERT_PARALLEL",
+            "expert-parallel",
+            "PhaseSplitHybridTP_AE",
+            "phase_split_hybrid_tp_ae",
+            "phase-split-hybrid-tp-ae",
+            "--moe-expert-mode",
+            "--moe-expert-overlay",
+            "moe_expert_parallel",
+            "apportioned-experts",
+            "replicated-experts",
+            "sharded-experts",
+        };
+
+        for (const auto &path : files)
+        {
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string source = readFile(path);
+            const std::string relative_path =
+                fs::relative(path, root).generic_string();
+            for (const auto &retired : retired_literals)
+            {
+                // The parser names this one obsolete YAML root solely to emit
+                // an actionable migration error. It remains forbidden in every
+                // other production file, including configuration consumers.
+                if ((retired == "moe_expert_parallel" ||
+                     retired == "expert_parallel") &&
+                    relative_path == "src/v2/config/OrchestrationConfigParser.cpp")
+                {
+                    continue;
+                }
+                EXPECT_EQ(source.find(retired), std::string::npos)
+                    << relative_path << " contains retired routed-expert term '"
+                    << retired << "'";
+            }
+        }
     }
 
 } // namespace llaminar2::test

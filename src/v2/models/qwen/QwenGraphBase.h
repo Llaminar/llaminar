@@ -175,6 +175,12 @@ namespace llaminar2
             return true;
         }
 
+        bool setLiveMTPRequestBatchCondition(bool enabled) override
+        {
+            config_.live_mtp_request_batch_condition = enabled;
+            return true;
+        }
+
         bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
         {
             const int max_rows = resolveMTPMaxTargetQueryRows(config_.mtp);
@@ -368,7 +374,25 @@ namespace llaminar2
         bool useDecodeMirroredEmbeddingWeights() const;
         bool hasMirroredMTPHeadWeightSource() const;
         bool localTPMirroredMTPHeadConfigured() const;
-        bool mirroredMTPHeadActiveForVerifierTokens(int total_tokens) const;
+        /**
+         * @brief Decide whether a terminal projection uses the mirrored MTP head.
+         *
+         * LocalTP MTP owns one replicated full-vocabulary terminal head per
+         * participant.  That head is required not only by the speculative
+         * verifier and NextN sidecar, but also by the grouped main-model
+         * condition forward that samples the first target token of a request
+         * batch.  Keeping the decision in one projected-row policy prevents
+         * that live condition transaction from silently rebuilding the
+         * column-parallel head and reintroducing a tiny logits collective.
+         *
+         * @param total_tokens Number of activation rows entering the graph.
+         *        Ordinary forward graphs project only their terminal row;
+         *        all-position and compact row-indexed graphs project their
+         *        corresponding declared output geometry.
+         * @return true when the graph must bind the replicated full-vocabulary
+         *         final norm and LM-head weights.
+         */
+        bool mirroredMTPHeadActiveForProjectedRows(int total_tokens) const;
         bool useMirroredMTPHeadWeights() const;
         bool useFullVocabEmbeddingForCurrentGraph() const;
         bool usesVocabParallelEmbeddingForCurrentGraph() const;
@@ -556,6 +580,24 @@ namespace llaminar2
             const std::vector<ITensorGemm *> &gate_gemm,
             const std::vector<ITensorGemm *> &up_gemm,
             const std::vector<ITensorGemm *> &down_gemm) const;
+
+        /**
+         * @brief Resolve the device owner of compact LM-head source-row indices.
+         *
+         * Request-batched prefill has no explicit verifier row plan, so one
+         * terminal row per request is derived from resident request lengths.
+         * Grouped MTP verification installs explicit query-row indices while the
+         * same request-length arena remains live; those explicit rows must take
+         * precedence or the graph will reinterpret verifier rows as requests.
+         *
+         * @param has_request_sequence_lengths Whether the active graph has a
+         *        device-resident request-length row.
+         * @return RequestTerminalLengths for compact prefill, otherwise
+         *         ExternalDeviceIndices for explicit verifier metadata.
+         */
+        HiddenStateRowsSelectStage::DeviceRowIndexSource
+        resolveLMHeadDeviceRowIndexSource(
+            bool has_request_sequence_lengths) const;
 
         /**
          * @brief Insert bucketed-prefill LM-head row selection when needed.

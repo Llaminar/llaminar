@@ -31,7 +31,7 @@
 #include "CollectiveBackendType.h"
 #include "ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include <string>
 #include <vector>
@@ -132,8 +132,10 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices; ///< Devices in this domain
         std::vector<float> weights;               ///< Optional: proportional weights (must sum to 1.0)
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
-        ExecutionDomainComputeKind compute_kind = ExecutionDomainComputeKind::UNSPECIFIED;
-        ExecutionDomainAssignmentKind assignment_kind = ExecutionDomainAssignmentKind::UNSPECIFIED;
+        RoutedExpertComputePolicy routed_compute_policy =
+            RoutedExpertComputePolicy::Unspecified;
+        RoutedExpertAssignmentPolicy routed_assignment_policy =
+            RoutedExpertAssignmentPolicy::Unspecified;
 
         // Phase 5: domain scope and rank ownership
         TPScope scope = TPScope::AUTO;   ///< Domain scope (local=single-rank, node_local/global=multi-rank)
@@ -432,17 +434,17 @@ namespace llaminar2
         bool moe_shared_experts_gpu = true; ///< Place shared experts on GPU
         bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
 
-        /// Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
+        /// Physical routed-expert compute distribution for the standard path.
+        RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        /// Bounded hot remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
         /// Decode histogram / dynamic rebalance settings promoted from env knobs.
         MoERebalanceRuntimeConfig moe_rebalance;
 
-        /// Optional same-layer MoE expert overlay / expert-parallel plan.
-        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+        /// Optional same-layer routed-expert placement plan.
+        std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
 
         // =========================================================================
         // Precision
@@ -494,10 +496,9 @@ namespace llaminar2
         /**
          * @brief Canonical view of all user-declared execution domains.
          *
-         * During the DomainDefinition/ExpertComputeDomain migration this joins
-         * legacy named-domain inputs and MoE overlay-domain inputs into one
-         * normalized inventory. Placements such as pp_stage_definitions and
-         * routed_tiers remain separate references over these domains.
+         * Named domains and routed-expert domain declarations feed one
+         * normalized hardware inventory. Placements such as PP stages and
+         * routed tiers remain separate references over those domains.
          */
         std::vector<ExecutionDomainDefinition> executionDomainDefinitions() const;
 
@@ -519,27 +520,26 @@ namespace llaminar2
     };
 
     /**
-     * @brief Validate only the MoE expert overlay portion of an orchestration config.
+     * @brief Validate the routed-expert placement portion of a configuration.
      *
      * This is intentionally separate from OrchestrationConfig::validate() so the
-     * CLI parser can validate overlay flags after YAML+CLI merging without also
-     * rejecting legacy/incomplete non-overlay CLI combinations that older parser
-     * tests and scripts still parse successfully.
+     * CLI parser can validate placement flags after YAML and CLI merging without
+     * coupling that validation to unrelated orchestration modes.
      */
-    std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config);
+    std::vector<std::string> validateMoERoutedExpertPlacementConfig(
+        const OrchestrationConfig &config);
 
     /**
-     * @brief Reconcile legacy overlay-domain inputs with the canonical domain inventory.
+     * @brief Reconcile routed-expert declarations with the domain inventory.
      *
-     * Phase 9C treats --define-domain as the single hardware-domain inventory.
-     * The legacy --moe-expert-overlay-domain/YAML domains syntax remains
-     * accepted as an alias: it contributes to the same inventory, then overlay
-     * placements (continuation/base/shared/tier) are resolved back into
-     * MoEExpertParallelPlan::domains for existing runtime consumers.
+     * Both --define-domain and --moe-routed-expert-domain contribute typed
+     * declarations to one inventory. Continuation, base, shared, and routed-tier
+     * placement references are then resolved back into the placement plan.
      *
      * @return Empty vector if normalization succeeded, otherwise conflict or
      *         conversion errors suitable for user-facing validation output.
      */
-    std::vector<std::string> normalizeMoEExpertOverlayDomains(OrchestrationConfig &config);
+    std::vector<std::string> normalizeMoERoutedExpertPlacementDomains(
+        OrchestrationConfig &config);
 
 } // namespace llaminar2

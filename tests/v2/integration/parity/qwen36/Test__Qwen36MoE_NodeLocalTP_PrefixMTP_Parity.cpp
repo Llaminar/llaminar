@@ -99,6 +99,24 @@ TEST(Qwen36MoENodeLocalTPPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfte
         true);
 }
 
+/**
+ * @brief Reproduce maximum-depth stochastic verification from a restored prefix.
+ *
+ * Dynamic-depth coverage can demote after the first request and accidentally
+ * exercise only a shallower restored-prefix verifier.  Keep this fixed-depth
+ * cell so the maximum four-row group is independently proven after both the
+ * first prefix restore and the subsequent explicit request reset.
+ */
+TEST(Qwen36MoENodeLocalTPPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterPrefixRestore)
+{
+    runMoEStochasticMTPVerifierParity(
+        cpuNodeLocalTPBenchmarkPromptCase(),
+        3,
+        true,
+        MTPDepthPolicyConfig{},
+        true);
+}
+
 TEST(Qwen36MoENodeLocalTPPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache)
 {
     runMoEStochasticMTPVerifierParity(

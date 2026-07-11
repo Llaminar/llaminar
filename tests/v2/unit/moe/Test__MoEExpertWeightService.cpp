@@ -382,7 +382,7 @@ TEST(Test__MoEExpertWeightService, ExtractExpertViews_EPRange)
 {
     TestWeightContextOwner owner;
     auto ctx = owner.buildContext();
-    // Set EP range: only experts 1..2
+    // Set the local expert-ID range to experts 1 and 2.
     ctx.local_expert_start = 1;
     ctx.local_expert_count = 2;
 

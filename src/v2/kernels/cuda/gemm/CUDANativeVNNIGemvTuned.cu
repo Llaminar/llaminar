@@ -2835,6 +2835,19 @@ namespace
                 d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
+        case 256 * 100 + 4:
+            /*
+             * Several large-K generated M=1 policies, including IQ2_S and
+             * IQ2_XXS at `N=1024, K=5120`, use 256 output columns with four
+             * columns per thread.  The grouped kernel supports the same
+             * 64-thread tile natively; omitting this dispatch case forced an
+             * otherwise valid decode-equivalent M=2..4 projection to fail.
+             */
+            return launchKparSmallMImpl<M, 256, 4, CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         default:
             return false;
         }

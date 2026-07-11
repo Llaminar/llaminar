@@ -1,9 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "config/OrchestrationConfig.h"
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 
-#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,21 +26,21 @@ namespace llaminar2::test
             return domain;
         }
 
-        ExpertComputeDomain routedTensorParallelDomain(const std::string &name)
+        RoutedExpertDomain routedTensorShardedDomain(const std::string &name)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::LocalTP;
+            domain.scope = ExecutionDomainScope::LOCAL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.backend = CollectiveBackendType::RCCL;
-            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
             domain.owner_rank = 0;
             return domain;
         }
 
-        ExpertRoutedTier fallbackTier(const std::string &domain)
+        RoutedExpertTier fallbackTier(const std::string &domain)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = "fallback";
             tier.domain = domain;
             tier.priority = 0;
@@ -66,14 +65,14 @@ namespace llaminar2::test
             return ExecutionDomainScope::AUTO;
         }
 
-        OrchestrationConfig configWithContinuationAndRoutedShardedExperts(TPScope continuation_scope)
+        OrchestrationConfig configWithIndependentRoutedTensorSharding(TPScope continuation_scope)
         {
             OrchestrationConfig config;
             config.domain_definitions.push_back(continuationDomain("dense_cont", continuation_scope));
 
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "dense_cont";
             plan->base_model_domain = "dense_cont";
             plan->shared_expert_domain = "dense_cont";
@@ -81,46 +80,39 @@ namespace llaminar2::test
             plan->continuation_domain_spec.logical_root_participant = 0;
             plan->continuation_domain_spec.dense_tp_enabled = true;
             plan->continuation_domain_spec.hidden_layout = MoEContinuationActivationLayout::ReplicatedHidden;
-            plan->domains = {routedTensorParallelDomain("routed_tp")};
+            plan->domains = {routedTensorShardedDomain("routed_tp")};
             plan->routed_tiers = {fallbackTier("routed_tp")};
-            config.moe_expert_parallel_plan = std::move(plan);
+            config.moe_routed_expert_plan = std::move(plan);
             return config;
         }
 
-        bool hasErrorContaining(const MoEExpertParallelValidationResult &result, const std::string &needle)
+        void expectContinuationConfigPreservesIndependentRoutedTensorSharding(
+            TPScope continuation_scope)
         {
-            return std::any_of(result.errors.begin(), result.errors.end(), [&](const std::string &error)
-                               { return error.find(needle) != std::string::npos; });
-        }
-
-        void expectContinuationConfigRejectsOnlyRoutedShardedExperts(TPScope continuation_scope)
-        {
-            auto config = configWithContinuationAndRoutedShardedExperts(continuation_scope);
-            auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+            auto config = configWithIndependentRoutedTensorSharding(continuation_scope);
+            auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
             ASSERT_TRUE(normalize_errors.empty()) << (normalize_errors.empty() ? "" : normalize_errors.front());
-            ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
+            ASSERT_NE(config.moe_routed_expert_plan, nullptr);
 
-            const auto &plan = *config.moe_expert_parallel_plan;
+            const auto &plan = *config.moe_routed_expert_plan;
             ASSERT_FALSE(plan.dense_domains.empty());
             EXPECT_EQ(plan.dense_domains.front().scope, expectedExecutionScope(continuation_scope));
 
-            const auto result = validateMoEExpertParallelPlan(plan);
-            EXPECT_FALSE(result.ok());
-            EXPECT_TRUE(hasErrorContaining(result, "ShardedExperts"));
-            EXPECT_TRUE(hasErrorContaining(result, "disabled by default"));
-            EXPECT_FALSE(hasErrorContaining(result, "scope=global"));
+            const auto result = validateMoERoutedExpertPlacementPlan(plan);
+            EXPECT_TRUE(result.ok())
+                << (result.errors.empty() ? "" : result.errors.front());
         }
 
     } // namespace
 
-    TEST(Test__MoEContinuationConfig, LocalTPContinuationStillRejectsRoutedShardedExpertsByDefault)
+    TEST(Test__MoEContinuationConfig, LocalTPContinuationKeepsRoutedTensorShardingIndependent)
     {
-        expectContinuationConfigRejectsOnlyRoutedShardedExperts(TPScope::LOCAL);
+        expectContinuationConfigPreservesIndependentRoutedTensorSharding(TPScope::LOCAL);
     }
 
-    TEST(Test__MoEContinuationConfig, GlobalTPContinuationStillRejectsRoutedShardedExpertsByDefault)
+    TEST(Test__MoEContinuationConfig, GlobalTPContinuationKeepsRoutedTensorShardingIndependent)
     {
-        expectContinuationConfigRejectsOnlyRoutedShardedExperts(TPScope::GLOBAL);
+        expectContinuationConfigPreservesIndependentRoutedTensorSharding(TPScope::GLOBAL);
     }
 
 } // namespace llaminar2::test

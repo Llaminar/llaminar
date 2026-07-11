@@ -230,6 +230,7 @@ namespace llaminar2
         case BufferId::PREFIX_TERMINAL_LOGITS:
         case BufferId::STOCHASTIC_PROCESSED_LOGITS:
         case BufferId::MTP_LOGITS:
+        case BufferId::MTP_LOGITS_GATHERED:
             return true;
         default:
             return false;
@@ -369,6 +370,8 @@ namespace llaminar2
             return BufferId::MTP_FFN_OUTPUT;
         if (name == "mtp_logits")
             return BufferId::MTP_LOGITS;
+        if (name == "mtp_logits_gathered")
+            return BufferId::MTP_LOGITS_GATHERED;
 
         return BufferId::_COUNT; // sentinel: no mapping
     }

@@ -334,7 +334,12 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void setGPUStream(void *stream) override
+            {
+                if (stream_ != stream)
+                    dynamic_attn_device_valid_ = false;
+                stream_ = stream;
+            }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -406,11 +411,10 @@ namespace llaminar2
              * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
              *
              * This is the graph-stage proof boundary for M=2..4 verifier rows.
-             * It prepares row-local attention parameters for the whole verifier
-             * span, then invokes one small-M attention dispatch.  ROCm currently
-             * preserves serial decode math with row-local flash-decode launches
-             * inside that dispatch; Phase 9.8 still tracks the true grouped
-             * attention kernel as the economics target.
+             * One grouped phase grid and one grouped reduction grid consume the
+             * shared K/V bank.  Device-resident row metadata selects each row's
+             * visible prefix, scalar split partition, and scalar wavefront
+             * count, preserving byte identity without row replay.
              */
             bool compute_verifier_rows_decode_equivalent(
                 const ITensor *Q,
@@ -419,6 +423,44 @@ namespace llaminar2
                 ITensor *output,
                 int verifier_rows,
                 int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal,
+                int window_size = -1,
+                const IMPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int gqa_n_rep = 0) override;
+
+            /**
+             * @brief Decode independent fixed-stride request banks in one HIP grid.
+             *
+             * K/V use the request-major resident layout emitted by
+             * ROCmRingKVCache.  Canonical post-append counts remain on device;
+             * a captured metadata kernel derives one row-local parameter record
+             * per request/query row before the grouped attention phase.  The
+             * method performs no D2H count read and no per-request launch loop.
+             *
+             * @param Q FP32 request-major query rows.
+             * @param K Fixed-stride resident K cache view.
+             * @param V Fixed-stride resident V cache view.
+             * @param post_append_cached_tokens_device Device count per request.
+             * @param output FP32 request-major output rows.
+             * @param request_count Number of independent request banks.
+             * @param query_rows Consecutive decode rows per request.
+             * @param max_kv_len Physical row stride for every request bank.
+             * @return true only when the grouped device path launches.
+             */
+            bool compute_device_request_batch_decode_equivalent(
+                const ITensor *Q,
+                const ITensor *K,
+                const ITensor *V,
+                const int *post_append_cached_tokens_device,
+                ITensor *output,
+                int request_count,
+                int query_rows,
+                int max_kv_len,
                 int n_heads,
                 int n_kv_heads,
                 int head_dim,
@@ -518,20 +560,23 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host staging for pre-capture attention-param uploads
-            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
-            int h_attn_params_capacity_ = 0;
             int small_decode_rows_ = 0;
+            /// Last explicit geometry associated with the device parameter block.
             int dynamic_attn_kv_len_ = 0;
             int dynamic_attn_position_offset_ = 0;
             int dynamic_attn_query_rows_ = 1;
             int dynamic_attn_param_rows_ = 1;
-            bool dynamic_attn_host_valid_ = false;
             bool dynamic_attn_device_valid_ = false;
             bool dynamic_attn_device_derived_ = false;
 
-            bool ensureHostAttnParamsCapacity(int capacity);
-            bool uploadDynamicAttnParams(void *stream);
+            /**
+             * @brief Enqueue explicit geometry into DEVICE_PARAMS on @p stream.
+             *
+             * The operation is a tiny graph-capturable HIP kernel. It never
+             * allocates host storage and never records a host-to-device memcpy.
+             */
+            bool writeDynamicAttnParams(
+                int kv_len, int position_offset, int query_rows, void *stream);
             bool dynamicAttnParamsReady(
                 int kv_len, int position_offset, int query_rows) const;
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);

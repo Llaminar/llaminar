@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -35,6 +36,7 @@
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/AttentionOutputGateStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "config/TensorParallelConfig.h"
 #include "kernels/IKVCache.h"
 #include "kernels/IHybridKVCache.h"
@@ -1195,6 +1197,126 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_AllWeightsWired)
     EXPECT_EQ(params.w_z, layer_.attn_gate);
     EXPECT_EQ(params.w_a, layer_.ssm_alpha);
     EXPECT_EQ(params.w_b, layer_.ssm_beta);
+}
+
+/**
+ * @brief Live request-batch conditions require serial-equivalent grouped GDN math.
+ *
+ * The live condition graph advances request-owned short-conv and recurrence
+ * banks, so it must not enable speculative verifier state capture.  That state
+ * ownership distinction must not disable decode-equivalent projection kernels:
+ * its M=2 QKV/Z/alpha/beta rows are still publishable main-model state and must
+ * be byte-identical to two ordinary M=1 decode projections.
+ */
+TEST_F(Qwen35GraphBuildTest, LiveMTPRequestBatchConditionUsesDecodeEquivalentGDNProjection)
+{
+    config_.mtp.enabled = true;
+    config_.live_mtp_request_batch_condition = true;
+
+    Qwen35Graph graph(config_, nullptr);
+    const std::vector<int> request_lengths = {1, 1};
+    ComputeGraph condition_graph = graph.buildAttentionGraph(
+        layer_,
+        buffers_,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/2,
+        stub_cache_.get(),
+        /*position_ids=*/nullptr,
+        DeviceId::cpu(),
+        &request_lengths);
+
+    ComputeNode *projection_node = condition_graph.getNode("layer0_gdn_proj");
+    ASSERT_NE(projection_node, nullptr);
+    auto *projection = dynamic_cast<GDNProjectionStage *>(
+        projection_node->stage.get());
+    ASSERT_NE(projection, nullptr);
+    EXPECT_TRUE(
+        projection->getParams().force_decode_equivalent_verifier_prefill)
+        << "Grouped live conditions must select the serial-row-equivalent GDN projection route";
+}
+
+/**
+ * @brief Live request conditions must not reinterpret logical lengths as copy widths.
+ *
+ * The device row passed to a live condition contains absolute sequence lengths
+ * such as `[17, 12]`.  Its full-attention KV append has captured width one and
+ * must therefore use exact-shape publication, while the same logical row stays
+ * available to recurrent state and terminal-logit selection elsewhere in the
+ * declarative graph.
+ */
+TEST_F(Qwen35GraphBuildTest, LiveMTPRequestBatchConditionUsesExactShapeKVAppend)
+{
+    config_.mtp.enabled = true;
+    config_.live_mtp_request_batch_condition = true;
+
+    Qwen35Graph graph(config_, nullptr);
+    const size_t d = static_cast<size_t>(config_.d_model);
+    const size_t q_dim =
+        static_cast<size_t>(config_.n_heads * config_.head_dim);
+    const size_t kv_dim =
+        static_cast<size_t>(config_.n_kv_heads * config_.head_dim);
+    constexpr int request_count = 2;
+    constexpr int query_rows = 1;
+    constexpr int total_rows = request_count * query_rows;
+
+    auto attn_norm = TestTensorFactory::createFP32Ones({d});
+    auto wq = TestTensorFactory::createFP32Random({q_dim * 2, d});
+    auto wk = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wv = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wo = TestTensorFactory::createFP32Random({d, q_dim});
+    LayerWeights fa_layer;
+    fa_layer.attn_norm = attn_norm.get();
+    fa_layer.wq = wq.get();
+    fa_layer.wk = wk.get();
+    fa_layer.wv = wv.get();
+    fa_layer.wo = wo.get();
+
+    ActivationBuffers fa_buffers;
+    auto hidden = TestTensorFactory::createFP32({total_rows, d});
+    auto residual = TestTensorFactory::createFP32({total_rows, d});
+    auto normalized = TestTensorFactory::createFP32({total_rows, d});
+    auto fa_q_raw = TestTensorFactory::createFP32({total_rows, q_dim * 2});
+    auto fa_gate = TestTensorFactory::createFP32({total_rows, q_dim});
+    auto q = TestTensorFactory::createFP32({total_rows, q_dim});
+    auto k = TestTensorFactory::createFP32({total_rows, kv_dim});
+    auto v = TestTensorFactory::createFP32({total_rows, kv_dim});
+    auto attn_output = TestTensorFactory::createFP32({total_rows, q_dim});
+    auto attn_proj = TestTensorFactory::createFP32({total_rows, d});
+    fa_buffers.current_hidden = hidden.get();
+    fa_buffers.residual = residual.get();
+    fa_buffers.normalized = normalized.get();
+    fa_buffers.Q = q.get();
+    fa_buffers.K = k.get();
+    fa_buffers.V = v.get();
+    fa_buffers.attn_output = attn_output.get();
+    fa_buffers.attn_proj = attn_proj.get();
+    fa_buffers.extensions[BufferId::FA_Q_RAW] = fa_q_raw.get();
+    fa_buffers.extensions[BufferId::FA_GATE] = fa_gate.get();
+
+    const std::vector<int> logical_lengths_host = {17, 12};
+    const std::array<int32_t, 2> logical_lengths_device_sentinel = {17, 12};
+    ComputeGraph condition_graph = graph.buildAttentionGraph(
+        fa_layer,
+        fa_buffers,
+        /*layer_idx=*/3,
+        /*seq_len=*/query_rows,
+        /*batch_size=*/request_count,
+        stub_cache_.get(),
+        /*position_ids=*/nullptr,
+        DeviceId::cpu(),
+        &logical_lengths_host,
+        /*position_ids_device=*/nullptr,
+        logical_lengths_device_sentinel.data());
+
+    ComputeNode *append_node = condition_graph.getNode("layer3_kv_append");
+    ASSERT_NE(append_node, nullptr);
+    auto *append = dynamic_cast<KVCacheAppendStage *>(append_node->stage.get());
+    ASSERT_NE(append, nullptr);
+    EXPECT_EQ(append->getParams().seq_len, 1);
+    EXPECT_EQ(append->getParams().batch_size, 2);
+    EXPECT_EQ(append->getParams().request_sequence_lengths_device, nullptr)
+        << "Absolute live sequence lengths must never become captured KV copy widths";
 }
 
 TEST_F(Qwen35GraphBuildTest, HybridPPFullAttentionUsesGlobalLayerIdsForCacheStages)

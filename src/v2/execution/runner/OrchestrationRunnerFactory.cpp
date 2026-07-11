@@ -137,7 +137,7 @@ namespace llaminar2
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
             OrchestrationConfig config) override
         {
-            auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+            auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
             if (!normalize_errors.empty())
             {
                 LOG_ERROR("MoE expert overlay domain normalization failed:");

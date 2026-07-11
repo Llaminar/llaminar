@@ -14,19 +14,19 @@ namespace llaminar2
 {
     namespace
     {
-        const char *residencyPolicyName(ExpertResidencyPolicy policy)
+        const char *residencyPolicyName(RoutedExpertResidencyPolicy policy)
         {
             switch (policy)
             {
-            case ExpertResidencyPolicy::Disabled:
+            case RoutedExpertResidencyPolicy::Disabled:
                 return "Disabled";
-            case ExpertResidencyPolicy::StaticById:
+            case RoutedExpertResidencyPolicy::StaticById:
                 return "StaticById";
-            case ExpertResidencyPolicy::HistogramTieredCache:
+            case RoutedExpertResidencyPolicy::HistogramTieredCache:
                 return "HistogramTieredCache";
-            case ExpertResidencyPolicy::ExplicitMasks:
+            case RoutedExpertResidencyPolicy::ExplicitMasks:
                 return "ExplicitMasks";
-            case ExpertResidencyPolicy::RoutedTierRebalanced:
+            case RoutedExpertResidencyPolicy::RoutedTierRebalanced:
                 return "RoutedTierRebalanced";
             }
             return "Unknown";
@@ -41,7 +41,7 @@ namespace llaminar2
             bool participant_world_rank_known,
             int owner_world_rank,
             WeightResidencyCategory residency_category,
-            ExpertResidencyPolicy residency_policy)
+            RoutedExpertResidencyPolicy residency_policy)
         {
             auto it = std::find_if(diagnostics.domains.begin(), diagnostics.domains.end(),
                                    [&](const auto &stats)
@@ -82,7 +82,7 @@ namespace llaminar2
         {
             if (participant.world_rank_known)
                 return participant.world_rank;
-            if (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0)
+            if (domain.scope == ExecutionDomainScope::LOCAL && domain.owner_rank >= 0)
                 return domain.owner_rank;
             if (domain.participants.size() == 1 && domain.owner_rank >= 0)
                 return domain.owner_rank;
@@ -92,7 +92,7 @@ namespace llaminar2
         bool effectiveParticipantRankKnown(const MoEOverlayRuntimeDomain &domain, const MoEOverlayDomainParticipant &participant)
         {
             return participant.world_rank_known ||
-                   (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0) ||
+                   (domain.scope == ExecutionDomainScope::LOCAL && domain.owner_rank >= 0) ||
                    (domain.participants.size() == 1 && domain.owner_rank >= 0);
         }
 
@@ -134,7 +134,7 @@ namespace llaminar2
             int expert_id)
         {
             auto participants = preparationParticipantsFor(domain);
-            if (domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts ||
+            if (domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned ||
                 participants.size() <= 1 ||
                 owner_map == nullptr)
             {
@@ -174,7 +174,7 @@ namespace llaminar2
             return participants;
         }
 
-        WeightResidencyCategory routedResidencyCategoryFor(const ExpertRoutedTier &tier, DeviceId device)
+        WeightResidencyCategory routedResidencyCategoryFor(const RoutedExpertTier &tier, DeviceId device)
         {
             if (tier.fallback || device.is_cpu())
                 return WeightResidencyCategory::CpuFallbackExpert;
@@ -381,13 +381,13 @@ namespace llaminar2
         if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
                         [](const auto &domain)
                         {
-                            return domain.compute_kind == ExpertDomainComputeKind::ApportionedExperts &&
+                            return domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
                                    domain.participants.size() > 1;
                         }))
         {
             owner_map = MoEExpertOwnerMap::build(
                 source,
-                MoEExpertOwnerMapBuildOptions{.reject_sharded_experts = false});
+                MoEExpertOwnerMapBuildOptions{.reject_tensor_sharded_domains = false});
         }
 
         for (const auto &placement : source.placements)

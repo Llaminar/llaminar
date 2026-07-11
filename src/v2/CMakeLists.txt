@@ -1314,7 +1314,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
-    execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp
+    execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.cpp
     execution/compute_stages/stages/MoELocalExpertStage.cpp
     execution/compute_stages/stages/MoESparseDispatchStage.cpp
     execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
@@ -1338,7 +1338,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/ExpertWeightCache.cpp
     execution/moe/ExpertRebalancer.cpp
     execution/moe/DecodeExpertHistogram.cpp
-    execution/moe/MoEExpertParallelPlanner.cpp
+    execution/moe/MoERoutedExpertPlacementPlanner.cpp
     execution/moe/MoEExpertOwnerMap.cpp
     execution/moe/MoEExpertTokenRowTransfer.cpp
     execution/moe/MoEExpertOverlayDenseReduce.cpp

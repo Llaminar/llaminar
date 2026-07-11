@@ -6,7 +6,7 @@
 #include "execution/moe/MoEExpertOverlayDenseReduce.h"
 
 #include "backends/DeviceId.h"
-#include "execution/compute_stages/stages/MoEExpertParallelReduceStage.h"
+#include "execution/compute_stages/stages/MoERoutedExpertPartialReduceStage.h"
 #include "utils/Logger.h"
 
 #include <unordered_map>
@@ -17,19 +17,19 @@ namespace llaminar2
 {
     namespace
     {
-        std::unordered_map<std::string, const ExpertComputeDomain *> domainsByName(
-            const MoEExpertParallelPlan &plan)
+        std::unordered_map<std::string, const RoutedExpertDomain *> domainsByName(
+            const MoERoutedExpertPlacementPlan &plan)
         {
-            std::unordered_map<std::string, const ExpertComputeDomain *> result;
+            std::unordered_map<std::string, const RoutedExpertDomain *> result;
             for (const auto &domain : plan.domains)
                 result.emplace(domain.name, &domain);
             return result;
         }
 
-        std::unordered_map<std::string, const ExpertRoutedTier *> tiersByName(
-            const MoEExpertParallelPlan &plan)
+        std::unordered_map<std::string, const RoutedExpertTier *> tiersByName(
+            const MoERoutedExpertPlacementPlan &plan)
         {
-            std::unordered_map<std::string, const ExpertRoutedTier *> result;
+            std::unordered_map<std::string, const RoutedExpertTier *> result;
             for (const auto &tier : plan.routed_tiers)
                 result.emplace(tier.name, &tier);
             return result;
@@ -53,9 +53,7 @@ namespace llaminar2
         }
 
         const auto &plan = *request.plan;
-        const auto plan_validation = validateMoEExpertParallelPlan(
-            plan,
-            MoEExpertParallelValidationOptions{.allow_routed_sharded_experts = true});
+        const auto plan_validation = validateMoERoutedExpertPlacementPlan(plan);
         for (const auto &error : plan_validation.errors)
             addError("plan: " + error);
 
@@ -144,12 +142,12 @@ namespace llaminar2
             return false;
         }
 
-        MoEExpertParallelReduceStage::Params params;
+        MoERoutedExpertPartialReduceStage::Params params;
         params.device_id = DeviceId::cpu();
         params.output = request.output;
         params.rows = request.rows;
         params.cols = request.cols;
-        params.mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        params.mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         params.continuation_domain = request.plan->continuation_domain;
         params.continuation_device = DeviceId::cpu();
         params.partials.reserve(request.partials.size());
@@ -157,14 +155,14 @@ namespace llaminar2
         for (const auto &partial : request.partials)
         {
             params.partials.push_back(partial.tensor);
-            params.partial_infos.push_back(MoEExpertParallelReducePartialInfo{
+            params.partial_infos.push_back(MoERoutedExpertPartialReducePartialInfo{
                 .name = partial.tier_name,
                 .source_domain = partial.source_domain,
                 .source_device = DeviceId::cpu(),
             });
         }
 
-        MoEExpertParallelReduceStage stage(std::move(params));
+        MoERoutedExpertPartialReduceStage stage(std::move(params));
         return stage.execute(ctx);
     }
 

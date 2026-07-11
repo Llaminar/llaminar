@@ -1,9 +1,9 @@
 /**
  * @file LeastLoadedExpertAssignment.h
- * @brief Backend-neutral Least-Loaded Expert Parallelism assignment policy.
+ * @brief Backend-neutral least-loaded-resident routed-row assignment policy.
  *
  * This header owns the small deterministic LLA/LLAS policy from
- * "Least-Loaded Expert Parallelism" in a form that CPU, CUDA, and ROCm code can
+ * least-loaded-resident assignment in a form that CPU, CUDA, and ROCm code can
  * share. It intentionally operates on caller-owned fixed buffers: graph-captured
  * device code must not allocate, and host tests should exercise the same
  * capacity/overflow behavior as the eventual kernels.

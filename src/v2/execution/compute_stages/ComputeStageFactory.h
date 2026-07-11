@@ -29,7 +29,7 @@
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEExpertComputeStage.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoERoutedExpertPartialReduceStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
@@ -201,22 +201,22 @@ namespace llaminar2
          * @brief Create a MoE routing stage (softmax top-k expert selection)
          *
          * Extracted from MoEExpertComputeStage. Outputs raw routing results (indices as float,
-         * normalized weights) without EP masking.
+         * normalized weights) without expert-ID ownership masking.
          */
         static std::unique_ptr<IComputeStage> createMoERouting(
             const MoERoutingStage::Params &params);
 
         /**
-         * @brief Create a host-side MoE expert-parallel dispatch descriptor stage
+         * @brief Create a host-side routed-row dispatch descriptor stage
          */
         static std::unique_ptr<IComputeStage> createMoEExpertDispatch(
             const MoEExpertDispatchStage::Params &params);
 
         /**
-         * @brief Create a host-side dense partial reduce stage for MoE expert-parallel tiers
+         * @brief Create a cross-domain routed partial reduce stage
          */
-        static std::unique_ptr<IComputeStage> createMoEExpertParallelReduce(
-            const MoEExpertParallelReduceStage::Params &params);
+        static std::unique_ptr<IComputeStage> createMoERoutedExpertPartialReduce(
+            const MoERoutedExpertPartialReduceStage::Params &params);
 
         static std::unique_ptr<IComputeStage> createMoESparseDispatch(
             const MoESparseDispatchStage::Params &params);

@@ -49,6 +49,7 @@
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <cstdint>
+#include <array>
 #include <cstring>
 #include <vector>
 #include <cmath>
@@ -820,6 +821,140 @@ TEST_F(Test__CUDAFlashAttentionParity, WorkspaceDeviceParamsSupportsSmallMVerifi
     EXPECT_GE(device_params->size_bytes,
               sizeof(llaminar2::attention::AttentionDeviceParams) * 4u)
         << "CUDA verifier attention needs one graph-replay param row per MTP verifier row";
+}
+
+/**
+ * @brief Prove a captured CUDA decode consumes a later device-parameter update.
+ *
+ * The graph is captured for one KV length and then replayed after the same
+ * kernel object enqueues a different explicit geometry block.  The captured
+ * launch must match a direct same-backend decode at the replay length byte for
+ * byte.  This specifically guards the stream-owned parameter writer: a stale
+ * graph argument, host mirror, or missing writer dependency changes which KV
+ * rows participate and fails the raw output comparison.
+ */
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedDeviceKVLenByteExact)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int capture_kv_len = 65;
+    constexpr int replay_kv_len = 66;
+    constexpr int max_kv_len = 80;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr int seq_len = 1;
+
+    const size_t q_size = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_size =
+        static_cast<size_t>(max_kv_len) * n_kv_heads * head_dim;
+    auto q_data = randomFP32(q_size);
+    auto k_data = randomFP32(kv_size);
+    auto v_data = randomFP32(kv_size);
+
+    FP32Tensor q_tensor({size_t{1}, q_size}, DeviceId::cpu());
+    FP32Tensor k_tensor(
+        {static_cast<size_t>(max_kv_len),
+         static_cast<size_t>(n_kv_heads * head_dim)},
+        DeviceId::cpu());
+    FP32Tensor v_tensor(
+        {static_cast<size_t>(max_kv_len),
+         static_cast<size_t>(n_kv_heads * head_dim)},
+        DeviceId::cpu());
+    FP32Tensor captured_output({size_t{1}, q_size}, DeviceId::cpu());
+    FP32Tensor direct_output({size_t{1}, q_size}, DeviceId::cpu());
+    std::copy(q_data.begin(), q_data.end(), q_tensor.mutable_data());
+    std::copy(k_data.begin(), k_data.end(), k_tensor.mutable_data());
+    std::copy(v_data.begin(), v_data.end(), v_tensor.mutable_data());
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(&q_tensor, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&k_tensor, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&v_tensor, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&captured_output, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&direct_output, gpu_device_, stream).success);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(
+        cuda_ordinal_);
+    cuda_kernel.setGPUStream(stream);
+    auto workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(workspace, nullptr);
+
+    ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParams(
+        capture_kv_len, 0, 1, stream));
+    ASSERT_TRUE(cuda_kernel.compute_tensor(
+        &q_tensor, &k_tensor, &v_tensor, &captured_output,
+        1, seq_len, capture_kv_len,
+        n_heads, n_kv_heads, head_dim,
+        false, -1,
+        nullptr, nullptr,
+        &mpi_ctx_, cuda_ordinal_));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+        ASSERT_TRUE(cuda_kernel.compute_tensor(
+            &q_tensor, &k_tensor, &v_tensor, &captured_output,
+            1, seq_len, capture_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            false, -1,
+            nullptr, nullptr,
+            &mpi_ctx_, cuda_ordinal_));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParams(
+        replay_kv_len, 0, 1, stream));
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> captured(q_size, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  captured.data(),
+                  captured_output.gpu_data_ptr(),
+                  q_size * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    ASSERT_TRUE(cuda_kernel.compute_tensor(
+        &q_tensor, &k_tensor, &v_tensor, &direct_output,
+        1, seq_len, replay_kv_len,
+        n_heads, n_kv_heads, head_dim,
+        false, -1,
+        nullptr, nullptr,
+        &mpi_ctx_, cuda_ordinal_));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> direct(q_size, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  direct.data(),
+                  direct_output.gpu_data_ptr(),
+                  q_size * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+        captured.data(),
+        direct.data(),
+        q_size,
+        "CUDA captured replay after device KV-length update"));
+
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
 TEST_F(Test__CUDAFlashAttentionParity, ComputeTensor_FP16KV_SmallM2_CausalGraphCapture)
@@ -3239,6 +3374,289 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedRequestBatchFP16CacheMatchesIsola
             expected.data() + request_offset,
             static_cast<size_t>(seq_len) * q_cols,
             "captured FP16 request-batch attention request=" +
+                std::to_string(request)));
+    }
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+}
+
+/**
+ * @brief Prove captured unequal-length request decode is byte-identical to M=1.
+ *
+ * Independent requests do not share a logical KV length.  The production cache
+ * gather emits fixed-stride request banks, while the grouped flash-decode kernel
+ * must read one canonical device count per bank.  Lengths 37 and 19 deliberately
+ * select two and one scalar decode splits respectively, so byte equality proves
+ * both request-bank addressing and row-local split/reduction policy.
+ */
+TEST_F(Test__CUDAFlashAttentionParity, CapturedVariableLengthRequestBatchFP16DecodeMatchesSerialByteExact)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int request_count = 2;
+    constexpr int query_rows = 1;
+    constexpr std::array<int, request_count> kv_lens = {37, 19};
+    constexpr int max_kv_len = kv_lens[0];
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+    const size_t q_elements = static_cast<size_t>(request_count) * q_cols;
+
+    auto q_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(request_count), q_cols},
+        DeviceId::cpu());
+    auto grouped_output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(request_count), q_cols},
+        DeviceId::cpu());
+    auto serial_output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(request_count), q_cols},
+        DeviceId::cpu());
+    const std::vector<float> q_host = randomFP32(q_elements);
+    std::copy(q_host.begin(), q_host.end(), q_tensor->mutable_data());
+
+    std::array<std::unique_ptr<FP16Tensor>, request_count> k_by_request;
+    std::array<std::unique_ptr<FP16Tensor>, request_count> v_by_request;
+    for (int request = 0; request < request_count; ++request)
+    {
+        const size_t elements =
+            static_cast<size_t>(kv_lens[request]) * kv_cols;
+        std::vector<float> k_source = randomFP32(elements);
+        std::vector<float> v_source = randomFP32(elements);
+        std::vector<uint16_t> k_fp16(elements);
+        std::vector<uint16_t> v_fp16(elements);
+        for (size_t i = 0; i < elements; ++i)
+        {
+            /*
+             * A deterministic request offset makes accidental sequence-zero
+             * reuse obvious even when the random streams contain close values.
+             */
+            k_fp16[i] = fp32_to_fp16(
+                k_source[i] + static_cast<float>(request) * 0.375f);
+            v_fp16[i] = fp32_to_fp16(
+                v_source[i] - static_cast<float>(request) * 0.625f);
+        }
+        k_by_request[request] = std::make_unique<FP16Tensor>(
+            std::vector<size_t>{static_cast<size_t>(kv_lens[request]), kv_cols},
+            k_fp16);
+        v_by_request[request] = std::make_unique<FP16Tensor>(
+            std::vector<size_t>{static_cast<size_t>(kv_lens[request]), kv_cols},
+            v_fp16);
+    }
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+        cudaSuccess);
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(q_tensor.get(), gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(grouped_output.get(), gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(serial_output.get(), gpu_device_, stream).success);
+    for (int request = 0; request < request_count; ++request)
+    {
+        ASSERT_TRUE(
+            transfer.uploadFull(k_by_request[request].get(), gpu_device_, stream)
+                .success);
+        ASSERT_TRUE(
+            transfer.uploadFull(v_by_request[request].get(), gpu_device_, stream)
+                .success);
+    }
+
+    llaminar::v2::kernels::KVCacheConfig cache_config;
+    cache_config.precision = ActivationPrecision::FP16;
+    cache_config.device = gpu_device_;
+    cache_config.num_layers = 1;
+    cache_config.batch_size = request_count;
+    cache_config.max_seq_len = max_kv_len + 8;
+    cache_config.n_kv_heads = n_kv_heads;
+    cache_config.head_dim = head_dim;
+    auto kv_cache =
+        llaminar::v2::kernels::KernelFactory::createKVCache(cache_config);
+    ASSERT_NE(kv_cache, nullptr);
+    auto cache_workspace = bindKVCacheWorkspace(
+        *kv_cache,
+        max_kv_len,
+        request_count,
+        head_dim);
+    ASSERT_NE(cache_workspace, nullptr);
+
+    for (int request = 0; request < request_count; ++request)
+    {
+        ASSERT_TRUE(kv_cache->appendWithStream(
+            /*layer=*/0,
+            request,
+            k_by_request[request].get(),
+            v_by_request[request].get(),
+            kv_lens[request],
+            stream));
+    }
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    for (int request = 0; request < request_count; ++request)
+    {
+        ASSERT_EQ(kv_cache->get_cached_tokens(/*layer=*/0, request),
+                  kv_lens[request]);
+    }
+
+    /*
+     * K/V fields satisfy the stage's declarative inputs, but read_kv_from_cache
+     * makes the captured production gather authoritative.  The supplied tensor
+     * is intentionally only request zero's variable-length allocation: treating
+     * it as a contiguous batch would therefore fail this test immediately.
+     */
+    AttentionComputeStage attention_stage({
+        .device_id = gpu_device_,
+        .mpi_ctx = &mpi_ctx_,
+        .Q = q_tensor.get(),
+        .K = k_by_request[0].get(),
+        .V = v_by_request[0].get(),
+        .output = grouped_output.get(),
+        .batch_size = request_count,
+        .seq_len = query_rows,
+        .kv_len = max_kv_len,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .causal = true,
+        .auto_detect_mode = true,
+        .kv_cache = kv_cache.get(),
+        .layer_idx = 0,
+        .read_kv_from_cache = true,
+    });
+    attention_stage.setGPUStream(stream);
+    const WorkspaceRequirements attention_requirements =
+        attention_stage.getWorkspaceRequirements(
+            /*m=*/request_count * query_rows,
+            /*n=*/n_heads,
+            /*k=*/head_dim);
+    DeviceWorkspaceManager attention_workspace(
+        gpu_device_,
+        attention_requirements.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(attention_workspace.allocate(attention_requirements));
+    attention_stage.bindWorkspace(&attention_workspace);
+
+    /*
+     * Host position is fixed launch geometry only.  The captured grouped path
+     * must derive the two live lengths from cache-owned device metadata.
+     */
+    attention_stage.updateDynamicParams(
+        /*pos_offset=*/max_kv_len - query_rows,
+        query_rows);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+        cudaSuccess);
+    bool capture_ok = false;
+    {
+        GraphCaptureGuard guard;
+        capture_ok = attention_stage.execute(nullptr);
+    }
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    ASSERT_TRUE(capture_ok);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32>
+        serial_kernel(cuda_ordinal_);
+    serial_kernel.setGPUStream(stream);
+    const WorkspaceRequirements serial_requirements =
+        serial_kernel.getWorkspaceRequirements(
+            /*m=*/1,
+            /*n=*/n_heads,
+            /*k=*/head_dim);
+    DeviceWorkspaceManager serial_workspace(
+        gpu_device_,
+        serial_requirements.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(serial_workspace.allocate(serial_requirements));
+    serial_kernel.bindWorkspace(&serial_workspace);
+
+    auto *q_device = static_cast<float *>(q_tensor->gpu_data_ptr());
+    auto *serial_device =
+        static_cast<float *>(serial_output->gpu_data_ptr());
+    ASSERT_NE(q_device, nullptr);
+    ASSERT_NE(serial_device, nullptr);
+    for (int request = 0; request < request_count; ++request)
+    {
+        GpuTensorView q_view(
+            q_device + static_cast<size_t>(request) * q_cols,
+            /*rows=*/1,
+            q_cols,
+            TensorType::FP32,
+            cuda_ordinal_);
+        GpuTensorView output_view(
+            serial_device + static_cast<size_t>(request) * q_cols,
+            /*rows=*/1,
+            q_cols,
+            TensorType::FP32,
+            cuda_ordinal_);
+
+        ASSERT_TRUE(serial_kernel.prepareDynamicAttnParams(
+            kv_lens[request],
+            kv_lens[request] - 1,
+            /*query_rows=*/1,
+            stream));
+        ASSERT_TRUE(serial_kernel.compute_tensor(
+            &q_view,
+            k_by_request[request].get(),
+            v_by_request[request].get(),
+            &output_view,
+            /*batch_size=*/1,
+            /*seq_len=*/1,
+            kv_lens[request],
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            /*causal=*/true,
+            /*window_size=*/-1,
+            /*workspace_scores=*/nullptr,
+            /*workspace_mask=*/nullptr,
+            &mpi_ctx_,
+            cuda_ordinal_,
+            /*head_start=*/0,
+            /*local_n_heads=*/n_heads,
+            /*local_n_kv_heads=*/n_kv_heads,
+            /*gqa_n_rep=*/n_heads / n_kv_heads));
+    }
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> actual(q_elements);
+    std::vector<float> expected(q_elements);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            actual.data(),
+            grouped_output->gpu_data_ptr(),
+            q_elements * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            expected.data(),
+            serial_output->gpu_data_ptr(),
+            q_elements * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    for (int request = 0; request < request_count; ++request)
+    {
+        const size_t offset = static_cast<size_t>(request) * q_cols;
+        EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+            actual.data() + offset,
+            expected.data() + offset,
+            q_cols,
+            "captured variable-length FP16 request decode request=" +
                 std::to_string(request)));
     }
 

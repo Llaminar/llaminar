@@ -1942,6 +1942,11 @@ namespace llaminar2
             const int *position_ids,
             int request_batch,
             int32_t *out_tokens) override;
+        bool advanceMTPRequestBatchConditionOnDevice(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds = nullptr) override;
         bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
@@ -2522,6 +2527,14 @@ namespace llaminar2
             int slot,
             bool require_ready = false) override;
         bool recordStochasticDraftSampleSlotReadyFromDevice(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true) override;
+        DeviceStochasticTargetSampleSlotHandle
+        deviceStochasticTargetSampleSlot(
+            int slot,
+            bool require_ready = false) override;
+        bool recordStochasticTargetSampleSlotReadyFromDevice(
             int slot,
             void *producer_stream,
             bool verifier_consumer_pending = true) override;
@@ -3153,13 +3166,20 @@ namespace llaminar2
          * `tokens` is always the host shadow used for request bookkeeping. When
          * `token_ids_device` is non-null, graph embedding stages read token IDs
          * from that stable device buffer instead of uploading from `tokens`.
+         * Device position and sequence-length overrides travel together for
+         * resident request batches: recurrent stages need both rows to select
+         * the correct request-owned live-state bank without observing a host
+         * length mirror.
          */
         const float *forwardImpl(
             const int *tokens,
             const void *token_ids_device,
             int seq_len,
             int batch_size,
-            bool force_prefill_phase = false);
+            bool force_prefill_phase = false,
+            bool force_decode_phase = false,
+            const void *position_ids_device_override = nullptr,
+            const int32_t *sequence_lengths_device_override = nullptr);
 
         size_t localLogitsVocabColumns(const TensorBase *tensor) const;
         size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
@@ -3287,6 +3307,12 @@ namespace llaminar2
 
         /** Whether forward graph construction should emit all-position logits. */
         bool computeAllPositionLogitsEnabled() const override { return compute_all_position_logits_; }
+
+        /** Whether this forward owns one live main-model condition row per request. */
+        bool liveMTPRequestBatchConditionEnabled() const override
+        {
+            return live_mtp_request_batch_condition_;
+        }
 
         /** Compact verifier logits row count; 0 means full all-position logits. */
         int allPositionLogitRows() const override
@@ -4950,14 +4976,198 @@ namespace llaminar2
             materialized_mtp_verifier_device_token_batch_;
 
         /**
-         * @brief Device-resident logical sequence-state publication mailbox.
+         * @brief Stable arena storage for request-lifetime logical sequence state.
          *
-         * The metadata derivation kernel writes target cached-token counts and
-         * next-condition tokens into the persistent MTP metadata workspace.  DGO
-         * treats target cached tokens as both the next logical position and the
-         * next request sequence length, but keeps them as device pointers until
-         * the graph-signature and scheduler paths can consume them without a
-         * host bridge.
+         * Verifier metadata scratch belongs to `WorkspaceAllocator`, whose
+         * contiguous device block may be replaced when a different graph shape
+         * is materialized. Published request state has a longer lifetime: the
+         * next verifier, sidecar, scheduler, and KV publication all consume it.
+         * This six-row arena allocation therefore owns the canonical published
+         * values independently of every graph-workspace generation.
+         *
+         * The derive and prefill-initialization kernels write these rows
+         * directly. There is deliberately no workspace-to-mailbox replay copy:
+         * direct publication is both cheaper and makes stale workspace pointer
+         * adoption impossible by construction.
+         */
+        struct DeviceResidentLogicalSequenceStateStorage
+        {
+            /// Number of distinct INT32 rows in the packed arena allocation.
+            static constexpr size_t kFieldCount = 6;
+
+            /// Field order in `BufferId::MTP_LOGICAL_SEQUENCE_STATE`.
+            enum class Field : size_t
+            {
+                TargetCachedTokens = 0,
+                AcceptedStateCounts,
+                NextConditionTokens,
+                AllDraftsAcceptedFlags,
+                StoppedFlags,
+                PublicationOkFlags,
+            };
+
+            int request_capacity = 0;
+            int32_t *target_cached_tokens_device = nullptr;
+            int32_t *accepted_state_counts_device = nullptr;
+            int32_t *next_condition_tokens_device = nullptr;
+            int32_t *all_drafts_accepted_flags_device = nullptr;
+            int32_t *stopped_flags_device = nullptr;
+            int32_t *publication_ok_flags_device = nullptr;
+
+            /**
+             * @brief Request count covered by the most recent live publication.
+             *
+             * This marker belongs to the durable arena owner rather than the
+             * event-fenced mailbox view. Metadata preparation may clear that
+             * view while an already-issued sidecar or publication handle still
+             * addresses these rows across a graph-workspace replacement.
+             */
+            int published_request_count = 0;
+
+            /// Live-state epoch associated with @ref published_request_count.
+            uint64_t published_live_state_epoch = 0;
+
+            /**
+             * @brief Bind typed row pointers to one stable packed device block.
+             *
+             * @param base First INT32 element of the arena allocation.
+             * @param capacity Number of request entries reserved in every row.
+             * @return true when the complete storage layout is bound.
+             */
+            bool bind(void *base, int capacity)
+            {
+                clear();
+                if (!base || capacity <= 0)
+                    return false;
+
+                request_capacity = capacity;
+                auto *elements = static_cast<int32_t *>(base);
+                auto row = [&](Field field)
+                {
+                    return elements +
+                           static_cast<size_t>(field) *
+                               static_cast<size_t>(request_capacity);
+                };
+                target_cached_tokens_device = row(Field::TargetCachedTokens);
+                accepted_state_counts_device = row(Field::AcceptedStateCounts);
+                next_condition_tokens_device = row(Field::NextConditionTokens);
+                all_drafts_accepted_flags_device = row(Field::AllDraftsAcceptedFlags);
+                stopped_flags_device = row(Field::StoppedFlags);
+                publication_ok_flags_device = row(Field::PublicationOkFlags);
+                return validFor(/*request_count=*/1);
+            }
+
+            /** @brief Return true when every durable row covers the request batch. */
+            bool validFor(int request_count) const
+            {
+                return request_count > 0 &&
+                       request_count <= request_capacity &&
+                       target_cached_tokens_device != nullptr &&
+                       accepted_state_counts_device != nullptr &&
+                       next_condition_tokens_device != nullptr &&
+                       all_drafts_accepted_flags_device != nullptr &&
+                       stopped_flags_device != nullptr &&
+                       publication_ok_flags_device != nullptr;
+            }
+
+            /**
+             * @brief Redirect publication outputs from transient scratch to this owner.
+             *
+             * The remaining fields in @p pointers continue to address
+             * graph-workspace scratch. Only values that survive the publication
+             * transaction are rebound to arena storage.
+             */
+            bool bindPublicationOutputs(
+                MTPSpecDecodeMetadataDevicePointers *pointers,
+                int request_count) const
+            {
+                if (!pointers || !validFor(request_count))
+                    return false;
+                pointers->target_cached_tokens = target_cached_tokens_device;
+                pointers->accepted_state_counts = accepted_state_counts_device;
+                pointers->next_condition_tokens = next_condition_tokens_device;
+                pointers->all_drafts_accepted_flags =
+                    all_drafts_accepted_flags_device;
+                pointers->stopped_flags = stopped_flags_device;
+                pointers->publication_ok_flags = publication_ok_flags_device;
+                return true;
+            }
+
+            /**
+             * @brief Mark the arena rows as request-lifetime published state.
+             *
+             * @param request_count Number of request rows made visible.
+             * @param live_state_epoch State epoch in which the rows were produced.
+             * @return true when the publication fits the bound arena storage.
+             */
+            bool markPublished(int request_count, uint64_t live_state_epoch)
+            {
+                if (!validFor(request_count))
+                    return false;
+                published_request_count = request_count;
+                published_live_state_epoch = live_state_epoch;
+                return true;
+            }
+
+            /** @brief Return true when durable rows remain live for this epoch. */
+            bool hasLivePublication(uint64_t live_state_epoch) const
+            {
+                return validFor(published_request_count) &&
+                       published_live_state_epoch == live_state_epoch;
+            }
+
+            /**
+             * @brief Compare the stable allocation identity of two snapshots.
+             *
+             * Workspace replacement is allowed to rebind transient metadata
+             * consumers, but it must never alter any request-lifetime row or
+             * its capacity.
+             */
+            bool aliasesSameRowsAs(
+                const DeviceResidentLogicalSequenceStateStorage &other) const
+            {
+                return request_capacity == other.request_capacity &&
+                       target_cached_tokens_device ==
+                           other.target_cached_tokens_device &&
+                       accepted_state_counts_device ==
+                           other.accepted_state_counts_device &&
+                       next_condition_tokens_device ==
+                           other.next_condition_tokens_device &&
+                       all_drafts_accepted_flags_device ==
+                           other.all_drafts_accepted_flags_device &&
+                       stopped_flags_device == other.stopped_flags_device &&
+                       publication_ok_flags_device ==
+                           other.publication_ok_flags_device;
+            }
+
+            /**
+             * @brief Retire publication liveness without releasing arena rows.
+             *
+             * Arena storage persists for the orchestrator lifetime. Only true
+             * request/session boundaries retire the logical values it contains.
+             */
+            void retirePublication()
+            {
+                published_request_count = 0;
+                published_live_state_epoch = 0;
+            }
+
+            void clear()
+            {
+                *this = {};
+            }
+        };
+        DeviceResidentLogicalSequenceStateStorage
+            device_resident_logical_sequence_state_storage_;
+
+        /**
+         * @brief Event-fenced view of arena-owned logical sequence state.
+         *
+         * DGO treats target cached tokens as both the next logical position and
+         * the next request sequence length. Every pointer below must alias
+         * `device_resident_logical_sequence_state_storage_`; the mailbox adds
+         * transaction epoch and stream ordering, but never owns or adopts a
+         * graph-workspace address.
          */
         struct DeviceResidentLogicalSequenceStateMailbox
         {
@@ -5189,6 +5399,7 @@ namespace llaminar2
         uint64_t device_sampling_counter_ = 0;
 
         bool compute_all_position_logits_ = false;
+        bool live_mtp_request_batch_condition_ = false;
         bool compute_row_indexed_all_position_logits_ = false;
         int row_indexed_all_position_logits_row_count_ = 0;
         int request_batched_prefill_logits_row_count_ = 0;
@@ -5450,9 +5661,8 @@ namespace llaminar2
             void *consumer_stream,
             const char *consumer_name) const;
 
-        /// Record the device pointers that later DGO logical-state consumers must use.
+        /// Record an event-fenced view of the arena-owned logical-state rows.
         bool recordDeviceResidentLogicalSequenceStateMailbox(
-            const MTPSpecDecodeMetadataDevicePointers &ptrs,
             int request_count,
             void *producer_stream,
             std::string *error = nullptr);

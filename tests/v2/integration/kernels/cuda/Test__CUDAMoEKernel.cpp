@@ -758,34 +758,6 @@ namespace
         bool old_fuse_swiglu_ = true;
     };
 
-    /**
-     * @brief Temporarily force or disable the parsed LocalTP small-allreduce flag.
-     *
-     * The collective regression needs to exercise the real NCCL path.  Mutating
-     * the parsed debug environment is more direct than setting an environment
-     * variable after `debugEnv()` has already been initialized by earlier tests.
-     */
-    class ScopedLocalTPSmallGpuAllreduce
-    {
-    public:
-        explicit ScopedLocalTPSmallGpuAllreduce(bool enabled)
-            : old_enabled_(llaminar2::mutableDebugEnv().localtp_small_gpu_allreduce)
-        {
-            llaminar2::mutableDebugEnv().localtp_small_gpu_allreduce = enabled;
-        }
-
-        ~ScopedLocalTPSmallGpuAllreduce()
-        {
-            llaminar2::mutableDebugEnv().localtp_small_gpu_allreduce = old_enabled_;
-        }
-
-        ScopedLocalTPSmallGpuAllreduce(const ScopedLocalTPSmallGpuAllreduce &) = delete;
-        ScopedLocalTPSmallGpuAllreduce &operator=(const ScopedLocalTPSmallGpuAllreduce &) = delete;
-
-    private:
-        bool old_enabled_ = true;
-    };
-
     void expectGroupedDecodeCounter(
         const char *counter_name,
         const char *source,
@@ -4990,7 +4962,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerNarrowsDeferredApplySpanToC
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLeastLoadedEPOwnershipTransfersWithoutHotCache)
+TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfersWithoutHotCache)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -5023,7 +4995,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLeastLoadedEPOwnership
     config.dynamic_max_swaps_per_layer = 0;
     config.dynamic_max_plan_entries_per_wave = 1;
     config.max_post_wave_load_spread_per_mille = 100;
-    config.routed_assignment_policy = llaminar2::kDeviceMoERebalanceAssignmentLeastLoadedEP;
+    config.routed_assignment_policy = llaminar2::kDeviceMoERebalanceAssignmentLeastLoadedResident;
     config.flags = 0;
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::PlanMissingArrivals);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::CollectLoadStats);
@@ -10212,9 +10184,10 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAl
  * allreduces `M * d_model` FP32 elements, while ordinary serial decode allreduces
  * exactly one `d_model` row per token.  For MTP publication those two schedules
  * must produce the same bytes for every row.  This test uses the production
- * `LocalTPContext::allreduceOnStream()` path on two CUDA devices, disables the
- * obsolete small peer-add shortcut, and compares the NCCL grouped result against
- * row-wise NCCL serial decode.
+ * `LocalTPContext::allreduceOnStream()` path on two CUDA devices and compares
+ * the NCCL grouped result against row-wise NCCL serial decode.  The requested
+ * FP16 transport and 5120-wide Qwen hidden state reproduce the threshold bug:
+ * one row is below the 8192 cutoff while every grouped depth is above it.
  */
 TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows)
 {
@@ -10226,7 +10199,7 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows
     if (device_count < 2)
         GTEST_SKIP() << "CUDA LocalTP NCCL allreduce regression needs two CUDA devices";
 
-    constexpr int d_model = 2048;
+    constexpr int d_model = 5120;
     const auto device0 = llaminar2::DeviceId::cuda(0);
     const auto device1 = llaminar2::DeviceId::cuda(1);
     std::array<llaminar2::DeviceId, 2> devices = {device0, device1};
@@ -10236,7 +10209,10 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows
     ASSERT_NE(stream1.get(), nullptr);
     std::array<cudaStream_t, 2> streams = {stream_, stream1.get()};
 
-    ScopedLocalTPSmallGpuAllreduce force_nccl(/*enabled=*/false);
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedEnv fp16_threshold_env(
+        "LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", "8192");
+    llaminar2::PerfStatsCollector::reset();
     auto tp_ctx = llaminar2::createLocalTPContext(
         {llaminar2::GlobalDeviceAddress::cuda(0),
          llaminar2::GlobalDeviceAddress::cuda(1)},
@@ -10253,11 +10229,11 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows
         std::thread worker0([&]()
                             { ok[0] = tp_ctx->allreduceOnStream(
                                   partials[0].get(), stage_name, count,
-                                  streams[0], "fp32"); });
+                                  streams[0], "fp16"); });
         std::thread worker1([&]()
                             { ok[1] = tp_ctx->allreduceOnStream(
                                   partials[1].get(), stage_name, count,
-                                  streams[1], "fp32"); });
+                                  streams[1], "fp16"); });
         worker0.join();
         worker1.join();
         ASSERT_TRUE(ok[0]) << stage_name << " participant 0";
@@ -10341,6 +10317,19 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows
             grouped_device0.size(),
             static_cast<size_t>(d_model));
     }
+
+    const auto transport_records =
+        llaminar2::PerfStatsCollector::snapshot({"tp_allreduce_runtime"});
+    ASSERT_FALSE(transport_records.empty());
+    for (const auto &record : transport_records)
+    {
+        ASSERT_EQ(record.tags.at("path"), "on_stream_grouped")
+            << "unexpected LocalTP transport record " << record.name;
+        ASSERT_EQ(record.tags.at("dtype"), "fp32")
+            << "a grouped row count changed the requested FP16 transport policy";
+        ASSERT_EQ(record.tags.at("requested_precision"), "fp16");
+    }
+    llaminar2::PerfStatsCollector::reset();
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 #endif
 }

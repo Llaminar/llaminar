@@ -21,7 +21,6 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/MPIContext.h"
 #include "../../attention/AttentionDeviceParams.h"
-#include <array>
 
 namespace llaminar2
 {
@@ -55,14 +54,6 @@ namespace llaminar2
             constexpr const char *V_TMP_FP32 = "attn_v_tmp_fp32";
         }
 
-        /**
-         * @brief Maximum verifier/decode rows that share one dynamic attention-param upload.
-         *
-         * The CUDA small-M attention path currently supports verifier groups up to
-         * four rows.  Keeping this value in the header lets both the workspace
-         * declaration and the host staging storage stay in lockstep.
-         */
-        constexpr int kMaxDynamicAttentionParamRows = 4;
         // Forward declaration of precision element type mapping
         namespace detail
         {
@@ -287,9 +278,14 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void setGPUStream(void *stream) override
+            {
+                if (stream_ != stream)
+                    dynamic_attn_device_valid_ = false;
+                stream_ = stream;
+            }
 
-            /// Update attention params in pinned host memory for graph replay
+            /// Enqueue a stream-ordered device write for explicit attention geometry.
             void setDynamicAttnParams(int kv_len, int position_offset) override;
             void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
             bool prepareDynamicAttnParams(
@@ -388,6 +384,34 @@ namespace llaminar2
                 ITensor *output,
                 int verifier_rows,
                 int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal,
+                int window_size = -1,
+                const IMPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int gqa_n_rep = 0) override;
+
+            /**
+             * @brief Run independent request cache banks through one CUDA decode grid.
+             *
+             * The K/V tensors use the fixed-stride request-major layout emitted
+             * by CUDARingKVCache.  Row-local lengths are derived on the execution
+             * stream from canonical cache-owned device counts, keeping capture
+             * and replay fully device-owned while preserving scalar split and
+             * reduction order for every request.
+             */
+            bool compute_device_request_batch_decode_equivalent(
+                const ITensor *Q,
+                const ITensor *K,
+                const ITensor *V,
+                const int *post_append_cached_tokens_device,
+                ITensor *output,
+                int request_count,
+                int query_rows,
+                int max_kv_len,
                 int n_heads,
                 int n_kv_heads,
                 int head_dim,
@@ -500,26 +524,22 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Fixed host staging for attention params that are uploaded before graph capture.
-            std::array<attention::AttentionDeviceParams, kMaxDynamicAttentionParamRows> h_attn_params_{};
-            int h_attn_params_capacity_ = kMaxDynamicAttentionParamRows;
+            /// Last explicit geometry associated with the device parameter block.
             int dynamic_attn_kv_len_ = 0;
             int dynamic_attn_position_offset_ = 0;
             int dynamic_attn_query_rows_ = 1;
             int dynamic_attn_param_rows_ = 1;
-            bool dynamic_attn_host_valid_ = false;
             bool dynamic_attn_device_valid_ = false;
             bool dynamic_attn_device_derived_ = false;
 
             /**
-             * @brief Validate that fixed host staging can hold the requested rows.
+             * @brief Enqueue explicit geometry into DEVICE_PARAMS on @p stream.
              *
-             * No CUDA allocation is allowed here: callers may prepare attention
-             * params during lazy graph setup, and the actual device storage lives
-             * in the IWorkspaceConsumer buffer named @ref AttentionWorkspaceBuffers::DEVICE_PARAMS.
+             * The operation is a tiny graph-capturable CUDA kernel. It never
+             * allocates host storage and never records a host-to-device memcpy.
              */
-            bool ensureHostAttnParamsCapacity(int capacity);
-            bool uploadDynamicAttnParams(void *stream);
+            bool writeDynamicAttnParams(
+                int kv_len, int position_offset, int query_rows, void *stream);
             bool dynamicAttnParamsReady(
                 int kv_len, int position_offset, int query_rows) const;
             bool allocateWorkspace(int n_heads, int head_dim, int num_splits);
@@ -557,7 +577,7 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Update attention params in pinned host memory for graph replay
+            /// Enqueue a stream-ordered device write for explicit attention geometry.
             void setDynamicAttnParams(int kv_len, int position_offset) override;
 
             bool compute(
@@ -659,10 +679,6 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Single-row host staging for attention params uploaded to DEVICE_PARAMS.
-            attention::AttentionDeviceParams h_attn_params_{};
-            bool dynamic_attn_device_valid_ = false;
-
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };
@@ -698,7 +714,7 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Update attention params in pinned host memory for graph replay
+            /// Enqueue a stream-ordered device write for explicit attention geometry.
             void setDynamicAttnParams(int kv_len, int position_offset) override;
 
             bool compute(
@@ -799,10 +815,6 @@ namespace llaminar2
 
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
-
-            /// Single-row host staging for attention params uploaded to DEVICE_PARAMS.
-            attention::AttentionDeviceParams h_attn_params_{};
-            bool dynamic_attn_device_valid_ = false;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();

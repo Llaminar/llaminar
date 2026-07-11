@@ -5977,7 +5977,7 @@ namespace llaminar2
 
         /*
          * The ROCm MTP verifier deliberately replays decode-equivalent rows from
-         * device routing tensors.  In LocalTP ExpertParallel overlays the route
+         * device routing tensors. In LocalTP routed-expert overlays the route
          * tensor names global experts, while this participant should compute only
          * its mask-active shard before the MoE output allreduce.  The masked
          * conversion writes -1 for nonlocal top-k slots into backend scratch; the
@@ -6009,7 +6009,7 @@ namespace llaminar2
         const int k_partitions = debugEnv().rocm.moe_gateup_kparts;
         /*
          * Masked explicit-routing decode is the M=1 production contract for
-         * LocalTP / ExpertParallel verifier rows.  Non-local route slots are
+         * LocalTP expert-id-apportioned verifier rows. Non-local route slots are
          * represented as -1 entries, and the grouped M=2..4 verifier publisher
          * must be byte-identical to this path before its partial output is
          * allreduced with peer shards.  Split-K gate/up changes the FP32 reduction
@@ -8708,7 +8708,7 @@ namespace llaminar2
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
         /*
          * Runtime-table verifier prefill is the production MTP path for ROCm
-         * LLEP / ExpertParallel.  Keep it on the same batch-invariant contract
+         * least-loaded or static-owner apportioned execution. Keep it on the same batch-invariant contract
          * as the direct grouped path: every output element is owned by one
          * token/column worker, and that worker accumulates original top-k
          * routes in serial decode order.  The global parallel-down toggle can

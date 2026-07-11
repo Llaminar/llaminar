@@ -18,7 +18,8 @@ Llaminar supports:
 * CUDA inferencing (RTX-3090 / `sm86` initial support for now)
 * ROCm inferencing (`gfx906` only for now)
 * All of the above simultaneously
-* Tensor Parallel / Pipeline Parallel / MoE Expert Parallel (WiP)
+* Tensor Parallel / Pipeline Parallel / MoE routed-expert placement (replicated,
+  apportioned, or tensor-sharded compute with explicit row assignment) (WiP)
 
 ## Supported Models
 

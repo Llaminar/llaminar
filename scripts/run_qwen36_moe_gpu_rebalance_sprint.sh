@@ -26,13 +26,11 @@ dense_policy="${LLAMINAR_GPU_MOE_REBALANCE_DENSE_POLICY:-}"
 routed_assignment_policy="${LLAMINAR_GPU_MOE_REBALANCE_ASSIGNMENT_POLICY:-}"
 allreduce_precision="${LLAMINAR_GPU_MOE_REBALANCE_ALLREDUCE_PRECISION:-}"
 allreduce_fp16_min_elements="${LLAMINAR_GPU_MOE_REBALANCE_ALLREDUCE_FP16_MIN_ELEMENTS:-}"
-small_gpu_allreduce="${LLAMINAR_GPU_MOE_REBALANCE_SMALL_GPU_ALLREDUCE:-0}"
-small_gpu_allreduce_max_elements="${LLAMINAR_GPU_MOE_REBALANCE_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS:-}"
 require_prefill_graph="${LLAMINAR_GPU_MOE_REBALANCE_REQUIRE_PREFILL_GRAPH:-1}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--assignment-policy static-owner|least-loaded-ep] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--small-gpu-allreduce] [--small-gpu-allreduce-max-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
+Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--routed-assignment-policy static-owner|least-loaded-resident] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
 
 Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   static placement
@@ -42,8 +40,8 @@ Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   dynamic ownership + 10% hot expert replicas
 
 Each run uses one homogeneous 2-card LocalTP routed expert domain owned by MPI rank 0:
-  CUDA: cuda:0,cuda:1; backend=nccl; compute=apportioned_experts
-  ROCm: rocm:0,rocm:1; backend=rccl; compute=apportioned_experts
+  CUDA: cuda:0,cuda:1; backend=nccl; routed_compute=apportioned
+  ROCm: rocm:0,rocm:1; backend=rccl; routed_compute=apportioned
 
 Single-card placement is included for 1x CUDA/ROCm baselines:
   CUDA: -d cuda:0
@@ -88,13 +86,14 @@ Use --dense-decode-replicated with --dense-tp to mirror full dense/non-expert
 weights for decode, while keeping dense tensor parallelism and allreduce in
 prefill. Routed expert reductions remain controlled by the MoE overlay.
 
-Use --dense-policy to pass an explicit --moe-expert-overlay-dense-policy value,
+Use --dense-policy to pass an explicit --moe-continuation-dense-policy value,
 for example tensor-parallel-decode-mirrored-embedding. This overrides
 --dense-tp/--dense-decode-replicated for two-card runs.
 
 Use case 'llep' to request LLEP as the first-class rebalance strategy. The
-older --assignment-policy least-loaded-ep flag remains available for diagnostic
-runs that need least-loaded row assignment independent of the rebalance mode.
+--routed-assignment-policy least-loaded-resident option remains available for
+diagnostic runs that need least-loaded row assignment independent of the
+rebalance mode.
 
 Use --allreduce-precision fp16|fp32|bf16 to force the collective transport
 precision for diagnostic/performance A/B runs. Omit it to use the model schema's
@@ -102,10 +101,6 @@ hybrid precision policy.
 
 Use --allreduce-fp16-min-elements N with fp16 transport to keep tiny decode
 reductions on fp32 while preserving fp16 for larger prefill reductions.
-
-Use --small-gpu-allreduce to try the experimental two-card LocalTP peer-add
-fast path for tiny fp32 decode reductions. Use
---small-gpu-allreduce-max-elements N to adjust the cutoff.
 
 Two-card MoE runs require captured/replayed prefill graphs by default. Use
 --no-require-prefill-graph only for fallback diagnostics; the sprint proof loop
@@ -229,11 +224,11 @@ while [[ $# -gt 0 ]]; do
       dense_policy=""
       shift
       ;;
-    --assignment-policy|--routed-assignment-policy)
-      routed_assignment_policy="${2:?missing --assignment-policy value}"
+    --routed-assignment-policy)
+      routed_assignment_policy="${2:?missing --routed-assignment-policy value}"
       shift 2
       ;;
-    --no-assignment-policy|--no-routed-assignment-policy)
+    --no-routed-assignment-policy)
       routed_assignment_policy=""
       shift
       ;;
@@ -251,22 +246,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-allreduce-fp16-min-elements)
       allreduce_fp16_min_elements=""
-      shift
-      ;;
-    --small-gpu-allreduce)
-      small_gpu_allreduce=1
-      shift
-      ;;
-    --no-small-gpu-allreduce)
-      small_gpu_allreduce=0
-      shift
-      ;;
-    --small-gpu-allreduce-max-elements)
-      small_gpu_allreduce_max_elements="${2:?missing --small-gpu-allreduce-max-elements value}"
-      shift 2
-      ;;
-    --no-small-gpu-allreduce-max-elements)
-      small_gpu_allreduce_max_elements=""
       shift
       ;;
     --require-prefill-graph)
@@ -309,6 +288,14 @@ case "${placement}" in
     ;;
 esac
 
+case "${routed_assignment_policy}" in
+  ""|static-owner|least-loaded-resident) ;;
+  *)
+    echo "error: --routed-assignment-policy must be static-owner or least-loaded-resident" >&2
+    exit 2
+    ;;
+esac
+
 if [[ "${reps}" -lt 1 ]]; then
   echo "error: --reps must be >= 1" >&2
   exit 2
@@ -336,13 +323,6 @@ esac
 if [[ -n "${allreduce_fp16_min_elements}" ]]; then
   if ! [[ "${allreduce_fp16_min_elements}" =~ ^[0-9]+$ ]]; then
     echo "error: --allreduce-fp16-min-elements must be a non-negative integer" >&2
-    exit 2
-  fi
-fi
-
-if [[ -n "${small_gpu_allreduce_max_elements}" ]]; then
-  if ! [[ "${small_gpu_allreduce_max_elements}" =~ ^[0-9]+$ ]]; then
-    echo "error: --small-gpu-allreduce-max-elements must be a non-negative integer" >&2
     exit 2
   fi
 fi
@@ -459,18 +439,18 @@ twocard_overlay_args() {
       ;;
   esac
   assignment_suffix=""
-  if [[ -n "${routed_assignment_policy}" && "${routed_assignment_policy}" != "static-owner" && "${routed_assignment_policy}" != "static_owner" ]]; then
-    assignment_suffix=";assignment=${routed_assignment_policy}"
+  if [[ -n "${routed_assignment_policy}" && "${routed_assignment_policy}" != "static-owner" ]]; then
+    assignment_suffix=";routed_assignment=${routed_assignment_policy}"
   fi
 
   printf '%s\n' \
-    --moe-expert-overlay tiered \
-    --moe-expert-overlay-continuation "${domain}" \
-    --moe-expert-overlay-base-domain "${domain}" \
-    --moe-expert-overlay-shared-domain "${domain}" \
-    --moe-expert-overlay-residency static-by-id \
-    --moe-expert-overlay-domain "${domain}=${devices};scope=local;backend=${collective};compute=apportioned_experts${assignment_suffix};owner=0" \
-    --moe-expert-overlay-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192"
+    --moe-routed-expert-placement tiered-overlay \
+    --moe-routed-expert-continuation-domain "${domain}" \
+    --moe-routed-expert-base-model-domain "${domain}" \
+    --moe-routed-expert-shared-domain "${domain}" \
+    --moe-routed-expert-residency static-by-id \
+    --moe-routed-expert-domain "${domain}=${devices};scope=local;backend=${collective};routed_compute=apportioned${assignment_suffix};owner=0" \
+    --moe-routed-expert-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192"
 }
 
 run_one() {
@@ -525,11 +505,11 @@ run_one() {
     dense_decode_replicated_enabled=1
   fi
   if [[ "${place}" == "twocard" && -n "${dense_policy}" ]]; then
-    cmd+=(--moe-expert-overlay-dense-policy "${dense_policy}")
+    cmd+=(--moe-continuation-dense-policy "${dense_policy}")
   elif [[ "${place}" == "twocard" && "${dense_tp_enabled}" == "1" && "${dense_decode_replicated_enabled}" == "1" ]]; then
-    cmd+=(--moe-expert-overlay-dense-policy phase-split-hybrid-tp-ae)
+    cmd+=(--moe-continuation-dense-policy prefill-tensor-parallel-decode-replicated)
   elif [[ "${place}" == "twocard" && "${dense_tp_enabled}" == "1" ]]; then
-    cmd+=(--moe-expert-overlay-dense-policy tensor-parallel)
+    cmd+=(--moe-continuation-dense-policy tensor-parallel)
   fi
   if [[ -n "${allreduce_precision}" ]]; then
     cmd+=(--tp-allreduce-precision "${allreduce_precision}")
@@ -591,12 +571,6 @@ run_one() {
       run_env+=("LLAMINAR_PREFILL_GRAPH_REQUIRED=1")
     else
       run_env+=("LLAMINAR_PREFILL_GRAPH_REQUIRED=0")
-    fi
-    if [[ "${small_gpu_allreduce}" != "0" && "${small_gpu_allreduce}" != "false" && "${small_gpu_allreduce}" != "off" ]]; then
-      run_env+=("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE=1")
-      if [[ -n "${small_gpu_allreduce_max_elements}" ]]; then
-        run_env+=("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS=${small_gpu_allreduce_max_elements}")
-      fi
     fi
     if [[ "${capture_collectives}" != "0" && "${capture_collectives}" != "false" && "${capture_collectives}" != "off" ]]; then
       run_env+=("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=1")

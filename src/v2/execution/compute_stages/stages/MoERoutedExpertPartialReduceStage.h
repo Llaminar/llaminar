@@ -1,6 +1,6 @@
 /**
- * @file MoEExpertParallelReduceStage.h
- * @brief Cross-domain partial reduction for MoE expert-parallel tiers.
+ * @file MoERoutedExpertPartialReduceStage.h
+ * @brief Cross-domain reduction of partial routed-expert outputs.
  *
  * Supports two partial layouts:
  *  - Dense [rows, cols]: the tier stage scatter-adds internally and returns the
@@ -28,24 +28,24 @@ namespace llaminar2
 {
 
     class TensorBase;
-    enum class MoEExpertParallelReduceMode
+    enum class MoERoutedExpertPartialReduceMode
     {
         HostStagedCorrectness,
         ContinuationDeviceOptimized,
     };
 
-    const char *toString(MoEExpertParallelReduceMode mode);
+    const char *toString(MoERoutedExpertPartialReduceMode mode);
 
-    enum class MoEExpertParallelReducePartialAccumulationPath
+    enum class MoERoutedExpertPartialReducePartialAccumulationPath
     {
         ContinuationDeviceAccumulated,
         HostStagedThenDeviceAccumulated,
         HostSummedCorrectnessFallback,
     };
 
-    const char *toString(MoEExpertParallelReducePartialAccumulationPath path);
+    const char *toString(MoERoutedExpertPartialReducePartialAccumulationPath path);
 
-    struct MoEExpertParallelReducePartialInfo
+    struct MoERoutedExpertPartialReducePartialInfo
     {
         std::string name;
         std::string source_domain;
@@ -58,7 +58,7 @@ namespace llaminar2
         std::vector<int> selected_rows;
     };
 
-    struct MoEExpertParallelReducePartialDiagnostics
+    struct MoERoutedExpertPartialReducePartialDiagnostics
     {
         std::string name;
         std::string source_domain;
@@ -68,13 +68,13 @@ namespace llaminar2
         bool source_is_continuation = false;
         bool is_sparse = false;      ///< True when partial uses compact selected_rows layout
         size_t sparse_row_count = 0; ///< Number of selected rows when is_sparse=true
-        MoEExpertParallelReducePartialAccumulationPath accumulation_path =
-            MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback;
+        MoERoutedExpertPartialReducePartialAccumulationPath accumulation_path =
+            MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback;
     };
 
-    struct MoEExpertParallelReduceDiagnostics
+    struct MoERoutedExpertPartialReduceDiagnostics
     {
-        MoEExpertParallelReduceMode mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        MoERoutedExpertPartialReduceMode mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         std::string continuation_domain;
         DeviceId continuation_device = DeviceId::invalid();
         bool host_staged = true;
@@ -87,12 +87,12 @@ namespace llaminar2
         size_t host_to_device_bytes = 0;
         size_t total_transfer_bytes = 0;
         double reduce_ms = 0.0;
-        std::vector<MoEExpertParallelReducePartialDiagnostics> partials;
+        std::vector<MoERoutedExpertPartialReducePartialDiagnostics> partials;
 
         void clear();
     };
 
-    class MoEExpertParallelReduceStage : public IComputeStage
+    class MoERoutedExpertPartialReduceStage : public IComputeStage
     {
     public:
         struct Params
@@ -101,7 +101,7 @@ namespace llaminar2
 
             std::vector<const ITensor *> partials;                                       ///< FP32 partial tensors: dense [rows,cols] or sparse [selected_rows.size(),cols]
             std::vector<std::shared_ptr<TensorBase>> partial_lifetimes;                  ///< Graph-owned partial tensor storage
-            std::vector<MoEExpertParallelReducePartialInfo> partial_infos;               ///< Optional per-partial source metadata
+            std::vector<MoERoutedExpertPartialReducePartialInfo> partial_infos;               ///< Optional per-partial source metadata
             std::vector<TensorBase *> sparse_expansion_scratch;                          ///< Dense [rows,cols] FP32 scratch for optimized sparse partials
             std::vector<std::shared_ptr<TensorBase>> sparse_expansion_scratch_lifetimes; ///< Optional owner for sparse_expansion_scratch
             ITensor *output = nullptr;                                                   ///< Dense FP32 continuation output [rows, cols]
@@ -110,20 +110,20 @@ namespace llaminar2
             size_t cols = 0;                                                             ///< Optional expected cols (0 = infer from output)
             int layer_idx = -1;
 
-            MoEExpertParallelReduceMode mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+            MoERoutedExpertPartialReduceMode mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
             std::string continuation_domain;
             DeviceId continuation_device = DeviceId::cpu();
-            MoEExpertParallelReduceDiagnostics *diagnostics = nullptr;
-            std::shared_ptr<MoEExpertParallelReduceDiagnostics> diagnostics_lifetime;
+            MoERoutedExpertPartialReduceDiagnostics *diagnostics = nullptr;
+            std::shared_ptr<MoERoutedExpertPartialReduceDiagnostics> diagnostics_lifetime;
         };
 
         static_assert(StageParamsRequired<Params>);
 
-        explicit MoEExpertParallelReduceStage(Params params);
+        explicit MoERoutedExpertPartialReduceStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
-        ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE; }
-        std::string name() const override { return "moe_expert_parallel_reduce"; }
+        ComputeStageType type() const override { return ComputeStageType::MOE_ROUTED_EXPERT_PARTIAL_REDUCE; }
+        std::string name() const override { return "moe_routed_expert_partial_reduce"; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;

@@ -140,7 +140,7 @@ namespace
              * These cells are coverage tests, not production economics tests:
              * make the LLEP assignment capacity strict enough that both CUDA
              * and ROCm must publish transfer-backed migrations instead of
-             * legally selecting standard EP for already-balanced router loads.
+             * legally selecting static-owner assignment for already-balanced router loads.
              */
             config.device_llep_alpha_numerator = 1;
             config.device_llep_alpha_denominator = 2;
@@ -438,6 +438,24 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAf
         true);
 }
 
+/**
+ * @brief Prove the maximum CUDA grouped verifier shape survives prefix restore.
+ *
+ * Dynamic depth may demote before a cache-hit request and thereby exercise
+ * fewer than four target rows. Keep this fixed-depth cell so restored terminal
+ * logits, hidden state, shifted MTP KV, resident outcome reduction, and direct
+ * publication are all validated at the maximum supported verifier shape.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterPrefixRestore_CUDA2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        cudaOnlyStochasticBenchmarkCase(),
+        3,
+        true,
+        MTPDepthPolicyConfig{},
+        true);
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache_CUDA2TPHotOnly)
 {
     runMoEStochasticMTPVerifierParity(
@@ -573,6 +591,24 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAf
     runMoEStochasticMTPVerifierParity(
         rocmOnlyStochasticBenchmarkCase(),
         3,
+        true);
+}
+
+/**
+ * @brief Prove the maximum ROCm grouped verifier shape survives prefix restore.
+ *
+ * This is deliberately symmetric with the CUDA cell above. It keeps the RCCL
+ * collective, resident stochastic reducer, restored attention/GDN/short-conv
+ * state, and accepted-state publication path covered at four verifier rows,
+ * independent of dynamic-depth controller decisions.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterPrefixRestore_ROCm2TPHotOnly)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyStochasticBenchmarkCase(),
+        3,
+        true,
+        MTPDepthPolicyConfig{},
         true);
 }
 
@@ -725,15 +761,15 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PartialPrefixFixturesUseLongMetadata
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MixedHotColdMTPUsesPhaseSplitDenseDecode)
 {
     const auto test_case = expertOverlayCase();
-    ASSERT_TRUE(test_case.moe_expert_parallel_plan);
+    ASSERT_TRUE(test_case.moe_routed_expert_plan);
 
     const auto &spec =
-        test_case.moe_expert_parallel_plan->continuation_domain_spec;
+        test_case.moe_routed_expert_plan->continuation_domain_spec;
     EXPECT_EQ(spec.effectiveDensePolicy(),
-              DenseParallelPolicy::PhaseSplitHybridTP_AE);
+              DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
     EXPECT_TRUE(spec.dense_tp_enabled);
     EXPECT_TRUE(spec.dense_decode_replicated);
-    EXPECT_EQ(test_case.moe_expert_parallel_plan->continuation_domain,
+    EXPECT_EQ(test_case.moe_routed_expert_plan->continuation_domain,
               "qwen36_moe_rocm_hot");
 }
 

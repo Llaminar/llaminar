@@ -393,7 +393,7 @@ TEST(Test__Commands, OneshotRejectsBenchmarkFlag)
 TEST(Test__Commands, OneshotRejectsTensorParallelMoEBeforeRuntime)
 {
     OneshotCommand oneshot;
-    ArgvBuilder args("llaminar2", "--moe-expert-mode", "sharded-experts",
+    ArgvBuilder args("llaminar2", "--moe-routed-expert-compute", "tensor-sharded",
                      "-m", "/tmp/does-not-need-to-exist.gguf", "-p", "test");
     EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 1);
 }
@@ -401,14 +401,14 @@ TEST(Test__Commands, OneshotRejectsTensorParallelMoEBeforeRuntime)
 TEST(Test__Commands, OneshotValidateOnlyReturns0BeforeRuntime)
 {
     OneshotCommand oneshot;
-    ArgvBuilder args("llaminar2", "--validate-only", "--moe-expert-mode", "apportioned-experts");
+    ArgvBuilder args("llaminar2", "--validate-only", "--moe-routed-expert-compute", "apportioned");
     EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 0);
 }
 
 TEST(Test__Commands, ServeRejectsTensorParallelMoEBeforeRuntime)
 {
     ServeCommand serve;
-    ArgvBuilder args("llaminar2", "--moe-expert-mode", "sharded-experts",
+    ArgvBuilder args("llaminar2", "--moe-routed-expert-compute", "tensor-sharded",
                      "-m", "/tmp/does-not-need-to-exist.gguf");
     EXPECT_EQ(serve.execute(args.argc(), args.argv()), 1);
 }

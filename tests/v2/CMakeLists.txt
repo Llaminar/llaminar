@@ -679,20 +679,20 @@ target_link_libraries(v2_unit_weight_manager_moe_expert_overlay_preparation
 )
 add_v2_test(V2_Unit_WeightManagerMoEExpertOverlayPreparation
     COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
-    LABELS "V2;Unit;Loaders;MoE;ExpertParallel"
+    LABELS "V2;Unit;Loaders;MoE;RoutedExpertPlacement"
     MPI_PROCS 1
 )
 
-# Test: MoE Expert Parallel Plan - same-layer expert overlay value validation
-add_executable(v2_unit_moe_expert_parallel_plan unit/execution/moe/Test__MoEExpertParallelPlan.cpp)
-target_link_libraries(v2_unit_moe_expert_parallel_plan
+# Test: typed same-layer routed-expert placement plan validation
+add_executable(v2_unit_moe_routed_expert_placement_plan unit/execution/moe/Test__MoERoutedExpertPlacementPlan.cpp)
+target_link_libraries(v2_unit_moe_routed_expert_placement_plan
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_MoEExpertParallelPlan
-    COMMAND $<TARGET_FILE:v2_unit_moe_expert_parallel_plan>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Configuration"
+add_v2_test(V2_Unit_MoERoutedExpertPlacementPlan
+    COMMAND $<TARGET_FILE:v2_unit_moe_routed_expert_placement_plan>
+    LABELS "V2;Unit;Execution;MoE;RoutedExpertPlacement;Configuration"
     MPI_PROCS 1
 )
 
@@ -707,20 +707,20 @@ target_link_libraries(v2_unit_moe_expert_overlay_runtime_plan
 )
 add_v2_test(V2_Unit_MoEExpertOverlayRuntimePlan
     COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Configuration"
+    LABELS "V2;Unit;Execution;MoE;RoutedExpertPlacement;Configuration"
     MPI_PROCS 1
 )
 
-# Test: MoE Expert Parallel Planner - static same-layer expert residency planning
-add_executable(v2_unit_moe_expert_parallel_planner unit/execution/moe/Test__MoEExpertParallelPlanner.cpp)
-target_link_libraries(v2_unit_moe_expert_parallel_planner
+# Test: static same-layer routed-expert placement planning
+add_executable(v2_unit_moe_routed_expert_placement_planner unit/execution/moe/Test__MoERoutedExpertPlacementPlanner.cpp)
+target_link_libraries(v2_unit_moe_routed_expert_placement_planner
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_MoEExpertParallelPlanner
-    COMMAND $<TARGET_FILE:v2_unit_moe_expert_parallel_planner>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Planner"
+add_v2_test(V2_Unit_MoERoutedExpertPlacementPlanner
+    COMMAND $<TARGET_FILE:v2_unit_moe_routed_expert_placement_planner>
+    LABELS "V2;Unit;Execution;MoE;RoutedExpertPlacement;Planner"
     MPI_PROCS 1
 )
 
@@ -735,6 +735,77 @@ add_v2_test(V2_Unit_MoEForbiddenDependencyScan
     COMMAND $<TARGET_FILE:v2_unit_moe_forbidden_dependency_scan>
     LABELS "V2;Unit;Execution;MoE;SourceHygiene;GraphNative"
     MPI_PROCS 1
+)
+
+# Focused routed-expert policy regressions. These suites use typed device
+# addresses and mock collective contexts only; physical GPU work belongs in the
+# integration gate and must never be introduced into these unit targets.
+function(add_v2_routed_expert_policy_unit TARGET_NAME TEST_NAME SOURCE_FILE)
+    add_executable(${TARGET_NAME} ${SOURCE_FILE})
+    target_include_directories(${TARGET_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(${TARGET_NAME}
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(${TEST_NAME}
+        COMMAND $<TARGET_FILE:${TARGET_NAME}>
+        LABELS "V2;Unit;Execution;MoE;RoutedExpertPlacement;Regression"
+        MPI_PROCS 1
+    )
+endfunction()
+
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_continuation_config
+    V2_Unit_MoEContinuationConfig
+    unit/execution/moe/Test__MoEContinuationConfig.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_continuation_domain_spec
+    V2_Unit_MoEContinuationDomainSpec
+    unit/execution/moe/Test__MoEContinuationDomainSpec.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_continuation_tp_context_plumbing
+    V2_Unit_MoEContinuationTPContextPlumbing
+    unit/execution/moe/Test__MoEContinuationTPContextPlumbing.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_expert_owner_map
+    V2_Unit_MoEExpertOwnerMap
+    unit/execution/moe/Test__MoEExpertOwnerMap.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_graph_native_production_hardening
+    V2_Unit_MoEGraphNativeProductionHardening
+    unit/execution/moe/Test__MoEGraphNativeProductionHardening.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_graph_role_runner_interface
+    V2_Unit_MoEGraphRoleRunnerInterface
+    unit/execution/moe/Test__MoEGraphRoleRunner_NoTensorPayloadAPI.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_legacy_runtime_quarantined
+    V2_Unit_MoELegacyRuntimeQuarantined
+    unit/execution/moe/Test__MoEOverlayLegacyRuntimeQuarantined.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_no_cpu_fallback_sidecar
+    V2_Unit_MoENoCPUFallbackSidecar
+    unit/execution/moe/Test__MoEOverlayNoCPUFallbackSidecar.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_routed_tier_planner
+    V2_Unit_MoERoutedTierPlanner
+    unit/execution/moe/Test__MoERoutedTierPlanner.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_routed_tier_rebalancer
+    V2_Unit_MoERoutedTierRebalancer
+    unit/execution/moe/Test__MoERoutedTierRebalancer.cpp
 )
 
 # Test: MoE overlay collective workspace and key namespace behavior
@@ -1753,7 +1824,7 @@ add_test(NAME V2_Unit_MoELLEPTraceCorpusEvaluatorScript
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_moe_llep_trace_corpus_evaluator.py
 )
 set_tests_properties(V2_Unit_MoELLEPTraceCorpusEvaluatorScript PROPERTIES
-    LABELS "V2;Unit;MoE;Benchmark;Policy;LeastLoadedEP;Regression"
+    LABELS "V2;Unit;MoE;Benchmark;Policy;LLEP;Regression"
     TIMEOUT 30
 )
 
@@ -6213,7 +6284,7 @@ if(ZLIB_FOUND)
     )
     set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS
         V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
-        CUDA ROCm NCCL RCCL LocalTP ExpertOverlay PhaseSplitHybridTP_AE
+        CUDA ROCm NCCL RCCL LocalTP ExpertOverlay PrefillTensorParallelDecodeReplicated
         Dynamic LLEP PyTorch GoldenReference FullModel
     )
     set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES
@@ -6352,7 +6423,7 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 MoE LongContext CPU-vs-ROCm parity sweep enabled")
 
-    # ---- LocalTP MoE Parity (2x ROCm with Expert Parallelism + RCCL) ----
+    # ---- LocalTP MoE Parity (2x ROCm expert-ID apportionment + RCCL) ----
     add_executable(v2_integration_parity_qwen35moe_local_tp
         integration/parity/qwen35moe/Test__Qwen35MoE_LocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -6370,7 +6441,7 @@ if(ZLIB_FOUND)
 
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_local_tp
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_LocalTP
-        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;LocalTP;RCCL;ROCm;TensorParallel;ExpertParallel"
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;LocalTP;RCCL;ROCm;TensorParallel;RoutedExpertPlacement"
         MPI_PROCS 1
     )
 
@@ -6418,7 +6489,7 @@ if(ZLIB_FOUND)
 
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_expert_overlay
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEExpertOverlay
-        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;ApportionedExperts;ModelLight"
+        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;RoutedExpertApportioned;ModelLight"
         MPI_PROCS 2
         TIMEOUT 600
     )
@@ -6491,10 +6562,10 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 MoE GraphNative parity tests enabled")
 
-    # ---- NodeLocalTP MoE Parity (Cross-Socket CPU TP with Expert Parallelism) ----
+    # ---- NodeLocalTP MoE Parity (cross-socket routed partials + dense TP) ----
     #
     # Tests Node-Local Tensor Parallelism for MoE models:
-    #   - Expert Parallelism (EP): each rank computes a subset of experts
+    #   - Static routed-row assignment: each rank computes a subset of experts
     #   - Shared Expert: Megatron TP (ColumnParallel gate/up, InputParallel down)
     #   - Single allreduce per layer on attn_proj
     #
@@ -6516,7 +6587,7 @@ if(ZLIB_FOUND)
 
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_node_local_tp
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU;ExpertParallel"
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU;RoutedExpertPlacement"
         MPI_PROCS 2
     )
 
@@ -6589,23 +6660,23 @@ add_v2_test(V2_Unit_GEMMStage
     MPI_PROCS 1  # Tests stage construction and params, no MPI needed
 )
 
-# Test: MoEExpertDispatchStage (model-light expert-parallel routing descriptor builder)
+# Test: MoEExpertDispatchStage (model-light routed-expert descriptor builder)
 add_executable(v2_test_moe_expert_dispatch_stage unit/execution/compute_stages/Test__MoEExpertDispatchStage.cpp)
 target_include_directories(v2_test_moe_expert_dispatch_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_test_moe_expert_dispatch_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_MoEExpertDispatchStage
     COMMAND $<TARGET_FILE:v2_test_moe_expert_dispatch_stage>
-    LABELS "V2;Unit;Execution;ComputeStage;MoE;ExpertParallel;Dispatch"
+    LABELS "V2;Unit;Execution;ComputeStage;MoE;RoutedExpertDispatch"
     MPI_PROCS 1
 )
 
-# Test: MoEExpertParallelReduceStage (model-light dense partial reduce)
-add_executable(v2_test_moe_expert_parallel_reduce_stage unit/execution/compute_stages/Test__MoEExpertParallelReduceStage.cpp)
-target_include_directories(v2_test_moe_expert_parallel_reduce_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_test_moe_expert_parallel_reduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MoEExpertParallelReduceStage
-    COMMAND $<TARGET_FILE:v2_test_moe_expert_parallel_reduce_stage>
-    LABELS "V2;Unit;Execution;ComputeStage;MoE;ExpertParallel;Reduce"
+# Test: MoERoutedExpertPartialReduceStage (model-light dense partial reduce)
+add_executable(v2_test_moe_routed_expert_partial_reduce_stage unit/execution/compute_stages/Test__MoERoutedExpertPartialReduceStage.cpp)
+target_include_directories(v2_test_moe_routed_expert_partial_reduce_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_routed_expert_partial_reduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoERoutedExpertPartialReduceStage
+    COMMAND $<TARGET_FILE:v2_test_moe_routed_expert_partial_reduce_stage>
+    LABELS "V2;Unit;Execution;ComputeStage;MoE;RoutedExpertPartialReduce"
     MPI_PROCS 1
 )
 
@@ -7964,13 +8035,13 @@ add_v2_test(V2_Unit_GraphResolver
     MPI_PROCS 1
 )
 
-# Test: GraphResolver ExpertParallel TP mode (Phase 4 MoE stage decomposition)
-# Verifies TPMode::ExpertParallel inserts allreduce collectives
-add_executable(v2_test_graph_resolver_expert_parallel unit/execution/local_execution/graph/Test__GraphResolver_ExpertParallel.cpp)
-target_link_libraries(v2_test_graph_resolver_expert_parallel llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphResolver_ExpertParallel
-    COMMAND $<TARGET_FILE:v2_test_graph_resolver_expert_parallel>
-    LABELS "V2;Unit;GraphResolver;MoE;ExpertParallel"
+# Test: GraphResolver within-expert tensor-sharding mode
+# Verifies TPMode::RoutedExpertTensorSharded inserts allreduce collectives
+add_executable(v2_test_graph_resolver_routed_expert_tensor_sharded unit/execution/local_execution/graph/Test__GraphResolver_RoutedExpertTensorSharded.cpp)
+target_link_libraries(v2_test_graph_resolver_routed_expert_tensor_sharded llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphResolver_RoutedExpertTensorSharded
+    COMMAND $<TARGET_FILE:v2_test_graph_resolver_routed_expert_tensor_sharded>
+    LABELS "V2;Unit;GraphResolver;MoE;RoutedExpertTensorSharded"
     MPI_PROCS 1
 )
 
@@ -10963,7 +11034,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_ROCmRequestBatchResidentKVAttention
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
-                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedRequestBatchAllStandardKVFormatsMatchIsolatedPrefillBytes
+                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedRequestBatchAllStandardKVFormatsMatchIsolatedPrefillBytes:Test__ROCmFlashAttentionParity.CapturedVariableLengthRequestBatchAllStandardKVFormatsDecodeMatchesSerialByteExact
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;Attention;KVCache;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;AllFormats;FP32;FP16;BF16;Q8_1;Regression;gfx906"
         MPI_PROCS 1
@@ -11612,7 +11683,7 @@ target_link_libraries(v2_unit_orchestration_runner_moe_overlay_plan
 )
 add_v2_test(V2_Unit_OrchestrationRunner_MoEOverlayPlan
     COMMAND $<TARGET_FILE:v2_unit_orchestration_runner_moe_overlay_plan>
-    LABELS "V2;Unit;Orchestration;OrchestrationRunner;MoE;Overlay;ExpertParallel"
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;MoE;RoutedExpertPlacement"
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added OrchestrationRunner MoE overlay plan unit tests")
@@ -12502,7 +12573,7 @@ target_link_libraries(v2_test_least_loaded_expert_assignment
 )
 add_v2_test(V2_Unit_LeastLoadedExpertAssignment
     COMMAND $<TARGET_FILE:v2_test_least_loaded_expert_assignment>
-    LABELS "V2;Unit;MoE;ExpertParallel;LeastLoadedEP;DynamicPlacement"
+    LABELS "V2;Unit;MoE;RoutedExpertPlacement;LeastLoadedResident;DynamicPlacement"
 )
 
 # Test: MoEConfig — configuration validation, isMoELayer()

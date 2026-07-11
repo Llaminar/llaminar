@@ -32,12 +32,12 @@ namespace llaminar2
             return message.str();
         }
 
-        std::vector<int> deterministicParticipantRanks(const ExpertComputeDomain &domain)
+        std::vector<int> deterministicParticipantRanks(const RoutedExpertDomain &domain)
         {
             if (!domain.world_ranks.empty())
                 return domain.world_ranks;
 
-            if (domain.kind == ExpertDomainKind::NodeLocalTP)
+            if (domain.scope == ExecutionDomainScope::NODE_LOCAL)
             {
                 std::vector<int> ranks;
                 ranks.reserve(domain.participants.size());
@@ -49,13 +49,13 @@ namespace llaminar2
             if (domain.owner_rank >= 0)
                 return std::vector<int>(domain.participants.size(), domain.owner_rank);
 
-            if (domain.kind == ExpertDomainKind::SingleDevice)
+            if (domain.scope == ExecutionDomainScope::SINGLE)
                 return std::vector<int>(domain.participants.size(), 0);
 
             return std::vector<int>(domain.participants.size(), -1);
         }
 
-        int inferredOwnerRank(const ExpertComputeDomain &domain, const std::vector<int> &participant_ranks)
+        int inferredOwnerRank(const RoutedExpertDomain &domain, const std::vector<int> &participant_ranks)
         {
             if (domain.owner_rank >= 0)
                 return domain.owner_rank;
@@ -64,7 +64,7 @@ namespace llaminar2
             return -1;
         }
 
-        int inferMinimumWorldSize(const MoEExpertParallelPlan &plan, int current_world_rank)
+        int inferMinimumWorldSize(const MoERoutedExpertPlacementPlan &plan, int current_world_rank)
         {
             int world_size = std::max(1, current_world_rank + 1);
             for (const auto &domain : plan.domains)
@@ -77,7 +77,7 @@ namespace llaminar2
                     for (int rank : domain.world_ranks)
                         world_size = std::max(world_size, rank + 1);
                 }
-                else if (domain.kind == ExpertDomainKind::NodeLocalTP)
+                else if (domain.scope == ExecutionDomainScope::NODE_LOCAL)
                 {
                     world_size = std::max(world_size, static_cast<int>(domain.participants.size()));
                 }
@@ -85,17 +85,17 @@ namespace llaminar2
             return world_size;
         }
 
-        std::unordered_map<std::string, const ExpertComputeDomain *> sourceDomainsByName(
-            const MoEExpertParallelPlan &plan)
+        std::unordered_map<std::string, const RoutedExpertDomain *> sourceDomainsByName(
+            const MoERoutedExpertPlacementPlan &plan)
         {
-            std::unordered_map<std::string, const ExpertComputeDomain *> by_name;
+            std::unordered_map<std::string, const RoutedExpertDomain *> by_name;
             for (const auto &domain : plan.domains)
                 by_name.emplace(domain.name, &domain);
             return by_name;
         }
 
-        const ExpertComputeDomain *findSourceDomain(
-            const std::unordered_map<std::string, const ExpertComputeDomain *> &by_name,
+        const RoutedExpertDomain *findSourceDomain(
+            const std::unordered_map<std::string, const RoutedExpertDomain *> &by_name,
             const std::string &name)
         {
             auto it = by_name.find(name);
@@ -105,7 +105,7 @@ namespace llaminar2
         }
 
         int domainOwnerRankOrInvalid(
-            const std::unordered_map<std::string, const ExpertComputeDomain *> &by_name,
+            const std::unordered_map<std::string, const RoutedExpertDomain *> &by_name,
             const std::string &name)
         {
             const auto *domain = findSourceDomain(by_name, name);
@@ -115,14 +115,12 @@ namespace llaminar2
         }
 
         std::vector<std::string> validateExecutionTopology(
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             int current_world_rank,
             int world_size)
         {
             std::vector<std::string> errors;
-            const auto validation = validateMoEExpertParallelPlan(
-                plan,
-                MoEExpertParallelValidationOptions{.allow_routed_sharded_experts = true});
+            const auto validation = validateMoERoutedExpertPlacementPlan(plan);
             for (const auto &error : validation.errors)
                 errors.push_back(error);
 
@@ -164,7 +162,7 @@ namespace llaminar2
                     }
                 }
 
-                if (domain.kind == ExpertDomainKind::LocalTP && distinct_ranks.size() > 1)
+                if (domain.scope == ExecutionDomainScope::LOCAL && distinct_ranks.size() > 1)
                 {
                     errors.push_back("domain '" + domain.name +
                                      "' is LocalTP but maps participants to multiple ranks; use NodeLocalTP for cross-rank domains");
@@ -210,7 +208,7 @@ namespace llaminar2
             return errors;
         }
 
-        std::set<std::string> fallbackDomainNames(const MoEExpertParallelPlan &plan)
+        std::set<std::string> fallbackDomainNames(const MoERoutedExpertPlacementPlan &plan)
         {
             std::set<std::string> domains;
             for (const auto &tier : plan.routed_tiers)
@@ -221,7 +219,7 @@ namespace llaminar2
             return domains;
         }
 
-        std::set<std::string> routedDomainNames(const MoEExpertParallelPlan &plan)
+        std::set<std::string> routedDomainNames(const MoERoutedExpertPlacementPlan &plan)
         {
             std::set<std::string> domains;
             for (const auto &tier : plan.routed_tiers)
@@ -231,14 +229,14 @@ namespace llaminar2
 
         struct DomainRoleDescriptor
         {
-            const ExpertComputeDomain *source = nullptr;
+            const RoutedExpertDomain *source = nullptr;
             const MoEOverlayRuntimeDomain *runtime = nullptr;
             std::vector<int> participant_ranks;
             int owner_rank = -1;
         };
 
         std::vector<DomainRoleDescriptor> buildDomainRoleDescriptors(
-            const MoEExpertParallelPlan &source_plan,
+            const MoERoutedExpertPlacementPlan &source_plan,
             const std::vector<MoEOverlayRuntimeDomain> &runtime_domains)
         {
             std::unordered_map<std::string, const MoEOverlayRuntimeDomain *> runtime_by_name;
@@ -335,13 +333,14 @@ namespace llaminar2
             if (!descriptor.source || !rankHasDeviceType(descriptor, rank, true))
                 return false;
 
-            if (descriptor.source->kind == ExpertDomainKind::LocalTP &&
-                descriptor.source->compute_kind == ExpertDomainComputeKind::ShardedExperts)
+            if (descriptor.source->scope == ExecutionDomainScope::LOCAL &&
+                descriptor.source->routed_compute_policy ==
+                    RoutedExpertComputePolicy::TensorSharded)
             {
                 return true;
             }
 
-            return descriptor.source->kind == ExpertDomainKind::SingleDevice &&
+            return descriptor.source->scope == ExecutionDomainScope::SINGLE &&
                    descriptor.owner_rank == continuation_root_rank &&
                    rank == continuation_root_rank;
         }
@@ -588,7 +587,7 @@ namespace llaminar2
     }
 
     MoEExpertOverlayExecutionPlan resolveMoEExpertOverlayExecutionPlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         int current_world_rank)
     {
         return resolveMoEExpertOverlayExecutionPlan(
@@ -600,7 +599,7 @@ namespace llaminar2
     }
 
     MoEExpertOverlayExecutionPlan resolveMoEExpertOverlayExecutionPlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         const MoEExpertOverlayExecutionPlanResolverOptions &options)
     {
         if (!plan || !plan->isTieredOverlay())

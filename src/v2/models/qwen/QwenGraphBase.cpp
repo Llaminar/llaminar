@@ -163,7 +163,9 @@ namespace llaminar2
             {
                 layout.seq_len = total_tokens;
                 layout.input_buffer_id = BufferId::NORMALIZED;
-                layout.compute_all_positions = config.compute_all_position_logits;
+                layout.compute_all_positions =
+                    config.compute_all_position_logits ||
+                    config.live_mtp_request_batch_condition;
                 layout.use_prefill_replay_row_offset = true;
                 return layout;
             }
@@ -195,8 +197,7 @@ namespace llaminar2
                    layout.compute_all_positions &&
                    layout.seq_len > 1 &&
                    layout.seq_len <= 4 &&
-                   config.compute_all_position_logits &&
-                   config.mtp.enabled;
+                   config.usesMTPGroupedDecodeEquivalentRows();
         }
 
         /**
@@ -362,28 +363,27 @@ namespace llaminar2
                config_.tp_ctx->isLocal();
     }
 
-    bool QwenGraphBase::mirroredMTPHeadActiveForVerifierTokens(int total_tokens) const
+    bool QwenGraphBase::mirroredMTPHeadActiveForProjectedRows(int total_tokens) const
     {
-        const int max_decode_like_rows =
-            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
-
         /*
-         * Request-batched prefill can have a large padded activation tensor but
-         * projects only one compact terminal row per request.  The LM-head
-         * policy must follow the number of rows actually projected, not the
-         * padded transformer input size.  Otherwise LocalTP falls back to
-         * column-parallel terminal logits and needs a tiny rank-level sampling
-         * collective precisely where the mirrored MTP head is intended to
-         * remove it.
+         * Ordinary prefill can contain thousands of transformer rows while its
+         * LM head projects only the final row. Request-batched prefill projects
+         * one compact terminal row per request, and an all-position verifier
+         * projects its explicit target rows. The mirrored-head decision follows
+         * that terminal projection geometry, never the transformer activation
+         * size. Otherwise a long prefill leaves the scalar MTP first-target
+         * sample on a sharded head even though every participant already owns
+         * the replicated weight.
          */
         const int projected_rows =
             config_.compute_row_indexed_logits
                 ? config_.row_indexed_logits_row_count
-                : total_tokens;
+                : (config_.compute_all_position_logits ||
+                   config_.live_mtp_request_batch_condition)
+                      ? total_tokens
+                      : 1;
         return localTPMirroredMTPHeadConfigured() &&
-               config_.compute_all_position_logits &&
-               projected_rows > 0 &&
-               projected_rows <= max_decode_like_rows;
+               projected_rows > 0;
     }
 
     bool QwenGraphBase::useMirroredMTPHeadWeights() const
@@ -615,7 +615,7 @@ namespace llaminar2
         owner_.replicated_attention_state_graph_active_ =
             owner_.replicatedAttentionStateActiveForTokens(total_tokens);
         owner_.mtp_mirrored_lm_head_graph_active_ =
-            owner_.mirroredMTPHeadActiveForVerifierTokens(total_tokens);
+            owner_.mirroredMTPHeadActiveForProjectedRows(total_tokens);
     }
 
     QwenGraphBase::DecodeReplicatedDenseScope::~DecodeReplicatedDenseScope()
@@ -1019,6 +1019,18 @@ namespace llaminar2
         return buffers_;
     }
 
+    HiddenStateRowsSelectStage::DeviceRowIndexSource
+    QwenGraphBase::resolveLMHeadDeviceRowIndexSource(
+        bool has_request_sequence_lengths) const
+    {
+        return has_request_sequence_lengths &&
+                       config_.row_indexed_logits_selected_rows.empty()
+                   ? HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                         RequestTerminalLengths
+                   : HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                         ExternalDeviceIndices;
+    }
+
     TensorBase *QwenGraphBase::maybeAddLMHeadRowSelect(
         ComputeGraph &graph,
         const std::string &dependency_node,
@@ -1077,7 +1089,15 @@ namespace llaminar2
             row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
             if (device.is_gpu())
             {
-                if (request_sequence_lengths_device)
+                const bool has_explicit_verifier_rows =
+                    !config_.row_indexed_logits_selected_rows.empty();
+                row_params.device_row_index_source =
+                    resolveLMHeadDeviceRowIndexSource(
+                        request_sequence_lengths_device != nullptr);
+                if (!has_explicit_verifier_rows &&
+                    row_params.device_row_index_source ==
+                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                            RequestTerminalLengths)
                 {
                     /*
                      * Request-batched prefill owns real lengths in the arena.
@@ -1085,18 +1105,19 @@ namespace llaminar2
                      * device array, so compact logits cannot accidentally read
                      * stale verifier metadata from an earlier transaction.
                      */
-                    row_params.device_row_index_source =
-                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
-                            RequestTerminalLengths;
                     row_params.request_sequence_lengths_device =
                         request_sequence_lengths_device;
                     row_params.request_row_stride = request_row_stride;
                 }
                 else
                 {
-                    row_params.device_row_index_source =
-                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
-                            ExternalDeviceIndices;
+                    /*
+                     * A grouped verifier carries one explicit source index per
+                     * compact logit row. The request-length arena remains live
+                     * during this forward, but it describes request terminals,
+                     * not verifier query rows. Explicit verifier metadata must
+                     * therefore take precedence whenever a row plan is present.
+                     */
                     row_params.workspace_buffer_name =
                         MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
                 }
@@ -2468,7 +2489,9 @@ namespace llaminar2
                 .column_parallel_output = logits_local,
                 .total_tokens = total_tokens,
                 .force_full_vocabulary_head = false,
-                .compute_all_positions = config_.compute_all_position_logits,
+                .compute_all_positions =
+                    config_.compute_all_position_logits ||
+                    config_.live_mtp_request_batch_condition,
             });
 
         // Final RMSNorm
@@ -2506,7 +2529,9 @@ namespace llaminar2
         std::string lm_head_dependency = "final_norm";
         int lm_head_seq_len = total_tokens;
         BufferId lm_head_input_buffer_id = BufferId::HIDDEN_STATE;
-        bool lm_head_compute_all_positions = config_.compute_all_position_logits;
+        bool lm_head_compute_all_positions =
+            config_.compute_all_position_logits ||
+            config_.live_mtp_request_batch_condition;
         bool lm_head_use_prefill_row_offset = true;
 
         if (config_.compute_all_position_logits && config_.compute_row_indexed_logits)
@@ -2658,8 +2683,7 @@ namespace llaminar2
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *gate_proj_binding =
             layer.gate_proj_binding ? layer.gate_proj_binding : layer_bindings.gate_proj;
@@ -3110,6 +3134,29 @@ namespace llaminar2
             static_cast<size_t>(reserve_full_mtp_head_buffers
                                     ? config_.vocab_size
                                     : config.local_vocab);
+        /*
+         * CPU GlobalTP computes the MTP LM head column-sharded, then allgathers
+         * only its compact sidecar rows for stochastic sampling.  Other
+         * topologies use either a single full head or mirrored LocalTP heads and
+         * reserve a 1x1 placeholder instead of wasting a full-vocabulary arena.
+         */
+        const bool reserve_global_mtp_gather =
+            config_.mtp.enabled &&
+            config_.lm_head_column_parallel &&
+            ((config_.tp_ctx != nullptr &&
+              !config_.tp_ctx->isLocal() &&
+              config_.tp_ctx->degree() > 1) ||
+             (config_.tp_ctx == nullptr &&
+              mpi_ctx_ != nullptr &&
+              mpi_ctx_->world_size() > 1));
+        config.custom_formulas["mtp_global_gather_rows"] =
+            reserve_global_mtp_gather
+                ? static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp))
+                : 1ULL;
+        config.custom_formulas["mtp_global_gather_vocab"] =
+            reserve_global_mtp_gather
+                ? static_cast<size_t>(config_.vocab_size)
+                : 1ULL;
 
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "
@@ -3392,8 +3439,7 @@ namespace llaminar2
         int pos_offset = position_ids ? position_ids[0] : 0;
         const bool force_decode_equivalent_rope_verifier_prefill =
             device.is_cpu() &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled &&
+            config_.usesMTPGroupedDecodeEquivalentRows() &&
             total_tokens > 1 &&
             total_tokens <= 4;
 
@@ -3443,6 +3489,23 @@ namespace llaminar2
 
         if (kv_cache)
         {
+            /*
+             * Request-prefill lengths and request-condition append widths are
+             * different policies even though both are represented by one
+             * device INT32 row at the orchestration boundary. During padded
+             * prefill, each value is the number of real rows to copy from a
+             * fixed bucket and must govern KV append. During a live MTP main
+             * condition, the values are absolute post-append logical lengths
+             * used by positions, recurrent state, and terminal-row selection;
+             * the KV graph itself appends exactly its captured `seq_len` rows.
+             * Binding those absolute lengths as append counts makes the
+             * capture guard reject every value greater than `seq_len`, turning
+             * the condition append into a silent zero-row operation.
+             */
+            const int32_t *kv_append_lengths_device =
+                config_.live_mtp_request_batch_condition
+                    ? nullptr
+                    : request_sequence_lengths_device;
             const bool phase_split_handoff =
                 needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
             ITensor *append_K = buffers.K;
@@ -3554,7 +3617,8 @@ namespace llaminar2
                                           seq_len >= 2 && seq_len <= 4
                                       ? KVCacheAppendSemantics::DecodeEquivalentVerifier
                                       : KVCacheAppendSemantics::Standard,
-                              .request_sequence_lengths_device = request_sequence_lengths_device,
+                              .request_sequence_lengths_device =
+                                  kv_append_lengths_device,
                               .kv_cache_scale_k = config_.kv_cache_scale_k,
                               .kv_cache_scale_v = config_.kv_cache_scale_v,
                               .head_dim = config_.head_dim,
@@ -3806,8 +3870,7 @@ namespace llaminar2
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
             total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
 
         std::string wo_node = prefix + wo_node_suffix;
         graph.addNode(wo_node,

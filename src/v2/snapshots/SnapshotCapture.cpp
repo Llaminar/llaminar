@@ -581,7 +581,7 @@ namespace llaminar2
             {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
             {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
-            {"_moe_expert_parallel_reduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_routed_expert_partial_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_expert_ffn", "_MOE_EXPERT_OUTPUT"},
             {"_moe_combine", "_MOE_COMBINED_OUTPUT"},

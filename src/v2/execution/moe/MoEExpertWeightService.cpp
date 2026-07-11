@@ -814,7 +814,7 @@ namespace llaminar2
             return false;
         }
 
-        // EP range: only extract views for local experts
+        // Expert-ID ownership range: extract views only for local experts.
         // Dynamic rebalancing may set an expert mask while using replicated
         // parent tensors. In that case, extracting all views is safe because
         // every global expert id is physically present. LocalTP static expert
@@ -839,7 +839,7 @@ namespace llaminar2
         // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts_in_tensor]
         // Each expert's 2D slice is [rows, cols] at element offset within the tensor.
         //
-        // With expert-parallel weight sharding, the 3D tensor may contain only
+        // With expert-ID-apportioned loading, the 3D tensor may contain only
         // local experts (shape[2] == local_count) instead of all experts.
         // In that case, global expert index `e` maps to local tensor index
         // `e - local_start`. When the tensor has all experts (shape[2] == num_experts),
@@ -862,13 +862,13 @@ namespace llaminar2
             size_t tensor_expert_count = shape[2];
             size_t elements_per_expert = rows * cols;
 
-            // Determine if the tensor was pre-sliced (expert-parallel sharding)
+            // Determine whether the expert-ID axis was pre-sliced.
             // or contains all experts (replicated mode).
             const bool is_presliced = (static_cast<int>(tensor_expert_count) != n_experts);
 
             for (int e = 0; e < n_experts; ++e)
             {
-                // Skip non-local experts under EP. A full replicated tensor can
+                // Skip non-local expert IDs under apportioned ownership. A replicated tensor can
                 // still extract every global expert when dynamic rebalance asks
                 // for it, but a presliced LocalTP tensor contains only local
                 // expert storage and must clamp to the physical local range.
@@ -928,7 +928,7 @@ namespace llaminar2
             return false;
 
         LOG_DEBUG("[MoEWeightService] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
-                                                  << " expert 2D views (EP range [" << local_start
+                                                  << " expert 2D views (expert-ID range [" << local_start
                                                   << ", " << local_end << ")"
                                                   << (extract_all ? " extract_all=true" : "") << ")");
         return true;
@@ -948,7 +948,7 @@ namespace llaminar2
             return false;
         }
 
-        // EP range
+        // Expert-ID ownership range.
         // Dynamic rebalancing: when expert_mask is set, prepare ONLY mask-active
         // experts (not all). Views exist for all experts, but GEMM engines are
         // expensive (VNNI repacking). Newly-acquired experts get engines from
@@ -1303,7 +1303,7 @@ namespace llaminar2
         // The VNNI interleaved engines now own their own copy — the original
         // mmap data is never accessed again. Releasing per-layer reduces peak RSS
         // by ~500 MB/layer instead of waiting for a bulk release at the end.
-        // NOTE: Only safe for mmap-backed tensors. Expert-parallel sliced tensors
+        // NOTE: Only safe for mmap-backed tensors. Expert-ID-sliced tensors
         // are heap-allocated copies — MADV_DONTNEED on heap memory corrupts malloc metadata.
         if (ctx.advise_raw_pages_after_prepare)
         {

@@ -1,8 +1,8 @@
 /**
- * @file Test__GraphResolver_ExpertParallel.cpp
- * @brief Unit tests for GraphResolver ExpertParallel TP mode
+ * @file Test__GraphResolver_RoutedExpertTensorSharded.cpp
+ * @brief Unit tests for GraphResolver RoutedExpertTensorSharded TP mode
  *
- * Verifies that when a StageSpec has tp_mode = TPMode::ExpertParallel,
+ * Verifies that when a StageSpec has tp_mode = TPMode::RoutedExpertTensorSharded,
  * the GraphResolver inserts an AllReduce collective stage (for world_size > 1).
  */
 
@@ -16,12 +16,12 @@ using namespace llaminar2;
 // Test Fixture
 // ============================================================================
 
-class Test__GraphResolver_ExpertParallel : public ::testing::Test
+class Test__GraphResolver_RoutedExpertTensorSharded : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
-        // Minimal schema with a single MoE FFN layer stage using ExpertParallel
+        // Minimal schema with a single MoE FFN layer stage using RoutedExpertTensorSharded
         schema_.name = "test_moe";
         schema_.version = "1.0";
 
@@ -31,7 +31,7 @@ protected:
                 .type = StageType::MoEFFN,
                 .inputs = {{"normalized", BufferSemantic::Input}},
                 .outputs = {{"moe_combined_output", BufferSemantic::Output}},
-                .tp_mode = TPMode::ExpertParallel,
+                .tp_mode = TPMode::RoutedExpertTensorSharded,
                 .is_optional = true,
                 .exec_policy_key = "exec_moe_ffn"}};
 
@@ -54,10 +54,10 @@ protected:
 };
 
 // ============================================================================
-// ExpertParallel TP Tests
+// RoutedExpertTensorSharded TP Tests
 // ============================================================================
 
-TEST_F(Test__GraphResolver_ExpertParallel, SingleRank_NoAllreduce)
+TEST_F(Test__GraphResolver_RoutedExpertTensorSharded, SingleRank_NoAllreduce)
 {
     config_.world_size = 1;
 
@@ -72,14 +72,14 @@ TEST_F(Test__GraphResolver_ExpertParallel, SingleRank_NoAllreduce)
     EXPECT_EQ(resolved.stats.allreduce_inserted, 0);
 }
 
-TEST_F(Test__GraphResolver_ExpertParallel, MultiRank_InsertsAllreduce)
+TEST_F(Test__GraphResolver_RoutedExpertTensorSharded, MultiRank_InsertsAllreduce)
 {
     config_.world_size = 2;
     config_.rank = 0;
 
     ResolvedGraphSpec resolved = resolver_.resolve(schema_, config_, empty_tensors_);
 
-    // Multi-rank with ExpertParallel: should insert an allreduce
+    // Multi-rank with RoutedExpertTensorSharded: should insert an allreduce
     bool found_allreduce = false;
     std::string allreduce_name;
     for (const auto &stage : resolved.stages)
@@ -93,10 +93,10 @@ TEST_F(Test__GraphResolver_ExpertParallel, MultiRank_InsertsAllreduce)
     }
 
     EXPECT_TRUE(found_allreduce)
-        << "Expected allreduce stage for ExpertParallel moe_ffn with world_size=2";
+        << "Expected allreduce stage for RoutedExpertTensorSharded moe_ffn with world_size=2";
 }
 
-TEST_F(Test__GraphResolver_ExpertParallel, AllreduceNameFollowsConvention)
+TEST_F(Test__GraphResolver_RoutedExpertTensorSharded, AllreduceNameFollowsConvention)
 {
     config_.world_size = 2;
     config_.rank = 0;
@@ -123,7 +123,7 @@ TEST_F(Test__GraphResolver_ExpertParallel, AllreduceNameFollowsConvention)
         << "Expected allreduce named 'layer0_moe_ffn_allreduce'";
 }
 
-TEST_F(Test__GraphResolver_ExpertParallel, AllreduceHasCorrectCount)
+TEST_F(Test__GraphResolver_RoutedExpertTensorSharded, AllreduceHasCorrectCount)
 {
     config_.world_size = 2;
     config_.rank = 0;
@@ -147,7 +147,7 @@ TEST_F(Test__GraphResolver_ExpertParallel, AllreduceHasCorrectCount)
     }
 }
 
-TEST_F(Test__GraphResolver_ExpertParallel, TPModeNone_NoAllreduce)
+TEST_F(Test__GraphResolver_RoutedExpertTensorSharded, TPModeNone_NoAllreduce)
 {
     // A stage with TPMode::None should never get an allreduce
     schema_.layer_template.ffn_stages = {
@@ -171,7 +171,7 @@ TEST_F(Test__GraphResolver_ExpertParallel, TPModeNone_NoAllreduce)
     }
 }
 
-TEST_F(Test__GraphResolver_ExpertParallel, SharedExpert_RowParallel_InsertsAllreduce)
+TEST_F(Test__GraphResolver_RoutedExpertTensorSharded, SharedExpert_RowParallel_InsertsAllreduce)
 {
     // Shared expert with RowParallel should also get an allreduce
     schema_.layer_template.ffn_stages = {

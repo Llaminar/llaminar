@@ -35,6 +35,23 @@ namespace llaminar2
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
         void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
+
+        /**
+         * @brief Commit one captured GDN recurrence state per host request.
+         *
+         * The method validates all requested rows before changing live state.
+         * Single-request grouped transactions publish directly into
+         * @p dst_state without allocating a request bank.  Multi-request
+         * transactions publish into the bank created by grouped request
+         * execution and mirror request zero for the public state ABI.
+         *
+         * @param dst_state Public live recurrence state for request zero.
+         * @param host_row_indices Flat capture row for each request; negative
+         *        entries preserve the corresponding live request state.
+         * @param request_count Number of request row selections.
+         * @param stream Unused by the CPU implementation.
+         * @return true when publication is valid and completes atomically.
+         */
         bool restoreVerifierStateCaptureRows(
             float *dst_state,
             const int *host_row_indices,

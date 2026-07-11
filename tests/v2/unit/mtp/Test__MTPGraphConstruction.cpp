@@ -17,7 +17,7 @@
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/runner/MTPVerifierForwardExecutor.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
@@ -124,10 +124,11 @@ namespace
     {
     public:
         using Qwen35Graph::Qwen35Graph;
+        using Qwen35Graph::resolveLMHeadDeviceRowIndexSource;
 
         bool mirroredHeadActiveForProjectedRows(int total_tokens) const
         {
-            return mirroredMTPHeadActiveForVerifierTokens(total_tokens);
+            return mirroredMTPHeadActiveForProjectedRows(total_tokens);
         }
     };
 
@@ -262,6 +263,7 @@ namespace
         std::unique_ptr<FP32Tensor> moe_gate_scratch;
         std::unique_ptr<FP32Tensor> moe_up_scratch;
         std::unique_ptr<FP32Tensor> logits;
+        std::unique_ptr<FP32Tensor> gathered_logits;
 
         std::unique_ptr<ICPUKVCache> kv_cache;
         int draft_token = 17;
@@ -351,6 +353,7 @@ namespace
             moe_gate_scratch = TestTensorFactory::createFP32({4, moe_experts});
             moe_up_scratch = TestTensorFactory::createFP32({4, moe_experts});
             logits = TestTensorFactory::createFP32({4, vocab});
+            gathered_logits = TestTensorFactory::createFP32({4, vocab});
 
             kv_cache = createCPURingKVCache(
                 ActivationPrecision::FP32,
@@ -412,6 +415,7 @@ namespace
         {
             MTPForwardOutput out;
             out.logits = logits.get();
+            out.gathered_logits = gathered_logits.get();
             out.hidden = hidden.get();
             out.embedding = embedding.get();
             out.norm_hidden = norm_hidden.get();
@@ -831,21 +835,21 @@ namespace
         return stages;
     }
 
-    ExpertComputeDomain mtpOverlayDomain(const std::string &name, GlobalDeviceAddress participant)
+    RoutedExpertDomain mtpOverlayDomain(const std::string &name, GlobalDeviceAddress participant)
     {
-        ExpertComputeDomain result;
+        RoutedExpertDomain result;
         result.name = name;
-        result.kind = ExpertDomainKind::SingleDevice;
+        result.scope = ExecutionDomainScope::SINGLE;
         result.backend = CollectiveBackendType::HOST;
         result.participants = {participant};
-        result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        result.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         result.owner_rank = 0;
         return result;
     }
 
-    ExpertRoutedTier mtpOverlayTier(const std::string &name, const std::string &domain_name, int priority, bool fallback = false)
+    RoutedExpertTier mtpOverlayTier(const std::string &name, const std::string &domain_name, int priority, bool fallback = false)
     {
-        ExpertRoutedTier result;
+        RoutedExpertTier result;
         result.name = name;
         result.domain = domain_name;
         result.priority = priority;
@@ -853,17 +857,17 @@ namespace
         return result;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeMTPOverlayPlanForLayer(int layer_idx)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeMTPOverlayPlanForLayer(int layer_idx)
     {
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = "continuation";
         plan->base_model_domain = "continuation";
         plan->shared_expert_domain = "continuation";
         plan->continuation_domain_spec.domain = "continuation";
         plan->continuation_domain_spec.logical_root_participant = 0;
-        plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+        plan->residency_policy = RoutedExpertResidencyPolicy::ExplicitMasks;
         plan->domains = {
             mtpOverlayDomain("continuation", GlobalDeviceAddress::cpu(0)),
             mtpOverlayDomain("hot_domain", GlobalDeviceAddress::cpu(0)),
@@ -873,11 +877,11 @@ namespace
             mtpOverlayTier("hot", "hot_domain", 0),
             mtpOverlayTier("cold", "cold_domain", 1, true),
         };
-        plan->placements.push_back(ExpertLayerPlacement{
+        plan->placements.push_back(RoutedExpertLayerPlacement{
             .layer = layer_idx,
             .routed_expert_tier = {0, 1, 0, 1},
         });
-        validateMoEExpertParallelPlanOrThrow(
+        validateMoERoutedExpertPlacementPlanOrThrow(
             *plan,
             {.routed_expert_count = 4});
         return plan;
@@ -1459,6 +1463,71 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
         dumpScalarInt(mirrored_lm_head->stage->getDumpInfoSnapshot(), "vocab_size"),
         mirrored_fixture.config.vocab_size)
         << "Mirrored LocalTP MTP sidecars must project the replicated full-vocab head.";
+    EXPECT_EQ(mirrored_graph.getNode("mtp0_lm_head_allgather"), nullptr)
+        << "A mirrored LocalTP MTP head already owns the full vocabulary and must not add a tiny verifier collective.";
+}
+
+/**
+ * @brief GlobalTP sidecars gather their sharded MTP vocabulary projection.
+ *
+ * CPU NodeLocalTP keeps the MTP LM head column-sharded because duplicating a
+ * 248k-vocabulary projection on every socket is needlessly expensive.  Unlike
+ * greedy argmax, stochastic draft sampling needs the complete distribution.
+ * The declarative sidecar graph must therefore make its one-row allgather an
+ * explicit terminal stage; leaving `mtp0_lm_head` terminal exposes only one
+ * rank's vocabulary shard to the stochastic verifier.
+ */
+TEST(Test__MTPGraphConstruction,
+     GlobalTPMTPHeadAllgathersShardedSidecarLogitsForStochasticVerifier)
+{
+    DenseMTPGraphFixture fixture;
+    ScriptedGlobalTPContext global_tp;
+
+    fixture.config.mtp.enabled = true;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / global_tp.degree();
+    fixture.config.tp_ctx = &global_tp;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            global_tp.degree(),
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size));
+    fixture.logits = TestTensorFactory::createFP32(
+        {4, static_cast<size_t>(fixture.config.vocab_local)});
+    fixture.gathered_logits = TestTensorFactory::createFP32(
+        {4, static_cast<size_t>(fixture.config.vocab_size)});
+
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        /*depth_idx=*/0,
+        fixture.mtpWeights(),
+        fixture.input(),
+        output);
+
+    const auto *local_head = graph.getNode("mtp0_lm_head");
+    ASSERT_NE(local_head, nullptr);
+    EXPECT_EQ(
+        dumpScalarInt(local_head->stage->getDumpInfoSnapshot(), "vocab_size"),
+        fixture.config.vocab_local)
+        << "GlobalTP must retain economical column-sharded MTP-head compute.";
+
+    const auto *allgather = graph.getNode("mtp0_lm_head_allgather");
+    ASSERT_NE(allgather, nullptr)
+        << "Stochastic GlobalTP MTP needs one full-vocabulary sidecar row on every rank.";
+    EXPECT_EQ(allgather->stage->type(), ComputeStageType::ALLGATHER);
+    const StageBufferContract gather_contract =
+        allgather->stage->bufferContract();
+    EXPECT_TRUE(contractReads(gather_contract, BufferId::MTP_LOGITS));
+    EXPECT_TRUE(contractWrites(
+        gather_contract,
+        BufferId::MTP_LOGITS_GATHERED));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head_allgather", "mtp0_lm_head"));
+    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head_allgather");
 }
 
 TEST(Test__MTPGraphConstruction,
@@ -1493,9 +1562,55 @@ TEST(Test__MTPGraphConstruction,
            "head even when their padded prefill activation contains many rows.";
 
     ASSERT_TRUE(builder.setComputeRowIndexedAllPositionLogits(false, 0));
-    EXPECT_FALSE(builder.mirroredHeadActiveForProjectedRows(padded_prefill_rows))
-        << "Without compact row selection, a large ordinary prefill remains on "
-           "the column-parallel LM-head path.";
+    ASSERT_TRUE(builder.setComputeAllPositionLogits(false));
+    EXPECT_TRUE(builder.mirroredHeadActiveForProjectedRows(padded_prefill_rows))
+        << "A large ordinary prefill still projects only one terminal row, so "
+           "its first scalar MTP target must come from the mirrored head.";
+
+    EXPECT_TRUE(builder.mirroredHeadActiveForProjectedRows(/*total_tokens=*/2))
+        << "The grouped main-model condition forward is decode-sized even "
+           "without all-position verifier mode and must bind the same mirrored "
+           "full-vocabulary head as the sidecar and verifier.";
+}
+
+TEST(Test__MTPGraphConstruction,
+     ExplicitVerifierRowsOverrideResidentRequestTerminalSelection)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.draft_tokens = 1;
+    fixture.config.mtp.max_request_batch = 2;
+
+    InspectableQwen35Graph builder(fixture.config, fixture.mpi);
+    ASSERT_TRUE(builder.setComputeAllPositionLogits(true));
+    ASSERT_TRUE(builder.setComputeRowIndexedAllPositionLogits(
+        true,
+        /*row_count=*/4));
+
+    using RowSource =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource;
+    EXPECT_EQ(
+        builder.resolveLMHeadDeviceRowIndexSource(
+            /*has_request_sequence_lengths=*/true),
+        RowSource::RequestTerminalLengths)
+        << "Compact request-batched prefill has no explicit query rows and must derive one terminal row per request.";
+
+    ASSERT_TRUE(builder.setRowIndexedAllPositionLogitRows({0, 1, 2, 3}));
+    EXPECT_EQ(
+        builder.resolveLMHeadDeviceRowIndexSource(
+            /*has_request_sequence_lengths=*/true),
+        RowSource::ExternalDeviceIndices)
+        << "A live request-length arena must not reinterpret explicit grouped-verifier query rows as request terminals.";
+
+    ASSERT_TRUE(builder.setRowIndexedAllPositionLogitRows({}));
+    EXPECT_EQ(
+        builder.resolveLMHeadDeviceRowIndexSource(
+            /*has_request_sequence_lengths=*/true),
+        RowSource::RequestTerminalLengths);
+    EXPECT_EQ(
+        builder.resolveLMHeadDeviceRowIndexSource(
+            /*has_request_sequence_lengths=*/false),
+        RowSource::ExternalDeviceIndices);
 }
 
 TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
@@ -2316,13 +2431,15 @@ TEST(Test__MTPGraphConstruction, PhaseSplitDecodeDoesNotExposeStaleColumnParalle
 }
 
 /**
- * @brief Compact LocalTP prefill rows advertise their mirrored full head.
+ * @brief Every LocalTP MTP terminal projection advertises its mirrored full head.
  *
- * The runner keeps `logits_local` allocated at maximum capacity even while a
- * temporary request-batched graph writes compact terminal rows through the
- * mirrored full-vocabulary head. This regression proves runtime sampling
- * classifies the active output transaction, not the dormant arena allocation.
- * It is CPU-only: the LocalTP context and transaction marker are policy mocks.
+ * The runner keeps `logits_local` allocated at maximum capacity for graph-shape
+ * stability. Once LocalTP MTP mirrors the terminal head, however, ordinary
+ * prefill/decode, compact request prefill, and grouped verifier transactions all
+ * publish complete rows through `LOGITS`. This regression prevents the dormant
+ * local-shard allocation from being advertised before or after a compact
+ * request transaction. It is CPU-only: the LocalTP context and transaction
+ * marker are policy mocks.
  */
 TEST(Test__MTPGraphConstruction,
      LocalTPCompactPrefillDoesNotExposeDormantColumnParallelLogits)
@@ -2350,8 +2467,9 @@ TEST(Test__MTPGraphConstruction,
         DeviceId::cpu()));
 
     orchestrator.setPhase(InferencePhase::PREFILL);
-    ASSERT_TRUE(orchestrator.hasLogitsLocal())
-        << "Ordinary LocalTP prefill starts with a column-parallel LM head.";
+    ASSERT_FALSE(orchestrator.hasLogitsLocal())
+        << "Ordinary LocalTP MTP prefill projects its single terminal row "
+           "through the mirrored full-vocabulary head.";
 
     orchestrator.markRequestBatchedPrefillLogitsForTesting(/*row_count=*/2);
     EXPECT_FALSE(orchestrator.hasLogitsLocal())
@@ -2359,8 +2477,9 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_FALSE(orchestrator.getLogitsLocalInfo());
 
     orchestrator.markRequestBatchedPrefillLogitsForTesting(/*row_count=*/0);
-    EXPECT_TRUE(orchestrator.hasLogitsLocal())
-        << "Ending the compact transaction restores ordinary prefill policy.";
+    EXPECT_FALSE(orchestrator.hasLogitsLocal())
+        << "Ending the compact transaction restores the ordinary mirrored "
+           "terminal-head policy, not the dormant local shard.";
 }
 
 TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspace)
@@ -2553,7 +2672,7 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+    fixture.config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     fixture.config.moe.has_shared_expert = false;
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
@@ -2622,9 +2741,9 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+    fixture.config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     fixture.config.moe.has_shared_expert = false;
-    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(64);
+    fixture.config.moe.routed_expert_plan = makeMTPOverlayPlanForLayer(64);
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
@@ -2739,7 +2858,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+    fixture.config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     fixture.config.moe.has_shared_expert = false;
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
@@ -2771,9 +2890,9 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+    fixture.config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     fixture.config.moe.has_shared_expert = false;
-    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(64);
+    fixture.config.moe.routed_expert_plan = makeMTPOverlayPlanForLayer(64);
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
@@ -3253,7 +3372,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+    fixture.config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     fixture.config.moe.has_shared_expert = false;
 
     auto graph_builder = std::make_shared<Qwen35MoEGraph>(fixture.config, fixture.mpi);
@@ -5004,6 +5123,9 @@ TEST(Test__MTPGraphConstruction, GPUStochasticRequestBatchScratchScalesWithConfi
                 ::testing::ElementsAre(size_t{2}, size_t{5}));
     EXPECT_THAT(shape_for(BufferId::STOCHASTIC_BATCH_OUTPUT_META),
                 ::testing::ElementsAre(size_t{2}, size_t{10}));
+    EXPECT_THAT(shape_for(BufferId::MTP_LOGICAL_SEQUENCE_STATE),
+                ::testing::ElementsAre(size_t{6}, size_t{2}))
+        << "Published request state must have stable arena rows outside graph workspace.";
 }
 
 TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifierGraph)

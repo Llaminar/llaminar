@@ -27,6 +27,23 @@ namespace llaminar2
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
         void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
+
+        /**
+         * @brief Commit one captured short-conv state per host request.
+         *
+         * The row vector is validated before any state is changed.  A
+         * singleton vector commits directly to @p dst_state because ordinary
+         * single-request MTP has no request-state bank.  True multi-request
+         * vectors commit into the persistent request-owned bank and mirror
+         * request zero into @p dst_state for prefix-cache compatibility.
+         *
+         * @param dst_state Public live state for request zero.
+         * @param host_row_indices Flat capture row for every request; a
+         *        negative row leaves that request unchanged.
+         * @param request_count Number of entries in @p host_row_indices.
+         * @param stream Unused on CPU; accepted for the common tensor API.
+         * @return true when the complete publication transaction succeeds.
+         */
         bool restoreVerifierStateCaptureRows(
             float *dst_state,
             const int *host_row_indices,

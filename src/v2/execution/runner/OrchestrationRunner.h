@@ -52,9 +52,9 @@ namespace llaminar2
     struct ExpertReplicaSet;
     struct MoEExpertOverlayExecutionPlan;
 
-    std::shared_ptr<MoEExpertParallelPlan> freezeMoEExpertOverlayPlanForModel(
+    std::shared_ptr<MoERoutedExpertPlacementPlan> freezeMoEExpertOverlayPlanForModel(
         IModelContext &model_ctx,
-        const std::shared_ptr<MoEExpertParallelPlan> &plan);
+        const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan);
 
     /**
      * @brief Concrete implementation of IOrchestrationRunner
@@ -462,16 +462,47 @@ namespace llaminar2
         int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
         int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
         /**
+         * @brief Initialize the scheduler-owned MTP position after prefill.
+         *
+         * GPU prefill and prefix restore already know exactly how many request
+         * tokens they committed.  Recording that scheduler fact here prevents
+         * the first MTP transaction from consulting a backend host position
+         * mirror before device-resident publication has produced its first
+         * logical-state mailbox.
+         *
+         * @param committed_tokens Logical tokens consumed by the successful
+         *        prefill transaction.
+         * @param source Diagnostic name for the prefill path.
+         * @return true when the position is valid and was initialized, or when
+         *         the active lane does not require GPU MTP planning state.
+         */
+        bool initializeDecodeTransactionPlanningPositionAfterPrefill(
+            int committed_tokens,
+            const char *source);
+        /**
+         * @brief Advance the scheduler position after one committed decode row.
+         *
+         * A normal decode forward consumes the previous response token and
+         * therefore advances the logical position of the logits sampled next.
+         * GPU lanes update the scheduler-owned control scalar here instead of
+         * observing a backend KV position mirror.
+         *
+         * @param source Diagnostic name for the forward path.
+         * @return true on success; false when a GPU forward has no initialized
+         *         decode transaction position.
+         */
+        bool advanceDecodeTransactionPlanningPositionAfterForward(
+            const char *source);
+        /**
          * @brief Resolve the scalar sidecar base position for MTP planning.
          *
-         * vLLM-style resident publication can advance logical positions on the
-         * device before backend host mirrors observe the same transaction. This
-         * helper is the only scalar MTP planning path that may read
-         * `get_position()`. When a live resident mailbox exists and the backend
-         * host mirror is stale, it instead returns the runner-owned transaction
-         * shadow maintained from accepted-state publication metadata.
+         * GPU lanes must use the orchestration-owned transaction position
+         * initialized by prefill and advanced from compact accepted-state
+         * publication metadata. They fail closed if that control-plane value
+         * is absent; reading `IInferenceRunner::get_position()` is a CPU-only
+         * path and can never become a GPU coherence fallback.
          */
-        std::optional<int> currentMTPBaseSidecarPositionForPlanning(
+        std::optional<int> currentDecodeTransactionPositionForPlanning(
             const char *context,
             std::string *error = nullptr) const;
         void recordMTPDepthZeroBypass();
@@ -486,7 +517,7 @@ namespace llaminar2
         /**
          * @brief Return true when LLEP prefill has current-window state semantics.
          *
-         * LeastLoadedEP route planning is deliberately a current-window policy:
+         * LLEP route planning is deliberately a current-window policy:
          * the same token span can produce different route assignments if it is
          * planned inside a larger prefill transaction.  This helper centralizes
          * the mode check so cache-enabled and cache-disabled prefill paths share
@@ -494,7 +525,7 @@ namespace llaminar2
          * state.
          *
          * @return true when either the execution plan or user config selects
-         *         LeastLoadedEP rebalance mode.
+         *         LLEP rebalance mode.
          */
         bool leastLoadedEPPrefillUsesStableWindows() const;
 
@@ -700,15 +731,16 @@ namespace llaminar2
         std::optional<SamplingParams>
             prelaunched_mtp_first_sidecar_params_;
         /**
-         * @brief Scalar planning position for device-resident MTP transactions.
+         * @brief Scheduler-owned logical position for the current decode transaction.
          *
-         * This value is a host-visible scalar, but it is not copied from backend
-         * logical mirrors. It is derived from the same verifier-base and
-         * accepted-state counts that drive device publication, so scalar control
-         * flow can schedule the next graph while KV/GDN/short-conv/logical state
-         * remain resident on the backend runner.
+         * This control-plane scalar is initialized from the request token count
+         * after successful prefill. Ordinary decode advances it after each
+         * committed condition-token forward; MTP advances it from the same
+         * compact outcome metadata that drives device publication. It is never
+         * adopted from a backend host mirror. KV, recurrent state, terminal
+         * hidden state, and publication metadata remain device-owned.
          */
-        std::optional<int> device_resident_mtp_planning_position_;
+        std::optional<int> decode_transaction_planning_position_;
         /**
          * @brief Per-request state initialized by prefillBatch().
          *

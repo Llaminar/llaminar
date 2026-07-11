@@ -17,7 +17,11 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h" // CollectiveBackendType
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -260,7 +264,56 @@ namespace llaminar2::test
             }
 
             ++sideband_call_count_;
-            return !sideband_should_fail_;
+            if (sideband_should_fail_)
+                return false;
+
+            const int participant_count = degree();
+            if (participant_count <= 1 || sidebands.empty())
+                return true;
+
+            /*
+             * RankOrchestrator dispatches one collective call per participant.
+             * Preserve that rendezvous here instead of merely returning true:
+             * device-slot publication tests need the peer mailbox bytes to
+             * change before its readiness event is recorded. The mock performs
+             * the transfer only after every participant has arrived, matching
+             * NCCL/RCCL's collective ordering contract closely enough for unit
+             * tests without pretending host staging occurred in production.
+             */
+            std::unique_lock<std::mutex> lock(sideband_collective_mutex_);
+            const int generation = sideband_generation_;
+            if (sideband_generation_requests_.empty())
+            {
+                sideband_generation_requests_.resize(
+                    static_cast<size_t>(participant_count));
+            }
+            auto &participant_requests =
+                sideband_generation_requests_[static_cast<size_t>(device_index)];
+            if (!participant_requests.empty())
+                return false;
+            participant_requests = sidebands;
+            ++sideband_arrivals_;
+
+            if (sideband_arrivals_ == participant_count)
+            {
+                sideband_generation_result_ =
+                    completeSidebandGenerationLocked();
+                sideband_arrivals_ = 0;
+                sideband_generation_requests_.clear();
+                ++sideband_generation_;
+                lock.unlock();
+                sideband_collective_cv_.notify_all();
+                return sideband_generation_result_;
+            }
+
+            const bool completed = sideband_collective_cv_.wait_for(
+                lock,
+                std::chrono::seconds(2),
+                [this, generation]()
+                {
+                    return sideband_generation_ != generation;
+                });
+            return completed && sideband_generation_result_;
         }
 
         void synchronize() override
@@ -419,7 +472,111 @@ namespace llaminar2::test
         }
 
     private:
+        static size_t collectiveDataTypeBytes(CollectiveDataType dtype)
+        {
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+            case CollectiveDataType::INT32:
+                return sizeof(std::uint32_t);
+            case CollectiveDataType::FLOAT16:
+            case CollectiveDataType::BFLOAT16:
+                return sizeof(std::uint16_t);
+            case CollectiveDataType::INT8:
+                return sizeof(std::uint8_t);
+            }
+            return 0;
+        }
+
+        /** Complete one mock sideband generation while its mutex is held. */
+        bool completeSidebandGenerationLocked()
+        {
+            const int participant_count = static_cast<int>(devices_.size());
+            if (participant_count <= 0 ||
+                static_cast<int>(sideband_generation_requests_.size()) !=
+                    participant_count)
+            {
+                return false;
+            }
+
+            const size_t sideband_count =
+                sideband_generation_requests_.front().size();
+            for (const auto &requests : sideband_generation_requests_)
+            {
+                if (requests.size() != sideband_count)
+                    return false;
+            }
+
+            for (size_t sideband_index = 0;
+                 sideband_index < sideband_count;
+                 ++sideband_index)
+            {
+                const auto &reference =
+                    sideband_generation_requests_.front()[sideband_index];
+                if (reference.root_device_index < 0 ||
+                    reference.root_device_index >= participant_count ||
+                    reference.element_count == 0)
+                {
+                    return false;
+                }
+
+                for (int participant = 0;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    const auto &request =
+                        sideband_generation_requests_[
+                            static_cast<size_t>(participant)][sideband_index];
+                    if (request.kind != reference.kind ||
+                        request.element_count != reference.element_count ||
+                        request.dtype != reference.dtype ||
+                        request.root_device_index !=
+                            reference.root_device_index)
+                    {
+                        return false;
+                    }
+                }
+
+                if (reference.kind !=
+                    LocalTPCollectiveSidebandKind::Broadcast)
+                {
+                    continue;
+                }
+
+                const auto &root =
+                    sideband_generation_requests_[static_cast<size_t>(
+                        reference.root_device_index)][sideband_index];
+                const void *source =
+                    root.send_buffer ? root.send_buffer : root.recv_buffer;
+                const size_t bytes =
+                    reference.element_count *
+                    collectiveDataTypeBytes(reference.dtype);
+                if (!source || bytes == 0)
+                    return false;
+
+                for (int participant = 0;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    auto &request =
+                        sideband_generation_requests_[
+                            static_cast<size_t>(participant)][sideband_index];
+                    if (!request.recv_buffer)
+                        return false;
+                    std::memcpy(request.recv_buffer, source, bytes);
+                }
+            }
+            return true;
+        }
+
         mutable std::mutex mutex_;
+        std::mutex sideband_collective_mutex_;
+        std::condition_variable sideband_collective_cv_;
+        int sideband_generation_ = 0;
+        int sideband_arrivals_ = 0;
+        bool sideband_generation_result_ = false;
+        std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+            sideband_generation_requests_;
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_;
         CollectiveBackendType backend_ = CollectiveBackendType::AUTO;

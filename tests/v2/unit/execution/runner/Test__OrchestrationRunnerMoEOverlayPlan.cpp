@@ -35,26 +35,26 @@ namespace
         return model_ctx;
     }
 
-    ExpertComputeDomain overlayDomain(
+    RoutedExpertDomain overlayDomain(
         const std::string &name,
         GlobalDeviceAddress participant)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = name;
-        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.scope = ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::AUTO;
         domain.participants = {std::move(participant)};
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertRoutedTier overlayTier(
+    RoutedExpertTier overlayTier(
         const std::string &name,
         const std::string &domain,
         int priority,
         bool fallback = false)
     {
-        ExpertRoutedTier tier;
+        RoutedExpertTier tier;
         tier.name = name;
         tier.domain = domain;
         tier.priority = priority;
@@ -62,12 +62,12 @@ namespace
         return tier;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeRequestedOverlayPlan(
-        ExpertResidencyPolicy policy = ExpertResidencyPolicy::StaticById)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeRequestedOverlayPlan(
+        RoutedExpertResidencyPolicy policy = RoutedExpertResidencyPolicy::StaticById)
     {
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = "gpu_hot";
         plan->shared_expert_domain = "gpu_hot";
         plan->residency_policy = policy;
@@ -84,43 +84,43 @@ namespace
         return plan;
     }
 
-    ExpertComputeDomain rocmLocalTPReplicatedDomain(
+    RoutedExpertDomain rocmLocalTPReplicatedDomain(
         const std::string &name,
         int owner_rank)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = name;
-        domain.kind = ExpertDomainKind::LocalTP;
+        domain.scope = ExecutionDomainScope::LOCAL;
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         domain.owner_rank = owner_rank;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertComputeDomain cpuLocalTPReplicatedDomain(
+    RoutedExpertDomain cpuLocalTPReplicatedDomain(
         const std::string &name,
         int owner_rank)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = name;
-        domain.kind = ExpertDomainKind::LocalTP;
+        domain.scope = ExecutionDomainScope::LOCAL;
         domain.backend = CollectiveBackendType::HOST;
         domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
         domain.owner_rank = owner_rank;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeHeterogeneousOverlayPlan()
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeHeterogeneousOverlayPlan()
     {
-        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
-        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = "rocm_hot";
         plan->base_model_domain = "rocm_hot";
         plan->shared_expert_domain = "rocm_hot";
-        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->domains = {
             rocmLocalTPReplicatedDomain("rocm_hot", 0),
             cpuLocalTPReplicatedDomain("cpu_cold", 1),
@@ -157,11 +157,11 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, FreezesMissingPlacementsFromLoaded
 TEST(Test__OrchestrationRunnerMoEOverlayPlan, KeepsExplicitPlacementsFrozen)
 {
     auto model_ctx = makeMoEModelContext();
-    auto explicit_plan = makeRequestedOverlayPlan(ExpertResidencyPolicy::ExplicitMasks);
+    auto explicit_plan = makeRequestedOverlayPlan(RoutedExpertResidencyPolicy::ExplicitMasks);
     explicit_plan->placements = {
-        ExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 0, 1, 0, 1}},
-        ExpertLayerPlacement{.layer = 1, .routed_expert_tier = {1, 0, 1, 0, 1, 0}},
-        ExpertLayerPlacement{.layer = 2, .routed_expert_tier = {0, 0, 1, 1, 0, 1}},
+        RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 0, 1, 0, 1}},
+        RoutedExpertLayerPlacement{.layer = 1, .routed_expert_tier = {1, 0, 1, 0, 1, 0}},
+        RoutedExpertLayerPlacement{.layer = 2, .routed_expert_tier = {0, 0, 1, 1, 0, 1}},
     };
 
     auto frozen_plan = freezeMoEExpertOverlayPlanForModel(*model_ctx, explicit_plan);

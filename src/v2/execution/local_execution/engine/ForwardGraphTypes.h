@@ -84,6 +84,7 @@ namespace llaminar2
         bool decode = false;
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
         bool all_position_logits = false;
+        bool live_mtp_request_batch_condition = false; ///< True for one live main-model row per MTP request.
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
@@ -106,6 +107,8 @@ namespace llaminar2
                    decode == other.decode &&
                    decode_has_history == other.decode_has_history &&
                    all_position_logits == other.all_position_logits &&
+                   live_mtp_request_batch_condition ==
+                       other.live_mtp_request_batch_condition &&
                    all_position_logit_rows == other.all_position_logit_rows &&
                    uses_device_token_ids == other.uses_device_token_ids &&
                    uses_device_position_ids == other.uses_device_position_ids &&
@@ -132,6 +135,7 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.live_mtp_request_batch_condition) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));

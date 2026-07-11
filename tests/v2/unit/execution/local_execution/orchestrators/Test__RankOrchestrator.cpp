@@ -17,7 +17,7 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -715,6 +715,29 @@ public:
         return static_cast<int>(
             std::distance(logits_.begin(),
                           std::max_element(logits_.begin(), logits_.end())));
+    }
+
+    bool sampleGreedyFromMainLogitsToDeviceTargetSlot(
+        int target_sample_slot,
+        int32_t *out_token) override
+    {
+        ++sample_greedy_main_target_slot_calls_;
+        if (target_sample_slot < 0 ||
+            target_sample_slot >=
+                static_cast<int>(target_sample_tokens_.size()) ||
+            logits_.empty())
+        {
+            return false;
+        }
+        const int32_t token = static_cast<int32_t>(
+            std::distance(
+                logits_.begin(),
+                std::max_element(logits_.begin(), logits_.end())));
+        target_sample_tokens_[static_cast<size_t>(target_sample_slot)] = token;
+        target_sample_slot_ready_[static_cast<size_t>(target_sample_slot)] = true;
+        if (out_token)
+            *out_token = token;
+        return true;
     }
 
     int sampleOnDevice(const SamplingParams &params) override
@@ -1449,15 +1472,62 @@ public:
         return true;
     }
 
+    DeviceStochasticTargetSampleSlotHandle deviceStochasticTargetSampleSlot(
+        int slot,
+        bool require_ready = false) override
+    {
+        if (slot < 0 ||
+            slot >= static_cast<int>(target_sample_tokens_.size()) ||
+            (require_ready &&
+             !target_sample_slot_ready_[static_cast<size_t>(slot)]))
+        {
+            return {};
+        }
+
+        DeviceStochasticTargetSampleSlotHandle handle;
+        handle.token_device =
+            target_sample_tokens_.data() + static_cast<size_t>(slot);
+        handle.slot = slot;
+        handle.device = device_id_;
+        handle.stream =
+            target_sample_stream_tokens_.data() + static_cast<size_t>(slot);
+        return handle;
+    }
+
+    bool recordStochasticTargetSampleSlotReadyFromDevice(
+        int slot,
+        void *producer_stream,
+        bool verifier_consumer_pending = true) override
+    {
+        (void)verifier_consumer_pending;
+        if (slot < 0 ||
+            slot >= static_cast<int>(target_sample_tokens_.size()) ||
+            producer_stream == nullptr)
+        {
+            return false;
+        }
+        ++record_target_sample_slot_ready_calls_;
+        last_recorded_target_sample_slot_ = slot;
+        target_sample_slot_ready_[static_cast<size_t>(slot)] = true;
+        return true;
+    }
+
     int sampleStochasticDistributionOnDevice(
         DeviceDistributionBuffer buffer,
         int slot,
         float threshold) override
     {
-        (void)buffer;
         ++sample_stochastic_distribution_calls_;
         last_stochastic_slot_ = slot;
         last_stochastic_threshold_ = threshold;
+        if (buffer == DeviceDistributionBuffer::Target &&
+            slot >= 0 &&
+            slot < static_cast<int>(target_sample_tokens_.size()))
+        {
+            target_sample_tokens_[static_cast<size_t>(slot)] =
+                stochastic_sample_token_;
+            target_sample_slot_ready_[static_cast<size_t>(slot)] = true;
+        }
         return stochastic_sample_token_;
     }
 
@@ -1843,7 +1913,14 @@ public:
         populated_prefix_tokens_.push_back(hit.cached_tokens);
         populated_prefix_restore_model_runtime_state_.push_back(hit.restore_model_runtime_state);
         if (prefix_populate_ok_)
+        {
             position_ = hit.cached_tokens;
+            if (prefix_populate_invalidates_resident_logical_state_)
+            {
+                resident_logical_state_valid_ = false;
+                resident_logical_state_request_count_ = 0;
+            }
+        }
         return prefix_populate_ok_;
     }
 
@@ -1993,6 +2070,10 @@ public:
     }
 
     void set_prefix_populate_ok(bool ok) { prefix_populate_ok_ = ok; }
+    void set_prefix_populate_invalidates_resident_logical_state(bool invalidates)
+    {
+        prefix_populate_invalidates_resident_logical_state_ = invalidates;
+    }
     void set_prefix_terminal_restore_requires_blocks(bool required) { prefix_terminal_restore_requires_blocks_ = required; }
     void set_forward_mtp_ok(bool ok) { forward_mtp_ok_ = ok; }
     void set_supports_chained_mtp_drafts(bool supported) { supports_chained_mtp_drafts_ = supported; }
@@ -2075,6 +2156,10 @@ public:
     size_t forward_mtp_from_last_draft_call_count() const { return forward_mtp_from_last_draft_calls_.load(std::memory_order_relaxed); }
     size_t sample_mtp_logits_call_count() const { return sample_mtp_logits_calls_; }
     size_t sample_greedy_on_device_call_count() const { return sample_greedy_on_device_calls_; }
+    size_t sample_greedy_main_target_slot_call_count() const
+    {
+        return sample_greedy_main_target_slot_calls_;
+    }
     size_t sample_on_device_call_count() const { return sample_on_device_calls_; }
     size_t get_logits_local_info_call_count() const { return get_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t consume_logits_local_info_call_count() const { return consume_logits_local_info_calls_.load(std::memory_order_relaxed); }
@@ -2162,6 +2247,10 @@ public:
     {
         return build_stochastic_distributions_calls_;
     }
+    size_t build_stochastic_distribution_call_count() const
+    {
+        return build_stochastic_distribution_calls_;
+    }
     size_t prepare_mtp_verifier_input_tokens_call_count() const
     {
         return prepare_mtp_verifier_input_tokens_calls_;
@@ -2186,6 +2275,14 @@ public:
     {
         return record_draft_sample_slot_ready_calls_;
     }
+    size_t record_target_sample_slot_ready_call_count() const
+    {
+        return record_target_sample_slot_ready_calls_;
+    }
+    int last_recorded_target_sample_slot() const
+    {
+        return last_recorded_target_sample_slot_;
+    }
     int last_recorded_draft_sample_slot() const
     {
         return last_recorded_draft_sample_slot_;
@@ -2203,6 +2300,20 @@ public:
             slot >= static_cast<int>(draft_sample_slot_ready_.size()))
             return false;
         return draft_sample_slot_ready_[static_cast<size_t>(slot)];
+    }
+    int32_t target_sample_token(int slot) const
+    {
+        if (slot < 0 ||
+            slot >= static_cast<int>(target_sample_tokens_.size()))
+            return -1;
+        return target_sample_tokens_[static_cast<size_t>(slot)];
+    }
+    bool target_sample_slot_ready(int slot) const
+    {
+        if (slot < 0 ||
+            slot >= static_cast<int>(target_sample_slot_ready_.size()))
+            return false;
+        return target_sample_slot_ready_[static_cast<size_t>(slot)];
     }
     size_t stage_stochastic_target_token_call_count() const
     {
@@ -2419,6 +2530,7 @@ private:
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
     bool prefix_terminal_restore_requires_blocks_ = false;
+    bool prefix_populate_invalidates_resident_logical_state_ = false;
     bool forward_mtp_ok_ = true;
     bool supports_chained_mtp_drafts_ = false;
     bool forward_mtp_from_last_draft_ok_ = true;
@@ -2487,6 +2599,7 @@ private:
     MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_input_plan_;
     size_t sample_mtp_logits_calls_ = 0;
     size_t sample_greedy_on_device_calls_ = 0;
+    size_t sample_greedy_main_target_slot_calls_ = 0;
     size_t sample_on_device_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
     size_t commit_mtp_checkpoint_terminal_hidden_calls_ = 0;
@@ -2530,6 +2643,8 @@ private:
     int32_t last_staged_target_token_ = -1;
     size_t record_draft_sample_slot_ready_calls_ = 0;
     int last_recorded_draft_sample_slot_ = -1;
+    size_t record_target_sample_slot_ready_calls_ = 0;
+    int last_recorded_target_sample_slot_ = -1;
     int last_resident_logical_state_request_index_ = -1;
     float last_stochastic_threshold_ = 0.0f;
     bool last_use_vllm_probability_rejection_ = false;
@@ -2551,6 +2666,12 @@ private:
         draft_sample_slot_ready_{};
     std::array<int, sampling_math::kSpeculativeBatchMaxRows>
         draft_sample_stream_tokens_{};
+    std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows>
+        target_sample_tokens_{};
+    std::array<bool, sampling_math::kSpeculativeBatchMaxRows>
+        target_sample_slot_ready_{};
+    std::array<int, sampling_math::kSpeculativeBatchMaxRows>
+        target_sample_stream_tokens_{};
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
     size_t prefix_harvest_calls_ = 0;
@@ -3905,8 +4026,8 @@ TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
     ASSERT_NE(stable_predicate_end, std::string::npos);
     const std::string stable_predicate_body =
         dgo_source.substr(stable_predicate_pos, stable_predicate_end - stable_predicate_pos);
-    EXPECT_NE(stable_predicate_body.find("ExpertDomainKind::LocalTP"), std::string::npos);
-    EXPECT_NE(stable_predicate_body.find("ExpertDomainComputeKind::ApportionedExperts"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("ExecutionDomainScope::LOCAL"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("RoutedExpertComputePolicy::Apportioned"), std::string::npos);
     EXPECT_NE(stable_predicate_body.find("domain.participants.size() < 2"), std::string::npos);
     EXPECT_NE(stable_predicate_body.find("participant.isGPU()"), std::string::npos);
     EXPECT_NE(stable_predicate_body.find("participant.device_type != participant_type"), std::string::npos);
@@ -4902,6 +5023,81 @@ TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRunsOnAllChildrenAtCommonLen
 
     EXPECT_EQ(runner0_ptr->terminal_restored_tokens(), std::vector<int>({4}));
     EXPECT_EQ(runner1_ptr->terminal_restored_tokens(), std::vector<int>({4}));
+}
+
+/**
+ * @brief Prove a CPU TP prefix restore cannot expose the previous request's logits.
+ *
+ * The child runners own the restored column-parallel terminal rows, while
+ * RankOrchestrator owns the full-vocabulary CPU sampling aggregate. A restore
+ * must update both ownership layers atomically; otherwise seeded stochastic
+ * MTP can sample the old request's next token immediately after clearCache().
+ */
+TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRefreshesCPUTPLogitsAggregate)
+{
+    MockDeviceGraphOrchestrator::Config child_config;
+    child_config.vocab_size = 4;
+
+    auto runner0 =
+        std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_mock_logits_local(
+        /*local_vocab=*/2,
+        {10.0f, 11.0f});
+    runner0_ptr->set_prefix_lookup_result(
+        makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    auto runner1 =
+        std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_mock_logits_local(
+        /*local_vocab=*/2,
+        {12.0f, 13.0f});
+    runner1_ptr->set_prefix_lookup_result(
+        makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContextBuilder()
+                         .usePreset(llaminar2::test::ModelPreset::MINIMAL)
+                         .setVocabSize(4)
+                         .build();
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    int32_t token = 1;
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+    const float *stale_aggregate = orchestrator->logits();
+    ASSERT_NE(stale_aggregate, nullptr);
+    EXPECT_THAT(
+        std::vector<float>(stale_aggregate, stale_aggregate + 4),
+        ::testing::ElementsAre(10.0f, 11.0f, 12.0f, 13.0f));
+
+    /*
+     * Model the child terminal-state import by replacing each local shard
+     * before RankOrchestrator completes the aggregate restore transaction.
+     */
+    runner0_ptr->set_mock_logits_local(
+        /*local_vocab=*/2,
+        {20.0f, 21.0f});
+    runner1_ptr->set_mock_logits_local(
+        /*local_vocab=*/2,
+        {22.0f, 23.0f});
+
+    const PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2, 3, 4});
+    ASSERT_TRUE(hit.has_terminal_logits);
+    ASSERT_TRUE(orchestrator->restorePrefixTerminalState(hit));
+
+    const float *restored_aggregate = orchestrator->logits();
+    ASSERT_NE(restored_aggregate, nullptr);
+    EXPECT_THAT(
+        std::vector<float>(restored_aggregate, restored_aggregate + 4),
+        ::testing::ElementsAre(20.0f, 21.0f, 22.0f, 23.0f));
 }
 
 TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreSurvivesLiveCacheClearAfterLookup)
@@ -6045,6 +6241,41 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredGreedyOutcomeBroadcastsCommonResid
     EXPECT_EQ(runner1_ptr->forward_mtp_from_resident_logical_state_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->last_resident_logical_state_request_index(), 0);
     EXPECT_EQ(runner1_ptr->last_resident_logical_state_request_index(), 0);
+
+    /*
+     * Reproduce the prefix-restore lifetime that originally left a phantom rank
+     * mailbox alive. Production child runners clear their logical mailbox when
+     * populatePrefix() replaces live request state. The rank must invalidate its
+     * aggregate before dispatching that replacement, and an already-issued rank
+     * handle must no longer be accepted by a sidecar consumer afterward.
+     */
+    runner0_ptr->set_prefix_populate_invalidates_resident_logical_state(true);
+    runner1_ptr->set_prefix_populate_invalidates_resident_logical_state(true);
+    runner0_ptr->set_prefix_lookup_result(
+        makePrefixHit(/*cached_tokens=*/4,
+                      /*terminal_logits=*/true,
+                      /*supported=*/true,
+                      /*include_blocks=*/true));
+    runner1_ptr->set_prefix_lookup_result(
+        makePrefixHit(/*cached_tokens=*/4,
+                      /*terminal_logits=*/true,
+                      /*supported=*/true,
+                      /*include_blocks=*/true));
+
+    const std::vector<int32_t> restored_prompt = {1, 2, 3, 4};
+    const PrefixLookupResult prefix_hit =
+        orchestrator->lookupPrefix(restored_prompt);
+    ASSERT_EQ(prefix_hit.cached_tokens, 4);
+    ASSERT_TRUE(orchestrator->populatePrefix(prefix_hit));
+    EXPECT_FALSE(orchestrator->deviceResidentLogicalSequenceState().valid())
+        << "Prefix replacement must not expose child mailboxes adopted by the "
+           "previous request.";
+    EXPECT_FALSE(
+        orchestrator->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+            resident_state,
+            /*request_index=*/0))
+        << "A rank mailbox issued before prefix restore must fail closed after "
+           "the aggregate epoch advances.";
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPResidentCompactGreedyOutcomeResolvesDeferredRankSlots)
@@ -6203,11 +6434,24 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
         /*slot=*/0,
         params,
         /*vocab_size=*/5));
+    EXPECT_EQ(runner0_ptr->build_stochastic_distribution_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->build_stochastic_distribution_call_count(), 0u)
+        << "A mirrored full-vocabulary main head needs one primary compact "
+           "distribution, not a rank merge or independently sampled children.";
     EXPECT_EQ(orchestrator->sampleStochasticDistributionOnDevice(
                   DeviceDistributionBuffer::Target,
                   /*slot=*/0,
                   /*threshold=*/0.10f),
               1);
+    EXPECT_EQ(runner0_ptr->sample_stochastic_distribution_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->sample_stochastic_distribution_call_count(), 0u);
+    EXPECT_EQ(runner0_ptr->record_target_sample_slot_ready_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->record_target_sample_slot_ready_call_count(), 1u);
+    EXPECT_TRUE(runner0_ptr->target_sample_slot_ready(0));
+    EXPECT_TRUE(runner1_ptr->target_sample_slot_ready(0));
+    EXPECT_EQ(runner0_ptr->target_sample_token(0), 1);
+    EXPECT_EQ(runner1_ptr->target_sample_token(0), 1)
+        << "NCCL/RCCL must publish the primary first target into every child slot.";
 
     const int32_t draft_token =
         orchestrator->sampleStochasticDraftProposalOnDevice(
@@ -6279,10 +6523,11 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
         /*inverse_sample_first_logical_position=*/64,
         /*use_vllm_probability_rejection=*/true));
     ASSERT_TRUE(handle.valid());
-    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 2u);
-    EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 4u)
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 4u);
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 6u)
         << "The primary stochastic compact outcome must be broadcast into "
-           "every child mailbox before any child publishes accepted state.";
+           "every child mailbox after the first target slot was likewise "
+           "published by a device collective.";
 
     DeviceSpeculativeVerifyBatchOutcome materialized;
     ASSERT_TRUE(orchestrator->materializeDeviceSpeculativeOutcomesForHostResponse(
@@ -6321,8 +6566,9 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
     EXPECT_EQ(runner1_ptr->publish_mtp_spec_state_batch_call_count(), 0u);
     EXPECT_EQ(runner0_ptr->publish_grouped_decode_equivalent_mtp_spec_state_batch_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->publish_grouped_decode_equivalent_mtp_spec_state_batch_call_count(), 0u);
-    EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 1u);
-    EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 0u)
+        << "Mirrored main-target sampling must not enter the legacy sharded reducer.";
     EXPECT_EQ(runner0_ptr->consume_mtp_logits_local_info_call_count(), 0u);
     EXPECT_EQ(runner1_ptr->consume_mtp_logits_local_info_call_count(), 0u)
         << "Mirrored stochastic MTP must not depend on rank-local shard logits.";
@@ -6338,12 +6584,10 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomeSamplesOnceAndSta
                 ::testing::ElementsAre(1));
     EXPECT_EQ(runner0_ptr->build_stochastic_distributions_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->build_stochastic_distributions_call_count(), 1u);
-    EXPECT_EQ(runner0_ptr->stage_stochastic_target_token_call_count(), 1u)
-        << "Mirrored verifier target and bonus rows stay in child-owned "
-           "distribution slots; only the sampled first-token handoff is staged.";
-    EXPECT_EQ(runner1_ptr->stage_stochastic_target_token_call_count(), 1u);
-    EXPECT_EQ(runner0_ptr->last_staged_target_sample_slot(), 0);
-    EXPECT_EQ(runner1_ptr->last_staged_target_sample_slot(), 0);
+    EXPECT_EQ(runner0_ptr->stage_stochastic_target_token_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->stage_stochastic_target_token_call_count(), 0u)
+        << "The first target handoff is a direct device-slot collective, not a "
+           "host-token staging call.";
 
     const DeviceResidentLogicalSequenceStateHandle child0_state =
         runner0_ptr->deviceResidentLogicalSequenceState();
@@ -6934,6 +7178,67 @@ TEST_F(Test__RankOrchestrator, MultiChildMainSamplingDelegatesToPrimaryReplicate
         << "Phase-split decode uses replicated full logits, not LOGITS_LOCAL shards.";
     EXPECT_EQ(runner0_ptr->sample_greedy_on_device_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->sample_greedy_on_device_call_count(), 0u);
+}
+
+/**
+ * @brief Mirrored LocalTP publishes one primary main-target argmax by collective.
+ *
+ * The first scalar MTP target is sampled from the preceding main terminal row.
+ * Once that row is mirrored, consulting `LOGITS_LOCAL` or staging a host token
+ * would revive the obsolete sharded path. This regression requires one child
+ * argmax, one NCCL/RCCL target-slot broadcast, and a fresh readiness publication
+ * on every participant.
+ */
+TEST_F(Test__RankOrchestrator,
+       MirroredLocalTPGreedyMainTargetSlotBroadcastsPrimaryDeviceSample)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_supports_device_stochastic_mtp_verification(true);
+    runner0_ptr->set_uses_mirrored_localtp_mtp_head_for_verifier(true);
+    runner0_ptr->set_mock_logits({0.0f, 1.0f, 9.0f, 2.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_supports_device_stochastic_mtp_verification(true);
+    runner1_ptr->set_uses_mirrored_localtp_mtp_head_for_verifier(true);
+    runner1_ptr->set_mock_logits({0.0f, 8.0f, 1.0f, 3.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto tp_ctx = makeTPContextForRunnerCount(2);
+    auto *tp_ctx_ptr = tp_ctx.get();
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        std::move(tp_ctx),
+        makeRankConfigForRunnerCount(2));
+
+    int32_t host_shadow = -1;
+    ASSERT_TRUE(orchestrator->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+        /*target_sample_slot=*/2,
+        &host_shadow));
+
+    EXPECT_EQ(host_shadow, 2);
+    EXPECT_EQ(runner0_ptr->sample_greedy_main_target_slot_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->sample_greedy_main_target_slot_call_count(), 0u)
+        << "Only the primary mirrored head performs the argmax.";
+    EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 2u);
+    EXPECT_EQ(tp_ctx_ptr->collective_sideband_broadcast_count(), 2u);
+    EXPECT_EQ(runner0_ptr->record_target_sample_slot_ready_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->record_target_sample_slot_ready_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_recorded_target_sample_slot(), 2);
+    EXPECT_EQ(runner1_ptr->last_recorded_target_sample_slot(), 2);
+    EXPECT_TRUE(runner0_ptr->target_sample_slot_ready(2));
+    EXPECT_TRUE(runner1_ptr->target_sample_slot_ready(2));
+    EXPECT_EQ(runner0_ptr->target_sample_token(2), 2);
+    EXPECT_EQ(runner1_ptr->target_sample_token(2), 2);
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildGreedyMainTargetSlotStagesCrossShardWinner)
@@ -7901,9 +8206,9 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeTreatsDenseOutputsAsRe
     auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
     model_ctx->setArchitecture("qwen35moe");
 
-    auto plan = std::make_shared<MoEExpertParallelPlan>();
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
     plan->enabled = true;
-    plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+    plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
     plan->continuation_domain_spec.dense_tp_enabled = true;
     plan->continuation_domain_spec.dense_decode_replicated = true;
     plan->continuation_domain_spec.refreshDensePolicyFromFlags();
@@ -7911,7 +8216,7 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeTreatsDenseOutputsAsRe
     RankOrchestrator::Config rank_config;
     rank_config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
     rank_config.weights = {0.5f, 0.5f};
-    rank_config.moe_expert_parallel_plan = plan;
+    rank_config.moe_routed_expert_plan = plan;
 
     MockLocalTPContext::Config tp_config;
     tp_config.devices = rank_config.devices;
@@ -8009,9 +8314,9 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutput
     auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
     model_ctx->setArchitecture("qwen35moe");
 
-    auto plan = std::make_shared<MoEExpertParallelPlan>();
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
     plan->enabled = true;
-    plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+    plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
     plan->continuation_domain_spec.dense_tp_enabled = true;
     plan->continuation_domain_spec.dense_decode_replicated = true;
     plan->continuation_domain_spec.refreshDensePolicyFromFlags();
@@ -8019,7 +8324,7 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutput
     RankOrchestrator::Config rank_config;
     rank_config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
     rank_config.weights = {0.5f, 0.5f};
-    rank_config.moe_expert_parallel_plan = plan;
+    rank_config.moe_routed_expert_plan = plan;
 
     MockLocalTPContext::Config tp_config;
     tp_config.devices = rank_config.devices;

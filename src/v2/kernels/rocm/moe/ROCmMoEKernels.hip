@@ -63,7 +63,7 @@ namespace
     constexpr uint32_t kDeviceMoERebalancePlanExpertPayloadArrival = 1u;
     constexpr uint32_t kDeviceMoERebalancePlanResidentExpertAssignment = 2u;
     constexpr uint32_t kDeviceMoERebalancePlanOwnershipTransfer = 3u;
-    constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedEP = 1u;
+    constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedResident = 1u;
     constexpr uint32_t kDeviceMoERebalancePhasePlanAssignments = 2u;
     constexpr uint32_t kDeviceMoERebalanceLifecycleIdle = 0u;
     constexpr uint32_t kDeviceMoERebalanceLifecyclePlanning = 1u;
@@ -1419,7 +1419,7 @@ namespace
             (config.flags & kDeviceMoERebalanceFlagDeferRuntimeApply) != 0u;
         const bool domain_root_planning = defer_runtime_apply && plan_missing_arrivals;
         const bool least_loaded_assignment =
-            config.routed_assignment_policy == kDeviceMoERebalanceAssignmentLeastLoadedEP;
+            config.routed_assignment_policy == kDeviceMoERebalanceAssignmentLeastLoadedResident;
         const bool hot_replica_cache =
             (config.flags & kDeviceMoERebalanceFlagHotReplicaCache) != 0u;
         const bool collect_load_stats =
@@ -10787,7 +10787,7 @@ bool hipMoE_device_rebalance_controller(
 
     const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
     const bool dynamic_ownership_fast_path =
-        cfg.routed_assignment_policy != kDeviceMoERebalanceAssignmentLeastLoadedEP &&
+        cfg.routed_assignment_policy != kDeviceMoERebalanceAssignmentLeastLoadedResident &&
         (cfg.flags & kDeviceMoERebalanceFlagHotReplicaCache) == 0u &&
         (cfg.flags & kDeviceMoERebalanceFlagPlanMissingArrivals) != 0u &&
         (cfg.flags & kDeviceMoERebalanceFlagDeferRuntimeApply) != 0u;

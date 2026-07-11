@@ -1697,12 +1697,84 @@ namespace llaminar2
         }
 
         /**
-         * @brief Update attention device params stored in pinned host memory for graph replay
+         * @brief Compute independent GPU request rows from one fixed-stride KV view.
          *
-         * Graph-captured attention reads AttentionDeviceParams from device memory.
-         * Implementations update that device buffer before beginCapture()/graph
-         * replay on the explicit stage stream; captured stage bodies must not
-         * record H2D nodes.
+         * GPU ring caches own independent allocations and live sequence counts for
+         * every request.  Before attention, the cache gather stage materializes
+         * those allocations as one device-resident tensor with layout
+         * `[request_count, max_kv_len, kv_width]`.  This method is the matching
+         * grouped attention contract: each request reads only the prefix named by
+         * its canonical device count while the backend launches one grouped phase
+         * grid and one grouped reduction grid.
+         *
+         * `query_rows` permits a compact verifier span for every request.  The
+         * device count is the post-append count for that request, so row `q` sees
+         * `post_append_count - (query_rows - 1 - q)` cache positions.  This is the
+         * same visibility sequence produced by serial one-token decode.
+         *
+         * This is a production economy contract.  Implementations must not copy
+         * counts to the host, launch one attention operation per request, or call
+         * the scalar `compute_tensor()` entry point in a loop.  Unsupported
+         * backends return false and the graph fails closed.
+         *
+         * @param Q FP32 query rows in request-major order.
+         * @param K Fixed-stride device K view produced by the GPU KV cache.
+         * @param V Fixed-stride device V view produced by the GPU KV cache.
+         * @param post_append_cached_tokens_device Contiguous device counts for
+         *        the request range, one INT32 value per request.
+         * @param output FP32 output rows matching @p Q.
+         * @param request_count Number of independent request cache banks.
+         * @param query_rows Number of consecutive decode rows per request.
+         * @param max_kv_len Physical row stride of each gathered request bank.
+         * @return true only when the grouped device implementation executed.
+         */
+        virtual bool compute_device_request_batch_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            const int *post_append_cached_tokens_device,
+            ITensor *output,
+            int request_count,
+            int query_rows,
+            int max_kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)post_append_cached_tokens_device;
+            (void)output;
+            (void)request_count;
+            (void)query_rows;
+            (void)max_kv_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)head_start;
+            (void)gqa_n_rep;
+            return false;
+        }
+
+        /**
+         * @brief Establish explicit attention geometry for the next execution.
+         *
+         * Graph-captured GPU attention reads AttentionDeviceParams exclusively
+         * from device memory. GPU implementations therefore enqueue a tiny
+         * stream-ordered device writer; they must not maintain a host mirror or
+         * record H2D parameter nodes. CPU implementations may retain ordinary
+         * scalar control state because they do not own a device replay graph.
          *
          * @param kv_len Number of cached tokens (including tokens to be appended this step)
          * @param position_offset Position offset for the current decode step
@@ -1722,10 +1794,10 @@ namespace llaminar2
         /**
          * @brief Prepare device-side attention params before graph capture/replay.
          *
-         * Backends with graph-captured attention should update any device-resident
-         * scalar params on the explicit execution stream before beginCapture() or
-         * graph launch. The default preserves existing backends by updating their
-         * host-side params and reporting success.
+         * Backends with graph-captured attention update their device-resident
+         * scalar params on the explicit execution stream before capture or graph
+         * launch. The default delegates to the scalar setter for non-GPU
+         * implementations; graph-capable GPU backends override this contract.
          */
         virtual bool prepareDynamicAttnParams(
             int kv_len, int position_offset, int query_rows, void *stream)

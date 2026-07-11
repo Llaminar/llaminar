@@ -10,6 +10,7 @@
  */
 
 #include "GlobalTPContext.h"
+#include "CollectiveTimeoutPolicy.h"
 #include "DeviceGroup.h"
 #include "backends/ShmemSpinBackend.h"
 #include "../config/TPDomain.h"
@@ -626,12 +627,10 @@ namespace llaminar2
         if (domain_comm_ == MPI_COMM_NULL)
             return;
 
-        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
-        if (timeout_ms <= 0)
-        {
-            MPI_Barrier(domain_comm_);
-            return;
-        }
+        const int timeout_ms =
+            collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms,
+                /*cold_start_completed=*/true);
 
         MPI_Request request = MPI_REQUEST_NULL;
         int result = MPI_Ibarrier(domain_comm_, &request);

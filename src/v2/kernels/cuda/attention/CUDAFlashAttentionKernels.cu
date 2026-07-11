@@ -76,6 +76,9 @@ namespace
     constexpr int FA2_NUM_STAGES = 2;       // Double buffering
     constexpr int FA2_PRODUCER_WARPS = 2;   // Warps dedicated to loading (fixed)
     constexpr int FA2_TILE_KV_DEFAULT = 64; // Default KV tile size
+    /// Maximum compact verifier rows represented by DEVICE_PARAMS.
+    constexpr int MAX_DYNAMIC_ATTENTION_PARAM_ROWS =
+        llaminar2::attention::kMaxGroupedVerifierAttentionRows;
     // Shared-memory padding constants.
     //
     // WMMA constraint: ldm must be a multiple of 8 (for half) or 8 (for float).
@@ -157,6 +160,67 @@ namespace
         out[row].kv_len = row_kv_len;
         out[row].position_offset = base_position + row;
         out[row].mask_stride = kv_len;
+    }
+
+    /**
+     * @brief Materialize explicit attention geometry directly in device memory.
+     *
+     * Eager kernel tests and non-cache callers already know their logical KV
+     * geometry as launch arguments.  Writing those arguments with a device
+     * kernel keeps the parameter block under stream ownership: there is no
+     * host mirror, no pinned allocation, and no host-to-device memcpy node.
+     * The launch is valid both before capture and as part of a captured graph.
+     *
+     * For a compact verifier group, row zero observes the shortest serial
+     * prefix and the final row observes @p kv_len.  The absolute query position
+     * advances with the row while every row retains the full mask stride.
+     */
+    __global__ void cuda_write_attention_params_from_geometry_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        int kv_len,
+        int position_offset,
+        int query_rows)
+    {
+        const int row = static_cast<int>(threadIdx.x);
+        if (!out || row >= query_rows)
+            return;
+
+        const int row_kv_len = max(1, kv_len - (query_rows - 1 - row));
+        out[row].kv_len = row_kv_len;
+        out[row].position_offset = position_offset + row;
+        out[row].mask_stride = kv_len;
+    }
+
+    /**
+     * @brief Derive request-major row metadata from independent device KV counts.
+     *
+     * Every request owns one canonical post-append count.  A request may carry
+     * several compact verifier rows, in which case the earlier rows expose
+     * successively shorter prefixes exactly as serial decode would.  The kernel
+     * performs no host read and is intentionally small enough to remain inside
+     * the captured attention graph.
+     */
+    __global__ void cuda_derive_attention_params_from_request_counts_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        const int *__restrict__ post_append_cached_tokens,
+        int request_count,
+        int query_rows)
+    {
+        const int flat_row = static_cast<int>(threadIdx.x);
+        const int total_rows = request_count * query_rows;
+        if (!out || !post_append_cached_tokens || flat_row >= total_rows)
+            return;
+
+        const int request = flat_row / query_rows;
+        const int query_row = flat_row - request * query_rows;
+        const int post_append_kv_len = max(1, post_append_cached_tokens[request]);
+        const int base_position = max(0, post_append_kv_len - query_rows);
+        const int row_kv_len =
+            max(1, post_append_kv_len - (query_rows - 1 - query_row));
+
+        out[flat_row].kv_len = row_kv_len;
+        out[flat_row].position_offset = base_position + query_row;
+        out[flat_row].mask_stride = post_append_kv_len;
     }
 
     /**
@@ -1179,17 +1243,25 @@ namespace
     // =========================================================================
 
     /**
-     * @brief FP16-KV flash-decode phase shared by scalar and grouped verifier launches.
-     *
-     * @tparam GROUPED_VERIFIER_ROWS When false, `blockIdx.z` is an ordinary
-     * batch row with its own contiguous K/V payload. When true, it is a compact
-     * verifier row: all rows share one K/V payload, read a row-local logical
-     * length from `device_params`, and may use fewer splits than the fixed
-     * launch geometry. The arithmetic inside each active block is deliberately
-     * identical in both modes so grouped publication remains byte-equivalent to
-     * serial decode.
+     * @brief Physical K/V ownership represented by one flash-decode grid row.
      */
-    template <bool GROUPED_VERIFIER_ROWS>
+    enum class FlashDecodeRowMode
+    {
+        OrdinaryBatch,      ///< One K/V bank per row, one shared parameter row.
+        SharedKVVerifier,   ///< All rows share one bank and own row-local params.
+        IndependentRequest ///< Rows map to independent fixed-stride request banks.
+    };
+
+    /**
+     * @brief FP16-KV flash-decode phase shared by every grouped row policy.
+     *
+     * The arithmetic in an active block is intentionally identical for scalar,
+     * shared-cache verifier, and independent-request execution.  The mode only
+     * selects the K/V bank and the device-parameter row.  Row-local modes also
+     * derive the split count with the exact scalar policy, allowing one fixed
+     * launch geometry to remain byte-equivalent across unequal KV lengths.
+     */
+    template <FlashDecodeRowMode ROW_MODE>
     __global__ __launch_bounds__(256, 4) void flash_decoding_fp16kv_kernel(
         const float *__restrict__ Q,
         const half *__restrict__ K_cache,
@@ -1204,14 +1276,20 @@ namespace
         int num_splits,
         float softmax_scale,
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        int query_rows_per_request,
         int head_start = 0,
         int gqa_n_rep = 0)
     {
+        constexpr bool ROW_LOCAL_PARAMS =
+            ROW_MODE != FlashDecodeRowMode::OrdinaryBatch;
+        constexpr bool SHARED_KV =
+            ROW_MODE == FlashDecodeRowMode::SharedKVVerifier;
+
         const int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
         if (device_params)
         {
-            const int param_row = GROUPED_VERIFIER_ROWS ? blockIdx.z : 0;
+            const int param_row = ROW_LOCAL_PARAMS ? blockIdx.z : 0;
             kv_len_runtime = device_params[param_row].kv_len;
         }
 
@@ -1225,7 +1303,7 @@ namespace
                                     : head_idx / effective_gqa;
 
         int row_num_splits = num_splits;
-        if constexpr (GROUPED_VERIFIER_ROWS)
+        if constexpr (ROW_LOCAL_PARAMS)
         {
             /*
              * `num_splits` is the serial policy result for the longest row.
@@ -1286,10 +1364,15 @@ namespace
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
+        int request_idx = batch_idx;
+        if constexpr (ROW_MODE == FlashDecodeRowMode::IndependentRequest)
+        {
+            request_idx = batch_idx / max(1, query_rows_per_request);
+        }
         const size_t kv_batch_offset =
-            GROUPED_VERIFIER_ROWS
+            SHARED_KV
                 ? 0
-                : static_cast<size_t>(batch_idx) *
+                : static_cast<size_t>(request_idx) *
                       static_cast<size_t>(kv_stride) *
                       static_cast<size_t>(n_kv_heads) *
                       static_cast<size_t>(head_dim);
@@ -1396,7 +1479,7 @@ namespace
      * expressions, which is the byte-equivalence requirement for MTP state
      * publication.
      */
-    __global__ void flash_decoding_grouped_verifier_reduce_fp32_kernel(
+    __global__ void flash_decoding_grouped_row_reduce_fp32_kernel(
         const float *__restrict__ O_partial,
         const float *__restrict__ m_partial,
         const float *__restrict__ l_partial,
@@ -2399,13 +2482,15 @@ extern "C"
             int block_size = 256;
             size_t smem_size = head_dim * sizeof(float);
 
-            flash_decoding_fp16kv_kernel<false><<<grid, block_size, smem_size, cuda_stream>>>(
+            flash_decoding_fp16kv_kernel<FlashDecodeRowMode::OrdinaryBatch>
+                <<<grid, block_size, smem_size, cuda_stream>>>(
                 Q,
                 static_cast<const half *>(K_cache_fp16),
                 static_cast<const half *>(V_cache_fp16),
                 O_partial, m_partial, l_partial,
                 kv_len, n_heads, n_kv_heads, head_dim,
                 num_splits, softmax_scale, device_params,
+                /*query_rows_per_request=*/1,
                 head_start, gqa_n_rep);
         }
 
@@ -2476,7 +2561,7 @@ extern "C"
             constexpr int block_size = 256;
             const size_t smem_size =
                 static_cast<size_t>(head_dim) * sizeof(float);
-            flash_decoding_fp16kv_kernel<true>
+            flash_decoding_fp16kv_kernel<FlashDecodeRowMode::SharedKVVerifier>
                 <<<grid, block_size, smem_size, cuda_stream>>>(
                     Q,
                     static_cast<const half *>(K_cache_fp16),
@@ -2491,6 +2576,7 @@ extern "C"
                     max_num_splits,
                     softmax_scale,
                     device_params,
+                    /*query_rows_per_request=*/1,
                     head_start,
                     gqa_n_rep);
         }
@@ -2499,7 +2585,95 @@ extern "C"
         {
             const dim3 grid(n_heads, verifier_rows);
             const int block_size = min(head_dim, 256);
-            flash_decoding_grouped_verifier_reduce_fp32_kernel
+            flash_decoding_grouped_row_reduce_fp32_kernel
+                <<<grid, block_size, 0, cuda_stream>>>(
+                    O_partial,
+                    m_partial,
+                    l_partial,
+                    O,
+                    n_heads,
+                    head_dim,
+                    max_num_splits,
+                    device_params);
+        }
+
+        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Launch serial-equivalent FP16 attention for independent requests.
+     *
+     * K/V use request-major fixed strides of `max_kv_len`.  The z dimension
+     * covers every request/query row, while device parameters select each row's
+     * logical prefix and scalar-equivalent split count.  This keeps the launch
+     * count constant at two regardless of request count.
+     */
+    int cudaFlashAttn_decode_fp16kv_grouped_request_rows(
+        const float *Q,
+        const void *K_cache_fp16,
+        const void *V_cache_fp16,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int request_count,
+        int query_rows,
+        int max_kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        const int total_rows = request_count * query_rows;
+        if (!Q || !K_cache_fp16 || !V_cache_fp16 || !O ||
+            !O_partial || !m_partial || !l_partial || !device_params ||
+            !stream || request_count < 2 || query_rows <= 0 ||
+            total_rows > 4 || max_kv_len <= 0 || n_heads <= 0 ||
+            n_kv_heads <= 0 || head_dim <= 0 ||
+            max_num_splits <= 0 || max_num_splits > 32)
+        {
+            return -1;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        const float softmax_scale =
+            1.0f / sqrtf(static_cast<float>(head_dim));
+
+        {
+            const dim3 grid(n_heads, max_num_splits, total_rows);
+            constexpr int block_size = 256;
+            const size_t smem_size =
+                static_cast<size_t>(head_dim) * sizeof(float);
+            flash_decoding_fp16kv_kernel<FlashDecodeRowMode::IndependentRequest>
+                <<<grid, block_size, smem_size, cuda_stream>>>(
+                    Q,
+                    static_cast<const half *>(K_cache_fp16),
+                    static_cast<const half *>(V_cache_fp16),
+                    O_partial,
+                    m_partial,
+                    l_partial,
+                    max_kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_num_splits,
+                    softmax_scale,
+                    device_params,
+                    query_rows,
+                    head_start,
+                    gqa_n_rep);
+        }
+
+        {
+            const dim3 grid(n_heads, total_rows);
+            const int block_size = min(head_dim, 256);
+            flash_decoding_grouped_row_reduce_fp32_kernel
                 <<<grid, block_size, 0, cuda_stream>>>(
                     O_partial,
                     m_partial,
@@ -2641,7 +2815,8 @@ extern "C"
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
-            query_rows <= 0 || !stream)
+            query_rows <= 0 ||
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
         {
             return -1;
         }
@@ -2656,6 +2831,74 @@ extern "C"
         if (err != cudaSuccess)
         {
             printf("[cudaFlashAttn_prepare_device_params_from_count] Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Write explicit decode geometry to the device-owned param block.
+     */
+    int cudaFlashAttn_prepare_device_params_from_geometry(
+        void *device_params,
+        int kv_len,
+        int position_offset,
+        int query_rows,
+        void *stream)
+    {
+        if (!device_params || kv_len <= 0 || position_offset < 0 ||
+            query_rows <= 0 ||
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
+        {
+            return -1;
+        }
+
+        cuda_write_attention_params_from_geometry_kernel
+            <<<1, query_rows, 0, static_cast<cudaStream_t>(stream)>>>(
+                static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+                kv_len,
+                position_offset,
+                query_rows);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_prepare_device_params_from_geometry] "
+                   "Kernel launch failed: %s\n",
+                   cudaGetErrorString(err));
+            return -1;
+        }
+        return 0;
+    }
+
+    /**
+     * @brief Derive grouped request-row params from contiguous device counts.
+     */
+    int cudaFlashAttn_prepare_device_params_from_request_counts(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int request_count,
+        int query_rows,
+        void *stream)
+    {
+        const int total_rows = request_count * query_rows;
+        if (!device_params || !post_append_cached_tokens ||
+            request_count < 2 || query_rows <= 0 || total_rows > 4 || !stream)
+        {
+            return -1;
+        }
+
+        cuda_derive_attention_params_from_request_counts_kernel
+            <<<1, total_rows, 0, static_cast<cudaStream_t>(stream)>>>(
+                static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+                post_append_cached_tokens,
+                request_count,
+                query_rows);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            printf("[cudaFlashAttn_prepare_device_params_from_request_counts] "
+                   "Kernel launch failed: %s\n",
                    cudaGetErrorString(err));
             return -1;
         }

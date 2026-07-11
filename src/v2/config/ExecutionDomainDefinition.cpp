@@ -98,36 +98,6 @@ namespace llaminar2
         return "unknown";
     }
 
-    const char *executionDomainComputeKindToString(ExecutionDomainComputeKind kind)
-    {
-        switch (kind)
-        {
-        case ExecutionDomainComputeKind::UNSPECIFIED:
-            return "unspecified";
-        case ExecutionDomainComputeKind::REPLICATED_EXPERTS:
-            return "replicated_experts";
-        case ExecutionDomainComputeKind::APPORTIONED_EXPERTS:
-            return "apportioned_experts";
-        case ExecutionDomainComputeKind::SHARDED_EXPERTS:
-            return "sharded_experts";
-        }
-        return "unknown";
-    }
-
-    const char *executionDomainAssignmentKindToString(ExecutionDomainAssignmentKind kind)
-    {
-        switch (kind)
-        {
-        case ExecutionDomainAssignmentKind::UNSPECIFIED:
-            return "unspecified";
-        case ExecutionDomainAssignmentKind::STATIC_OWNER:
-            return "static_owner";
-        case ExecutionDomainAssignmentKind::LEAST_LOADED_EP:
-            return "least_loaded_ep";
-        }
-        return "unknown";
-    }
-
     std::optional<ExecutionDomainScope> parseExecutionDomainScope(const std::string &value)
     {
         const std::string normalized = normalizeToken(value);
@@ -141,42 +111,6 @@ namespace llaminar2
             return ExecutionDomainScope::NODE_LOCAL;
         if (normalized == "global")
             return ExecutionDomainScope::GLOBAL;
-        return std::nullopt;
-    }
-
-    std::optional<ExecutionDomainComputeKind> parseExecutionDomainComputeKind(const std::string &value)
-    {
-        const std::string normalized = normalizeToken(value);
-        if (normalized == "replicated_experts" ||
-            normalized == "replicated_routed_experts" ||
-            normalized == "routed_experts_replicated" ||
-            normalized == "all_replicated_experts" ||
-            normalized == "fully_replicated_experts")
-            return ExecutionDomainComputeKind::REPLICATED_EXPERTS;
-        if (normalized == "apportioned_experts" ||
-            normalized == "apportioned_routed_experts" ||
-            normalized == "whole_experts_apportioned")
-            return ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
-        if (normalized == "sharded_experts" ||
-            normalized == "intra_expert_tensor_parallel")
-            return ExecutionDomainComputeKind::SHARDED_EXPERTS;
-        return std::nullopt;
-    }
-
-    std::optional<ExecutionDomainAssignmentKind> parseExecutionDomainAssignmentKind(const std::string &value)
-    {
-        const std::string normalized = normalizeToken(value);
-        if (normalized == "static_owner" ||
-            normalized == "static" ||
-            normalized == "owner" ||
-            normalized == "canonical_owner")
-            return ExecutionDomainAssignmentKind::STATIC_OWNER;
-        if (normalized == "least_loaded_ep" ||
-            normalized == "least_loaded_experts" ||
-            normalized == "least_loaded" ||
-            normalized == "llep" ||
-            normalized == "least_loaded_expert_parallel")
-            return ExecutionDomainAssignmentKind::LEAST_LOADED_EP;
         return std::nullopt;
     }
 
@@ -195,7 +129,7 @@ namespace llaminar2
         if (eq_pos == std::string::npos)
         {
             throw std::invalid_argument("Invalid " + options.context + " spec: '" + spec +
-                                        "' (expected name=devices[;scope=...][;backend=...][;compute=...][;assignment=...])");
+                                        "' (expected name=devices[;scope=...][;backend=...][;routed_compute=...][;routed_assignment=...])");
         }
 
         ExecutionDomainDefinition domain;
@@ -217,7 +151,7 @@ namespace llaminar2
         }
 
         bool saw_scope = false;
-        bool saw_compute = false;
+        bool saw_routed_compute = false;
         for (size_t index = 1; index < sections.size(); ++index)
         {
             const size_t option_eq_pos = sections[index].find('=');
@@ -276,25 +210,22 @@ namespace llaminar2
             {
                 domain.ranks = parseRankList(value, "ranks");
             }
-            else if (key == "compute")
+            else if (key == "routed_compute")
             {
-                if (!options.allow_compute)
-                    throw std::invalid_argument(options.context + " does not accept compute=<kind>");
-                auto compute = parseExecutionDomainComputeKind(value);
+                if (!options.allow_routed_expert_compute)
+                    throw std::invalid_argument(options.context + " does not accept routed_compute=<policy>");
+                auto compute = parseRoutedExpertComputePolicy(value);
                 if (!compute)
-                    throw std::invalid_argument("Invalid " + options.context + " compute kind: '" + value + "'");
-                domain.compute_kind = *compute;
-                saw_compute = true;
+                    throw std::invalid_argument("Invalid " + options.context + " routed compute policy: '" + value + "'");
+                domain.routed_compute_policy = *compute;
+                saw_routed_compute = true;
             }
-            else if (key == "assignment" ||
-                     key == "assignment_policy" ||
-                     key == "dispatch" ||
-                     key == "dispatch_policy")
+            else if (key == "routed_assignment")
             {
-                auto assignment = parseExecutionDomainAssignmentKind(value);
+                auto assignment = parseRoutedExpertAssignmentPolicy(value);
                 if (!assignment)
-                    throw std::invalid_argument("Invalid " + options.context + " assignment kind: '" + value + "'");
-                domain.assignment_kind = *assignment;
+                    throw std::invalid_argument("Invalid " + options.context + " routed assignment policy: '" + value + "'");
+                domain.routed_assignment_policy = *assignment;
             }
             else
             {
@@ -304,8 +235,8 @@ namespace llaminar2
 
         if (options.require_scope && !saw_scope)
             throw std::invalid_argument(options.context + " '" + domain.name + "' is missing scope=<single|local|node_local>");
-        if (options.require_compute && !saw_compute)
-            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing compute=<replicated_experts|apportioned_experts|sharded_experts>");
+        if (options.require_routed_expert_compute && !saw_routed_compute)
+            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing routed_compute=<replicated|apportioned|tensor-sharded>");
 
         return domain;
     }
@@ -329,17 +260,17 @@ namespace llaminar2
         return scope == ExecutionDomainScope::LOCAL || scope == ExecutionDomainScope::NODE_LOCAL;
     }
 
-    bool ExecutionDomainDefinition::supportsApportionedExperts() const
+    bool ExecutionDomainDefinition::supportsWholeExpertApportionment() const
     {
         return !participants.empty();
     }
 
-    bool ExecutionDomainDefinition::supportsLeastLoadedEP() const
+    bool ExecutionDomainDefinition::supportsLeastLoadedResidentAssignment() const
     {
         return isDomainScopedTP() && hasMultipleParticipants();
     }
 
-    bool ExecutionDomainDefinition::supportsShardedExperts() const
+    bool ExecutionDomainDefinition::supportsRoutedExpertTensorSharding() const
     {
         return isDomainScopedTP() && hasMultipleParticipants();
     }
@@ -403,25 +334,28 @@ namespace llaminar2
                              " is not in its rank list");
         }
 
-        if ((compute_kind == ExecutionDomainComputeKind::APPORTIONED_EXPERTS) && !supportsApportionedExperts())
+        if (routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
+            !supportsWholeExpertApportionment())
         {
-            errors.push_back("Domain '" + name + "' uses apportioned_experts but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses routed_compute=apportioned but has no participants");
         }
 
-        if (assignment_kind == ExecutionDomainAssignmentKind::LEAST_LOADED_EP &&
-            compute_kind != ExecutionDomainComputeKind::APPORTIONED_EXPERTS)
+        if (routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
+            routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
         {
-            errors.push_back("Domain '" + name + "' uses assignment=least_loaded_ep but does not use compute=apportioned_experts");
+            errors.push_back("Domain '" + name + "' uses routed_assignment=least-loaded-resident but does not use routed_compute=apportioned");
         }
 
-        if (assignment_kind == ExecutionDomainAssignmentKind::LEAST_LOADED_EP && !supportsLeastLoadedEP())
+        if (routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
+            !supportsLeastLoadedResidentAssignment())
         {
-            errors.push_back("Domain '" + name + "' uses assignment=least_loaded_ep but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses routed_assignment=least-loaded-resident but is not a multi-participant domain-scoped TP domain");
         }
 
-        if ((compute_kind == ExecutionDomainComputeKind::SHARDED_EXPERTS) && !supportsShardedExperts())
+        if (routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+            !supportsRoutedExpertTensorSharding())
         {
-            errors.push_back("Domain '" + name + "' uses sharded_experts but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses routed_compute=tensor-sharded but is not a multi-participant domain-scoped TP domain");
         }
 
         return errors;
@@ -468,10 +402,12 @@ namespace llaminar2
         }
         if (backend != CollectiveBackendType::AUTO)
             oss << " backend=" << collectiveBackendTypeToString(backend);
-        if (compute_kind != ExecutionDomainComputeKind::UNSPECIFIED)
-            oss << " compute=" << executionDomainComputeKindToString(compute_kind);
-        if (assignment_kind != ExecutionDomainAssignmentKind::UNSPECIFIED)
-            oss << " assignment=" << executionDomainAssignmentKindToString(assignment_kind);
+        if (routed_compute_policy != RoutedExpertComputePolicy::Unspecified)
+            oss << " routed_compute="
+                << routedExpertComputePolicyToString(routed_compute_policy);
+        if (routed_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
+            oss << " routed_assignment="
+                << routedExpertAssignmentPolicyToString(routed_assignment_policy);
 
         return oss.str();
     }

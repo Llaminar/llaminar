@@ -54,7 +54,7 @@ namespace llaminar2
     class TurboQuantContext;
     class ActivationRotation;
     class DecodeExpertHistogram;
-    struct MoEExpertParallelPlan;
+    struct MoERoutedExpertPlacementPlan;
     struct MoEExpertOverlayExecutionPlan;
     class MoEExpertOverlayRuntimePlan;
     struct PipelineConfig;
@@ -175,6 +175,34 @@ namespace llaminar2
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.
         bool compute_all_position_logits = false;
+
+        /**
+         * @brief Runtime-only live request-batch condition transaction.
+         *
+         * A request-batched MTP step first advances one ordinary main-model row
+         * per request, samples those target rows, and only then starts sidecar
+         * drafting. This mode tells graph builders that every input row is a
+         * live decode condition whose terminal logits must be projected. It is
+         * deliberately distinct from `compute_all_position_logits`: GDN,
+         * short-conv, and KV stages update request-owned live state rather than
+         * writing speculative verifier capture slots.
+         */
+        bool live_mtp_request_batch_condition = false;
+
+        /**
+         * @brief Whether small-M stages must use grouped serial-row-equivalent math.
+         *
+         * Both speculative verifier rows and the live grouped condition forward
+         * publish state that must be byte-identical to serial M=1 decode. This
+         * common predicate keeps kernel policy symmetric without conflating
+         * their recurrent-state ownership semantics.
+         */
+        bool usesMTPGroupedDecodeEquivalentRows() const
+        {
+            return mtp.enabled &&
+                   (compute_all_position_logits ||
+                    live_mtp_request_batch_condition);
+        }
 
         /// Runtime-only verifier optimization: pack selected hidden rows into a
         /// compact scratch before LM head instead of projecting every row in
@@ -453,27 +481,26 @@ namespace llaminar2
             int shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
             bool shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
 
-            /// Routed expert execution mode for the standard graph path.
-            MoEExpertMode expert_mode = MoEExpertMode::ApportionedExperts;
-
-            /// Explicit semantic policy for routed expert placement/compute.
-            RoutedExpertParallelPolicy routed_expert_parallel_policy =
-                RoutedExpertParallelPolicy::ApportionedExperts;
+            /// Physical distribution of each routed expert's weights and GEMMs.
+            RoutedExpertComputePolicy routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
 
             /// Explicit semantic policy for assigning router-selected rows to
             /// participants that can execute the selected routed expert.
-            RoutedExpertAssignmentPolicy routed_expert_assignment_policy =
+            RoutedExpertAssignmentPolicy routed_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
 
-            /// Composite MoE policy derived from dense/shared and routed expert axes.
-            MoEParallelPolicy parallel_policy = MoEParallelPolicy::HybridTP_AE;
+            /// Explicit, non-combinatorial view of all MoE execution axes.
+            MoEExecutionPolicy execution_policy = makeMoEExecutionPolicy(
+                DenseParallelPolicy::TensorParallel,
+                RoutedExpertComputePolicy::Apportioned);
 
             /// Static contiguous expert-id range owned by this TP participant.
             /// count < 0 means the routed expert output is full/replicated.
             int local_expert_start = 0;
             int local_expert_count = -1;
 
-            /// Bounded remote hot-expert cache configuration for dynamic EP.
+            /// Bounded remote hot-expert cache configuration for dynamic placement.
             MoEHotExpertCacheConfig hot_expert_cache;
 
             /// Explicit semantic policy for routed expert replicas.
@@ -499,13 +526,12 @@ namespace llaminar2
 
             /// MoE rebalancing controller mode (OFF / OBSERVE / DYNAMIC).
             /// Public LLEP strategy uses the dynamic maintenance clock with
-            /// LeastLoadedEP routed assignment selected in rebalance_config.
+            /// LeastLoadedResident assignment selected in rebalance_config.
             /// Set by InferenceRunnerFactory from MoERebalanceController.
             MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
 
-            /// Optional same-layer expert-parallel overlay plan.
-            /// Phase 1 stores the validated value only; graph execution remains unchanged.
-            std::shared_ptr<MoEExpertParallelPlan> expert_parallel_plan = nullptr;
+            /// Optional same-layer routed-expert placement/overlay plan.
+            std::shared_ptr<MoERoutedExpertPlacementPlan> routed_expert_plan = nullptr;
 
             /// Runtime-resolved overlay descriptor for domain devices, ranks, and MVP lowering.
             std::shared_ptr<MoEExpertOverlayRuntimePlan> expert_overlay_runtime_plan = nullptr;
@@ -522,20 +548,17 @@ namespace llaminar2
             bool enabled() const { return num_experts > 0 && top_k > 0; }
         } moe;
 
-        /// Refresh explicit semantic policy fields from the compatibility knobs
-        /// that still drive much of the existing graph construction.
-        void refreshMoEParallelPolicies()
+        /// Refresh the explicit policy value after one of its source axes changes.
+        void refreshMoEExecutionPolicy()
         {
             dense_parallel_policy = denseParallelPolicyFromFlags(
                 dense_tp_enabled,
                 dense_tp_decode_replicated,
                 dense_tp_decode_mirrored_embedding);
-            moe.routed_expert_parallel_policy =
-                routedExpertParallelPolicyFromMode(moe.expert_mode);
-            moe.parallel_policy = deriveMoEParallelPolicy(
+            moe.execution_policy = makeMoEExecutionPolicy(
                 dense_parallel_policy,
-                moe.routed_expert_parallel_policy,
-                moe.routed_expert_assignment_policy);
+                moe.routed_compute_policy,
+                moe.routed_assignment_policy);
             moe.expert_replica_policy =
                 expertReplicaPolicyFromHotExpertCache(moe.hot_expert_cache);
         }
@@ -850,7 +873,22 @@ namespace llaminar2
 
     struct MTPForwardOutput
     {
+        /**
+         * @brief Native MTP-head output owned by this graph participant.
+         *
+         * This is a local vocabulary shard for GlobalTP, and a full-vocabulary
+         * row for single-device or mirrored LocalTP execution.
+         */
         TensorBase *logits = nullptr;
+
+        /**
+         * @brief Full-vocabulary GlobalTP sidecar rows produced by allgather.
+         *
+         * CPU GlobalTP keeps the MTP head sharded for economical projection, then
+         * gathers only the one-to-four sampled sidecar rows required by stochastic
+         * verification. Other topologies leave this pointer unused.
+         */
+        TensorBase *gathered_logits = nullptr;
         TensorBase *hidden = nullptr;
 
         TensorBase *embedding = nullptr;

@@ -3461,6 +3461,20 @@ namespace llaminar2
 
             auto launch_small_m = [&]
             {
+                /*
+                 * Canonical serial M=1 decode intentionally passes no lazy
+                 * row-major weight slot: large-K generated KPAR shapes must
+                 * keep their fixed two-phase reduction instead of changing to
+                 * ROWPAR after an auxiliary transpose happens to exist.  The
+                 * grouped verifier must make the same dispatch decision for
+                 * every row.  It remains one economical M=2..4 launch; only
+                 * the incompatible ROWPAR promotion is suppressed while the
+                 * explicit decode-equivalent scope is active.
+                 */
+                CUDARowMajorWeights **rowmajor_slot =
+                    explicitSmallMVerifierScopeActive()
+                        ? nullptr
+                        : (packed_ ? &packed_->rowmajor_ : nullptr);
                 return cudaNativeVNNIGemvTuned_small_m_fp32(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
@@ -3480,7 +3494,7 @@ namespace llaminar2
                     cuda_device_id_,
                     stream_handle,
                     impl_->gemv_ctx,
-                    packed_ ? &packed_->rowmajor_ : nullptr);
+                    rowmajor_slot);
             };
 
             /*

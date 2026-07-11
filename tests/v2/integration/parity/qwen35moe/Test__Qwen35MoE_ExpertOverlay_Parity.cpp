@@ -4,7 +4,7 @@
  *
  * This is a V2 parity-harness test: it loads the real Qwen3.5 MoE GGUF,
  * regenerates/loads PyTorch snapshots through Qwen35MoEParityTestBase, injects
- * a planned MoEExpertParallelPlan into the production graph config, and compares
+ * a planned MoERoutedExpertPlacementPlan into the production graph config, and compares
  * Llaminar prefill/decode snapshots against the PyTorch reference.
  *
  * Bridge Phase 5A audit contract: OverlayPlanTopology_* tests only prove that the
@@ -23,7 +23,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 #include "execution/factory/InferenceRunnerFactory.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include <algorithm>
 #include <cctype>
@@ -69,45 +69,45 @@ namespace
         return value * 1024ULL * 1024ULL * 1024ULL;
     }
 
-    ExpertComputeDomain rocmLocalTPDomain(const std::string &name)
+    RoutedExpertDomain rocmLocalTPDomain(const std::string &name)
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = name;
-        domain.kind = ExpertDomainKind::LocalTP;
+        domain.scope = ExecutionDomainScope::LOCAL;
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertComputeDomain cudaSharedHotDomain()
+    RoutedExpertDomain cudaSharedHotDomain()
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = kCudaSharedHotDomain;
-        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.scope = ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::NCCL;
         domain.participants = {GlobalDeviceAddress::cuda(0)};
         domain.world_ranks = {0};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertComputeDomain cpuNodeLocalTPDomain()
+    RoutedExpertDomain cpuNodeLocalTPDomain()
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = kCpuColdDomain;
-        domain.kind = ExpertDomainKind::NodeLocalTP;
+        domain.scope = ExecutionDomainScope::NODE_LOCAL;
         domain.backend = CollectiveBackendType::UPI;
         domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
         domain.world_ranks = {0, 1};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertRoutedTier tier(
+    RoutedExpertTier tier(
         const std::string &name,
         const std::string &domain,
         int priority,
@@ -115,7 +115,7 @@ namespace
         size_t memory_budget_bytes,
         bool fallback = false)
     {
-        ExpertRoutedTier result;
+        RoutedExpertTier result;
         result.name = name;
         result.domain = domain;
         result.priority = priority;
@@ -125,12 +125,12 @@ namespace
         return result;
     }
 
-    MoEExpertModelMetadata metadataFromModel(const ModelContext &ctx)
+    MoERoutedExpertModelMetadata metadataFromModel(const ModelContext &ctx)
     {
         const auto &loader = ctx.concreteLoader();
         const std::string &arch = ctx.architecture();
 
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = ctx.totalBlockCount();
         metadata.num_experts = loader.getInt(arch + ".expert_count", 0);
         metadata.d_model = ctx.embeddingLength();
@@ -146,7 +146,7 @@ namespace
         return metadata;
     }
 
-    std::string validationErrors(const MoEExpertParallelValidationResult &validation)
+    std::string validationErrors(const MoERoutedExpertPlacementValidationResult &validation)
     {
         std::ostringstream message;
         for (const auto &error : validation.errors)
@@ -154,15 +154,15 @@ namespace
         return message.str();
     }
 
-    MoEExpertParallelPlan requestedPlan(OverlayTopologyKind topology, const MoEExpertModelMetadata &metadata)
+    MoERoutedExpertPlacementPlan requestedPlan(OverlayTopologyKind topology, const MoERoutedExpertModelMetadata &metadata)
     {
         const int small_hot_capacity = std::max(1, metadata.num_experts / 8);
         const int medium_hot_capacity = std::max(1, metadata.num_experts / 4);
 
-        MoEExpertParallelPlan plan;
+        MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
-        plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-        plan.residency_policy = ExpertResidencyPolicy::StaticById;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
 
         switch (topology)
         {
@@ -197,26 +197,26 @@ namespace
         return plan;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeOverlayPlan(
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeOverlayPlan(
         OverlayTopologyKind topology,
         const ModelContext &ctx)
     {
         const auto metadata = metadataFromModel(ctx);
-        auto planned = MoEExpertParallelPlanner::plan(
+        auto planned = MoERoutedExpertPlacementPlanner::plan(
                            requestedPlan(topology, metadata),
                            metadata)
                            .planned_plan;
 
-        MoEExpertParallelValidationOptions options;
+        MoERoutedExpertPlacementValidationOptions options;
         options.layer_count = metadata.num_layers;
         options.routed_expert_count = metadata.num_experts;
-        auto validation = validateMoEExpertParallelPlan(planned, options);
+        auto validation = validateMoERoutedExpertPlacementPlan(planned, options);
         if (!validation.ok())
         {
             throw std::invalid_argument("Invalid planned MoE expert overlay:" + validationErrors(validation));
         }
 
-        return std::make_shared<MoEExpertParallelPlan>(std::move(planned));
+        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
     }
 
     TestConfig makeBaseConfig(const std::string &name)
@@ -273,7 +273,7 @@ namespace
         return kOverlayParityCases.front();
     }
 
-    std::vector<size_t> tierExpertCounts(const MoEExpertParallelPlan &plan)
+    std::vector<size_t> tierExpertCounts(const MoERoutedExpertPlacementPlan &plan)
     {
         std::vector<size_t> counts(plan.routed_tiers.size(), 0);
         for (const auto &placement : plan.placements)
@@ -290,13 +290,13 @@ namespace
     /**
      * @brief Resolve the concrete local device that owns continuation execution.
      *
-     * Expert overlay tests intentionally build the same MoEExpertParallelPlan
+     * Expert overlay tests intentionally build the same MoERoutedExpertPlacementPlan
      * consumed by production graph lowering. The runner must therefore be
      * created on a participant of that continuation domain; using a placeholder
      * CPU device would rely on implicit device rewriting and can hide ownership
      * races between host fallback ranks and GPU continuation ranks.
      */
-    DeviceId continuationRootDevice(const MoEExpertParallelPlan &plan)
+    DeviceId continuationRootDevice(const MoERoutedExpertPlacementPlan &plan)
     {
         const std::string &domain_name = plan.continuation_domain;
         for (const auto &domain : plan.domains)
@@ -320,21 +320,21 @@ namespace
         throw std::runtime_error("Continuation domain '" + domain_name + "' was not found in overlay plan");
     }
 
-    const ExpertComputeDomain *findDomain(
-        const MoEExpertParallelPlan &plan,
+    const RoutedExpertDomain *findDomain(
+        const MoERoutedExpertPlacementPlan &plan,
         const std::string &domain_name)
     {
         auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
-                               [&domain_name](const ExpertComputeDomain &domain)
+                               [&domain_name](const RoutedExpertDomain &domain)
                                {
                                    return domain.name == domain_name;
                                });
         return it == plan.domains.end() ? nullptr : &(*it);
     }
 
-    MoEExpertModelMetadata topologyOnlyMetadata()
+    MoERoutedExpertModelMetadata topologyOnlyMetadata()
     {
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = 40;
         metadata.num_experts = 256;
         metadata.d_model = 2048;
@@ -345,24 +345,24 @@ namespace
         return metadata;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeTopologyOnlyOverlayPlan(OverlayTopologyKind topology)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeTopologyOnlyOverlayPlan(OverlayTopologyKind topology)
     {
         const auto metadata = topologyOnlyMetadata();
-        auto planned = MoEExpertParallelPlanner::plan(
+        auto planned = MoERoutedExpertPlacementPlanner::plan(
                            requestedPlan(topology, metadata),
                            metadata)
                            .planned_plan;
 
-        MoEExpertParallelValidationOptions options;
+        MoERoutedExpertPlacementValidationOptions options;
         options.layer_count = metadata.num_layers;
         options.routed_expert_count = metadata.num_experts;
-        auto validation = validateMoEExpertParallelPlan(planned, options);
+        auto validation = validateMoERoutedExpertPlacementPlan(planned, options);
         if (!validation.ok())
         {
             throw std::invalid_argument("Invalid topology-only MoE expert overlay:" + validationErrors(validation));
         }
 
-        return std::make_shared<MoEExpertParallelPlan>(std::move(planned));
+        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
     }
 
     std::optional<std::string> overlayHardwareBlocker(OverlayTopologyKind topology)
@@ -573,7 +573,7 @@ protected:
         inf_config.force_graph = true;
         inf_config.activation_precision = cfg().activation_precision;
         inf_config.kv_cache_precision = cfg().kv_cache_precision;
-        inf_config.moe_expert_parallel_plan = overlay_plan_;
+        inf_config.moe_routed_expert_plan = overlay_plan_;
         inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
 
         DeviceId continuation_device;
@@ -724,7 +724,7 @@ protected:
         assertDecodeParity(summary);
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> overlay_plan_;
+    std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan_;
 };
 
 TEST(Qwen35MoEExpertOverlayTopology, OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold)

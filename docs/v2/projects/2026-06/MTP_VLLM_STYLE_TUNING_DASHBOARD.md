@@ -12,18 +12,20 @@ RAG: **G** correct and speed-positive, **A** correct but slow/stale,
 Fresh E2E: dense baseline/RAM-prefix/MTP d2 `261/261` on CPU/CUDA/ROCm; CPU
 MoE MTP d2 `27/27`; CUDA Qwen3.5 MoE bucket `28/28`.
 
-2026-07-10: unit `518/518`; grouped gate `47/47` substantive cells (CPU 13,
+2026-07-10: unit `528/528`; grouped gate `47/47` substantive cells (CPU 13,
 CUDA 15, ROCm 19; `48/48` with fixture). GPU request-batch stochastic draws
 consume resident positions and match scalar bytes. GDN/short-conv capture-once
 continuation covers M=2/3/4 and every accepted row byte-for-byte.
 
 LocalTP compact prefill now uses each child's mirrored full head; rank sampling
 fans out to child-resident mailboxes with no logits gather or tiny allreduce.
-CUDA2/ROCm2 unequal-length greedy+stochastic production cells passed in
-`45.77 s`/`63.18 s` with resident MTP, recurrent, and rank fan-out counters.
+CUDA2/ROCm2 unequal-length greedy+stochastic production cells are green.
+ROCm2 resident request decode passed at `70.37 s`; CUDA2 passed at `54.32 s`.
+Attention is byte-exact across grouped formats/unequal lengths; captured scalar
+replay is byte-exact and has no pinned host mirror or parameter H2D path.
 GPU publication ignores host shadows; CPU grouped publication uses host-owned
 terminal rows. GPU-shaped engine units now use a host-injected mock worker.
-Architecture estimate: LocalTP 95%, ExpertParallel 80%.
+Architecture estimate: LocalTP 98%, ExpertParallel 80%.
 
 ## Device And Topology Matrix
 
@@ -84,8 +86,12 @@ time on both CUDA and ROCm; blanket main-graph recapture is retired.
 - LocalTP GPU grouped path: mirrored children publish resident outcomes;
   request prefill/sampling uses full heads, device-token matrices, resident
   conditions, and per-child mailboxes. No row replay, host plan/materializer,
-  logits gather, or tiny allreduce. Gates: focused `9/9`, full unit `518/518`,
-  CUDA2/ROCm2 request batch `2/2`; prior LocalTP parity `13/13`.
+  logits gather, or tiny allreduce. ROCm attention uses one grouped phase and
+  reduction for shared verifier or independent request banks. Attention params
+  are device-written on CUDA/ROCm; source policy forbids host mirrors/H2D.
+  Gates: focused `9/9`, full unit `528/528`, CUDA attention `46/46`, ROCm
+  attention `54/54`, ROCm grouped `19/19`, CUDA2/ROCm2 request batch green;
+  prior LocalTP parity `13/13`.
 - MPI/server regressions pass: MPI bootstrap, prefill/decode transition,
   CPU MTP thinking `27/27`, dense Qwen3.6 E2E `261/261`.
 - Model-load/MTP lifecycle guards pass: `V2_Unit_NodeLeaderPageCache` and

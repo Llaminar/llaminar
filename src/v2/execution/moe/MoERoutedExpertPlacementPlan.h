@@ -1,10 +1,11 @@
 /**
- * @file MoEExpertParallelPlan.h
- * @brief Value types for same-layer MoE expert-parallel placement plans.
+ * @file MoERoutedExpertPlacementPlan.h
+ * @brief Declarative same-layer placement plans for routed MoE experts.
  *
- * This is a configuration contract only. TieredExpertOverlay describes
- * multiple role domains contributing to the same MoE layer and must not be
- * lowered as sequential pipeline-parallel stage ownership.
+ * Routed-expert placement is independent from both dense tensor parallelism
+ * and the compute distribution used inside a routed domain.  A tiered overlay
+ * may therefore contain whole-expert-apportioned, replicated, or
+ * tensor-sharded domains without changing its topology name.
  */
 
 #pragma once
@@ -24,27 +25,15 @@
 namespace llaminar2
 {
 
-    /**
-     * @brief High-level MoE expert execution policy.
-     *
-     * SingleDomainExpertSharded models one domain covering routed experts by
-     * expert id. TieredExpertOverlay models ordered same-layer expert tiers
-     * whose partial outputs are reduced back to the continuation domain.
-     */
-    enum class MoEExpertExecutionKind
+    /** @brief Topology of routed-expert placement domains. */
+    enum class RoutedExpertPlacementTopology
     {
-        SingleDomainExpertSharded,
-        TieredExpertOverlay,
+        SingleDomain,
+        TieredOverlay,
     };
 
-    enum class ExpertDomainKind
-    {
-        SingleDevice,
-        LocalTP,
-        NodeLocalTP,
-    };
-
-    enum class ExpertPlacementRole
+    /** @brief Model role assigned to an execution domain. */
+    enum class RoutedExpertPlacementRole
     {
         SharedExpert,
         RoutedExpertTier,
@@ -57,7 +46,8 @@ namespace llaminar2
         ShardedHiddenRequiresGather,
     };
 
-    enum class ExpertResidencyPolicy
+    /** @brief Policy controlling which complete routed experts are resident. */
+    enum class RoutedExpertResidencyPolicy
     {
         Disabled,
         StaticById,
@@ -67,36 +57,25 @@ namespace llaminar2
     };
 
     /**
-     * @brief Domain-internal expert compute strategy.
+     * @brief One hardware domain that owns routed-expert compute.
      *
-     * ReplicatedExperts means every participant owns every routed expert.
-     * ApportionedExperts means whole routed expert ids are divided across
-     * participants. ShardedExperts means each selected expert's GEMMs are
-     * sharded across a multi-participant domain-scoped TP context. Current-row
-     * assignment algorithms such as LLEP live on ExpertComputeDomain::assignment_policy.
+     * `routed_compute_policy` describes whether full experts are replicated,
+     * apportioned by expert id, or tensor-sharded. `routed_assignment_policy`
+     * applies only to row scheduling among eligible residents. `scope`
+     * describes the participant topology and carries no compute semantics.
      */
-    enum class ExpertDomainComputeKind
+    struct RoutedExpertDomain
     {
-        ReplicatedExperts,
-        ApportionedExperts,
-        ShardedExperts,
-    };
-
-    struct ExpertComputeDomain
-    {
-        // Migration note: ExpertComputeDomain is a compatibility wrapper for
-        // ExecutionDomainDefinition plus MoE-specific placement references.
-        // New domain fields belong on ExecutionDomainDefinition; continuation,
-        // shared expert, and routed tier ownership must remain placements over
-        // domains rather than domain-type semantics.
         std::string name;
-        ExpertDomainKind kind = ExpertDomainKind::SingleDevice;
+        ExecutionDomainScope scope = ExecutionDomainScope::SINGLE;
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
         std::vector<GlobalDeviceAddress> participants;
         std::vector<int> world_ranks;
         int owner_rank = -1;
-        ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ApportionedExperts;
-        RoutedExpertAssignmentPolicy assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+        RoutedExpertComputePolicy routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        RoutedExpertAssignmentPolicy routed_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
         std::vector<float> weights;
 
         ExecutionDomainDefinition toExecutionDomainDefinition() const
@@ -109,105 +88,45 @@ namespace llaminar2
             domain.owner_rank = owner_rank >= 0 ? std::optional<int>(owner_rank) : std::nullopt;
             domain.ranks = world_ranks;
 
-            switch (kind)
-            {
-            case ExpertDomainKind::SingleDevice:
-                domain.scope = ExecutionDomainScope::SINGLE;
-                break;
-            case ExpertDomainKind::LocalTP:
-                domain.scope = ExecutionDomainScope::LOCAL;
-                break;
-            case ExpertDomainKind::NodeLocalTP:
-                domain.scope = ExecutionDomainScope::NODE_LOCAL;
-                break;
-            }
-
-            switch (compute_kind)
-            {
-            case ExpertDomainComputeKind::ReplicatedExperts:
-                domain.compute_kind = ExecutionDomainComputeKind::REPLICATED_EXPERTS;
-                break;
-            case ExpertDomainComputeKind::ApportionedExperts:
-                domain.compute_kind = ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
-                break;
-            case ExpertDomainComputeKind::ShardedExperts:
-                domain.compute_kind = ExecutionDomainComputeKind::SHARDED_EXPERTS;
-                break;
-            }
-
-            switch (assignment_policy)
-            {
-            case RoutedExpertAssignmentPolicy::StaticOwner:
-                break;
-            case RoutedExpertAssignmentPolicy::LeastLoadedEP:
-                domain.assignment_kind = ExecutionDomainAssignmentKind::LEAST_LOADED_EP;
-                break;
-            }
+            domain.scope = scope;
+            domain.routed_compute_policy = routed_compute_policy;
+            domain.routed_assignment_policy = routed_assignment_policy;
 
             return domain;
         }
 
-        static ExpertComputeDomain fromExecutionDomainDefinition(const ExecutionDomainDefinition &domain)
+        static RoutedExpertDomain fromExecutionDomainDefinition(
+            const ExecutionDomainDefinition &domain)
         {
-            ExpertComputeDomain result;
+            RoutedExpertDomain result;
             result.name = domain.name;
             result.backend = domain.backend;
             result.participants = domain.participants;
             result.world_ranks = domain.ranks;
             result.owner_rank = domain.owner_rank.value_or(-1);
             result.weights = domain.weights;
-
-            switch (domain.scope)
-            {
-            case ExecutionDomainScope::SINGLE:
-                result.kind = ExpertDomainKind::SingleDevice;
-                break;
-            case ExecutionDomainScope::LOCAL:
-                result.kind = ExpertDomainKind::LocalTP;
-                break;
-            case ExecutionDomainScope::NODE_LOCAL:
-                result.kind = ExpertDomainKind::NodeLocalTP;
-                break;
-            case ExecutionDomainScope::AUTO:
-                result.kind = domain.participants.size() > 1
-                                  ? ExpertDomainKind::LocalTP
-                                  : ExpertDomainKind::SingleDevice;
-                break;
-            case ExecutionDomainScope::GLOBAL:
-                throw std::invalid_argument("MoE expert overlay domains do not support scope=global; use node_local or local");
-            }
-
-            switch (domain.compute_kind)
-            {
-            case ExecutionDomainComputeKind::UNSPECIFIED:
-            case ExecutionDomainComputeKind::APPORTIONED_EXPERTS:
-                result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
-                break;
-            case ExecutionDomainComputeKind::REPLICATED_EXPERTS:
-                result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
-                break;
-            case ExecutionDomainComputeKind::SHARDED_EXPERTS:
-                result.compute_kind = ExpertDomainComputeKind::ShardedExperts;
-                break;
-            }
-
-            switch (domain.assignment_kind)
-            {
-            case ExecutionDomainAssignmentKind::UNSPECIFIED:
-            case ExecutionDomainAssignmentKind::STATIC_OWNER:
-                result.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
-                break;
-            case ExecutionDomainAssignmentKind::LEAST_LOADED_EP:
-                result.assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
-                break;
-            }
+            result.scope = domain.scope == ExecutionDomainScope::AUTO
+                               ? (domain.participants.size() > 1
+                                      ? ExecutionDomainScope::LOCAL
+                                      : ExecutionDomainScope::SINGLE)
+                               : domain.scope;
+            result.routed_compute_policy =
+                domain.routed_compute_policy == RoutedExpertComputePolicy::Unspecified
+                    ? RoutedExpertComputePolicy::Apportioned
+                    : domain.routed_compute_policy;
+            result.routed_assignment_policy =
+                domain.routed_assignment_policy == RoutedExpertAssignmentPolicy::Unspecified
+                    ? RoutedExpertAssignmentPolicy::StaticOwner
+                    : domain.routed_assignment_policy;
 
             return result;
         }
 
-        bool isDomainScopedTPKind() const
+        bool isCollectiveDomain() const
         {
-            return kind == ExpertDomainKind::LocalTP || kind == ExpertDomainKind::NodeLocalTP;
+            return scope == ExecutionDomainScope::LOCAL ||
+                   scope == ExecutionDomainScope::NODE_LOCAL ||
+                   scope == ExecutionDomainScope::GLOBAL;
         }
 
         bool hasMultipleParticipants() const
@@ -215,25 +134,26 @@ namespace llaminar2
             return participants.size() > 1;
         }
 
-        bool supportsDomainScopedShardedExperts() const
+        bool supportsRoutedExpertTensorSharding() const
         {
-            return isDomainScopedTPKind() && hasMultipleParticipants();
+            return isCollectiveDomain() && hasMultipleParticipants();
         }
 
-        bool supportsApportionedExperts() const
+        bool supportsWholeExpertApportionment() const
         {
             return !participants.empty();
         }
 
-        bool supportsLeastLoadedEP() const
+        bool supportsLeastLoadedResidentAssignment() const
         {
-            return compute_kind == ExpertDomainComputeKind::ApportionedExperts &&
-                   supportsDomainScopedShardedExperts();
+            return routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
+                   isCollectiveDomain() &&
+                   hasMultipleParticipants();
         }
 
     };
 
-    struct ExpertRoutedTier
+    struct RoutedExpertTier
     {
         std::string name;
         std::string domain;
@@ -278,7 +198,7 @@ namespace llaminar2
         }
     };
 
-    struct ExpertLayerPlacement
+    struct RoutedExpertLayerPlacement
     {
         int layer = -1;
 
@@ -287,31 +207,30 @@ namespace llaminar2
         std::vector<int> routed_expert_tier;
     };
 
-    struct MoEExpertParallelPlan
+    struct MoERoutedExpertPlacementPlan
     {
         bool enabled = false;
-        MoEExpertExecutionKind execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        RoutedExpertPlacementTopology topology =
+            RoutedExpertPlacementTopology::TieredOverlay;
         std::string continuation_domain;
         std::string base_model_domain;
         std::string shared_expert_domain;
         MoEContinuationDomainSpec continuation_domain_spec;
-        ExpertResidencyPolicy residency_policy = ExpertResidencyPolicy::Disabled;
+        RoutedExpertResidencyPolicy residency_policy =
+            RoutedExpertResidencyPolicy::Disabled;
 
         /// Generic dense execution domains for continuation/base/shared model flow.
         /// These may use SINGLE, LOCAL, NODE_LOCAL, or GLOBAL scope and are
         /// validated separately from routed whole-expert ownership domains.
         std::vector<ExecutionDomainDefinition> dense_domains;
 
-        /// Routed expert ownership domains. These remain whole-expert domains
-        /// in the graph-native reset; ShardedExperts is rejected by validation
-        /// unless explicitly allowed by legacy compatibility code.
-        std::vector<ExpertComputeDomain> domains;
-        std::vector<ExpertRoutedTier> routed_tiers;
-        std::vector<ExpertLayerPlacement> placements;
+        std::vector<RoutedExpertDomain> domains;
+        std::vector<RoutedExpertTier> routed_tiers;
+        std::vector<RoutedExpertLayerPlacement> placements;
 
         bool isTieredOverlay() const
         {
-            return enabled && execution_kind == MoEExpertExecutionKind::TieredExpertOverlay;
+            return enabled && topology == RoutedExpertPlacementTopology::TieredOverlay;
         }
 
         std::string effectiveBaseModelDomain() const
@@ -320,7 +239,7 @@ namespace llaminar2
         }
     };
 
-    struct MoEExpertParallelValidationOptions
+    struct MoERoutedExpertPlacementValidationOptions
     {
         /// When > 0 and placements are provided, require one placement per layer [0, layer_count).
         int layer_count = 0;
@@ -328,13 +247,9 @@ namespace llaminar2
         /// When > 0 and placements are provided, each placement must cover exactly this many experts.
         int routed_expert_count = 0;
 
-        /// Graph-native routed tiers reject true tensor-sharded expert GEMMs by
-        /// default and use whole-expert owners.
-        bool allow_routed_sharded_experts = false;
-
     };
 
-    struct MoEExpertParallelValidationResult
+    struct MoERoutedExpertPlacementValidationResult
     {
         std::vector<std::string> errors;
 
@@ -349,42 +264,14 @@ namespace llaminar2
         }
     };
 
-    inline const char *toString(MoEExpertExecutionKind kind)
+    inline const char *toString(RoutedExpertPlacementTopology topology)
     {
-        switch (kind)
+        switch (topology)
         {
-        case MoEExpertExecutionKind::SingleDomainExpertSharded:
-            return "SingleDomainExpertSharded";
-        case MoEExpertExecutionKind::TieredExpertOverlay:
-            return "TieredExpertOverlay";
-        }
-        return "Unknown";
-    }
-
-    inline const char *toString(ExpertDomainKind kind)
-    {
-        switch (kind)
-        {
-        case ExpertDomainKind::SingleDevice:
-            return "SingleDevice";
-        case ExpertDomainKind::LocalTP:
-            return "LocalTP";
-        case ExpertDomainKind::NodeLocalTP:
-            return "NodeLocalTP";
-        }
-        return "Unknown";
-    }
-
-    inline const char *toString(ExpertDomainComputeKind kind)
-    {
-        switch (kind)
-        {
-        case ExpertDomainComputeKind::ReplicatedExperts:
-            return "ReplicatedExperts";
-        case ExpertDomainComputeKind::ApportionedExperts:
-            return "ApportionedExperts";
-        case ExpertDomainComputeKind::ShardedExperts:
-            return "ShardedExperts";
+        case RoutedExpertPlacementTopology::SingleDomain:
+            return "single-domain";
+        case RoutedExpertPlacementTopology::TieredOverlay:
+            return "tiered-overlay";
         }
         return "Unknown";
     }
@@ -403,26 +290,26 @@ namespace llaminar2
         return "Unknown";
     }
 
-    inline const char *toString(ExpertResidencyPolicy policy)
+    inline const char *toString(RoutedExpertResidencyPolicy policy)
     {
         switch (policy)
         {
-        case ExpertResidencyPolicy::Disabled:
+        case RoutedExpertResidencyPolicy::Disabled:
             return "Disabled";
-        case ExpertResidencyPolicy::StaticById:
+        case RoutedExpertResidencyPolicy::StaticById:
             return "StaticById";
-        case ExpertResidencyPolicy::HistogramTieredCache:
+        case RoutedExpertResidencyPolicy::HistogramTieredCache:
             return "HistogramTieredCache";
-        case ExpertResidencyPolicy::ExplicitMasks:
+        case RoutedExpertResidencyPolicy::ExplicitMasks:
             return "ExplicitMasks";
-        case ExpertResidencyPolicy::RoutedTierRebalanced:
+        case RoutedExpertResidencyPolicy::RoutedTierRebalanced:
             return "RoutedTierRebalanced";
         }
         return "Unknown";
     }
 
-    inline std::string renderMoEExpertParallelPlanExplanation(
-        const MoEExpertParallelPlan &plan,
+    inline std::string renderMoERoutedExpertPlacementPlanExplanation(
+        const MoERoutedExpertPlacementPlan &plan,
         int model_routed_expert_count = 0)
     {
         auto memoryText = [](size_t bytes)
@@ -458,7 +345,7 @@ namespace llaminar2
             out << "]";
         };
 
-        auto findExpertDomain = [&](const std::string &name) -> const ExpertComputeDomain *
+        auto findRoutedExpertDomain = [&](const std::string &name) -> const RoutedExpertDomain *
         {
             for (const auto &domain : plan.domains)
             {
@@ -475,7 +362,7 @@ namespace llaminar2
         };
 
         std::ostringstream out;
-        out << "  moe_expert_overlay:\n";
+        out << "  moe_routed_expert_placement:\n";
         out << "    enabled: " << (plan.enabled ? "true" : "false") << "\n";
         if (!plan.enabled)
         {
@@ -483,8 +370,7 @@ namespace llaminar2
             return out.str();
         }
 
-        out << "    execution: graph-native " << toString(plan.execution_kind)
-            << " (whole-expert routed ownership, no shadow LocalTP runtime)\n";
+        out << "    topology: graph-native " << toString(plan.topology) << "\n";
         out << "    residency_policy: " << toString(plan.residency_policy) << "\n";
         out << "    continuation_domain: " << plan.continuation_domain
             << " root_participant=" << plan.continuation_domain_spec.logical_root_participant
@@ -511,9 +397,11 @@ namespace llaminar2
             {
                 out << "      - " << domain.name << " devices=";
                 appendDevices(out, domain.participants);
-                out << " kind=" << toString(domain.kind)
-                    << " compute=" << toString(domain.compute_kind)
-                    << " assignment=" << routedExpertAssignmentPolicyToString(domain.assignment_policy)
+                out << " scope=" << executionDomainScopeToString(domain.scope)
+                    << " routed_compute="
+                    << routedExpertComputePolicyToString(domain.routed_compute_policy)
+                    << " routed_assignment="
+                    << routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)
                     << " backend=" << collectiveBackendTypeToString(domain.backend);
                 if (domain.owner_rank >= 0)
                     out << " owner=" << domain.owner_rank;
@@ -560,7 +448,7 @@ namespace llaminar2
                 {
                     ++fallback_count;
                     addUnique(fallback_domains, tier.domain);
-                    if (const auto *domain = findExpertDomain(tier.domain))
+                    if (const auto *domain = findRoutedExpertDomain(tier.domain))
                     {
                         has_cpu_fallback = has_cpu_fallback ||
                                            std::any_of(domain->participants.begin(),
@@ -642,20 +530,20 @@ namespace llaminar2
         out << "    rebalance_hint: ";
         switch (plan.residency_policy)
         {
-        case ExpertResidencyPolicy::RoutedTierRebalanced:
+        case RoutedExpertResidencyPolicy::RoutedTierRebalanced:
             out << "uses histogram-aware routed tier rebalancing at safe step boundaries";
             break;
-        case ExpertResidencyPolicy::HistogramTieredCache:
+        case RoutedExpertResidencyPolicy::HistogramTieredCache:
             out << "uses histogram tier ordering when model-aware planning has histogram data";
             break;
-        case ExpertResidencyPolicy::StaticById:
+        case RoutedExpertResidencyPolicy::StaticById:
             out << "uses deterministic expert-id ordering across routed tiers";
             break;
-        case ExpertResidencyPolicy::ExplicitMasks:
+        case RoutedExpertResidencyPolicy::ExplicitMasks:
             out << "uses explicit masks/placements supplied by configuration or caller";
             break;
-        case ExpertResidencyPolicy::Disabled:
-            out << "requires precomputed placements for enabled overlays";
+        case RoutedExpertResidencyPolicy::Disabled:
+            out << "requires precomputed placements for enabled routed-expert plans";
             break;
         }
         out << "\n";
@@ -678,12 +566,12 @@ namespace llaminar2
         return false;
     }
 
-    inline MoEExpertParallelValidationResult validateMoEContinuationDomainSpec(
+    inline MoERoutedExpertPlacementValidationResult validateMoEContinuationDomainSpec(
         const MoEContinuationDomainSpec &spec,
         const ExecutionDomainDefinition &domain,
         const std::string &role_name = "continuation")
     {
-        MoEExpertParallelValidationResult result;
+        MoERoutedExpertPlacementValidationResult result;
         auto addError = [&](const std::string &message)
         {
             result.errors.push_back(message);
@@ -723,11 +611,11 @@ namespace llaminar2
         return result;
     }
 
-    inline MoEExpertParallelValidationResult validateMoEExpertParallelPlan(
-        const MoEExpertParallelPlan &plan,
-        const MoEExpertParallelValidationOptions &options = {})
+    inline MoERoutedExpertPlacementValidationResult validateMoERoutedExpertPlacementPlan(
+        const MoERoutedExpertPlacementPlan &plan,
+        const MoERoutedExpertPlacementValidationOptions &options = {})
     {
-        MoEExpertParallelValidationResult result;
+        MoERoutedExpertPlacementValidationResult result;
         auto addError = [&](const std::string &message)
         {
             result.errors.push_back(message);
@@ -756,7 +644,7 @@ namespace llaminar2
         std::vector<ExecutionDomainDefinition> canonical_expert_domains;
         canonical_expert_domains.reserve(plan.domains.size());
 
-        std::unordered_map<std::string, const ExpertComputeDomain *> domains_by_name;
+        std::unordered_map<std::string, const RoutedExpertDomain *> domains_by_name;
         for (const auto &domain : plan.domains)
         {
             canonical_expert_domains.push_back(domain.toExecutionDomainDefinition());
@@ -820,31 +708,37 @@ namespace llaminar2
                 addError("expert compute domain '" + domain.name + "' has invalid owner rank");
             }
 
-            if (domain.kind == ExpertDomainKind::SingleDevice && domain.participants.size() > 1)
+            if (domain.scope == ExecutionDomainScope::SINGLE &&
+                domain.participants.size() > 1)
             {
-                addError("expert compute domain '" + domain.name + "' is SingleDevice but declares multiple participants");
+                addError("routed expert domain '" + domain.name +
+                         "' has scope=single but declares multiple participants");
             }
 
-            if (domain.compute_kind == ExpertDomainComputeKind::ApportionedExperts && !domain.supportsApportionedExperts())
+            if (domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned && !domain.supportsWholeExpertApportionment())
             {
-                addError("expert compute domain '" + domain.name + "' uses ApportionedExperts but declares no participants");
+                addError("routed expert domain '" + domain.name +
+                         "' uses routed_compute=apportioned but declares no participants");
             }
 
-            if (domain.assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
-                domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts)
+            if (domain.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
+                domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
             {
-                addError("expert compute domain '" + domain.name + "' uses LeastLoadedEP assignment but is not an ApportionedExperts domain");
+                addError("routed expert domain '" + domain.name +
+                         "' uses routed_assignment=least-loaded-resident but does not use routed_compute=apportioned");
             }
 
-            if (domain.assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
-                !domain.supportsLeastLoadedEP())
+            if (domain.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
+                !domain.supportsLeastLoadedResidentAssignment())
             {
-                addError("expert compute domain '" + domain.name + "' uses LeastLoadedEP assignment but is not a multi-participant domain-scoped TP domain");
+                addError("routed expert domain '" + domain.name +
+                         "' uses routed_assignment=least-loaded-resident but is not a multi-participant collective domain");
             }
 
-            if (domain.compute_kind == ExpertDomainComputeKind::ShardedExperts && !domain.supportsDomainScopedShardedExperts())
+            if (domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && !domain.supportsRoutedExpertTensorSharding())
             {
-                addError("expert compute domain '" + domain.name + "' uses ShardedExperts but is not a multi-participant domain-scoped TP domain");
+                addError("routed expert domain '" + domain.name +
+                         "' uses routed_compute=tensor-sharded but is not a multi-participant collective domain");
             }
         }
 
@@ -898,7 +792,7 @@ namespace llaminar2
 
         if (plan.routed_tiers.empty())
         {
-            addError("enabled MoE expert parallel plan must declare at least one routed tier");
+            addError("enabled routed-expert placement plan must declare at least one routed tier");
         }
 
         std::unordered_map<std::string, size_t> tiers_by_name;
@@ -926,7 +820,8 @@ namespace llaminar2
             }
             else if (domains_by_name.find(tier.domain) == domains_by_name.end())
             {
-                addError("routed tier '" + tier.name + "' references unknown routed expert compute domain: " + tier.domain);
+                addError("routed tier '" + tier.name +
+                         "' references unknown routed expert domain: " + tier.domain);
             }
             else
             {
@@ -937,28 +832,9 @@ namespace llaminar2
                 ++fallback_count;
         }
 
-        if (!options.allow_routed_sharded_experts)
-        {
-            for (const auto &domain_name : routed_domain_names)
-            {
-                auto domain_it = domains_by_name.find(domain_name);
-                if (domain_it == domains_by_name.end() || !domain_it->second)
-                    continue;
-                const auto &domain = *domain_it->second;
-                if (domain.compute_kind == ExpertDomainComputeKind::ShardedExperts)
-                {
-                    addError("routed expert domain '" + domain.name +
-                             "' uses ShardedExperts, which is unsupported for graph-native whole-expert routed tiers; "
-                             "the ShardedExperts routed tier path is disabled by default because "
-                             "graph-native MoE overlay has no shadow LocalTP runtime. Use whole-expert ownership or "
-                             "enable an explicit future ShardedExperts path with its own reduction stage");
-                }
-            }
-        }
-
         if (fallback_count > 1)
         {
-            addError("enabled MoE expert parallel plan with routed tiers must declare at most one fallback tier");
+            addError("enabled routed-expert placement plan must declare at most one fallback tier");
         }
 
         if (fallback_count == 0 && options.routed_expert_count > 0 && !plan.routed_tiers.empty())
@@ -980,7 +856,7 @@ namespace llaminar2
             if (all_non_fallback_capacity_known &&
                 non_fallback_capacity < static_cast<size_t>(options.routed_expert_count))
             {
-                addError("graph-native whole-expert overlay has no fallback tier and non-fallback routed tier capacity covers only " +
+                addError("graph-native whole-expert routed placement has no fallback tier and non-fallback routed tier capacity covers only " +
                          std::to_string(non_fallback_capacity) + " of " +
                          std::to_string(options.routed_expert_count) +
                          " routed experts; increase routed tier capacity or configure one fallback tier");
@@ -1069,7 +945,7 @@ namespace llaminar2
             }
         }
 
-        if (plan.execution_kind == MoEExpertExecutionKind::SingleDomainExpertSharded)
+        if (plan.topology == RoutedExpertPlacementTopology::SingleDomain)
         {
             std::unordered_set<std::string> routed_domains;
             for (const auto &tier : plan.routed_tiers)
@@ -1080,30 +956,30 @@ namespace llaminar2
 
             if (routed_domains.size() > 1)
             {
-                addError("SingleDomainExpertSharded plans must route experts through one compute domain");
+                addError("SingleDomain routed-expert plans must use one routed compute domain");
             }
         }
 
         return result;
     }
 
-    inline bool isValidMoEExpertParallelPlan(
-        const MoEExpertParallelPlan &plan,
-        const MoEExpertParallelValidationOptions &options = {})
+    inline bool isValidMoERoutedExpertPlacementPlan(
+        const MoERoutedExpertPlacementPlan &plan,
+        const MoERoutedExpertPlacementValidationOptions &options = {})
     {
-        return validateMoEExpertParallelPlan(plan, options).ok();
+        return validateMoERoutedExpertPlacementPlan(plan, options).ok();
     }
 
-    inline void validateMoEExpertParallelPlanOrThrow(
-        const MoEExpertParallelPlan &plan,
-        const MoEExpertParallelValidationOptions &options = {})
+    inline void validateMoERoutedExpertPlacementPlanOrThrow(
+        const MoERoutedExpertPlacementPlan &plan,
+        const MoERoutedExpertPlacementValidationOptions &options = {})
     {
-        auto result = validateMoEExpertParallelPlan(plan, options);
+        auto result = validateMoERoutedExpertPlacementPlan(plan, options);
         if (result.ok())
             return;
 
         std::ostringstream message;
-        message << "Invalid MoE expert parallel plan:";
+        message << "Invalid routed-expert placement plan:";
         for (const auto &error : result.errors)
         {
             message << "\n - " << error;

@@ -26,7 +26,7 @@ namespace llaminar2
         bool participant_world_rank_known = false;
         int owner_world_rank = -1;
         WeightResidencyCategory residency_category = WeightResidencyCategory::Unspecified;
-        ExpertResidencyPolicy residency_policy = ExpertResidencyPolicy::Disabled;
+        RoutedExpertResidencyPolicy residency_policy = RoutedExpertResidencyPolicy::Disabled;
         size_t estimated_routed_bytes = 0;
         size_t memory_budget_bytes = 0;
         bool fallback = false;
@@ -41,7 +41,7 @@ namespace llaminar2
         bool participant_world_rank_known = false;
         int owner_world_rank = -1;
         WeightResidencyCategory residency_category = WeightResidencyCategory::Unspecified;
-        ExpertResidencyPolicy residency_policy = ExpertResidencyPolicy::Disabled;
+        RoutedExpertResidencyPolicy residency_policy = RoutedExpertResidencyPolicy::Disabled;
         bool accelerator = false;
         bool fallback = false;
         size_t memory_budget_bytes = 0;

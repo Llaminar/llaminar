@@ -176,7 +176,9 @@ namespace
         MockInferenceRunner()
         {
             device_target_sample_tokens_.fill(-1);
+            device_target_sample_ready_.fill(false);
             device_draft_sample_tokens_.fill(-1);
+            device_draft_sample_ready_.fill(false);
             device_verifier_input_tokens_.fill(-1);
             // Set up prefill logits: token 7 has highest value
             setupPrefillLogits();
@@ -317,6 +319,7 @@ namespace
             int request_count,
             int padded_seq_len) override
         {
+            execution_events_.push_back("prepare_verifier_token_batch");
             ++prepare_mtp_verifier_input_tokens_on_device_count_;
             last_prepare_mtp_verifier_total_tokens_ = padded_seq_len;
             if (!supports_mtp_device_draft_token_input_ ||
@@ -353,10 +356,33 @@ namespace
                     static_cast<size_t>(padded_seq_len);
                 if (row.first_token_from_device)
                 {
-                    if (row.first_token_device)
+                    const bool has_resident_state =
+                        row.first_token_logical_state.valid();
+                    const bool has_resident_index =
+                        row.first_token_request_index >= 0;
+                    if (has_resident_state != has_resident_index)
+                        return nullptr;
+                    const bool uses_target_sample_slot =
+                        row.first_target_sample_slot >= 0;
+                    if (has_resident_state == uses_target_sample_slot)
+                        return nullptr;
+
+                    if (has_resident_state)
                     {
+                        const DeviceResidentLogicalSequenceStateHandle
+                            current_state =
+                                deviceResidentLogicalSequenceState();
+                        if (!row.first_token_logical_state.sameMailboxAs(
+                                current_state) ||
+                            !row.first_token_logical_state.coversRequest(
+                                row.first_token_request_index))
+                        {
+                            return nullptr;
+                        }
                         device_verifier_input_tokens_[row_base] =
-                            *row.first_token_device;
+                            *row.first_token_logical_state
+                                 .nextConditionTokenDeviceForRequest(
+                                     row.first_token_request_index);
                     }
                     else if (row.first_target_sample_slot >= 0 &&
                              row.first_target_sample_slot <
@@ -727,6 +753,7 @@ namespace
         {
             if (!mtp_enabled_ || !plan.ok)
                 return false;
+            execution_events_.push_back("install_verifier_plan");
             ++set_mtp_spec_verifier_plan_count_;
             last_mtp_spec_verifier_plan_ = plan;
             last_mtp_spec_verifier_rows_ = plan.verifier_logit_rows;
@@ -1444,6 +1471,67 @@ namespace
             return true;
         }
 
+        bool advanceMTPRequestBatchConditionOnDevice(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds = nullptr) override
+        {
+            ++advance_mtp_request_batch_condition_on_device_count_;
+            last_condition_advance_tokens_.clear();
+            last_condition_advance_positions_.clear();
+            last_condition_advance_seeds_.clear();
+            if (!primary_device_.is_gpu() ||
+                !supports_device_resident_mtp_spec_state_publication_ ||
+                !supports_mtp_device_draft_token_input_ ||
+                !logical_state.valid() ||
+                !logical_state.coversRequest(request_batch - 1) ||
+                logical_state.device != primary_device_ ||
+                logical_state.target_positions_device !=
+                    resident_target_positions_.data() ||
+                logical_state.next_condition_tokens_device !=
+                    resident_next_condition_tokens_.data() ||
+                request_batch <= 0 ||
+                request_batch > batch_capacity_ ||
+                (!params.is_greedy() && !stochastic_position_seeds))
+            {
+                return false;
+            }
+
+            for (int request = 0; request < request_batch; ++request)
+            {
+                const size_t index = static_cast<size_t>(request);
+                if (resident_next_condition_tokens_[index] < 0 ||
+                    resident_target_positions_[index] < 0)
+                {
+                    return false;
+                }
+                if (!params.is_greedy())
+                {
+                    if (stochastic_position_seeds[request] == 0)
+                        return false;
+                    last_condition_advance_seeds_.push_back(
+                        stochastic_position_seeds[request]);
+                }
+                last_condition_advance_tokens_.push_back(
+                    resident_next_condition_tokens_[index]);
+                last_condition_advance_positions_.push_back(
+                    resident_target_positions_[index]);
+
+                ++resident_target_positions_[index];
+                ++resident_target_sequence_lengths_[index];
+                resident_base_cached_tokens_[index] =
+                    resident_target_positions_[index];
+                resident_accepted_state_counts_[index] = 0;
+                resident_next_condition_tokens_[index] = DECODE_ARGMAX_TOKEN;
+                resident_all_drafts_accepted_flags_[index] = 0;
+                resident_stopped_flags_[index] = 0;
+                resident_publication_ok_flags_[index] = 1;
+                device_target_sample_tokens_[index] = DECODE_ARGMAX_TOKEN;
+            }
+            return true;
+        }
+
         bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_batch,
@@ -1488,10 +1576,10 @@ namespace
                     return false;
                 last_mtp_batch_resident_condition_tokens_.push_back(condition);
                 last_mtp_batch_resident_position_ids_.push_back(position);
-                device_draft_sample_tokens_[
-                    static_cast<size_t>(
-                        first_draft_slot + request * slot_stride)] =
-                    MTP_ARGMAX_TOKEN;
+                const size_t destination_slot = static_cast<size_t>(
+                    first_draft_slot + request * slot_stride);
+                device_draft_sample_tokens_[destination_slot] = MTP_ARGMAX_TOKEN;
+                device_draft_sample_ready_[destination_slot] = true;
             }
             mtp_logits_.assign(VOCAB_SIZE, -10.0f);
             mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
@@ -1594,6 +1682,8 @@ namespace
             {
                 const int source_slot =
                     first_condition_slot + request * condition_slot_stride;
+                if (!device_draft_sample_ready_[static_cast<size_t>(source_slot)])
+                    return false;
                 const int32_t condition =
                     device_draft_sample_tokens_[static_cast<size_t>(source_slot)];
                 const int32_t position =
@@ -1603,10 +1693,10 @@ namespace
                     return false;
                 last_chained_mtp_batch_condition_tokens_.push_back(condition);
                 last_chained_mtp_batch_position_ids_.push_back(position);
-                device_draft_sample_tokens_[
-                    static_cast<size_t>(
-                        first_draft_slot + request * draft_slot_stride)] =
-                    MTP_ARGMAX_TOKEN;
+                const size_t destination_slot = static_cast<size_t>(
+                    first_draft_slot + request * draft_slot_stride);
+                device_draft_sample_tokens_[destination_slot] = MTP_ARGMAX_TOKEN;
+                device_draft_sample_ready_[destination_slot] = true;
             }
             mtp_logits_.assign(VOCAB_SIZE, -10.0f);
             mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
@@ -1754,8 +1844,71 @@ namespace
                 return false;
             device_draft_sample_tokens_[static_cast<size_t>(draft_sample_slot)] =
                 token;
+            device_draft_sample_ready_[static_cast<size_t>(draft_sample_slot)] =
+                true;
             if (out_token)
                 *out_token = token;
+            return true;
+        }
+
+        /**
+         * @brief Expose one mock device draft slot to rank collective publication.
+         *
+         * The token array models device storage and the per-slot integer models
+         * an explicit producer stream. Requiring readiness therefore catches a
+         * rank that attempts to broadcast before the grouped child sampler has
+         * published its output event.
+         */
+        DeviceStochasticDraftSampleSlotHandle deviceStochasticDraftSampleSlot(
+            int slot,
+            bool require_ready = false) override
+        {
+            if (!primary_device_.is_gpu() ||
+                !supports_mtp_device_draft_token_input_ ||
+                slot < 0 ||
+                slot >= static_cast<int>(device_draft_sample_tokens_.size()) ||
+                (require_ready &&
+                 !device_draft_sample_ready_[static_cast<size_t>(slot)]))
+            {
+                return {};
+            }
+
+            DeviceStochasticDraftSampleSlotHandle handle;
+            handle.token_device =
+                device_draft_sample_tokens_.data() + static_cast<size_t>(slot);
+            handle.slot = slot;
+            handle.device = primary_device_;
+            handle.stream =
+                device_draft_sample_stream_tokens_.data() +
+                static_cast<size_t>(slot);
+            return handle;
+        }
+
+        /**
+         * @brief Record the mock NCCL/RCCL broadcast as the slot producer.
+         *
+         * Production records a GPU event on @p producer_stream. The unit mock
+         * keeps the same readiness state transition and counts it, allowing the
+         * regression to prove every participant crossed the collective boundary
+         * without initializing a GPU runtime.
+         */
+        bool recordStochasticDraftSampleSlotReadyFromDevice(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true) override
+        {
+            (void)verifier_consumer_pending;
+            if (!primary_device_.is_gpu() ||
+                !supports_mtp_device_draft_token_input_ ||
+                slot < 0 ||
+                slot >= static_cast<int>(device_draft_sample_tokens_.size()) ||
+                !producer_stream)
+            {
+                return false;
+            }
+
+            ++record_draft_sample_slot_ready_from_device_count_;
+            device_draft_sample_ready_[static_cast<size_t>(slot)] = true;
             return true;
         }
 
@@ -2020,6 +2173,7 @@ namespace
             last_request_batch_outcome_bonus_target_slots_.clear();
             last_request_batch_outcome_first_tokens_.clear();
             last_request_batch_outcome_first_tokens_from_device_.clear();
+            last_request_batch_outcome_first_target_sample_slots_.clear();
             last_request_batch_outcome_token_row_offsets_.clear();
             last_request_batch_outcome_token_row_strides_.clear();
             last_request_batch_outcome_draft_tokens_.clear();
@@ -2260,8 +2414,50 @@ namespace
                 return false;
             device_target_sample_tokens_[static_cast<size_t>(target_sample_slot)] =
                 token;
+            device_target_sample_ready_[static_cast<size_t>(target_sample_slot)] =
+                true;
             if (out_token)
                 *out_token = token;
+            return true;
+        }
+
+        DeviceStochasticTargetSampleSlotHandle
+        deviceStochasticTargetSampleSlot(
+            int slot,
+            bool require_ready = false) override
+        {
+            if (slot < 0 ||
+                slot >= static_cast<int>(device_target_sample_tokens_.size()) ||
+                (require_ready &&
+                 !device_target_sample_ready_[static_cast<size_t>(slot)]))
+            {
+                return {};
+            }
+            return DeviceStochasticTargetSampleSlotHandle{
+                .token_device =
+                    device_target_sample_tokens_.data() +
+                    static_cast<size_t>(slot),
+                .slot = slot,
+                .device = primary_device_,
+                .stream =
+                    device_target_sample_stream_tokens_.data() +
+                    static_cast<size_t>(slot),
+            };
+        }
+
+        bool recordStochasticTargetSampleSlotReadyFromDevice(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true) override
+        {
+            (void)verifier_consumer_pending;
+            if (slot < 0 ||
+                slot >= static_cast<int>(device_target_sample_ready_.size()) ||
+                !producer_stream)
+            {
+                return false;
+            }
+            device_target_sample_ready_[static_cast<size_t>(slot)] = true;
             return true;
         }
 
@@ -2413,6 +2609,7 @@ namespace
                     return false;
                 row_logits = mtp_logits_.data();
                 break;
+            case DeviceLogitsSource::MainRequestBatch:
             case DeviceLogitsSource::AllPosition:
             {
                 const size_t offset = static_cast<size_t>(row) * VOCAB_SIZE;
@@ -2504,6 +2701,7 @@ namespace
                         return false;
                     row_logits = mtp_logits_.data();
                     break;
+                case DeviceLogitsSource::MainRequestBatch:
                 case DeviceLogitsSource::AllPosition:
                 {
                     const size_t offset =
@@ -2565,6 +2763,7 @@ namespace
                         return false;
                     row_logits = mtp_logits_.data();
                     break;
+                case DeviceLogitsSource::MainRequestBatch:
                 case DeviceLogitsSource::AllPosition:
                 {
                     const size_t offset =
@@ -2712,6 +2911,7 @@ namespace
                 slot < static_cast<int>(device_target_sample_tokens_.size()))
             {
                 device_target_sample_tokens_[static_cast<size_t>(slot)] = token;
+                device_target_sample_ready_[static_cast<size_t>(slot)] = true;
             }
             return token;
         }
@@ -2739,6 +2939,7 @@ namespace
                 slot < static_cast<int>(device_target_sample_tokens_.size()))
             {
                 device_target_sample_tokens_[static_cast<size_t>(slot)] = token;
+                device_target_sample_ready_[static_cast<size_t>(slot)] = true;
             }
             return true;
         }
@@ -3083,6 +3284,7 @@ namespace
             last_request_batch_outcome_bonus_target_slots_.clear();
             last_request_batch_outcome_first_tokens_.clear();
             last_request_batch_outcome_first_tokens_from_device_.clear();
+            last_request_batch_outcome_first_target_sample_slots_.clear();
             last_request_batch_outcome_token_row_offsets_.clear();
             last_request_batch_outcome_token_row_strides_.clear();
             last_request_batch_outcome_draft_tokens_.clear();
@@ -3116,6 +3318,8 @@ namespace
                     request.first_token);
                 last_request_batch_outcome_first_tokens_from_device_.push_back(
                     request.first_token_from_device);
+                last_request_batch_outcome_first_target_sample_slots_.push_back(
+                    request.first_target_sample_slot);
                 last_request_batch_outcome_token_row_offsets_.push_back(
                     request.token_row_offset);
                 last_request_batch_outcome_token_row_strides_.push_back(
@@ -3131,6 +3335,24 @@ namespace
                     DeviceStochasticDrawPositionSource::ResidentLogicalState);
                 last_request_batch_outcome_serial_sample_equivalent_.push_back(
                     request.serial_sample_equivalent);
+
+                /*
+                 * Mirror the production resident descriptor invariant. A deferred
+                 * first token is owned by the target-sample slot only until it is
+                 * materialized into verifier row entry zero; reducers must then
+                 * name the row and retire the sample-slot source. Rejecting the
+                 * ambiguous descriptor here prevents this mock from normalizing a
+                 * lifetime bug that the real CUDA/ROCm orchestrator rejects.
+                 */
+                if (request.first_token_from_device)
+                {
+                    const bool uses_target_sample =
+                        request.first_target_sample_slot >= 0;
+                    const bool uses_verifier_row =
+                        request.token_row_offset >= 0;
+                    if (uses_target_sample == uses_verifier_row)
+                        return false;
+                }
 
                 int effective_first_logical_position =
                     request.inverse_sample_first_logical_position;
@@ -3326,6 +3548,7 @@ namespace
             last_request_batch_outcome_bonus_target_slots_.clear();
             last_request_batch_outcome_first_tokens_.clear();
             last_request_batch_outcome_first_tokens_from_device_.clear();
+            last_request_batch_outcome_first_target_sample_slots_.clear();
             last_request_batch_outcome_token_row_offsets_.clear();
             last_request_batch_outcome_token_row_strides_.clear();
             last_request_batch_outcome_draft_tokens_.clear();
@@ -3361,6 +3584,8 @@ namespace
                     request.first_token);
                 last_request_batch_outcome_first_tokens_from_device_.push_back(
                     request.first_token_from_device);
+                last_request_batch_outcome_first_target_sample_slots_.push_back(
+                    request.first_target_sample_slot);
                 last_request_batch_outcome_token_row_offsets_.push_back(
                     request.token_row_offset);
                 last_request_batch_outcome_token_row_strides_.push_back(
@@ -3376,6 +3601,21 @@ namespace
                     DeviceStochasticDrawPositionSource::ResidentLogicalState);
                 last_request_batch_outcome_serial_sample_equivalent_.push_back(
                     request.serial_sample_equivalent);
+
+                /*
+                 * The real backend rejects a device token with two owners. Keep
+                 * the resident mock equally strict so the focused orchestration
+                 * test cannot pass while publishing an ambiguous descriptor.
+                 */
+                if (request.first_token_from_device)
+                {
+                    const bool uses_target_sample =
+                        request.first_target_sample_slot >= 0;
+                    const bool uses_verifier_row =
+                        request.token_row_offset >= 0;
+                    if (uses_target_sample == uses_verifier_row)
+                        return false;
+                }
 
                 int effective_first_logical_position =
                     request.inverse_sample_first_logical_position;
@@ -3837,8 +4077,23 @@ namespace
                         meta = {};
                     row_tokens[0] = *forced_rejection_token;
 
+                    int32_t first_token = request.first_token;
+                    if (request.first_token_from_device)
+                    {
+                        if (request.token_row_offset < 0 ||
+                            request.token_row_offset >=
+                                static_cast<int>(
+                                    device_verifier_input_tokens_.size()))
+                        {
+                            return false;
+                        }
+                        first_token =
+                            device_verifier_input_tokens_[static_cast<size_t>(
+                                request.token_row_offset)];
+                    }
+
                     sampling_math::summarize_speculative_verify_batch(
-                        request.first_token,
+                        first_token,
                         row_tokens.data(),
                         row_accepted.data(),
                         request.row_count,
@@ -4140,6 +4395,10 @@ namespace
         {
             return last_request_batch_outcome_first_tokens_from_device_;
         }
+        const std::vector<int> &lastRequestBatchOutcomeFirstTargetSampleSlots() const
+        {
+            return last_request_batch_outcome_first_target_sample_slots_;
+        }
         const std::vector<int> &lastRequestBatchOutcomeTokenRowOffsets() const
         {
             return last_request_batch_outcome_token_row_offsets_;
@@ -4200,6 +4459,26 @@ namespace
         int forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount() const
         {
             return forward_mtp_batch_from_resident_state_to_device_draft_slots_count_;
+        }
+        int advanceMTPRequestBatchConditionOnDeviceCount() const
+        {
+            return advance_mtp_request_batch_condition_on_device_count_;
+        }
+        const std::vector<int32_t> &lastConditionAdvanceTokens() const
+        {
+            return last_condition_advance_tokens_;
+        }
+        const std::vector<int> &lastConditionAdvancePositions() const
+        {
+            return last_condition_advance_positions_;
+        }
+        const std::vector<uint64_t> &lastConditionAdvanceSeeds() const
+        {
+            return last_condition_advance_seeds_;
+        }
+        int recordDraftSampleSlotReadyFromDeviceCount() const
+        {
+            return record_draft_sample_slot_ready_from_device_count_;
         }
         int lastMTPBatchDeviceDraftFirstSlot() const
         {
@@ -4686,6 +4965,7 @@ namespace
         void enableMirroredLocalTPMTPHeadForVerifier()
         {
             mirrors_localtp_mtp_head_for_verifier_ = true;
+            supports_stochastic_device_sampling_ = true;
             hide_local_logits_ = false;
         }
         void hideMTPSpecStatePublicationFromPolicy()
@@ -5280,9 +5560,11 @@ namespace
         int forward_mtp_from_device_target_for_device_sampling_count_{0};
         int forward_mtp_and_sample_count_{0};
         int forward_mtp_batch_and_sample_count_{0};
+        int advance_mtp_request_batch_condition_on_device_count_{0};
         int forward_mtp_batch_from_resident_state_to_device_draft_slots_count_{0};
         int forward_mtp_batch_from_last_draft_and_sample_count_{0};
         int forward_mtp_batch_from_device_draft_slots_to_device_draft_slots_count_{0};
+        int record_draft_sample_slot_ready_from_device_count_{0};
         int forward_mtp_from_last_draft_and_sample_count_{0};
         int flush_pending_mtp_work_count_{0};
         int clear_cache_count_{0};
@@ -5427,6 +5709,9 @@ namespace
         std::vector<bool> last_mtp_verifier_batch_first_tokens_from_device_;
         std::vector<int32_t> last_mtp_batch_condition_tokens_;
         std::vector<int> last_mtp_batch_position_ids_;
+        std::vector<int32_t> last_condition_advance_tokens_;
+        std::vector<int> last_condition_advance_positions_;
+        std::vector<uint64_t> last_condition_advance_seeds_;
         std::vector<int32_t> last_chained_mtp_batch_condition_tokens_;
         std::vector<int> last_chained_mtp_batch_position_ids_;
         std::vector<int32_t> last_staged_stochastic_draft_tokens_;
@@ -5443,6 +5728,7 @@ namespace
         std::vector<int> last_request_batch_outcome_bonus_target_slots_;
         std::vector<int32_t> last_request_batch_outcome_first_tokens_;
         std::vector<bool> last_request_batch_outcome_first_tokens_from_device_;
+        std::vector<int> last_request_batch_outcome_first_target_sample_slots_;
         std::vector<int> last_request_batch_outcome_token_row_offsets_;
         std::vector<int> last_request_batch_outcome_token_row_strides_;
         std::vector<std::vector<int32_t>> last_request_batch_outcome_draft_tokens_;
@@ -5471,8 +5757,16 @@ namespace
             draft_device_distributions_;
         std::array<int32_t, kMockVerifierTokenCapacity>
             device_target_sample_tokens_{};
+        std::array<bool, kMockVerifierTokenCapacity>
+            device_target_sample_ready_{};
+        std::array<int, kMockVerifierTokenCapacity>
+            device_target_sample_stream_tokens_{};
         std::array<int32_t, kMockVerifierTokenCapacity>
             device_draft_sample_tokens_{};
+        std::array<bool, kMockVerifierTokenCapacity>
+            device_draft_sample_ready_{};
+        std::array<int, kMockVerifierTokenCapacity>
+            device_draft_sample_stream_tokens_{};
         std::array<int32_t, kMockVerifierTokenCapacity>
             device_verifier_input_tokens_{};
         std::array<int32_t,
@@ -5536,6 +5830,7 @@ namespace
         struct LocalTPRunnerHarness
         {
             OrchestrationRunner *runner = nullptr;
+            RankOrchestrator *rank = nullptr;
             MockInferenceRunner *child0 = nullptr;
             MockInferenceRunner *child1 = nullptr;
         };
@@ -5748,6 +6043,7 @@ namespace
                 std::move(device_runners),
                 std::move(tp_ctx),
                 rank_config);
+            auto *rank_runner_ptr = rank_runner.get();
 
             OrchestrationConfig config;
             config.device_for_this_rank = devices.front();
@@ -5776,7 +6072,11 @@ namespace
             runner->setSkipLogitsGatherPrefill(devices.front().isGPU());
 
             runners_.push_back(std::move(runner));
-            return {runners_.back().get(), child0_ptr, child1_ptr};
+            return {
+                runners_.back().get(),
+                rank_runner_ptr,
+                child0_ptr,
+                child1_ptr};
         }
 
         static GlobalPPTopology buildSingleStageGlobalTPTopo(int world_size)
@@ -5956,7 +6256,7 @@ namespace
     }
 
     TEST_F(Test__PrefillDecodeTransition,
-           RequestBatchedLocalTPGpuPrefillPublishesEveryChildResidentMailbox)
+           RequestBatchedLocalTPGpuPrefillPublishesMailboxesAndExecutesResidentDepths)
     {
         ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
         PerfStatsCollector::reset();
@@ -5964,7 +6264,7 @@ namespace
             /*mtp_accept=*/true,
             /*column_parallel_logits=*/true,
             {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
-            /*mtp_draft_tokens=*/1,
+            /*mtp_draft_tokens=*/2,
             MTPDepthPolicyConfig{},
             /*spec_state_publication=*/false,
             /*max_request_batch=*/2);
@@ -6000,6 +6300,63 @@ namespace
         EXPECT_THAT(batch_step.requests[1].tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
 
+        ASSERT_NE(harness.rank, nullptr);
+        const DeviceResidentLogicalSequenceStateHandle rank_mailbox =
+            harness.rank->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(rank_mailbox.valid())
+            << "The rank must adopt child mailboxes before the first grouped MTP continuation.";
+        EXPECT_EQ(rank_mailbox.request_count, 2);
+        EXPECT_EQ(rank_mailbox.device, DeviceId::cuda(0));
+
+        /*
+         * Request-major depth-two storage is [r0d0, r0d1, r1d0, r1d1].
+         * Exercising both columns proves that RankOrchestrator invokes each
+         * child grouped API once, preserves the strided device-slot geometry,
+         * and publishes every proposal through the LocalTP collective context.
+         */
+        ASSERT_TRUE(
+            harness.rank
+                ->forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(
+                    rank_mailbox,
+                    /*request_batch=*/2,
+                    /*first_draft_slot=*/0,
+                    /*slot_stride=*/2));
+        ASSERT_TRUE(
+            harness.rank
+                ->forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(
+                    rank_mailbox,
+                    /*request_batch=*/2,
+                    /*first_condition_slot=*/0,
+                    /*condition_slot_stride=*/2,
+                    /*position_offset=*/1,
+                    /*first_draft_slot=*/1,
+                    /*draft_slot_stride=*/2));
+
+        std::array<DeviceMTPVerifierInputBatchRequest, 2>
+            verifier_token_rows{};
+        for (int request = 0; request < 2; ++request)
+        {
+            DeviceMTPVerifierInputBatchRequest &row =
+                verifier_token_rows[static_cast<size_t>(request)];
+            row.request_id = request;
+            row.first_token =
+                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + request;
+            row.first_token_from_device = true;
+            row.first_token_logical_state = rank_mailbox;
+            row.first_token_request_index = request;
+            row.first_target_sample_slot = -1;
+            row.first_draft_slot = request * 2;
+            row.draft_token_count = 2;
+            row.total_verifier_input_tokens = 3;
+        }
+        ASSERT_NE(
+            harness.rank->prepareMTPVerifierInputTokenBatchOnDevice(
+                verifier_token_rows.data(),
+                /*request_count=*/2,
+                /*padded_seq_len=*/3),
+            nullptr)
+            << "The rank must translate its opaque aggregate identity into each child's real device mailbox.";
+
         for (MockInferenceRunner *child : {harness.child0, harness.child1})
         {
             EXPECT_EQ(child->forwardBatchCallCount(), 1);
@@ -6009,8 +6366,60 @@ namespace
                         ElementsAre(stochastic.seed, stochastic.seed));
             EXPECT_THAT(child->lastMainLogitsBatchResidentPositions(),
                         ElementsAre(3, 2));
+            const DeviceResidentLogicalSequenceStateHandle child_mailbox =
+                child->deviceResidentLogicalSequenceState();
+            ASSERT_TRUE(child_mailbox.valid());
+            EXPECT_EQ(child_mailbox.request_count, 2);
+            EXPECT_EQ(child_mailbox.device, child->primaryDeviceId());
             EXPECT_EQ(child->getLogitsCallCount(), 0)
                 << "Rank-level response comparison must never materialize full logits.";
+            EXPECT_EQ(
+                child->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(),
+                1)
+                << "Each participant must receive one grouped depth-zero sidecar, not scalar row replay.";
+            EXPECT_EQ(child->lastMTPBatchDeviceDraftFirstSlot(), 0);
+            EXPECT_EQ(child->lastMTPBatchDeviceDraftSlotStride(), 2);
+            EXPECT_THAT(
+                child->lastMTPBatchResidentConditionTokens(),
+                ElementsAre(
+                    MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                    MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+            EXPECT_EQ(
+                child->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(),
+                1)
+                << "Depth one must remain one grouped child graph invocation.";
+            EXPECT_THAT(
+                child->lastChainedMTPBatchDeviceConditionFirstSlots(),
+                ElementsAre(0));
+            EXPECT_THAT(
+                child->lastChainedMTPBatchDeviceConditionSlotStrides(),
+                ElementsAre(2));
+            EXPECT_THAT(
+                child->lastChainedMTPBatchDevicePositionOffsets(),
+                ElementsAre(1));
+            EXPECT_THAT(
+                child->lastChainedMTPBatchDeviceDraftFirstSlots(),
+                ElementsAre(1));
+            EXPECT_THAT(
+                child->lastChainedMTPBatchDeviceDraftSlotStrides(),
+                ElementsAre(2));
+            EXPECT_EQ(child->recordDraftSampleSlotReadyFromDeviceCount(), 4)
+                << "Both depth columns must record both request slots after their NCCL/RCCL broadcasts.";
+            EXPECT_EQ(child->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
+            EXPECT_THAT(
+                child->lastMTPVerifierBatchFirstTokensFromDevice(),
+                ElementsAre(true, true));
+            const auto &verifier_tokens = child->deviceVerifierInputTokens();
+            EXPECT_EQ(
+                verifier_tokens[0],
+                MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+            EXPECT_EQ(verifier_tokens[1], MockInferenceRunner::MTP_ARGMAX_TOKEN);
+            EXPECT_EQ(verifier_tokens[2], MockInferenceRunner::MTP_ARGMAX_TOKEN);
+            EXPECT_EQ(
+                verifier_tokens[3],
+                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1);
+            EXPECT_EQ(verifier_tokens[4], MockInferenceRunner::MTP_ARGMAX_TOKEN);
+            EXPECT_EQ(verifier_tokens[5], MockInferenceRunner::MTP_ARGMAX_TOKEN);
         }
 
         const auto records = PerfStatsCollector::snapshot({"mtp"});
@@ -6024,6 +6433,60 @@ namespace
             << "Initial resident sampling occurs in decodeStepBatch(), after prefill has published logits.";
         EXPECT_EQ(rank_samples->value, 2.0)
             << "The counter records one sampled mailbox row per request, not per host call.";
+        const PerfStatRecord *mailbox_adoption = findPerfRecordWithTags(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "rank_mirrored_localtp_resident_mailbox_adoptions",
+            {{"lifecycle", "request_batch_prefill_sample"},
+             {"payload_owner", "child_device_mailboxes"}});
+        ASSERT_NE(mailbox_adoption, nullptr)
+            << "The regression gate must prove the rank adopted the initial child device mailboxes.";
+        EXPECT_EQ(mailbox_adoption->value, 1.0);
+
+        const PerfStatRecord *verifier_token_batch = findPerfRecordWithTags(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "rank_verifier_token_batches_prepared_from_device_slots",
+            {{"participants", "2"},
+             {"requests", "2"},
+             {"padded_seq_len", "3"}});
+        ASSERT_NE(verifier_token_batch, nullptr)
+            << "The regression must prove child-specific device mailbox translation at the verifier boundary.";
+        EXPECT_EQ(verifier_token_batch->value, 1.0);
+
+        const PerfStatRecord *initial_grouped_sidecar = findPerfRecordWithTags(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "rank_mirrored_localtp_resident_request_batch_sidecars",
+            {{"source", "resident_logical_state"},
+             {"implementation", "grouped_child_graphs"}});
+        ASSERT_NE(initial_grouped_sidecar, nullptr)
+            << "The first MTP depth must traverse the rank's true grouped resident path.";
+        EXPECT_EQ(initial_grouped_sidecar->value, 1.0);
+
+        const PerfStatRecord *chained_grouped_sidecar = findPerfRecordWithTags(
+            records,
+            PerfStatRecord::Kind::Counter,
+            "rank_mirrored_localtp_resident_request_batch_sidecars",
+            {{"source", "device_draft_slots"},
+             {"implementation", "grouped_child_graphs"}});
+        ASSERT_NE(chained_grouped_sidecar, nullptr)
+            << "The second MTP depth must consume the previous device draft column as one grouped batch.";
+        EXPECT_EQ(chained_grouped_sidecar->value, 1.0);
+
+        for (const char *source : {"resident_logical_state", "device_draft_slots"})
+        {
+            const PerfStatRecord *slot_publications = findPerfRecordWithTags(
+                records,
+                PerfStatRecord::Kind::Counter,
+                "rank_mirrored_localtp_resident_request_batch_draft_slot_publications",
+                {{"source", source},
+                 {"collective", "nccl_rccl_int32_broadcast"}});
+            ASSERT_NE(slot_publications, nullptr)
+                << "Every grouped depth must prove compact device-slot publication for source="
+                << source;
+            EXPECT_EQ(slot_publications->value, 2.0);
+        }
         PerfStatsCollector::reset();
     }
 
@@ -6357,10 +6820,16 @@ namespace
         ASSERT_TRUE(second.error.empty()) << second.error;
         ASSERT_THAT(second.requests, SizeIs(2));
         EXPECT_THAT(second.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(second.requests[1].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
+        EXPECT_EQ(mock->advanceMTPRequestBatchConditionOnDeviceCount(), 1);
+        EXPECT_THAT(mock->lastConditionAdvanceTokens(), ElementsAre(7, 8));
+        EXPECT_THAT(mock->lastConditionAdvancePositions(), ElementsAre(3, 2));
+        EXPECT_THAT(mock->lastConditionAdvanceSeeds(), ElementsAre(1234u, 1234u));
         EXPECT_EQ(mock->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(), 1)
             << "Depth-one stochastic request batching should sample sidecar "
                "drafts directly into runner-owned device slots.";
@@ -6373,9 +6842,13 @@ namespace
                     ElementsAre(1, 1));
         EXPECT_THAT(mock->lastRequestBatchOutcomeFirstDraftSlots(),
                     ElementsAre(0, 1));
-        EXPECT_THAT(mock->lastBatchOutcomeFirstDraftSlots(),
-                    ElementsAre(0, 1));
-        EXPECT_TRUE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection());
+        EXPECT_THAT(mock->lastBatchOutcomeFirstDraftSlots(), IsEmpty())
+            << "The seeded serial-equivalent reducer must not enter the vLLM probability-rejection mock.";
+        EXPECT_FALSE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection())
+            << "Seeded request batches must sample grouped target rows with "
+               "serial-decode position keys.";
+        EXPECT_THAT(mock->lastRequestBatchOutcomeSerialSampleEquivalent(),
+                    ElementsAre(true, true));
         EXPECT_FALSE(mock->batchOutcomeUsedHostDraftTokens())
             << "The compact verifier reducer must consume draft tokens from "
                "device slots even while metadata still keeps a host shadow.";
@@ -6427,10 +6900,12 @@ namespace
         ASSERT_TRUE(second.error.empty()) << second.error;
         ASSERT_THAT(second.requests, SizeIs(2));
         EXPECT_THAT(second.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(second.requests[1].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPBatchAndSampleCount(), 0)
             << "GPU request batches must not invoke the host-token grouped sidecar API.";
@@ -6440,9 +6915,9 @@ namespace
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftFirstSlot(), 0);
         EXPECT_EQ(mock->lastMTPBatchDeviceDraftSlotStride(), 2);
         EXPECT_THAT(mock->lastMTPBatchResidentConditionTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
-        EXPECT_THAT(mock->lastMTPBatchResidentPositionIds(), ElementsAre(3, 2));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->lastMTPBatchResidentPositionIds(), ElementsAre(4, 3));
         EXPECT_EQ(mock->forwardMTPBatchFromDeviceDraftSlotsToDeviceDraftSlotsCount(), 1);
         EXPECT_THAT(mock->lastChainedMTPBatchDeviceConditionFirstSlots(),
                     ElementsAre(0));
@@ -6485,17 +6960,20 @@ namespace
                     ElementsAre(3, 3));
         EXPECT_THAT(mock->lastRequestBatchOutcomeBonusTargetSlots(),
                     ElementsAre(2, 5));
-        EXPECT_THAT(mock->lastBatchOutcomeFirstTargetSlots(),
-                    ElementsAre(0, 3));
-        EXPECT_THAT(mock->lastBatchOutcomeFirstDraftSlots(),
-                    ElementsAre(0, 2));
-        EXPECT_THAT(mock->lastBatchOutcomeBonusTargetSlots(),
-                    ElementsAre(2, 5));
-        EXPECT_TRUE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection());
+        EXPECT_THAT(mock->lastBatchOutcomeFirstTargetSlots(), IsEmpty());
+        EXPECT_THAT(mock->lastBatchOutcomeFirstDraftSlots(), IsEmpty());
+        EXPECT_THAT(mock->lastBatchOutcomeBonusTargetSlots(), IsEmpty())
+            << "Seeded depth-two verification must bypass the distributional vLLM reducer.";
+        EXPECT_FALSE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection())
+            << "Seeded depth-two request batches must remain pathwise equal to serial decode.";
+        EXPECT_THAT(mock->lastRequestBatchOutcomeSerialSampleEquivalent(),
+                    ElementsAre(true, true));
         EXPECT_FALSE(mock->batchOutcomeUsedHostDraftTokens())
             << "Request-batched stochastic verification must consume the "
                "runner-owned draft sample slots";
-        EXPECT_EQ(mock->lastBatchOutcomeInverseSampleSeed(), sampling.seed);
+        EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(),
+                    ElementsAre(static_cast<uint64_t>(sampling.seed),
+                                static_cast<uint64_t>(sampling.seed)));
         EXPECT_EQ(mock->publishMTPSpecStateBatchCount(), 0)
             << "The compatibility host-plan publisher must not run after "
                "resident request-batch publication succeeds.";
@@ -6541,7 +7019,7 @@ namespace
         EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
                     ElementsAre(-1, -1));
         EXPECT_THAT(mock->lastRequestBatchOutcomeEffectiveFirstPositions(),
-                    ElementsAre(7, 6))
+                    ElementsAre(8, 7))
             << "The next verifier step must read the positions published by "
                "the prior device transaction, not stale backend host mirrors.";
     }
@@ -6593,10 +7071,12 @@ namespace
         ASSERT_TRUE(second.error.empty()) << second.error;
         ASSERT_THAT(second.requests, SizeIs(2));
         EXPECT_THAT(second.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(second.requests[1].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 1);
@@ -6619,6 +7099,17 @@ namespace
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
         EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
                         .outcome.mtp_transaction.valid());
+        const auto &events = mock->executionEvents();
+        const auto plan_install =
+            std::find(events.begin(), events.end(), "install_verifier_plan");
+        const auto token_prepare =
+            std::find(events.begin(), events.end(), "prepare_verifier_token_batch");
+        ASSERT_NE(plan_install, events.end());
+        ASSERT_NE(token_prepare, events.end());
+        EXPECT_LT(std::distance(events.begin(), plan_install),
+                  std::distance(events.begin(), token_prepare))
+            << "A verifier plan invalidates pending token composition, so the "
+               "request-major device rows must be staged afterward.";
     }
 
     /**
@@ -6631,13 +7122,13 @@ namespace
      * observes the accepted tokens.
      */
     TEST_F(Test__PrefillDecodeTransition,
-           RequestBatchedGreedyResidentPublicationDoesNotRequireDirectAdvert)
+           RequestBatchedGreedySamplingSpecializesSpeculativeVerifierWithResidentPublication)
     {
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
                 /*max_request_batch=*/2,
                 /*mtp_draft_tokens=*/2,
-                MTPVerifyMode::Greedy);
+                MTPVerifyMode::SpeculativeSampling);
         mock->setPrimaryDevice(DeviceId::cuda(0));
         mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableDeviceResidentMTPSpecStatePublication();
@@ -6650,17 +7141,20 @@ namespace
         GenerationBatchResult first = runner->decodeStepBatch(2);
         ASSERT_TRUE(first.error.empty()) << first.error;
         EXPECT_TRUE(runner->supportsDecodeStepBatch(2))
-            << "GPU greedy request batching should advertise only when compact "
-               "device-resident publication can execute.";
+            << "Temperature-zero sampling must use the deterministic specialization "
+               "of the configured speculative verifier while retaining compact "
+               "device-resident publication.";
 
         GenerationBatchResult second = runner->decodeStepBatch(2);
         ASSERT_TRUE(second.error.empty()) << second.error;
         ASSERT_THAT(second.requests, SizeIs(2));
         EXPECT_THAT(second.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(second.requests[1].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         EXPECT_EQ(mock->forwardMTPBatchFromResidentStateToDeviceDraftSlotsCount(), 1);
@@ -6697,6 +7191,17 @@ namespace
         EXPECT_EQ(mock->lastDeviceResidentPublicationRequest().max_draft_tokens, 3);
         EXPECT_TRUE(mock->lastDeviceResidentPublicationRequest()
                         .outcome.mtp_transaction.valid());
+        const auto &events = mock->executionEvents();
+        const auto plan_install =
+            std::find(events.begin(), events.end(), "install_verifier_plan");
+        const auto token_prepare =
+            std::find(events.begin(), events.end(), "prepare_verifier_token_batch");
+        ASSERT_NE(plan_install, events.end());
+        ASSERT_NE(token_prepare, events.end());
+        EXPECT_LT(std::distance(events.begin(), plan_install),
+                  std::distance(events.begin(), token_prepare))
+            << "Greedy resident verification must materialize its device token "
+               "matrix inside the verifier transaction that consumes it.";
     }
 
     /**
@@ -6732,9 +7237,9 @@ namespace
         EXPECT_THAT(mock->lastMTPVerifierBatchFirstTokensFromDevice(),
                     ElementsAre(true, true));
         EXPECT_THAT(mock->lastMTPBatchResidentConditionTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
-        EXPECT_THAT(mock->lastMTPBatchResidentPositionIds(), ElementsAre(3, 2));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->lastMTPBatchResidentPositionIds(), ElementsAre(4, 3));
 
         GenerationBatchResult ready_bonus = runner->decodeStepBatch(2);
         ASSERT_TRUE(ready_bonus.error.empty()) << ready_bonus.error;
@@ -6749,10 +7254,12 @@ namespace
             << resident_continuation.error;
         ASSERT_THAT(resident_continuation.requests, SizeIs(2));
         EXPECT_THAT(resident_continuation.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_THAT(resident_continuation.requests[1].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensOnDeviceCount(), 2);
@@ -6831,8 +7338,10 @@ namespace
             << "Depth-three request batching should use strided device-slot "
                "sidecar stores instead of per-request host staging.";
         EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::PREFILL_ARGMAX_TOKEN + 1));
+                    ElementsAre(0, 0))
+            << "Device-owned verifier row zero must not acquire a host token shadow.";
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokensFromDevice(),
+                    ElementsAre(true, true));
         ASSERT_THAT(mock->lastRequestBatchOutcomeDraftTokens(), SizeIs(2));
         EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[0],
                     ElementsAre(0, 0, 0));
@@ -6856,7 +7365,12 @@ namespace
         EXPECT_THAT(mock->lastRequestBatchOutcomeResidentThresholdPositions(),
                     ElementsAre(true, true));
         EXPECT_THAT(mock->lastRequestBatchOutcomeEffectiveFirstPositions(),
-                    ElementsAre(4, 3));
+                    ElementsAre(5, 4));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeSerialSampleEquivalent(),
+                    ElementsAre(true, true))
+            << "A fixed seed requires every grouped target row to use the exact serial-decode draw.";
+        EXPECT_FALSE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection())
+            << "Distributional vLLM rejection cannot satisfy seeded request-batch invariance.";
 
         auto threshold = [&](int logical_position, int purpose) {
             return mtpSeededVerifierThreshold(
@@ -6867,10 +7381,11 @@ namespace
 
         ASSERT_THAT(mock->lastRequestBatchOutcomeAcceptThresholds(), SizeIs(2));
         ASSERT_THAT(mock->lastRequestBatchOutcomeResidualThresholds(), SizeIs(2));
+        ASSERT_THAT(mock->lastRequestBatchOutcomeSampleThresholds(), SizeIs(2));
         ASSERT_THAT(mock->lastRequestBatchOutcomeBonusThresholds(), SizeIs(2));
 
-        const std::array<int, 3> request0_positions = {4, 5, 6};
-        const std::array<int, 3> request1_positions = {3, 4, 5};
+        const std::array<int, 3> request0_positions = {5, 6, 7};
+        const std::array<int, 3> request1_positions = {4, 5, 6};
         for (int row = 0; row < 3; ++row)
         {
             EXPECT_EQ(
@@ -6884,6 +7399,11 @@ namespace
                     request0_positions[static_cast<size_t>(row)],
                     2 /* MTPSpecStochasticDrawPurpose::Residual */)));
             EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeSampleThresholds()[0][row]),
+                floatBytes(threshold(
+                    request0_positions[static_cast<size_t>(row)],
+                    0 /* MTPSpecStochasticDrawPurpose::Sample */)));
+            EXPECT_EQ(
                 floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[1][row]),
                 floatBytes(threshold(
                     request1_positions[static_cast<size_t>(row)],
@@ -6893,15 +7413,20 @@ namespace
                 floatBytes(threshold(
                     request1_positions[static_cast<size_t>(row)],
                     2 /* MTPSpecStochasticDrawPurpose::Residual */)));
+            EXPECT_EQ(
+                floatBytes(mock->lastRequestBatchOutcomeSampleThresholds()[1][row]),
+                floatBytes(threshold(
+                    request1_positions[static_cast<size_t>(row)],
+                    0 /* MTPSpecStochasticDrawPurpose::Sample */)));
         }
         EXPECT_EQ(
             floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[0]),
             floatBytes(threshold(
-                7, 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
+                8, 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
         EXPECT_EQ(
             floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[1]),
             floatBytes(threshold(
-                6, 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
+                7, 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
 
         const auto records = PerfStatsCollector::snapshot({"mtp"});
         const PerfStatsCollector::Tags batch_tags{
@@ -6974,7 +7499,11 @@ namespace
         EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
                     ElementsAre(-1, -1));
         EXPECT_THAT(mock->lastRequestBatchOutcomeEffectiveFirstPositions(),
-                    ElementsAre(4, 3));
+                    ElementsAre(5, 4));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeSerialSampleEquivalent(),
+                    ElementsAre(false, false));
+        EXPECT_TRUE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection())
+            << "Unseeded requests retain the economical distributional rejection path.";
 
         ASSERT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(), SizeIs(2));
         const uint64_t request0_seed =
@@ -6992,25 +7521,25 @@ namespace
                 floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[0][row]),
                 floatBytes(mtpSeededVerifierThreshold(
                     request0_seed,
-                    4 + row,
+                    5 + row,
                     1 /* MTPSpecStochasticDrawPurpose::Accept */)));
             EXPECT_EQ(
                 floatBytes(mock->lastRequestBatchOutcomeResidualThresholds()[0][row]),
                 floatBytes(mtpSeededVerifierThreshold(
                     request0_seed,
-                    4 + row,
+                    5 + row,
                     2 /* MTPSpecStochasticDrawPurpose::Residual */)));
             EXPECT_EQ(
                 floatBytes(mock->lastRequestBatchOutcomeAcceptThresholds()[1][row]),
                 floatBytes(mtpSeededVerifierThreshold(
                     request1_seed,
-                    3 + row,
+                    4 + row,
                     1 /* MTPSpecStochasticDrawPurpose::Accept */)));
             EXPECT_EQ(
                 floatBytes(mock->lastRequestBatchOutcomeResidualThresholds()[1][row]),
                 floatBytes(mtpSeededVerifierThreshold(
                     request1_seed,
-                    3 + row,
+                    4 + row,
                     2 /* MTPSpecStochasticDrawPurpose::Residual */)));
         }
         ASSERT_THAT(mock->lastRequestBatchOutcomeBonusThresholds(), SizeIs(2));
@@ -7018,24 +7547,29 @@ namespace
             floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[0]),
             floatBytes(mtpSeededVerifierThreshold(
                 request0_seed,
-                6,
+                7,
                 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
         EXPECT_EQ(
             floatBytes(mock->lastRequestBatchOutcomeBonusThresholds()[1]),
             floatBytes(mtpSeededVerifierThreshold(
                 request1_seed,
-                5,
+                6,
                 0 /* MTPSpecStochasticDrawPurpose::Sample */)));
     }
 
-    TEST_F(Test__PrefillDecodeTransition, RequestBatchedStochasticMixedReadyAndRejectStaysLockstep)
+    TEST_F(Test__PrefillDecodeTransition,
+           RequestBatchedStochasticMixedReadyDefersOneBoundaryThenRejoinsLockstep)
     {
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
                 /*max_request_batch=*/2,
                 /*mtp_draft_tokens=*/1,
                 MTPVerifyMode::SpeculativeSampling);
+        mock->setPrimaryDevice(DeviceId::cuda(0));
+        mock->enableMainLogitsBatchRowsOnDevice();
         mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableMTPDeviceDraftTokenInput();
         mock->forceStochasticRequestBatchReject(/*request_id=*/1,
                                                 /*correction_token=*/4);
 
@@ -7056,25 +7590,41 @@ namespace
         ASSERT_TRUE(second.error.empty()) << second.error;
         ASSERT_THAT(second.requests, SizeIs(2));
         EXPECT_THAT(second.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::DECODE_ARGMAX_TOKEN))
-            << "The all-accepted lane should emit its bonus-ready token inline "
-               "instead of leaving a terminal-logit state beside a rejected lane";
-        EXPECT_THAT(second.requests[1].tokens, ElementsAre(4));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN))
+            << "The all-accepted lane must not emit the next API call's ready "
+               "token in the current grouped verifier response.";
+        EXPECT_THAT(second.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN, 4));
         EXPECT_TRUE(runner->supportsDecodeStepBatch(2))
-            << "Inlining the ready token should keep every live request in the "
-               "same verifier-continuation state class";
+            << "A mixed ready/continuation transaction is a supported resident "
+               "flush state, not a missing grouped implementation.";
 
         GenerationBatchResult third = runner->decodeStepBatch(2);
         ASSERT_TRUE(third.error.empty()) << third.error;
         ASSERT_THAT(third.requests, SizeIs(2));
         EXPECT_THAT(third.requests[0].tokens,
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::DECODE_ARGMAX_TOKEN));
-        EXPECT_THAT(third.requests[1].tokens, ElementsAre(4));
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN))
+            << "The sampled terminal token belongs to this API boundary.";
+        EXPECT_TRUE(third.requests[1].tokens.empty())
+            << "The rejecting lane already emitted its correction and must not "
+               "run serial model work while its peer flushes a ready token.";
+        EXPECT_EQ(mock->forwardBatchCallCount(), 2)
+            << "Flushing resident sampled tokens must not execute another model forward.";
+        EXPECT_TRUE(runner->supportsDecodeStepBatch(2))
+            << "After the flush both live lanes own unforwarded conditions and "
+               "can rejoin grouped verification.";
+
+        GenerationBatchResult fourth = runner->decodeStepBatch(2);
+        ASSERT_TRUE(fourth.error.empty()) << fourth.error;
+        ASSERT_THAT(fourth.requests, SizeIs(2));
+        EXPECT_THAT(fourth.requests[0].tokens,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(fourth.requests[1].tokens,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN, 4));
         EXPECT_EQ(mock->forwardBatchCallCount(), 3)
-            << "The next lockstep step should run one verifier batch rather "
-               "than failing on mixed ready/verifier ownership";
+            << "The post-flush step must run one grouped verifier batch for both lanes.";
     }
 
     TEST_F(Test__PrefillDecodeTransition, PrefillBatchRejectsUndersizedRunnerCapacityBeforeForward)
@@ -9917,6 +10467,13 @@ namespace
         EXPECT_EQ(mock->forwardWithDeviceTokenIdsCount(), 1);
         EXPECT_EQ(mock->verifyStochasticRequestBatchOutcomeCount(), 1);
         EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokens(), ElementsAre(-1));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTokensFromDevice(),
+                    ElementsAre(true));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeFirstTargetSampleSlots(),
+                    ElementsAre(-1))
+            << "The deferred sample must relinquish ownership after verifier-row materialization.";
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowOffsets(), ElementsAre(0));
+        EXPECT_THAT(mock->lastRequestBatchOutcomeTokenRowStrides(), ElementsAre(2));
         ASSERT_THAT(mock->lastRequestBatchOutcomeDraftTokens(), SizeIs(1));
         EXPECT_THAT(mock->lastRequestBatchOutcomeDraftTokens()[0], ElementsAre(-1));
         EXPECT_EQ(mock->residentSidecarCountAtLastHostBridge(), 1)
@@ -11092,6 +11649,23 @@ namespace
                                PerfStatRecord::Kind::Counter,
                                "stochastic_terminal_host_samples");
             ASSERT_NE(host_terminal, nullptr);
+            ASSERT_NE(findPerfRecord(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "first_token_stochastic_serial_equivalent_host_samples"),
+                      nullptr);
+            ASSERT_NE(findPerfRecord(
+                          records,
+                          PerfStatRecord::Kind::Counter,
+                          "mtp_token_stochastic_position_keyed_host_samples"),
+                      nullptr);
+            const PerfStatRecord *serial_equivalent_row =
+                findPerfRecordWithTags(
+                    records,
+                    PerfStatRecord::Kind::Counter,
+                    "stochastic_serial_equivalent_host_verifier_rows",
+                    {{"row", "0"}});
+            ASSERT_NE(serial_equivalent_row, nullptr);
             const PerfStatRecord *trace =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
@@ -11182,11 +11756,25 @@ namespace
             EXPECT_EQ(probe.mtp_transaction_rollbacks, 0u);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *host_residual =
+            const PerfStatRecord *host_correction =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
-                               "stochastic_residual_host_samples");
-            ASSERT_NE(host_residual, nullptr);
+                               "stochastic_serial_equivalent_correction_host_samples");
+            ASSERT_NE(host_correction, nullptr);
+            EXPECT_EQ(findPerfRecord(records,
+                                     PerfStatRecord::Kind::Counter,
+                                     "stochastic_residual_host_samples"),
+                      nullptr)
+                << "seeded CPU grouped verification must use the exact serial "
+                   "target sample instead of probability-ratio residual recovery";
+            const PerfStatRecord *serial_equivalent_row =
+                findPerfRecordWithTags(
+                    records,
+                    PerfStatRecord::Kind::Counter,
+                    "stochastic_serial_equivalent_host_verifier_rows",
+                    {{"row", "0"},
+                     {"logical_position", "6"}});
+            ASSERT_NE(serial_equivalent_row, nullptr);
             const PerfStatRecord *trace =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,

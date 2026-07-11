@@ -1745,7 +1745,7 @@ namespace llaminar2
         if (!supportsRequestedRoutedAssignmentPolicy())
         {
             LOG_ERROR("[MoEExpertComputeStage] Routed expert assignment policy "
-                      << routedExpertAssignmentPolicyToString(params_.routed_expert_assignment_policy)
+                      << routedExpertAssignmentPolicyToString(params_.routed_assignment_policy)
                       << " is not wired for this execution path. Refusing to execute as StaticOwner.");
             return false;
         }
@@ -1793,7 +1793,7 @@ namespace llaminar2
         // Get device-appropriate MoE kernel for gather/scatter
         IMoEKernel *kernel = ensureMoEKernel();
 
-        // Expert Parallelism: determine which experts this rank processes
+        // Resolve the contiguous expert-ID range owned by this participant.
         const int local_start = params_.local_expert_start;
         const int local_count = (params_.local_expert_count < 0)
                                     ? num_experts
@@ -1952,7 +1952,7 @@ namespace llaminar2
                 has_prefill_mask,
                 !params_.expert_mask.empty(),
                 has_replicas,
-                params_.routed_expert_assignment_policy,
+                params_.routed_assignment_policy,
                 prefill_mask_ref,
                 params_.expert_mask,
                 expert_token_counts,
@@ -2082,7 +2082,7 @@ namespace llaminar2
         const float *routing_wt_data = params_.routing_weights->data();
 
         // Step 3: Group tokens by expert for batched GEMM execution.
-        // With EP, we only process experts in our local range, but still
+        // With expert-ID apportionment, process only the local range while still
         // build the full routing map so scratch sizing is correct.
 
         std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
@@ -2111,7 +2111,7 @@ namespace llaminar2
                 }
                 if (weight == 0.0f)
                     continue;
-                // With EP or dynamic mask, only accumulate tokens for local experts
+                // With static ownership or a dynamic resident mask, accumulate only local expert rows.
                 bool is_local;
                 if (has_prefill_mask)
                 {
@@ -2279,7 +2279,7 @@ namespace llaminar2
         // Zero output via tensor-aware kernel (works for both CPU and GPU)
         kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
 
-        // EP range
+        // Expert-ID ownership range.
         const int local_start = params_.local_expert_start;
         const int local_count = (params_.local_expert_count < 0)
                                     ? num_experts
@@ -4408,11 +4408,11 @@ namespace llaminar2
     {
         moe_prefill_runtime_grouping_available_ = false;
         const bool static_owner_runtime_grouping =
-            params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner &&
+            params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner &&
             ((hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
              hasFixedTopologyPrefillExpertMask());
         const bool least_loaded_runtime_grouping =
-            params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
+            params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident &&
             hasFixedTopologyPrefillExpertMask();
         if (!params_.use_runtime_prefill_grouping ||
             !params_.moe_runtime_table ||
@@ -4641,10 +4641,10 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::supportsRequestedRoutedAssignmentPolicy() const
     {
-        if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
+        if (params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
             return true;
 
-        if (params_.routed_expert_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedEP)
+        if (params_.routed_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedResident)
             return false;
 
         const bool supports_llep_prefill =
@@ -4675,10 +4675,10 @@ namespace llaminar2
         {
             return false;
         }
-        if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
+        if (params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
             return (hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
                    hasFixedTopologyPrefillExpertMask();
-        if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+        if (params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
             return hasFixedTopologyPrefillExpertMask();
         return false;
     }
@@ -4905,7 +4905,7 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::hasTransferBackedPrefillLLEP() const
     {
-        if (params_.routed_expert_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedEP ||
+        if (params_.routed_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedResident ||
             !params_.prefill_llep_tp_ctx ||
             !params_.moe_runtime_table ||
             !params_.prefill_llep_transfer_slots ||
@@ -5398,7 +5398,7 @@ namespace llaminar2
                      << " seq_len=" << seq_len
                      << " top_k=" << top_k
                      << " assignment_policy="
-                     << routedExpertAssignmentPolicyToString(params_.routed_expert_assignment_policy)
+                     << routedExpertAssignmentPolicyToString(params_.routed_assignment_policy)
                      << " runtime_grouping=" << perfBool(runtime_grouping)
                      << " masked_grouping=" << perfBool(masked_grouping)
                      << " requested_runtime_grouping=" << perfBool(params_.use_runtime_prefill_grouping)
@@ -5430,7 +5430,7 @@ namespace llaminar2
         if (runtime_grouping)
         {
             const bool filter_runtime_grouping_to_local_experts =
-                params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner;
+                params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner;
             groups_prepared = kernel->groupPrefillRoutes(
                 moe_runtime_layer_,
                 params_.routing_indices,
@@ -5446,7 +5446,7 @@ namespace llaminar2
                 return false;
             }
             if (groups_prepared &&
-                params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
             {
                 const auto &runtime_state =
                     params_.moe_runtime_table->hostLayerState(params_.layer_idx);
@@ -5571,7 +5571,7 @@ namespace llaminar2
                     if (params_.prefill_llep_require_transfer_backing)
                     {
                         throw std::runtime_error(
-                            "LeastLoadedEP grouped GPU prefill transfer mode 'full' requires "
+                            "LLEP grouped GPU prefill transfer mode 'full' requires "
                             "compact transfer-backed current-batch expert movement");
                     }
                     groups_prepared =

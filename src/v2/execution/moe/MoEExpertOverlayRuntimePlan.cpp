@@ -11,7 +11,7 @@ namespace llaminar2
 {
     namespace
     {
-        std::string formatValidationErrors(const MoEExpertParallelValidationResult &validation)
+        std::string formatValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
         {
             std::ostringstream message;
             message << "Invalid MoE expert overlay runtime plan:";
@@ -21,23 +21,23 @@ namespace llaminar2
         }
 
         int participantRankFor(
-            const ExpertComputeDomain &domain,
+            const RoutedExpertDomain &domain,
             size_t participant_index,
             int current_world_rank)
         {
             if (participant_index < domain.world_ranks.size())
                 return domain.world_ranks[participant_index];
-            if (domain.kind == ExpertDomainKind::NodeLocalTP)
+            if (domain.scope == ExecutionDomainScope::NODE_LOCAL)
                 return static_cast<int>(participant_index);
             if (participant_index == 0 && domain.owner_rank >= 0)
                 return domain.owner_rank;
             return current_world_rank;
         }
 
-        bool participantRankKnown(const ExpertComputeDomain &domain, size_t participant_index)
+        bool participantRankKnown(const RoutedExpertDomain &domain, size_t participant_index)
         {
             return participant_index < domain.world_ranks.size() ||
-                   domain.kind == ExpertDomainKind::NodeLocalTP ||
+                   domain.scope == ExecutionDomainScope::NODE_LOCAL ||
                    (participant_index == 0 && domain.owner_rank >= 0);
         }
 
@@ -55,7 +55,7 @@ namespace llaminar2
 
         bool isCpuNodeLocalFallbackDomain(const MoEOverlayRuntimeDomain &domain)
         {
-            if (domain.kind != ExpertDomainKind::NodeLocalTP || domain.participants.empty())
+            if (domain.scope != ExecutionDomainScope::NODE_LOCAL || domain.participants.empty())
                 return false;
             return std::all_of(domain.participants.begin(), domain.participants.end(),
                                [](const auto &participant)
@@ -64,10 +64,10 @@ namespace llaminar2
                                });
         }
 
-        bool isAcceleratorLocalTPShardedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
+        bool isAcceleratorLocalTPTensorShardedDomain(const MoEOverlayRuntimeDomain &domain)
         {
-            if (domain.kind != ExpertDomainKind::LocalTP ||
-                domain.compute_kind != ExpertDomainComputeKind::ShardedExperts ||
+            if (domain.scope != ExecutionDomainScope::LOCAL ||
+                domain.routed_compute_policy != RoutedExpertComputePolicy::TensorSharded ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -82,10 +82,10 @@ namespace llaminar2
                                });
         }
 
-        bool isLocalTPApportionedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
+        bool isLocalTPExpertIdApportionedDomain(const MoEOverlayRuntimeDomain &domain)
         {
-            if (domain.kind != ExpertDomainKind::LocalTP ||
-                domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts ||
+            if (domain.scope != ExecutionDomainScope::LOCAL ||
+                domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -102,8 +102,8 @@ namespace llaminar2
         bool hasDomainScopedRuntimeSupport(const MoEOverlayRuntimeDomain &domain)
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
-                   isAcceleratorLocalTPShardedExpertsDomain(domain) ||
-                   isLocalTPApportionedExpertsDomain(domain);
+                   isAcceleratorLocalTPTensorShardedDomain(domain) ||
+                   isLocalTPExpertIdApportionedDomain(domain);
         }
 
         std::string sanitizeDomainToken(std::string value)
@@ -141,16 +141,16 @@ namespace llaminar2
         }
 
         MoEOverlayRuntimeDomain resolveDomain(
-            const ExpertComputeDomain &domain,
+            const RoutedExpertDomain &domain,
             int current_world_rank)
         {
             const auto canonical = domain.toExecutionDomainDefinition();
             MoEOverlayRuntimeDomain resolved;
             resolved.name = canonical.name;
-            resolved.kind = domain.kind;
+            resolved.scope = domain.scope;
             resolved.backend = canonical.backend;
-            resolved.compute_kind = domain.compute_kind;
-            resolved.assignment_policy = domain.assignment_policy;
+            resolved.routed_compute_policy = domain.routed_compute_policy;
+            resolved.routed_assignment_policy = domain.routed_assignment_policy;
             resolved.owner_rank = canonical.owner_rank.value_or(-1);
 
             resolved.participants.reserve(canonical.participants.size());
@@ -188,13 +188,13 @@ namespace llaminar2
                 domain.hasMultipleParticipants() && !resolved.domain_scoped_collective_context_ready;
             if (resolved.multi_participant_execution_pending)
             {
-                const bool sharded_experts =
-                    domain.compute_kind == ExpertDomainComputeKind::ShardedExperts;
+                const bool tensor_sharded =
+                    domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded;
                 std::ostringstream reason;
                 reason << "Domain-scoped runtime support is not available for this "
-                       << (sharded_experts ? "ShardedExperts" : "multi-participant")
+                       << (tensor_sharded ? "tensor-sharded" : "multi-participant")
                        << " domain shape. Bridge Phase 5C covers accelerator LocalTP "
-                       << "ShardedExperts and CPU NodeLocalTP fallback helpers; Bridge Phase 5D "
+                       << "tensor-sharded and CPU NodeLocalTP fallback helpers; Bridge Phase 5D "
                        << "still wires the accelerator LocalTP executor into the Qwen graph. "
                        << "Primary-only lowering to " << resolved.primary_device.to_string()
                        << " is no longer used for routed tier work";
@@ -205,7 +205,7 @@ namespace llaminar2
     } // namespace
 
     MoEExpertOverlayRuntimePlan::MoEExpertOverlayRuntimePlan(
-        std::shared_ptr<const MoEExpertParallelPlan> source_plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan,
         int current_world_rank,
         std::vector<MoEOverlayRuntimeDomain> domains,
         std::vector<MoEOverlayRuntimeTier> routed_tiers)
@@ -321,10 +321,12 @@ namespace llaminar2
         for (const auto &domain : domains_)
         {
             out << "\n  domain " << domain.name
-                << ": kind=" << toString(domain.kind)
+                << ": scope=" << executionDomainScopeToString(domain.scope)
                 << " backend=" << collectiveBackendTypeToString(domain.backend)
-                << " compute=" << toString(domain.compute_kind)
-                << " assignment=" << routedExpertAssignmentPolicyToString(domain.assignment_policy)
+                << " routed_compute="
+                << routedExpertComputePolicyToString(domain.routed_compute_policy)
+                << " routed_assignment="
+                << routedExpertAssignmentPolicyToString(domain.routed_assignment_policy)
                 << " participants=" << domain.participants.size()
                 << " primary=" << domain.primary_participant.toShortString()
                 << " primary_device=" << domain.primary_device.to_string()
@@ -358,21 +360,19 @@ namespace llaminar2
     }
 
     std::shared_ptr<MoEExpertOverlayRuntimePlan> resolveMoEExpertOverlayRuntimePlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         const MoEExpertOverlayRuntimeResolverOptions &options)
     {
         if (!plan || !plan->isTieredOverlay())
             return nullptr;
 
-        const auto validation = validateMoEExpertParallelPlan(
-            *plan,
-            MoEExpertParallelValidationOptions{.allow_routed_sharded_experts = true});
+        const auto validation = validateMoERoutedExpertPlacementPlan(*plan);
         if (!validation.ok())
             throw std::invalid_argument(formatValidationErrors(validation));
 
         std::vector<MoEOverlayRuntimeDomain> domains;
         domains.reserve(plan->dense_domains.size() + plan->domains.size());
-        auto addDomainIfAbsent = [&](const ExpertComputeDomain &domain)
+        auto addDomainIfAbsent = [&](const RoutedExpertDomain &domain)
         {
             const auto exists = std::any_of(domains.begin(), domains.end(), [&](const auto &resolved)
                                             { return resolved.name == domain.name; });
@@ -380,7 +380,7 @@ namespace llaminar2
                 domains.push_back(resolveDomain(domain, options.current_world_rank));
         };
         for (const auto &domain : plan->dense_domains)
-            addDomainIfAbsent(ExpertComputeDomain::fromExecutionDomainDefinition(domain));
+            addDomainIfAbsent(RoutedExpertDomain::fromExecutionDomainDefinition(domain));
         for (const auto &domain : plan->domains)
             addDomainIfAbsent(domain);
 
@@ -448,7 +448,8 @@ namespace llaminar2
             if (domain.multi_participant_execution_pending)
             {
                 LOG_WARN("[MoEExpertOverlayRuntimePlan] Domain '" << domain.name
-                                                                  << "' requests " << toString(domain.compute_kind)
+                                                                  << "' requests "
+                                                                  << routedExpertComputePolicyToString(domain.routed_compute_policy)
                                                                   << " over " << domain.participants.size()
                                                                   << " participants; " << domain.pending_reason);
             }

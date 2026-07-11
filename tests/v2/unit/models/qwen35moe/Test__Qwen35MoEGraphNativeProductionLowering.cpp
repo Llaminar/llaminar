@@ -164,35 +164,35 @@ namespace llaminar2::test
             std::fill_n(tensor->mutable_data(), tensor->numel(), value);
         }
 
-        ExpertComputeDomain domain(const std::string &name, GlobalDeviceAddress participant)
+        RoutedExpertDomain domain(const std::string &name, GlobalDeviceAddress participant)
         {
-            ExpertComputeDomain result;
+            RoutedExpertDomain result;
             result.name = name;
-            result.kind = ExpertDomainKind::SingleDevice;
+            result.scope = ExecutionDomainScope::SINGLE;
             result.backend = CollectiveBackendType::HOST;
             result.participants = {std::move(participant)};
-            result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            result.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             result.owner_rank = 0;
             return result;
         }
 
-        ExpertComputeDomain localTPDomain(
+        RoutedExpertDomain localTPDomain(
             const std::string &name,
             std::vector<GlobalDeviceAddress> participants)
         {
-            ExpertComputeDomain result;
+            RoutedExpertDomain result;
             result.name = name;
-            result.kind = ExpertDomainKind::LocalTP;
+            result.scope = ExecutionDomainScope::LOCAL;
             result.backend = CollectiveBackendType::RCCL;
             result.participants = std::move(participants);
-            result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            result.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             result.owner_rank = 0;
             return result;
         }
 
-        ExpertRoutedTier tier(const std::string &name, const std::string &domain_name, int priority, bool fallback = false)
+        RoutedExpertTier tier(const std::string &name, const std::string &domain_name, int priority, bool fallback = false)
         {
-            ExpertRoutedTier result;
+            RoutedExpertTier result;
             result.name = name;
             result.domain = domain_name;
             result.priority = priority;
@@ -200,17 +200,17 @@ namespace llaminar2::test
             return result;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> makeProductionStylePlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> makeProductionStylePlan()
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "continuation";
             plan->base_model_domain = "continuation";
             plan->shared_expert_domain = "continuation";
             plan->continuation_domain_spec.domain = "continuation";
             plan->continuation_domain_spec.logical_root_participant = 0;
-            plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+            plan->residency_policy = RoutedExpertResidencyPolicy::ExplicitMasks;
             plan->domains = {
                 domain("continuation", GlobalDeviceAddress::cpu(0)),
                 domain("hot_domain", GlobalDeviceAddress::cpu(0)),
@@ -222,27 +222,27 @@ namespace llaminar2::test
                 tier("warm", "warm_domain", 1),
                 tier("cold", "cold_domain", 99, true),
             };
-            plan->placements.push_back(ExpertLayerPlacement{
+            plan->placements.push_back(RoutedExpertLayerPlacement{
                 .layer = 0,
                 .routed_expert_tier = {0, 1, 2, 0, 1, 2},
             });
-            validateMoEExpertParallelPlanOrThrow(
+            validateMoERoutedExpertPlacementPlanOrThrow(
                 *plan,
                 {.layer_count = 1, .routed_expert_count = kNumExperts});
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> makeLocalTPApportionedHotPlan(int layer_count = 1)
+        std::shared_ptr<MoERoutedExpertPlacementPlan> makeLocalTPApportionedHotPlan(int layer_count = 1)
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "hot_domain";
             plan->base_model_domain = "hot_domain";
             plan->shared_expert_domain = "hot_domain";
             plan->continuation_domain_spec.domain = "hot_domain";
             plan->continuation_domain_spec.logical_root_participant = 0;
-            plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+            plan->residency_policy = RoutedExpertResidencyPolicy::ExplicitMasks;
             plan->domains = {
                 localTPDomain(
                     "hot_domain",
@@ -253,18 +253,18 @@ namespace llaminar2::test
             };
             for (int layer = 0; layer < layer_count; ++layer)
             {
-                plan->placements.push_back(ExpertLayerPlacement{
+                plan->placements.push_back(RoutedExpertLayerPlacement{
                     .layer = layer,
                     .routed_expert_tier = {0, 0, 0, 0, 0, 0},
                 });
             }
-            validateMoEExpertParallelPlanOrThrow(
+            validateMoERoutedExpertPlacementPlanOrThrow(
                 *plan,
                 {.layer_count = layer_count, .routed_expert_count = kNumExperts});
             return plan;
         }
 
-        GraphConfig makeConfig(std::shared_ptr<MoEExpertParallelPlan> plan)
+        GraphConfig makeConfig(std::shared_ptr<MoERoutedExpertPlacementPlan> plan)
         {
             GraphConfig config;
             config.n_layers = 2;
@@ -281,7 +281,7 @@ namespace llaminar2::test
             config.moe.top_k = kTopK;
             config.moe.intermediate_size = kIntermediate;
             config.moe.norm_topk_prob = true;
-            config.moe.expert_parallel_plan = std::move(plan);
+            config.moe.routed_expert_plan = std::move(plan);
             return config;
         }
 
@@ -571,7 +571,7 @@ namespace llaminar2::test
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPApportionedExpertsGpuPrefillUsesCapturableFastPathByDefault)
+         LocalTPApportionedRoutedComputeGpuPrefillUsesCapturableFastPathByDefault)
     {
         GraphConfig config = makeConfig(makeLocalTPApportionedHotPlan());
         config.default_device = DeviceId::rocm(0);
@@ -705,11 +705,11 @@ namespace llaminar2::test
         });
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -751,11 +751,11 @@ namespace llaminar2::test
         });
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -779,17 +779,17 @@ namespace llaminar2::test
         const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(expert_node->stage.get());
         ASSERT_NE(expert_stage, nullptr);
         EXPECT_EQ(expert_stage->routedExpertAssignmentPolicyForTesting(),
-                  RoutedExpertAssignmentPolicy::LeastLoadedEP)
-            << "assignment=least_loaded_ep must reach the production expert stage; otherwise "
+                  RoutedExpertAssignmentPolicy::LeastLoadedResident)
+            << "assignment=least-loaded-resident must reach the production expert stage; otherwise "
                "the graph can silently execute StaticOwner under an LLEP label.";
         EXPECT_TRUE(expert_stage->usesRuntimePrefillGroupingForTesting())
-            << "LeastLoadedEP prefill must use runtime grouping so the device-side "
+            << "LLEP prefill must use runtime grouping so the device-side "
                "route-participant assignment kernel is reachable in production graphs.";
         EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting())
-            << "LeastLoadedEP prefill must carry its LocalTP context so full "
+            << "LLEP prefill must carry its LocalTP context so full "
                "current-batch row exchange can use grouped NCCL/RCCL collectives.";
         EXPECT_TRUE(expert_stage->hasTransferBackedPrefillLLEPForTesting())
-            << "LeastLoadedEP prefill must carry compact transfer-slot backing; "
+            << "LLEP prefill must carry compact transfer-slot backing; "
                "otherwise foreign current-batch spans silently collapse back to resident-only routing.";
         EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
     }
@@ -804,11 +804,11 @@ namespace llaminar2::test
         constexpr int kLayerCount = 2;
         auto plan = makeLocalTPApportionedHotPlan(kLayerCount);
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -853,11 +853,11 @@ namespace llaminar2::test
     {
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
-        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        plan->domains[0].routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         GraphConfig config = makeConfig(plan);
         config.default_device = DeviceId::rocm(0);
-        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        config.moe.routed_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
 
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
@@ -880,14 +880,14 @@ namespace llaminar2::test
         const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(expert_node->stage.get());
         ASSERT_NE(expert_stage, nullptr);
         EXPECT_EQ(expert_stage->routedExpertAssignmentPolicyForTesting(),
-                  RoutedExpertAssignmentPolicy::LeastLoadedEP);
+                  RoutedExpertAssignmentPolicy::LeastLoadedResident);
         EXPECT_FALSE(expert_stage->usesRuntimePrefillGroupingForTesting())
             << "Single-token decode uses the runtime decode table, not the multi-token prefill grouper.";
         EXPECT_TRUE(expert_stage->hasMoERuntimeTableForTesting())
-            << "LeastLoadedEP decode must be given the runtime placement table; without it "
+            << "LLEP decode must be given the runtime placement table; without it "
                "production decode fails closed before the device-routed path can run.";
         EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting())
-            << "LeastLoadedEP decode must be allowed to enter the existing device-routed "
+            << "LLEP decode must be allowed to enter the existing device-routed "
                "runtime table path instead of failing before executeSingleToken().";
     }
 

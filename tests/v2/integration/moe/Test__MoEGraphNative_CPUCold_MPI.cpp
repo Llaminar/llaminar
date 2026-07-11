@@ -121,38 +121,38 @@ namespace llaminar2::test
             return weights;
         }
 
-        ExpertComputeDomain hotDomain()
+        RoutedExpertDomain hotDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "cpu_hot";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::MPI;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.world_ranks = {0};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain cpuColdDomain()
+        RoutedExpertDomain cpuColdDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "cpu_cold";
-            domain.kind = ExpertDomainKind::NodeLocalTP;
+            domain.scope = ExecutionDomainScope::NODE_LOCAL;
             domain.backend = CollectiveBackendType::UPI;
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
             domain.world_ranks = {1, 2};
             domain.owner_rank = 1;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier routedTier(const std::string &name,
+        RoutedExpertTier routedTier(const std::string &name,
                                     const std::string &domain,
                                     int priority,
                                     bool fallback = false)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             tier.priority = priority;
@@ -160,21 +160,21 @@ namespace llaminar2::test
             return tier;
         }
 
-        MoEExpertParallelPlan makeCpuColdPlan()
+        MoERoutedExpertPlacementPlan makeCpuColdPlan()
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "cpu_hot";
             plan.shared_expert_domain = "cpu_hot";
-            plan.residency_policy = ExpertResidencyPolicy::StaticById;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan.domains = {hotDomain(), cpuColdDomain()};
             plan.routed_tiers = {
                 routedTier("hot", "cpu_hot", 0),
                 routedTier("cold", "cpu_cold", 1, true),
             };
             plan.placements = {
-                ExpertLayerPlacement{.layer = kLayer,
+                RoutedExpertLayerPlacement{.layer = kLayer,
                                      .routed_expert_tier = {0, 0, 1, 1}},
             };
             return plan;
@@ -236,7 +236,7 @@ namespace llaminar2::test
                                               TensorBase *hidden,
                                               TensorBase *routing_indices,
                                               TensorBase *routing_weights,
-                                              const MoEExpertParallelPlan &plan)
+                                              const MoERoutedExpertPlacementPlan &plan)
         {
             MoEExpertDispatchOutput dispatch;
             MoEExpertDispatchStage::Params params;

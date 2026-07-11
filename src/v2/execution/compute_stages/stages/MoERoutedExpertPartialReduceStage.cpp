@@ -1,6 +1,6 @@
 /**
- * @file MoEExpertParallelReduceStage.cpp
- * @brief Implementation of cross-domain partial reduction for MoE expert-parallel tiers.
+ * @file MoERoutedExpertPartialReduceStage.cpp
+ * @brief Cross-domain reduction of partial routed-expert outputs.
  *
  * Bridge Phase 7A sparse return interface:
  *  - Partials with selected_rows non-empty are scatter-added (sparse layout).
@@ -10,7 +10,7 @@
  *    H2D upload and standard device accumulation. See runContinuationDeviceOptimizedReduce().
  */
 
-#include "MoEExpertParallelReduceStage.h"
+#include "MoERoutedExpertPartialReduceStage.h"
 
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/IBackend.h"
@@ -34,7 +34,7 @@ namespace llaminar2
         struct PartialRuntime
         {
             const ITensor *tensor = nullptr;
-            MoEExpertParallelReducePartialInfo info;
+            MoERoutedExpertPartialReducePartialInfo info;
             size_t bytes = 0;
             bool host_sync_required = false;
             bool is_sparse = false;      ///< True when info.selected_rows is non-empty
@@ -45,12 +45,12 @@ namespace llaminar2
         {
             if (!tensor)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Null " << name << " tensor");
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Null " << name << " tensor");
                 return false;
             }
             if (tensor->native_type() != TensorType::FP32)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] " << name << " must be FP32");
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] " << name << " must be FP32");
                 return false;
             }
             return true;
@@ -61,12 +61,12 @@ namespace llaminar2
             const auto &shape = tensor->shape();
             if (shape.size() != 2)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] " << name << " must be 2D [rows, cols], got rank " << shape.size());
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] " << name << " must be 2D [rows, cols], got rank " << shape.size());
                 return false;
             }
             if (shape[0] == 0 || shape[1] == 0)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] " << name << " has invalid empty shape ["
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] " << name << " has invalid empty shape ["
                                                             << shape[0] << ", " << shape[1] << "]");
                 return false;
             }
@@ -90,15 +90,15 @@ namespace llaminar2
             return device.is_valid() ? device.to_string() : "invalid";
         }
 
-        MoEExpertParallelReducePartialInfo partialInfoFor(
-            const MoEExpertParallelReduceStage::Params &params,
+        MoERoutedExpertPartialReducePartialInfo partialInfoFor(
+            const MoERoutedExpertPartialReduceStage::Params &params,
             size_t partial_index,
             const ITensor *partial)
         {
             if (partial_index < params.partial_infos.size())
                 return params.partial_infos[partial_index];
 
-            MoEExpertParallelReducePartialInfo info;
+            MoERoutedExpertPartialReducePartialInfo info;
             info.name = "partial" + std::to_string(partial_index);
             if (const auto *base = tensorBase(partial))
             {
@@ -111,7 +111,7 @@ namespace llaminar2
         }
 
         bool sourceMatchesContinuation(
-            const MoEExpertParallelReducePartialInfo &info,
+            const MoERoutedExpertPartialReducePartialInfo &info,
             const std::string &continuation_domain,
             DeviceId continuation_device)
         {
@@ -122,16 +122,16 @@ namespace llaminar2
         }
 
         void recordPartialDiagnostics(
-            MoEExpertParallelReduceDiagnostics *diagnostics,
+            MoERoutedExpertPartialReduceDiagnostics *diagnostics,
             const PartialRuntime &partial,
             const std::string &continuation_domain,
             DeviceId continuation_device,
-            MoEExpertParallelReducePartialAccumulationPath accumulation_path)
+            MoERoutedExpertPartialReducePartialAccumulationPath accumulation_path)
         {
             if (!diagnostics)
                 return;
 
-            MoEExpertParallelReducePartialDiagnostics entry;
+            MoERoutedExpertPartialReducePartialDiagnostics entry;
             entry.name = partial.info.name;
             entry.source_domain = partial.info.source_domain;
             entry.source_device = partial.info.source_device;
@@ -150,7 +150,7 @@ namespace llaminar2
         }
 
         void estimateOptimizedTransferBytes(
-            MoEExpertParallelReduceDiagnostics *diagnostics,
+            MoERoutedExpertPartialReduceDiagnostics *diagnostics,
             const PartialRuntime &partial,
             const TensorBase *partial_base,
             DeviceId continuation_device,
@@ -181,7 +181,7 @@ namespace llaminar2
             {
                 if (row < 0 || static_cast<size_t>(row) >= live_rows)
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Sparse partial tensor " << partial_index
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse partial tensor " << partial_index
                                                                                       << " selected row " << row
                                                                                       << " is outside live row range [0, "
                                                                                       << live_rows << ")");
@@ -191,7 +191,7 @@ namespace llaminar2
                 auto &was_seen = seen[static_cast<size_t>(row)];
                 if (was_seen)
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Sparse partial tensor " << partial_index
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse partial tensor " << partial_index
                                                                                       << " contains duplicate selected row " << row);
                     return false;
                 }
@@ -201,7 +201,7 @@ namespace llaminar2
         }
 
         TensorBase *sparseExpansionScratchFor(
-            const MoEExpertParallelReduceStage::Params &params,
+            const MoERoutedExpertPartialReduceStage::Params &params,
             size_t sparse_index,
             size_t live_rows,
             size_t live_cols,
@@ -209,7 +209,7 @@ namespace llaminar2
         {
             if (sparse_index >= params.sparse_expansion_scratch.size())
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Sparse optimized partial '"
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse optimized partial '"
                           << partial_name << "' requires preallocated dense expansion scratch ["
                           << live_rows << ", " << live_cols << "]; none was provided for sparse partial index "
                           << sparse_index);
@@ -219,14 +219,14 @@ namespace llaminar2
             TensorBase *scratch = params.sparse_expansion_scratch[sparse_index];
             if (!scratch)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Sparse optimized partial '"
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse optimized partial '"
                           << partial_name << "' has null dense expansion scratch at sparse partial index "
                           << sparse_index);
                 return nullptr;
             }
             if (scratch->native_type() != TensorType::FP32)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Sparse optimized partial '"
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse optimized partial '"
                           << partial_name << "' expansion scratch must be FP32, got "
                           << scratch->dtype_name());
                 return nullptr;
@@ -235,7 +235,7 @@ namespace llaminar2
             const auto &shape = scratch->shape();
             if (shape.size() != 2 || shape[0] < live_rows || shape[1] != live_cols)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Sparse optimized partial '"
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse optimized partial '"
                           << partial_name << "' expansion scratch shape ["
                           << (shape.empty() ? 0 : shape[0]) << ", "
                           << (shape.size() < 2 ? 0 : shape[1])
@@ -245,13 +245,13 @@ namespace llaminar2
             return scratch;
         }
 
-        void logDiagnosticsIfRequested(const MoEExpertParallelReduceDiagnostics &diagnostics)
+        void logDiagnosticsIfRequested(const MoERoutedExpertPartialReduceDiagnostics &diagnostics)
         {
             const auto &env = debugEnv();
             if (!env.moe_expert_overlay.transfer_trace && !env.moe_expert_overlay.trace && !env.profile.enabled)
                 return;
 
-            LOG_DEBUG("[MoEExpertParallelReduceStage] mode=" << toString(diagnostics.mode)
+            LOG_DEBUG("[MoERoutedExpertPartialReduceStage] mode=" << toString(diagnostics.mode)
                                                             << " host_staged=" << (diagnostics.host_staged ? "true" : "false")
                                                             << " continuation_domain=" << diagnostics.continuation_domain
                                                             << " continuation_device=" << deviceString(diagnostics.continuation_device)
@@ -269,7 +269,7 @@ namespace llaminar2
             {
                 for (const auto &partial : diagnostics.partials)
                 {
-                    LOG_DEBUG("[MoEExpertParallelReduceStage] partial name=" << partial.name
+                    LOG_DEBUG("[MoERoutedExpertPartialReduceStage] partial name=" << partial.name
                                                                             << " source_domain=" << partial.source_domain
                                                                             << " source_device=" << deviceString(partial.source_device)
                                                                             << " bytes=" << partial.bytes
@@ -283,14 +283,14 @@ namespace llaminar2
         }
 
         bool runHostStagedCorrectnessReduce(
-            const MoEExpertParallelReduceStage::Params &params,
+            const MoERoutedExpertPartialReduceStage::Params &params,
             const std::vector<PartialRuntime> &runtime_partials,
             TensorBase *output_base,
             size_t element_count,
             size_t live_cols,
-            MoEExpertParallelReduceDiagnostics *diagnostics)
+            MoERoutedExpertPartialReduceDiagnostics *diagnostics)
         {
-            diagnostics->mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+            diagnostics->mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
             diagnostics->host_staged = true;
 
             float *out = params.output->mutable_data();
@@ -307,13 +307,13 @@ namespace llaminar2
                     partial,
                     params.continuation_domain,
                     params.continuation_device,
-                    MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback);
+                    MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback);
 
                 if (const auto *partial_base = tensorBase(partial.tensor))
                 {
                     if (!const_cast<TensorBase *>(partial_base)->ensureOnHost())
                     {
-                        LOG_ERROR("[MoEExpertParallelReduceStage] Failed to stage partial '"
+                        LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to stage partial '"
                                   << partial.info.name << "' from domain '" << partial.info.source_domain
                                   << "' on host for reduction");
                         return false;
@@ -346,7 +346,7 @@ namespace llaminar2
                 diagnostics->host_to_device_bytes += element_count * sizeof(float);
                 if (!output_base->ensureOnDevice(params.continuation_device))
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Failed to upload reduced output to continuation domain '"
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to upload reduced output to continuation domain '"
                               << params.continuation_domain << "' on " << params.continuation_device.to_string());
                     return false;
                 }
@@ -361,19 +361,19 @@ namespace llaminar2
         }
 
         bool runContinuationDeviceOptimizedReduce(
-            const MoEExpertParallelReduceStage::Params &params,
+            const MoERoutedExpertPartialReduceStage::Params &params,
             const std::vector<PartialRuntime> &runtime_partials,
             TensorBase *output_base,
             size_t element_count,
             size_t live_cols,
-            MoEExpertParallelReduceDiagnostics *diagnostics,
+            MoERoutedExpertPartialReduceDiagnostics *diagnostics,
             void *stream)
         {
             if (!params.continuation_device.is_gpu())
             {
-                LOG_DEBUG("[MoEExpertParallelReduceStage] " << toString(params.mode)
+                LOG_DEBUG("[MoERoutedExpertPartialReduceStage] " << toString(params.mode)
                                                             << " requested for CPU continuation; using "
-                                                            << toString(MoEExpertParallelReduceMode::HostStagedCorrectness)
+                                                            << toString(MoERoutedExpertPartialReduceMode::HostStagedCorrectness)
                                                             << " bridge path");
                 return runHostStagedCorrectnessReduce(params, runtime_partials, output_base, element_count, live_cols, diagnostics);
             }
@@ -381,12 +381,12 @@ namespace llaminar2
             IBackend *backend = getBackendFor(params.continuation_device);
             if (!backend)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] No backend available for continuation device "
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] No backend available for continuation device "
                           << params.continuation_device.to_string());
                 return false;
             }
 
-            diagnostics->mode = MoEExpertParallelReduceMode::ContinuationDeviceOptimized;
+            diagnostics->mode = MoERoutedExpertPartialReduceMode::ContinuationDeviceOptimized;
             diagnostics->host_staged = false;
 
             const size_t live_bytes = element_count * sizeof(float);
@@ -396,14 +396,14 @@ namespace llaminar2
                 diagnostics->host_to_device_bytes += params.output->numel() * sizeof(float);
                 if (!output_base->ensureOnDevice(params.continuation_device))
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Failed to upload output tail-preservation buffer to "
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to upload output tail-preservation buffer to "
                               << params.continuation_device.to_string());
                     return false;
                 }
             }
             else if (!output_base->allocateOnDevice(params.continuation_device))
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Failed to allocate reduced output on continuation device "
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to allocate reduced output on continuation device "
                           << params.continuation_device.to_string());
                 return false;
             }
@@ -411,14 +411,14 @@ namespace llaminar2
             void *output_device = output_base->gpu_data_ptr();
             if (!output_device)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Output has no device pointer after continuation allocation");
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Output has no device pointer after continuation allocation");
                 return false;
             }
 
             const int continuation_ordinal = params.continuation_device.gpu_ordinal();
             if (!backend->memset(output_device, 0, live_bytes, continuation_ordinal, stream))
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Failed to zero live output region on "
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to zero live output region on "
                           << params.continuation_device.to_string());
                 return false;
             }
@@ -430,7 +430,7 @@ namespace llaminar2
                 auto *partial_base = const_cast<TensorBase *>(tensorBase(partial.tensor));
                 if (!partial_base)
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Optimized continuation-device reduction requires TensorBase partials");
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Optimized continuation-device reduction requires TensorBase partials");
                     return false;
                 }
 
@@ -446,7 +446,7 @@ namespace llaminar2
 
                     if (!partial_base->ensureOnHost())
                     {
-                        LOG_ERROR("[MoEExpertParallelReduceStage] Failed to stage sparse partial '"
+                        LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to stage sparse partial '"
                                   << partial.info.name << "' on host for scatter-add before continuation-device accumulation");
                         return false;
                     }
@@ -478,7 +478,7 @@ namespace llaminar2
 
                     if (!dense_scratch->ensureOnDevice(params.continuation_device))
                     {
-                        LOG_ERROR("[MoEExpertParallelReduceStage] Failed to upload scatter-expanded sparse partial '"
+                        LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to upload scatter-expanded sparse partial '"
                                   << partial.info.name << "' to " << params.continuation_device.to_string());
                         return false;
                     }
@@ -486,7 +486,7 @@ namespace llaminar2
                     const void *scratch_device = dense_scratch->gpu_data_ptr();
                     if (!scratch_device)
                     {
-                        LOG_ERROR("[MoEExpertParallelReduceStage] Expanded sparse partial '" << partial.info.name
+                        LOG_ERROR("[MoERoutedExpertPartialReduceStage] Expanded sparse partial '" << partial.info.name
                                                                                              << "' has no device pointer after H2D upload");
                         return false;
                     }
@@ -494,7 +494,7 @@ namespace llaminar2
                     if (!backend->vectorAddInplace(output_device, scratch_device, element_count,
                                                    sizeof(float), continuation_ordinal, stream))
                     {
-                        LOG_ERROR("[MoEExpertParallelReduceStage] Device accumulation of scatter-expanded sparse partial '"
+                        LOG_ERROR("[MoERoutedExpertPartialReduceStage] Device accumulation of scatter-expanded sparse partial '"
                                   << partial.info.name << "' failed on " << params.continuation_device.to_string());
                         return false;
                     }
@@ -504,7 +504,7 @@ namespace llaminar2
                         partial,
                         params.continuation_domain,
                         params.continuation_device,
-                        MoEExpertParallelReducePartialAccumulationPath::HostStagedThenDeviceAccumulated);
+                        MoERoutedExpertPartialReducePartialAccumulationPath::HostStagedThenDeviceAccumulated);
                     continue;
                 }
 
@@ -523,7 +523,7 @@ namespace llaminar2
                 {
                     if (!partial_base->ensureOnHost())
                     {
-                        LOG_ERROR("[MoEExpertParallelReduceStage] Failed to stage partial '"
+                        LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to stage partial '"
                                   << partial.info.name << "' from " << current_device->to_string()
                                   << " through host before continuation-device accumulation on "
                                   << params.continuation_device.to_string());
@@ -533,7 +533,7 @@ namespace llaminar2
 
                 if (!partial_base->ensureOnDevice(params.continuation_device))
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Failed to make partial '"
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Failed to make partial '"
                               << partial.info.name << "' available on continuation device "
                               << params.continuation_device.to_string());
                     return false;
@@ -542,7 +542,7 @@ namespace llaminar2
                 const void *partial_device = partial_base->gpu_data_ptr();
                 if (!partial_device)
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Partial '" << partial.info.name
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Partial '" << partial.info.name
                                                                          << "' has no device pointer after transfer to continuation");
                     return false;
                 }
@@ -550,7 +550,7 @@ namespace llaminar2
                 if (!backend->vectorAddInplace(output_device, partial_device, element_count,
                                                sizeof(float), continuation_ordinal, stream))
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Device accumulation failed for partial '"
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Device accumulation failed for partial '"
                               << partial.info.name << "' on " << params.continuation_device.to_string());
                     return false;
                 }
@@ -561,8 +561,8 @@ namespace llaminar2
                     params.continuation_domain,
                     params.continuation_device,
                     already_on_continuation
-                        ? MoEExpertParallelReducePartialAccumulationPath::ContinuationDeviceAccumulated
-                        : MoEExpertParallelReducePartialAccumulationPath::HostStagedThenDeviceAccumulated);
+                        ? MoERoutedExpertPartialReducePartialAccumulationPath::ContinuationDeviceAccumulated
+                        : MoERoutedExpertPartialReducePartialAccumulationPath::HostStagedThenDeviceAccumulated);
             }
 
             output_base->transitionToWithEvent(
@@ -575,35 +575,35 @@ namespace llaminar2
 
     } // namespace
 
-    const char *toString(MoEExpertParallelReduceMode mode)
+    const char *toString(MoERoutedExpertPartialReduceMode mode)
     {
         switch (mode)
         {
-        case MoEExpertParallelReduceMode::HostStagedCorrectness:
+        case MoERoutedExpertPartialReduceMode::HostStagedCorrectness:
             return "HostStagedCorrectness";
-        case MoEExpertParallelReduceMode::ContinuationDeviceOptimized:
+        case MoERoutedExpertPartialReduceMode::ContinuationDeviceOptimized:
             return "ContinuationDeviceOptimized";
         }
         return "Unknown";
     }
 
-    const char *toString(MoEExpertParallelReducePartialAccumulationPath path)
+    const char *toString(MoERoutedExpertPartialReducePartialAccumulationPath path)
     {
         switch (path)
         {
-        case MoEExpertParallelReducePartialAccumulationPath::ContinuationDeviceAccumulated:
+        case MoERoutedExpertPartialReducePartialAccumulationPath::ContinuationDeviceAccumulated:
             return "ContinuationDeviceAccumulated";
-        case MoEExpertParallelReducePartialAccumulationPath::HostStagedThenDeviceAccumulated:
+        case MoERoutedExpertPartialReducePartialAccumulationPath::HostStagedThenDeviceAccumulated:
             return "HostStagedThenDeviceAccumulated";
-        case MoEExpertParallelReducePartialAccumulationPath::HostSummedCorrectnessFallback:
+        case MoERoutedExpertPartialReducePartialAccumulationPath::HostSummedCorrectnessFallback:
             return "HostSummedCorrectnessFallback";
         }
         return "Unknown";
     }
 
-    void MoEExpertParallelReduceDiagnostics::clear()
+    void MoERoutedExpertPartialReduceDiagnostics::clear()
     {
-        mode = MoEExpertParallelReduceMode::HostStagedCorrectness;
+        mode = MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         continuation_domain.clear();
         continuation_device = DeviceId::invalid();
         host_staged = true;
@@ -619,12 +619,12 @@ namespace llaminar2
         partials.clear();
     }
 
-    MoEExpertParallelReduceStage::MoEExpertParallelReduceStage(Params params)
+    MoERoutedExpertPartialReduceStage::MoERoutedExpertPartialReduceStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
-    bool MoEExpertParallelReduceStage::execute(IDeviceContext *ctx)
+    bool MoERoutedExpertPartialReduceStage::execute(IDeviceContext *ctx)
     {
         (void)ctx;
 
@@ -634,7 +634,7 @@ namespace llaminar2
         TensorBase *output_base = tensorBase(params_.output);
         if (!output_base)
         {
-            LOG_ERROR("[MoEExpertParallelReduceStage] Output tensor must derive from TensorBase for explicit continuation-domain coherence");
+            LOG_ERROR("[MoERoutedExpertPartialReduceStage] Output tensor must derive from TensorBase for explicit continuation-domain coherence");
             return false;
         }
 
@@ -648,7 +648,7 @@ namespace llaminar2
 
         if (rows < live_rows || cols != live_cols)
         {
-            LOG_ERROR("[MoEExpertParallelReduceStage] Output shape [" << rows << ", " << cols
+            LOG_ERROR("[MoERoutedExpertPartialReduceStage] Output shape [" << rows << ", " << cols
                                                                       << "] cannot hold live output ["
                                                                       << live_rows << ", " << live_cols << "]");
             return false;
@@ -661,14 +661,14 @@ namespace llaminar2
             const ITensor *partial = params_.partials[partial_index];
             if (partial == params_.output)
             {
-                LOG_ERROR("[MoEExpertParallelReduceStage] Partial tensor " << partial_index
+                LOG_ERROR("[MoERoutedExpertPartialReduceStage] Partial tensor " << partial_index
                                                                            << " aliases output; inputs must be preserved");
                 return false;
             }
             if (!validateFP32Tensor(partial, "partial"))
                 return false;
 
-            const MoEExpertParallelReducePartialInfo info = partialInfoFor(params_, partial_index, partial);
+            const MoERoutedExpertPartialReducePartialInfo info = partialInfoFor(params_, partial_index, partial);
             const bool is_sparse = !info.selected_rows.empty();
 
             size_t partial_rows = 0;
@@ -681,7 +681,7 @@ namespace llaminar2
                 // Sparse partial: shape must be [selected_rows.size(), live_cols].
                 if (partial_rows != info.selected_rows.size() || partial_cols != live_cols)
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Sparse partial tensor " << partial_index
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Sparse partial tensor " << partial_index
                                                                                       << " shape [" << partial_rows << ", " << partial_cols
                                                                                       << "] must equal compact selected-row shape [" << info.selected_rows.size()
                                                                                       << " selected rows with " << live_cols << " cols");
@@ -695,7 +695,7 @@ namespace llaminar2
                 // Dense partial: must cover at least live_rows x live_cols.
                 if (partial_rows < live_rows || partial_cols != live_cols)
                 {
-                    LOG_ERROR("[MoEExpertParallelReduceStage] Partial tensor " << partial_index
+                    LOG_ERROR("[MoERoutedExpertPartialReduceStage] Partial tensor " << partial_index
                                                                                << " shape [" << partial_rows << ", " << partial_cols
                                                                                << "] cannot provide live output shape [" << live_rows << ", " << live_cols << "]");
                     return false;
@@ -718,8 +718,8 @@ namespace llaminar2
 
         const size_t element_count = live_rows * live_cols;
 
-        MoEExpertParallelReduceDiagnostics local_diagnostics;
-        MoEExpertParallelReduceDiagnostics *diagnostics = params_.diagnostics;
+        MoERoutedExpertPartialReduceDiagnostics local_diagnostics;
+        MoERoutedExpertPartialReduceDiagnostics *diagnostics = params_.diagnostics;
         if (!diagnostics && params_.diagnostics_lifetime)
             diagnostics = params_.diagnostics_lifetime.get();
         if (!diagnostics)
@@ -728,13 +728,13 @@ namespace llaminar2
         diagnostics->mode = params_.mode;
         diagnostics->continuation_domain = params_.continuation_domain;
         diagnostics->continuation_device = params_.continuation_device;
-        diagnostics->host_staged = params_.mode == MoEExpertParallelReduceMode::HostStagedCorrectness;
+        diagnostics->host_staged = params_.mode == MoERoutedExpertPartialReduceMode::HostStagedCorrectness;
         diagnostics->partial_count = runtime_partials.size();
 
         const auto start_time = std::chrono::steady_clock::now();
 
         bool ok = false;
-        if (params_.mode == MoEExpertParallelReduceMode::ContinuationDeviceOptimized)
+        if (params_.mode == MoERoutedExpertPartialReduceMode::ContinuationDeviceOptimized)
         {
             ok = runContinuationDeviceOptimizedReduce(
                 params_, runtime_partials, output_base, element_count, live_cols, diagnostics, gpuStream());
@@ -759,7 +759,7 @@ namespace llaminar2
         return true;
     }
 
-    size_t MoEExpertParallelReduceStage::estimatedFlops() const
+    size_t MoERoutedExpertPartialReduceStage::estimatedFlops() const
     {
         if (!params_.output)
             return 0;
@@ -767,7 +767,7 @@ namespace llaminar2
         return partial_count == 0 ? 0 : params_.output->numel() * partial_count;
     }
 
-    size_t MoEExpertParallelReduceStage::estimatedMemoryBytes() const
+    size_t MoERoutedExpertPartialReduceStage::estimatedMemoryBytes() const
     {
         if (!params_.output)
             return 0;
@@ -775,14 +775,14 @@ namespace llaminar2
         return bytes * (params_.partials.size() + 1);
     }
 
-    bool MoEExpertParallelReduceStage::supportsBackend(ComputeBackendType backend) const
+    bool MoERoutedExpertPartialReduceStage::supportsBackend(ComputeBackendType backend) const
     {
         return backend == ComputeBackendType::CPU ||
                backend == ComputeBackendType::GPU_CUDA ||
                backend == ComputeBackendType::GPU_ROCM;
     }
 
-    StageBufferRequirements MoEExpertParallelReduceStage::getBufferRequirements() const
+    StageBufferRequirements MoERoutedExpertPartialReduceStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
         for (const ITensor *partial : params_.partials)
@@ -795,7 +795,7 @@ namespace llaminar2
         return reqs;
     }
 
-    StageBufferContract MoEExpertParallelReduceStage::bufferContract() const
+    StageBufferContract MoERoutedExpertPartialReduceStage::bufferContract() const
     {
         auto contract = StageBufferContract::build();
         if (params_.output_buffer_id != BufferId::_COUNT)
@@ -803,7 +803,7 @@ namespace llaminar2
         return contract;
     }
 
-    StageDumpInfo MoEExpertParallelReduceStage::buildDumpInfoImpl() const
+    StageDumpInfo MoERoutedExpertPartialReduceStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
         const size_t rows = params_.rows > 0
@@ -823,7 +823,7 @@ namespace llaminar2
         info.addScalarInt("partial_count", static_cast<int>(params_.partials.size()));
         info.addScalarInt("layer_idx", params_.layer_idx);
         info.addScalarInt("reduce_mode", static_cast<int>(params_.mode));
-        info.addScalarBool("host_staged", params_.mode == MoEExpertParallelReduceMode::HostStagedCorrectness);
+        info.addScalarBool("host_staged", params_.mode == MoERoutedExpertPartialReduceMode::HostStagedCorrectness);
         info.addScalarBool("has_continuation_domain", !params_.continuation_domain.empty());
         return info;
     }

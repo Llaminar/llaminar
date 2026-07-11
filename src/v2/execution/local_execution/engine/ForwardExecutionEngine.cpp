@@ -361,6 +361,8 @@ namespace llaminar2
         {
             if (!signature.decode)
                 return signature.is_bucketed_prefill ? "prefill_bucket" : "prefill";
+            if (signature.live_mtp_request_batch_condition)
+                return "main_condition_batch";
             return signature.all_position_logits ? "main_verifier" : "main_decode";
         }
 
@@ -374,6 +376,8 @@ namespace llaminar2
                 {"seq_len", std::to_string(signature.seq_len)},
                 {"decode_has_history", boolTag(signature.decode_has_history)},
                 {"all_position_logits", boolTag(signature.all_position_logits)},
+                {"live_mtp_request_batch_condition",
+                 boolTag(signature.live_mtp_request_batch_condition)},
                 {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
                 {"uses_device_token_ids", boolTag(signature.uses_device_token_ids)},
                 {"uses_device_position_ids", boolTag(signature.uses_device_position_ids)},
@@ -431,6 +435,12 @@ namespace llaminar2
                 return lhs.seq_len < rhs.seq_len;
             if (lhs.all_position_logits != rhs.all_position_logits)
                 return lhs.all_position_logits < rhs.all_position_logits;
+            if (lhs.live_mtp_request_batch_condition !=
+                rhs.live_mtp_request_batch_condition)
+            {
+                return lhs.live_mtp_request_batch_condition <
+                       rhs.live_mtp_request_batch_condition;
+            }
             if (lhs.all_position_logit_rows != rhs.all_position_logit_rows)
                 return lhs.all_position_logit_rows < rhs.all_position_logit_rows;
             return lhs.batch_size < rhs.batch_size;
@@ -947,6 +957,8 @@ namespace llaminar2
         // decode graph path rather than the prompt-prefill path.
         const int decode_max_seq_len = std::max(1, config_.cache_config.decode_seq_len);
         const bool all_position_logits = host.computeAllPositionLogitsEnabled();
+        const bool live_mtp_request_batch_condition =
+            host.liveMTPRequestBatchConditionEnabled();
         if (all_position_logits)
         {
             /*
@@ -970,7 +982,8 @@ namespace llaminar2
         const bool is_decode =
             is_single_token_decode ||
             is_short_continuation_decode ||
-            mtp_spec_verifier_decode;
+            mtp_spec_verifier_decode ||
+            live_mtp_request_batch_condition;
         const bool decode_has_history = is_decode && first_position > 0;
         const bool has_unified_pp = config_.has_unified_pp;
         const bool is_standard_path = !has_unified_pp && !config_.pp_stage_config.has_value();
@@ -1146,6 +1159,8 @@ namespace llaminar2
                 .decode = is_decode,
                 .decode_has_history = decode_has_history,
                 .all_position_logits = all_position_logits,
+                .live_mtp_request_batch_condition =
+                    live_mtp_request_batch_condition,
                 .all_position_logit_rows =
                     all_position_logits
                         ? std::max(0, host.allPositionLogitRows())

@@ -93,10 +93,84 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep);
 
+    int hipFlashAttn_decode_fp32_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    int hipFlashAttn_decode_fp16_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    int hipFlashAttn_decode_q8_1_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    int hipFlashAttn_decode_fp32_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    int hipFlashAttn_decode_fp16_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    int hipFlashAttn_decode_q8_1_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
     int hipFlashAttn_prepare_device_params_from_count(
         void *device_params,
         const int *post_append_cached_tokens,
         int seq_len,
+        int query_rows,
+        void *stream);
+
+    int hipFlashAttn_prepare_device_params_from_geometry(
+        void *device_params,
+        int kv_len,
+        int position_offset,
+        int query_rows,
+        void *stream);
+
+    int hipFlashAttn_prepare_device_params_from_request_counts(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int request_count,
         int query_rows,
         void *stream);
 
@@ -133,7 +207,8 @@ namespace llaminar2
          * Falling back to prefill for M=4 changes the causal continuation
          * semantics and can make ROCm accept a token CUDA/CPU reject.
          */
-        constexpr int MAX_SMALL_DECODE_ROWS = 4;
+        constexpr int MAX_SMALL_DECODE_ROWS =
+            attention::kMaxGroupedVerifierAttentionRows;
 
         static int selectFlashDecodeNumSplits(int kv_len)
         {
@@ -157,7 +232,7 @@ namespace llaminar2
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr),
-              h_attn_params_(nullptr), h_attn_params_capacity_(0), small_decode_rows_(0)
+              small_decode_rows_(0)
         {
             if (device_idx < 0)
             {
@@ -173,7 +248,7 @@ namespace llaminar2
             : stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
               workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr),
-              h_attn_params_(nullptr), h_attn_params_capacity_(0), small_decode_rows_(0)
+              small_decode_rows_(0)
         {
             if (!ctx)
             {
@@ -200,12 +275,6 @@ namespace llaminar2
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::~ROCmFlashAttentionKernelT()
         {
             freeWorkspace();
-            if (h_attn_params_)
-            {
-                (void)hipHostFree(h_attn_params_);
-                h_attn_params_ = nullptr;
-                h_attn_params_capacity_ = 0;
-            }
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ROCmFlashAttentionKernelT(
@@ -218,14 +287,11 @@ namespace llaminar2
               max_splits_(other.max_splits_),
               workspace_(other.workspace_),
               device_ctx_(other.device_ctx_),
-              h_attn_params_(other.h_attn_params_),
-              h_attn_params_capacity_(other.h_attn_params_capacity_),
               small_decode_rows_(other.small_decode_rows_),
               dynamic_attn_kv_len_(other.dynamic_attn_kv_len_),
               dynamic_attn_position_offset_(other.dynamic_attn_position_offset_),
               dynamic_attn_query_rows_(other.dynamic_attn_query_rows_),
               dynamic_attn_param_rows_(other.dynamic_attn_param_rows_),
-              dynamic_attn_host_valid_(other.dynamic_attn_host_valid_),
               dynamic_attn_device_valid_(other.dynamic_attn_device_valid_),
               dynamic_attn_device_derived_(other.dynamic_attn_device_derived_)
         {
@@ -237,10 +303,7 @@ namespace llaminar2
             other.max_splits_ = 0;
             other.workspace_ = nullptr;
             other.device_ctx_ = nullptr;
-            other.h_attn_params_ = nullptr;
-            other.h_attn_params_capacity_ = 0;
             other.small_decode_rows_ = 0;
-            other.dynamic_attn_host_valid_ = false;
             other.dynamic_attn_device_valid_ = false;
             other.dynamic_attn_device_derived_ = false;
         }
@@ -252,12 +315,6 @@ namespace llaminar2
             if (this != &other)
             {
                 freeWorkspace();
-                if (h_attn_params_)
-                {
-                    (void)hipHostFree(h_attn_params_);
-                    h_attn_params_ = nullptr;
-                    h_attn_params_capacity_ = 0;
-                }
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
@@ -267,14 +324,11 @@ namespace llaminar2
                 max_splits_ = other.max_splits_;
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
-                h_attn_params_ = other.h_attn_params_;
-                h_attn_params_capacity_ = other.h_attn_params_capacity_;
                 small_decode_rows_ = other.small_decode_rows_;
                 dynamic_attn_kv_len_ = other.dynamic_attn_kv_len_;
                 dynamic_attn_position_offset_ = other.dynamic_attn_position_offset_;
                 dynamic_attn_query_rows_ = other.dynamic_attn_query_rows_;
                 dynamic_attn_param_rows_ = other.dynamic_attn_param_rows_;
-                dynamic_attn_host_valid_ = other.dynamic_attn_host_valid_;
                 dynamic_attn_device_valid_ = other.dynamic_attn_device_valid_;
                 dynamic_attn_device_derived_ = other.dynamic_attn_device_derived_;
 
@@ -286,119 +340,55 @@ namespace llaminar2
                 other.max_splits_ = 0;
                 other.workspace_ = nullptr;
                 other.device_ctx_ = nullptr;
-                other.h_attn_params_ = nullptr;
-                other.h_attn_params_capacity_ = 0;
                 other.small_decode_rows_ = 0;
-                other.dynamic_attn_host_valid_ = false;
                 other.dynamic_attn_device_valid_ = false;
                 other.dynamic_attn_device_derived_ = false;
             }
             return *this;
         }
 
-        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ensureHostAttnParamsCapacity(
-            int capacity)
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::writeDynamicAttnParams(
+            int kv_len, int position_offset, int query_rows, void *stream)
         {
-            capacity = std::max(1, capacity);
-            if (h_attn_params_ && h_attn_params_capacity_ >= capacity)
-                return true;
-
-            hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
-            if (stream_)
-                (void)hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
-            if (cap_status == hipStreamCaptureStatusActive)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] "
-                          "attention device params were not allocated before graph capture");
-                return false;
-            }
-
-            if (h_attn_params_)
-            {
-                (void)hipHostFree(h_attn_params_);
-                h_attn_params_ = nullptr;
-                h_attn_params_capacity_ = 0;
-            }
-
-            hipError_t err = hipHostMalloc(&h_attn_params_,
-                                           sizeof(attention::AttentionDeviceParams) *
-                                               static_cast<size_t>(capacity),
-                                           hipHostMallocDefault);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipHostMalloc failed for "
-                          << capacity << " attention param row(s): "
-                          << hipGetErrorString(err));
-                h_attn_params_ = nullptr;
-                h_attn_params_capacity_ = 0;
-                return false;
-            }
-
-            h_attn_params_capacity_ = capacity;
-            dynamic_attn_device_valid_ = false;
-            return true;
-        }
-
-        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::uploadDynamicAttnParams(
-            void *stream)
-        {
-            if (!dynamic_attn_host_valid_ || !h_attn_params_)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot upload attention params before host values are prepared");
-                dynamic_attn_device_valid_ = false;
-                return false;
-            }
             if (!stream)
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot upload attention params on a null/default HIP stream");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot write attention params on a null/default HIP stream");
                 dynamic_attn_device_valid_ = false;
                 return false;
             }
             if (!workspace_)
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot upload attention params without a bound workspace");
-                dynamic_attn_device_valid_ = false;
-                return false;
-            }
-
-            hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
-            const hipError_t cap_err =
-                hipStreamIsCapturing(static_cast<hipStream_t>(stream), &cap_status);
-            if (cap_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipStreamIsCapturing failed before attention-param upload: "
-                          << hipGetErrorString(cap_err));
-                dynamic_attn_device_valid_ = false;
-                return false;
-            }
-            if (cap_status == hipStreamCaptureStatusActive)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Refusing to record attention-param H2D inside HIP graph capture");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot write attention params without a bound workspace");
                 dynamic_attn_device_valid_ = false;
                 return false;
             }
 
             void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
-            if (!d_buf)
+            const size_t required_bytes =
+                sizeof(attention::AttentionDeviceParams) *
+                static_cast<size_t>(query_rows);
+            if (!d_buf ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::DEVICE_PARAMS) <
+                    required_bytes)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Missing workspace buffer "
                           << AttentionWorkspaceBuffers::DEVICE_PARAMS
-                          << " for attention params");
+                          << " for " << query_rows << " attention param row(s)");
                 dynamic_attn_device_valid_ = false;
                 return false;
             }
 
-            const hipError_t copy_err =
-                hipMemcpyAsync(d_buf,
-                               h_attn_params_,
-                               sizeof(attention::AttentionDeviceParams) *
-                                   static_cast<size_t>(dynamic_attn_param_rows_),
-                               hipMemcpyHostToDevice,
-                               static_cast<hipStream_t>(stream));
-            if (copy_err != hipSuccess)
+            if (hipFlashAttn_prepare_device_params_from_geometry(
+                    d_buf,
+                    kv_len,
+                    position_offset,
+                    query_rows,
+                    stream) != 0)
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipMemcpyAsync failed for attention params: "
-                          << hipGetErrorString(copy_err));
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device attention-param writer failed"
+                          << " kv_len=" << kv_len
+                          << " position_offset=" << position_offset
+                          << " query_rows=" << query_rows);
                 dynamic_attn_device_valid_ = false;
                 return false;
             }
@@ -413,8 +403,7 @@ namespace llaminar2
             const int sanitized_query_rows =
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
             const int param_rows = std::max(1, sanitized_query_rows);
-            return dynamic_attn_host_valid_ &&
-                   dynamic_attn_device_valid_ &&
+            return dynamic_attn_device_valid_ &&
                    dynamic_attn_kv_len_ == kv_len &&
                    dynamic_attn_position_offset_ == position_offset &&
                    dynamic_attn_query_rows_ == sanitized_query_rows &&
@@ -690,86 +679,28 @@ namespace llaminar2
             small_decode_rows_ = (sanitized_query_rows > 1) ? sanitized_query_rows : 0;
             const int param_rows = std::max(1, sanitized_query_rows);
             const bool same_params =
-                dynamic_attn_host_valid_ &&
+                !dynamic_attn_device_derived_ &&
+                dynamic_attn_device_valid_ &&
                 dynamic_attn_kv_len_ == kv_len &&
                 dynamic_attn_position_offset_ == position_offset &&
                 dynamic_attn_query_rows_ == sanitized_query_rows &&
                 dynamic_attn_param_rows_ == param_rows;
 
-            if (!ensureHostAttnParamsCapacity(param_rows))
-            {
-                dynamic_attn_host_valid_ = false;
-                dynamic_attn_device_valid_ = false;
+            if (same_params)
                 return;
-            }
-
-            if (!same_params)
-            {
-                dynamic_attn_device_valid_ = false;
-            }
-            dynamic_attn_device_derived_ = false;
-
-            if (small_decode_rows_ > 1)
-            {
-                for (int row = 0; row < small_decode_rows_; ++row)
-                {
-                    const int row_kv_len = std::max(1, kv_len - (small_decode_rows_ - 1 - row));
-                    h_attn_params_[row].kv_len = row_kv_len;
-                    /*
-                     * Multi-row verifier continuation must use the same row
-                     * contract as CUDA and CPU: row i is the query at absolute
-                     * position `position_offset + i`, while `kv_len` is the
-                     * full verifier KV span.  Re-deriving position_offset from
-                     * the row-local KV length makes the first verifier row
-                     * attend as if it had already consumed later draft rows,
-                     * which can falsely accept speculative tokens.
-                     */
-                    h_attn_params_[row].position_offset = position_offset + row;
-                    h_attn_params_[row].mask_stride = kv_len;
-                }
-            }
-            else
-            {
-                h_attn_params_->kv_len = kv_len;
-                h_attn_params_->position_offset = position_offset;
-                h_attn_params_->mask_stride = kv_len;
-            }
 
             dynamic_attn_kv_len_ = kv_len;
             dynamic_attn_position_offset_ = position_offset;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = param_rows;
-            dynamic_attn_host_valid_ = true;
+            dynamic_attn_device_valid_ = false;
+            dynamic_attn_device_derived_ = false;
 
             if (!stream_ || !workspace_)
-            {
                 return;
-            }
 
-            hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
-            const hipError_t cap_err =
-                hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
-            if (cap_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipStreamIsCapturing failed while preparing attention params: "
-                          << hipGetErrorString(cap_err));
-                dynamic_attn_device_valid_ = false;
-                return;
-            }
-            if (cap_status == hipStreamCaptureStatusActive)
-            {
-                if (!dynamic_attn_device_valid_)
-                {
-                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Attention params changed during HIP graph capture; "
-                              "they must be uploaded before beginCapture()");
-                }
-                return;
-            }
-
-            if (!dynamic_attn_device_valid_)
-            {
-                uploadDynamicAttnParams(stream_);
-            }
+            (void)writeDynamicAttnParams(
+                kv_len, position_offset, sanitized_query_rows, stream_);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
@@ -796,8 +727,7 @@ namespace llaminar2
                           << ", pos=" << dynamic_attn_position_offset_
                           << ", rows=" << dynamic_attn_query_rows_
                           << ", param_rows=" << dynamic_attn_param_rows_
-                          << ") host_valid=" << dynamic_attn_host_valid_
-                          << " device_valid=" << dynamic_attn_device_valid_
+                          << ") device_valid=" << dynamic_attn_device_valid_
                           << " workspace=" << (workspace_ != nullptr)
                           << " stream=" << stream_);
             }
@@ -858,7 +788,6 @@ namespace llaminar2
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = sanitized_query_rows;
-            dynamic_attn_host_valid_ = true;
             dynamic_attn_device_valid_ = true;
             dynamic_attn_device_derived_ = true;
             return true;
@@ -871,7 +800,6 @@ namespace llaminar2
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = 1;
             dynamic_attn_param_rows_ = 1;
-            dynamic_attn_host_valid_ = false;
             dynamic_attn_device_valid_ = false;
             dynamic_attn_device_derived_ = false;
         }
@@ -1017,11 +945,10 @@ namespace llaminar2
                                                                                  << " head_dim=" << head_dim << " causal=" << causal
                                                                                  << " device_idx=" << dev);
 
-            // Wire device_params for graph-capture replay. The tiny H2D copy is
-            // deliberately issued before beginCapture()/graph launch through
-            // setDynamicAttnParams()/prepareDynamicAttnParams(), never from the
-            // captured stage body. Capturing this memcpy made ROCm attention
-            // graph replay crash intermittently inside hipGraphLaunch.
+            // Wire the device-owned parameter block for graph-capture replay.
+            // Resident cache execution derives it from the live device count;
+            // explicit-geometry callers populate the same block with a tiny
+            // stream-ordered kernel. Neither path has a host parameter mirror.
             const attention::AttentionDeviceParams *d_attn_params = nullptr;
             if (stream_ && workspace_)
             {
@@ -1064,8 +991,7 @@ namespace llaminar2
                 }
                 else if (cap_status == hipStreamCaptureStatusActive)
                 {
-                    if (!dynamic_attn_host_valid_ ||
-                        !dynamic_attn_device_valid_ ||
+                    if (!dynamic_attn_device_valid_ ||
                         dynamic_attn_param_rows_ < 1 ||
                         dynamic_attn_query_rows_ != query_rows_for_params)
                     {
@@ -1078,8 +1004,7 @@ namespace llaminar2
                                   << ", pos=" << dynamic_attn_position_offset_
                                   << ", rows=" << dynamic_attn_query_rows_
                                   << ", param_rows=" << dynamic_attn_param_rows_
-                                  << ") host_valid=" << dynamic_attn_host_valid_
-                                  << " device_valid=" << dynamic_attn_device_valid_
+                                  << ") device_valid=" << dynamic_attn_device_valid_
                                   << " workspace=" << (workspace_ != nullptr)
                                   << " stream=" << stream_);
                         return false;
@@ -1134,59 +1059,28 @@ namespace llaminar2
                 int result;
                 if (small_decode_rows_ > 1)
                 {
-                    const int max_num_splits = selectFlashDecodeNumSplits(kv_len);
-
-                    allocateWorkspace(n_heads, head_dim, max_num_splits);
-
-                    if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
-                    {
-                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Workspace allocation failed for small native decode");
-                        return false;
-                    }
-
-                    result = 0;
-                    ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_DECODE,
-                                                     static_cast<hipStream_t>(stream_));
-                    for (int row = 0; row < small_decode_rows_; ++row)
-                    {
-                        const int row_kv_len = std::max(1, kv_len - (small_decode_rows_ - 1 - row));
-                        const int row_num_splits = selectFlashDecodeNumSplits(row_kv_len);
-                        const float *row_q =
-                            Q_ptr + static_cast<size_t>(row) * static_cast<size_t>(n_heads) *
-                                        static_cast<size_t>(head_dim);
-                        float *row_o =
-                            O_ptr + static_cast<size_t>(row) * static_cast<size_t>(n_heads) *
-                                        static_cast<size_t>(head_dim);
-                        const attention::AttentionDeviceParams *row_params =
-                            d_attn_params ? (d_attn_params + row) : nullptr;
-
-                        if (kv_native_type == TensorType::FP16)
-                        {
-                            result = hipFlashAttn_decode_fp16(
-                                row_q, K->gpu_data_ptr(), V->gpu_data_ptr(), row_o,
-                                static_cast<float *>(partial_output_buf_),
-                                static_cast<float *>(partial_m_buf_),
-                                static_cast<float *>(partial_l_buf_),
-                                1, row_kv_len,
-                                n_heads, n_kv_heads, head_dim,
-                                row_num_splits, row_params, stream_,
-                                head_start, gqa_n_rep);
-                        }
-                        else
-                        {
-                            result = hipFlashAttn_decode_q8_1(
-                                row_q, K->gpu_data_ptr(), V->gpu_data_ptr(), row_o,
-                                static_cast<float *>(partial_output_buf_),
-                                static_cast<float *>(partial_m_buf_),
-                                static_cast<float *>(partial_l_buf_),
-                                1, row_kv_len,
-                                n_heads, n_kv_heads, head_dim,
-                                row_num_splits, row_params, stream_,
-                                head_start, gqa_n_rep);
-                        }
-                        if (result != 0)
-                            break;
-                    }
+                    /*
+                     * Enter the named grouped contract instead of hiding a
+                     * row-replay loop inside compute_tensor().  The method
+                     * below consumes this already-prepared device parameter
+                     * block and launches one phase grid plus one reduction.
+                     */
+                    return compute_verifier_rows_decode_equivalent(
+                        Q,
+                        K,
+                        V,
+                        output,
+                        small_decode_rows_,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        causal,
+                        window_size,
+                        mpi_ctx,
+                        dev,
+                        head_start,
+                        gqa_n_rep);
                 }
                 else if (seq_len == 1 && !decode_via_prefill)
                 {
@@ -1293,6 +1187,8 @@ namespace llaminar2
             int head_start,
             int gqa_n_rep)
         {
+            (void)window_size;
+            (void)mpi_ctx;
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Null tensor");
@@ -1313,17 +1209,12 @@ namespace llaminar2
                           "requires explicit HIP stream and bound workspace");
                 return false;
             }
-            if (Q->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
+            if (Q->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
                           "requires FP32 Q/output, got Q=" << Q->dtype_name()
                                                            << " O=" << output->dtype_name());
-                return false;
-            }
-            if (K->native_type() != TensorType::FP16 && K->native_type() != TensorType::Q8_1)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
-                          "unsupported K cache type " << K->dtype_name());
                 return false;
             }
             if (K->native_type() != V->native_type())
@@ -1331,6 +1222,30 @@ namespace llaminar2
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
                           "mixed K/V cache types are unsupported: K=" << K->dtype_name()
                                                                       << " V=" << V->dtype_name());
+                return false;
+            }
+            if (K->native_type() != TensorType::FP32 &&
+                K->native_type() != TensorType::BF16 &&
+                K->native_type() != TensorType::FP16 &&
+                K->native_type() != TensorType::Q8_1)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "unsupported grouped K/V cache type " << K->dtype_name());
+                return false;
+            }
+            if (Q->rows() < static_cast<size_t>(verifier_rows) ||
+                output->rows() < static_cast<size_t>(verifier_rows) ||
+                K->rows() < static_cast<size_t>(kv_len) ||
+                V->rows() < static_cast<size_t>(kv_len))
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "undersized grouped tensor geometry"
+                          << " verifier_rows=" << verifier_rows
+                          << " kv_len=" << kv_len
+                          << " Q_rows=" << Q->rows()
+                          << " K_rows=" << K->rows()
+                          << " V_rows=" << V->rows()
+                          << " O_rows=" << output->rows());
                 return false;
             }
 
@@ -1348,23 +1263,431 @@ namespace llaminar2
                 return false;
             }
 
-            return compute_tensor(Q, K, V, output,
-                                  /*batch_size=*/1,
-                                  verifier_rows,
-                                  kv_len,
-                                  n_heads,
-                                  n_kv_heads,
-                                  head_dim,
-                                  causal,
-                                  window_size,
-                                  nullptr,
-                                  nullptr,
-                                  mpi_ctx,
-                                  device_idx,
-                                  head_start,
-                                  n_heads,
-                                  n_kv_heads,
-                                  gqa_n_rep);
+            const float *q_ptr = static_cast<const float *>(Q->gpu_data_ptr());
+            const void *k_ptr = K->gpu_data_ptr();
+            const void *v_ptr = V->gpu_data_ptr();
+            float *output_ptr = static_cast<float *>(output->gpu_data_ptr());
+            if (!q_ptr || !k_ptr || !v_ptr || !output_ptr)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Missing GPU data pointer");
+                return false;
+            }
+
+            const int dev = device_idx >= 0 ? device_idx : device_idx_;
+            if (hipFlashAttn_setDevice(dev) != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Failed to set ROCm device "
+                          << dev);
+                return false;
+            }
+
+            const int max_num_splits = selectFlashDecodeNumSplits(kv_len);
+            allocateWorkspace(n_heads, head_dim, max_num_splits);
+            if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Workspace binding failed");
+                return false;
+            }
+
+            const size_t partial_rows =
+                static_cast<size_t>(verifier_rows) *
+                static_cast<size_t>(n_heads) *
+                static_cast<size_t>(max_num_splits);
+            const size_t required_partial_output =
+                partial_rows * static_cast<size_t>(head_dim) * sizeof(float);
+            const size_t required_partial_meta = partial_rows * sizeof(float);
+            if (workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT) <
+                    required_partial_output ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_M) <
+                    required_partial_meta ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_L) <
+                    required_partial_meta)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "Grouped verifier workspace is too small"
+                          << " required_output=" << required_partial_output
+                          << " required_meta=" << required_partial_meta
+                          << " rows=" << verifier_rows);
+                return false;
+            }
+
+            void *device_params_buffer =
+                workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            if (!device_params_buffer ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::DEVICE_PARAMS) <
+                    static_cast<size_t>(verifier_rows) *
+                        sizeof(attention::AttentionDeviceParams))
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Missing grouped device params workspace");
+                return false;
+            }
+            const auto *device_params =
+                static_cast<const attention::AttentionDeviceParams *>(
+                    device_params_buffer);
+
+            TensorType execution_kv_type = K->native_type();
+            const bool convert_to_fp32 =
+                execution_kv_type == TensorType::BF16 ||
+                (debugEnv().rocm.fa_disable_native_kv &&
+                 execution_kv_type != TensorType::FP32);
+            if (convert_to_fp32)
+            {
+                float *k_tmp = static_cast<float *>(
+                    workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
+                float *v_tmp = static_cast<float *>(
+                    workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
+                const size_t logical_elements =
+                    static_cast<size_t>(kv_len) *
+                    static_cast<size_t>(n_kv_heads) *
+                    static_cast<size_t>(head_dim);
+                const size_t required_bytes = logical_elements * sizeof(float);
+                if (!k_tmp || !v_tmp ||
+                    workspace_->getBufferSize(AttentionWorkspaceBuffers::K_TMP_FP32) <
+                        required_bytes ||
+                    workspace_->getBufferSize(AttentionWorkspaceBuffers::V_TMP_FP32) <
+                        required_bytes ||
+                    !hip_convert_tensor_to_fp32(
+                        k_ptr,
+                        execution_kv_type,
+                        k_tmp,
+                        static_cast<int>(logical_elements),
+                        kv_len,
+                        n_kv_heads * head_dim,
+                        static_cast<hipStream_t>(stream_)) ||
+                    !hip_convert_tensor_to_fp32(
+                        v_ptr,
+                        execution_kv_type,
+                        v_tmp,
+                        static_cast<int>(logical_elements),
+                        kv_len,
+                        n_kv_heads * head_dim,
+                        static_cast<hipStream_t>(stream_)))
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Grouped K/V conversion failed");
+                    return false;
+                }
+                k_ptr = k_tmp;
+                v_ptr = v_tmp;
+                execution_kv_type = TensorType::FP32;
+            }
+
+            int result = -1;
+            {
+                ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                    ROCmKernelType::FLASH_ATTN_DECODE,
+                    static_cast<hipStream_t>(stream_));
+                if (execution_kv_type == TensorType::FP16)
+                {
+                    result = hipFlashAttn_decode_fp16_grouped_verifier_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        verifier_rows, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+                else if (execution_kv_type == TensorType::Q8_1)
+                {
+                    result = hipFlashAttn_decode_q8_1_grouped_verifier_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        verifier_rows, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+                else
+                {
+                    result = hipFlashAttn_decode_fp32_grouped_verifier_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        verifier_rows, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+            }
+            if (result != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Grouped verifier decode failed"
+                          << " rows=" << verifier_rows
+                          << " kv_len=" << kv_len
+                          << " max_num_splits=" << max_num_splits
+                          << " kv_type=" << K->dtype_name());
+                return false;
+            }
+            return true;
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_device_request_batch_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            const int *post_append_cached_tokens_device,
+            ITensor *output,
+            int request_count,
+            int query_rows,
+            int max_kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size,
+            const IMPIContext *mpi_ctx,
+            int device_idx,
+            int head_start,
+            int gqa_n_rep)
+        {
+            (void)window_size;
+            (void)mpi_ctx;
+            const int total_rows = request_count * query_rows;
+            if (!Q || !K || !V || !output ||
+                !post_append_cached_tokens_device)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Null request-batch input");
+                return false;
+            }
+            if (request_count < 2 || query_rows <= 0 ||
+                total_rows > MAX_SMALL_DECODE_ROWS || max_kv_len <= 0 ||
+                n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || !causal)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Invalid grouped request geometry"
+                          << " requests=" << request_count
+                          << " query_rows=" << query_rows
+                          << " max_kv_len=" << max_kv_len
+                          << " n_heads=" << n_heads
+                          << " n_kv_heads=" << n_kv_heads
+                          << " head_dim=" << head_dim
+                          << " causal=" << causal);
+                return false;
+            }
+            if (!stream_ || !workspace_)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] requires an explicit HIP stream and bound workspace");
+                return false;
+            }
+            if (Q->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32 ||
+                K->native_type() != V->native_type())
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Invalid Q/output or asymmetric K/V types"
+                          << " Q=" << Q->dtype_name()
+                          << " K=" << K->dtype_name()
+                          << " V=" << V->dtype_name()
+                          << " O=" << output->dtype_name());
+                return false;
+            }
+            if (K->native_type() != TensorType::FP32 &&
+                K->native_type() != TensorType::BF16 &&
+                K->native_type() != TensorType::FP16 &&
+                K->native_type() != TensorType::Q8_1)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Unsupported fixed-stride K/V type "
+                          << K->dtype_name());
+                return false;
+            }
+
+            const size_t required_kv_rows =
+                static_cast<size_t>(request_count) *
+                static_cast<size_t>(max_kv_len);
+            if (K->rows() < required_kv_rows || V->rows() < required_kv_rows ||
+                Q->rows() < static_cast<size_t>(total_rows) ||
+                output->rows() < static_cast<size_t>(total_rows))
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Fixed-stride tensor geometry is undersized"
+                          << " required_kv_rows=" << required_kv_rows
+                          << " K_rows=" << K->rows()
+                          << " V_rows=" << V->rows()
+                          << " total_rows=" << total_rows
+                          << " Q_rows=" << Q->rows()
+                          << " O_rows=" << output->rows());
+                return false;
+            }
+
+            const float *q_ptr = static_cast<const float *>(Q->gpu_data_ptr());
+            const void *k_ptr = K->gpu_data_ptr();
+            const void *v_ptr = V->gpu_data_ptr();
+            float *output_ptr = static_cast<float *>(output->gpu_data_ptr());
+            if (!q_ptr || !k_ptr || !v_ptr || !output_ptr)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Missing GPU data pointer");
+                return false;
+            }
+
+            const int dev = device_idx >= 0 ? device_idx : device_idx_;
+            if (hipFlashAttn_setDevice(dev) != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Failed to set ROCm device "
+                          << dev);
+                return false;
+            }
+
+            const int max_num_splits =
+                selectFlashDecodeNumSplits(max_kv_len);
+            allocateWorkspace(n_heads, head_dim, max_num_splits);
+            if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Workspace binding failed");
+                return false;
+            }
+
+            const size_t partial_rows =
+                static_cast<size_t>(total_rows) *
+                static_cast<size_t>(n_heads) *
+                static_cast<size_t>(max_num_splits);
+            const size_t required_partial_output =
+                partial_rows * static_cast<size_t>(head_dim) * sizeof(float);
+            const size_t required_partial_meta = partial_rows * sizeof(float);
+            if (workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT) <
+                    required_partial_output ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_M) <
+                    required_partial_meta ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_L) <
+                    required_partial_meta)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Grouped request workspace is too small"
+                          << " required_output=" << required_partial_output
+                          << " required_meta=" << required_partial_meta
+                          << " rows=" << total_rows);
+                return false;
+            }
+
+            void *device_params_buffer =
+                workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            if (!device_params_buffer ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::DEVICE_PARAMS) <
+                    static_cast<size_t>(total_rows) *
+                        sizeof(attention::AttentionDeviceParams))
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Missing grouped device params workspace");
+                return false;
+            }
+            if (hipFlashAttn_prepare_device_params_from_request_counts(
+                    device_params_buffer,
+                    post_append_cached_tokens_device,
+                    request_count,
+                    query_rows,
+                    stream_) != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Failed to derive request-row params");
+                return false;
+            }
+            const auto *device_params =
+                static_cast<const attention::AttentionDeviceParams *>(
+                    device_params_buffer);
+
+            dynamic_attn_kv_len_ = 0;
+            dynamic_attn_position_offset_ = 0;
+            dynamic_attn_query_rows_ = total_rows;
+            dynamic_attn_param_rows_ = total_rows;
+            dynamic_attn_device_valid_ = true;
+            dynamic_attn_device_derived_ = true;
+
+            TensorType execution_kv_type = K->native_type();
+            const bool convert_to_fp32 =
+                execution_kv_type == TensorType::BF16 ||
+                (debugEnv().rocm.fa_disable_native_kv &&
+                 execution_kv_type != TensorType::FP32);
+            if (convert_to_fp32)
+            {
+                float *k_tmp = static_cast<float *>(
+                    workspace_->getBuffer(AttentionWorkspaceBuffers::K_TMP_FP32));
+                float *v_tmp = static_cast<float *>(
+                    workspace_->getBuffer(AttentionWorkspaceBuffers::V_TMP_FP32));
+                const size_t logical_elements =
+                    required_kv_rows *
+                    static_cast<size_t>(n_kv_heads) *
+                    static_cast<size_t>(head_dim);
+                const size_t required_bytes = logical_elements * sizeof(float);
+                if (!k_tmp || !v_tmp ||
+                    workspace_->getBufferSize(AttentionWorkspaceBuffers::K_TMP_FP32) <
+                        required_bytes ||
+                    workspace_->getBufferSize(AttentionWorkspaceBuffers::V_TMP_FP32) <
+                        required_bytes ||
+                    !hip_convert_tensor_to_fp32(
+                        k_ptr,
+                        execution_kv_type,
+                        k_tmp,
+                        static_cast<int>(logical_elements),
+                        static_cast<int>(required_kv_rows),
+                        n_kv_heads * head_dim,
+                        static_cast<hipStream_t>(stream_)) ||
+                    !hip_convert_tensor_to_fp32(
+                        v_ptr,
+                        execution_kv_type,
+                        v_tmp,
+                        static_cast<int>(logical_elements),
+                        static_cast<int>(required_kv_rows),
+                        n_kv_heads * head_dim,
+                        static_cast<hipStream_t>(stream_)))
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Grouped K/V conversion failed");
+                    return false;
+                }
+                k_ptr = k_tmp;
+                v_ptr = v_tmp;
+                execution_kv_type = TensorType::FP32;
+            }
+
+            int result = -1;
+            {
+                ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                    ROCmKernelType::FLASH_ATTN_DECODE,
+                    static_cast<hipStream_t>(stream_));
+                if (execution_kv_type == TensorType::FP16)
+                {
+                    result = hipFlashAttn_decode_fp16_grouped_request_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        request_count, query_rows, max_kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+                else if (execution_kv_type == TensorType::Q8_1)
+                {
+                    result = hipFlashAttn_decode_q8_1_grouped_request_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        request_count, query_rows, max_kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+                else
+                {
+                    result = hipFlashAttn_decode_fp32_grouped_request_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        request_count, query_rows, max_kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+            }
+            if (result != 0)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Grouped request decode failed"
+                          << " requests=" << request_count
+                          << " query_rows=" << query_rows
+                          << " max_kv_len=" << max_kv_len
+                          << " max_num_splits=" << max_num_splits
+                          << " kv_type=" << K->dtype_name());
+                return false;
+            }
+            return true;
         }
 
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(

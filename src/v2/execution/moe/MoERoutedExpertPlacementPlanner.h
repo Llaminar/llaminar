@@ -1,11 +1,11 @@
 /**
- * @file MoEExpertParallelPlanner.h
- * @brief Static residency planner for same-layer MoE expert-parallel overlays.
+ * @file MoERoutedExpertPlacementPlanner.h
+ * @brief Static residency planner for same-layer routed-expert placement.
  */
 
 #pragma once
 
-#include "MoEExpertParallelPlan.h"
+#include "MoERoutedExpertPlacementPlan.h"
 
 #include <cstddef>
 #include <string>
@@ -16,7 +16,7 @@ namespace llaminar2
 
     class DecodeExpertHistogram;
 
-    struct MoEExpertModelMetadata
+    struct MoERoutedExpertModelMetadata
     {
         int num_layers = 0;
         int num_experts = 0;
@@ -28,7 +28,7 @@ namespace llaminar2
         std::string shared_quant_type = "F32";
     };
 
-    struct MoEExpertLayerTierMask
+    struct MoERoutedExpertLayerTierMask
     {
         int layer = -1;
         int tier_index = -1;
@@ -90,25 +90,25 @@ namespace llaminar2
         /// Optional previous placements for hysteresis.  When provided,
         /// already-assigned experts are kept in their tier unless capacity
         /// forces eviction.  Currently reserved for future use.
-        std::vector<ExpertLayerPlacement> previous_placements;
+        std::vector<RoutedExpertLayerPlacement> previous_placements;
     };
 
-    struct MoEExpertParallelPlannerOptions
+    struct MoERoutedExpertPlacementPlannerOptions
     {
         const DecodeExpertHistogram *decode_histogram = nullptr;
-        std::vector<ExpertLayerPlacement> explicit_placements;
-        std::vector<MoEExpertLayerTierMask> explicit_masks;
+        std::vector<RoutedExpertLayerPlacement> explicit_placements;
+        std::vector<MoERoutedExpertLayerTierMask> explicit_masks;
         MoERoutedTierRebalancerOptions rebalancer;
     };
 
-    struct MoEExpertParallelPlannerInput
+    struct MoERoutedExpertPlacementPlannerInput
     {
-        MoEExpertParallelPlan plan;
-        MoEExpertModelMetadata metadata;
-        MoEExpertParallelPlannerOptions options;
+        MoERoutedExpertPlacementPlan plan;
+        MoERoutedExpertModelMetadata metadata;
+        MoERoutedExpertPlacementPlannerOptions options;
     };
 
-    struct MoEExpertTierMemoryEstimate
+    struct MoERoutedExpertTierMemoryEstimate
     {
         int tier_index = -1;
         std::string tier_name;
@@ -117,7 +117,7 @@ namespace llaminar2
         size_t routed_expert_bytes = 0;
     };
 
-    struct MoEExpertDomainMemoryEstimate
+    struct MoERoutedExpertDomainMemoryEstimate
     {
         std::string domain;
         size_t shared_expert_bytes = 0;
@@ -129,38 +129,38 @@ namespace llaminar2
         }
     };
 
-    struct MoEExpertParallelMemoryEstimate
+    struct MoERoutedExpertPlacementMemoryEstimate
     {
         std::string shared_expert_domain;
         size_t routed_expert_bytes_per_expert = 0;
         size_t shared_expert_bytes_per_layer = 0;
         size_t total_shared_expert_bytes = 0;
         size_t total_routed_expert_bytes = 0;
-        std::vector<MoEExpertTierMemoryEstimate> tiers;
-        std::vector<MoEExpertDomainMemoryEstimate> domains;
+        std::vector<MoERoutedExpertTierMemoryEstimate> tiers;
+        std::vector<MoERoutedExpertDomainMemoryEstimate> domains;
     };
 
-    struct MoEExpertParallelPlannerResult
+    struct MoERoutedExpertPlacementPlannerResult
     {
-        MoEExpertParallelPlan planned_plan;
-        MoEExpertParallelMemoryEstimate memory;
+        MoERoutedExpertPlacementPlan planned_plan;
+        MoERoutedExpertPlacementMemoryEstimate memory;
         /// Populated when residency_policy == RoutedTierRebalanced.
         MoERoutedTierRebalanceDiagnostics rebalance_diagnostics;
     };
 
-    class MoEExpertParallelPlanner
+    class MoERoutedExpertPlacementPlanner
     {
     public:
-        static MoEExpertParallelPlannerResult plan(const MoEExpertParallelPlannerInput &input);
+        static MoERoutedExpertPlacementPlannerResult plan(const MoERoutedExpertPlacementPlannerInput &input);
 
-        static MoEExpertParallelPlannerResult plan(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
-            const MoEExpertParallelPlannerOptions &options = {});
+        static MoERoutedExpertPlacementPlannerResult plan(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedExpertPlacementPlannerOptions &options = {});
 
-        static size_t estimateRoutedExpertBytesPerExpert(const MoEExpertModelMetadata &metadata);
-        static size_t estimateSharedExpertBytesPerLayer(const MoEExpertModelMetadata &metadata);
-        static size_t estimateTotalSharedExpertBytes(const MoEExpertModelMetadata &metadata);
+        static size_t estimateRoutedExpertBytesPerExpert(const MoERoutedExpertModelMetadata &metadata);
+        static size_t estimateSharedExpertBytesPerLayer(const MoERoutedExpertModelMetadata &metadata);
+        static size_t estimateTotalSharedExpertBytes(const MoERoutedExpertModelMetadata &metadata);
     };
 
 } // namespace llaminar2

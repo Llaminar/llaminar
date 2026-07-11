@@ -626,8 +626,8 @@ namespace llaminar2
             return ShardingMode::ROW_PARALLEL;
         case WeightShardingMode::InputParallel:
             return ShardingMode::INPUT_PARALLEL;
-        case WeightShardingMode::ExpertParallel:
-            return ShardingMode::EXPERT_PARALLEL;
+        case WeightShardingMode::ExpertIdApportioned:
+            return ShardingMode::EXPERT_ID_APPORTIONED;
         case WeightShardingMode::Replicate:
         default:
             return ShardingMode::REPLICATE;
@@ -1521,9 +1521,9 @@ namespace llaminar2
             registerDerivedMetadata(name, slice, WeightDerivationKind::ColumnSlice, input_slice, device);
             return slice;
         }
-        else if (mode == ShardingMode::EXPERT_PARALLEL)
+        else if (mode == ShardingMode::EXPERT_ID_APPORTIONED)
         {
-            // Expert-parallel: split the EXPERT dimension of 3D MoE weight tensors
+            // Expert-ID apportionment splits the expert axis of a 3D MoE tensor.
             //
             // Expert weights are stored as 3D tensors [ne0, ne1, num_experts] where:
             //   ne0 = columns (fastest varying)
@@ -1544,12 +1544,12 @@ namespace llaminar2
             auto dims_opt = loader_.getTensorShape(name);
             if (!dims_opt || dims_opt->empty())
             {
-                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-parallel: " << name);
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-id-apportioned loading: " << name);
                 return nullptr;
             }
             if (dims_opt->size() != 3)
             {
-                throw std::runtime_error("[WeightManager] Expert-parallel requires 3D tensor, got " +
+                throw std::runtime_error("[WeightManager] Expert-ID apportionment requires a 3D tensor, got " +
                                          std::to_string(dims_opt->size()) + "D for: " + name);
             }
             const auto &dims = *dims_opt;
@@ -1579,13 +1579,13 @@ namespace llaminar2
                                          " failed to load expert slice for: " + name);
             }
 
-            LOG_DEBUG("[WeightManager] Rank " << rank << " expert-parallel " << name
+            LOG_DEBUG("[WeightManager] Rank " << rank << " expert-id-apportioned " << name
                                               << " [" << ne0 << ", " << ne1 << ", " << ne2
                                               << "] -> loaded ONLY experts [" << expert_start << ", " << expert_end
                                               << ") = " << expert_count << "/" << ne2 << " experts");
 
             // Return the sliced 3D tensor directly (no TensorSlice wrapping needed —
-            // expert parallelism uses allreduce on the MoE output, not on weights)
+            // expert-ID apportionment combines routed outputs, not weights)
             WeightSliceSpec expert_slice;
             expert_slice.source_rows = ne0;
             expert_slice.source_cols = ne1;
@@ -1975,9 +1975,9 @@ namespace llaminar2
             break;
         }
 
-        case ShardingMode::EXPERT_PARALLEL:
+        case ShardingMode::EXPERT_ID_APPORTIONED:
         {
-            // Expert-parallel weights are 3D MoE tensors — decode sharding
+            // Expert-ID-apportioned weights are 3D MoE tensors; decode sharding
             // not applicable. Return the full tensor as-is.
             decode_shard = full_tensor;
             break;
@@ -4364,7 +4364,7 @@ namespace llaminar2
                 source.inner_is_presliced = slice.inner_is_presliced;
 
                 /**
-                 * Expert-parallel LocalTP freezes a tensor that already contains
+                 * Expert-ID-apportioned LocalTP freezes a tensor that already contains
                  * only this participant's expert range. The registry, router, and
                  * graph still use global expert ids, so keep two coordinates:
                  *
@@ -6847,7 +6847,7 @@ namespace llaminar2
                     (mode == ShardingMode::ROW_PARALLEL && slice && slice->is_row_parallel()) ||
                     (mode == ShardingMode::INPUT_PARALLEL && slice && slice->is_row_parallel()) ||
                     (mode == ShardingMode::COLUMN_PARALLEL && slice && slice->is_column_parallel()) ||
-                    (mode == ShardingMode::EXPERT_PARALLEL);
+                    (mode == ShardingMode::EXPERT_ID_APPORTIONED);
 
                 if (cache_matches_mode)
                 {
@@ -7023,18 +7023,18 @@ namespace llaminar2
             break;
         }
 
-        case ShardingMode::EXPERT_PARALLEL:
+        case ShardingMode::EXPERT_ID_APPORTIONED:
         {
-            // Expert-parallel for LOCAL TP: split 3D expert tensors across local devices
+            // For LocalTP expert-ID apportionment, split the 3D tensor's expert axis.
             auto dims_opt = loader_.getTensorShape(name);
             if (!dims_opt || dims_opt->empty())
             {
-                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-parallel: " << name);
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-id-apportioned loading: " << name);
                 return nullptr;
             }
             if (dims_opt->size() != 3)
             {
-                throw std::runtime_error("[WeightManager] Expert-parallel requires 3D tensor, got " +
+                throw std::runtime_error("[WeightManager] Expert-ID apportionment requires a 3D tensor, got " +
                                          std::to_string(dims_opt->size()) + "D for: " + name);
             }
             const auto &dims = *dims_opt;
@@ -7074,7 +7074,7 @@ namespace llaminar2
             registerDerivedMetadata(name, result, WeightDerivationKind::ExpertSlice, expert_slice, device);
 
             LOG_DEBUG("[WeightManager] Device " << device.to_string()
-                                                << " expert-parallel " << name
+                                                << " expert-id-apportioned " << name
                                                 << " [" << dims[0] << ", " << dims[1] << ", " << ne2
                                                 << "] -> experts [" << expert_start << ", "
                                                 << (expert_start + expert_count) << ") = "

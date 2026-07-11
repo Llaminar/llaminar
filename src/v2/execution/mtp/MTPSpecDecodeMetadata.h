@@ -344,11 +344,15 @@ namespace llaminar2
     };
 
     /**
-     * Runner-owned workspace consumer for graph-facing spec-decode metadata.
+     * @brief Workspace binding for graph-facing speculative-decode metadata.
      *
-     * The buffers are not a graph stage scratch allocation. They are persistent
-     * per-runner metadata slots that graph-captured MTP verifier/state stages
-     * can read after the runner uploads a new batch on an explicit stream.
+     * These rows are verifier working storage. `WorkspaceAllocator` may replace
+     * their backing allocation whenever a newly materialized graph needs a
+     * different workspace layout, so no request-lifetime owner may retain a raw
+     * pointer from this binding across graph materialization. Published logical
+     * sequence state has a separate arena-owned allocation in
+     * `DeviceGraphOrchestrator`; derivation kernels write those durable output
+     * rows directly instead of treating this binding as a publication mailbox.
      */
     class MTPSpecDecodeMetadataWorkspaceBinding : public IWorkspaceConsumer
     {

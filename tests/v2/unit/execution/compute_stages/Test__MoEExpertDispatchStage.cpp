@@ -17,18 +17,18 @@ namespace llaminar2::test
 namespace
 {
 
-    ExpertRoutedTier tier(const std::string &name, const std::string &domain, bool fallback = false)
+    RoutedExpertTier tier(const std::string &name, const std::string &domain, bool fallback = false)
     {
-        ExpertRoutedTier result;
+        RoutedExpertTier result;
         result.name = name;
         result.domain = domain;
         result.fallback = fallback;
         return result;
     }
 
-    ExpertLayerPlacement placement(std::vector<int> routed_expert_tier)
+    RoutedExpertLayerPlacement placement(std::vector<int> routed_expert_tier)
     {
-        ExpertLayerPlacement result;
+        RoutedExpertLayerPlacement result;
         result.layer = 4;
         result.routed_expert_tier = std::move(routed_expert_tier);
         return result;
@@ -46,8 +46,8 @@ namespace
         const ITensor *weights,
         int seq_len,
         int top_k,
-        std::optional<ExpertLayerPlacement> expert_placement,
-        std::vector<ExpertRoutedTier> routed_tiers,
+        std::optional<RoutedExpertLayerPlacement> expert_placement,
+        std::vector<RoutedExpertTier> routed_tiers,
         MoEExpertDispatchOutput *output)
     {
         MoEExpertDispatchStage::Params params;

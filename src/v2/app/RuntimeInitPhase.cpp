@@ -256,12 +256,12 @@ namespace llaminar2
         }
 
         std::optional<MoEExpertOverlayExecutionPlan> overlay_execution_plan;
-        if (config.moe_expert_parallel_plan && config.moe_expert_parallel_plan->isTieredOverlay())
+        if (config.moe_routed_expert_plan && config.moe_routed_expert_plan->isTieredOverlay())
         {
             try
             {
                 overlay_execution_plan = resolveMoEExpertOverlayExecutionPlan(
-                    config.moe_expert_parallel_plan,
+                    config.moe_routed_expert_plan,
                     MoEExpertOverlayExecutionPlanResolverOptions{
                         .current_world_rank = mpi_ctx->rank(),
                         .world_size = mpi_ctx->world_size(),

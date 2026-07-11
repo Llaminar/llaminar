@@ -2279,7 +2279,19 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
         std::vector<float> grouped_state = initial_state;
         std::vector<float> grouped_output(static_cast<size_t>(rows) * kChannels);
         std::vector<float> snapshots(static_cast<size_t>(rows) * kStateFloats);
-        ASSERT_TRUE(grouped_kernel.forwardWithStateSnapshots(
+        std::vector<float> speculative_state(kStateFloats);
+
+        /*
+         * Enter through the production binding and forward APIs.  The grouped
+         * verifier must advance a private speculative state, publish every
+         * post-row snapshot, and leave the request's live state untouched
+         * until the transaction selects an accepted row.
+         */
+        grouped_kernel.bindVerifierStateCaptureWorkspace(
+            snapshots.data(), rows, kStateFloats);
+        grouped_kernel.bindSpeculativeStateWorkspace(
+            speculative_state.data(), kStateFloats);
+        ASSERT_TRUE(grouped_kernel.forward(
             input.data(),
             weight.data(),
             bias.data(),
@@ -2288,9 +2300,6 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
             rows,
             kChannels,
             kKernelSize,
-            snapshots.data(),
-            kStateFloats,
-            rows,
             /*apply_silu=*/true))
             << "rows=" << rows;
         expectGroupedShortConvCounter(rows, kChannels, kKernelSize);
@@ -2328,9 +2337,31 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
             "CPU grouped short-conv output rows=" + std::to_string(rows));
         expectByteExactFP32(
             grouped_state.data(),
+            initial_state.data(),
+            initial_state.size(),
+            "CPU grouped short-conv live-state preservation rows=" +
+                std::to_string(rows));
+
+        /*
+         * The production host transaction always uses the grouped publication
+         * API, even when its request batch contains one request.  Restoring the
+         * terminal verifier row must therefore be a valid native snapshot copy,
+         * not a dependency on a request bank that only multi-request execution
+         * happens to initialize.
+         */
+        const int restore_row = rows - 1;
+        ASSERT_TRUE(grouped_kernel.restoreVerifierStateCaptureRows(
+            grouped_state.data(),
+            &restore_row,
+            /*request_count=*/1,
+            /*stream=*/nullptr))
+            << "rows=" << rows;
+        expectByteExactFP32(
+            grouped_state.data(),
             serial_state.data(),
             serial_state.size(),
-            "CPU grouped short-conv final state rows=" + std::to_string(rows));
+            "CPU grouped short-conv published state rows=" +
+                std::to_string(rows));
     }
 }
 

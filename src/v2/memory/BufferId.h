@@ -142,10 +142,12 @@ namespace llaminar2
         MTP_GATE_PROJ,
         MTP_UP_PROJ,
         MTP_FFN_OUTPUT,
-        MTP_LOGITS,
+        MTP_LOGITS, ///< Column-parallel shard, or full row for non-GlobalTP/Mirrored LocalTP
+        MTP_LOGITS_GATHERED, ///< Full-vocabulary CPU GlobalTP sidecar rows after allgather
         MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
         MTP_POSITION_IDS, ///< Arena-owned INT32 request positions for device-resident batched MTP sidecar replay
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
+        MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
 
         _COUNT ///< Sentinel – must be last
     };
@@ -331,12 +333,16 @@ namespace llaminar2
             return "MTP_FFN_OUTPUT";
         case BufferId::MTP_LOGITS:
             return "MTP_LOGITS";
+        case BufferId::MTP_LOGITS_GATHERED:
+            return "MTP_LOGITS_GATHERED";
         case BufferId::MTP_CONDITION_TOKEN:
             return "MTP_CONDITION_TOKEN";
         case BufferId::MTP_POSITION_IDS:
             return "MTP_POSITION_IDS";
         case BufferId::MTP_VERIFIER_INPUT_TOKENS:
             return "MTP_VERIFIER_INPUT_TOKENS";
+        case BufferId::MTP_LOGICAL_SEQUENCE_STATE:
+            return "MTP_LOGICAL_SEQUENCE_STATE";
         case BufferId::MOE_GATE_SCRATCH:
             return "MOE_GATE_SCRATCH";
         case BufferId::MOE_UP_SCRATCH:

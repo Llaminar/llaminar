@@ -5,7 +5,7 @@
 
 #include "config/OrchestrationConfigParser.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 
 #include <gtest/gtest.h>
 
@@ -20,45 +20,45 @@ namespace llaminar2::test
     namespace
     {
 
-        ExpertComputeDomain singleDeviceDomain(
+        RoutedExpertDomain singleDeviceDomain(
             const std::string &name,
             GlobalDeviceAddress participant,
             CollectiveBackendType backend,
             int owner_rank)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = backend;
             domain.participants = {std::move(participant)};
             domain.owner_rank = owner_rank;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain localTPDomain(
+        RoutedExpertDomain localTPDomain(
             const std::string &name,
             CollectiveBackendType backend,
             int owner_rank = 1)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::LocalTP;
+            domain.scope = ExecutionDomainScope::LOCAL;
             domain.backend = backend;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)};
             domain.owner_rank = owner_rank;
-            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier routedTier(
+        RoutedExpertTier routedTier(
             const std::string &name,
             const std::string &domain,
             int priority,
             int capacity,
             bool fallback = false)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             tier.priority = priority;
@@ -67,18 +67,18 @@ namespace llaminar2::test
             return tier;
         }
 
-        MoEExpertParallelPlan productionPlan()
+        MoERoutedExpertPlacementPlan productionPlan()
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "cuda_hot";
             plan.base_model_domain = "cuda_hot";
             plan.shared_expert_domain = "cuda_hot";
             plan.continuation_domain_spec.domain = "cuda_hot";
             plan.continuation_domain_spec.logical_root_participant = 0;
             plan.continuation_domain_spec.hidden_layout = MoEContinuationActivationLayout::ReplicatedHidden;
-            plan.residency_policy = ExpertResidencyPolicy::StaticById;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan.domains = {
                 singleDeviceDomain("cuda_hot", GlobalDeviceAddress::cuda(0, 0), CollectiveBackendType::NCCL, 0),
                 localTPDomain("rocm_warm", CollectiveBackendType::RCCL, 1),
@@ -93,7 +93,7 @@ namespace llaminar2::test
             return plan;
         }
 
-        bool hasErrorContaining(const MoEExpertParallelValidationResult &result, const std::string &needle)
+        bool hasErrorContaining(const MoERoutedExpertPlacementValidationResult &result, const std::string &needle)
         {
             return std::any_of(result.errors.begin(), result.errors.end(), [&](const std::string &error)
                                { return error.find(needle) != std::string::npos; });
@@ -122,14 +122,14 @@ namespace llaminar2::test
 
     } // namespace
 
-    TEST(Test__MoEGraphNativeProductionHardening, ExplanationUsesProductionGraphNativeTerms)
+    TEST(Test__MoEGraphNativeProductionHardening, ExplanationUsesExplicitRoutedExpertPolicyAxes)
     {
         const auto plan = productionPlan();
-        const std::string explanation = renderMoEExpertParallelPlanExplanation(plan);
+        const std::string explanation = renderMoERoutedExpertPlacementPlanExplanation(plan);
 
-        EXPECT_NE(explanation.find("graph-native"), std::string::npos);
-        EXPECT_NE(explanation.find("whole-expert routed ownership"), std::string::npos);
-        EXPECT_NE(explanation.find("no shadow LocalTP runtime"), std::string::npos);
+        EXPECT_NE(explanation.find("topology: graph-native tiered-overlay"), std::string::npos);
+        EXPECT_NE(explanation.find("routed_compute=apportioned"), std::string::npos);
+        EXPECT_NE(explanation.find("routed_assignment=static-owner"), std::string::npos);
         EXPECT_NE(explanation.find("continuation_domain: cuda_hot"), std::string::npos);
         EXPECT_NE(explanation.find("routed_domains:"), std::string::npos);
         EXPECT_NE(explanation.find("routed_tiers:"), std::string::npos);
@@ -138,16 +138,16 @@ namespace llaminar2::test
         EXPECT_NE(explanation.find("model expert count is not known at config parse time"), std::string::npos);
     }
 
-    TEST(Test__MoEGraphNativeProductionHardening, OrchestrationToStringIncludesMoEOverlayExplanation)
+    TEST(Test__MoEGraphNativeProductionHardening, OrchestrationToStringIncludesRoutedExpertPlacementExplanation)
     {
         OrchestrationConfig config;
         config.explain_placement = true;
-        config.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>(productionPlan());
+        config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(productionPlan());
 
         const std::string text = config.toString();
 
-        EXPECT_NE(text.find("moe_expert_overlay:"), std::string::npos);
-        EXPECT_NE(text.find("execution: graph-native TieredExpertOverlay"), std::string::npos);
+        EXPECT_NE(text.find("moe_routed_expert_placement:"), std::string::npos);
+        EXPECT_NE(text.find("topology: graph-native tiered-overlay"), std::string::npos);
         EXPECT_NE(text.find("coverage is validated during model-aware resolution"), std::string::npos);
     }
 
@@ -157,7 +157,7 @@ namespace llaminar2::test
         plan.domains.pop_back();
         plan.routed_tiers.pop_back();
 
-        const std::string explanation = renderMoEExpertParallelPlanExplanation(plan, 4);
+        const std::string explanation = renderMoERoutedExpertPlacementPlanExplanation(plan, 4);
 
         EXPECT_NE(explanation.find("coverage: incomplete without fallback (3/4)"), std::string::npos);
     }
@@ -168,26 +168,24 @@ namespace llaminar2::test
         plan.domains.pop_back();
         plan.routed_tiers.pop_back();
 
-        const auto result = validateMoEExpertParallelPlan(
+        const auto result = validateMoERoutedExpertPlacementPlan(
             plan,
-            MoEExpertParallelValidationOptions{.routed_expert_count = 4});
+            MoERoutedExpertPlacementValidationOptions{.routed_expert_count = 4});
 
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(result, "no fallback tier"));
         EXPECT_TRUE(hasErrorContaining(result, "covers only 3 of 4 routed experts"));
     }
 
-    TEST(Test__MoEGraphNativeProductionHardening, ValidatorRejectsRoutedShardedExpertsForGraphNativeOverlay)
+    TEST(Test__MoEGraphNativeProductionHardening, PlacementValidatorAcceptsRoutedTensorSharding)
     {
         auto plan = productionPlan();
-        plan.domains[1].compute_kind = ExpertDomainComputeKind::ShardedExperts;
+        plan.domains[1].routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
 
-        const auto result = validateMoEExpertParallelPlan(plan);
+        const auto result = validateMoERoutedExpertPlacementPlan(plan);
 
-        EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "ShardedExperts"));
-        EXPECT_TRUE(hasErrorContaining(result, "graph-native whole-expert routed tiers"));
-        EXPECT_TRUE(hasErrorContaining(result, "no shadow LocalTP runtime"));
+        EXPECT_TRUE(result.ok())
+            << (result.errors.empty() ? "" : result.errors.front());
     }
 
     TEST(Test__MoEGraphNativeProductionHardening, ValidatorReportsMissingContinuationBaseAndSharedReferences)
@@ -198,7 +196,7 @@ namespace llaminar2::test
         plan.shared_expert_domain = "missing_shared";
         plan.continuation_domain_spec.domain = "missing_continuation";
 
-        const auto result = validateMoEExpertParallelPlan(plan);
+        const auto result = validateMoERoutedExpertPlacementPlan(plan);
 
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(result, "continuation domain references unknown execution domain"));
@@ -212,31 +210,31 @@ namespace llaminar2::test
         plan.routed_tiers[0].fallback = true;
         plan.routed_tiers[1].fallback = true;
 
-        const auto result = validateMoEExpertParallelPlan(plan);
+        const auto result = validateMoERoutedExpertPlacementPlan(plan);
 
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(result, "at most one fallback tier"));
     }
 
-    TEST(Test__MoEGraphNativeProductionHardening, ParserRequiresOverlayDomainScopeAndComputeHints)
+    TEST(Test__MoEGraphNativeProductionHardening, ParserRequiresRoutedDomainScopeAndComputePolicy)
     {
         const std::string missing_scope = parseArgsError({"llaminar2",
-                                                          "--moe-expert-overlay", "tiered",
-                                                          "--moe-expert-overlay-continuation", "cuda_hot",
-                                                          "--moe-expert-overlay-shared-domain", "cuda_hot",
-                                                          "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0;backend=nccl;compute=apportioned_experts",
-                                                          "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
+                                                          "--moe-routed-expert-placement", "tiered-overlay",
+                                                          "--moe-routed-expert-continuation-domain", "cuda_hot",
+                                                          "--moe-routed-expert-shared-domain", "cuda_hot",
+                                                          "--moe-routed-expert-domain", "cuda_hot=0:cuda:0;backend=nccl;routed_compute=apportioned",
+                                                          "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
 
         EXPECT_NE(missing_scope.find("missing scope"), std::string::npos);
 
         const std::string missing_compute = parseArgsError({"llaminar2",
-                                                            "--moe-expert-overlay", "tiered",
-                                                            "--moe-expert-overlay-continuation", "cuda_hot",
-                                                            "--moe-expert-overlay-shared-domain", "cuda_hot",
-                                                            "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0;scope=single;backend=nccl",
-                                                            "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
+                                                            "--moe-routed-expert-placement", "tiered-overlay",
+                                                            "--moe-routed-expert-continuation-domain", "cuda_hot",
+                                                            "--moe-routed-expert-shared-domain", "cuda_hot",
+                                                            "--moe-routed-expert-domain", "cuda_hot=0:cuda:0;scope=single;backend=nccl",
+                                                            "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
 
-        EXPECT_NE(missing_compute.find("missing compute"), std::string::npos);
+        EXPECT_NE(missing_compute.find("missing routed_compute"), std::string::npos);
     }
 
     TEST(Test__MoEGraphNativeProductionHardening, ExecutionPlanResolverReportsAmbiguousLocalTPRankHints)
@@ -247,7 +245,7 @@ namespace llaminar2::test
         try
         {
             (void)resolveMoEExpertOverlayExecutionPlan(
-                std::make_shared<MoEExpertParallelPlan>(plan),
+                std::make_shared<MoERoutedExpertPlacementPlan>(plan),
                 MoEExpertOverlayExecutionPlanResolverOptions{.current_world_rank = 0, .world_size = 3});
             FAIL() << "Expected ambiguous LocalTP rank ownership to fail";
         }

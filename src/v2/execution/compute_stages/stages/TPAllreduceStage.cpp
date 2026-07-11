@@ -6,6 +6,7 @@
  */
 
 #include "TPAllreduceStage.h"
+#include "../../../collective/AllreducePrecisionPolicy.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../memory/StageBufferContract.h"
@@ -68,10 +69,15 @@ namespace llaminar2
             size_t effective_count)
         {
             const std::string requested_precision = requestedTransportPrecision(params);
+            const size_t logical_row_elements =
+                params.tensor ? params.tensor->cols() : 0;
+            const size_t decision_elements =
+                batchInvariantAllreduceDecisionElements(
+                    effective_count, logical_row_elements);
             if (requested_precision == "fp16" &&
                 params.tensor &&
                 params.tensor->native_type() == TensorType::FP32 &&
-                effective_count < debugEnv().allreduce_fp16_min_elements)
+                decision_elements < debugEnv().allreduce_fp16_min_elements)
             {
                 return "fp32";
             }
@@ -281,6 +287,13 @@ namespace llaminar2
                 {"degree", params.tp_ctx ? std::to_string(params.tp_ctx->degree()) : "0"},
                 {"no_op", no_op ? "true" : "false"}};
             common_tags.emplace("elements", std::to_string(effective_count));
+            const size_t logical_row_elements = params.tensor->cols();
+            common_tags.emplace(
+                "logical_row_elements", std::to_string(logical_row_elements));
+            common_tags.emplace(
+                "precision_decision_elements",
+                std::to_string(batchInvariantAllreduceDecisionElements(
+                    effective_count, logical_row_elements)));
             common_tags.emplace("precision", params.precision.empty() ? "default" : params.precision);
             common_tags.emplace("requested_transport_precision", requestedTransportPrecision(params));
             common_tags.emplace("transport_precision", effectiveTransportPrecision(params, effective_count));
@@ -392,7 +405,12 @@ namespace llaminar2
                                        << ", tensor numel=" << params_.tensor->numel() << ")");
 
         void *stage_stream = gpuStream();
-        const std::string transport_precision = requestedTransportPrecision(params_);
+        // Resolve the schema request once at the stage boundary.  The LocalTP
+        // context receives the actual transport precision, so graph capture,
+        // eager execution, sideband bundles, and perf telemetry all obey the
+        // same per-row batch-invariant decision.
+        const std::string transport_precision =
+            effectiveTransportPrecision(params_, effective_count);
         const bool gpu_stage =
             params_.device_id.is_gpu() || (ctx && ctx->isGPU());
 

@@ -1,4 +1,4 @@
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "planning/WeightMemoryEstimator.h"
@@ -22,7 +22,7 @@ namespace llaminar2
             return static_cast<size_t>(std::ceil(bytes));
         }
 
-        void validateMetadata(const MoEExpertModelMetadata &metadata)
+        void validateMetadata(const MoERoutedExpertModelMetadata &metadata)
         {
             if (metadata.num_layers <= 0)
                 throw std::invalid_argument("MoE expert planner metadata num_layers must be > 0");
@@ -36,10 +36,10 @@ namespace llaminar2
                 throw std::invalid_argument("MoE expert planner metadata shared_intermediate_size must be > 0 when has_shared_expert is true");
         }
 
-        std::string formatValidationErrors(const MoEExpertParallelValidationResult &validation)
+        std::string formatValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
         {
             std::ostringstream message;
-            message << "Invalid MoE expert parallel plan for planner:";
+            message << "Invalid routed-expert placement plan for planner:";
             for (const auto &error : validation.errors)
             {
                 message << "\n - " << error;
@@ -47,7 +47,7 @@ namespace llaminar2
             return message.str();
         }
 
-        int findFallbackTierIndex(const MoEExpertParallelPlan &plan)
+        int findFallbackTierIndex(const MoERoutedExpertPlacementPlan &plan)
         {
             for (size_t tier_idx = 0; tier_idx < plan.routed_tiers.size(); ++tier_idx)
             {
@@ -58,7 +58,7 @@ namespace llaminar2
         }
 
         std::vector<int> sortedPlanningTierIndices(
-            const MoEExpertParallelPlan &plan,
+            const MoERoutedExpertPlacementPlan &plan,
             int fallback_tier)
         {
             std::vector<int> tier_indices;
@@ -121,7 +121,7 @@ namespace llaminar2
         }
 
         size_t tierCapacityPerLayer(
-            const ExpertRoutedTier &tier,
+            const RoutedExpertTier &tier,
             int num_experts,
             size_t routed_expert_bytes_per_expert)
         {
@@ -140,15 +140,15 @@ namespace llaminar2
             return capacity;
         }
 
-        ExpertLayerPlacement buildPlacementFromExpertOrder(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
+        RoutedExpertLayerPlacement buildPlacementFromExpertOrder(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
             int layer,
             const std::vector<int> &expert_order,
             size_t routed_expert_bytes_per_expert)
         {
             const int fallback_tier = findFallbackTierIndex(plan);
-            ExpertLayerPlacement placement;
+            RoutedExpertLayerPlacement placement;
             placement.layer = layer;
             placement.routed_expert_tier.assign(static_cast<size_t>(metadata.num_experts), fallback_tier);
 
@@ -170,7 +170,7 @@ namespace llaminar2
             if (fallback_tier < 0 && next_expert < expert_order.size())
             {
                 std::ostringstream message;
-                message << "MoE expert parallel planner no-fallback routed tier capacity cannot cover every expert for layer "
+                message << "Routed-expert placement planner no-fallback tier capacity cannot cover every expert for layer "
                         << layer << ": assigned " << next_expert << " of " << expert_order.size()
                         << " experts; increase routed tier max_experts_per_layer or memory_budget_bytes, or configure one fallback tier";
                 throw std::invalid_argument(message.str());
@@ -179,16 +179,16 @@ namespace llaminar2
             return placement;
         }
 
-        std::vector<ExpertLayerPlacement> convertExplicitMasksToPlacements(
-            const std::vector<MoEExpertLayerTierMask> &explicit_masks,
-            const MoEExpertModelMetadata &metadata,
-            const MoEExpertParallelPlan &plan)
+        std::vector<RoutedExpertLayerPlacement> convertExplicitMasksToPlacements(
+            const std::vector<MoERoutedExpertLayerTierMask> &explicit_masks,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedExpertPlacementPlan &plan)
         {
-            std::vector<ExpertLayerPlacement> placements;
+            std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
             for (int layer = 0; layer < metadata.num_layers; ++layer)
             {
-                ExpertLayerPlacement placement;
+                RoutedExpertLayerPlacement placement;
                 placement.layer = layer;
                 placement.routed_expert_tier.assign(static_cast<size_t>(metadata.num_experts), -1);
                 placements.push_back(std::move(placement));
@@ -219,10 +219,10 @@ namespace llaminar2
             return placements;
         }
 
-        std::vector<ExpertLayerPlacement> explicitPlacements(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
-            const MoEExpertParallelPlannerOptions &options)
+        std::vector<RoutedExpertLayerPlacement> explicitPlacements(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedExpertPlacementPlannerOptions &options)
         {
             if (!options.explicit_placements.empty())
                 return options.explicit_placements;
@@ -233,12 +233,12 @@ namespace llaminar2
             throw std::invalid_argument("ExplicitMasks MoE expert residency policy requires explicit placements or masks");
         }
 
-        std::vector<ExpertLayerPlacement> staticByIdPlacements(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
+        std::vector<RoutedExpertLayerPlacement> staticByIdPlacements(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
             size_t routed_expert_bytes_per_expert)
         {
-            std::vector<ExpertLayerPlacement> placements;
+            std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
             const auto expert_order = byIdExpertOrder(metadata.num_experts);
             for (int layer = 0; layer < metadata.num_layers; ++layer)
@@ -248,10 +248,10 @@ namespace llaminar2
             return placements;
         }
 
-        std::vector<ExpertLayerPlacement> histogramTieredCachePlacements(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
-            const MoEExpertParallelPlannerOptions &options,
+        std::vector<RoutedExpertLayerPlacement> histogramTieredCachePlacements(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedExpertPlacementPlannerOptions &options,
             size_t routed_expert_bytes_per_expert)
         {
             if (!options.decode_histogram)
@@ -263,7 +263,7 @@ namespace llaminar2
                 throw std::invalid_argument("DecodeExpertHistogram shape is smaller than MoE expert planner model metadata");
             }
 
-            std::vector<ExpertLayerPlacement> placements;
+            std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
             const auto by_id_order = byIdExpertOrder(metadata.num_experts);
             for (int layer = 0; layer < metadata.num_layers; ++layer)
@@ -276,8 +276,8 @@ namespace llaminar2
             return placements;
         }
 
-        MoEExpertDomainMemoryEstimate &domainEstimate(
-            MoEExpertParallelMemoryEstimate &estimate,
+        MoERoutedExpertDomainMemoryEstimate &domainEstimate(
+            MoERoutedExpertPlacementMemoryEstimate &estimate,
             const std::string &domain)
         {
             auto found = std::find_if(estimate.domains.begin(), estimate.domains.end(), [&](const auto &entry)
@@ -285,22 +285,22 @@ namespace llaminar2
             if (found != estimate.domains.end())
                 return *found;
 
-            MoEExpertDomainMemoryEstimate entry;
+            MoERoutedExpertDomainMemoryEstimate entry;
             entry.domain = domain;
             estimate.domains.push_back(std::move(entry));
             return estimate.domains.back();
         }
 
-        MoEExpertParallelMemoryEstimate estimateMemory(
-            const MoEExpertParallelPlan &planned_plan,
-            const MoEExpertModelMetadata &metadata,
+        MoERoutedExpertPlacementMemoryEstimate estimateMemory(
+            const MoERoutedExpertPlacementPlan &planned_plan,
+            const MoERoutedExpertModelMetadata &metadata,
             size_t routed_expert_bytes_per_expert)
         {
-            MoEExpertParallelMemoryEstimate estimate;
+            MoERoutedExpertPlacementMemoryEstimate estimate;
             estimate.shared_expert_domain = planned_plan.shared_expert_domain;
             estimate.routed_expert_bytes_per_expert = routed_expert_bytes_per_expert;
-            estimate.shared_expert_bytes_per_layer = MoEExpertParallelPlanner::estimateSharedExpertBytesPerLayer(metadata);
-            estimate.total_shared_expert_bytes = MoEExpertParallelPlanner::estimateTotalSharedExpertBytes(metadata);
+            estimate.shared_expert_bytes_per_layer = MoERoutedExpertPlacementPlanner::estimateSharedExpertBytesPerLayer(metadata);
+            estimate.total_shared_expert_bytes = MoERoutedExpertPlacementPlanner::estimateTotalSharedExpertBytes(metadata);
             estimate.tiers.reserve(planned_plan.routed_tiers.size());
 
             if (!planned_plan.shared_expert_domain.empty())
@@ -312,7 +312,7 @@ namespace llaminar2
             for (size_t tier_idx = 0; tier_idx < planned_plan.routed_tiers.size(); ++tier_idx)
             {
                 const auto &tier = planned_plan.routed_tiers[tier_idx];
-                MoEExpertTierMemoryEstimate tier_estimate;
+                MoERoutedExpertTierMemoryEstimate tier_estimate;
                 tier_estimate.tier_index = static_cast<int>(tier_idx);
                 tier_estimate.tier_name = tier.name;
                 tier_estimate.domain = tier.domain;
@@ -346,15 +346,15 @@ namespace llaminar2
         // RoutedTierRebalanced: deterministic hot-cache placement with diagnostics
         // ---------------------------------------------------------------------------
 
-        int findFallbackTierIndexRebalanced(const MoEExpertParallelPlan &plan)
+        int findFallbackTierIndexRebalanced(const MoERoutedExpertPlacementPlan &plan)
         {
             return findFallbackTierIndex(plan);
         }
 
         MoERoutedTierRebalanceLayerDiagnostics buildLayerDiagnostics(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
-            const ExpertLayerPlacement &placement,
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const RoutedExpertLayerPlacement &placement,
             const DecodeExpertHistogram *histogram,
             int layer,
             size_t routed_expert_bytes_per_expert)
@@ -408,14 +408,14 @@ namespace llaminar2
 
         struct RoutedTierRebalancedResult
         {
-            std::vector<ExpertLayerPlacement> placements;
+            std::vector<RoutedExpertLayerPlacement> placements;
             MoERoutedTierRebalanceDiagnostics diagnostics;
         };
 
         RoutedTierRebalancedResult routedTierRebalancedPlacements(
-            const MoEExpertParallelPlan &plan,
-            const MoEExpertModelMetadata &metadata,
-            const MoEExpertParallelPlannerOptions &options,
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedExpertPlacementPlannerOptions &options,
             size_t routed_expert_bytes_per_expert)
         {
             const DecodeExpertHistogram *histogram = options.decode_histogram;
@@ -467,64 +467,64 @@ namespace llaminar2
 
     } // namespace
 
-    MoEExpertParallelPlannerResult MoEExpertParallelPlanner::plan(const MoEExpertParallelPlannerInput &input)
+    MoERoutedExpertPlacementPlannerResult MoERoutedExpertPlacementPlanner::plan(const MoERoutedExpertPlacementPlannerInput &input)
     {
         return plan(input.plan, input.metadata, input.options);
     }
 
-    MoEExpertParallelPlannerResult MoEExpertParallelPlanner::plan(
-        const MoEExpertParallelPlan &base_plan,
-        const MoEExpertModelMetadata &metadata,
-        const MoEExpertParallelPlannerOptions &options)
+    MoERoutedExpertPlacementPlannerResult MoERoutedExpertPlacementPlanner::plan(
+        const MoERoutedExpertPlacementPlan &base_plan,
+        const MoERoutedExpertModelMetadata &metadata,
+        const MoERoutedExpertPlacementPlannerOptions &options)
     {
         if (!base_plan.enabled)
         {
-            MoEExpertParallelPlannerResult result;
+            MoERoutedExpertPlacementPlannerResult result;
             result.planned_plan = base_plan;
             return result;
         }
 
         validateMetadata(metadata);
 
-        const auto base_validation = validateMoEExpertParallelPlan(base_plan);
+        const auto base_validation = validateMoERoutedExpertPlacementPlan(base_plan);
         if (!base_validation.ok())
             throw std::invalid_argument(formatValidationErrors(base_validation));
 
-        MoEExpertParallelPlan planned_plan = base_plan;
+        MoERoutedExpertPlacementPlan planned_plan = base_plan;
         const size_t routed_expert_bytes_per_expert = estimateRoutedExpertBytesPerExpert(metadata);
 
-        MoEExpertParallelPlannerResult result;
+        MoERoutedExpertPlacementPlannerResult result;
 
         switch (base_plan.residency_policy)
         {
-        case ExpertResidencyPolicy::StaticById:
+        case RoutedExpertResidencyPolicy::StaticById:
             planned_plan.placements = staticByIdPlacements(base_plan, metadata, routed_expert_bytes_per_expert);
             break;
-        case ExpertResidencyPolicy::ExplicitMasks:
+        case RoutedExpertResidencyPolicy::ExplicitMasks:
             planned_plan.placements = explicitPlacements(base_plan, metadata, options);
             break;
-        case ExpertResidencyPolicy::HistogramTieredCache:
+        case RoutedExpertResidencyPolicy::HistogramTieredCache:
             planned_plan.placements = histogramTieredCachePlacements(base_plan, metadata, options, routed_expert_bytes_per_expert);
             break;
-        case ExpertResidencyPolicy::RoutedTierRebalanced:
+        case RoutedExpertResidencyPolicy::RoutedTierRebalanced:
         {
             auto rebalanced = routedTierRebalancedPlacements(base_plan, metadata, options, routed_expert_bytes_per_expert);
             planned_plan.placements = std::move(rebalanced.placements);
             result.rebalance_diagnostics = std::move(rebalanced.diagnostics);
             break;
         }
-        case ExpertResidencyPolicy::Disabled:
+        case RoutedExpertResidencyPolicy::Disabled:
             if (base_plan.placements.empty())
-                throw std::invalid_argument("MoE expert parallel planner cannot plan an enabled overlay with Disabled residency policy and no placements");
+                throw std::invalid_argument("Routed-expert placement planner cannot plan an enabled overlay with Disabled residency policy and no placements");
             planned_plan.placements = base_plan.placements;
             break;
         }
 
-        const MoEExpertParallelValidationOptions validation_options{
+        const MoERoutedExpertPlacementValidationOptions validation_options{
             .layer_count = metadata.num_layers,
             .routed_expert_count = metadata.num_experts,
         };
-        const auto planned_validation = validateMoEExpertParallelPlan(planned_plan, validation_options);
+        const auto planned_validation = validateMoERoutedExpertPlacementPlan(planned_plan, validation_options);
         if (!planned_validation.ok())
             throw std::invalid_argument(formatValidationErrors(planned_validation));
 
@@ -533,7 +533,7 @@ namespace llaminar2
         return result;
     }
 
-    size_t MoEExpertParallelPlanner::estimateRoutedExpertBytesPerExpert(const MoEExpertModelMetadata &metadata)
+    size_t MoERoutedExpertPlacementPlanner::estimateRoutedExpertBytesPerExpert(const MoERoutedExpertModelMetadata &metadata)
     {
         validateMetadata(metadata);
         const long double elements = 3.0L * static_cast<long double>(metadata.d_model) *
@@ -542,7 +542,7 @@ namespace llaminar2
         return ceilBytes(elements * bytes_per_weight);
     }
 
-    size_t MoEExpertParallelPlanner::estimateSharedExpertBytesPerLayer(const MoEExpertModelMetadata &metadata)
+    size_t MoERoutedExpertPlacementPlanner::estimateSharedExpertBytesPerLayer(const MoERoutedExpertModelMetadata &metadata)
     {
         validateMetadata(metadata);
         if (!metadata.has_shared_expert)
@@ -553,7 +553,7 @@ namespace llaminar2
         return ceilBytes(elements * bytes_per_weight);
     }
 
-    size_t MoEExpertParallelPlanner::estimateTotalSharedExpertBytes(const MoEExpertModelMetadata &metadata)
+    size_t MoERoutedExpertPlacementPlanner::estimateTotalSharedExpertBytes(const MoERoutedExpertModelMetadata &metadata)
     {
         validateMetadata(metadata);
         return estimateSharedExpertBytesPerLayer(metadata) * static_cast<size_t>(metadata.num_layers);

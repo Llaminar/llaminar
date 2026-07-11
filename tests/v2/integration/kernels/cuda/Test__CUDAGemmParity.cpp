@@ -40,6 +40,7 @@
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "loaders/ModelContextConfig.h"
+#include "models/qwen35/Qwen35Schema.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 #include "tensors/TensorSlice.h"
 #include "tensors/TensorFactory.h"
@@ -1290,6 +1291,16 @@ namespace
     }
 
     /**
+     * @brief Return the Qwen3.6 dense GGUF used by real LocalTP regressions.
+     */
+    std::filesystem::path qwen36DenseModelPath()
+    {
+        if (const char *env = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL"))
+            return std::filesystem::path(env);
+        return std::filesystem::path("/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf");
+    }
+
+    /**
      * @brief Load a model context whose raw quantized weights can be GPU-prepared.
      *
      * The production GPU upload/repack helper consumes the host GGUF blocks
@@ -1354,6 +1365,56 @@ namespace
             std::max(
                 model_ctx->feedForwardLength(),
                 model_ctx->concreteLoader().getInt("expert_feed_forward_length", 0)));
+        const int vocab_size = model_ctx->vocabSize();
+
+        weight_manager->setModelDimensions(n_heads, n_kv_heads, head_dim);
+        weight_manager->setGDNDimensions(
+            model_ctx->concreteLoader().getInt("ssm.group_count", 0),
+            model_ctx->concreteLoader().getInt("ssm.time_step_rank", 0),
+            model_ctx->concreteLoader().getInt("ssm.state_size", 0));
+
+        auto tp_config = std::make_shared<TensorParallelConfig>(
+            TensorParallelConfig::equalSplit(
+                static_cast<int>(devices.size()),
+                n_heads,
+                n_kv_heads,
+                d_ff,
+                vocab_size,
+                devices));
+        weight_manager->setTensorParallelConfig(tp_config);
+        return tp_config;
+    }
+
+    /**
+     * @brief Configure the dense Qwen3.6 production two-way LocalTP sharder.
+     *
+     * Qwen3.6 GDN QKV is not a uniform column slice: Q/K channels are mirrored
+     * while V channels are apportioned.  A synthetic tensor with the resulting
+     * dimensions cannot prove the production slice wrapper, native GGUF block
+     * boundaries, or GPU repack.  This helper installs the real dense schema and
+     * model dimensions before a regression asks WeightManager for each device's
+     * concrete local tensor.
+     */
+    std::shared_ptr<TensorParallelConfig> configureQwen36DenseLocalTPWeights(
+        const std::shared_ptr<ModelContext> &model_ctx,
+        const std::vector<DeviceId> &devices)
+    {
+        auto weight_manager = model_ctx ? model_ctx->concreteWeightManager() : nullptr;
+        if (!model_ctx || !weight_manager)
+            return nullptr;
+
+        Qwen35SchemaFactory schema_factory;
+        weight_manager->setWeightShardingConfig(
+            schema_factory.getWeightShardingConfig());
+
+        const int n_heads = model_ctx->headCount();
+        const int n_kv_heads = std::max(1, model_ctx->headCountKV());
+        const int head_dim = model_ctx->keyLength() > 0
+                                 ? model_ctx->keyLength()
+                                 : (n_heads > 0
+                                        ? model_ctx->embeddingLength() / n_heads
+                                        : 0);
+        const int d_ff = std::max(32, model_ctx->feedForwardLength());
         const int vocab_size = model_ctx->vocabSize();
 
         weight_manager->setModelDimensions(n_heads, n_kv_heads, head_dim);
@@ -3297,6 +3358,170 @@ TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSi
         << "M=4 mixed-codebook GDN z fused verifier test must not leak CUDA dynamic state";
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+}
+
+/**
+ * @brief Guard the asymmetric Qwen3.6 dense LocalTP GDN QKV shard at M=2.
+ *
+ * Two-way LocalTP replicates the GDN Q/K channels and shards the wider V
+ * channels.  The resulting rank-local fused QKV tensor has 7168 output rows,
+ * a geometry absent from the earlier full-weight `N=10240` regressions.  The
+ * device-resident request-batch condition graph uses exactly M=2, and its first
+ * observed byte drift occurred at this projection.  Exercise the public
+ * grouped projection API and independently quantized ordinary M=1 API so the
+ * test covers dispatch, reduction, and epilogue equivalence end to end.
+ */
+TEST_F(Test__CUDAGemmParity, Q5K_Qwen36DenseLocalTPGDNQKV_M2MatchesTwoSingleRowDecodeGEMVs)
+{
+    constexpr int M = 2;
+    constexpr int N = 7168;
+    constexpr int K = 5120;
+
+    auto weights = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)},
+        4433);
+    ASSERT_NE(weights, nullptr);
+
+    auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K));
+
+    const auto input = randomFP32(static_cast<size_t>(M) * K);
+    std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+        kernel,
+        input.data(),
+        grouped.data(),
+        M,
+        N,
+        K,
+        gpu_device_,
+        workspace_.get()));
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            kernel,
+            input.data() + static_cast<size_t>(row) * K,
+            serial.data(),
+            /*M=*/1,
+            N,
+            K,
+            gpu_device_));
+        expectBitwiseEqualFloatRow(
+            (std::string("Q5_K Qwen36 dense LocalTP GDN QKV M=2 row=") +
+             std::to_string(row))
+                .c_str(),
+            grouped.data() + static_cast<size_t>(row) * N,
+            serial.data(),
+            serial.size());
+    }
+
+    cleanupWorkspaceIfNeeded(kernel);
+    EXPECT_FALSE(kernel->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @brief Prove both real dense Qwen3.6 LocalTP GDN QKV slices at M=2.
+ *
+ * This is the focused kernel regression for the resident request-batch
+ * condition failure.  It uses the actual GGUF tensor, dense schema, asymmetric
+ * two-way LocalTP sharder, TensorSlice wrapper, native GPU weight repack, and
+ * public grouped projection API.  Each rank-local grouped row is compared with
+ * an independently quantized ordinary M=1 decode invocation.  No production
+ * serial replay path is involved; serial calls exist only as this test's oracle.
+ */
+TEST_F(Test__CUDAGemmParity, RealQwen36DenseLocalTPGDNQKVShardM2MatchesSerialDecodeRows)
+{
+    SKIP_IF_NO_CUDA();
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+
+    const std::filesystem::path model_path = qwen36DenseModelPath();
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen 3.6 dense model not found at " << model_path
+                     << "; set LLAMINAR_QWEN36_DENSE_MODEL to run this real-weight regression";
+    }
+
+    auto model_ctx = loadQwen36ModelForGpuWeights(model_path);
+    ASSERT_NE(model_ctx, nullptr);
+    const std::vector<DeviceId> logical_tp_devices = {
+        DeviceId::cuda(0),
+        DeviceId::cuda(1),
+    };
+    auto tp_config = configureQwen36DenseLocalTPWeights(
+        model_ctx,
+        logical_tp_devices);
+    ASSERT_NE(tp_config, nullptr);
+    ASSERT_TRUE(tp_config->validate()) << tp_config->validationError();
+
+    constexpr int M = 2;
+    const ModelContextId model_id{36364};
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        auto weight = model_ctx->getWeightForDevice(
+            "blk.0.attn_qkv.weight",
+            logical_tp_devices[static_cast<size_t>(rank)]);
+        ASSERT_NE(weight, nullptr) << "rank=" << rank;
+        ASSERT_EQ(weight->native_type(), TensorType::Q5_K)
+            << "The Qwen3.6 dense fixture's first GDN QKV projection changed format";
+
+        const int N = static_cast<int>(weight->rows());
+        const int K = static_cast<int>(weight->cols());
+        ASSERT_EQ(N, 7168) << "rank=" << rank;
+        ASSERT_EQ(K, 5120) << "rank=" << rank;
+
+        auto prepared = llaminar2::test::makeGpuPreparedGemm(
+            gpuPreparationTensor(weight.get()),
+            gpu_device_,
+            "blk.0.attn_qkv.weight.localtp.rank" + std::to_string(rank),
+            model_id);
+        ASSERT_NE(prepared.kernel, nullptr) << "rank=" << rank;
+        ASSERT_TRUE(setupWorkspaceIfNeeded(prepared.kernel, M, N, K))
+            << "rank=" << rank;
+
+        const auto input = randomFP32(static_cast<size_t>(M) * K);
+        std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+        ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+            prepared.kernel,
+            input.data(),
+            grouped.data(),
+            M,
+            N,
+            K,
+            gpu_device_,
+            workspace_.get()))
+            << "rank=" << rank;
+
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                prepared.kernel,
+                input.data() + static_cast<size_t>(row) * K,
+                serial.data(),
+                /*M=*/1,
+                N,
+                K,
+                gpu_device_))
+                << "rank=" << rank << " row=" << row;
+            expectBitwiseEqualFloatRow(
+                (std::string("real Qwen36 dense LocalTP GDN QKV rank=") +
+                 std::to_string(rank) + " M=2 row=" + std::to_string(row))
+                    .c_str(),
+                grouped.data() + static_cast<size_t>(row) * N,
+                serial.data(),
+                serial.size());
+        }
+
+        cleanupWorkspaceIfNeeded(prepared.kernel);
+        EXPECT_FALSE(prepared.kernel->hasDynamicStateActive())
+            << "rank=" << rank;
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(
+            gpuPreparationTensor(weight.get()));
+    }
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
@@ -5918,6 +6143,81 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
         cleanupWorkspaceIfNeeded(base_kernel);
         EXPECT_FALSE(base_kernel->hasDynamicStateActive())
             << fmt.name << " specialized small-M equivalence test leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+}
+
+/**
+ * @brief Prove every native codebook on the production large-K KPAR shape class.
+ *
+ * The compact all-format sweep above uses `K=512`, while Qwen3.6 LocalTP GDN
+ * projects a rank-local `K=5120` activation.  Generated dispatch classifies
+ * `N=1024, K=5120` as KPAR for both M=1 and M=2.  Before this regression, the
+ * grouped verifier could still create a lazy row-major weight view and promote
+ * only M=2 to ROWPAR; serial decode deliberately kept KPAR, producing widespread
+ * one-ULP drift that eventually changed sampled tokens.
+ *
+ * This test exercises the public fused verifier API and the ordinary fused M=1
+ * API independently, including separate activation quantization.  Every row
+ * must be byte-identical for every supported quantized tensor format.  The
+ * grouped implementation remains a single native small-M launch and never
+ * replays rows through the serial API.
+ */
+TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode)
+{
+    constexpr int M = 2;
+    constexpr int N = 1024;
+    constexpr int K = 5120;
+
+    for (const auto &format : cudaSmallMNativeFormats())
+    {
+        auto weights = format.create(N, K);
+        ASSERT_NE(weights, nullptr)
+            << "Failed to create " << format.name << " large-K weights";
+
+        auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(kernel, nullptr) << format.name << " CUDA kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K))
+            << format.name << " large-K verifier workspace";
+
+        const auto input = randomFP32(static_cast<size_t>(M) * K);
+        std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+        ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
+            kernel,
+            input.data(),
+            grouped.data(),
+            M,
+            N,
+            K,
+            gpu_device_,
+            workspace_.get()))
+            << format.name << " grouped large-K verifier projection";
+
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+            ASSERT_TRUE(cudaMultiplyViaTensor(
+                kernel,
+                input.data() + static_cast<size_t>(row) * K,
+                serial.data(),
+                /*M=*/1,
+                N,
+                K,
+                gpu_device_))
+                << format.name << " serial large-K decode row " << row;
+
+            expectBitwiseEqualFloatRow(
+                (std::string(format.name) + " large-K KPAR M=2 row=" +
+                 std::to_string(row))
+                    .c_str(),
+                grouped.data() + static_cast<size_t>(row) * N,
+                serial.data(),
+                serial.size());
+        }
+
+        cleanupWorkspaceIfNeeded(kernel);
+        EXPECT_FALSE(kernel->hasDynamicStateActive())
+            << format.name << " large-K sweep leaked CUDA dynamic state";
         llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
     }
 }

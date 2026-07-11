@@ -87,7 +87,7 @@ namespace llaminar2
     class MoEExpertOverlayRuntimePlan;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
-    struct MoEExpertParallelPlan;
+    struct MoERoutedExpertPlacementPlan;
 
     using DomainTPContextMap = std::map<std::string, std::shared_ptr<ITPContext>>;
 
@@ -135,9 +135,9 @@ namespace llaminar2
         MTPRuntimeConfig mtp;
 
         /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
+        RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        /// Bounded remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
         /// Decode histogram / dynamic rebalance settings.
@@ -190,7 +190,7 @@ namespace llaminar2
         std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
         /// Optional same-layer MoE expert overlay plan propagated into GraphConfig.
-        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+        std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
 
         /// True when a parent RankOrchestrator has already prepared overlay
         /// expert weights for the whole LocalTP domain. Child device runners
@@ -230,7 +230,7 @@ namespace llaminar2
             config.fused_attention_backend = plan.runtime.fused_attention_backend;
             config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
-            config.moe_expert_mode = plan.runtime.moe_expert_mode;
+            config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
             config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
             config.moe_rebalance = plan.runtime.moe_rebalance;
             config.prefix_cache = plan.runtime.prefix_cache;
@@ -280,7 +280,7 @@ namespace llaminar2
         DeviceId device,
         const InferenceRunnerConfig &config = {});
 
-    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
+    std::shared_ptr<MoERoutedExpertPlacementPlan> resolveMoERoutedExpertPlacementPlanForModel(
         IModelContext &model_ctx,
         const InferenceRunnerConfig &config);
 

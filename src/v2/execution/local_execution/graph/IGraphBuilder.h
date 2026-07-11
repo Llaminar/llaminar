@@ -358,6 +358,19 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Select the grouped live MTP condition graph policy.
+         *
+         * Unlike all-position verification, this mode advances live recurrent
+         * state and requests one terminal-logit row for each request. Builders
+         * must not implement it by enabling speculative verifier state capture.
+         */
+        virtual bool setLiveMTPRequestBatchCondition(bool enabled)
+        {
+            (void)enabled;
+            return false;
+        }
+
         /// Enable compact row-indexed all-position verifier logits.
         virtual bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
         {

@@ -15,7 +15,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/moe/MoEExpertOverlayProfiler.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -59,39 +59,39 @@ namespace
         return std::filesystem::exists(kModelPath);
     }
 
-    ExpertComputeDomain cudaHotDomain()
+    RoutedExpertDomain cudaHotDomain()
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = kCudaHotDomain;
-        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.scope = ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::NCCL;
         domain.participants = {GlobalDeviceAddress::cuda(0)};
         domain.world_ranks = {0};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertComputeDomain rocmWarmDomain()
+    RoutedExpertDomain rocmWarmDomain()
     {
-        ExpertComputeDomain domain;
+        RoutedExpertDomain domain;
         domain.name = kRocmWarmDomain;
-        domain.kind = ExpertDomainKind::SingleDevice;
+        domain.scope = ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0)};
         domain.world_ranks = {1};
         domain.owner_rank = 1;
-        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         return domain;
     }
 
-    ExpertRoutedTier makeTier(
+    RoutedExpertTier makeTier(
         const std::string &name,
         const std::string &domain,
         int priority,
         int max_experts_per_layer)
     {
-        ExpertRoutedTier t;
+        RoutedExpertTier t;
         t.name = name;
         t.domain = domain;
         t.priority = priority;
@@ -101,9 +101,9 @@ namespace
         return t;
     }
 
-    MoEExpertModelMetadata topologyOnlyMetadata()
+    MoERoutedExpertModelMetadata topologyOnlyMetadata()
     {
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_experts = kQwen35MoENumExperts;
         metadata.num_layers = kQwen35MoENumLayers;
         metadata.d_model = 4096;
@@ -115,12 +115,12 @@ namespace
         return metadata;
     }
 
-    MoEExpertModelMetadata metadataFromModel(const ModelContext &ctx)
+    MoERoutedExpertModelMetadata metadataFromModel(const ModelContext &ctx)
     {
         const auto &loader = ctx.concreteLoader();
         const std::string &arch = ctx.architecture();
 
-        MoEExpertModelMetadata metadata;
+        MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = ctx.totalBlockCount();
         metadata.num_experts = loader.getInt(arch + ".expert_count", 0);
         metadata.d_model = ctx.embeddingLength();
@@ -136,17 +136,17 @@ namespace
         return metadata;
     }
 
-    MoEExpertParallelPlan requestedPlan(const MoEExpertModelMetadata &metadata)
+    MoERoutedExpertPlacementPlan requestedPlan(const MoERoutedExpertModelMetadata &metadata)
     {
         const int cuda_capacity = std::max(1, metadata.num_experts / 2);
         const int rocm_capacity = std::max(1, metadata.num_experts - cuda_capacity);
 
-        MoEExpertParallelPlan plan;
+        MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
-        plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan.continuation_domain = kCudaHotDomain;
         plan.shared_expert_domain = kCudaHotDomain;
-        plan.residency_policy = ExpertResidencyPolicy::StaticById;
+        plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan.domains = {
             cudaHotDomain(),
             rocmWarmDomain(),
@@ -158,7 +158,7 @@ namespace
         return plan;
     }
 
-    std::string planValidationErrors(const MoEExpertParallelValidationResult &validation)
+    std::string planValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
     {
         std::ostringstream message;
         for (const auto &error : validation.errors)
@@ -166,26 +166,26 @@ namespace
         return message.str();
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makePlannedOverlayPlan(
-        const MoEExpertModelMetadata &metadata)
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makePlannedOverlayPlan(
+        const MoERoutedExpertModelMetadata &metadata)
     {
-        auto result = MoEExpertParallelPlanner::plan(requestedPlan(metadata), metadata);
+        auto result = MoERoutedExpertPlacementPlanner::plan(requestedPlan(metadata), metadata);
         auto planned = result.planned_plan;
 
-        MoEExpertParallelValidationOptions options;
+        MoERoutedExpertPlacementValidationOptions options;
         options.layer_count = metadata.num_layers;
         options.routed_expert_count = metadata.num_experts;
-        auto validation = validateMoEExpertParallelPlan(planned, options);
+        auto validation = validateMoERoutedExpertPlacementPlan(planned, options);
         if (!validation.ok())
         {
             throw std::invalid_argument(
                 "Graph-native CudaHot/RocmWarm plan is invalid:" +
                 planValidationErrors(validation));
         }
-        return std::make_shared<MoEExpertParallelPlan>(std::move(planned));
+        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
     }
 
-    std::vector<size_t> tierExpertCounts(const MoEExpertParallelPlan &plan)
+    std::vector<size_t> tierExpertCounts(const MoERoutedExpertPlacementPlan &plan)
     {
         std::vector<size_t> counts(plan.routed_tiers.size(), 0);
         for (const auto &placement : plan.placements)
@@ -418,7 +418,7 @@ protected:
         inf_config.force_graph = true;
         inf_config.activation_precision = cfg().activation_precision;
         inf_config.kv_cache_precision = cfg().kv_cache_precision;
-        inf_config.moe_expert_parallel_plan = overlay_plan_;
+        inf_config.moe_routed_expert_plan = overlay_plan_;
         inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
 
         runner_ = createInferenceRunner(model_ctx_, nullptr, DeviceId::cuda(0), inf_config);
@@ -584,7 +584,7 @@ protected:
         assertDecodeParity(summary);
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> overlay_plan_;
+    std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan_;
 };
 
 TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, TopologySmoke)
@@ -597,7 +597,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, TopologySmoke)
 
     const auto metadata = topologyOnlyMetadata();
 
-    std::shared_ptr<MoEExpertParallelPlan> plan;
+    std::shared_ptr<MoERoutedExpertPlacementPlan> plan;
     ASSERT_NO_THROW(plan = makePlannedOverlayPlan(metadata))
         << "Plan construction threw for the all-GPU cuda_hot / rocm_warm layout";
     ASSERT_NE(plan, nullptr);
@@ -611,8 +611,8 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, TopologySmoke)
 
     const auto &cuda_domain = plan->domains[0];
     EXPECT_EQ(cuda_domain.name, kCudaHotDomain);
-    EXPECT_EQ(cuda_domain.kind, ExpertDomainKind::SingleDevice);
-    EXPECT_EQ(cuda_domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts);
+    EXPECT_EQ(cuda_domain.scope, ExecutionDomainScope::SINGLE);
+    EXPECT_EQ(cuda_domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
     ASSERT_EQ(cuda_domain.participants.size(), 1u);
     EXPECT_TRUE(cuda_domain.participants[0].isCUDA());
     EXPECT_EQ(cuda_domain.owner_rank, 0);
@@ -621,8 +621,8 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, TopologySmoke)
 
     const auto &rocm_domain = plan->domains[1];
     EXPECT_EQ(rocm_domain.name, kRocmWarmDomain);
-    EXPECT_EQ(rocm_domain.kind, ExpertDomainKind::SingleDevice);
-    EXPECT_EQ(rocm_domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts);
+    EXPECT_EQ(rocm_domain.scope, ExecutionDomainScope::SINGLE);
+    EXPECT_EQ(rocm_domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
     ASSERT_EQ(rocm_domain.participants.size(), 1u);
     EXPECT_TRUE(rocm_domain.participants[0].isROCm());
     EXPECT_EQ(rocm_domain.owner_rank, 1);
@@ -631,7 +631,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, TopologySmoke)
 
     for (const auto &domain : plan->domains)
     {
-        EXPECT_EQ(domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts)
+        EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned)
             << "Domain '" << domain.name << "' must use whole-expert graph-native ownership";
         for (const auto &participant : domain.participants)
         {

@@ -147,15 +147,20 @@ direction.
   - Decode: dense replicated plus apportioned routed experts, with optional hot
     expert replica/cache layer.
   - Shared experts follow dense policy, not routed-expert movement policy.
-- Canonical terminology:
-  - `ReplicatedExperts`: all experts on every participant.
-  - `ApportionedExperts`: whole experts split across participants.
-  - `ShardedExperts`: every participant owns a shard of every expert, with
-    reduction where required.
-  - `HybridTP_AE`: tensor parallel dense plus apportioned experts.
-  - `PhaseSplitHybridTP_AE`: TP dense in prefill, replicated dense in decode,
-    apportioned routed experts.
-  - `HybridTP_RE`: TP dense plus replicated experts.
+- Canonical terminology separates four independent policy axes:
+  - Routed-expert compute: `replicated`, `apportioned`, or `tensor-sharded`.
+    Apportioned compute assigns complete expert IDs to participants;
+    tensor-sharded compute assigns every participant a weight slice of every
+    routed expert and requires a partial-result reduction.
+  - Routed-expert assignment: `static-owner` or `least-loaded-resident` (LLEP).
+    Assignment chooses which resident complete expert handles a routed row; it
+    does not describe expert weight slicing.
+  - Dense compute: `replicated`, `tensor-parallel`,
+    `tensor-parallel-decode-mirrored-embedding`, or
+    `prefill-tensor-parallel-decode-replicated`.
+  - Routed-expert placement topology: `single-domain` or `tiered-overlay`.
+  Composite names that mixed these axes are retired. A policy is described by
+  its explicit dense, routed-compute, routed-assignment, and placement values.
 - `clear_cache()` naming is overloaded and architecturally suspect. Prefer
   explicit inference-state boundary semantics as work continues.
 - The next strategic direction after correctness is a cleaner inference state
@@ -174,11 +179,9 @@ This is the sprint path so far, in compact but complete form.
 3. Generalized expert movement beyond CPU NodeLocal domains:
    same-backend direct movement, async staging, transfer slots, device-side
    runtime tables, CUDA/ROCm parity.
-4. Clarified parallel policy semantics:
-   `ExpertParallel` renamed to `ApportionedExperts`;
-   `HybridTP_EP` renamed to `HybridTP_AE`;
-   `PhaseSplitHybridTP_EP` renamed to `PhaseSplitHybridTP_AE`;
-   added/kept clear semantics for replicated/apportioned/sharded experts.
+4. Clarified parallel policy semantics by replacing the old umbrella and
+   composite names with independent typed policies for dense compute,
+   routed-expert compute, routed-row assignment, and placement topology.
 5. Shifted strategy:
    decode roofline is limited by splitting routed experts across cards, so
    maxing prefill and cleaning phase-split dense policy became important.

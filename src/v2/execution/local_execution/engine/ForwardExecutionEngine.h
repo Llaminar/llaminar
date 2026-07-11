@@ -200,7 +200,7 @@ namespace llaminar2
         /**
          * @brief True when active MoE placement changes are graph-stable.
          *
-         * Homogeneous GPU LocalTP AE can publish ownership/replica changes by
+         * Homogeneous GPU LocalTP expert-ID apportionment can publish ownership and replica changes by
          * mutating persistent runtime tables and transfer slots in place. Captured
          * prefill graphs may then replay against padded buckets because the graph
          * records stable table pointers, not placement topology. Hosts that cannot
@@ -260,6 +260,15 @@ namespace llaminar2
 
         /** Whether the current forward graph must materialize logits for every input row. */
         virtual bool computeAllPositionLogitsEnabled() const { return false; }
+
+        /**
+         * @brief Whether this forward is the live grouped MTP condition batch.
+         *
+         * The shape is `batch_size > 1, seq_len == 1`, which would otherwise be
+         * classified as prompt prefill. The explicit signal routes it through
+         * decode graph capture while preserving live recurrent-state ownership.
+         */
+        virtual bool liveMTPRequestBatchConditionEnabled() const { return false; }
 
         /** Compact verifier row count when all-position logits are row-indexed; 0 means full input rows. */
         virtual int allPositionLogitRows() const { return 0; }

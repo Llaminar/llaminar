@@ -31,6 +31,7 @@
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "backends/GPUDeviceContextPool.h"
+#include "collective/LocalTPContext.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -68,6 +69,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #ifdef HAVE_ROCM
@@ -804,6 +806,7 @@ namespace
                 old_value_ = old_value;
             }
             ::setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnvOverride()
@@ -812,6 +815,7 @@ namespace
                 ::setenv(name_.c_str(), old_value_.c_str(), 1);
             else
                 ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
         }
 
         ScopedEnvOverride(const ScopedEnvOverride &) = delete;
@@ -4288,7 +4292,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerNarrowsDeferredApplySpanToCom
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
-TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansLeastLoadedEPOwnershipTransfersWithoutHotCache)
+TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfersWithoutHotCache)
 {
     SKIP_IF_NO_ROCM();
 
@@ -4321,7 +4325,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansLeastLoadedEPOwnershipTr
     config.dynamic_max_swaps_per_layer = 0;
     config.dynamic_max_plan_entries_per_wave = 1;
     config.max_post_wave_load_spread_per_mille = 100;
-    config.routed_assignment_policy = kDeviceMoERebalanceAssignmentLeastLoadedEP;
+    config.routed_assignment_policy = kDeviceMoERebalanceAssignmentLeastLoadedResident;
     config.flags = 0;
     config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
     config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
@@ -9702,6 +9706,204 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllr
             grouped_allreduced.size(),
             static_cast<size_t>(d_model));
     }
+    EXPECT_EQ(hipSetDevice(0), hipSuccess);
+}
+
+/**
+ * @brief Prove RCCL LocalTP verifier allreduce is invariant to row grouping.
+ *
+ * The production grouped verifier allreduces `M * d_model` FP32 elements for
+ * M=2..4, while serial decode performs one `d_model` allreduce per row. The
+ * transport-precision decision must therefore depend on the logical row width,
+ * not the aggregate grouped element count. Otherwise a threshold can select
+ * FP32 for M=1 and FP16 for M>1, making an otherwise exact grouped verifier
+ * diverge from serial decode.
+ *
+ * This regression runs the real `LocalTPContext::allreduceOnStream()` path on
+ * two ROCm devices with Qwen's 5120-wide hidden rows. It deliberately requests
+ * FP16 transport with an 8192-element cutoff, compares grouped RCCL output to
+ * row-wise RCCL output byte for byte, and validates perfstats records so a host
+ * sum or another non-production transport cannot satisfy the test accidentally.
+ */
+TEST(Test__ROCmMoEKernel, LocalTPRCCLVerifierRowAllreduceM234MatchesSerialRows)
+{
+    SKIP_IF_NO_ROCM();
+
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count < 2)
+        GTEST_SKIP() << "ROCm LocalTP RCCL allreduce regression needs two ROCm devices";
+
+    constexpr int d_model = 5120;
+    const std::array<DeviceId, 2> devices = {
+        DeviceId::rocm(0), DeviceId::rocm(1)};
+    ScopedHipDeviceStream stream0(0);
+    ScopedHipDeviceStream stream1(1);
+    ASSERT_EQ(stream0.status(), hipSuccess);
+    ASSERT_EQ(stream1.status(), hipSuccess);
+    ASSERT_NE(stream0.get(), nullptr);
+    ASSERT_NE(stream1.get(), nullptr);
+    const std::array<hipStream_t, 2> streams = {
+        stream0.get(), stream1.get()};
+
+    ScopedEnvOverride perf_stats_env(
+        "LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedEnvOverride fp16_threshold_env(
+        "LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", "8192");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext(
+        {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+        {},
+        CollectiveBackendType::RCCL);
+    ASSERT_NE(tp_ctx, nullptr);
+
+    auto make_tensor = [](
+                           const std::vector<size_t> &shape,
+                           const std::vector<float> &values)
+    {
+        auto tensor = TestTensorFactory::createFP32(shape);
+        EXPECT_EQ(tensor->numel(), values.size());
+        std::copy(values.begin(), values.end(), tensor->mutable_data());
+        return tensor;
+    };
+
+    auto run_allreduce =
+        [&](std::array<std::unique_ptr<FP32Tensor>, 2> &partials,
+            size_t count,
+            const std::string &stage_name)
+    {
+        std::array<bool, 2> ok = {false, false};
+        std::thread worker0([&]()
+                            { ok[0] = tp_ctx->allreduceOnStream(
+                                  partials[0].get(), stage_name, count,
+                                  streams[0], "fp16"); });
+        std::thread worker1([&]()
+                            { ok[1] = tp_ctx->allreduceOnStream(
+                                  partials[1].get(), stage_name, count,
+                                  streams[1], "fp16"); });
+        worker0.join();
+        worker1.join();
+        ASSERT_TRUE(ok[0]) << stage_name << " participant 0";
+        ASSERT_TRUE(ok[1]) << stage_name << " participant 1";
+    };
+
+    for (int seq_len : {2, 3, 4})
+    {
+        SCOPED_TRACE("seq_len=" + std::to_string(seq_len));
+        const size_t element_count =
+            static_cast<size_t>(seq_len) * d_model;
+        std::array<std::vector<float>, 2> partial_values;
+        for (auto &values : partial_values)
+            values.resize(element_count);
+
+        for (size_t element = 0; element < element_count; ++element)
+        {
+            for (int participant = 0; participant < 2; ++participant)
+            {
+                partial_values[static_cast<size_t>(participant)][element] =
+                    (0.052f + 0.007f * participant) *
+                        std::sin(0.0049f *
+                                 static_cast<float>(element + 13 + participant)) -
+                    (0.041f - 0.005f * participant) *
+                        std::cos(0.0107f *
+                                 static_cast<float>(element + 29)) +
+                    0.00037f * static_cast<float>(
+                                     static_cast<int>(
+                                         (element + 3 * participant) % 31) -
+                                     15);
+            }
+        }
+
+        std::array<std::unique_ptr<FP32Tensor>, 2> grouped_partials = {
+            make_tensor(
+                {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+                partial_values[0]),
+            make_tensor(
+                {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+                partial_values[1])};
+        ASSERT_TRUE(grouped_partials[0]->ensureOnDevice(devices[0], streams[0]));
+        ASSERT_TRUE(grouped_partials[1]->ensureOnDevice(devices[1], streams[1]));
+        run_allreduce(
+            grouped_partials,
+            element_count,
+            "rocm_localtp_rccl_grouped_verifier_rows_m" +
+                std::to_string(seq_len));
+
+        const auto grouped_device0 = copyROCmFP32TensorToHost(
+            grouped_partials[0].get(), streams[0]);
+        const auto grouped_device1 = copyROCmFP32TensorToHost(
+            grouped_partials[1].get(), streams[1]);
+        expectBitwiseVerifierRowsEqual(
+            "ROCm RCCL grouped allreduce replicas",
+            grouped_device0.data(),
+            grouped_device1.data(),
+            grouped_device0.size(),
+            static_cast<size_t>(d_model));
+
+        std::vector<float> serial_allreduced(element_count);
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const size_t row_offset = static_cast<size_t>(row) * d_model;
+            std::vector<float> row0(static_cast<size_t>(d_model));
+            std::vector<float> row1(static_cast<size_t>(d_model));
+            std::copy_n(
+                partial_values[0].data() + row_offset,
+                d_model,
+                row0.data());
+            std::copy_n(
+                partial_values[1].data() + row_offset,
+                d_model,
+                row1.data());
+
+            std::array<std::unique_ptr<FP32Tensor>, 2> row_partials = {
+                make_tensor({1u, static_cast<size_t>(d_model)}, row0),
+                make_tensor({1u, static_cast<size_t>(d_model)}, row1)};
+            ASSERT_TRUE(row_partials[0]->ensureOnDevice(devices[0], streams[0]));
+            ASSERT_TRUE(row_partials[1]->ensureOnDevice(devices[1], streams[1]));
+            run_allreduce(
+                row_partials,
+                static_cast<size_t>(d_model),
+                "rocm_localtp_rccl_serial_verifier_row" +
+                    std::to_string(row));
+
+            const auto row_device0 = copyROCmFP32TensorToHost(
+                row_partials[0].get(), streams[0]);
+            const auto row_device1 = copyROCmFP32TensorToHost(
+                row_partials[1].get(), streams[1]);
+            expectBitwiseVerifierRowsEqual(
+                "ROCm RCCL serial allreduce replicas",
+                row_device0.data(),
+                row_device1.data(),
+                row_device0.size(),
+                static_cast<size_t>(d_model));
+            std::copy_n(
+                row_device0.data(),
+                d_model,
+                serial_allreduced.data() + row_offset);
+        }
+
+        expectBitwiseVerifierRowsEqual(
+            "ROCm RCCL LocalTP grouped verifier allreduce vs serial rows",
+            grouped_device0.data(),
+            serial_allreduced.data(),
+            grouped_device0.size(),
+            static_cast<size_t>(d_model));
+    }
+
+    const auto transport_records =
+        PerfStatsCollector::snapshot({"tp_allreduce_runtime"});
+    ASSERT_FALSE(transport_records.empty());
+    for (const auto &record : transport_records)
+    {
+        ASSERT_EQ(record.tags.at("path"), "on_stream_grouped")
+            << "unexpected LocalTP transport record " << record.name;
+        ASSERT_EQ(record.tags.at("dtype"), "fp32")
+            << "a grouped row count changed the requested FP16 transport policy";
+        ASSERT_EQ(record.tags.at("requested_precision"), "fp16");
+    }
+
+    PerfStatsCollector::reset();
     EXPECT_EQ(hipSetDevice(0), hipSuccess);
 }
 
@@ -16404,7 +16606,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1
 
         /*
          * The model graph uses the runtime-table grouped prefill entry point
-         * for LLEP / ExpertParallel verifier rows.  Keep this in the same
+         * for least-loaded-resident and static-owner verifier rows. Keep this in the same
          * regression as the direct grouped pipeline so a future optimization
          * cannot accidentally re-enable original-slot atomic publication for
          * verifier-sized batches.

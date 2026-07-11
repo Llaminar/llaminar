@@ -228,7 +228,10 @@ namespace llaminar2::test::gpu_residual_add_verifier
         const char *counter_name,
         const char *format_label)
     {
-        constexpr std::array<int, 2> column_counts = {128, 4096};
+        // Include the non-power-of-two Qwen3.6/Qwen2.5-32B hidden width so the
+        // standalone residual publication proof covers the exact geometry
+        // consumed by the fused residual-plus-RMSNorm production stage.
+        constexpr std::array<int, 3> column_counts = {128, 4096, 5120};
 
         for (int cols : column_counts)
         {
