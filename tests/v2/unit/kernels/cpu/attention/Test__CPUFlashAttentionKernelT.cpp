@@ -32,6 +32,7 @@
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
 #include "v2/utils/PerfStatsCollector.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 
@@ -501,7 +502,7 @@ TEST_F(Test__CPUFlashAttentionKernelT, Decode_HeadDim128)
                         "Decode_HeadDim128");
 }
 
-TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_M2ToM4)
+TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_RuntimeM)
 {
     ScopedPerfStats perfstats;
 
@@ -519,12 +520,11 @@ TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen
     constexpr int kHeads = 24;
     constexpr int kKVHeads = 4;
     constexpr int kHeadDim = 256;
-    constexpr int kMaxRows = 4;
     constexpr int kQStride = kHeads * kHeadDim;
     constexpr int kKVStride = kKVHeads * kHeadDim;
     const std::array<int, 3> base_kv_lengths = {9, 37, 129};
 
-    for (const int verifier_rows : {2, 3, 4})
+    for (const int verifier_rows : test::kGroupedVerifierRuntimeRows)
     {
         for (const int base_kv_len : base_kv_lengths)
         {

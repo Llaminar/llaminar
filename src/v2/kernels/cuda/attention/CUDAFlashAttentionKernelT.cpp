@@ -147,11 +147,13 @@ extern "C"
         const int *post_append_cached_tokens,
         int seq_len,
         int query_rows,
+        int kv_stride,
         void *stream);
 
     int cudaFlashAttn_prepare_device_params_from_geometry(
         void *device_params,
         int kv_len,
+        int kv_stride,
         int position_offset,
         int query_rows,
         void *stream);
@@ -161,6 +163,7 @@ extern "C"
         const int *post_append_cached_tokens,
         int request_count,
         int query_rows,
+        int kv_stride,
         void *stream);
 
     int cudaFlashAttn_setDevice(int device_idx);
@@ -312,6 +315,7 @@ namespace llaminar2
               workspace_(other.workspace_),
               device_ctx_(other.device_ctx_),
               dynamic_attn_kv_len_(other.dynamic_attn_kv_len_),
+              dynamic_attn_kv_stride_(other.dynamic_attn_kv_stride_),
               dynamic_attn_position_offset_(other.dynamic_attn_position_offset_),
               dynamic_attn_query_rows_(other.dynamic_attn_query_rows_),
               dynamic_attn_param_rows_(other.dynamic_attn_param_rows_),
@@ -347,6 +351,7 @@ namespace llaminar2
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
                 dynamic_attn_kv_len_ = other.dynamic_attn_kv_len_;
+                dynamic_attn_kv_stride_ = other.dynamic_attn_kv_stride_;
                 dynamic_attn_position_offset_ = other.dynamic_attn_position_offset_;
                 dynamic_attn_query_rows_ = other.dynamic_attn_query_rows_;
                 dynamic_attn_param_rows_ = other.dynamic_attn_param_rows_;
@@ -1362,6 +1367,7 @@ namespace llaminar2
                     post_append_cached_tokens_device,
                     request_count,
                     query_rows,
+                    max_kv_len,
                     stream_) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Failed to derive request-row params");
@@ -1369,6 +1375,7 @@ namespace llaminar2
             }
 
             dynamic_attn_kv_len_ = 0;
+            dynamic_attn_kv_stride_ = max_kv_len;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = total_rows;
             dynamic_attn_param_rows_ = total_rows;
@@ -1498,7 +1505,11 @@ namespace llaminar2
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::writeDynamicAttnParams(
-            int kv_len, int position_offset, int query_rows, void *stream)
+            int kv_len,
+            int kv_stride,
+            int position_offset,
+            int query_rows,
+            void *stream)
         {
             if (!stream)
             {
@@ -1531,12 +1542,14 @@ namespace llaminar2
             if (cudaFlashAttn_prepare_device_params_from_geometry(
                     d_buf,
                     kv_len,
+                    kv_stride,
                     position_offset,
                     query_rows,
                     stream) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device attention-param writer failed"
                           << " kv_len=" << kv_len
+                          << " kv_stride=" << kv_stride
                           << " position_offset=" << position_offset
                           << " query_rows=" << query_rows);
                 dynamic_attn_device_valid_ = false;
@@ -1574,6 +1587,7 @@ namespace llaminar2
                 !dynamic_attn_device_derived_ &&
                 dynamic_attn_device_valid_ &&
                 dynamic_attn_kv_len_ == kv_len &&
+                dynamic_attn_kv_stride_ == kv_len &&
                 dynamic_attn_position_offset_ == position_offset &&
                 dynamic_attn_query_rows_ == sanitized_query_rows &&
                 dynamic_attn_param_rows_ == param_rows;
@@ -1582,6 +1596,7 @@ namespace llaminar2
                 return;
 
             dynamic_attn_kv_len_ = kv_len;
+            dynamic_attn_kv_stride_ = kv_len;
             dynamic_attn_position_offset_ = position_offset;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = param_rows;
@@ -1592,11 +1607,15 @@ namespace llaminar2
                 return;
 
             (void)writeDynamicAttnParams(
-                kv_len, position_offset, sanitized_query_rows, stream_);
+                kv_len, kv_len, position_offset, sanitized_query_rows, stream_);
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
-            int kv_len, int position_offset, int query_rows, void *stream)
+            int kv_len,
+            int position_offset,
+            int query_rows,
+            void *stream,
+            int kv_stride)
         {
             if (!stream)
             {
@@ -1605,15 +1624,49 @@ namespace llaminar2
                 return false;
             }
             setGPUStream(stream);
-            setDynamicAttnParams(kv_len, position_offset, query_rows);
-            const bool ready = dynamicAttnParamsReady(kv_len, position_offset, query_rows);
+            const int resolved_kv_stride =
+                std::max(kv_len, kv_stride > 0 ? kv_stride : kv_len);
+            const int sanitized_query_rows =
+                sanitizeSmallDecodeQueryRows(query_rows);
+            const bool same_params =
+                !dynamic_attn_device_derived_ &&
+                dynamic_attn_device_valid_ &&
+                dynamic_attn_kv_len_ == kv_len &&
+                dynamic_attn_kv_stride_ == resolved_kv_stride &&
+                dynamic_attn_position_offset_ == position_offset &&
+                dynamic_attn_query_rows_ == sanitized_query_rows &&
+                dynamic_attn_param_rows_ == sanitized_query_rows;
+            if (!same_params)
+            {
+                dynamic_attn_kv_len_ = kv_len;
+                dynamic_attn_kv_stride_ = resolved_kv_stride;
+                dynamic_attn_position_offset_ = position_offset;
+                dynamic_attn_query_rows_ = sanitized_query_rows;
+                dynamic_attn_param_rows_ = sanitized_query_rows;
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                if (!writeDynamicAttnParams(
+                        kv_len,
+                        resolved_kv_stride,
+                        position_offset,
+                        sanitized_query_rows,
+                        stream))
+                {
+                    return false;
+                }
+            }
+            const bool ready =
+                dynamicAttnParamsReady(kv_len, position_offset, query_rows) &&
+                dynamic_attn_kv_stride_ == resolved_kv_stride;
             if (!ready)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Dynamic attention params not ready after prepare"
                           << " requested(kv_len=" << kv_len
+                          << ", kv_stride=" << resolved_kv_stride
                           << ", pos=" << position_offset
                           << ", rows=" << sanitizeSmallDecodeQueryRows(query_rows) << ")"
                           << " prepared(kv_len=" << dynamic_attn_kv_len_
+                          << ", kv_stride=" << dynamic_attn_kv_stride_
                           << ", pos=" << dynamic_attn_position_offset_
                           << ", rows=" << dynamic_attn_query_rows_
                           << ", param_rows=" << dynamic_attn_param_rows_
@@ -1629,10 +1682,14 @@ namespace llaminar2
             const int *post_append_cached_tokens_device,
             int seq_len,
             int query_rows,
-            void *stream)
+            void *stream,
+            int kv_stride)
         {
             const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
-            if (!post_append_cached_tokens_device || seq_len <= 0 || !stream)
+            const int resolved_kv_stride =
+                kv_stride > 0 ? kv_stride : seq_len;
+            if (!post_append_cached_tokens_device || seq_len <= 0 ||
+                resolved_kv_stride <= 0 || !stream)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len, and explicit stream");
                 dynamic_attn_device_valid_ = false;
@@ -1664,6 +1721,7 @@ namespace llaminar2
                 post_append_cached_tokens_device,
                 seq_len,
                 sanitized_query_rows,
+                resolved_kv_stride,
                 stream);
             if (rc != 0)
             {
@@ -1674,6 +1732,7 @@ namespace llaminar2
             }
 
             dynamic_attn_kv_len_ = 0;
+            dynamic_attn_kv_stride_ = resolved_kv_stride;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = sanitized_query_rows;
@@ -2048,7 +2107,8 @@ namespace llaminar2
             }
 
             if (cudaFlashAttn_prepare_device_params_from_geometry(
-                    device_params, kv_len, position_offset, 1, stream_) != 0)
+                    device_params, kv_len, kv_len, position_offset, 1,
+                    stream_) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP16>] Device attention-param writer failed");
             }
@@ -2340,7 +2400,8 @@ namespace llaminar2
             }
 
             if (cudaFlashAttn_prepare_device_params_from_geometry(
-                    device_params, kv_len, position_offset, 1, stream_) != 0)
+                    device_params, kv_len, kv_len, position_offset, 1,
+                    stream_) != 0)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<BF16>] Device attention-param writer failed");
             }

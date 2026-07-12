@@ -689,8 +689,14 @@ namespace llaminar2
             const std::string &k_dependency);
 
         /**
-         * Add RoPE stage on Q and K.
-         * @return Node name (prefix + "rope")
+         * @brief Add the declarative RoPE stage for Q and, when configured, K.
+         *
+         * The graph-wide @c rope_on_read policy is the sole owner of whether K
+         * is rotated here or while reading the KV cache. Callers must not
+         * override that policy for individual execution phases, because doing
+         * so gives full and chunked prefill different numerical paths.
+         *
+         * @return Node name (prefix + "rope").
          */
         std::string addRoPE(
             ComputeGraph &graph,
@@ -701,8 +707,7 @@ namespace llaminar2
             int total_tokens,
             const int *position_ids,
             const void *position_ids_device,
-            DeviceId device,
-            bool force_apply_rope_to_k = false);
+            DeviceId device);
 
         /**
          * @brief Add a KV cache append stage.

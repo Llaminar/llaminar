@@ -1,608 +1,575 @@
 #!/usr/bin/env python3
-"""Generate ROCm NativeVNNI decode dispatch artifacts from trainer CSVs.
+"""Compile strong ROCm NativeVNNI decode evidence through the common policy core.
 
-Run sweeps with LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 when refreshing
-checked-in tables so AUTO rows do not benchmark the previous table.
+The analyzer deliberately performs no backend-local modal-label learning.
+Every raw row is first adapted into the strict common schema; byte/route
+eligibility, source-alias robustness, eager/captured robustness, and generic
+regret learning then come from the shared NativeVNNI implementation.
+
+Only Fast M=1 candidates encode a KB in the current ROCm runtime ABI.  The
+grouped runtime-M verifier candidate is ``INHERIT_SERIAL_M1`` and is certified as
+an independent execution surface, but it never emits a conflicting split-K
+entry.  Production verifier resolution therefore consumes the exact same
+frozen M=1 policy that defined its serial oracle.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parents[1]
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
 
-from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK  # noqa: E402
+KERNEL_PERF_ROOT = Path(__file__).resolve().parents[1]
+if str(KERNEL_PERF_ROOT) not in sys.path:
+    sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
-
-ASPECT_BUCKETS = (
-    ("very_wide", 16.0),
-    ("wide", 2.0),
-    ("balanced", 0.75),
+from native_vnni_dispatch.adapters.rocm_decode import (  # noqa: E402
+    ROCmDecodeAdapterContext,
+    adapt_rocm_decode_csv,
+    raw_corpus_id,
+)
+from native_vnni_dispatch.candidate_observation import (  # noqa: E402
+    write_observation_csv,
+)
+from native_vnni_dispatch.candidate_registry import (  # noqa: E402
+    candidate_registry_digest,
+    rocm_native_vnni_decode_registry,
+)
+from native_vnni_dispatch.corpus import ObservationCorpus, RuntimeKey  # noqa: E402
+from native_vnni_dispatch.exact_oracle import (  # noqa: E402
+    ExactWinner,
+    build_exact_winners,
+)
+from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.schema import (  # noqa: E402
+    AspectBucket,
+    ExecutionMode,
+    SemanticContract,
+)
+from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    GenericDispatchRule,
+    fit_generic_policy,
+)
+from native_vnni_dispatch.validation import (  # noqa: E402
+    CANONICAL_VERIFIER_M,
+    require_candidate_matrix_complete,
+    require_canonical_alias_coverage,
+    require_registry_candidate_coverage,
+    require_verifier_m_matrix,
 )
 
-ASPECT_ORDER = ("very_wide", "wide", "balanced", "tall")
 
-ASPECT_CONDITIONS = {
-    "very_wide": "aspect_ratio >= 16.0f",
-    "wide": "aspect_ratio >= 2.0f",
-    "balanced": "aspect_ratio >= 0.75f",
-    "tall": "true",
-}
+CANONICAL_TARGET_WAVES = 4
+OVERLAY_BEGIN = "    // BEGIN COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY"
+OVERLAY_END = "    // END COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY"
 
 
-@dataclass(frozen=True)
-class DecodeRow:
-    fmt: str
+@dataclass(frozen=True, order=True)
+class FastEntry:
+    """One alias/mode-robust Fast M=1 exact decision for the ROCm ABI."""
+
     codebook: int
-    shape: str
-    m: int
     n: int
     k: int
-    variant: str
     kb: int
-    target_waves: int
-    min_us: float
-    mean_us: float
-    eff_bw_gbs: float
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", nargs="+", required=True, help="ROCm decode trainer CSV path(s)")
-    parser.add_argument("--output", required=True, help="Generated C++ include path")
-    parser.add_argument("--summary", default=None, help="Human-readable summary path")
-    parser.add_argument(
-        "--base-include",
-        default=None,
-        help=(
-            "Existing generated include to preserve while layering exact "
-            "shape winners from the input CSV. Use this for staged profiles "
-            "such as qwen36-moe so a partial refresh does not discard the "
-            "broader dispatch table."
-        ),
-    )
-    parser.add_argument(
-        "--max-generated-kb",
-        type=int,
-        default=16,
-        help=(
-            "Maximum KB split allowed in generated decode dispatch. Keep this aligned "
-            "with the strict-parity native-VNNI small-M verifier sweep envelope."
-        ),
-    )
-    return parser.parse_args()
-
-
-def canonical_label(codebook: int) -> str:
-    return CODEBOOK_TO_FORMAT.get(codebook, f"CB{codebook}").split("/")[0]
-
-
-def aspect_bucket(n: int, k: int) -> str:
-    ratio = (float(n) / float(k)) if k > 0 else 0.0
-    for name, threshold in ASPECT_BUCKETS:
-        if ratio >= threshold:
-            return name
-    return "tall"
-
-
-def work_items(row: DecodeRow) -> int:
-    return row.n * row.k
-
-
-def dispatch_candidate(row: DecodeRow) -> tuple[int, int]:
-    return row.kb, row.target_waves
+    candidate_id: str
+    shape_name: str
+    max_surface_regret: float
+    max_cv: float
 
 
 def pack_shape_key(m: int, n: int, k: int) -> int:
-    """Pack the verifier-row count with the logical GEMV shape.
-
-    ROCm decode now has two distinct regimes: classic single-token GEMV (M=1)
-    and MTP verifier catch-up rows (M=2..4).  The kernels are templated on M,
-    so a table trained for M=1 can pick a poor split for verifier rows.  Packing
-    M into the key keeps those dispatch choices independent while preserving the
-    compact binary-search table layout used by the generated C++ include.
-    """
+    """Pack the existing ROCm decode exact-key ABI without lossy hashing."""
 
     return ((m & 0xFF) << 56) | ((k & 0xFFFFFF) << 28) | (n & 0x0FFFFFFF)
 
 
-def _to_int(path: Path, row_index: int, column: str, value: str) -> int:
-    try:
-        return int(value, 0)
-    except ValueError as exc:
-        raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
+def _candidate_kb(candidate_id: str) -> int:
+    """Resolve one common Fast candidate and return its effective KB."""
+
+    candidate = rocm_native_vnni_decode_registry().resolve(candidate_id)
+    if not candidate.supports_contract(SemanticContract.FAST):
+        raise ValueError(f"{candidate_id} is not a Fast ROCm decode candidate")
+    return int(candidate.config_json["kb"])
 
 
-def _to_float(path: Path, row_index: int, column: str, value: str) -> float:
-    try:
-        return float(value)
-    except ValueError as exc:
-        raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
+def _serial_hashes(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> dict[RuntimeKey, str]:
+    """Bind every represented verifier key to the frozen M=1 artifact."""
+
+    return {
+        key: serial_m1_policy_hash
+        for key in corpus.runtime_keys()
+        if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    }
 
 
-def parse_variant(
-    path: Path,
-    row_index: int,
-    row: dict[str, str],
-    max_generated_kb: int,
-) -> tuple[int, int] | None:
-    variant = (row.get("variant") or "").strip().upper()
-    kb = _to_int(path, row_index, "kb", row.get("kb", ""))
-    target_waves = _to_int(path, row_index, "target_waves", row.get("target_waves", ""))
-    if variant == "AUTO":
-        if kb != 0 or target_waves != 0:
-            raise SystemExit(f"{path}:{row_index}: AUTO rows must use kb=0,target_waves=0")
-        return None
+def select_fast_entries(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> tuple[list[FastEntry], dict[RuntimeKey, ExactWinner]]:
+    """Run the common exact oracle and encode only Fast M=1 KB decisions."""
 
-    match = re.fullmatch(r"KB(?P<kb>\d+)[/_]TW(?P<tw>\d+)", variant)
-    if not match:
-        raise SystemExit(f"{path}:{row_index}: unsupported decode variant {variant!r}")
-    parsed_kb = int(match.group("kb"))
-    parsed_tw = int(match.group("tw"))
-    if parsed_kb != kb or parsed_tw != target_waves:
-        raise SystemExit(
-            f"{path}:{row_index}: variant {variant!r} disagrees with "
-            f"kb={kb},target_waves={target_waves}"
-        )
-    if parsed_kb <= 0 or parsed_tw <= 0:
-        raise SystemExit(f"{path}:{row_index}: generated decode variants need positive kb and target_waves")
-    if parsed_kb > 64:
-        raise SystemExit(f"{path}:{row_index}: decode kb={parsed_kb} exceeds kernel cap 64")
-    if parsed_kb > max_generated_kb:
-        return None
-    return parsed_kb, parsed_tw
-
-
-def load_decode_rows(paths: list[str], max_generated_kb: int) -> list[DecodeRow]:
-    if max_generated_kb <= 0:
-        raise SystemExit("--max-generated-kb must be positive")
-
-    best_by_key: dict[tuple[int, int, int, int], DecodeRow] = {}
-    for raw_path in paths:
-        path = Path(raw_path)
-        with path.open(newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row_index, row in enumerate(reader, start=2):
-                if (row.get("backend") or "").strip() != "rocm":
-                    continue
-                if (row.get("phase") or "").strip() != "decode":
-                    continue
-                if _to_int(path, row_index, "correctness_pass", row.get("correctness_pass", "")) != 1:
-                    continue
-
-                fmt = (row.get("format") or "").strip().upper()
-                expected_codebook = FORMAT_TO_CODEBOOK.get(fmt)
-                if expected_codebook is None:
-                    raise SystemExit(f"{path}:{row_index}: unknown format {fmt!r}")
-                codebook = _to_int(path, row_index, "codebook", row.get("codebook", ""))
-                if codebook != expected_codebook:
-                    raise SystemExit(
-                        f"{path}:{row_index}: codebook mismatch for {fmt}: "
-                        f"expected {expected_codebook}, found {codebook}"
-                    )
-
-                parsed_variant = parse_variant(path, row_index, row, max_generated_kb)
-                if parsed_variant is None:
-                    continue
-                kb, target_waves = parsed_variant
-                m = _to_int(path, row_index, "m", row.get("m", "1"))
-                if m <= 0:
-                    raise SystemExit(f"{path}:{row_index}: decode m must be positive")
-                n = _to_int(path, row_index, "n", row.get("n", ""))
-                k = _to_int(path, row_index, "k", row.get("k", ""))
-                key = (codebook, m, n, k)
-                entry = DecodeRow(
-                    fmt=fmt,
-                    codebook=codebook,
-                    shape=(row.get("shape") or f"{n}x{k}").strip(),
-                    m=m,
-                    n=n,
-                    k=k,
-                    variant=(row.get("variant") or "").strip().upper(),
-                    kb=kb,
-                    target_waves=target_waves,
-                    min_us=_to_float(path, row_index, "min_us", row.get("min_us", "")),
-                    mean_us=_to_float(path, row_index, "mean_us", row.get("mean_us", "0")),
-                    eff_bw_gbs=_to_float(path, row_index, "eff_bw_gbs", row.get("eff_bw_gbs", "0")),
+    exact = build_exact_winners(
+        corpus,
+        serial_m1_hashes=_serial_hashes(corpus, serial_m1_policy_hash),
+    )
+    entries = []
+    for key, winner in sorted(exact.items()):
+        if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
+            if winner.candidate_id != (
+                "rocm.nvnni.decode.verifier.inherit_serial_m1"
+            ):
+                raise ValueError(
+                    "grouped verifier exact winner does not inherit serial M1"
                 )
-                previous = best_by_key.get(key)
-                if previous is None or entry.min_us < previous.min_us:
-                    best_by_key[key] = entry
-
-    return sorted(best_by_key.values(), key=lambda item: (item.codebook, item.m, item.n, item.k, item.variant))
-
-
-def _modal_candidate(rows: list[DecodeRow]) -> tuple[tuple[int, int], int]:
-    counts: dict[tuple[int, int], int] = {}
-    best_time: dict[tuple[int, int], float] = {}
-    for row in rows:
-        candidate = dispatch_candidate(row)
-        counts[candidate] = counts.get(candidate, 0) + 1
-        best_time[candidate] = min(best_time.get(candidate, row.min_us), row.min_us)
-    return max(
-        counts,
-        key=lambda candidate: (
-            counts[candidate],
-            -best_time[candidate],
-            -candidate[0],
-            -candidate[1],
-        ),
-    ), max(counts.values())
-
-
-def _candidate_cuts(rows: list[DecodeRow]) -> list[int]:
-    works = sorted({work_items(row) for row in rows})
-    return [((left + right) // 2) for left, right in zip(works, works[1:]) if left != right]
-
-
-def _split_rows(rows: list[DecodeRow], cuts: list[int]) -> list[list[DecodeRow]]:
-    segments: list[list[DecodeRow]] = []
-    start = 0
-    for cut in cuts:
-        end = start
-        while end < len(rows) and work_items(rows[end]) <= cut:
-            end += 1
-        segments.append(rows[start:end])
-        start = end
-    segments.append(rows[start:])
-    return segments
-
-
-def _best_segments(rows: list[DecodeRow], max_segments: int = 3, min_size: int = 4) -> list[dict]:
-    """Train a small work-size segmented policy for one codebook/M/aspect bucket.
-
-    The durable ROCm policy must generalize to future models whose matrix sizes
-    are close but not identical to Qwen3.6.  We therefore train on aspect ratio
-    and total work size, keeping exact-shape winners only as an optional overlay.
-    """
-
-    if not rows:
-        return []
-
-    ordered = sorted(rows, key=lambda row: (work_items(row), row.n, row.k, row.shape, row.fmt))
-    cuts = _candidate_cuts(ordered)
-
-    def score_segments(segments: list[list[DecodeRow]]) -> tuple[int, list[dict]] | None:
-        if any(not segment for segment in segments):
-            return None
-        if len(ordered) >= min_size * len(segments) and any(len(segment) < min_size for segment in segments):
-            return None
-
-        score = 0
-        rules: list[dict] = []
-        for segment in segments:
-            candidate, support = _modal_candidate(segment)
-            score += support
-            rules.append(
-                {
-                    "max_work": work_items(segment[-1]),
-                    "candidate": candidate,
-                    "support": support,
-                    "total": len(segment),
-                }
+            continue
+        if key.semantic_contract != SemanticContract.FAST or key.m != 1:
+            raise ValueError(f"unsupported ROCm decode exact policy key {key}")
+        if len(key.projection_n_vector) != 1:
+            raise ValueError("ROCm decode exact entry is not a single projection")
+        rows = corpus.rows_for_runtime_key(key)
+        shape_names = sorted({row.shape_name for row in rows})
+        if len(shape_names) != 1:
+            raise ValueError(
+                f"multiple shape names collapse onto ROCm exact key {key}: {shape_names}"
             )
-        return score, rules
-
-    scored = score_segments([ordered])
-    assert scored is not None
-    best_score, best_rules = scored
-    best_len = 1
-
-    for cut in cuts:
-        scored = score_segments(_split_rows(ordered, [cut]))
-        if scored is None:
-            continue
-        score, rules = scored
-        if score > best_score or (score == best_score and 2 < best_len):
-            best_score, best_rules, best_len = score, rules, 2
-
-    if max_segments >= 3:
-        for index, left in enumerate(cuts):
-            for right in cuts[index + 1:]:
-                scored = score_segments(_split_rows(ordered, [left, right]))
-                if scored is None:
-                    continue
-                score, rules = scored
-                if score > best_score or (score == best_score and 3 < best_len):
-                    best_score, best_rules, best_len = score, rules, 3
-
-    return best_rules
+        entries.append(FastEntry(
+            codebook=key.runtime_codebook_id,
+            n=key.aggregate_n,
+            k=key.k,
+            kb=_candidate_kb(winner.candidate_id),
+            candidate_id=winner.candidate_id,
+            shape_name=shape_names[0],
+            max_surface_regret=winner.max_surface_regret,
+            max_cv=winner.max_cv,
+        ))
+    return entries, exact
 
 
-def build_aspect_fallback_rules(rows: list[DecodeRow]) -> dict[tuple[int, int, str], list[dict]]:
-    grouped: dict[tuple[int, int, str], list[DecodeRow]] = {}
-    for row in rows:
-        grouped.setdefault((row.codebook, row.m, aspect_bucket(row.n, row.k)), []).append(row)
-    return {
-        key: _best_segments(bucket)
-        for key, bucket in sorted(grouped.items(), key=lambda item: item[0])
-    }
+def select_fast_generic_rules(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> list[GenericDispatchRule]:
+    """Fit the shared bounded regret learner and retain Fast M=1 domains."""
+
+    generic = fit_generic_policy(
+        corpus,
+        serial_m1_hashes=_serial_hashes(corpus, serial_m1_policy_hash),
+    )
+    return [
+        rule
+        for rule in generic.rules
+        if rule.domain.semantic_contract == SemanticContract.FAST
+        and rule.domain.m == 1
+    ]
 
 
-def _pick_fallback_candidate(
-    rules: dict[tuple[int, int, str], list[dict]],
-    row: DecodeRow,
-) -> tuple[int, int] | None:
-    bucket_rules = rules.get((row.codebook, row.m, aspect_bucket(row.n, row.k)))
-    if not bucket_rules:
-        return None
-    row_work = work_items(row)
-    for rule in bucket_rules:
-        if row_work <= rule["max_work"]:
-            return rule["candidate"]
-    return bucket_rules[-1]["candidate"]
+def validate_complete(corpus: ObservationCorpus) -> None:
+    """Require all aliases, modes, M depths, and registry candidates."""
 
+    require_canonical_alias_coverage(
+        corpus,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_verifier_m_matrix(corpus)
+    require_candidate_matrix_complete(corpus)
+    require_registry_candidate_coverage(
+        corpus,
+        rocm_native_vnni_decode_registry(),
+    )
 
-def compute_aspect_fallback_metrics(rows: list[DecodeRow], rules: dict[tuple[int, int, str], list[dict]]) -> dict:
-    exact_hits = 0
-    covered = 0
-    for row in rows:
-        predicted = _pick_fallback_candidate(rules, row)
-        if predicted is None:
-            continue
-        covered += 1
-        if predicted == dispatch_candidate(row):
-            exact_hits += 1
-    total = len(rows)
-    return {
-        "total": total,
-        "covered": covered,
-        "coverage_pct": (100.0 * covered / total) if total else 0.0,
-        "exact_hits": exact_hits,
-        "exact_pct": (100.0 * exact_hits / total) if total else 0.0,
-    }
-
-
-OVERLAY_BEGIN = "    // BEGIN ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY"
-OVERLAY_END = "    // END ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY"
-
-
-def emit_overlay_block(rows: list[DecodeRow]) -> str:
-    """Return an exact-shape overlay block for a staged ROCm refresh.
-
-    The broad generated ROCm table is intentionally replaced only by full
-    qwen36/all refreshes.  Staged profiles add known shape winners before the
-    existing binary-search tables, preserving older entries while allowing the
-    verifier pipeline to learn newly added production buckets.
-    """
-
-    lines: list[str] = [OVERLAY_BEGIN]
-    for row in sorted(rows, key=lambda item: (item.codebook, item.m, item.n, item.k)):
-        label = canonical_label(row.codebook)
-        lines.append(
-            f"    if (codebook_id == {row.codebook} && key == "
-            f"0x{pack_shape_key(row.m, row.n, row.k):016x}ULL) "
-            f"{{ out = ROCmNativeVNNIDecodeDispatchConfig{{{row.kb}, {row.target_waves}}}; "
-            f"return true; }} // CB={row.codebook} ({label}) M={row.m} "
-            f"{row.n}x{row.k} {row.variant} {row.shape} {row.min_us:.3f}us"
+    by_shape: dict[tuple, set[tuple[SemanticContract, int]]] = {}
+    for row in corpus:
+        identity = (
+            row.runtime_codebook_id,
+            row.source_format,
+            row.execution_mode,
+            row.shape_group_id,
         )
-    lines.append(OVERLAY_END)
+        by_shape.setdefault(identity, set()).add((row.semantic_contract, row.m))
+    required = {(SemanticContract.FAST, 1)} | {
+        (SemanticContract.VERIFIER_SERIAL_M1_BITWISE, m)
+        for m in CANONICAL_VERIFIER_M
+    }
+    missing = [
+        (identity, sorted(required - represented, key=lambda item: (item[0].value, item[1])))
+        for identity, represented in by_shape.items()
+        if not required.issubset(represented)
+    ]
+    if missing:
+        raise ValueError(
+            f"ROCm decode Fast/verifier depth matrix is incomplete for "
+            f"{len(missing)} surface(s); first={missing[0]}"
+        )
+
+
+def _entry_line(entry: FastEntry, *, indent: str) -> str:
+    """Render one current-ABI exact entry with common provenance."""
+
+    return (
+        f"{indent}{{0x{pack_shape_key(1, entry.n, entry.k):016x}ULL, "
+        f"{{{entry.kb}, {CANONICAL_TARGET_WAVES}}}}}, "
+        f"// CB={entry.codebook} M=1 {entry.n}x{entry.k} "
+        f"{entry.candidate_id} {entry.shape_name} "
+        f"max-regret={entry.max_surface_regret:.4%} max-cv={entry.max_cv:.4%}"
+    )
+
+
+def _aspect_condition(bucket: AspectBucket) -> str:
+    return {
+        AspectBucket.VERY_WIDE: "aspect_ratio >= 16.0f",
+        AspectBucket.WIDE: "aspect_ratio >= 2.0f",
+        AspectBucket.BALANCED: "aspect_ratio >= 0.75f",
+        AspectBucket.TALL: "true",
+    }[bucket]
+
+
+def generate_include(
+    entries: list[FastEntry],
+    generic_rules: list[GenericDispatchRule],
+    *,
+    corpus_digest: str,
+    registry_digest: str,
+    profile: MeasurementProfile,
+) -> str:
+    """Render exact and common-regret generic decisions into the current ABI."""
+
+    entries_by_codebook: dict[int, list[FastEntry]] = {}
+    for entry in entries:
+        entries_by_codebook.setdefault(entry.codebook, []).append(entry)
+    for rows in entries_by_codebook.values():
+        rows.sort(key=lambda item: pack_shape_key(1, item.n, item.k))
+
+    rules_by_codebook: dict[int, list[GenericDispatchRule]] = {}
+    for rule in generic_rules:
+        rules_by_codebook.setdefault(rule.domain.runtime_codebook_id, []).append(rule)
+
+    lines = [
+        "// Auto-generated by analyze_rocm_native_vnni_decode_trainer.py. DO NOT EDIT.",
+        "// Decisions: common alias/mode-robust exact oracle + segmented-regret learner.",
+        "// Runtime-M verifier rows inherit this serial M=1 policy; no independent verifier KB is emitted.",
+        f"// Measurement profile: {profile.value}",
+        f"// Common corpus digest: {corpus_digest}",
+        f"// Candidate registry digest: {registry_digest}",
+        "#pragma once",
+        "",
+        "#include <cstddef>",
+        "#include <cstdint>",
+        "",
+        "namespace llaminar2::rocm::generated",
+        "{",
+        "struct ROCmNativeVNNIDecodeDispatchConfig",
+        "{",
+        "    uint8_t kb = 0;",
+        "    // ABI compatibility only: explicit KB fully determines the launch.",
+        "    uint8_t target_waves_per_cu = 0;",
+        "};",
+        "",
+        "struct ROCmNativeVNNIDecodeTuningEntry",
+        "{",
+        "    uint64_t key;",
+        "    ROCmNativeVNNIDecodeDispatchConfig config;",
+        "};",
+        "",
+        "inline constexpr uint64_t packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)",
+        "{",
+        "    return (static_cast<uint64_t>(m & 0xFF) << 56) |",
+        "           (static_cast<uint64_t>(k & 0xFFFFFF) << 28) |",
+        "           static_cast<uint64_t>(n & 0x0FFFFFFF);",
+        "}",
+        "",
+        "template <size_t Count>",
+        "inline bool findROCmNativeVNNIDecodeDispatchEntry(",
+        "    const ROCmNativeVNNIDecodeTuningEntry (&table)[Count],",
+        "    uint64_t key,",
+        "    ROCmNativeVNNIDecodeDispatchConfig &out)",
+        "{",
+        "    size_t lo = 0;",
+        "    size_t hi = Count;",
+        "    while (lo < hi)",
+        "    {",
+        "        const size_t mid = lo + ((hi - lo) / 2);",
+        "        if (table[mid].key == key)",
+        "        {",
+        "            out = table[mid].config;",
+        "            return true;",
+        "        }",
+        "        if (table[mid].key < key)",
+        "            lo = mid + 1;",
+        "        else",
+        "            hi = mid;",
+        "    }",
+        "    return false;",
+        "}",
+        "",
+        "inline bool selectROCmNativeVNNIDecodeGenerated(",
+        "    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)",
+        "{",
+        "    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);",
+    ]
+
+    for codebook in sorted(entries_by_codebook):
+        lines.extend([
+            f"    if (codebook_id == {codebook})",
+            "    {",
+            "        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {",
+        ])
+        lines.extend(_entry_line(entry, indent="            ") for entry in entries_by_codebook[codebook])
+        lines.extend([
+            "        };",
+            "        if (findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out))",
+            "            return true;",
+            "    }",
+        ])
+
+    lines.extend([
+        "",
+        "    if (m != 1)",
+        "        return false;",
+    ])
+    if rules_by_codebook:
+        lines.extend([
+            "    const float aspect_ratio =",
+            "        k > 0 ? static_cast<float>(n) / static_cast<float>(k) : 0.0f;",
+            "    const long long work_items =",
+            "        static_cast<long long>(n) * static_cast<long long>(k);",
+        ])
+    for codebook in sorted(rules_by_codebook):
+        lines.append(f"    if (codebook_id == {codebook})")
+        lines.append("    {")
+        for rule in sorted(
+            rules_by_codebook[codebook],
+            key=lambda item: (
+                list(AspectBucket).index(item.domain.aspect_bucket),
+                item.min_work_items,
+            ),
+        ):
+            kb = _candidate_kb(rule.candidate_id)
+            lines.extend([
+                f"        if ({_aspect_condition(rule.domain.aspect_bucket)} &&",
+                f"            work_items >= {rule.min_work_items}LL &&",
+                f"            work_items <= {rule.max_work_items}LL)",
+                "        {",
+                f"            out = ROCmNativeVNNIDecodeDispatchConfig{{{kb}, {CANONICAL_TARGET_WAVES}}};",
+                "            return true;",
+                "        }",
+            ])
+        lines.append("    }")
+    lines.extend([
+        "    return false;",
+        "}",
+        "",
+        "} // namespace llaminar2::rocm::generated",
+        "",
+    ])
     return "\n".join(lines)
 
 
-def strip_existing_overlay(text: str) -> str:
+def _strip_existing_overlay(text: str) -> str:
+    """Remove one previous partial exact overlay before inserting a refresh."""
+
     begin = text.find(OVERLAY_BEGIN)
     if begin < 0:
         return text
     end = text.find(OVERLAY_END, begin)
     if end < 0:
-        raise SystemExit("base include contains overlay begin marker without end marker")
+        raise ValueError("base include has an unterminated common exact overlay")
     end += len(OVERLAY_END)
     if end < len(text) and text[end] == "\n":
         end += 1
     return text[:begin] + text[end:]
 
 
-def emit_cpp_overlay(rows: list[DecodeRow], output: Path, base_include: Path) -> None:
-    if not base_include.is_file():
-        raise SystemExit(f"base include not found: {base_include}")
-    text = strip_existing_overlay(base_include.read_text())
-    marker = "    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);\n"
-    marker_index = text.find(marker)
-    if marker_index < 0:
-        raise SystemExit("base include does not contain ROCm NativeVNNI selector key marker")
-    insert_at = marker_index + len(marker)
-    updated = text[:insert_at] + emit_overlay_block(rows) + "\n" + text[insert_at:]
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(updated)
+def emit_overlay(entries: list[FastEntry], output: Path, base: Path) -> None:
+    """Layer common exact M=1 winners above a broader checked-in policy."""
 
-
-def emit_cpp(rows: list[DecodeRow], output: Path) -> None:
-    rows_by_codebook: dict[int, list[DecodeRow]] = {}
-    for row in rows:
-        rows_by_codebook.setdefault(row.codebook, []).append(row)
-    for codebook_rows in rows_by_codebook.values():
-        codebook_rows.sort(key=lambda item: pack_shape_key(item.m, item.n, item.k))
-    aspect_rules = build_aspect_fallback_rules(rows)
-    fallback_metrics = compute_aspect_fallback_metrics(rows, aspect_rules)
-
-    lines: list[str] = []
-    lines.append("// Generated by tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py.")
-    lines.append("// Do not edit by hand; regenerate from ROCm NativeVNNI decode trainer CSVs.")
-    lines.append(
-        f"// Aspect fallback exact hit rate: {fallback_metrics['exact_hits']}/{fallback_metrics['total']} "
-        f"({fallback_metrics['exact_pct']:.2f}%), coverage {fallback_metrics['covered']}/{fallback_metrics['total']} "
-        f"({fallback_metrics['coverage_pct']:.2f}%)."
+    if not base.is_file():
+        raise ValueError(f"base include not found: {base}")
+    text = _strip_existing_overlay(base.read_text(encoding="utf-8"))
+    marker = (
+        "    const uint64_t key = "
+        "packROCmNativeVNNIDecodeDispatchKey(m, n, k);\n"
     )
-    lines.append("#pragma once")
-    lines.append("")
-    lines.append("#include <cstddef>")
-    lines.append("#include <cstdint>")
-    lines.append("")
-    lines.append("namespace llaminar2::rocm::generated")
-    lines.append("{")
-    lines.append("struct ROCmNativeVNNIDecodeDispatchConfig")
-    lines.append("{")
-    lines.append("    uint8_t kb = 0;")
-    lines.append("    uint8_t target_waves_per_cu = 0;")
-    lines.append("};")
-    lines.append("")
-    lines.append("struct ROCmNativeVNNIDecodeTuningEntry")
-    lines.append("{")
-    lines.append("    uint64_t key;")
-    lines.append("    ROCmNativeVNNIDecodeDispatchConfig config;")
-    lines.append("};")
-    lines.append("")
-    lines.append("struct ROCmNativeVNNIDecodeAspectRule")
-    lines.append("{")
-    lines.append("    long long max_work_items;")
-    lines.append("    ROCmNativeVNNIDecodeDispatchConfig config;")
-    lines.append("};")
-    lines.append("")
-    lines.append("inline constexpr uint64_t packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)")
-    lines.append("{")
-    lines.append("    return (static_cast<uint64_t>(m & 0xFF) << 56) |")
-    lines.append("           (static_cast<uint64_t>(k & 0xFFFFFF) << 28) |")
-    lines.append("           static_cast<uint64_t>(n & 0x0FFFFFFF);")
-    lines.append("}")
-    lines.append("")
-    lines.append("template <size_t Count>")
-    lines.append("inline bool findROCmNativeVNNIDecodeDispatchEntry(")
-    lines.append("    const ROCmNativeVNNIDecodeTuningEntry (&table)[Count],")
-    lines.append("    uint64_t key,")
-    lines.append("    ROCmNativeVNNIDecodeDispatchConfig &out)")
-    lines.append("{")
-    lines.append("    size_t lo = 0;")
-    lines.append("    size_t hi = Count;")
-    lines.append("    while (lo < hi)")
-    lines.append("    {")
-    lines.append("        const size_t mid = lo + ((hi - lo) / 2);")
-    lines.append("        const uint64_t candidate = table[mid].key;")
-    lines.append("        if (candidate == key)")
-    lines.append("        {")
-    lines.append("            out = table[mid].config;")
-    lines.append("            return true;")
-    lines.append("        }")
-    lines.append("        if (candidate < key)")
-    lines.append("            lo = mid + 1;")
-    lines.append("        else")
-    lines.append("            hi = mid;")
-    lines.append("    }")
-    lines.append("    return false;")
-    lines.append("}")
-    lines.append("")
-    lines.append("template <size_t Count>")
-    lines.append("inline ROCmNativeVNNIDecodeDispatchConfig pickROCmNativeVNNIDecodeAspectRule(")
-    lines.append("    const ROCmNativeVNNIDecodeAspectRule (&rules)[Count],")
-    lines.append("    long long work_items)")
-    lines.append("{")
-    lines.append("    for (size_t i = 0; i < Count; ++i)")
-    lines.append("    {")
-    lines.append("        if (work_items <= rules[i].max_work_items || i + 1 == Count)")
-    lines.append("            return rules[i].config;")
-    lines.append("    }")
-    lines.append("    return ROCmNativeVNNIDecodeDispatchConfig{};")
-    lines.append("}")
-    lines.append("")
-    lines.append("inline bool selectROCmNativeVNNIDecodeAspectFallback(")
-    lines.append("    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)")
-    lines.append("{")
-    lines.append("    const float aspect_ratio = (k > 0) ? (static_cast<float>(n) / static_cast<float>(k)) : 0.0f;")
-    lines.append("    const long long work_items = static_cast<long long>(n) * static_cast<long long>(k);")
-    for codebook in sorted({key[0] for key in aspect_rules}):
-        label = canonical_label(codebook)
-        lines.append(f"    if (codebook_id == {codebook}) {{ // CB={codebook} ({label})")
-        first_m = True
-        for m in sorted({key[1] for key in aspect_rules if key[0] == codebook}):
-            m_prefix = "if" if first_m else "else if"
-            first_m = False
-            lines.append(f"        {m_prefix} (m == {m}) {{")
-            first_aspect = True
-            for aspect in ASPECT_ORDER:
-                rules = aspect_rules.get((codebook, m, aspect))
-                if not rules:
-                    continue
-                aspect_prefix = "if" if first_aspect else "else if"
-                first_aspect = False
-                lines.append(f"            {aspect_prefix} ({ASPECT_CONDITIONS[aspect]}) {{")
-                lines.append("                static constexpr ROCmNativeVNNIDecodeAspectRule kRules[] = {")
-                for rule in rules:
-                    kb, target_waves = rule["candidate"]
-                    lines.append(
-                        f"                    {{{rule['max_work']}LL, {{{kb}, {target_waves}}}}}, "
-                        f"// {rule['support']}/{rule['total']}"
-                    )
-                lines.append("                };")
-                lines.append("                out = pickROCmNativeVNNIDecodeAspectRule(kRules, work_items);")
-                lines.append("                return true;")
-                lines.append("            }")
-            lines.append("        }")
-        lines.append("    }")
-    lines.append("    return false;")
-    lines.append("}")
-    lines.append("")
-    lines.append("inline bool selectROCmNativeVNNIDecodeGenerated(")
-    lines.append("    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)")
-    lines.append("{")
-    lines.append("    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);")
-
-    for codebook in sorted(rows_by_codebook):
-        label = canonical_label(codebook)
-        lines.append(f"    if (codebook_id == {codebook}) {{ // CB={codebook} ({label})")
-        lines.append("        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {")
-        for row in rows_by_codebook[codebook]:
-            lines.append(
-                f"            {{0x{pack_shape_key(row.m, row.n, row.k):016x}ULL, "
-                f"{{{row.kb}, {row.target_waves}}}}}, // CB={codebook} ({label}) "
-                f"M={row.m} {row.n}x{row.k} {row.variant} {row.shape} {row.min_us:.3f}us"
-            )
-        lines.append("        };")
-        lines.append("        if (findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out))")
-        lines.append("            return true;")
-        lines.append("    }")
-
-    lines.append("    return selectROCmNativeVNNIDecodeAspectFallback(codebook_id, m, n, k, out);")
-    lines.append("}")
-    lines.append("")
-    lines.append("} // namespace llaminar2::rocm::generated")
+    location = text.find(marker)
+    if location < 0:
+        raise ValueError("base include lacks the ROCm selector key marker")
+    insert_at = location + len(marker)
+    overlay = [OVERLAY_BEGIN]
+    for entry in sorted(entries):
+        overlay.extend([
+            f"    if (codebook_id == {entry.codebook} &&",
+            f"        key == 0x{pack_shape_key(1, entry.n, entry.k):016x}ULL)",
+            "    {",
+            f"        out = ROCmNativeVNNIDecodeDispatchConfig{{{entry.kb}, {CANONICAL_TARGET_WAVES}}};",
+            "        return true;",
+            "    }",
+        ])
+    overlay.append(OVERLAY_END)
+    updated = text[:insert_at] + "\n".join(overlay) + "\n" + text[insert_at:]
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("\n".join(lines) + "\n")
+    output.write_text(updated, encoding="utf-8")
 
 
-def emit_summary(rows: list[DecodeRow], summary_path: Path) -> None:
-    aspect_rules = build_aspect_fallback_rules(rows)
-    fallback_metrics = compute_aspect_fallback_metrics(rows, aspect_rules)
-    lines = [
-        f"ROCm NativeVNNI decode generated entries: {len(rows)}",
-        (
-            "Aspect fallback exact hit rate: "
-            f"{fallback_metrics['exact_hits']}/{fallback_metrics['total']} "
-            f"({fallback_metrics['exact_pct']:.2f}%), coverage "
-            f"{fallback_metrics['covered']}/{fallback_metrics['total']} "
-            f"({fallback_metrics['coverage_pct']:.2f}%)"
-        ),
-        "codebook,format,shape,m,n,k,variant,kb,target_waves,min_us,eff_bw_gbs",
-    ]
-    for row in rows:
-        lines.append(
-            f"{row.codebook},{canonical_label(row.codebook)},{row.shape},"
-            f"{row.m},{row.n},{row.k},{row.variant},{row.kb},{row.target_waves},"
-            f"{row.min_us:.3f},{row.eff_bw_gbs:.3f}"
-        )
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text("\n".join(lines) + "\n")
+def write_summary(
+    path: Path,
+    entries: list[FastEntry],
+    exact: dict[RuntimeKey, ExactWinner],
+) -> None:
+    """Write selected Fast entries plus verifier certification counts."""
+
+    verifier_count = sum(
+        key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        for key in exact
+    )
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "execution_codebook", "m", "n", "k", "candidate_id", "kb",
+            "target_waves", "shape", "max_surface_regret", "max_cv",
+            "certified_verifier_key_count",
+        ])
+        for entry in sorted(entries):
+            writer.writerow([
+                entry.codebook,
+                1,
+                entry.n,
+                entry.k,
+                entry.candidate_id,
+                entry.kb,
+                CANONICAL_TARGET_WAVES,
+                entry.shape_name,
+                f"{entry.max_surface_regret:.9f}",
+                f"{entry.max_cv:.9f}",
+                verifier_count,
+            ])
+
+
+def _context_from_args(
+    args: argparse.Namespace,
+    inputs: tuple[Path, ...],
+) -> ROCmDecodeAdapterContext:
+    """Build conspicuous smoke provenance or strict installable provenance."""
+
+    corpus_id = raw_corpus_id((*inputs, *args.timing_sidecar))
+    profile = MeasurementProfile(args.profile)
+    if not profile.installable:
+        return ROCmDecodeAdapterContext.workflow_smoke(corpus_id=corpus_id)
+    return ROCmDecodeAdapterContext(
+        profile=profile,
+        run_id=args.run_id,
+        corpus_id=corpus_id,
+        git_revision=args.git_revision,
+        build_id=args.build_id,
+        compiler_id=args.compiler_id,
+        architecture_class=args.architecture_class,
+        device_name=args.device_name,
+        driver_runtime=args.driver_runtime,
+        serial_m1_policy_hash=args.serial_m1_policy_hash,
+        raw_timing_sidecar_retained=bool(args.timing_sidecar),
+    )
 
 
 def main() -> int:
-    args = parse_args()
-    rows = load_decode_rows(args.input, args.max_generated_kb)
-    if not rows:
-        raise SystemExit("no generated ROCm NativeVNNI decode rows; no correct rows fit the generated KB cap")
-    output = Path(args.output)
+    """CLI entry point for common adaptation and current-ABI ROCm emission."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("inputs", nargs="*", type=Path)
+    parser.add_argument(
+        "--input", nargs="+", type=Path, dest="input_options",
+        help="Legacy spelling for strong trainer CSV shard(s)",
+    )
+    parser.add_argument(
+        "--timing-sidecar", action="append", type=Path, default=[],
+        help="Raw timing CSV shard; repeat for every aggregate shard",
+    )
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--summary", "--summary-csv", dest="summary", type=Path)
+    parser.add_argument("--common-observations", type=Path)
+    parser.add_argument("--base-include", type=Path)
+    parser.add_argument(
+        "--max-generated-kb", type=int, default=64,
+        help="Current ABI guard; values below the graph-safe cap are rejected",
+    )
+    parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument(
+        "--profile", choices=[profile.value for profile in MeasurementProfile],
+        default=MeasurementProfile.QUICK.value,
+    )
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--git-revision", default="")
+    parser.add_argument("--build-id", default="")
+    parser.add_argument("--compiler-id", default="")
+    parser.add_argument("--architecture-class", default="")
+    parser.add_argument("--device-name", default="")
+    parser.add_argument("--driver-runtime", default="")
+    parser.add_argument("--serial-m1-policy-hash", default="")
+    args = parser.parse_args()
+
+    positional = tuple(args.inputs)
+    optional = tuple(args.input_options or ())
+    if positional and optional:
+        parser.error("use positional inputs or --input, not both")
+    inputs = positional or optional
+    if not inputs:
+        parser.error("at least one strong trainer CSV is required")
+    if args.max_generated_kb != 64:
+        parser.error(
+            "--max-generated-kb must remain 64; silently dropping forceable "
+            "candidates makes the common matrix incomplete"
+        )
+
+    context = _context_from_args(args, inputs)
+    corpus = adapt_rocm_decode_csv(
+        inputs,
+        context,
+        timing_sidecars=args.timing_sidecar,
+    )
+    entries, exact = select_fast_entries(
+        corpus,
+        context.serial_m1_policy_hash,
+    )
+    generic_rules = select_fast_generic_rules(
+        corpus,
+        context.serial_m1_policy_hash,
+    )
+    if args.require_complete:
+        validate_complete(corpus)
+
     if args.base_include:
-        emit_cpp_overlay(rows, output, Path(args.base_include))
+        emit_overlay(entries, args.output, args.base_include)
     else:
-        emit_cpp(rows, output)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            generate_include(
+                entries,
+                generic_rules,
+                corpus_digest=corpus.digest(),
+                registry_digest=candidate_registry_digest(),
+                profile=context.profile,
+            ),
+            encoding="utf-8",
+        )
     if args.summary:
-        emit_summary(rows, Path(args.summary))
-    print(f"generated {len(rows)} ROCm NativeVNNI decode dispatch entries -> {output}")
+        args.summary.parent.mkdir(parents=True, exist_ok=True)
+        write_summary(args.summary, entries, exact)
+    if args.common_observations:
+        args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+        write_observation_csv(args.common_observations, corpus)
+    print(
+        f"adapted {len(corpus)} strong observations; selected {len(entries)} "
+        f"Fast M=1 exact entries and certified "
+        f"{sum(key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE for key in exact)} "
+        f"verifier keys -> {args.output}"
+    )
     return 0
 
 

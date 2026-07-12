@@ -89,7 +89,14 @@ namespace llaminar2
         constexpr int kGroupedDescriptorTableSlots = 128;
         constexpr int kRouterGateCacheSlots = 128;
         constexpr int kHistogramLayerSlots = 128;
-        constexpr int kMaxVerifierRows = 4;
+        /**
+         * @brief Reusable row tile used by verifier split-K partial buffers.
+         *
+         * This is a workspace tile, not an MTP depth limit. Runtime verifier
+         * rows beyond this tile are processed by repeated grouped tiles while
+         * preserving the serial decode reduction order inside each row.
+         */
+        constexpr int kVerifierSplitKTileRows = 16;
 
         inline int ceilDiv(int value, int divisor)
         {
@@ -168,16 +175,16 @@ namespace llaminar2
             constexpr int kMaxDownPartitions = 16;
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
             const std::size_t verifier_splitk_slots =
-                static_cast<std::size_t>(std::min(max_seq_len, kMaxVerifierRows)) *
+                static_cast<std::size_t>(std::min(max_seq_len, kVerifierSplitKTileRows)) *
                 static_cast<std::size_t>(top_k);
             const std::size_t gateup_partial_slots =
                 std::max(decode_slots, verifier_splitk_slots);
 
             add(reqs, DECODE_HIDDEN_INT8,
-                static_cast<std::size_t>(kMaxVerifierRows) *
+                static_cast<std::size_t>(max_seq_len) *
                     static_cast<std::size_t>(d_model) * sizeof(int8_t));
             add(reqs, DECODE_HIDDEN_SCALES,
-                static_cast<std::size_t>(kMaxVerifierRows) *
+                static_cast<std::size_t>(max_seq_len) *
                     static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             add(reqs, GATEUP_GATE_PARTIALS,
                 gateup_partial_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
@@ -266,10 +273,10 @@ namespace llaminar2
                     static_cast<std::size_t>(num_experts) * sizeof(uint64_t));
             add(reqs, ROCM_EXPERT_MASK, static_cast<std::size_t>(num_experts) * sizeof(bool));
             add(reqs, ROCM_ROUTER_Q8_HIDDEN,
-                static_cast<std::size_t>(kMaxVerifierRows) *
+                static_cast<std::size_t>(max_seq_len) *
                     static_cast<std::size_t>(d_model) * sizeof(int8_t));
             add(reqs, ROCM_ROUTER_Q8_SCALES,
-                static_cast<std::size_t>(kMaxVerifierRows) *
+                static_cast<std::size_t>(max_seq_len) *
                     static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             add(reqs, ROCM_ROUTER_Q8_GATE_WEIGHTS,
                 static_cast<std::size_t>(kRouterGateCacheSlots) *

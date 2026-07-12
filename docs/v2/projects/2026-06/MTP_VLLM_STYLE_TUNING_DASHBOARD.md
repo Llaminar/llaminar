@@ -12,10 +12,13 @@ RAG: **G** correct and speed-positive, **A** correct but slow/stale,
 Fresh E2E: dense baseline/RAM-prefix/MTP d2 `261/261` on CPU/CUDA/ROCm; CPU
 MoE MTP d2 `27/27`; CUDA Qwen3.5 MoE bucket `28/28`.
 
-2026-07-10: unit `528/528`; grouped gate `47/47` substantive cells (CPU 13,
-CUDA 15, ROCm 19; `48/48` with fixture). GPU request-batch stochastic draws
-consume resident positions and match scalar bytes. GDN/short-conv capture-once
-continuation covers M=2/3/4 and every accepted row byte-for-byte.
+2026-07-11: unit `536/536`; grouped gate `49/49` substantive cells (CPU 13,
+CUDA 16, ROCm 20; `50` with fixture). CPU NativeVNNI direct and fused K-part
+paths are byte/repeat exact for all formats at M=2..16/M31 in AVX2,
+AVX512+AVX2-dispatch, and AVX512 regimes; counters prove 2/4-row physical tiles.
+GPU request-batch stochastic draws consume resident positions and match scalar
+bytes. GDN/short-conv capture-once continuation covers M=2/3/4 and every
+accepted row byte-for-byte.
 
 LocalTP compact prefill now uses each child's mirrored full head; rank sampling
 fans out to child-resident mailboxes with no logits gather or tiny allreduce.

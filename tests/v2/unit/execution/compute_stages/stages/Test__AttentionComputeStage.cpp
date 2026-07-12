@@ -10,14 +10,18 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 #include <cmath>
 #include <memory>
+#include <string>
 
 #include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
+#include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
 
 #ifdef HAVE_CUDA
@@ -33,6 +37,60 @@ using namespace llaminar2;
 namespace
 {
     constexpr float TOLERANCE = 1e-4f;
+
+    /**
+     * @brief Temporarily override attention diagnostics and reload DebugEnv.
+     *
+     * DebugEnv caches parsed values, so changing the process environment alone
+     * would make this unit depend on test order.  The helper restores every
+     * original value and reloads the cache when it leaves scope.
+     */
+    class ScopedAttentionDebugEnv
+    {
+    public:
+        explicit ScopedAttentionDebugEnv(
+            std::initializer_list<std::pair<const char *, const char *>> values)
+        {
+            for (const auto &[name, value] : values)
+            {
+                Entry entry;
+                entry.name = name;
+                if (const char *old_value = std::getenv(name))
+                {
+                    entry.had_value = true;
+                    entry.old_value = old_value;
+                }
+                entries_.push_back(std::move(entry));
+                ::setenv(name, value, 1);
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedAttentionDebugEnv()
+        {
+            for (const auto &entry : entries_)
+            {
+                if (entry.had_value)
+                    ::setenv(entry.name.c_str(), entry.old_value.c_str(), 1);
+                else
+                    ::unsetenv(entry.name.c_str());
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ScopedAttentionDebugEnv(const ScopedAttentionDebugEnv &) = delete;
+        ScopedAttentionDebugEnv &operator=(const ScopedAttentionDebugEnv &) = delete;
+
+    private:
+        struct Entry
+        {
+            std::string name;
+            bool had_value = false;
+            std::string old_value;
+        };
+
+        std::vector<Entry> entries_;
+    };
 
     class Test__AttentionComputeStage : public ::testing::Test
     {
@@ -56,12 +114,17 @@ namespace
     {
     public:
         int cached_tokens = 0;
+        mutable int cached_token_queries = 0;
         ActivationPrecision k_precision_value = ActivationPrecision::FP16;
         ActivationPrecision v_precision_value = ActivationPrecision::FP16;
 
         ActivationPrecision k_precision() const override { return k_precision_value; }
         ActivationPrecision v_precision() const override { return v_precision_value; }
-        int get_cached_tokens(int, int = 0) const override { return cached_tokens; }
+        int get_cached_tokens(int, int = 0) const override
+        {
+            ++cached_token_queries;
+            return cached_tokens;
+        }
         int max_seq_len() const override { return 4096; }
         int n_layers() const override { return 1; }
 
@@ -382,6 +445,78 @@ namespace
         EXPECT_EQ(rocm_sig_before, rocm_sig_after)
             << "ROCm one-row decode should remain bucketed by launch topology "
                "rather than recapturing for every exact token count";
+    }
+
+    /**
+     * @brief Dump metadata must not observe host KV state during graph capture.
+     *
+     * Snapshot nodes are assembled inside the same recording window as the
+     * production attention launch. A host cached-token query there is both an
+     * illegal coherence boundary and a stale-state risk. This test performs no
+     * GPU work: the thread-local capture guard and counting cache fake prove
+     * that capture-time metadata neither observes host state nor substitutes
+     * the declarative projection tensor for an unresolved production cache
+     * view. Eager diagnostics may still refresh ordinary host-visible inputs.
+     */
+    TEST_F(Test__AttentionComputeStage, CaptureTimeDumpInfoDoesNotQueryHostKVState)
+    {
+        ScopedAttentionDebugEnv env({
+            {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
+            {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER", "0"},
+        });
+        TensorFactory factory(mpi_ctx_);
+        constexpr int seq_len = 8;
+        constexpr int n_heads = 4;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 16;
+        const size_t q_cols = n_heads * head_dim;
+        const size_t kv_cols = n_kv_heads * head_dim;
+
+        auto Q = factory.createFP32({seq_len, q_cols}, device_id_);
+        FakeCaptureKVCache kv_cache;
+        kv_cache.cached_tokens = seq_len;
+        const size_t physical_kv_rows = static_cast<size_t>(kv_cache.max_seq_len());
+        auto K = factory.createFP32({physical_kv_rows, kv_cols}, device_id_);
+        auto V = factory.createFP32({physical_kv_rows, kv_cols}, device_id_);
+        auto output = factory.createFP32({seq_len, q_cols}, device_id_);
+
+        AttentionComputeStage::Params params;
+        params.device_id = DeviceId::cuda(0);
+        params.Q = Q.get();
+        params.K = K.get();
+        params.V = V.get();
+        params.output = output.get();
+        params.batch_size = 1;
+        params.seq_len = seq_len;
+        params.kv_len = seq_len;
+        params.n_heads = n_heads;
+        params.n_kv_heads = n_kv_heads;
+        params.head_dim = head_dim;
+        params.kv_cache = &kv_cache;
+        params.layer_idx = 0;
+        params.read_kv_from_cache = true;
+        AttentionComputeStage stage(params);
+
+        {
+            GraphCaptureGuard capture;
+            const StageDumpInfo captured_info = stage.buildDumpInfoImpl();
+            EXPECT_FALSE(captured_info.inputs.empty());
+            const auto effective_k = std::find_if(
+                captured_info.outputs.begin(),
+                captured_info.outputs.end(),
+                [](const StageDumpInfo::OutputBuffer &candidate)
+                {
+                    return candidate.name && std::string(candidate.name) == "effective_k";
+                });
+            EXPECT_EQ(effective_k, captured_info.outputs.end())
+                << "Unexecuted GPU attention must not label its FP32 projection buffer as the effective cache view";
+        }
+        EXPECT_EQ(kv_cache.cached_token_queries, 0)
+            << "graph recording must not cross to host KV sequence state";
+
+        (void)stage.buildDumpInfoImpl();
+        EXPECT_EQ(kv_cache.cached_token_queries, 1)
+            << "eager diagnostics may refresh cache-backed dump geometry";
     }
 
     /**

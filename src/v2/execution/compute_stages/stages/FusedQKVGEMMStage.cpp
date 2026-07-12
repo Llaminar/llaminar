@@ -311,13 +311,6 @@ namespace llaminar2
         ITensorGemm *gemm_k,
         ITensorGemm *gemm_v)
     {
-        if (params_.m > 4)
-        {
-            LOG_ERROR("[FusedQKVGEMMStage] Decode-equivalent verifier prefill is only supported "
-                      << "for tiny MTP verifier batches, got m=" << params_.m);
-            return false;
-        }
-
         const bool is_gpu = params_.device_id.is_gpu();
         void *stream = gpuStream();
         if (is_gpu && !stream)

@@ -1172,8 +1172,9 @@ TEST(Test__ROCmRingKVCacheTQ, MetadataAccessors)
  * The test covers both supported TQ block dimensions, a wrapped request-zero
  * ring, and a shorter request-one ring. The grouped device-state path is
  * captured and replayed as production attention uses it. Every live FP16 K/V
- * word must equal the existing scalar dequant route, and every padding word
- * must be zero so one request cannot observe another request's cache payload.
+ * word must equal the existing scalar dequant route. Inactive capacity remains
+ * unspecified because attention consumes only the canonical device count;
+ * clearing the maximum context on every short decode would waste bandwidth.
  */
 TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBytes)
 {
@@ -1270,7 +1271,6 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
                 /*layer=*/0,
                 /*first_seq_idx=*/0,
                 batch_size,
-                max_seq_len,
                 &grouped_k,
                 &grouped_v,
                 stream.opaque());
@@ -1336,12 +1336,6 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
                 actual_k.data() + request_offset, scalar_k[request], "TQ8 K");
             expectWordsEqual(
                 actual_v.data() + request_offset, scalar_v[request], "TQ4 V");
-            for (size_t index = live_elements;
-                 index < static_cast<size_t>(max_seq_len) * kv_dim; ++index)
-            {
-                EXPECT_EQ(actual_k[request_offset + index], uint16_t{0});
-                EXPECT_EQ(actual_v[request_offset + index], uint16_t{0});
-            }
         }
 
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
@@ -1700,7 +1694,7 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
             GraphCaptureGuard guard;
             capture_ok = append_stage.execute(nullptr) &&
                          actual.get_kv_batched_converted_device_view(
-                             0, 0, /*request_count=*/1, max_seq_len,
+                             0, 0, /*request_count=*/1,
                              ActivationPrecision::FP16,
                              &captured_k, &captured_v, read_params);
         }

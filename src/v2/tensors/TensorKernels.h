@@ -1800,9 +1800,14 @@ namespace llaminar2
          * implementations; graph-capable GPU backends override this contract.
          */
         virtual bool prepareDynamicAttnParams(
-            int kv_len, int position_offset, int query_rows, void *stream)
+            int kv_len,
+            int position_offset,
+            int query_rows,
+            void *stream,
+            int kv_stride = -1)
         {
             (void)stream;
+            (void)kv_stride;
             setDynamicAttnParams(kv_len, position_offset, query_rows);
             return true;
         }
@@ -1823,17 +1828,21 @@ namespace llaminar2
          * @param seq_len Logical query row count for this attention stage.
          * @param query_rows Number of row-local dynamic attention params needed.
          * @param stream Explicit non-null backend stream.
+         * @param kv_stride Stable physical request-major K/V row capacity. A
+         *        negative value means tightly packed @p kv_len rows.
          */
         virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
             const int *post_append_cached_tokens_device,
             int seq_len,
             int query_rows,
-            void *stream)
+            void *stream,
+            int kv_stride = -1)
         {
             (void)post_append_cached_tokens_device;
             (void)seq_len;
             (void)query_rows;
             (void)stream;
+            (void)kv_stride;
             return false;
         }
     };

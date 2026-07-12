@@ -651,11 +651,9 @@ namespace llaminar2
         const int *target_token_ids, const float *target_probs,
         const int *draft_token_ids, const float *draft_probs,
         int k, int distribution_stride,
-        int draft_token0, int draft_token1, int draft_token2, int draft_token3,
-        float accept_threshold0, float accept_threshold1,
-        float accept_threshold2, float accept_threshold3,
-        float residual_threshold0, float residual_threshold1,
-        float residual_threshold2, float residual_threshold3,
+        const int *draft_tokens_host,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int row_count,
         int *out_token,
         int *out_accepted,
@@ -668,10 +666,8 @@ namespace llaminar2
         int k, int distribution_stride,
         const int *sampled_draft_tokens,
         const float *sampled_draft_probabilities,
-        float accept_threshold0, float accept_threshold1,
-        float accept_threshold2, float accept_threshold3,
-        float residual_threshold0, float residual_threshold1,
-        float residual_threshold2, float residual_threshold3,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int row_count,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
@@ -694,10 +690,8 @@ namespace llaminar2
         int target_row_stride,
         int draft_row_stride,
         const int *sampled_draft_tokens,
-        float accept_threshold0, float accept_threshold1,
-        float accept_threshold2, float accept_threshold3,
-        float residual_threshold0, float residual_threshold1,
-        float residual_threshold2, float residual_threshold3,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -712,10 +706,7 @@ namespace llaminar2
         int target_row_stride,
         int draft_row_stride,
         const int *sampled_draft_tokens,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
+        const float *accept_thresholds_host,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
         int thresholds_from_seed,
@@ -737,10 +728,7 @@ namespace llaminar2
         int draft_row_stride,
         const int *sampled_draft_tokens,
         const float *sampled_draft_probabilities,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
+        const float *accept_thresholds_host,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
         int *out_token,
@@ -759,10 +747,7 @@ namespace llaminar2
         int draft_row_stride,
         int inverse_sample_row_stride,
         const int *sampled_draft_tokens,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
+        const float *accept_thresholds_host,
         int no_draft_probabilities,
         int *out_token,
         int *out_accepted,
@@ -781,6 +766,7 @@ namespace llaminar2
         const int *bonus_token,
         int has_bonus_token,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta,
         int device_idx,
         void *stream);
@@ -795,6 +781,7 @@ namespace llaminar2
         const int *bonus_token,
         int has_bonus_token,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta,
         int device_idx,
         void *stream);
@@ -807,6 +794,7 @@ namespace llaminar2
         int stop_token4, int stop_token5, int stop_token6, int stop_token7,
         int stop_token_count,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta,
         int device_idx,
         void *stream);
@@ -1296,7 +1284,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
             !verify_tokens_device || !verify_accepted_device ||
-            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            row_count < 0 ||
             (first_token < 0 && !first_token_device) ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
@@ -1454,7 +1442,7 @@ namespace llaminar2
         void *stream)
     {
         if (device_id >= device_count_ || device_id < 0 ||
-            !out_samples_device || row_count <= 0 || row_count > 4 ||
+            !out_samples_device || row_count <= 0 ||
             vocab_size <= 0 || row_stride < vocab_size || !stream)
         {
             return false;
@@ -1537,22 +1525,12 @@ namespace llaminar2
             !draft_token_ids_device || !draft_probs_device ||
             top_k <= 0 || top_k > 256 ||
             distribution_stride < top_k ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             !draft_tokens_host || !accept_thresholds_host ||
             !residual_thresholds_host ||
             !stream || !out_token_device || !out_accepted_device)
         {
             return false;
-        }
-
-        int draft_tokens[4] = {-1, -1, -1, -1};
-        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = 0; i < row_count; ++i)
-        {
-            draft_tokens[i] = draft_tokens_host[i];
-            accept_thresholds[i] = accept_thresholds_host[i];
-            residual_thresholds[i] = residual_thresholds_host[i];
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
@@ -1563,18 +1541,9 @@ namespace llaminar2
             static_cast<const float *>(draft_probs_device),
             top_k,
             distribution_stride,
-            draft_tokens[0],
-            draft_tokens[1],
-            draft_tokens[2],
-            draft_tokens[3],
-            accept_thresholds[0],
-            accept_thresholds[1],
-            accept_thresholds[2],
-            accept_thresholds[3],
-            residual_thresholds[0],
-            residual_thresholds[1],
-            residual_thresholds[2],
-            residual_thresholds[3],
+            draft_tokens_host,
+            accept_thresholds_host,
+            residual_thresholds_host,
             row_count,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
@@ -1630,22 +1599,11 @@ namespace llaminar2
             !draft_tokens_device ||
             top_k <= 0 || top_k > 256 ||
             distribution_stride < top_k ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             (!has_host_thresholds && !uses_seeded_device_thresholds) ||
             !stream || !out_token_device || !out_accepted_device)
         {
             return false;
-        }
-
-        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (has_host_thresholds)
-        {
-            for (int i = 0; i < row_count; ++i)
-            {
-                accept_thresholds[i] = accept_thresholds_host[i];
-                residual_thresholds[i] = residual_thresholds_host[i];
-            }
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
@@ -1658,14 +1616,8 @@ namespace llaminar2
             distribution_stride,
             static_cast<const int *>(draft_tokens_device),
             static_cast<const float *>(draft_token_probabilities_device),
-            accept_thresholds[0],
-            accept_thresholds[1],
-            accept_thresholds[2],
-            accept_thresholds[3],
-            residual_thresholds[0],
-            residual_thresholds[1],
-            residual_thresholds[2],
-            residual_thresholds[3],
+            accept_thresholds_host,
+            residual_thresholds_host,
             row_count,
             inverse_sample_seed,
             inverse_sample_first_logical_position,
@@ -1704,7 +1656,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !target_logits_device || !draft_logits_device ||
             !draft_tokens_device ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
             draft_row_stride < vocab_size ||
@@ -1712,14 +1664,6 @@ namespace llaminar2
             !stream || !out_token_device || !out_accepted_device)
         {
             return false;
-        }
-
-        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = 0; i < row_count; ++i)
-        {
-            accept_thresholds[i] = accept_thresholds_host[i];
-            residual_thresholds[i] = residual_thresholds_host[i];
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
@@ -1731,14 +1675,8 @@ namespace llaminar2
             target_row_stride,
             draft_row_stride,
             static_cast<const int *>(draft_tokens_device),
-            accept_thresholds[0],
-            accept_thresholds[1],
-            accept_thresholds[2],
-            accept_thresholds[3],
-            residual_thresholds[0],
-            residual_thresholds[1],
-            residual_thresholds[2],
-            residual_thresholds[3],
+            accept_thresholds_host,
+            residual_thresholds_host,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
@@ -1781,7 +1719,7 @@ namespace llaminar2
             !target_logits_device ||
             (!no_draft_probabilities && !draft_probabilities_device) ||
             !draft_tokens_device ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
             (!no_draft_probabilities && draft_row_stride < vocab_size) ||
@@ -1790,13 +1728,6 @@ namespace llaminar2
             !stream || !out_token_device || !out_accepted_device)
         {
             return false;
-        }
-
-        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (has_host_thresholds)
-        {
-            for (int i = 0; i < row_count; ++i)
-                accept_thresholds[i] = accept_thresholds_host[i];
         }
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
@@ -1808,10 +1739,7 @@ namespace llaminar2
             target_row_stride,
             draft_row_stride,
             static_cast<const int *>(draft_tokens_device),
-            accept_thresholds[0],
-            accept_thresholds[1],
-            accept_thresholds[2],
-            accept_thresholds[3],
+            accept_thresholds_host,
             static_cast<unsigned long long>(inverse_sample_seed),
             inverse_sample_first_logical_position,
             uses_seeded_device_thresholds ? 1 : 0,
@@ -1848,7 +1776,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !target_logits_device || !draft_logits_device ||
             !draft_tokens_device ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
             draft_row_stride < vocab_size ||
@@ -1857,10 +1785,6 @@ namespace llaminar2
         {
             return false;
         }
-
-        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = 0; i < row_count; ++i)
-            accept_thresholds[i] = accept_thresholds_host[i];
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         return rocmOps_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_f32(
@@ -1872,10 +1796,7 @@ namespace llaminar2
             draft_row_stride,
             static_cast<const int *>(draft_tokens_device),
             static_cast<const float *>(draft_token_probabilities_device),
-            accept_thresholds[0],
-            accept_thresholds[1],
-            accept_thresholds[2],
-            accept_thresholds[3],
+            accept_thresholds_host,
             static_cast<unsigned long long>(inverse_sample_seed),
             inverse_sample_first_logical_position,
             static_cast<int *>(out_token_device),
@@ -1909,7 +1830,7 @@ namespace llaminar2
             !target_probabilities_device || !inverse_rejection_samples_device ||
             (!no_draft_probabilities && !draft_probabilities_device) ||
             !draft_tokens_device ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
             (!no_draft_probabilities && draft_row_stride < vocab_size) ||
@@ -1919,10 +1840,6 @@ namespace llaminar2
         {
             return false;
         }
-
-        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int i = 0; i < row_count; ++i)
-            accept_thresholds[i] = accept_thresholds_host[i];
 
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         return rocmOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32(
@@ -1935,10 +1852,7 @@ namespace llaminar2
             draft_row_stride,
             inverse_sample_row_stride,
             static_cast<const int *>(draft_tokens_device),
-            accept_thresholds[0],
-            accept_thresholds[1],
-            accept_thresholds[2],
-            accept_thresholds[3],
+            accept_thresholds_host,
             no_draft_probabilities ? 1 : 0,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
@@ -1959,13 +1873,14 @@ namespace llaminar2
         bool has_bonus_token,
         int device_id,
         void *stream,
+        int out_token_capacity,
         void *out_tokens_device,
         void *out_meta_device)
     {
         using namespace sampling_math;
         if (device_id >= device_count_ || device_id < 0 ||
             !verify_tokens_device || !verify_accepted_device ||
-            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            row_count < 0 || out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens_host) ||
@@ -1998,6 +1913,7 @@ namespace llaminar2
             static_cast<const int *>(bonus_token_device),
             has_bonus_token ? 1 : 0,
             static_cast<int *>(out_tokens_device),
+            out_token_capacity,
             static_cast<int *>(out_meta_device),
             device_id,
             stream);
@@ -2014,6 +1930,7 @@ namespace llaminar2
         bool has_bonus_token,
         int device_id,
         void *stream,
+        int out_token_capacity,
         void *out_tokens_device,
         void *out_meta_device)
     {
@@ -2021,7 +1938,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !verify_tokens_device || !verify_accepted_device ||
             !first_token_device ||
-            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            row_count < 0 || out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens_host) ||
@@ -2054,6 +1971,7 @@ namespace llaminar2
             static_cast<const int *>(bonus_token_device),
             has_bonus_token ? 1 : 0,
             static_cast<int *>(out_tokens_device),
+            out_token_capacity,
             static_cast<int *>(out_meta_device),
             device_id,
             stream);
@@ -2068,6 +1986,7 @@ namespace llaminar2
         int stop_token_count,
         int device_id,
         void *stream,
+        int out_token_capacity,
         void *out_tokens_device,
         void *out_meta_device)
     {
@@ -2075,7 +1994,7 @@ namespace llaminar2
         if (device_id >= device_count_ || device_id < 0 ||
             !verify_tokens_device || !draft_tokens_device ||
             compare_row_count < 0 ||
-            compare_row_count > kSpeculativeBatchMaxRows ||
+            out_token_capacity < compare_row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens_host) ||
@@ -2105,6 +2024,7 @@ namespace llaminar2
             stop_tokens[7],
             stop_token_count,
             static_cast<int *>(out_tokens_device),
+            out_token_capacity,
             static_cast<int *>(out_meta_device),
             device_id,
             stream);
@@ -2241,11 +2161,10 @@ namespace llaminar2
             !out_position_ids_device ||
             !stream ||
             meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
-            output_token_stride < sampling_math::kSpeculativeBatchMaxOutputTokens ||
+            output_token_stride <= first_output_token_index ||
             request_index < 0 ||
             first_output_token_index < 0 ||
-            row_count <= 0 ||
-            row_count > sampling_math::kSpeculativeBatchMaxRows)
+            row_count <= 0)
         {
             return false;
         }
@@ -2284,7 +2203,6 @@ namespace llaminar2
             condition_token_stride <= 0 ||
             !base_positions_device ||
             request_count <= 0 ||
-            request_count > sampling_math::kSpeculativeBatchMaxRows ||
             !stream ||
             !out_condition_tokens_device ||
             !out_position_ids_device)
@@ -2323,7 +2241,6 @@ namespace llaminar2
             !sampled_tokens_device ||
             !target_positions_device ||
             request_count <= 0 ||
-            request_count > sampling_math::kSpeculativeBatchMaxRows ||
             !stream ||
             !out_base_cached_tokens_device ||
             !out_target_positions_device ||

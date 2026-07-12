@@ -40,6 +40,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "../../utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 
@@ -2244,7 +2245,7 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVe
     EXPECT_EQ(maxAbsDiff(restored_state, accepted_replay_state), 0.0f);
 }
 
-TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeM2ToM4)
+TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeRuntimeM)
 {
     ScopedPerfStatsEnv perfstats;
 
@@ -2268,7 +2269,7 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
     for (auto &x : initial_state)
         x = state_dist(rng);
 
-    for (int rows = 2; rows <= 4; ++rows)
+    for (int rows : test::kGroupedVerifierRuntimeRows)
     {
         PerfStatsCollector::reset();
         std::vector<float> input(static_cast<size_t>(rows) * kChannels);

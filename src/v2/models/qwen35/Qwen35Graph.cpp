@@ -16,6 +16,7 @@
 #include "../../utils/Logger.h"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -381,7 +382,6 @@ namespace llaminar2
     {
         ComputeGraph graph;
         const std::string prefix = "mtp" + std::to_string(depth_idx) + "_";
-        const int total_tokens = input.batch_size * input.seq_len;
         const DeviceId device = input.device.is_valid() ? input.device : config_.default_device;
 
         auto missing = [&](const char *name, const void *ptr)
@@ -394,14 +394,15 @@ namespace llaminar2
 
         if (input.batch_size <= 0 ||
             input.seq_len <= 0 ||
-            total_tokens > 4 ||
+            input.batch_size > std::numeric_limits<int>::max() / input.seq_len ||
             (!input.kv_cache_only && input.seq_len != 1) ||
             (input.kv_cache_only && input.batch_size != 1 && input.seq_len != 1))
         {
-            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MTP sidecar graphs require total_tokens<=4, "
+            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MTP sidecar graphs require a positive, representable shape, "
                       "normal execution with seq_len=1, and multi-token catchup only for a single request");
             return graph;
         }
+        const int total_tokens = input.batch_size * input.seq_len;
 
         /*
          * MTP sidecars verify decode rows.  When LocalTP uses a replicated
@@ -731,7 +732,6 @@ namespace llaminar2
         const bool force_decode_equivalent_lm_head_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
             config_.usesMTPGroupedDecodeEquivalentRows();
 
         graph.addNode(prefix + "lm_head",
@@ -969,8 +969,7 @@ namespace llaminar2
         const bool force_decode_equivalent_gdn_verifier_prefill =
             config_.usesMTPGroupedDecodeEquivalentRows() &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
-            total_tokens > 1 &&
-            total_tokens <= 4;
+            total_tokens > 1;
         const int full_key_dim = n_k_heads_full * d_k;
         const int full_value_dim = config_.gdn.inner_size > 0
                                        ? config_.gdn.inner_size
@@ -1357,7 +1356,6 @@ namespace llaminar2
         const bool force_decode_equivalent_qkv_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
             config_.usesMTPGroupedDecodeEquivalentRows();
 
         graph.addNode(prefix + "qkv_proj",
@@ -1413,8 +1411,6 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             prefix + "q_gate_split",
             prefix + "qkv_proj");
-        const bool phase_split_prefill_kv_handoff =
-            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
         std::vector<std::string> cache_source_dependencies;
         if (has_qk_norms)
         {
@@ -1430,8 +1426,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device,
-            phase_split_prefill_kv_handoff);
+            position_ids, position_ids_device, device);
 
         if (has_qk_norms)
         {
@@ -1524,7 +1519,6 @@ namespace llaminar2
             const bool force_decode_equivalent_qkv_verifier_prefill =
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
-                total_tokens <= 4 &&
                 config_.usesMTPGroupedDecodeEquivalentRows();
 
             LOG_DEBUG("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
@@ -1595,8 +1589,6 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             prefix + "q_gate_split",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
-        const bool phase_split_prefill_kv_handoff =
-            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
         std::vector<std::string> cache_source_dependencies;
         if (has_qk_norms)
         {
@@ -1616,8 +1608,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device,
-            phase_split_prefill_kv_handoff);
+            position_ids, position_ids_device, device);
 
         if (has_qk_norms)
         {

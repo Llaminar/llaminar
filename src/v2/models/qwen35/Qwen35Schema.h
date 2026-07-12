@@ -327,29 +327,29 @@ namespace llaminar2
                 {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
                 {"lm_head_input_rows", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
 
-                // MTP verifier sidecar buffers are declared as graph scratch with
-                // capacity for Phase 13.5 small-M verifier rows (M <= 4). Stages
-                // still execute their actual runtime m, so this is capacity, not
-                // a request to process four rows every time.
-                {"mtp_embedding", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
-                {"mtp_norm_hidden", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
-                {"mtp_norm_embedding", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
-                {"mtp_concat", {"4", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
-                {"mtp_projected", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
-                {"mtp_hidden", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
-                {"mtp_q_raw", {"4", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
-                {"mtp_q_gate", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
-                {"mtp_q", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
-                {"mtp_k", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
-                {"mtp_v", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
-                {"mtp_k_full_prefill", {"4", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full key rows for phase-split prefill KV handoff"},
-                {"mtp_v_full_prefill", {"4", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full value rows for phase-split prefill KV handoff"},
-                {"mtp_attn_output", {"4", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
-                {"mtp_attn_proj", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
-                {"mtp_gate", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
-                {"mtp_up", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
-                {"mtp_ffn_output", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
-                {"mtp_logits", {"4", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits rows; local shard normally, full vocab when LocalTP mirrors the MTP head"},
+                // Every sidecar tensor owns the complete configured flattened
+                // verifier capacity. Runtime execution still supplies the
+                // semantic row count, so fixed and dynamic policies can use any
+                // M that fits their graph plan without a hidden M<=4 ABI.
+                {"mtp_embedding", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
+                {"mtp_norm_hidden", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
+                {"mtp_norm_embedding", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
+                {"mtp_concat", {"mtp_target_query_rows", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
+                {"mtp_projected", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
+                {"mtp_hidden", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
+                {"mtp_q_raw", {"mtp_target_query_rows", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
+                {"mtp_q_gate", {"mtp_target_query_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
+                {"mtp_q", {"mtp_target_query_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
+                {"mtp_k", {"mtp_target_query_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
+                {"mtp_v", {"mtp_target_query_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
+                {"mtp_k_full_prefill", {"mtp_target_query_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full key rows for phase-split prefill KV handoff"},
+                {"mtp_v_full_prefill", {"mtp_target_query_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full value rows for phase-split prefill KV handoff"},
+                {"mtp_attn_output", {"mtp_target_query_rows", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
+                {"mtp_attn_proj", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
+                {"mtp_gate", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
+                {"mtp_up", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
+                {"mtp_ffn_output", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
+                {"mtp_logits", {"mtp_target_query_rows", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits rows; local shard normally, full vocab when LocalTP mirrors the MTP head"},
                 {"mtp_logits_gathered", {"mtp_global_gather_rows", "mtp_global_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary CPU GlobalTP MTP rows; conditionally 1x1 outside GlobalTP"},
             };
 

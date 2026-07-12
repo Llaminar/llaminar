@@ -198,23 +198,6 @@ namespace
             const auto it = record.tags.find(key);
             return it != record.tags.end() && it->second == value;
         };
-        auto tag_is_one_of = [](const PerfStatRecord &record,
-                                const char *key,
-                                std::initializer_list<const char *> values) -> bool
-        {
-            const auto it = record.tags.find(key);
-            if (it == record.tags.end())
-            {
-                return false;
-            }
-            return std::any_of(
-                values.begin(),
-                values.end(),
-                [&](const char *value)
-                {
-                    return it->second == value;
-                               });
-        };
         auto tag_int_in_range = [](const PerfStatRecord &record,
                                    const char *key,
                                    int lower_bound,
@@ -235,11 +218,9 @@ namespace
         const int expected_routed_experts = 256;
         const int expected_total_slots =
             expected_seq_len * expected_routed_top_k;
-        const int expected_tile_m = 2;
         const std::string seq_len_tag = std::to_string(expected_seq_len);
         const std::string total_slots_tag =
             std::to_string(expected_total_slots);
-        const std::string tile_m_tag = std::to_string(expected_tile_m);
 
         if (expected_seq_len == 1)
         {
@@ -278,7 +259,7 @@ namespace
             [&](const PerfStatRecord &record)
             {
                 return record.name ==
-                           "rocm_moe_grouped_prefill_active_expert_grid_calls" &&
+                           "rocm_moe_grouped_prefill_batch_invariant_calls" &&
                        tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
                        tag_equals(record, "top_k", "8") &&
                        tag_equals(record,
@@ -289,17 +270,17 @@ namespace
                                         1,
                                         expected_total_slots) &&
                        tag_equals(record, "num_experts", "256") &&
-                       tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
-                       tag_is_one_of(record,
-                                     "gateup_route",
-                                     {"decode_equiv_router_q8",
-                                      "decode_equiv_prefill",
-                                      "kpart_prefill",
-                                      "fused_prefill"});
+                       tag_equals(record,
+                                  "gateup_route",
+                                  "route_owned_router_q8") &&
+                       tag_equals(record,
+                                  "down_route",
+                                  "direct_ordered_publish") &&
+                       tag_equals(record, "row_tile", "1");
             });
         ASSERT_NE(routed_grouped, records.end())
-            << "ROCm MoE grouped verifier did not exercise the active-expert "
-               "grouped prefill routed path for M="
+            << "ROCm MoE grouped verifier did not exercise the batch-invariant "
+               "direct verifier path for M="
             << expected_seq_len << ".\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});
 

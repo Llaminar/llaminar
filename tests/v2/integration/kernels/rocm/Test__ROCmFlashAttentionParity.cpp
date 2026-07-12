@@ -834,7 +834,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
     LOG_INFO("[FlashAttn2_FP32_LargeHeadDim_GQA] PASSED");
 }
 
-TEST_F(Test__ROCmFlashAttentionParity, RocblasPrefillHonorsExternalMask)
+TEST_F(Test__ROCmFlashAttentionParity, DeviceResidentPrefillHonorsExternalMask)
 {
     if (!hasROCm())
     {
@@ -844,7 +844,7 @@ TEST_F(Test__ROCmFlashAttentionParity, RocblasPrefillHonorsExternalMask)
     constexpr int seq_len = 2;
     constexpr int n_heads = 1;
     constexpr int n_kv_heads = 1;
-    constexpr int head_dim = 64; // Forces the rocBLAS prefill implementation.
+    constexpr int head_dim = 64;
     const size_t q_size = seq_len * n_heads * head_dim;
     const size_t kv_size = seq_len * n_kv_heads * head_dim;
     const size_t out_size = q_size;
@@ -3171,11 +3171,10 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen35LongPrefill
 /**
  * @brief Prove request-batched ROCm prefill is byte-identical to isolated requests.
  *
- * The rocBLAS prefill implementation consumes request-major Q/K/V spans.  Its
- * FP16 and Q8_1 routes first convert the native KV cache into an FP32 workspace,
- * so the conversion span must include the batch dimension too.  A one-request
- * test cannot detect a missing batch factor: request zero remains valid while
- * request one reads beyond the temporary allocation and can hard-fault the GPU.
+ * The device-resident prefill implementation consumes request-major Q/K/V
+ * spans with a fixed physical stride. A one-request test cannot detect an
+ * incorrect request base: request zero remains valid while request one can
+ * read inactive capacity or another cache bank.
  *
  * This regression uses the exact dense Qwen 3.6 attention geometry that exposed
  * the defect and sweeps every production prefill storage route.  Each request
@@ -3395,14 +3394,16 @@ TEST_F(
  *
  * This regression captures the actual `KVCacheAppendStage -> resident cache
  * gather -> AttentionComputeStage` chain. Request-specific K/V offsets make
- * sequence-zero substitution immediately visible. Every ordinary ROCm ring
- * storage type is exercised, and each request's FP32 output must be byte-for-
- * byte identical to an isolated batch-one invocation of the same production
- * attention kernel over the same native cache bytes.
+ * sequence-zero substitution immediately visible. The graph is replayed
+ * twice without recapture, growing every request beyond the live length seen
+ * during capture. Every ordinary ROCm ring storage type is exercised, and
+ * each request's FP32 output must be byte-for-byte identical to an isolated
+ * batch-one invocation of the same production attention kernel over the same
+ * native cache bytes after both launches.
  */
 TEST_F(
     Test__ROCmFlashAttentionParity,
-    CapturedRequestBatchAllStandardKVFormatsMatchIsolatedPrefillBytes)
+    CapturedGrowingRequestBatchAllStandardKVFormatsMatchesIsolatedPrefillBytes)
 {
     if (!hasROCm())
     {
@@ -3585,18 +3586,6 @@ TEST_F(
         attention_stage.updateDynamicParams(/*pos_offset=*/0, seq_len);
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        /*
-         * ROCm's rocBLAS prefill implementation owns a persistent stream pool,
-         * hipBLAS handles, events, and score buffers. Production graph planning
-         * initializes those resources before capture because HIP forbids their
-         * lazy allocation while a global capture is active. Reading an empty
-         * cache is sufficient for that one-time planning launch and leaves all
-         * ring metadata untouched; the append and the cache read being proved
-         * remain wholly inside the graph below.
-         */
-        ASSERT_TRUE(attention_stage.execute(nullptr));
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-
         hipGraph_t graph = nullptr;
         hipGraphExec_t graph_exec = nullptr;
         ASSERT_EQ(
@@ -3708,6 +3697,106 @@ TEST_F(
                     format.name + " request=" + std::to_string(request)));
         }
 
+        /*
+         * Replay the identical graph without touching host-side attention
+         * geometry.  The captured append advances each ring from eight to
+         * sixteen live rows, the resident gather stripes to the new device
+         * count, and attention must consume those rows with the original
+         * fixed physical request stride.  This is the exact lifecycle that
+         * previously left the second suffix block reading stale cache data.
+         */
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        EXPECT_EQ(kv_cache->get_cached_tokens(0, 0), 2 * seq_len);
+        EXPECT_EQ(kv_cache->get_cached_tokens(0, 1), 2 * seq_len);
+
+        std::vector<float> grown_actual(q_elements, 0.0f);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                grown_actual.data(), batch_output->gpu_data_ptr(),
+                q_elements * sizeof(float), hipMemcpyDeviceToHost, stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const size_t q_begin =
+                static_cast<size_t>(request) * request_q_elements;
+            const size_t kv_begin =
+                static_cast<size_t>(request) * request_kv_elements;
+            const std::vector<float> q_request(
+                q_host.begin() + static_cast<std::ptrdiff_t>(q_begin),
+                q_host.begin() + static_cast<std::ptrdiff_t>(
+                                     q_begin + request_q_elements));
+            const std::vector<float> k_block(
+                k_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
+                k_host.begin() + static_cast<std::ptrdiff_t>(
+                                     kv_begin + request_kv_elements));
+            const std::vector<float> v_block(
+                v_host.begin() + static_cast<std::ptrdiff_t>(kv_begin),
+                v_host.begin() + static_cast<std::ptrdiff_t>(
+                                     kv_begin + request_kv_elements));
+
+            std::vector<float> k_history;
+            std::vector<float> v_history;
+            k_history.reserve(2 * request_kv_elements);
+            v_history.reserve(2 * request_kv_elements);
+            k_history.insert(k_history.end(), k_block.begin(), k_block.end());
+            k_history.insert(k_history.end(), k_block.begin(), k_block.end());
+            v_history.insert(v_history.end(), v_block.begin(), v_block.end());
+            v_history.insert(v_history.end(), v_block.begin(), v_block.end());
+
+            auto q_single = makeFP32(q_request, seq_len, q_cols);
+            auto k_single = makeNativeKV(
+                k_history, 2 * seq_len, kv_cols, format.precision);
+            auto v_single = makeNativeKV(
+                v_history, 2 * seq_len, kv_cols, format.precision);
+            auto output_single = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(seq_len), q_cols});
+            ASSERT_NE(k_single, nullptr);
+            ASSERT_NE(v_single, nullptr);
+            ASSERT_TRUE(transfer.uploadFull(q_single.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(k_single.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(v_single.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(output_single.get(), device, stream).success);
+
+            ASSERT_TRUE(serial_kernel.compute_tensor(
+                q_single.get(), k_single.get(), v_single.get(),
+                output_single.get(),
+                /*batch_size=*/1,
+                seq_len,
+                /*kv_len=*/2 * seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                /*causal=*/true,
+                /*window_size=*/-1,
+                /*workspace_scores=*/nullptr,
+                /*workspace_mask=*/nullptr,
+                &mpi_ctx_,
+                /*device_idx=*/0,
+                /*head_start=*/0,
+                /*local_n_heads=*/n_heads,
+                /*local_n_kv_heads=*/n_kv_heads,
+                /*gqa_n_rep=*/n_heads / n_kv_heads));
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            std::vector<float> expected(request_q_elements, 0.0f);
+            ASSERT_EQ(
+                hipMemcpyAsync(
+                    expected.data(), output_single->gpu_data_ptr(),
+                    request_q_elements * sizeof(float),
+                    hipMemcpyDeviceToHost, stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            EXPECT_TRUE(expectBitwiseEqualFP32Rows(
+                grown_actual.data() + q_begin,
+                expected.data(),
+                request_q_elements,
+                std::string("captured growing ROCm request-batch cache ") +
+                    format.name + " request=" + std::to_string(request)));
+        }
+
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
         ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
@@ -3729,7 +3818,7 @@ TEST_F(
  * short row selects a two-split, two-wavefront decode for this head geometry.
  * The grouped graph has one fixed physical launch but must reproduce both M=1
  * arithmetic orders byte-for-byte.  FP32, FP16, BF16, and Q8_1 cover every
- * standard ROCm ring format, including the grouped BF16 conversion route.
+ * standard ROCm ring format, including native grouped BF16 decode.
  */
 TEST_F(
     Test__ROCmFlashAttentionParity,
@@ -4440,8 +4529,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
               << ", k_only_cos=" << k_only_cos
               << ", v_only_cos=" << v_only_cos << std::endl;
 
-    // With rocBLAS prefill, GPU Q/K/V snapshots closely match CPU reference.
-    // (The old cooperative kernel diverged here — cosine < 0.995.)
+    // The native tiled prefill path must keep real layer snapshots close to
+    // the CPU reference in addition to preserving batch invariance.
     EXPECT_GT(all_inputs_cos, 0.999)
         << "ROCm layer-3 Q/K/V snapshots should produce attention-context close to CPU reference";
 }

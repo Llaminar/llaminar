@@ -113,7 +113,192 @@ namespace
         return workspace;
     }
 
+    /**
+     * @brief Prove one captured resident gather follows a growing device count.
+     *
+     * Production prefill captures a chunk-shaped graph only once. The cache
+     * count can be larger on every later replay, so the gather's physical
+     * request stride and launch topology must come from the resident cache
+     * capacity rather than the prefix visible while capture occurred. This
+     * helper captures at eight rows, appends twelve more rows, and then requires
+     * the unchanged graph to publish all twenty native rows byte for byte.
+     *
+     * @tparam Precision Native CUDA cache format under test.
+     * @param format_name Human-readable format included in assertion output.
+     */
+    template <ActivationPrecision Precision>
+    void runCapturedResidentGatherGrowthByteExact(const char *format_name)
+    {
+        using DataT = typename llaminar2::detail::CUDAKVCacheType<Precision>::Type;
+
+        constexpr int layer = 0;
+        constexpr int batch_size = 1;
+        constexpr int max_seq_len = 32;
+        constexpr int capture_rows = 8;
+        constexpr int continuation_rows = 12;
+        constexpr int live_rows = capture_rows + continuation_rows;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 32;
+        constexpr int logical_kv_dim = n_kv_heads * head_dim;
+        constexpr int storage_dim =
+            Precision == ActivationPrecision::Q8_1
+                ? logical_kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE)
+                : logical_kv_dim;
+
+        SCOPED_TRACE(format_name);
+        ASSERT_GT(storage_dim, 0);
+
+        CUDARingKVCache<Precision> cache(
+            /*n_layers=*/1,
+            batch_size,
+            max_seq_len,
+            n_kv_heads,
+            head_dim,
+            /*device_id=*/0);
+        const WorkspaceRequirements requirements =
+            cache.getWorkspaceRequirements(
+                capture_rows,
+                batch_size,
+                head_dim);
+        DeviceWorkspaceManager workspace(
+            DeviceId::cuda(0),
+            requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        cache.bindWorkspace(&workspace);
+        ASSERT_TRUE(cache.hasWorkspace());
+
+        std::vector<DataT> source_k(
+            static_cast<size_t>(live_rows) * storage_dim);
+        std::vector<DataT> source_v(
+            static_cast<size_t>(live_rows) * storage_dim);
+        auto fillNativeBytes = [](std::vector<DataT> &values, uint8_t salt)
+        {
+            auto *bytes = reinterpret_cast<uint8_t *>(values.data());
+            const size_t byte_count = values.size() * sizeof(DataT);
+            for (size_t index = 0; index < byte_count; ++index)
+            {
+                bytes[index] = static_cast<uint8_t>(
+                    1u + ((static_cast<unsigned int>(salt) +
+                           static_cast<unsigned int>(index * 29u)) %
+                          251u));
+            }
+        };
+        fillNativeBytes(source_k, 17);
+        fillNativeBytes(source_v, 113);
+
+        ScopedCudaStream stream;
+        DataT *device_k = nullptr;
+        DataT *device_v = nullptr;
+        const size_t source_bytes = source_k.size() * sizeof(DataT);
+        ASSERT_EQ(cudaMalloc(&device_k, source_bytes), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&device_v, source_bytes), cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                device_k, source_k.data(), source_bytes,
+                cudaMemcpyHostToDevice, stream.stream()),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                device_v, source_v.data(), source_bytes,
+                cudaMemcpyHostToDevice, stream.stream()),
+            cudaSuccess);
+        ASSERT_TRUE(cache.append(
+            layer, /*seq_idx=*/0, device_k, device_v,
+            capture_rows, stream.stream()));
+
+        /*
+         * Establish cache-owned tensor wrappers before global capture. The
+         * subsequent call is the operation whose launch geometry is recorded.
+         */
+        ITensor *gathered_k = nullptr;
+        ITensor *gathered_v = nullptr;
+        ASSERT_TRUE(cache.get_kv_batched_device_view(
+            layer, /*first_seq_idx=*/0, batch_size,
+            &gathered_k, &gathered_v, stream.opaque()));
+        stream.synchronize();
+
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            cudaStreamBeginCapture(
+                stream.stream(), cudaStreamCaptureModeGlobal),
+            cudaSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok = cache.get_kv_batched_device_view(
+                layer, /*first_seq_idx=*/0, batch_size,
+                &gathered_k, &gathered_v, stream.opaque());
+        }
+        ASSERT_EQ(cudaStreamEndCapture(stream.stream(), &graph), cudaSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            cudaSuccess);
+
+        ASSERT_TRUE(cache.append(
+            layer,
+            /*seq_idx=*/0,
+            device_k + static_cast<size_t>(capture_rows) * storage_dim,
+            device_v + static_cast<size_t>(capture_rows) * storage_dim,
+            continuation_rows,
+            stream.stream()));
+        ASSERT_EQ(cudaGraphLaunch(graph_exec, stream.stream()), cudaSuccess);
+        stream.synchronize();
+
+        ASSERT_NE(gathered_k, nullptr);
+        ASSERT_NE(gathered_v, nullptr);
+        const size_t live_elements =
+            static_cast<size_t>(live_rows) * storage_dim;
+        std::vector<DataT> actual_k(live_elements);
+        std::vector<DataT> actual_v(live_elements);
+        const size_t live_bytes = live_elements * sizeof(DataT);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                actual_k.data(), gathered_k->gpu_data_ptr(), live_bytes,
+                cudaMemcpyDeviceToHost, stream.stream()),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                actual_v.data(), gathered_v->gpu_data_ptr(), live_bytes,
+                cudaMemcpyDeviceToHost, stream.stream()),
+            cudaSuccess);
+        stream.synchronize();
+
+        EXPECT_EQ(
+            std::memcmp(actual_k.data(), source_k.data(), live_bytes), 0)
+            << "Captured resident K gather stopped at its capture-time horizon for "
+            << format_name;
+        EXPECT_EQ(
+            std::memcmp(actual_v.data(), source_v.data(), live_bytes), 0)
+            << "Captured resident V gather stopped at its capture-time horizon for "
+            << format_name;
+
+        EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+        EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+        EXPECT_EQ(cudaFree(device_k), cudaSuccess);
+        EXPECT_EQ(cudaFree(device_v), cudaSuccess);
+        cache.unbindWorkspace();
+    }
+
 } // namespace
+
+/**
+ * @brief Every standard CUDA cache format grows beyond capture byte-exactly.
+ */
+TEST(Test__CUDARingKVCache, CapturedResidentGatherGrowthAllFormatsIsByteExact)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::FP32>("FP32");
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::FP16>("FP16");
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::BF16>("BF16");
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::Q8_1>("Q8_1");
+}
 
 // =============================================================================
 // Test: Basic Append and Retrieval
@@ -1564,6 +1749,29 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
         EXPECT_TRUE(buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K ||
                     buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
         EXPECT_GE(buf.size_bytes, expected_explicit_scratch);
+    }
+
+    /*
+     * A graph bucket bounds only the newly submitted rows. On the third 16-row
+     * chunk, attention may already gather more than 16 cached rows. Prove the
+     * production two-dimensional sizing API keeps the complete cache horizon
+     * and configured batch capacity instead of shrinking to that first bucket.
+     */
+    const int graph_bucket_tokens = 16;
+    const int first_request_batch = 1;
+    const auto bucket_reqs = workspace_consumer->getWorkspaceRequirements(
+        graph_bucket_tokens,
+        first_request_batch,
+        0);
+    const size_t expected_resident_horizon_scratch =
+        static_cast<size_t>(max_seq_len) * batch_size *
+        n_kv_heads * head_dim * sizeof(float);
+    for (const auto &buf : bucket_reqs.buffers)
+    {
+        EXPECT_TRUE(buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K ||
+                    buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+        EXPECT_GE(buf.size_bytes, expected_resident_horizon_scratch)
+            << "Resident KV gather scratch must cover history beyond the active graph bucket";
     }
 
     LOG_INFO("[WorkspaceRequirements] PASSED");

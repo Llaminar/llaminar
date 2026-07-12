@@ -7,36 +7,59 @@
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include "../../../mocks/MockComputeStage.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/NativeVNNITrainerEvidence.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "kernels/rocm/moe/ROCmMoEKernel.h"
+
+extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
+    uint8_t codebook_id,
+    int projection_role,
+    int m,
+    int n,
+    int k,
+    int *tile_m,
+    int *tile_n);
 #endif
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <vector>
 
 /**
  * @file Perf__ROCmMoEVerifierPrefill.cpp
- * @brief ROCm half of the MoE verifier-prefill speedometer.
+ * @brief ROCm MoE verifier and batch-invariant prefill speedometer.
  *
  * CUDA and HIP runtime headers cannot be included in the same translation unit
  * in heterogeneous builds because both define vector types such as `dim3`. This
  * file mirrors the CUDA harness with ROCm-only timing and graph-capture calls.
+ * In addition to M=1..4 verifier buckets, it measures production M=8/32/256
+ * router and routed-expert paths against serial M=1 oracles. Every measured
+ * result must remain native-bit identical before its economy result is accepted.
  */
 
 namespace
@@ -56,6 +79,8 @@ namespace
         size_t nonfinite_expected_count = 0;
         size_t first_nonfinite_index = 0;
         size_t worst_row = 0;
+        size_t bit_mismatch_count = 0;
+        size_t first_bit_mismatch_index = 0;
     };
 
     struct BenchResult
@@ -154,6 +179,7 @@ namespace
                 old_ = old;
             }
             setenv(name, value, 1);
+            llaminar2::mutableDebugEnv().rocm.reload();
         }
 
         ~ScopedEnvOverride()
@@ -162,6 +188,7 @@ namespace
                 setenv(name_.c_str(), old_.c_str(), 1);
             else
                 unsetenv(name_.c_str());
+            llaminar2::mutableDebugEnv().rocm.reload();
         }
 
     private:
@@ -211,6 +238,26 @@ namespace
             start = comma + 1;
         }
         return false;
+    }
+
+    std::vector<int> envCsvInts(
+        const char *name,
+        std::initializer_list<int> defaults)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value)
+            return std::vector<int>(defaults);
+
+        std::vector<int> parsed;
+        std::stringstream stream(value);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            const int number = std::atoi(token.c_str());
+            if (number > 0)
+                parsed.push_back(number);
+        }
+        return parsed.empty() ? std::vector<int>(defaults) : parsed;
     }
 
     std::shared_ptr<llaminar2::FP32Tensor> makeTensor(
@@ -402,6 +449,13 @@ namespace
         double diff2 = 0.0;
         for (size_t i = 0; i < actual.size(); ++i)
         {
+            if (std::bit_cast<uint32_t>(actual[i]) !=
+                std::bit_cast<uint32_t>(expected[i]))
+            {
+                if (metrics.bit_mismatch_count == 0)
+                    metrics.first_bit_mismatch_index = i;
+                ++metrics.bit_mismatch_count;
+            }
             const bool actual_finite = std::isfinite(actual[i]);
             const bool expected_finite = std::isfinite(expected[i]);
             if (!actual_finite || !expected_finite)
@@ -490,6 +544,9 @@ namespace
 
     void expectClose(const CloseMetrics &metrics)
     {
+        EXPECT_EQ(metrics.bit_mismatch_count, 0u)
+            << "ROCm grouped prefill must be byte-identical to serial decode; "
+            << "first_bit_mismatch_index=" << metrics.first_bit_mismatch_index;
         EXPECT_EQ(metrics.nonfinite_count, 0u)
             << "first_nonfinite_index=" << metrics.first_nonfinite_index
             << " nonfinite_actual=" << metrics.nonfinite_actual_count
@@ -531,6 +588,26 @@ namespace
             << " worst_row=" << metrics.worst_row;
     }
 
+    /**
+     * @brief Report useful routed-expert INT8 work per timed pipeline second.
+     *
+     * Gate, up, and down each execute `M * top_k * d_model * intermediate`
+     * multiply-accumulates. Counting a multiply and add as two integer
+     * operations gives six operations per matrix element across the three
+     * projections. The metric intentionally divides by the complete grouped
+     * pipeline time, so routing-row quantization, SwiGLU quantization, directory
+     * planning, partial publication, and launch overhead all reduce the score.
+     */
+    double routedExpertPipelineGops(const BenchResult &result)
+    {
+        if (result.pipeline_ms <= 0.0)
+            return 0.0;
+        const double operations =
+            6.0 * static_cast<double>(result.m) * static_cast<double>(result.top_k) *
+            static_cast<double>(result.d_model) * static_cast<double>(result.intermediate);
+        return operations / (result.pipeline_ms * 1.0e6);
+    }
+
     void printResult(const BenchResult &result)
     {
         static bool printed_header = false;
@@ -538,7 +615,8 @@ namespace
         {
             std::cout
                 << "backend,case,m,top_k,num_experts,d_model,intermediate,"
-                   "eager_ms,prepare_ms,pipeline_ms,graph_ms,rowwise_ms,speedup_vs_reference,"
+                   "eager_ms,prepare_ms,pipeline_ms,pipeline_int8_gops,"
+                   "graph_ms,rowwise_ms,speedup_vs_reference,"
                    "cosine,relative_l2,max_abs,"
                    "min_row_cosine,max_row_relative_l2,max_row_kl,"
                    "nonfinite_count,nonfinite_actual_count,nonfinite_expected_count,"
@@ -559,6 +637,7 @@ namespace
                   << result.eager_ms << ','
                   << result.prepare_ms << ','
                   << result.pipeline_ms << ','
+                  << routedExpertPipelineGops(result) << ','
                   << result.graph_ms << ','
                   << result.rowwise_ms << ','
                   << speedup << ','
@@ -641,7 +720,9 @@ namespace
         int num_experts,
         int d_model,
         int intermediate,
-        std::vector<int> materialized_experts)
+        std::vector<int> materialized_experts,
+        const llaminar2::test::QuantizedVerifierFormatCase &gateup_format,
+        const llaminar2::test::QuantizedVerifierFormatCase &down_format)
     {
         PreparedExpertTables tables;
         materialized_experts =
@@ -653,46 +734,42 @@ namespace
         tables.down_descs.resize(num_experts);
         std::vector<bool> has_desc(static_cast<size_t>(num_experts), false);
 
-        auto add_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
+        auto add_desc = [&](
+            int rows,
+            int cols,
+            int seed,
+            const char *role,
+            const llaminar2::test::QuantizedVerifierFormatCase &format)
         {
-            std::unique_ptr<llaminar2::TensorBase> weight;
-            if (expected_codebook == 13)
-            {
-                weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
-                    {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                    static_cast<unsigned>(seed));
-            }
-            else
-            {
-                weight = llaminar2::test::TestTensorFactory::createIQ4_XSRandom(
-                    {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                    static_cast<unsigned>(seed));
-            }
+            std::unique_ptr<llaminar2::TensorBase> weight = format.create(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
 
             auto *weight_ptr = weight.get();
             tables.weights.push_back(std::move(weight));
             tables.prepared.push_back(llaminar2::test::makeGpuPreparedGemm(
                 weight_ptr,
                 device,
-                "perf.moe_verifier.rocm." + std::string(role) + "." + std::to_string(seed),
+                "perf.moe_verifier.rocm." + std::string(format.label) + "." +
+                    role + "." + std::to_string(seed),
                 llaminar2::ModelContextId{280000 + static_cast<uint64_t>(seed)}));
 
             llaminar2::DeviceNativeVNNIMatrixDesc desc{};
             EXPECT_TRUE(tables.prepared.back().kernel->exportNativeVNNIMatrixDesc(desc));
             EXPECT_EQ(desc.n, rows);
             EXPECT_EQ(desc.k, cols);
-            EXPECT_EQ(desc.codebook_id, expected_codebook);
+            EXPECT_EQ(desc.codebook_id, format.device_execution_codebook_id);
             return desc;
         };
 
         for (int expert : materialized_experts)
         {
             tables.gate_descs[static_cast<size_t>(expert)] =
-                add_desc(intermediate, d_model, 4100 + expert, "gate", 13);
+                add_desc(intermediate, d_model, 4100 + expert, "gate", gateup_format);
             tables.up_descs[static_cast<size_t>(expert)] =
-                add_desc(intermediate, d_model, 4200 + expert, "up", 13);
+                add_desc(intermediate, d_model, 4200 + expert, "up", gateup_format);
             tables.down_descs[static_cast<size_t>(expert)] =
-                add_desc(d_model, intermediate, 4300 + expert, "down", 4);
+                add_desc(d_model, intermediate, 4300 + expert, "down", down_format);
             has_desc[static_cast<size_t>(expert)] = true;
         }
 
@@ -727,6 +804,42 @@ namespace
     {
         int count = 0;
         return hipGetDeviceCount(&count) == hipSuccess && count > 0;
+    }
+
+    bool isGfx906Device()
+    {
+        hipDeviceProp_t properties{};
+        if (hipGetDeviceProperties(&properties, 0) != hipSuccess)
+            return false;
+        return std::string(properties.gcnArchName).find("gfx906") == 0;
+    }
+
+    /**
+     * @brief Enforce useful long-prefill throughput on the MI50/MI60 target.
+     *
+     * The best dense gfx906 INT8 kernels in this repository sustain roughly
+     * 12.7 TOPS on larger FFN shapes. A routed pipeline also pays device grouping,
+     * row quantization, SwiGLU, and deterministic publication costs, so the
+     * acceptance floors are deliberately below that dense ceiling but far above
+     * merely beating serial decode. These bounds reject the register-spilling
+     * 24-row experiment and the old per-route weight-decode implementation.
+     */
+    void expectGfx906LongPrefillThroughput(const BenchResult &result)
+    {
+        if (!isGfx906Device())
+            return;
+
+        const double gops = routedExpertPipelineGops(result);
+        if (result.m >= 256)
+        {
+            EXPECT_GE(gops, 9000.0)
+                << "gfx906 M=256 grouped routed prefill must sustain at least 9.0 TOPS";
+        }
+        else if (result.m >= 32)
+        {
+            EXPECT_GE(gops, 3500.0)
+                << "gfx906 M=32 grouped routed prefill must sustain at least 3.5 TOPS";
+        }
     }
 
     class HipGraphOwner
@@ -854,7 +967,11 @@ namespace
         int routed_top_k = 8,
         int routed_num_experts = 256,
         const char *case_name_override = nullptr,
-        bool unique_routes = false)
+        bool unique_routes = false,
+        int d_model = 2048,
+        int intermediate = 512,
+        const llaminar2::test::QuantizedVerifierFormatCase *gateup_format = nullptr,
+        const llaminar2::test::QuantizedVerifierFormatCase *down_format = nullptr)
     {
         /*
          * Keep this harness aligned with the Qwen3.6 MoE model shape.  The
@@ -864,10 +981,14 @@ namespace
          */
         constexpr int shared_top_k = 1;
         constexpr int shared_num_experts = 1;
-        constexpr int d_model = 2048;
-        constexpr int intermediate = 512;
         const int top_k = shared ? shared_top_k : routed_top_k;
         const int num_experts = shared ? shared_num_experts : routed_num_experts;
+        const auto &selected_gateup_format = gateup_format
+                                                 ? *gateup_format
+                                                 : llaminar2::test::quantizedVerifierFormat("IQ2_S");
+        const auto &selected_down_format = down_format
+                                               ? *down_format
+                                               : llaminar2::test::quantizedVerifierFormat("IQ4_XS");
         /*
          * This mirrors the CUDA production speedometer: the combined path and
          * split reference are both sub-millisecond graph-captured paths, so a
@@ -875,8 +996,12 @@ namespace
          * real verifier-economy regressions.  Sweeps may still override it
          * with LLAMINAR_MOE_VERIFIER_PREFILL_ITERS.
          */
-        const int iterations = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", 120);
-        const int warmups = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", 5);
+        const int default_iterations = rows >= 256 ? 8 : (rows >= 32 ? 24 : 120);
+        const int default_warmups = rows >= 32 ? 2 : 5;
+        const int iterations = envInt(
+            "LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", default_iterations);
+        const int warmups = envInt(
+            "LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", default_warmups);
         const auto device = llaminar2::DeviceId::rocm(0);
 
         EXPECT_EQ(hipSetDevice(0), hipSuccess);
@@ -891,7 +1016,7 @@ namespace
         const int workspace_num_experts = std::max(num_experts, routed_num_experts);
         const int workspace_top_k = std::max(top_k, routed_top_k);
         auto reqs = llaminar2::MoEWorkspaceBuffers::rocmMoE(
-            /*max_seq_len=*/4,
+            /*max_seq_len=*/rows,
             d_model,
             intermediate,
             workspace_num_experts,
@@ -909,7 +1034,9 @@ namespace
         const auto routing_weights = makeRoutingWeights(rows, top_k);
         auto tables = prepareExpertTables(
             moe, device, num_experts, d_model, intermediate,
-            uniqueExpertIdsFromRoutes(routing_indices, num_experts));
+            uniqueExpertIdsFromRoutes(routing_indices, num_experts),
+            selected_gateup_format,
+            selected_down_format);
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto route_indices_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_indices);
         auto route_weights_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_weights);
@@ -1495,6 +1622,292 @@ namespace
     }
 
     /**
+     * @brief Timing and native-bit result for the production ROCm MoE router.
+     *
+     * `graph_ms` measures one captured grouped prefill route. `rowwise_ms`
+     * measures the same rows through independent production M=1 routing calls,
+     * which remain a test oracle only.
+     */
+    struct RouterBenchResult
+    {
+        int rows = 0;
+        double graph_ms = 0.0;
+        double rowwise_ms = 0.0;
+        size_t index_bit_mismatches = 0;
+        size_t weight_bit_mismatches = 0;
+    };
+
+    /**
+     * @brief Compute end-to-end router GOPS for the Qwen3.6 production shape.
+     *
+     * The denominator includes row quantization, grouped Q8 logits, exact
+     * softmax/top-k, integer-to-FP32 publication, and graph launch overhead.
+     */
+    double routerPipelineGops(const RouterBenchResult &result)
+    {
+        constexpr double d_model = 2048.0;
+        constexpr double num_experts = 256.0;
+        if (result.graph_ms <= 0.0)
+            return 0.0;
+        const double operations =
+            2.0 * static_cast<double>(result.rows) * d_model * num_experts;
+        return operations / (result.graph_ms * 1.0e6);
+    }
+
+    /**
+     * @brief Force the production Q8 router policy for one benchmark case.
+     *
+     * The combined CUDA/ROCm perf binary may initialize DebugEnv before the ROCm
+     * tests run. Mutating the parsed policy directly avoids test-order-dependent
+     * environment reloads while restoring every field on scope exit.
+     */
+    class ScopedROCmBatchInvariantRouterPolicy
+    {
+    public:
+        ScopedROCmBatchInvariantRouterPolicy()
+            : old_q8_(llaminar2::mutableDebugEnv().rocm.moe_router_q8),
+              old_fp16_(llaminar2::mutableDebugEnv().rocm.moe_router_fp16),
+              old_reuse_(llaminar2::mutableDebugEnv().rocm.moe_reuse_router_q8_hidden)
+        {
+            auto &config = llaminar2::mutableDebugEnv().rocm;
+            config.moe_router_q8 = true;
+            config.moe_router_fp16 = false;
+            config.moe_reuse_router_q8_hidden = true;
+        }
+
+        ~ScopedROCmBatchInvariantRouterPolicy()
+        {
+            auto &config = llaminar2::mutableDebugEnv().rocm;
+            config.moe_router_q8 = old_q8_;
+            config.moe_router_fp16 = old_fp16_;
+            config.moe_reuse_router_q8_hidden = old_reuse_;
+        }
+
+        ScopedROCmBatchInvariantRouterPolicy(
+            const ScopedROCmBatchInvariantRouterPolicy &) = delete;
+        ScopedROCmBatchInvariantRouterPolicy &operator=(
+            const ScopedROCmBatchInvariantRouterPolicy &) = delete;
+
+    private:
+        bool old_q8_ = true;
+        bool old_fp16_ = false;
+        bool old_reuse_ = true;
+    };
+
+    /**
+     * @brief Benchmark captured batch-invariant Q8 routing against serial M=1.
+     *
+     * The grouped kernel owns one expert and one fixed four-row tile. Increasing
+     * M adds independent tiles while preserving each row's serial K traversal
+     * and reduction tree. The perfstats assertion prevents a batch-shaped GEMM
+     * or hidden row-replay substitution from passing on coincidental equality.
+     */
+    RouterBenchResult runROCmBatchInvariantRouterCase(int rows)
+    {
+        constexpr int d_model = 2048;
+        constexpr int intermediate = 512;
+        constexpr int num_experts = 256;
+        constexpr int top_k = 8;
+        const auto device = llaminar2::DeviceId::rocm(0);
+        const int iterations = envInt(
+            "LLAMINAR_ROCM_MOE_BATCH_INVARIANT_ROUTER_ITERS",
+            rows >= 256 ? 12 : (rows >= 32 ? 40 : 160));
+        const int rowwise_iterations = rows >= 32 ? 1 : 3;
+
+        ScopedROCmBatchInvariantRouterPolicy policy;
+        EXPECT_EQ(hipSetDevice(0), hipSuccess);
+        hipStream_t stream = nullptr;
+        EXPECT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+        auto *moe = KernelFactory::getOrCreateMoEKernel(device);
+        EXPECT_NE(moe, nullptr);
+        moe->setGPUStream(stream);
+        auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
+        EXPECT_NE(workspace_consumer, nullptr);
+        auto requirements = llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            rows, d_model, intermediate, num_experts, top_k);
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            requirements.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        EXPECT_TRUE(workspace->allocate(requirements));
+        workspace_consumer->bindWorkspace(workspace.get());
+
+        const std::vector<float> hidden_values = makeHiddenValues(rows, d_model);
+        auto hidden = makeTensor(
+            {static_cast<size_t>(rows), static_cast<size_t>(d_model)},
+            hidden_values);
+        std::vector<float> gate_values(
+            static_cast<size_t>(num_experts) * static_cast<size_t>(d_model));
+        for (size_t i = 0; i < gate_values.size(); ++i)
+        {
+            gate_values[i] =
+                0.021f * std::sin(0.0037f * static_cast<float>(i + 37)) +
+                0.014f * std::cos(0.0051f * static_cast<float>(i + 19));
+        }
+        auto gate = makeTensor(
+            {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)},
+            gate_values);
+        auto grouped_indices = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(top_k)});
+        auto grouped_weights = makeZeros(
+            {static_cast<size_t>(rows), static_cast<size_t>(top_k)});
+        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
+        EXPECT_TRUE(gate->ensureOnDevice(device, stream));
+        EXPECT_TRUE(grouped_indices->ensureOnDevice(device, stream));
+        EXPECT_TRUE(grouped_weights->ensureOnDevice(device, stream));
+
+        llaminar2::MoERoutingResult ignored_host_result;
+        auto run_grouped = [&]()
+        {
+            return moe->routeWithTensors(
+                hidden.get(), gate.get(), rows, d_model, num_experts, top_k,
+                /*normalize_weights=*/true,
+                grouped_indices.get(), grouped_weights.get(), ignored_host_result);
+        };
+
+        EXPECT_TRUE(run_grouped());
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        HipGraphOwner graph;
+        EXPECT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+        const bool captured = run_grouped();
+        const hipError_t capture_status =
+            hipStreamEndCapture(stream, graph.graphPtr());
+        EXPECT_TRUE(captured);
+        EXPECT_EQ(capture_status, hipSuccess) << hipGetErrorString(capture_status);
+        EXPECT_NE(*graph.graphPtr(), nullptr);
+        EXPECT_EQ(
+            hipGraphInstantiate(graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0),
+            hipSuccess);
+        for (int i = 0; i < 3; ++i)
+            EXPECT_EQ(hipGraphLaunch(graph.execHandle(), stream), hipSuccess);
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        const double graph_ms = timeHipEvents(
+            stream,
+            iterations,
+            [&]()
+            {
+                return hipGraphLaunch(graph.execHandle(), stream) == hipSuccess;
+            });
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        llaminar2::PerfStatsCollector::reset();
+        EXPECT_TRUE(run_grouped());
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        const auto route_records = llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.rocm_moe_batch_invariant_prefill_router_calls"});
+        const std::string expected_rows = std::to_string(rows);
+        const auto route_record = std::find_if(
+            route_records.begin(),
+            route_records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                const auto tag_equals = [&](const char *key, const std::string &value)
+                {
+                    const auto it = record.tags.find(key);
+                    return it != record.tags.end() && it->second == value;
+                };
+                return record.name ==
+                           "rocm_moe_batch_invariant_prefill_router_calls" &&
+                       tag_equals("seq_len", expected_rows) &&
+                       tag_equals("row_tile", "16") &&
+                       tag_equals("route", "grouped_q8") &&
+                       record.count > 0;
+            });
+        EXPECT_NE(route_record, route_records.end())
+            << llaminar2::PerfStatsCollector::summaryString(
+                   {"kernel.rocm_moe_batch_invariant_prefill_router_calls"});
+
+        grouped_indices->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        grouped_weights->transitionTo(
+            llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        const std::vector<float> grouped_index_values(
+            grouped_indices->data(),
+            grouped_indices->data() + grouped_indices->numel());
+        const std::vector<float> grouped_weight_values(
+            grouped_weights->data(),
+            grouped_weights->data() + grouped_weights->numel());
+
+        std::vector<std::shared_ptr<llaminar2::FP32Tensor>> row_hidden;
+        std::vector<std::shared_ptr<llaminar2::FP32Tensor>> row_indices;
+        std::vector<std::shared_ptr<llaminar2::FP32Tensor>> row_weights;
+        row_hidden.reserve(rows);
+        row_indices.reserve(rows);
+        row_weights.reserve(rows);
+        for (int row = 0; row < rows; ++row)
+        {
+            const auto first =
+                hidden_values.begin() + static_cast<ptrdiff_t>(row) * d_model;
+            row_hidden.push_back(makeTensor(
+                {1u, static_cast<size_t>(d_model)},
+                std::vector<float>(first, first + d_model)));
+            row_indices.push_back(makeZeros({1u, static_cast<size_t>(top_k)}));
+            row_weights.push_back(makeZeros({1u, static_cast<size_t>(top_k)}));
+            EXPECT_TRUE(row_hidden.back()->ensureOnDevice(device, stream));
+            EXPECT_TRUE(row_indices.back()->ensureOnDevice(device, stream));
+            EXPECT_TRUE(row_weights.back()->ensureOnDevice(device, stream));
+        }
+
+        auto run_rowwise = [&]()
+        {
+            for (int row = 0; row < rows; ++row)
+            {
+                if (!moe->routeVerifierRowsDecodeEquivalent(
+                        row_hidden[static_cast<size_t>(row)].get(),
+                        gate.get(),
+                        /*seq_len=*/1,
+                        d_model,
+                        num_experts,
+                        top_k,
+                        /*normalize_weights=*/true,
+                        row_indices[static_cast<size_t>(row)].get(),
+                        row_weights[static_cast<size_t>(row)].get()))
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+        EXPECT_TRUE(run_rowwise());
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        const double rowwise_ms = timeHipEvents(
+            stream, rowwise_iterations, run_rowwise);
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> serial_index_values;
+        std::vector<float> serial_weight_values;
+        serial_index_values.reserve(static_cast<size_t>(rows) * top_k);
+        serial_weight_values.reserve(static_cast<size_t>(rows) * top_k);
+        for (int row = 0; row < rows; ++row)
+        {
+            auto &indices = row_indices[static_cast<size_t>(row)];
+            auto &weights = row_weights[static_cast<size_t>(row)];
+            indices->transitionTo(
+                llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            weights->transitionTo(
+                llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            serial_index_values.insert(
+                serial_index_values.end(), indices->data(), indices->data() + top_k);
+            serial_weight_values.insert(
+                serial_weight_values.end(), weights->data(), weights->data() + top_k);
+        }
+
+        const CloseMetrics index_metrics = compareVectors(
+            grouped_index_values, serial_index_values, static_cast<size_t>(top_k));
+        const CloseMetrics weight_metrics = compareVectors(
+            grouped_weight_values, serial_weight_values, static_cast<size_t>(top_k));
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+        return RouterBenchResult{
+            rows,
+            graph_ms,
+            rowwise_ms,
+            index_metrics.bit_mismatch_count,
+            weight_metrics.bit_mismatch_count};
+    }
+
+    /**
      * @brief Exercise production's M=1 grouped-verifier shared-FFN route.
      *
      * The Qwen3.6 MoE MTP sidecar sets both verifier-facing knobs on
@@ -1631,6 +2044,546 @@ namespace
             0.0,
             metrics};
     }
+
+    /** One reciprocal MoE projection shape in the dispatch trainer. */
+    struct MoEPrefillSweepShape
+    {
+        const char *name;
+        int d_model;
+        int intermediate;
+    };
+
+    /** One compile-time candidate exposed by the production HIP launcher. */
+    struct MoEPrefillSweepCandidate
+    {
+        int tile_m;
+        int tile_n;
+    };
+
+    /** Machine-readable result for one exact candidate graph replay. */
+    struct MoEPrefillSweepResult
+    {
+        std::string source_format;
+        uint8_t source_codebook = 0;
+        uint8_t execution_codebook = 0;
+        std::string shape;
+        std::string role;
+        std::string candidate_id;
+        int m = 0;
+        int n = 0;
+        int k = 0;
+        int tile_m = 0;
+        int tile_n = 0;
+        int warmup_count = 0;
+        int sample_count = 0;
+        int timed_replays = 0;
+        double min_us = 0.0;
+        double graph_us = 0.0;
+        double p95_us = 0.0;
+        double mad_us = 0.0;
+        double cv = 0.0;
+        double pipeline_gops = 0.0;
+        size_t bit_mismatches = 0;
+        size_t first_bit_mismatch = 0;
+        size_t repeat_bit_mismatches = 0;
+        double max_abs = 0.0;
+        double relative_l2 = 0.0;
+        double cosine = 0.0;
+        double symmetric_kld = 0.0;
+        std::string grouped_output_digest;
+        std::string serial_output_digest;
+        std::string timing_sample_digest;
+        bool route_counter_ok = false;
+        std::string observed_candidate_id;
+        bool is_winner = false;
+    };
+
+    constexpr std::array<MoEPrefillSweepCandidate, 12> kMoEPrefillSweepCandidates{{
+        {4, 64}, {4, 128}, {4, 256},
+        {8, 64}, {8, 128}, {8, 256},
+        {12, 64}, {12, 128}, {12, 256},
+        {16, 64}, {16, 128}, {16, 256},
+    }};
+
+    constexpr std::array<MoEPrefillSweepShape, 7> kMoEPrefillSweepShapes{{
+        {"gate_ratio_1_8", 2048, 256},
+        {"gate_ratio_1_4", 2048, 512},
+        {"gate_ratio_1_2", 2048, 1024},
+        {"gate_ratio_1_1", 1024, 1024},
+        {"gate_ratio_2_1", 1024, 2048},
+        {"gate_ratio_4_1", 512, 2048},
+        {"gate_ratio_8_1", 256, 2048},
+    }};
+
+    std::string moePrefillCandidateName(const MoEPrefillSweepCandidate &candidate)
+    {
+        return "tm" + std::to_string(candidate.tile_m) +
+               "_tn" + std::to_string(candidate.tile_n);
+    }
+
+    void writeMoEPrefillSweepResult(
+        std::FILE *csv,
+        const MoEPrefillSweepResult &result)
+    {
+        std::fprintf(
+            csv,
+            "rocm,grouped_prefill,%s,%u,%u,%s,%s,%s,%d,%d,%d,%d,%d,"
+            "%d,%d,%d,%.3f,%.3f,%.3f,%.6f,%.6f,%.3f,%zu,%zu,%zu,"
+            "%.9g,%.9g,%.9g,%.9g,%s,%s,%s,%d,%s,%d\n",
+            result.source_format.c_str(),
+            static_cast<unsigned>(result.source_codebook),
+            static_cast<unsigned>(result.execution_codebook),
+            result.shape.c_str(),
+            result.role.c_str(),
+            result.candidate_id.c_str(),
+            result.m,
+            result.n,
+            result.k,
+            result.tile_m,
+            result.tile_n,
+            result.warmup_count,
+            result.sample_count,
+            result.timed_replays,
+            result.min_us,
+            result.graph_us,
+            result.p95_us,
+            result.mad_us,
+            result.cv,
+            result.pipeline_gops,
+            result.bit_mismatches,
+            result.first_bit_mismatch,
+            result.repeat_bit_mismatches,
+            result.max_abs,
+            result.relative_l2,
+            result.cosine,
+            result.symmetric_kld,
+            result.grouped_output_digest.c_str(),
+            result.serial_output_digest.c_str(),
+            result.timing_sample_digest.c_str(),
+            result.route_counter_ok ? 1 : 0,
+            result.observed_candidate_id.c_str(),
+            result.is_winner ? 1 : 0);
+        std::fflush(csv);
+    }
+
+    /**
+     * @brief Sweep every selected projection policy against one prepared shape.
+     *
+     * Eight real expert matrices are retained for the whole shape sweep. Every
+     * token routes once to each expert, so an M-row batch gives each expert M
+     * rows and makes row-tile reuse directly observable. Grouping is prepared
+     * once per M bucket and remains device-resident while each candidate captures
+     * the production projection pipeline. The serial-row oracle is also built
+     * once per M bucket, then every candidate is required to match it bitwise.
+     */
+    void runROCmMoEPrefillFormatShapeSweep(
+        const llaminar2::test::QuantizedVerifierFormatCase &format,
+        const MoEPrefillSweepShape &shape,
+        const std::vector<int> &m_values,
+        int warmups,
+        int iterations,
+        int timing_trials,
+        std::FILE *csv,
+        std::FILE *timing_csv)
+    {
+        constexpr int top_k = 8;
+        constexpr int num_experts = 8;
+        const auto device = llaminar2::DeviceId::rocm(0);
+        const int max_rows = *std::max_element(m_values.begin(), m_values.end());
+
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+        llaminar2::ROCmMoEKernel moe_storage(0);
+        llaminar2::IMoEKernel *moe = &moe_storage;
+        moe->setGPUStream(stream);
+        auto *workspace_consumer =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe);
+        ASSERT_NE(workspace_consumer, nullptr);
+
+        auto reqs = llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            max_rows,
+            shape.d_model,
+            shape.intermediate,
+            num_experts,
+            top_k);
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            reqs.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        ASSERT_TRUE(workspace->allocate(reqs));
+        workspace_consumer->bindWorkspace(workspace.get());
+
+        std::vector<int> materialized_experts(static_cast<size_t>(num_experts));
+        for (int expert = 0; expert < num_experts; ++expert)
+            materialized_experts[static_cast<size_t>(expert)] = expert;
+        auto tables = prepareExpertTables(
+            moe,
+            device,
+            num_experts,
+            shape.d_model,
+            shape.intermediate,
+            materialized_experts,
+            format,
+            format);
+
+        for (const int rows : m_values)
+        {
+            if (rows <= 8)
+                continue;
+
+            const std::vector<float> hidden_values =
+                makeHiddenValues(rows, shape.d_model);
+            const std::vector<float> routing_indices =
+                makeRoutingIndices(rows, top_k, num_experts);
+            const std::vector<float> routing_weights =
+                makeRoutingWeights(rows, top_k);
+            auto hidden = makeTensor(
+                {static_cast<size_t>(rows), static_cast<size_t>(shape.d_model)},
+                hidden_values);
+            auto route_indices_tensor = makeTensor(
+                {static_cast<size_t>(rows), static_cast<size_t>(top_k)},
+                routing_indices);
+            auto route_weights_tensor = makeTensor(
+                {static_cast<size_t>(rows), static_cast<size_t>(top_k)},
+                routing_weights);
+            auto grouped_output = makeZeros(
+                {static_cast<size_t>(rows), static_cast<size_t>(shape.d_model)});
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+            ASSERT_TRUE(route_indices_tensor->ensureOnDevice(device, stream));
+            ASSERT_TRUE(route_weights_tensor->ensureOnDevice(device, stream));
+            ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
+
+            const auto run_prepare = [&]()
+            {
+                return moe->prepareExpertGroupsAsync(
+                    route_indices_tensor.get(),
+                    route_weights_tensor.get(),
+                    rows,
+                    num_experts,
+                    top_k);
+            };
+            const auto run_pipeline = [&]()
+            {
+                return moe->executeGroupedPrefillPipeline(
+                    hidden.get(),
+                    grouped_output.get(),
+                    tables.gateup_table_id,
+                    tables.down_table_id,
+                    rows,
+                    shape.d_model,
+                    shape.intermediate,
+                    num_experts,
+                    top_k);
+            };
+
+            ASSERT_TRUE(run_prepare());
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            double serial_ms = 0.0;
+            const std::vector<float> serial = runRowwiseDecode(
+                moe,
+                stream,
+                hidden_values,
+                routing_indices,
+                routing_weights,
+                rows,
+                top_k,
+                shape.d_model,
+                shape.intermediate,
+                tables.gateup_table_id,
+                tables.down_table_id,
+                &serial_ms);
+
+            for (const std::string role : {std::string("gateup"), std::string("down")})
+            {
+                if (!envCsvContainsOrUnset(
+                        "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_ROLES", role))
+                {
+                    continue;
+                }
+
+                std::vector<MoEPrefillSweepResult> role_results;
+                role_results.reserve(kMoEPrefillSweepCandidates.size());
+                for (const auto &candidate : kMoEPrefillSweepCandidates)
+                {
+                    const std::string candidate_name =
+                        moePrefillCandidateName(candidate);
+                    if (!envCsvContainsOrUnset(
+                            "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_VARIANTS",
+                            candidate_name))
+                    {
+                        continue;
+                    }
+
+                    const int gateup_tile_m =
+                        role == "gateup" ? candidate.tile_m : 16;
+                    const int gateup_tile_n =
+                        role == "gateup" ? candidate.tile_n : 128;
+                    const int down_tile_m =
+                        role == "down" ? candidate.tile_m : 16;
+                    const int down_tile_n =
+                        role == "down" ? candidate.tile_n : 128;
+                    const std::string gateup_tile_m_text = std::to_string(gateup_tile_m);
+                    const std::string gateup_tile_n_text = std::to_string(gateup_tile_n);
+                    const std::string down_tile_m_text = std::to_string(down_tile_m);
+                    const std::string down_tile_n_text = std::to_string(down_tile_n);
+
+                    ScopedEnvOverride gateup_m(
+                        "LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M",
+                        gateup_tile_m_text.c_str());
+                    ScopedEnvOverride gateup_n(
+                        "LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N",
+                        gateup_tile_n_text.c_str());
+                    ScopedEnvOverride down_m(
+                        "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_M",
+                        down_tile_m_text.c_str());
+                    ScopedEnvOverride down_n(
+                        "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_N",
+                        down_tile_n_text.c_str());
+
+                    llaminar2::PerfStatsCollector::reset();
+                    HipGraphOwner graph;
+                    ASSERT_EQ(
+                        hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+                        hipSuccess);
+                    const bool captured = run_pipeline();
+                    const hipError_t capture_status =
+                        hipStreamEndCapture(stream, graph.graphPtr());
+                    ASSERT_TRUE(captured)
+                        << format.label << ' ' << shape.name << " M=" << rows
+                        << ' ' << role << ' ' << candidate_name;
+                    ASSERT_EQ(capture_status, hipSuccess)
+                        << hipGetErrorString(capture_status);
+                    ASSERT_NE(*graph.graphPtr(), nullptr);
+                    ASSERT_EQ(
+                        hipGraphInstantiate(
+                            graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0),
+                        hipSuccess);
+
+                    const auto route_records =
+                        llaminar2::PerfStatsCollector::snapshot(
+                            {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+                    bool route_counter_ok = false;
+                    std::string observed_candidate_id = "missing";
+                    for (const auto &record : route_records)
+                    {
+                        if (record.name !=
+                            "rocm_moe_grouped_prefill_batch_invariant_calls")
+                        {
+                            continue;
+                        }
+                        const auto tag = [&](const char *name) -> std::string
+                        {
+                            const auto iterator = record.tags.find(name);
+                            return iterator == record.tags.end()
+                                       ? std::string{}
+                                       : iterator->second;
+                        };
+                        const std::string observed_tile_m =
+                            tag(role == "gateup" ? "gateup_tile_m" : "down_tile_m");
+                        const std::string observed_tile_n =
+                            tag(role == "gateup" ? "gateup_tile_n" : "down_tile_n");
+                        if (!observed_tile_m.empty() && !observed_tile_n.empty())
+                        {
+                            observed_candidate_id =
+                                "tm" + observed_tile_m + "_tn" + observed_tile_n;
+                        }
+                        route_counter_ok =
+                            tag("seq_len") == std::to_string(rows) &&
+                            observed_candidate_id == candidate_name &&
+                            record.count > 0;
+                        if (route_counter_ok)
+                            break;
+                    }
+                    EXPECT_TRUE(route_counter_ok)
+                        << format.label << ' ' << shape.name << " M=" << rows
+                        << ' ' << role << ' ' << candidate_name << '\n'
+                        << llaminar2::PerfStatsCollector::summaryString(
+                               {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+
+                    for (int warmup = 0; warmup < warmups; ++warmup)
+                    {
+                        ASSERT_EQ(
+                            hipGraphLaunch(graph.execHandle(), stream),
+                            hipSuccess);
+                    }
+                    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+                    const auto download_grouped_output = [&]()
+                    {
+                        std::vector<float> host(grouped_output->numel());
+                        const hipError_t copy_status = hipMemcpyAsync(
+                            host.data(),
+                            grouped_output->gpu_data_ptr(),
+                            host.size() * sizeof(float),
+                            hipMemcpyDeviceToHost,
+                            stream);
+                        EXPECT_EQ(copy_status, hipSuccess);
+                        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                        return host;
+                    };
+                    const std::vector<float> repeated_output_a =
+                        download_grouped_output();
+                    ASSERT_EQ(
+                        hipGraphLaunch(graph.execHandle(), stream),
+                        hipSuccess);
+                    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                    const std::vector<float> repeated_output_b =
+                        download_grouped_output();
+                    const size_t repeat_bit_mismatches =
+                        llaminar2::test::trainer::nativeByteMismatchCount(
+                            repeated_output_a,
+                            repeated_output_b);
+                    EXPECT_EQ(repeat_bit_mismatches, 0u)
+                        << format.label << ' ' << shape.name << " M=" << rows
+                        << ' ' << role << ' ' << candidate_name
+                        << " captured graph replay is not byte-stable";
+
+                    std::vector<double> trial_ms;
+                    trial_ms.reserve(static_cast<size_t>(timing_trials));
+                    for (int trial = 0; trial < timing_trials; ++trial)
+                    {
+                        trial_ms.push_back(timeHipEvents(
+                            stream,
+                            iterations,
+                            [&]()
+                            {
+                                return hipGraphLaunch(graph.execHandle(), stream) == hipSuccess;
+                            }));
+                    }
+                    std::sort(trial_ms.begin(), trial_ms.end());
+                    const auto timing_evidence =
+                        llaminar2::test::trainer::summarizeSortedTimingSamples(
+                            trial_ms);
+                    const double min_graph_ms = timing_evidence.min;
+                    const double graph_ms = timing_evidence.median;
+                    const double p95_graph_ms = timing_evidence.p95;
+                    const double mad_graph_ms = timing_evidence.mad;
+                    const double timing_cv = timing_evidence.cv;
+                    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+                    /*
+                     * Aggregate timing rows are insufficient evidence for an
+                     * installable learned policy. Retain every sorted trial so
+                     * the common adapter can recompute the digest, audit the
+                     * sample count, and later perform paired confirmation. The
+                     * trial value is already normalized to one graph replay by
+                     * timeHipEvents(); timed_replays records how many launches
+                     * contributed to that event sample.
+                     */
+                    if (timing_csv)
+                    {
+                        for (size_t sample_index = 0;
+                             sample_index < trial_ms.size();
+                             ++sample_index)
+                        {
+                            std::fprintf(
+                                timing_csv,
+                                "rocm,grouped_prefill,%s,%u,%u,%s,%s,%s,"
+                                "%d,%d,%d,%d,%d,%zu,%d,%.9f,%a\n",
+                                format.label,
+                                static_cast<unsigned>(format.source_codebook_id),
+                                static_cast<unsigned>(format.device_execution_codebook_id),
+                                shape.name,
+                                role.c_str(),
+                                candidate_name.c_str(),
+                                rows,
+                                role == "gateup" ? shape.intermediate : shape.d_model,
+                                role == "gateup" ? shape.d_model : shape.intermediate,
+                                candidate.tile_m,
+                                candidate.tile_n,
+                                sample_index,
+                                iterations,
+                                trial_ms[sample_index] * 1000.0,
+                                trial_ms[sample_index]);
+                        }
+                        std::fflush(timing_csv);
+                    }
+
+                    grouped_output->transitionTo(
+                        llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                        device);
+                    ASSERT_TRUE(grouped_output->ensureOnHost(stream));
+                    const std::vector<float> actual(
+                        grouped_output->data(),
+                        grouped_output->data() + grouped_output->numel());
+                    const CloseMetrics metrics = compareVectors(
+                        actual,
+                        serial,
+                        static_cast<size_t>(shape.d_model));
+                    const auto common_evidence =
+                        llaminar2::test::trainer::compareFP32(
+                            actual,
+                            serial,
+                            static_cast<size_t>(shape.d_model));
+                    EXPECT_EQ(common_evidence.mismatch_count, 0u)
+                        << format.label << ' ' << shape.name << " M=" << rows
+                        << ' ' << role << ' ' << candidate_name
+                        << " first_bit_mismatch="
+                        << common_evidence.first_mismatch_index;
+
+                    const double operations =
+                        6.0 * static_cast<double>(rows) * top_k *
+                        static_cast<double>(shape.d_model) *
+                        static_cast<double>(shape.intermediate);
+                    role_results.push_back(MoEPrefillSweepResult{
+                        format.label,
+                        format.source_codebook_id,
+                        format.device_execution_codebook_id,
+                        shape.name,
+                        role,
+                        candidate_name,
+                        rows,
+                        role == "gateup" ? shape.intermediate : shape.d_model,
+                        role == "gateup" ? shape.d_model : shape.intermediate,
+                        candidate.tile_m,
+                        candidate.tile_n,
+                        warmups,
+                        timing_trials,
+                        timing_trials * iterations,
+                        min_graph_ms * 1000.0,
+                        graph_ms * 1000.0,
+                        p95_graph_ms * 1000.0,
+                        mad_graph_ms * 1000.0,
+                        timing_cv,
+                        graph_ms > 0.0 ? operations / (graph_ms * 1.0e6) : 0.0,
+                        common_evidence.mismatch_count,
+                        common_evidence.first_mismatch_index,
+                        repeat_bit_mismatches,
+                        common_evidence.max_abs,
+                        common_evidence.relative_l2,
+                        common_evidence.cosine,
+                        common_evidence.symmetric_kld,
+                        common_evidence.actual_digest,
+                        common_evidence.expected_digest,
+                        timing_evidence.digest,
+                        route_counter_ok,
+                        observed_candidate_id,
+                        false});
+                }
+
+                auto winner = std::min_element(
+                    role_results.begin(),
+                    role_results.end(),
+                    [](const auto &lhs, const auto &rhs)
+                    {
+                        const bool lhs_exact = lhs.bit_mismatches == 0;
+                        const bool rhs_exact = rhs.bit_mismatches == 0;
+                        if (lhs_exact != rhs_exact)
+                            return lhs_exact;
+                        return lhs.graph_us < rhs.graph_us;
+                    });
+                if (winner != role_results.end() && winner->bit_mismatches == 0)
+                    winner->is_winner = true;
+                for (const auto &result : role_results)
+                    writeMoEPrefillSweepResult(csv, result);
+            }
+        }
+
+        workspace_consumer->unbindWorkspace();
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    }
 }
 #endif
 
@@ -1650,6 +2603,177 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M1234_RoutedExpertFFNDecodeEquivalent)
         if (rows >= 2)
             expectGraphReplayFasterThanReference(routed);
         printResult(routed);
+    }
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M832256_RoutedExpertBatchInvariantEconomy)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    for (int rows : {8, 32, 256})
+    {
+        SCOPED_TRACE(rows);
+        llaminar2::PerfStatsCollector::reset();
+        auto routed = runROCmCase(/*shared=*/false, rows);
+        expectClose(routed.metrics);
+        expectGraphReplayFasterThanReference(routed);
+        expectGfx906LongPrefillThroughput(routed);
+
+        int expected_gateup_tile_m = 1;
+        int expected_gateup_tile_n = 64;
+        int expected_down_tile_m = 1;
+        int expected_down_tile_n = 64;
+        if (rows > 8)
+        {
+            ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
+                /*IQ2_S execution codebook=*/13,
+                /*projection_role=*/0,
+                rows,
+                routed.intermediate,
+                routed.d_model,
+                &expected_gateup_tile_m,
+                &expected_gateup_tile_n));
+            ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
+                /*IQ4_XS execution codebook=*/4,
+                /*projection_role=*/1,
+                rows,
+                routed.d_model,
+                routed.intermediate,
+                &expected_down_tile_m,
+                &expected_down_tile_n));
+        }
+        const std::string expected_gateup_tile_m_text =
+            std::to_string(expected_gateup_tile_m);
+        const std::string expected_gateup_tile_n_text =
+            std::to_string(expected_gateup_tile_n);
+        const std::string expected_down_tile_m_text =
+            std::to_string(expected_down_tile_m);
+        const std::string expected_down_tile_n_text =
+            std::to_string(expected_down_tile_n);
+        const std::string expected_common_row_tile =
+            expected_gateup_tile_m == expected_down_tile_m
+                ? expected_gateup_tile_m_text
+                : "mixed";
+
+        const auto records = llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+        const std::string expected_rows = std::to_string(rows);
+        const auto production_route = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                const auto tag_equals = [&](const char *key, const char *value)
+                {
+                    const auto it = record.tags.find(key);
+                    return it != record.tags.end() && it->second == value;
+                };
+                return record.name == "rocm_moe_grouped_prefill_batch_invariant_calls" &&
+                       tag_equals("seq_len", expected_rows.c_str()) &&
+                       tag_equals(
+                           "gateup_route",
+                           rows > 8
+                               ? "expert_tiled_original_row_quant"
+                               : "route_owned_original_row_quant") &&
+                       tag_equals(
+                           "down_route",
+                           rows > 8
+                               ? "expert_tiled_partials_ordered_publish"
+                               : "direct_ordered_publish") &&
+                       tag_equals("gateup_tile_m", expected_gateup_tile_m_text.c_str()) &&
+                       tag_equals("gateup_tile_n", expected_gateup_tile_n_text.c_str()) &&
+                       tag_equals("down_tile_m", expected_down_tile_m_text.c_str()) &&
+                       tag_equals("down_tile_n", expected_down_tile_n_text.c_str()) &&
+                       tag_equals("row_tile", expected_common_row_tile.c_str()) &&
+                       record.count > 0;
+            });
+        EXPECT_NE(production_route, records.end())
+            << llaminar2::PerfStatsCollector::summaryString(
+                   {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+        printResult(routed);
+    }
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M256_UniformExpertBatchInvariantEconomy)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * The skewed long-prefill case above resembles prompts whose router reuses a
+     * compact hot expert set. This companion fixture distributes 2,048 routes
+     * evenly across all 256 experts, leaving eight rows per expert. It guards the
+     * opposite end of the occupancy surface: every descriptor is live, every
+     * expert gets real row-tiled work, and the kernel cannot earn an economy pass
+     * solely from unusually high weight reuse.
+     */
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    auto routed = runROCmCase(
+        /*shared=*/false,
+        /*rows=*/256,
+        /*routed_top_k=*/8,
+        /*routed_num_experts=*/256,
+        /*case_name_override=*/"routed_uniform_experts",
+        /*unique_routes=*/true);
+    expectClose(routed.metrics);
+    expectGraphReplayFasterThanReference(routed);
+    if (isGfx906Device())
+    {
+        EXPECT_GE(routedExpertPipelineGops(routed), 6500.0)
+            << "gfx906 uniform-expert M=256 prefill must sustain at least 6.5 TOPS";
+    }
+    printResult(routed);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M24832256_BatchInvariantRouterEconomy)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    std::cout << "backend,case,m,graph_ms,router_int8_gops,rowwise_ms,speedup,index_bit_mismatches,"
+                 "weight_bit_mismatches\n";
+    for (int rows : {2, 4, 8, 32, 256})
+    {
+        SCOPED_TRACE(rows);
+        const RouterBenchResult result = runROCmBatchInvariantRouterCase(rows);
+        EXPECT_EQ(result.index_bit_mismatches, 0u);
+        EXPECT_EQ(result.weight_bit_mismatches, 0u);
+        ASSERT_GT(result.graph_ms, 0.0);
+        ASSERT_GT(result.rowwise_ms, 0.0);
+        EXPECT_LT(result.graph_ms, result.rowwise_ms)
+            << "M=" << rows << " grouped router must beat serial M=1 routing";
+        const double router_gops = routerPipelineGops(result);
+        if (isGfx906Device() && rows >= 256)
+        {
+            EXPECT_GE(router_gops, 1300.0)
+                << "gfx906 M=256 grouped Q8 router must sustain at least 1.3 TOPS end-to-end";
+        }
+        else if (isGfx906Device() && rows >= 32)
+        {
+            EXPECT_GE(router_gops, 500.0)
+                << "gfx906 M=32 grouped Q8 router must sustain at least 0.5 TOPS end-to-end";
+        }
+        std::cout << std::fixed << std::setprecision(6)
+                  << "rocm,batch_invariant_q8_router," << rows << ','
+                  << result.graph_ms << ',' << router_gops << ',' << result.rowwise_ms << ','
+                  << (result.rowwise_ms / result.graph_ms) << ','
+                  << result.index_bit_mismatches << ','
+                  << result.weight_bit_mismatches << '\n';
     }
 #endif
 }
@@ -1804,5 +2928,122 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M4_CombinedRoutedSharedUpperBound)
     expectClose(combined.metrics);
     expectGraphReplayFasterThanReference(combined);
     printResult(combined);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_AllFormatAspectRatioMGroupedPrefillDispatchTrainer)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+    if (envInt("LLAMINAR_ROCM_MOE_PREFILL_SWEEP", 0) == 0)
+    {
+        GTEST_SKIP()
+            << "Set LLAMINAR_ROCM_MOE_PREFILL_SWEEP=1 to run the exhaustive trainer";
+    }
+
+    const std::vector<int> m_values = envCsvInts(
+        "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_M",
+        {12, 16, 24, 32, 64, 128, 256});
+    const int warmups = envInt(
+        "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_WARMUPS", 5);
+    const int iterations = envInt(
+        "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_ITERS", 8);
+    const int timing_trials = envInt(
+        "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_TRIALS", 30);
+    ASSERT_GE(warmups, 0);
+    ASSERT_GT(iterations, 0);
+    ASSERT_GT(timing_trials, 0);
+    const int max_cases = envInt(
+        "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_MAX_CASES",
+        std::numeric_limits<int>::max());
+    ScopedEnvOverride rowwise_iters(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+
+    std::FILE *csv = stdout;
+    bool owns_csv = false;
+    if (const char *path = std::getenv("LLAMINAR_ROCM_MOE_PREFILL_SWEEP_CSV");
+        path && *path)
+    {
+        csv = std::fopen(path, "w");
+        ASSERT_NE(csv, nullptr) << "failed to open grouped-prefill trainer CSV " << path;
+        owns_csv = true;
+    }
+    std::FILE *timing_csv = nullptr;
+    if (const char *path =
+            std::getenv("LLAMINAR_ROCM_MOE_PREFILL_SWEEP_TIMING_CSV");
+        path && *path)
+    {
+        timing_csv = std::fopen(path, "w");
+        ASSERT_NE(timing_csv, nullptr)
+            << "failed to open grouped-prefill raw timing CSV " << path;
+        std::fprintf(
+            timing_csv,
+            "backend,phase,source_format,source_codebook,execution_codebook,"
+            "shape,role,candidate_id,m,n,k,tile_m,tile_n,sample_index,"
+            "timed_replays,latency_us,latency_ms_hex\n");
+    }
+    std::fprintf(
+        csv,
+        "backend,phase,source_format,source_codebook,execution_codebook,shape,role,"
+        "candidate_id,m,n,k,tile_m,tile_n,warmup_count,sample_count,timed_replays,"
+        "min_us,graph_us,p95_us,mad_us,cv,pipeline_gops,bit_mismatches,"
+        "first_bit_mismatch,repeat_bit_mismatches,max_abs,relative_l2,cosine,"
+        "symmetric_kld,grouped_output_digest,"
+        "serial_output_digest,timing_sample_digest,route_counter_ok,"
+        "observed_candidate_id,is_winner\n");
+
+    int executed_cases = 0;
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        if (!envCsvContainsOrUnset(
+                "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_FORMATS", format.label))
+        {
+            continue;
+        }
+        for (const auto &shape : kMoEPrefillSweepShapes)
+        {
+            if (!envCsvContainsOrUnset(
+                    "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_SHAPES", shape.name))
+            {
+                continue;
+            }
+            if (executed_cases >= max_cases)
+                break;
+
+            SCOPED_TRACE(std::string(format.label) + "/" + shape.name);
+            std::fprintf(
+                stderr,
+                "[ROCm MoE grouped-prefill sweep] format=%s codebook=%u "
+                "shape=%s d_model=%d intermediate=%d\n",
+                format.label,
+                static_cast<unsigned>(format.device_execution_codebook_id),
+                shape.name,
+                shape.d_model,
+                shape.intermediate);
+            runROCmMoEPrefillFormatShapeSweep(
+                format,
+                shape,
+                m_values,
+                warmups,
+                iterations,
+                timing_trials,
+                csv,
+                timing_csv);
+            ++executed_cases;
+        }
+        if (executed_cases >= max_cases)
+            break;
+    }
+
+    if (owns_csv)
+        ASSERT_EQ(std::fclose(csv), 0);
+    if (timing_csv)
+        ASSERT_EQ(std::fclose(timing_csv), 0);
+    EXPECT_GT(executed_cases, 0)
+        << "grouped-prefill trainer filters selected no format/shape cases";
 #endif
 }

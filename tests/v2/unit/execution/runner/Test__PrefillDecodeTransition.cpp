@@ -2034,6 +2034,7 @@ namespace
                 ready_token,
                 1,
                 output_tokens.data(),
+                static_cast<int>(output_tokens.size()),
                 meta.data());
             if (meta[kSpecBatchMetaOk] == 0)
                 return false;
@@ -2291,6 +2292,7 @@ namespace
                     verify_tokens[static_cast<size_t>(compare_rows)],
                     1,
                     output_tokens.data(),
+                    static_cast<int>(output_tokens.size()),
                     meta.data());
                 if (meta[kSpecBatchMetaOk] == 0)
                     return false;
@@ -3201,6 +3203,7 @@ namespace
                 ready_token,
                 bonus_target_slot >= 0 ? 1 : 0,
                 output_tokens.data(),
+                static_cast<int>(output_tokens.size()),
                 meta.data());
 
             if (meta[kSpecBatchMetaOk] == 0)
@@ -3498,6 +3501,7 @@ namespace
                     /*bonus_ready_token=*/-1,
                     /*has_bonus_ready_token=*/0,
                     output_tokens.data(),
+                    static_cast<int>(output_tokens.size()),
                     meta.data());
                 if (meta[sampling_math::kSpecBatchMetaOk] == 0)
                     return false;
@@ -3784,6 +3788,7 @@ namespace
                         /*bonus_ready_token=*/-1,
                         /*has_bonus_ready_token=*/0,
                         output_tokens.data(),
+                        static_cast<int>(output_tokens.size()),
                         meta.data());
                     if (meta[sampling_math::kSpecBatchMetaOk] == 0)
                         return false;
@@ -3923,6 +3928,7 @@ namespace
                         bonus_ready_token,
                         /*has_bonus_ready_token=*/1,
                         output_tokens.data(),
+                        static_cast<int>(output_tokens.size()),
                         meta.data());
                     if (meta[sampling_math::kSpecBatchMetaOk] == 0)
                         return false;
@@ -4104,6 +4110,7 @@ namespace
                         /*bonus_ready_token=*/-1,
                         /*has_bonus_ready_token=*/0,
                         output_tokens.data(),
+                        static_cast<int>(output_tokens.size()),
                         meta.data());
                     if (meta[sampling_math::kSpecBatchMetaOk] == 0)
                         return false;
@@ -8399,7 +8406,7 @@ namespace
         EXPECT_EQ(probe.mtp_depth_policy_updates, 1u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthHoldsBeforeDeepestWithoutGeneratedPolicy)
+    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthCanReachConfiguredMaximumWithoutGeneratedPolicy)
     {
         MTPDepthPolicyConfig depth_policy;
         depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -8443,11 +8450,11 @@ namespace
         EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 1)
             << "second step should use depth 2 before evaluating the deepest lane";
         probe = runner->prefixStateProbe();
-        EXPECT_EQ(probe.mtp_current_depth, 2)
-            << "depth 3 is expensive enough that dynamic mode only enters it through generated policy evidence";
-        EXPECT_EQ(probe.mtp_depth_policy_promotions, 1u);
-        EXPECT_EQ(probe.mtp_depth_policy_updates, 1u);
-        EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "hold");
+        EXPECT_EQ(probe.mtp_current_depth, 3)
+            << "The generic controller must not reserve the configured maximum as an unreachable special case.";
+        EXPECT_EQ(probe.mtp_depth_policy_promotions, 2u);
+        EXPECT_EQ(probe.mtp_depth_policy_updates, 2u);
+        EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "promote_full_accept_rate");
     }
 
     TEST_F(Test__PrefillDecodeTransition, FixedMTPDepthRemainsHardPinned)
@@ -8489,6 +8496,38 @@ namespace
         EXPECT_EQ(probe.mtp_depth_policy_windows, 0u);
         EXPECT_EQ(probe.mtp_depth_policy_updates, 0u);
         EXPECT_FALSE(probe.mtp_request.adaptive_depth_enabled);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, FixedMTPDepthFiveExecutesPastLegacyDepthThreeGate)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Fixed;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/5,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->setVerifierAcceptedPrefixScript({0});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult step = runner->decodeStep();
+        ASSERT_TRUE(step.success()) << step.error;
+
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 4)
+            << "Depth five must execute one initial sidecar plus four chained grouped rows.";
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 5);
+        EXPECT_EQ(probe.mtp_min_depth, 5);
+        EXPECT_EQ(probe.mtp_max_depth, 5);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPChainedFirstSpecRejectReplaysReturnedCorrection)
@@ -11940,16 +11979,14 @@ namespace
         GenerationResult step1 = runner->decodeStep();
         EXPECT_FALSE(step1.success());
         EXPECT_NE(step1.error.find("LLAMINAR_ROCM_CONCURRENT_DECODE"), std::string::npos);
-        EXPECT_NE(step1.error.find("LLAMINAR_ROCM_CONCURRENT_M2_ROWS"), std::string::npos);
         EXPECT_EQ(mock->forwardMTPCount(), 0);
         EXPECT_EQ(mock->forwardCallCount(), 1);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, ROCmMTPAllowsNarrowM2RowOverlapFlag)
+    TEST_F(Test__PrefillDecodeTransition, ROCmMTPAllowsGpuGraphs)
     {
-        ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "0");
+        ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
         ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "0");
-        ScopedEnv m2_rows("LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "1");
 
         auto [runner, mock] = createRunner(
             /*mtp_enabled=*/true,
@@ -11970,60 +12007,6 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
-    }
-
-    TEST_F(Test__PrefillDecodeTransition, ROCmMTPAllowsGpuGraphsWithoutM2RowOverlap)
-    {
-        ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "0");
-        ScopedEnv m2_rows("LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0");
-
-        auto [runner, mock] = createRunner(
-            /*mtp_enabled=*/true,
-            /*mtp_accept=*/true,
-            /*mtp_unsupported_reason=*/{},
-            /*mpi_ctx=*/nullptr,
-            /*mtp_token_coordination=*/true,
-            /*hide_local_logits=*/false,
-        DeviceId::rocm(0));
-        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
-        mock->enableMTPDeviceDraftTokenInput();
-
-        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
-
-        GenerationResult step1 = runner->decodeStep();
-        ASSERT_TRUE(step1.success()) << step1.error;
-        EXPECT_THAT(step1.tokens,
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->forwardMTPCount(), 1);
-    }
-
-    TEST_F(Test__PrefillDecodeTransition, ROCmMTPHardFailsWithM2RowOverlapUnderGpuGraphs)
-    {
-        ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "0");
-        ScopedEnv m2_rows("LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "1");
-
-        auto [runner, mock] = createRunner(
-            /*mtp_enabled=*/true,
-            /*mtp_accept=*/true,
-            /*mtp_unsupported_reason=*/{},
-            /*mpi_ctx=*/nullptr,
-            /*mtp_token_coordination=*/false,
-            /*hide_local_logits=*/false,
-            DeviceId::rocm(0));
-
-        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
-
-        GenerationResult step1 = runner->decodeStep();
-        EXPECT_FALSE(step1.success());
-        EXPECT_NE(step1.error.find("LLAMINAR_ROCM_CONCURRENT_M2_ROWS"), std::string::npos)
-            << step1.error;
-        EXPECT_NE(step1.error.find("LLAMINAR_GPU_GRAPHS=1"), std::string::npos)
-            << step1.error;
-        EXPECT_EQ(mock->forwardMTPCount(), 0);
-        EXPECT_EQ(mock->forwardCallCount(), 1);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeUsesVerifierTerminalTokenWithoutRefeedingPreviousToken)

@@ -1078,7 +1078,7 @@ namespace llaminar2
             if (!state)
                 return false;
         }
-        if (state_snapshots && seq_len > 1 && seq_len <= 4)
+        if (state_snapshots && seq_len > 1)
         {
             return chunkForwardVerifierDecodeEquivalent(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
@@ -1103,7 +1103,7 @@ namespace llaminar2
         float *state_snapshots, int snapshot_stride_floats,
         int max_snapshot_rows)
     {
-        if (state_snapshots && seq_len > 1 && seq_len <= 4)
+        if (state_snapshots && seq_len > 1)
         {
             return chunkForwardVerifierDecodeEquivalent(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
@@ -1147,7 +1147,8 @@ namespace llaminar2
         if (!alpha || !beta_raw || !A_log || !dt_bias ||
             !output || !state || !state_snapshots ||
             seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-            snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
+            snapshot_stride_floats < state_floats ||
+            max_snapshot_rows < seq_len)
         {
             return false;
         }
@@ -1162,7 +1163,7 @@ namespace llaminar2
              {"n_heads", std::to_string(n_heads)},
              {"d_k", std::to_string(d_k)},
              {"d_v", std::to_string(d_v)},
-             {"snapshot_rows", std::to_string(std::min(seq_len, max_snapshot_rows))},
+             {"snapshot_rows", std::to_string(seq_len)},
              {"execution_policy", "head_grouped_recurrence"}});
 
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
@@ -1176,7 +1177,7 @@ namespace llaminar2
          * state for all rows, advances that head in serial decode order, and
          * publishes the head slice of every post-row snapshot.  This preserves
          * the exact recurrent_step() operation order for each head while using
-         * one OpenMP worksharing region for the whole M=2..4 verifier chunk.
+         * one OpenMP worksharing region for the whole runtime-M verifier chunk.
          */
         auto grouped_decode_equivalent = [&]()
         {

@@ -703,7 +703,15 @@ namespace llaminar2
         bool ensureSharedGateScratchCapacity(int seq_len);
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
         bool ensureRouteLogitsPartialsCapacity(size_t partial_count);
-        bool ensureRouterQ8HiddenScratchCapacity(int d_model);
+        /**
+         * @brief Bind row-major Q8 router publication scratch for a prefill bucket.
+         *
+         * The same graph-stable workspace is shared by serial decode, grouped
+         * MTP verification, and ordinary prefill.  Sizing by the declared row
+         * bucket lets production prefill use the batch-invariant grouped router
+         * without a verifier-only four-row ceiling or a hot-path allocation.
+         */
+        bool ensureRouterQ8HiddenScratchCapacity(int rows, int d_model);
         /**
          * @brief Invalidate the router-to-expert Q8 hidden publication.
          *
@@ -795,7 +803,8 @@ namespace llaminar2
         bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
                        bool normalize_weights, DeviceRouteBuffers &bufs,
-                       const int *device_effective_seq_len = nullptr);
+                       const int *device_effective_seq_len = nullptr,
+                       ITensor *gate_weights_tensor = nullptr);
         bool routeWithTensorsImpl(
             ITensor *hidden, ITensor *gate_weights,
             int seq_len, int d_model, int num_experts, int top_k,
@@ -938,8 +947,8 @@ namespace llaminar2
         int *d_route_indices_ = nullptr;             ///< [route_topk_capacity_] ints on device
         float *d_route_weights_ = nullptr;           ///< [route_topk_capacity_] floats on device
         float *d_route_logits_partials_ = nullptr;   ///< [route_logits_partials_capacity_] floats on device
-        int8_t *d_router_q8_hidden_ = nullptr;       ///< [kMaxVerifierRows, router_q8_hidden_d_model_cap_] device rows
-        float *d_router_q8_hidden_scales_ = nullptr; ///< [kMaxVerifierRows, router_q8_hidden_blocks_cap_] device scales
+        int8_t *d_router_q8_hidden_ = nullptr;       ///< [router_q8_hidden_rows_cap_, router_q8_hidden_d_model_cap_] device rows
+        float *d_router_q8_hidden_scales_ = nullptr; ///< [router_q8_hidden_rows_cap_, router_q8_hidden_blocks_cap_] device scales
         const float *router_q8_hidden_source_ = nullptr; ///< FP32 row base that produced the published Q8 rows
         int router_q8_hidden_rows_ = 0; ///< Number of contiguous valid rows in the publication
         bool router_q8_hidden_valid_ = false; ///< True only after a Q8 router producer has been issued
@@ -947,6 +956,7 @@ namespace llaminar2
         size_t route_logits_capacity_ = 0;
         size_t route_topk_capacity_ = 0;
         size_t route_logits_partials_capacity_ = 0;
+        int router_q8_hidden_rows_cap_ = 0;
         int router_q8_hidden_d_model_cap_ = 0;
         int router_q8_hidden_blocks_cap_ = 0;
         std::vector<RouterFP16GateCacheEntry> router_fp16_gate_cache_;

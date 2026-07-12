@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "utils/PrefillGraphBucketDefaults.h"
+
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_SAMPLING_HD __host__ __device__ inline
 #else
@@ -17,7 +19,18 @@
 namespace llaminar2::sampling_math
 {
     constexpr int kMaxTopK = 256;
-    constexpr int kSpeculativeBatchMaxRows = 4;
+
+    /**
+     * @brief Default number of draft-token comparisons in one MTP transaction.
+     *
+     * A target verifier evaluates one row per draft token plus a terminal bonus
+     * row.  The shared grouped-verifier capacity therefore leaves exactly one
+     * row for that bonus.  Kernels consume the runtime row count and do not
+     * specialize on this value; it sizes the default graph-owned mailboxes and
+     * value-owned launch parameters only.
+     */
+    constexpr int kSpeculativeBatchMaxRows =
+        kDefaultNativeVNNIVerifierRowCapacity - 1;
     constexpr int kSpeculativeBatchMaxOutputTokens =
         kSpeculativeBatchMaxRows + 1;
     constexpr int kSpeculativeBatchMaxStopTokens = 8;
@@ -25,6 +38,33 @@ namespace llaminar2::sampling_math
     constexpr float kMaxUnitThreshold = 0.99999994f;
     constexpr uint64_t kInverseSampleDomain = 0xA0761D6478BD642FULL;
     constexpr uint64_t kMTPSpecDrawPurposesPerToken = 8;
+
+    /**
+     * @brief Value-owned explicit thresholds captured with one GPU launch.
+     *
+     * Production seeded MTP derives these values from device-owned logical
+     * positions, but explicit-threshold integration probes still need a stable
+     * graph-capturable launch ABI. Passing one bounded aggregate avoids a
+     * depth-specialized argument list and keeps every runtime row addressable.
+     */
+    struct SpeculativeBatchThresholdParameters
+    {
+        float accept[kSpeculativeBatchMaxRows] = {};
+        float residual[kSpeculativeBatchMaxRows] = {};
+    };
+
+    /**
+     * @brief Value-owned host-token inputs for the diagnostic batch verifier.
+     *
+     * The production GPU path reads sampled draft tokens from device buffers.
+     * This aggregate exists for explicit low-level probes and contains no
+     * pointers whose lifetime could outlive graph capture.
+     */
+    struct SpeculativeBatchHostParameters
+    {
+        int draft_tokens[kSpeculativeBatchMaxRows] = {};
+        SpeculativeBatchThresholdParameters thresholds{};
+    };
 
     enum SpeculativeBatchMetaIndex : int
     {
@@ -598,6 +638,11 @@ namespace llaminar2::sampling_math
      * a ready token only when every verifier row accepted. The metadata layout
      * is fixed by SpeculativeBatchMetaIndex so host tests and GPU kernels cannot
      * drift.
+     *
+     * @param out_token_capacity Number of writable entries in `out_tokens`.
+     *        The complete declared extent is initialized to `-1`, making the
+     *        compact outcome byte-stable even when request rows share a larger
+     *        configured batch stride.
      */
     LLAMINAR_SAMPLING_HD void summarize_speculative_verify_batch(
         int first_token,
@@ -609,11 +654,13 @@ namespace llaminar2::sampling_math
         int bonus_ready_token,
         int has_bonus_ready_token,
         int *out_tokens,
-        int *out_meta)
+        int out_token_capacity,
+        int *out_meta,
+        const int *greedy_draft_tokens = nullptr)
     {
         if (!out_tokens || !out_meta ||
             row_count < 0 ||
-            row_count > kSpeculativeBatchMaxRows ||
+            out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens)
         {
@@ -622,7 +669,7 @@ namespace llaminar2::sampling_math
             return;
         }
 
-        for (int i = 0; i < kSpeculativeBatchMaxOutputTokens; ++i)
+        for (int i = 0; i < out_token_capacity; ++i)
             out_tokens[i] = -1;
         for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
             out_meta[i] = 0;
@@ -651,14 +698,19 @@ namespace llaminar2::sampling_math
 
         for (int row = 0; !stopped && row < row_count; ++row)
         {
-            if (!row_tokens || !row_accepted || row_tokens[row] < 0)
+            if (!row_tokens ||
+                (!row_accepted && !greedy_draft_tokens) ||
+                row_tokens[row] < 0)
             {
                 out_meta[kSpecBatchMetaOk] = 0;
                 return;
             }
 
             const int token = row_tokens[row];
-            const bool accepted = row_accepted[row] != 0;
+            const bool accepted = row_accepted
+                                      ? row_accepted[row] != 0
+                                      : row_tokens[row] ==
+                                            greedy_draft_tokens[row + 1];
             out_tokens[output_count++] = token;
             ++consumed_rows;
 
@@ -935,7 +987,7 @@ namespace llaminar2::sampling_math
         if (!meta ||
             !output_tokens ||
             meta_stride < kSpeculativeBatchMetaCount ||
-            output_token_stride < kSpeculativeBatchMaxOutputTokens ||
+            output_token_stride <= first_output_token_index ||
             request_index < 0 ||
             first_output_token_index < 0)
         {
@@ -954,6 +1006,8 @@ namespace llaminar2::sampling_math
         const int32_t *request_tokens =
             output_tokens + static_cast<size_t>(request_index) *
                                 static_cast<size_t>(output_token_stride);
+        if (output_count < 0 || output_count > output_token_stride)
+            return;
         if (output_count > 0)
         {
             const int32_t live_filler = request_tokens[0];
@@ -1003,7 +1057,6 @@ namespace llaminar2::sampling_math
     {
         if (first_token < 0 ||
             row_count < 0 ||
-            row_count > kSpeculativeBatchMaxRows ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens)
         {
@@ -1052,35 +1105,30 @@ namespace llaminar2::sampling_math
         const int *stop_tokens,
         int stop_token_count,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta)
     {
-        if (!verifier_tokens || !draft_tokens || compare_row_count < 0 ||
-            compare_row_count > kSpeculativeBatchMaxRows)
+        if (!verifier_tokens || !draft_tokens || compare_row_count < 0)
         {
             if (out_meta)
                 out_meta[kSpecBatchMetaOk] = 0;
             return;
         }
 
-        int row_accepted[kSpeculativeBatchMaxRows] = {0, 0, 0, 0};
-        for (int row = 0; row < compare_row_count; ++row)
-        {
-            row_accepted[row] =
-                verifier_tokens[row] == draft_tokens[row + 1] ? 1 : 0;
-        }
-
         const int bonus_ready_token = verifier_tokens[compare_row_count];
         summarize_speculative_verify_batch(
             first_token,
             verifier_tokens,
-            row_accepted,
+            /*row_accepted=*/nullptr,
             compare_row_count,
             stop_tokens,
             stop_token_count,
             bonus_ready_token,
             /*has_bonus_ready_token=*/1,
             out_tokens,
-            out_meta);
+            out_token_capacity,
+            out_meta,
+            draft_tokens);
     }
 
 } // namespace llaminar2::sampling_math

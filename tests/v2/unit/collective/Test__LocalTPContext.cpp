@@ -432,10 +432,9 @@ TEST_F(Test__LocalTPContext, CollectTimeoutPolicySeparatesCollectivesFromWorkerJ
     using collective_timeout_policy::effectiveCollectTimeoutMs;
     using collective_timeout_policy::effectiveWorkerJoinTimeoutMs;
 
-    EXPECT_EQ(effectiveCollectTimeoutMs(0, false), 30000);
-    EXPECT_EQ(effectiveCollectTimeoutMs(30000, false), 30000);
-    EXPECT_EQ(effectiveCollectTimeoutMs(450000, false), 450000);
-    EXPECT_EQ(effectiveCollectTimeoutMs(30000, true), 30000);
+    EXPECT_EQ(effectiveCollectTimeoutMs(0), 30000);
+    EXPECT_EQ(effectiveCollectTimeoutMs(30000), 30000);
+    EXPECT_EQ(effectiveCollectTimeoutMs(450000), 450000);
 
     EXPECT_EQ(effectiveWorkerJoinTimeoutMs(0), 0);
     EXPECT_EQ(effectiveWorkerJoinTimeoutMs(30000), 0)

@@ -37,7 +37,7 @@ namespace llaminar2
         int d_model)
     {
         invalidateRouterQ8HiddenPublication();
-        if (!source || rows < 1 || rows > 4 || d_model <= 0)
+        if (!source || rows < 1 || d_model <= 0)
             return false;
 
         const int blocks_per_row = (d_model + Q8_1Block::BLOCK_SIZE - 1) /
@@ -46,9 +46,11 @@ namespace llaminar2
             static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
 
         /*
-         * Verifier batches contain at most four rows.  Quantizing them directly
-         * avoids an OpenMP fork whose scheduling overhead would exceed the SIMD
-         * block work, while preserving the exact serial-decode block primitive.
+         * Quantize each row with the serial-decode block primitive. The outer
+         * row loop is intentionally direct: the activation batch is small even
+         * at deep speculative settings, and introducing a second OpenMP region
+         * here would compete with the grouped expert projection work that
+         * follows immediately.
          */
         const bool rows_are_block_aligned = (d_model % Q8_1Block::BLOCK_SIZE) == 0;
         for (int row = 0; row < rows; ++row)
@@ -134,11 +136,12 @@ namespace llaminar2
         }
 
         /*
-         * MTP and ordinary decode use M=1..4.  Publish their Q8_1 rows before
-         * routing so the immediately following native expert stage never repeats
-         * this activation transform once per selected expert.
+         * Publish every routed row before routing so the immediately following
+         * native expert stage never repeats this activation transform once per
+         * selected expert. The publication vector grows to the runtime request
+         * shape; speculative depth is not a four-row ABI.
          */
-        if (seq_len <= 4 && !publishRouterQ8Hidden(hidden, seq_len, d_model))
+        if (!publishRouterQ8Hidden(hidden, seq_len, d_model))
         {
             LOG_ERROR("[CPUMoEKernel::route] failed to publish verifier Q8_1 hidden rows");
             return false;

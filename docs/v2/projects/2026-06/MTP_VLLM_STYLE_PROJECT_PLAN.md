@@ -102,6 +102,27 @@ M=1..4; and the complete discovered
 `^V2_Integration_GroupedVerifierRows_` matrix passed `43/43` in `306.44s`
 (13 CPU, 13 CUDA, 17 ROCm).
 
+2026-07-11 update: Grouped verifier depth is now a runtime capacity contract,
+not an M=2..4 architecture. Graph/schema tests reserve 31 target-query rows,
+and the canonical kernel inventory proves every grouped M=2..16 plus M=31;
+M=1 remains the independent production serial-decode oracle and M=31 is a
+deeper sentinel, not a maximum. CPU NativeVNNI composes arbitrary M from
+bounded two-row AVX2 or up-to-four-row AVX512 physical tiles. Both the direct
+grouped projection and fused multi-projection long-K scheduler share decoded
+weights across each tile and reduce K partials through one runtime-ISA-selected,
+in-order FP32 reducer. The fused route publishes its physical tile and K-part
+policy through PerfStats, so byte equality cannot hide independent one-row work.
+
+The promotion-grade CPU trainer now executes that fused production bundle twice
+in every format/M cell. AVX2-build/AVX2-runtime, AVX512-build/forced-AVX2, and
+AVX512-build/AVX512 all passed the complete format and M=2..16/M31 long-K sweep
+with zero serial or repeat byte mismatches. The focused CPU integration gate
+passed in `89.74s`; the rebuilt unit gate passed `536/536`; and the complete
+discovered grouped-verifier gate passed `50/50` CTest entries in `565.28s`
+(`49` substantive lanes: 13 CPU, 16 CUDA, 20 ROCm). A fresh Release configure
+also exposed and fixed an unconditional property assignment to an omitted ROCm
+integration test, so performance-only build trees configure cleanly again.
+
 ## Why vLLM Is Fast
 
 The local vLLM source shape to port is:
@@ -2885,6 +2906,12 @@ implementations before any Phase 10 default-enablement decision. The verifier
 must stay decode-equivalent, but the hot path should no longer pay row-serial
 replay, full all-position LM-head, or host transfer/sync costs where a compact
 backend-resident path can produce the same state and logits.
+
+NativeVNNI small-M retuning and promotion in this phase is governed by the
+[Cross-Backend Batch-Invariant NativeVNNI Learned Dispatch Policy](../2026-07/NATIVE_VNNI_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md):
+verifier candidates require serial-M1 byte equality, and the exact frozen
+generic policy requires maximum sealed worst-surface performance regret of at
+most 3% with no post-certification refit.
 
 Scope:
 

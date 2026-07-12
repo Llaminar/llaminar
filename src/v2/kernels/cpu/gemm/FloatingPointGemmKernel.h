@@ -90,104 +90,117 @@ namespace llaminar2
 
             /*
              * MTP verifier rows need decode-equivalent FP32 accumulation, so we
-             * keep the scalar kk order used by one-row decode.  The ordinary
-             * row/column loop below is correct, but for M=2..4 with transposed
-             * weights it reloads the same B row once per verifier row.  This
-             * grouped-column path reuses that B row while maintaining independent
-             * scalar accumulators for each output row.  It is intentionally not a
-             * vector reduction: changing reduction order here would risk recurrent
-             * state drift in GDN/short-conv publication.
+             * keep the scalar kk order used by one-row decode. The ordinary
+             * row/column loop below is correct, but it reloads the same B row
+             * once per verifier row. This grouped-column path tiles runtime M
+             * in fixed four-row groups and reuses that B row while maintaining
+             * one independent scalar accumulator per row. The fixed tile bounds
+             * register pressure for deep speculation; it is intentionally not a
+             * vector reduction because changing K reduction order would risk
+             * recurrent-state drift in GDN/short-conv publication.
              */
-            if (transpose_B && M >= 2 && M <= 4 && N >= 128)
+            if (transpose_B && M >= 2 && N >= 128)
             {
+                constexpr int kVerifierRowTile = 4;
+                const int row_tiles =
+                    (M + kVerifierRowTile - 1) / kVerifierRowTile;
                 auto grouped_column_work = [&]()
                 {
-#pragma omp for schedule(static)
-                    for (int col = 0; col < N; ++col)
+#pragma omp for collapse(2) schedule(static)
+                    for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
                     {
-                        const float *b_row = B + static_cast<size_t>(col) * K;
-                        const float *a0 = A;
-                        const float *a1 = A + static_cast<size_t>(K);
-
-                        float acc0 = 0.0f;
-                        float acc1 = 0.0f;
-                        if (M == 2)
+                        for (int col = 0; col < N; ++col)
                         {
-                            for (int kk = 0; kk < K; ++kk)
+                            const int first_row = row_tile * kVerifierRowTile;
+                            const int tile_rows =
+                                std::min(kVerifierRowTile, M - first_row);
+                            const float *b_row =
+                                B + static_cast<size_t>(col) * K;
+                            float accumulators[kVerifierRowTile] = {};
+                            const float *a0 =
+                                A + static_cast<size_t>(first_row) * K;
+
+                            /*
+                             * Keep explicit accumulators for each physical tile
+                             * width. A runtime inner row loop invites the compiler
+                             * to choose a different vector/FMA schedule once M
+                             * exceeds four, which is mathematically valid but not
+                             * byte-identical to the proven M=1 decode expression.
+                             */
+                            if (tile_rows == 1)
                             {
-                                const float b = b_row[kk];
-                                acc0 += a0[kk] * b;
-                                acc1 += a1[kk] * b;
+                                float acc0 = 0.0f;
+                                for (int kk = 0; kk < K; ++kk)
+                                    acc0 += a0[kk] * b_row[kk];
+                                accumulators[0] = acc0;
+                            }
+                            else if (tile_rows == 2)
+                            {
+                                const float *a1 = a0 + K;
+                                float acc0 = 0.0f;
+                                float acc1 = 0.0f;
+                                for (int kk = 0; kk < K; ++kk)
+                                {
+                                    const float b = b_row[kk];
+                                    acc0 += a0[kk] * b;
+                                    acc1 += a1[kk] * b;
+                                }
+                                accumulators[0] = acc0;
+                                accumulators[1] = acc1;
+                            }
+                            else if (tile_rows == 3)
+                            {
+                                const float *a1 = a0 + K;
+                                const float *a2 = a1 + K;
+                                float acc0 = 0.0f;
+                                float acc1 = 0.0f;
+                                float acc2 = 0.0f;
+                                for (int kk = 0; kk < K; ++kk)
+                                {
+                                    const float b = b_row[kk];
+                                    acc0 += a0[kk] * b;
+                                    acc1 += a1[kk] * b;
+                                    acc2 += a2[kk] * b;
+                                }
+                                accumulators[0] = acc0;
+                                accumulators[1] = acc1;
+                                accumulators[2] = acc2;
+                            }
+                            else
+                            {
+                                const float *a1 = a0 + K;
+                                const float *a2 = a1 + K;
+                                const float *a3 = a2 + K;
+                                float acc0 = 0.0f;
+                                float acc1 = 0.0f;
+                                float acc2 = 0.0f;
+                                float acc3 = 0.0f;
+                                for (int kk = 0; kk < K; ++kk)
+                                {
+                                    const float b = b_row[kk];
+                                    acc0 += a0[kk] * b;
+                                    acc1 += a1[kk] * b;
+                                    acc2 += a2[kk] * b;
+                                    acc3 += a3[kk] * b;
+                                }
+                                accumulators[0] = acc0;
+                                accumulators[1] = acc1;
+                                accumulators[2] = acc2;
+                                accumulators[3] = acc3;
                             }
 
                             const float bias_value = bias ? bias[col] : 0.0f;
-                            float value0 = alpha * acc0 + bias_value;
-                            float value1 = alpha * acc1 + bias_value;
-                            if (beta != 0.0f)
+                            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
                             {
-                                value0 += beta * C[col];
-                                value1 += beta * C[static_cast<size_t>(N) + col];
+                                const size_t output_index =
+                                    static_cast<size_t>(first_row + tile_row) * N + col;
+                                float value =
+                                    alpha * accumulators[tile_row] + bias_value;
+                                if (beta != 0.0f)
+                                    value += beta * C[output_index];
+                                C[output_index] = value;
                             }
-                            C[col] = value0;
-                            C[static_cast<size_t>(N) + col] = value1;
-                            continue;
                         }
-
-                        const float *a2 = A + static_cast<size_t>(2) * K;
-                        float acc2 = 0.0f;
-                        if (M == 3)
-                        {
-                            for (int kk = 0; kk < K; ++kk)
-                            {
-                                const float b = b_row[kk];
-                                acc0 += a0[kk] * b;
-                                acc1 += a1[kk] * b;
-                                acc2 += a2[kk] * b;
-                            }
-
-                            const float bias_value = bias ? bias[col] : 0.0f;
-                            float value0 = alpha * acc0 + bias_value;
-                            float value1 = alpha * acc1 + bias_value;
-                            float value2 = alpha * acc2 + bias_value;
-                            if (beta != 0.0f)
-                            {
-                                value0 += beta * C[col];
-                                value1 += beta * C[static_cast<size_t>(N) + col];
-                                value2 += beta * C[static_cast<size_t>(2) * N + col];
-                            }
-                            C[col] = value0;
-                            C[static_cast<size_t>(N) + col] = value1;
-                            C[static_cast<size_t>(2) * N + col] = value2;
-                            continue;
-                        }
-
-                        const float *a3 = A + static_cast<size_t>(3) * K;
-                        float acc3 = 0.0f;
-                        for (int kk = 0; kk < K; ++kk)
-                        {
-                            const float b = b_row[kk];
-                            acc0 += a0[kk] * b;
-                            acc1 += a1[kk] * b;
-                            acc2 += a2[kk] * b;
-                            acc3 += a3[kk] * b;
-                        }
-
-                        const float bias_value = bias ? bias[col] : 0.0f;
-                        float value0 = alpha * acc0 + bias_value;
-                        float value1 = alpha * acc1 + bias_value;
-                        float value2 = alpha * acc2 + bias_value;
-                        float value3 = alpha * acc3 + bias_value;
-                        if (beta != 0.0f)
-                        {
-                            value0 += beta * C[col];
-                            value1 += beta * C[static_cast<size_t>(N) + col];
-                            value2 += beta * C[static_cast<size_t>(2) * N + col];
-                            value3 += beta * C[static_cast<size_t>(3) * N + col];
-                        }
-                        C[col] = value0;
-                        C[static_cast<size_t>(N) + col] = value1;
-                        C[static_cast<size_t>(2) * N + col] = value2;
-                        C[static_cast<size_t>(3) * N + col] = value3;
                     }
                 };
                 OMP_WORKSHARE_REGION(grouped_column_work);
@@ -261,38 +274,48 @@ namespace llaminar2
                 return false;
             }
 
+            /*
+             * Four-row tiles reuse each decoded weight value without joining
+             * the per-row accumulators. Every accumulator still visits K in
+             * increasing order, exactly as the one-row decode primitive does.
+             */
+            constexpr int kVerifierRowTile = 4;
+            const int row_tiles =
+                (M + kVerifierRowTile - 1) / kVerifierRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
-                for (int row = 0; row < M; ++row)
+                for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        float acc = 0.0f;
-                        const uint16_t *a_row = A + static_cast<size_t>(row) * K;
-                        if (transpose_B)
+                        const int first_row = row_tile * kVerifierRowTile;
+                        const int tile_rows =
+                            std::min(kVerifierRowTile, M - first_row);
+                        float accumulators[kVerifierRowTile] = {};
+                        for (int kk = 0; kk < K; ++kk)
                         {
-                            const uint16_t *b_row = B + static_cast<size_t>(col) * K;
-                            for (int kk = 0; kk < K; ++kk)
+                            const uint16_t b_bits = transpose_B
+                                                        ? B[static_cast<size_t>(col) * K + kk]
+                                                        : B[static_cast<size_t>(kk) * N + col];
+                            const float b = decode(b_bits);
+                            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
                             {
-                                acc += decode(a_row[kk]) * decode(b_row[kk]);
-                            }
-                        }
-                        else
-                        {
-                            for (int kk = 0; kk < K; ++kk)
-                            {
-                                acc += decode(a_row[kk]) *
-                                       decode(B[static_cast<size_t>(kk) * N + col]);
+                                const uint16_t *a_row =
+                                    A + static_cast<size_t>(first_row + tile_row) * K;
+                                accumulators[tile_row] += decode(a_row[kk]) * b;
                             }
                         }
 
-                        float value = alpha * acc;
-                        if (beta != 0.0f)
+                        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
                         {
-                            value += beta * C[static_cast<size_t>(row) * N + col];
+                            const size_t output_index =
+                                static_cast<size_t>(first_row + tile_row) * N + col;
+                            float value = alpha * accumulators[tile_row];
+                            if (beta != 0.0f)
+                                value += beta * C[output_index];
+                            C[output_index] = value;
                         }
-                        C[static_cast<size_t>(row) * N + col] = value;
                     }
                 }
             };
@@ -347,7 +370,7 @@ namespace llaminar2
          * in verifier publication code.  This helper is the CPU counterpart to
          * the GPU fp32x16 verifier kernels: it keeps A in FP32, converts each
          * 16-bit weight element inside the scalar K loop, and therefore gives
-         * M=1 and grouped M=2..4 rows one shared reduction contract.
+         * M=1 and grouped runtime-M rows one shared reduction contract.
          */
         template <typename DecodeFn>
         inline bool run_fp32x16_skinny_matmul(const float *A,
@@ -371,31 +394,48 @@ namespace llaminar2
                 return false;
             }
 
+            /*
+             * Match the homogeneous 16-bit primitive above: a fixed four-row
+             * tile shares each decoded weight while preserving one independent
+             * scalar K reduction per verifier row.
+             */
+            constexpr int kVerifierRowTile = 4;
+            const int row_tiles =
+                (M + kVerifierRowTile - 1) / kVerifierRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
-                for (int row = 0; row < M; ++row)
+                for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        float acc = 0.0f;
-                        const float *a_row = A + static_cast<size_t>(row) * K;
-                        if (transpose_B)
+                        const int first_row = row_tile * kVerifierRowTile;
+                        const int tile_rows =
+                            std::min(kVerifierRowTile, M - first_row);
+                        float accumulators[kVerifierRowTile] = {};
+                        for (int kk = 0; kk < K; ++kk)
                         {
-                            const uint16_t *b_row = B + static_cast<size_t>(col) * K;
-                            for (int kk = 0; kk < K; ++kk)
-                                acc += a_row[kk] * decode(b_row[kk]);
-                        }
-                        else
-                        {
-                            for (int kk = 0; kk < K; ++kk)
-                                acc += a_row[kk] * decode(B[static_cast<size_t>(kk) * N + col]);
+                            const uint16_t b_bits = transpose_B
+                                                        ? B[static_cast<size_t>(col) * K + kk]
+                                                        : B[static_cast<size_t>(kk) * N + col];
+                            const float b = decode(b_bits);
+                            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+                            {
+                                const float *a_row =
+                                    A + static_cast<size_t>(first_row + tile_row) * K;
+                                accumulators[tile_row] += a_row[kk] * b;
+                            }
                         }
 
-                        float value = alpha * acc;
-                        if (beta != 0.0f)
-                            value += beta * C[static_cast<size_t>(row) * N + col];
-                        C[static_cast<size_t>(row) * N + col] = value;
+                        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+                        {
+                            const size_t output_index =
+                                static_cast<size_t>(first_row + tile_row) * N + col;
+                            float value = alpha * accumulators[tile_row];
+                            if (beta != 0.0f)
+                                value += beta * C[output_index];
+                            C[output_index] = value;
+                        }
                     }
                 }
             };
@@ -1535,7 +1575,7 @@ namespace llaminar2
             /**
              * @brief Grouped verifier SwiGLU + FP32 down projection.
              *
-             * The verifier graph may carry M=2..4 candidate rows, but state
+             * The verifier graph may carry an arbitrary runtime-M candidate batch, but state
              * publication must remain equivalent to serial decode.  This path
              * computes all SwiGLU rows with the shared CPU primitive, then uses
              * run_fp32_skinny_matmul(): work is parallelized over rows/columns
@@ -1552,7 +1592,7 @@ namespace llaminar2
             {
                 (void)workspace;
                 if (!weight_tensor_ || !gate || !up || !output ||
-                    m < 1 || m > 4 || n <= 0 || k <= 0)
+                    m < 1 || n <= 0 || k <= 0)
                 {
                     LOG_ERROR("[FloatingPointGemmKernel] grouped verifier SwiGLU rejected: weight="
                               << (weight_tensor_ != nullptr)
@@ -1706,7 +1746,7 @@ namespace llaminar2
             /**
              * @brief Group verifier rows while preserving serial decode dot-product order.
              *
-             * Phase 9.8 verifier graphs evaluate M=2..4 candidate rows together,
+             * Phase 9.8 verifier graphs evaluate runtime-M candidate rows together,
              * but publication-capable recurrent state must match the row-by-row
              * decode contract.  FP32, FP16, and BF16 weights use skinny
              * primitives that parallelize over rows and output columns in one
@@ -1724,7 +1764,7 @@ namespace llaminar2
                 (void)mpi_ctx;
                 (void)workspace;
 
-                if (!weight_tensor_ || !input || m <= 1 || m > 4 || k <= 0 || projections.empty())
+                if (!weight_tensor_ || !input || m <= 1 || k <= 0 || projections.empty())
                 {
                     LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: weight="
                               << (weight_tensor_ != nullptr) << " input=" << (input != nullptr)

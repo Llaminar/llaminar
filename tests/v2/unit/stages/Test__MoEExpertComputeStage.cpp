@@ -25,6 +25,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/PreparedWeightTestHarness.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <cstdlib>
 #include <cmath>
@@ -1187,7 +1188,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     }
 }
 
-TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierAllNativeFormatsMatchSerialDecodeByteExact)
+TEST_F(MoEExpertComputeStageTest, SharedExpert_RuntimeMVerifierAllNativeFormatsMatchSerialDecodeByteExact)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     PerfStatsCollector::reset();
@@ -1239,7 +1240,7 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierAllNativeFormatsMatch
             return stage.execute(cpu_ctx_.get());
         };
 
-        for (const int seq : std::array<int, 3>{2, 3, 4})
+        for (const int seq : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE("seq=" + std::to_string(seq));
             auto input = TestTensorFactory::createFP32Random(
@@ -1305,7 +1306,7 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_M234VerifierAllNativeFormatsMatch
     PerfStatsCollector::reset();
 }
 
-TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_AllNativeFormatsRouterQ8Reuse)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_AllNativeFormatsRouterQ8Reuse)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     constexpr int d = 256;
@@ -1374,7 +1375,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_AllNati
             return stage.execute(cpu_ctx_.get());
         };
 
-        for (const int seq : std::array<int, 3>{2, 3, 4})
+        for (const int seq : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE("seq=" + std::to_string(seq));
             auto input = TestTensorFactory::createFP32Random(
@@ -1483,7 +1484,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_AllNati
     PerfStatsCollector::reset();
 }
 
-TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S_TopK8)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3S_TopK8)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     PerfStatsCollector::reset();
@@ -1529,7 +1530,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S_To
         return stage.execute(cpu_ctx_.get());
     };
 
-    for (const int seq : std::array<int, 3>{2, 3, 4})
+    for (const int seq : kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE("seq=" + std::to_string(seq));
         auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(seq), static_cast<size_t>(d)}, -0.5f, 0.5f, 740 + seq);
@@ -1584,7 +1585,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_IQ3S_To
     PerfStatsCollector::reset();
 }
 
-TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_QwenSizedQ4KQ5K_TopK8)
+TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_QwenSizedQ4KQ5K_TopK8)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     PerfStatsCollector::reset();
@@ -1630,7 +1631,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_M234VerifierMatchesSerialDecode_QwenSiz
         return stage.execute(cpu_ctx_.get());
     };
 
-    for (const int seq : std::array<int, 3>{2, 3, 4})
+    for (const int seq : kGroupedVerifierBoundaryRows)
     {
         SCOPED_TRACE("seq=" + std::to_string(seq));
         auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(seq), static_cast<size_t>(d)}, -0.5f, 0.5f, 760 + seq);

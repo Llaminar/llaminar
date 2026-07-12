@@ -437,7 +437,7 @@ namespace llaminar2::cpu::native_vnni
          * @brief Grouped MTP verifier SwiGLU + down projection.
          *
          * This follows the same SwiGLU math as the ordinary CPU down path, but
-         * sends the resulting M=2..4 activation rows through
+         * sends the resulting runtime-M activation rows through
          * gemm_native_vnni_preq_decode_equivalent_rows().  That helper shares
          * Q8_1 activation quantization across rows and parallelizes the work,
          * while each row keeps the same K-tile reduction order as M=1 decode.
@@ -451,7 +451,7 @@ namespace llaminar2::cpu::native_vnni
             DeviceWorkspaceManager *workspace = nullptr) override
         {
             (void)workspace;
-            if (!valid_ || !gate || !up || !output || m <= 1 || m > 4 || n <= 0 || k <= 0)
+            if (!valid_ || !gate || !up || !output || m <= 1 || n <= 0 || k <= 0)
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU rejected: valid="
                           << valid_ << " gate=" << (gate != nullptr)
@@ -814,7 +814,7 @@ namespace llaminar2::cpu::native_vnni
             (void)mpi_ctx;
             (void)workspace;
 
-            if (!valid_ || !input || m <= 1 || m > 4 || k <= 0 || projections.empty())
+            if (!valid_ || !input || m <= 1 || k <= 0 || projections.empty())
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: valid="
                           << valid_ << " input=" << (input != nullptr)
@@ -890,7 +890,7 @@ namespace llaminar2::cpu::native_vnni
              * Multi-projection verifier path.
              *
              * GDN/QKV verifier graphs commonly have several projections fed by
-             * the same M=2..4 hidden-state rows.  The older implementation ran
+             * the same runtime-M hidden-state rows. The older implementation ran
              * one grouped-row GEMV per projection, which was correct but paid
              * an OpenMP team entry and scheduling cost for every projection.
              * This fused descriptor path keeps the exact M=1 decode chunk math
@@ -953,9 +953,9 @@ namespace llaminar2::cpu::native_vnni
                     return true;
                 }
 
-                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Fused grouped verifier "
-                          "projection path unavailable; using per-projection "
-                          "grouped verifier rows");
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused grouped verifier "
+                          "kernel rejected an advertised multi-projection "
+                          "NativeVNNI contract");
                 recordVerifierTiming(
                     "cpu_native_vnni_verifier_projection_fused_gemv_rejected",
                     perf_start,
@@ -963,6 +963,13 @@ namespace llaminar2::cpu::native_vnni
                     /*n=*/0,
                     k,
                     static_cast<int>(fused_descs.size()));
+
+                for (auto *vnni : vnni_kernels)
+                {
+                    if (vnni->deferred_packing_)
+                        vnni->packed_.clearWorkspace();
+                }
+                return false;
             }
 
             for (size_t i = 0; i < projections.size(); ++i)
@@ -1030,7 +1037,7 @@ namespace llaminar2::cpu::native_vnni
          * Q8_1 row set once, and this method consumes gathered blocks from that
          * publication directly.
          *
-         * M=1 chunks use the ordinary fused decode GEMV kernel.  M=2..4 chunks
+         * M=1 chunks use the ordinary fused decode GEMV kernel. Multi-row chunks
          * use the fused verifier-row kernel, whose per-row K reduction order is
          * identical to M=1 decode.  The method has no FP32 or per-projection
          * fallback: every projection must be an eager, unrotated NativeVNNI
@@ -1038,7 +1045,8 @@ namespace llaminar2::cpu::native_vnni
          *
          * @param input_q8 Contiguous Q8_1 rows in `[m, ceil(k / 32)]` layout.
          * @param projections Gate/up projection bundle sharing the same rows.
-         * @param m Number of gathered route rows, in the range 1..4.
+         * @param m Number of gathered route rows. Runtime M is bounded only by
+         *          the caller's declared graph and scratch capacity.
          * @param k FP32 logical width represented by each Q8_1 row.
          */
         bool multiply_fused_router_q8_hidden_decode_equivalent(
@@ -1047,7 +1055,7 @@ namespace llaminar2::cpu::native_vnni
             int m,
             int k)
         {
-            if (!valid_ || !input_q8 || m < 1 || m > 4 || k <= 0 ||
+            if (!valid_ || !input_q8 || m < 1 || k <= 0 ||
                 projections.empty())
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] router-Q8 projection rejected: valid="

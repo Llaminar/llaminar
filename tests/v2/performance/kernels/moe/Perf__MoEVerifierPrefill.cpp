@@ -779,9 +779,7 @@ namespace
     {
     public:
         ScopedCudaMoEGemmConfig()
-            : old_gateup_kpart_decode_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kpart_decode),
-              old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
-              old_down_kpart_decode_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
+            : old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
               old_down_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kparts)
         {
         }
@@ -789,25 +787,19 @@ namespace
         ~ScopedCudaMoEGemmConfig()
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kpart_decode = old_gateup_kpart_decode_;
             gemm.cuda_moe_gateup_kparts = old_gateup_kparts_;
-            gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
             gemm.cuda_moe_down_kparts = old_down_kparts_;
         }
 
-        void set(bool gateup_kpart, int gateup_kparts, bool down_kpart, int down_kparts)
+        void set(int gateup_kparts, int down_kparts)
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kpart_decode = gateup_kpart;
             gemm.cuda_moe_gateup_kparts = gateup_kparts;
-            gemm.cuda_moe_down_kpart_decode = down_kpart;
             gemm.cuda_moe_down_kparts = down_kparts;
         }
 
     private:
-        bool old_gateup_kpart_decode_ = true;
         int old_gateup_kparts_ = 16;
-        bool old_down_kpart_decode_ = true;
         int old_down_kparts_ = 16;
     };
 
@@ -1020,12 +1012,11 @@ namespace
             envInt("LLAMINAR_MOE_VERIFIER_PREFILL_CUDA_DOWN_KPARTS",
                    llaminar2::debugEnv().gemm.cuda_moe_down_kparts);
         /*
-         * Production defaults remain in DebugEnv. These optional harness
-         * overrides let the verifier-prefill speedometer sweep K-partitioning
-         * policy without source edits, then promote only proven policies.
+         * Ordered K-part execution is mandatory in production. These optional
+         * harness overrides sweep only the partition count, preserving the
+         * decode-equivalent arithmetic contract in every measured variant.
          */
-        gemm_config.set(/*gateup_kpart=*/true, gateup_kparts,
-                        /*down_kpart=*/true, down_kparts);
+        gemm_config.set(gateup_kparts, down_kparts);
 
         const auto hidden_values = makeHiddenValues(rows, d_model);
         const auto routing_indices = unique_routes

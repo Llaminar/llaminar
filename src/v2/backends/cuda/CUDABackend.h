@@ -394,6 +394,7 @@ namespace llaminar2
             bool has_bonus_token,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device) override;
         bool enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
@@ -407,6 +408,7 @@ namespace llaminar2
             bool has_bonus_token,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device) override;
         bool enqueueSummarizeGreedySpeculativeVerifyBatch(
@@ -418,6 +420,7 @@ namespace llaminar2
             int stop_token_count,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device) override;
         bool enqueueDeriveSpeculativePublicationMetadata(

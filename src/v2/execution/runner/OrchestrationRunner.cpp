@@ -1498,10 +1498,10 @@ namespace llaminar2
                 return false;
             }
             const int effective_max_draft_tokens = effectiveMTPMaxDraftDepth(active_mtp);
-            if (effective_max_draft_tokens < 1 || effective_max_draft_tokens > 3)
+            if (effective_max_draft_tokens < 1)
             {
                 return setError(
-                    "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4");
+                    "MTP decode requires --mtp-draft-tokens >= 1");
             }
             if (effective_max_draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
             {
@@ -2506,11 +2506,11 @@ namespace llaminar2
             return batch_result;
         }
         const int draft_depth = effectiveMTPMaxDraftDepth(mtp);
-        if (draft_depth < 1 || draft_depth > 3)
+        if (draft_depth < 1)
         {
             batch_result.error =
                 "decodeStepBatch() request-batched verifier continuation "
-                "requires --mtp-draft-tokens in [1, 3]";
+                "requires --mtp-draft-tokens >= 1";
             return batch_result;
         }
         if (draft_depth > 1 && !runner_->supportsChainedMTPDrafts())
@@ -3843,8 +3843,7 @@ namespace llaminar2
                         static_cast<int>(request.draft_tokens.size());
                     const int compare_rows = verifier_token_count - 1;
                     if (compare_rows <= 0 ||
-                        compare_rows >
-                            sampling_math::kSpeculativeBatchMaxRows ||
+                        compare_rows > draft_depth ||
                         static_cast<int>(verifier_input_plan.query_start_locs.size()) <=
                             static_cast<int>(i))
                     {
@@ -3897,6 +3896,11 @@ namespace llaminar2
                         batched_request_states_[static_cast<size_t>(request_id)]
                             .stochastic_position_seed;
                     DeviceStochasticBatchOutcomeRequest descriptor;
+                    if (!descriptor.ensureHostRowCapacity(compare_rows))
+                    {
+                        return set_producer_error(
+                            "stochastic request-batch verifier could not size its host diagnostic descriptor");
+                    }
                     descriptor.request_id = request_id;
                     descriptor.first_target_slot = first_compact_row;
                     descriptor.first_draft_slot = first_draft_slot;
@@ -4425,9 +4429,9 @@ namespace llaminar2
             return {};
 
         const int effective_max_draft_tokens = effectiveMTPMaxDraftDepth(mtp);
-        if (effective_max_draft_tokens < 1 || effective_max_draft_tokens > 3)
+        if (effective_max_draft_tokens < 1)
         {
-            return "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4";
+            return "MTP decode requires --mtp-draft-tokens >= 1";
         }
         if (effective_max_draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
         {
@@ -4447,7 +4451,7 @@ namespace llaminar2
              * CPU Global/NodeLocal TP owns a complete stochastic distribution
              * through graph collectives: the ordinary target verifier gathers its
              * row-indexed LM-head output, and the MTP sidecar now terminates with
-             * an explicit allgather of its compact one-to-four sharded rows.  Every
+             * an explicit allgather of its configured compact row batch. Every
              * rank therefore consumes the same exact full-vocabulary bytes while
              * retaining economical column-sharded head compute.
              *
@@ -4481,13 +4485,7 @@ namespace llaminar2
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
         {
-            return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_DECODE; use LLAMINAR_ROCM_CONCURRENT_M2_ROWS for M=2 verifier experiments";
-        }
-        if (runner_->primaryDeviceId().is_rocm() &&
-            debugEnv().execution.gpu_graphs &&
-            debugEnv().rocm.concurrent_m2_rows)
-        {
-            return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_M2_ROWS when LLAMINAR_GPU_GRAPHS=1; M=2 row-overlap launches side streams that are not graph-capture safe";
+            return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_DECODE";
         }
         return {};
     }
@@ -4539,11 +4537,7 @@ namespace llaminar2
 
     int OrchestrationRunner::effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const
     {
-        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed)
-        {
-            return mtp.draft_tokens;
-        }
-        return mtp.depth_policy.max_depth > 0 ? mtp.depth_policy.max_depth : mtp.draft_tokens;
+        return resolveMTPMaximumDraftDepth(mtp);
     }
 
     bool OrchestrationRunner::ensureMTPDepthController(const MTPRuntimeConfig &mtp)
@@ -8571,7 +8565,7 @@ namespace llaminar2
                         sampling_math::kSpeculativeBatchMaxStopTokens) &&
                 draft_tokens.size() <=
                     static_cast<size_t>(
-                        sampling_math::kSpeculativeBatchMaxOutputTokens);
+                        effectiveMTPMaxDraftDepth(mtp) + 1);
             if (!stochastic_verify &&
                 runner_->primaryDeviceId().is_gpu() &&
                 !use_greedy_device_batch_outcome)
@@ -11745,10 +11739,10 @@ namespace llaminar2
                 if (draft_tokens.empty() ||
                     draft_tokens.size() >
                         static_cast<size_t>(
-                            sampling_math::kSpeculativeBatchMaxOutputTokens))
+                            effectiveMTPMaxDraftDepth(mtp) + 1))
                 {
                     return fail_after_checkpoint(
-                        "Grouped-outcome greedy MTP draft width is outside compact verifier limits");
+                        "Grouped-outcome greedy MTP draft width exceeds the configured verifier graph capacity");
                 }
 
                 const bool first_token_deferred =

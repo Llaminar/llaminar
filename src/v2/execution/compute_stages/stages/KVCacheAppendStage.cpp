@@ -91,7 +91,7 @@ namespace llaminar2
             return false;
 
         if (!params_.kv_cache || params_.layer_idx < 0 || params_.seq_idx < 0 ||
-            request_rows < 2 || request_rows > 4)
+            request_rows < 2)
         {
             LOG_ERROR("[KVCacheAppendStage] Invalid grouped verifier cache-publication contract"
                       << " rows=" << request_rows

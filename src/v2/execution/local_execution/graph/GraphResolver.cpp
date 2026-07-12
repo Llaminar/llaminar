@@ -1105,7 +1105,9 @@ namespace llaminar2
             auto it = config.custom_formulas.find(formula);
             if (it != config.custom_formulas.end())
                 return it->second;
-            return 4;
+            throw std::invalid_argument(
+                "GraphResolver requires an explicit mtp_target_query_rows capacity; "
+                "MTP graph shape must come from runtime policy rather than a fixed small-M default");
         }
         if (formula == "mtp_vocab")
         {

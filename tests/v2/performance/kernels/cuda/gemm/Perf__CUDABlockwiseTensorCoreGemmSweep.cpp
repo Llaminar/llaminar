@@ -48,6 +48,7 @@ extern "C"
     void cudaNativeVNNIGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
         int target_waves, int mkg, int max_kb,
+        int exact_kb,
         int force_two_phase);
     void cudaNativeVNNIGemvSweep_clearConfig();
 }
@@ -137,6 +138,10 @@ namespace
          { return createFastSweepTensor<IQ1_MTensor, IQ1_MBlock>(n, k); }},
         {"Q8_0", [](size_t n, size_t k)
          { return createFastSweepTensor<Q8_0Tensor, Q8_0Block>(n, k); }},
+        {"Q8_1", [](size_t n, size_t k)
+         { return createFastSweepTensor<Q8_1Tensor, Q8_1Block>(n, k); }},
+        {"Q8_K", [](size_t n, size_t k)
+         { return createFastSweepTensor<Q8_KTensor, Q8_KBlock>(n, k); }},
     };
 
     const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
@@ -687,6 +692,7 @@ namespace
                 candidate.target_waves,
                 candidate.mkg,
                 candidate.max_kb,
+                0,
                 candidate.force_two_phase);
 
             if (!kernel)

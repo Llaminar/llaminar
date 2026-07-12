@@ -27,7 +27,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <hipblas/hipblas.h>
+#include <hip/hip_bfloat16.h>
 #include <cstdint>
 #include "../../attention/AttentionDeviceParams.h"
 #include "../../../tensors/BlockStructures.h"
@@ -71,8 +71,9 @@ namespace
     // directly in their native storage format.
     //   FP32: K/V are float*    (4 bytes/element) — baseline
     //   FP16: K/V are __half*   (2 bytes/element) — 2× BW savings + fdot2
+    //   BF16: K/V are hip_bfloat16* (2 bytes/element) — native FP32 conversion
     //   Q8_1: K/V are Q8_1Block* (36 bytes/32 elements) — ~3.5× BW savings
-    enum class KVTypeTag { FP32, FP16, Q8_1 };
+    enum class KVTypeTag { FP32, FP16, BF16, Q8_1 };
 
     /**
      * @brief Derive graph-captured attention params from live KV cache count.
@@ -85,7 +86,8 @@ namespace
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         const int *__restrict__ post_append_cached_tokens,
         int seq_len,
-        int query_rows)
+        int query_rows,
+        int kv_stride)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
@@ -99,6 +101,7 @@ namespace
         const int row_kv_len_raw = kv_len - (query_rows - 1 - row);
         const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
         out[row].kv_len = row_kv_len;
+        out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
         out[row].position_offset = base_position + row;
         out[row].mask_stride = kv_len;
     }
@@ -119,6 +122,7 @@ namespace
     __global__ void hip_write_attention_params_from_geometry_kernel(
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         int kv_len,
+        int kv_stride,
         int position_offset,
         int query_rows)
     {
@@ -129,6 +133,7 @@ namespace
         const int row_kv_len_raw = kv_len - (query_rows - 1 - row);
         const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
         out[row].kv_len = row_kv_len;
+        out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
         out[row].position_offset = position_offset + row;
         out[row].mask_stride = kv_len;
     }
@@ -152,7 +157,8 @@ namespace
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         const int *__restrict__ post_append_cached_tokens,
         int request_count,
-        int query_rows)
+        int query_rows,
+        int kv_stride)
     {
         const int flat_row = static_cast<int>(threadIdx.x);
         const int total_rows = request_count * query_rows;
@@ -171,6 +177,8 @@ namespace
         const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
 
         out[flat_row].kv_len = row_kv_len;
+        out[flat_row].kv_stride =
+            kv_stride > post_append_kv_len ? kv_stride : post_append_kv_len;
         out[flat_row].position_offset = base_position + query_row;
         out[flat_row].mask_stride = post_append_kv_len;
     }
@@ -769,15 +777,101 @@ namespace
     };
 
     /**
+     * @brief Load one logical KV element and convert it to the FP16 LDS format.
+     *
+     * The prefill kernel keeps K and V in their native cache representation
+     * while they reside in HBM.  Conversion happens only as the live tile is
+     * staged into LDS, preserving the bandwidth advantage of FP16 and Q8_1
+     * caches without allocating a graph-unstable full-cache conversion buffer.
+     *
+     * @tparam KV_TYPE Physical cache representation selected at kernel launch.
+     * @param source Beginning of the request-major native cache allocation.
+     * @param logical_element Dense FP32-equivalent element index.  Q8_1 rows
+     *        are block aligned because every supported head dimension is a
+     *        multiple of the 32-element Q8_1 block width.
+     * @return The requested value rounded to the FP16 arithmetic format used
+     *         by the MI50 dot-product pipeline.
+     */
+    template <KVTypeTag KV_TYPE>
+    __device__ __forceinline__ __half load_fa2_kv_element_as_half(
+        const void *__restrict__ source,
+        size_t logical_element)
+    {
+        if constexpr (KV_TYPE == KVTypeTag::FP32)
+        {
+            return float_to_half(static_cast<const float *>(source)[logical_element]);
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::FP16)
+        {
+            return static_cast<const __half *>(source)[logical_element];
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::BF16)
+        {
+            return float_to_half(
+                static_cast<float>(
+                    static_cast<const hip_bfloat16 *>(source)[logical_element]));
+        }
+        else
+        {
+            constexpr size_t ELEMENTS_PER_BLOCK = llaminar2::Q8_1Block::BLOCK_SIZE;
+            const auto *blocks = static_cast<const llaminar2::Q8_1Block *>(source);
+            const auto &block = blocks[logical_element / ELEMENTS_PER_BLOCK];
+            const int element_in_block =
+                static_cast<int>(logical_element % ELEMENTS_PER_BLOCK);
+            const float scale = __half2float(
+                *reinterpret_cast<const __half *>(&block.d));
+            return float_to_half(scale * static_cast<float>(block.qs[element_in_block]));
+        }
+    }
+
+    /**
+     * @brief Load two adjacent KV values in the packed format consumed by fdot2.
+     *
+     * FP32 and FP16 caches retain vectorized global-memory reads.  Q8_1 uses
+     * two scalar block lookups because its scale metadata is shared by 32
+     * values; the resulting pair is still packed before entering LDS.
+     */
+    template <KVTypeTag KV_TYPE>
+    __device__ __forceinline__ __half2 load_fa2_kv_pair_as_half2(
+        const void *__restrict__ source,
+        size_t logical_element)
+    {
+        if constexpr (KV_TYPE == KVTypeTag::FP32)
+        {
+            const float2 values = *reinterpret_cast<const float2 *>(
+                static_cast<const float *>(source) + logical_element);
+            return __float22half2_rn(values);
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::FP16)
+        {
+            return *reinterpret_cast<const __half2 *>(
+                static_cast<const __half *>(source) + logical_element);
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::BF16)
+        {
+            return __halves2half2(
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element),
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element + 1));
+        }
+        else
+        {
+            return __halves2half2(
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element),
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element + 1));
+        }
+    }
+
+    /**
      * @brief Flash Attention 2 prefill kernel for MI50
      *
      * Uses vectorized FP16 VALU operations for Q@K^T computation.
      * No WMMA/Matrix Cores - pure ALU implementation optimized for Vega.
      */
-    __global__ __launch_bounds__(256, 4) void flash_attention_2_mi50_kernel(
+    template <KVTypeTag KV_TYPE, int THREADS_PER_ROW>
+    __global__ __launch_bounds__(256, 2) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
-        const float *__restrict__ K,
-        const float *__restrict__ V,
+        const void *__restrict__ K,
+        const void *__restrict__ V,
         float *__restrict__ O,
         int batch_size,
         int seq_len,
@@ -804,6 +898,7 @@ namespace
         if (device_params)
         {
             kv_len_runtime = device_params->kv_len;
+            kv_stride = device_params->kv_stride;
             position_offset_runtime = device_params->position_offset;
             mask_stride = device_params->mask_stride;
         }
@@ -862,13 +957,14 @@ namespace
 
         // Use 4 threads per Q row so all 256 threads participate when tile_q=64.
         // Each thread owns a disjoint subset of output dims for that row.
-        constexpr int THREADS_PER_ROW = 4;
         const int local_q_row = tid / THREADS_PER_ROW;
         const int row_lane = tid % THREADS_PER_ROW;
         const bool thread_has_row = (local_q_row < q_tile_rows);
 
-        // This tiled kernel runs only for head_dim < 64 (rocBLAS handles >= 64).
-        // THREADS_PER_ROW=4 => max ceil(head_dim/4) = 16 dims per thread.
+        // Both launch variants cap ownership at 32 output dimensions per
+        // thread.  Four lanes cooperate through head_dim 128; eight lanes
+        // cooperate at head_dim 256.  Keeping this bound compile-time visible
+        // prevents the accumulator array from growing with the context length.
         float O_acc[32];
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
@@ -884,8 +980,9 @@ namespace
 
         // Batch/head pointers
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
-        const float *K_batch = K + batch_idx * kv_stride * n_kv_heads * head_dim;
-        const float *V_batch = V + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const size_t request_element_offset =
+            static_cast<size_t>(batch_idx) * static_cast<size_t>(kv_stride) *
+            static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
 
         // =====================================================================
         // Load Q tile into LDS (done once per block)
@@ -940,14 +1037,18 @@ namespace
                     int d2 = i % head_dim_vec2;
                     int d = d2 * 2;
                     int global_row = kv_start + local_row;
+                    const size_t element =
+                        request_element_offset +
+                        (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                            static_cast<size_t>(head_dim) +
+                        static_cast<size_t>(d);
 
-                    const float2 kv = *reinterpret_cast<const float2 *>(
-                        K_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-                    const float2 vv = *reinterpret_cast<const float2 *>(
-                        V_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-
-                    reinterpret_cast<__half2 *>(K_dst + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(kv);
-                    reinterpret_cast<__half2 *>(V_dst + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(vv);
+                    reinterpret_cast<__half2 *>(
+                        K_dst + local_row * lds_layout.kv_stride + d)[0] =
+                        load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
+                    reinterpret_cast<__half2 *>(
+                        V_dst + local_row * lds_layout.kv_stride + d)[0] =
+                        load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
                 }
             }
             else
@@ -957,12 +1058,16 @@ namespace
                     int local_row = i / head_dim;
                     int d = i % head_dim;
                     int global_row = kv_start + local_row;
+                    const size_t element =
+                        request_element_offset +
+                        (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                            static_cast<size_t>(head_dim) +
+                        static_cast<size_t>(d);
 
-                    float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                    float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-
-                    K_dst[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
-                    V_dst[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                    K_dst[local_row * lds_layout.kv_stride + d] =
+                        load_fa2_kv_element_as_half<KV_TYPE>(K, element);
+                    V_dst[local_row * lds_layout.kv_stride + d] =
+                        load_fa2_kv_element_as_half<KV_TYPE>(V, element);
                 }
             }
         }
@@ -1011,14 +1116,18 @@ namespace
                         int d2 = i % head_dim_vec2;
                         int d = d2 * 2;
                         int global_row = next_kv_start + local_row;
+                        const size_t element =
+                            request_element_offset +
+                            (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                                static_cast<size_t>(head_dim) +
+                            static_cast<size_t>(d);
 
-                        const float2 kv = *reinterpret_cast<const float2 *>(
-                            K_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-                        const float2 vv = *reinterpret_cast<const float2 *>(
-                            V_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-
-                        reinterpret_cast<__half2 *>(K_next + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(kv);
-                        reinterpret_cast<__half2 *>(V_next + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(vv);
+                        reinterpret_cast<__half2 *>(
+                            K_next + local_row * lds_layout.kv_stride + d)[0] =
+                            load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
+                        reinterpret_cast<__half2 *>(
+                            V_next + local_row * lds_layout.kv_stride + d)[0] =
+                            load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
                     }
                 }
                 else
@@ -1028,12 +1137,16 @@ namespace
                         int local_row = i / head_dim;
                         int d = i % head_dim;
                         int global_row = next_kv_start + local_row;
+                        const size_t element =
+                            request_element_offset +
+                            (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                                static_cast<size_t>(head_dim) +
+                            static_cast<size_t>(d);
 
-                        float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                        float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-
-                        K_next[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
-                        V_next[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                        K_next[local_row * lds_layout.kv_stride + d] =
+                            load_fa2_kv_element_as_half<KV_TYPE>(K, element);
+                        V_next[local_row * lds_layout.kv_stride + d] =
+                            load_fa2_kv_element_as_half<KV_TYPE>(V, element);
                     }
                 }
             }
@@ -1448,11 +1561,12 @@ namespace
             ROW_MODE == FlashDecodeRowMode::SharedKVVerifier;
 
         int kv_len_runtime = kv_len;
-        const int kv_batch_stride = kv_len;
+        int kv_batch_stride = kv_len;
         if (device_params)
         {
             const int param_row = ROW_LOCAL_PARAMS ? blockIdx.z : 0;
             kv_len_runtime = device_params[param_row].kv_len;
+            kv_batch_stride = device_params[param_row].kv_stride;
         }
 
         const int head_idx = blockIdx.x;
@@ -1544,7 +1658,8 @@ namespace
 
         // Load Q into LDS (all threads cooperate)
         // FP16 KV path: store Q as half in LDS (convert once, use many times)
-        // FP32/Q8_1 paths: store Q as float in LDS (matching their dot product type)
+        // FP32/BF16/Q8_1 paths store Q as float in LDS so BF16 and Q8_1
+        // dequantization retains the scalar FP32 decode arithmetic contract.
         extern __shared__ char smem[];
         [[maybe_unused]] float *Q_shared = nullptr;
         [[maybe_unused]] __half *Q_shared_h = nullptr;
@@ -1628,6 +1743,10 @@ namespace
             row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(__half);
             base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
                           + static_cast<size_t>(kv_head_offset_elems) * sizeof(__half);
+        } else if constexpr (KV_TYPE == KVTypeTag::BF16) {
+            row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(hip_bfloat16);
+            base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
+                          + static_cast<size_t>(kv_head_offset_elems) * sizeof(hip_bfloat16);
         } else {
             row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(float);
             base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
@@ -1688,6 +1807,16 @@ namespace
                     partial_dot += Q_shared[d] * (static_cast<float>(Kq[bi].qs[bo]) * ks);
                 }
             }
+            else if constexpr (KV_TYPE == KVTypeTag::BF16)
+            {
+                const auto *K_bf16 =
+                    reinterpret_cast<const hip_bfloat16 *>(K_pos);
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                {
+                    partial_dot +=
+                        Q_shared[d] * static_cast<float>(K_bf16[d]);
+                }
+            }
             else
             {
                 const float *K_ptr = reinterpret_cast<const float*>(K_pos);
@@ -1746,6 +1875,19 @@ namespace
                     const int bo = d % Q8_BS;
                     const float vs = __half2float(*reinterpret_cast<const __half*>(&Vq[bi].d));
                     O_lane[o_idx] = O_lane[o_idx] * scale_old + p * (static_cast<float>(Vq[bi].qs[bo]) * vs);
+                }
+            }
+            else if constexpr (KV_TYPE == KVTypeTag::BF16)
+            {
+                const auto *V_bf16 =
+                    reinterpret_cast<const hip_bfloat16 *>(V_pos);
+                for (int d = lane_id;
+                     d < head_dim;
+                     d += WAVEFRONT_SIZE, ++o_idx)
+                {
+                    O_lane[o_idx] =
+                        O_lane[o_idx] * scale_old +
+                        p * static_cast<float>(V_bf16[d]);
                 }
             }
             else
@@ -1984,6 +2126,170 @@ namespace
     }
 
 } // anonymous namespace
+
+// =============================================================================
+// Device-resident prefill launch template
+// =============================================================================
+
+/**
+ * @brief Launch the native-format ROCm prefill kernel with stable graph shape.
+ *
+ * Tile selection depends only on the immutable head dimension and MI50 LDS
+ * capacity.  In particular, neither the live KV length nor the current cache
+ * fill level changes the grid or shared-memory allocation.  A captured graph
+ * can therefore replay after later cache appends: the kernel reads the new
+ * logical length and fixed physical request stride from @p device_params.
+ *
+ * The cache remains compressed in HBM for FP16 and Q8_1.  Only each live K/V
+ * tile is converted to the half-precision LDS representation used by gfx906
+ * `v_dot2_f32_f16`, avoiding full-cache conversion buffers and host-sized GEMM
+ * launches.
+ *
+ * @tparam KV_TYPE Physical representation of the resident K/V cache.
+ * @return Zero after a valid launch, or -1 when geometry is unsupported or
+ *         HIP reports a launch error.
+ */
+template <KVTypeTag KV_TYPE>
+static int launch_device_resident_prefill(
+    const float *Q,
+    const void *K,
+    const void *V,
+    float *O,
+    int batch_size,
+    int seq_len,
+    int kv_len,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    bool causal,
+    int window_size,
+    int position_offset,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    const float *mask,
+    hipStream_t hip_stream,
+    int head_start,
+    int gqa_n_rep)
+{
+    if (!Q || !K || !V || !O || batch_size <= 0 || seq_len <= 0 ||
+        kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || head_dim > 256)
+    {
+        printf("[launch_device_resident_prefill] Invalid pointers or geometry\n");
+        return -1;
+    }
+    if (n_heads % n_kv_heads != 0)
+    {
+        printf("[launch_device_resident_prefill] n_heads must be divisible by n_kv_heads\n");
+        return -1;
+    }
+    if constexpr (KV_TYPE == KVTypeTag::Q8_1)
+    {
+        if (head_dim % static_cast<int>(llaminar2::Q8_1Block::BLOCK_SIZE) != 0)
+        {
+            printf("[launch_device_resident_prefill] Q8_1 head_dim must be a multiple of 32\n");
+            return -1;
+        }
+    }
+
+    struct TileCandidate
+    {
+        int q;
+        int kv;
+    };
+
+    // Larger tile area wins; ties prefer more query rows so a K/V tile is
+    // reused by more work.  The 32x16 and 16x16 candidates keep head_dim 256
+    // comfortably below MI50's 64 KiB LDS limit.
+    constexpr TileCandidate candidates[] = {
+        {64, 64},
+        {64, 32},
+        {32, 64},
+        {32, 32},
+        {32, 16},
+        {16, 32},
+        {16, 16},
+        {8, 16},
+        {8, 8},
+    };
+
+    constexpr int THREADS_PER_BLOCK = 256;
+    const int threads_per_row = head_dim <= 128 ? 4 : 8;
+    const int max_tile_q = THREADS_PER_BLOCK / threads_per_row;
+    int tile_q = -1;
+    int tile_kv = -1;
+    int best_area = -1;
+    FA2LDSLayout lds_layout{};
+
+    for (const auto &candidate : candidates)
+    {
+        if (candidate.q > max_tile_q)
+            continue;
+
+        FA2LDSLayout candidate_layout;
+        candidate_layout.compute(head_dim, candidate.q, candidate.kv);
+        if (candidate_layout.total_size > LDS_SIZE_BYTES)
+            continue;
+
+        const int area = candidate.q * candidate.kv;
+        if (area > best_area || (area == best_area && candidate.q > tile_q))
+        {
+            tile_q = candidate.q;
+            tile_kv = candidate.kv;
+            best_area = area;
+            lds_layout = candidate_layout;
+        }
+    }
+
+    if (best_area < 0)
+    {
+        printf("[launch_device_resident_prefill] No LDS tile fits head_dim=%d\n", head_dim);
+        return -1;
+    }
+
+    const float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
+    const dim3 grid(n_heads, num_q_tiles, batch_size);
+    const dim3 block(THREADS_PER_BLOCK);
+
+    // Discard an error left by an earlier asynchronous operation before the
+    // launch, then report only the status produced by this kernel.
+    (void)hipGetLastError();
+    if (threads_per_row == 4)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<KV_TYPE, 4>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<KV_TYPE, 8>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep);
+    }
+
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        printf("[launch_device_resident_prefill] Kernel launch failed: %s\n",
+               hipGetErrorString(error));
+        return -1;
+    }
+    return 0;
+}
 
 // =============================================================================
 // Flash Decoding launch template (outside extern "C" — templates need C++ linkage)
@@ -2285,635 +2591,6 @@ static int launch_grouped_decode(
 }
 
 // =============================================================================
-// rocBLAS-based Prefill Attention (Two-pass GEMM + Causal Softmax)
-// =============================================================================
-// Strategy: use rocBLAS (Tensile) tiled GEMMs for QK^T and PV, connected by a
-// custom causal softmax kernel. This gives 24-32× better data reuse per tile
-// compared to streaming K/V from HBM per query position.
-//
-// Per head:
-//   1) S = (1/√d) * Q_h @ K_{kh}^T    [seq × kv_len]  via hipBLAS SGEMM
-//   2) P = causal_softmax(S)            [seq × kv_len]  custom HIP kernel
-//   3) O_h = P @ V_{kh}                [seq × hdim]    via hipBLAS SGEMM
-//
-// Memory layout (all row-major, interleaved heads):
-//   Q[batch, seq, n_heads * head_dim]   — Q_h at offset h*head_dim, stride n_heads*head_dim
-//   K[batch, kv,  n_kv_heads * head_dim]
-//   V[batch, kv,  n_kv_heads * head_dim]
-//   O[batch, seq, n_heads * head_dim]
-// =============================================================================
-
-/**
- * @brief Row-wise causal softmax (2-pass): P[i,j] = softmax(S[i, 0..i+pos_off])
- *
- * Optimizations vs the original 3-pass kernel:
- *   - softmax_scale is folded into the QK^T GEMM alpha, so scores arrive pre-scaled
- *   - Pass 1 is read-only (find max), eliminating seq×kv_len global writes
- *   - Pass 2 fuses exp+sum and normalize: each thread holds exp values in registers,
- *     reduces the sum, then writes final normalized values — 1 read + 1 write total
- *
- * Memory traffic: 2 reads + 1 write per element (was 3 reads + 3 writes).
- *
- * Each block processes one row. 256 threads (4 wavefronts) cooperate.
- * Register budget: MAX_ELEMS_PER_THREAD × 4 bytes. For kv_len ≤ 8192 with 256
- * threads, that's ≤ 32 registers per thread — well within gfx906's 256 VGPRs.
- */
-__global__ __launch_bounds__(256, 4)
-void causal_softmax_inplace_kernel(
-    float* __restrict__ S,
-    int total_rows,
-    int seq_len,
-    int kv_len,
-    int position_offset,
-    const float* __restrict__ mask,
-    int mask_stride)
-{
-    const int row = blockIdx.x;
-    if (row >= total_rows) return;
-
-    float* row_data = S + static_cast<size_t>(row) * kv_len;
-    const int seq_pos = row % seq_len;
-    const int last_valid = seq_pos + position_offset;
-    constexpr int WARP_SIZE = 64;
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int lane_id = threadIdx.x % WARP_SIZE;
-
-    // Pass 1: Find row max (read-only — scores are pre-scaled by GEMM alpha)
-    float local_max = -FLT_MAX;
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
-        if (j <= last_valid && mask_val > -1.0e20f) {
-            local_max = fmaxf(local_max, row_data[j] + mask_val);
-        }
-    }
-
-    // Wavefront-level max reduce
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
-
-    __shared__ float shared_max[4];
-    if (lane_id == 0) shared_max[warp_id] = local_max;
-    __syncthreads();
-
-    float row_max;
-    if (threadIdx.x < 4) {
-        row_max = shared_max[threadIdx.x];
-        for (int offset = 2; offset > 0; offset >>= 1)
-            row_max = fmaxf(row_max, __shfl_xor(row_max, offset));
-        shared_max[0] = row_max;
-    }
-    __syncthreads();
-    row_max = shared_max[0];
-
-    // Pass 2: Fused exp + sum + normalize
-    // Each thread computes exp values into a register array, reduces the sum,
-    // then writes normalized values — one read + one write per element.
-    constexpr int MAX_ELEMS_PER_THREAD = 32;  // Supports kv_len ≤ 8192 @ 256 threads
-    constexpr float LOG2E = 1.4426950408889634f;
-    float local_exp[MAX_ELEMS_PER_THREAD];
-    float local_sum = 0.0f;
-
-    const int elems_per_thread = (kv_len + blockDim.x - 1) / blockDim.x;
-
-    // Sub-pass 2a: compute exp values into registers, accumulate sum
-    for (int i = 0; i < elems_per_thread; i++) {
-        int j = threadIdx.x + i * blockDim.x;
-        float val = 0.0f;
-        if (j < kv_len) {
-            const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
-            if (j <= last_valid && mask_val > -1.0e20f) {
-                val = exp2f((row_data[j] + mask_val - row_max) * LOG2E);
-            }
-        }
-        local_exp[i] = val;
-        local_sum += val;
-    }
-
-    // Wavefront-level sum reduce
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        local_sum += __shfl_xor(local_sum, offset);
-
-    __shared__ float shared_sum[4];
-    if (lane_id == 0) shared_sum[warp_id] = local_sum;
-    __syncthreads();
-
-    float row_sum;
-    if (threadIdx.x < 4) {
-        row_sum = shared_sum[threadIdx.x];
-        for (int offset = 2; offset > 0; offset >>= 1)
-            row_sum += __shfl_xor(row_sum, offset);
-        shared_sum[0] = row_sum;
-    }
-    __syncthreads();
-    row_sum = shared_sum[0];
-
-    // Sub-pass 2b: normalize and write
-    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-    for (int i = 0; i < elems_per_thread; i++) {
-        int j = threadIdx.x + i * blockDim.x;
-        if (j < kv_len) {
-            row_data[j] = local_exp[i] * inv_sum;
-        }
-    }
-}
-
-namespace {
-
-// Cached hipBLAS handles (one per device, created on first use)
-static hipblasHandle_t get_cached_rocblas_handle(int device_id) {
-    static std::mutex mtx;
-    static std::unordered_map<int, hipblasHandle_t> handles;
-
-    std::lock_guard<std::mutex> lock(mtx);
-    auto it = handles.find(device_id);
-    if (it != handles.end()) return it->second;
-
-    hipblasHandle_t h = nullptr;
-    hipblasStatus_t status = hipblasCreate(&h);
-    if (status != HIPBLAS_STATUS_SUCCESS) {
-        printf("[rocblas_prefill] Failed to create hipBLAS handle for device %d\n", device_id);
-        return nullptr;
-    }
-    // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels.
-    // Atomic accumulation produces nondeterministic floating-point reduction
-    // order across runs, which causes parity tests to drift ~14x in KL
-    // divergence and occasionally fail tight thresholds. The deterministic
-    // (non-atomic) Tensile paths are selected instead; perf impact is minor
-    // on gfx906 since SGEMM there is compute-bound, not reduction-bound.
-    hipblasSetAtomicsMode(h, HIPBLAS_ATOMICS_NOT_ALLOWED);
-    handles[device_id] = h;
-    return h;
-}
-
-// ─── Multi-stream infrastructure for GQA group pipelining ───
-// Each stream gets its own hipBLAS handle and scores buffer so that
-// consecutive GQA groups can overlap QK^T / softmax / PV across streams.
-constexpr int NUM_PREFILL_STREAMS = 2;
-
-struct PrefillStreamCtx {
-    hipStream_t stream = nullptr;
-    hipblasHandle_t handle = nullptr;
-    float* scores_buf = nullptr;
-    size_t scores_cap = 0;
-    hipEvent_t completion_event = nullptr;  // Signals when this stream's work is done
-};
-
-// Per-device input readiness event: recorded on the caller's stream so pool
-// streams can wait for Q/K/V data to be fully written before reading.
-struct PrefillPoolState {
-    std::array<PrefillStreamCtx, NUM_PREFILL_STREAMS> streams;
-    hipEvent_t input_ready = nullptr;  // Recorded on caller's stream before dispatch
-};
-
-static std::mutex s_stream_mtx;
-static std::unordered_map<int, PrefillPoolState> s_stream_pools;
-
-static PrefillPoolState& get_stream_pool(int device_id) {
-    std::lock_guard<std::mutex> lock(s_stream_mtx);
-    auto it = s_stream_pools.find(device_id);
-    if (it != s_stream_pools.end()) return it->second;
-
-    // Ensure streams/handles are created on the correct device for multi-GPU TP
-    (void)hipSetDevice(device_id);
-
-    auto& state = s_stream_pools[device_id];
-    for (int i = 0; i < NUM_PREFILL_STREAMS; i++) {
-        (void)hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
-        hipblasCreate(&state.streams[i].handle);
-        hipblasSetStream(state.streams[i].handle, state.streams[i].stream);
-        // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels for
-        // deterministic output (see get_cached_rocblas_handle for rationale).
-        hipblasSetAtomicsMode(state.streams[i].handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
-        (void)hipEventCreateWithFlags(&state.streams[i].completion_event, hipEventDisableTiming);
-    }
-    (void)hipEventCreateWithFlags(&state.input_ready, hipEventDisableTiming);
-    return state;
-}
-
-static float* ensure_scores_buffer(PrefillStreamCtx& ctx, size_t required_bytes) {
-    if (required_bytes > ctx.scores_cap) {
-        if (ctx.scores_buf) (void)hipFree(ctx.scores_buf);
-        hipError_t err = hipMalloc(&ctx.scores_buf, required_bytes);
-        if (err != hipSuccess) {
-            ctx.scores_buf = nullptr;
-            ctx.scores_cap = 0;
-            return nullptr;
-        }
-        ctx.scores_cap = required_bytes;
-    }
-    return ctx.scores_buf;
-}
-
-/**
- * @brief rocBLAS two-pass prefill attention (FP32 KV)
- *
- * Optimizations over the initial implementation:
- *   - softmax_scale folded into QK^T GEMM alpha (eliminates per-element multiply)
- *   - Multi-stream pipelining: 2 HIP streams overlap consecutive GQA groups
- *     (group N's PV overlaps with group N+1's QK^T)
- *   - Per-stream scores buffers (no contention, independent lifetimes)
- *   - PV GEMM uses OP_T for V to hit Tensile's optimized (OP_T, OP_N) path
- *   - 2-pass softmax: fused exp+sum+normalize eliminates one full R/W pass
- *
- * Uses hipblasSgemmStridedBatched to process all Q heads within each GQA group
- * in a single GEMM call (one QK^T batch + one PV batch per KV head).
- * For Qwen 7B (28h, 4kv): 8 GEMMs + 4 softmax = 12 launches across 2 streams.
- */
-static int rocblas_prefill_impl(
-    const float *Q, const float *K, const float *V, float *O,
-    int batch_size, int seq_len, int kv_len,
-    int n_heads, int n_kv_heads, int head_dim,
-    float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream,
-    const float *mask = nullptr,
-    int mask_stride = 0,
-    int head_start = 0, int gqa_n_rep = 0)
-{
-    int device_id = 0;
-    (void)hipGetDevice(&device_id);
-
-    auto& pool_state = get_stream_pool(device_id);
-    auto& pool = pool_state.streams;
-
-    // ─── Input fence: pool streams must wait for caller's stream ───
-    // Q/K/V data is written by upstream stages (QKV projection, RoPE, KV append)
-    // on hip_stream. Pool streams use hipStreamNonBlocking, which does NOT
-    // implicitly sync with the caller's stream. Without this fence, pool
-    // streams can read stale Q/K/V data from prior pipeline iterations.
-    (void)hipEventRecord(pool_state.input_ready, hip_stream);
-    for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-        (void)hipStreamWaitEvent(pool[s].stream, pool_state.input_ready, 0);
-    }
-
-    const int gqa_ratio = n_heads / n_kv_heads;
-    // Effective GQA repetition: use global ratio when provided (TP replicated KV)
-    const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : gqa_ratio;
-
-    // Per-stream scores buffer: sized for max local Q heads in any single KV group
-    const size_t scores_per_head = static_cast<size_t>(seq_len) * kv_len;
-    // When using global GQA mapping, a single KV head may serve up to n_heads local Q heads
-    const int max_group_size = (gqa_n_rep > 0) ? n_heads : gqa_ratio;
-    const size_t scores_per_group = static_cast<size_t>(max_group_size) * scores_per_head;
-    const size_t scores_bytes = scores_per_group * sizeof(float);
-
-    // Ensure all stream buffers are large enough
-    for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-        if (!ensure_scores_buffer(pool[s], scores_bytes)) return -1;
-    }
-
-    const float alpha_one = 1.0f;
-    const float beta_zero = 0.0f;
-
-    // Leading dimensions (row strides for interleaved head layout)
-    const int lda_q = n_heads * head_dim;
-    const int lda_k = n_kv_heads * head_dim;
-    const int lda_v = n_kv_heads * head_dim;
-    const int lda_o = n_heads * head_dim;
-
-    // QK^T strides (within a GQA group)
-    const long long strideB_qkt = head_dim;             // Q: consecutive heads
-    const long long strideA_qkt = 0;                    // K: shared across group
-    const long long strideC_qkt = static_cast<long long>(scores_per_head);
-
-    // PV strides — O^T = V^T @ P^T with OP_T on V
-    // V is row-major with stride lda_v; transposing gives column-major access
-    const long long strideA_pv = 0;                     // V: shared across group
-    const long long strideB_pv = static_cast<long long>(scores_per_head);
-    const long long strideC_pv = head_dim;              // O: interleaved heads
-
-    int pos_off = causal ? position_offset : (kv_len - 1);
-    if (mask && mask_stride <= 0) {
-        mask_stride = kv_len;
-    }
-
-    for (int b = 0; b < batch_size; b++) {
-        const float* Q_batch = Q + static_cast<size_t>(b) * seq_len * lda_q;
-        const float* K_batch = K + static_cast<size_t>(b) * kv_len * lda_k;
-        const float* V_batch = V + static_cast<size_t>(b) * kv_len * lda_v;
-        float* O_batch = O + static_cast<size_t>(b) * seq_len * lda_o;
-        const float* mask_batch = mask ? mask + static_cast<size_t>(b) * seq_len * mask_stride : nullptr;
-
-        for (int kh = 0; kh < n_kv_heads; kh++) {
-            // TP-aware GQA mapping: compute which LOCAL Q heads map to this KV head
-            // Global Q heads [kh * effective_gqa, (kh+1) * effective_gqa) use KV head kh
-            // Local Q heads are [0, n_heads) corresponding to global [head_start, head_start + n_heads)
-            int local_first, local_last;
-            if (gqa_n_rep > 0) {
-                int global_q_first = kh * effective_gqa;
-                int global_q_last = (kh + 1) * effective_gqa - 1;
-                local_first = max(0, global_q_first - head_start);
-                local_last = min(n_heads - 1, global_q_last - head_start);
-            } else {
-                // Standard (non-TP) path: uniform gqa_ratio heads per KV head
-                local_first = kh * gqa_ratio;
-                local_last = local_first + gqa_ratio - 1;
-            }
-            if (local_first > local_last) continue;  // No local Q heads for this KV head
-            const int local_group_size = local_last - local_first + 1;
-
-            const int stream_idx = kh % NUM_PREFILL_STREAMS;
-            auto& ctx = pool[stream_idx];
-
-            const float* Q_group = Q_batch + local_first * head_dim;
-            const float* K_kh = K_batch + kh * head_dim;
-            const float* V_kh = V_batch + kh * head_dim;
-            float* O_group = O_batch + local_first * head_dim;
-
-            // ─── Pass 1: S = softmax_scale * Q @ K^T  (scale baked into alpha) ───
-            hipblasStatus_t status = hipblasSgemmStridedBatched(
-                ctx.handle,
-                HIPBLAS_OP_T, HIPBLAS_OP_N,
-                kv_len, seq_len, head_dim,
-                &softmax_scale,                              // α = 1/√d (#4)
-                K_kh, lda_k, strideA_qkt,
-                Q_group, lda_q, strideB_qkt,
-                &beta_zero,
-                ctx.scores_buf, kv_len, strideC_qkt,
-                local_group_size);
-            if (status != HIPBLAS_STATUS_SUCCESS) {
-                printf("[rocblas_prefill] QK^T GEMM failed: %d (kv_head %d)\n", (int)status, kh);
-                return -1;
-            }
-
-            // ─── Pass 2: causal softmax (no scale — already applied) ───
-            dim3 grid_sm(local_group_size * seq_len);
-            dim3 block_sm(256);
-            hipLaunchKernelGGL(
-                causal_softmax_inplace_kernel,
-                grid_sm, block_sm, 0, ctx.stream,
-                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off,
-                mask_batch, mask_stride);
-
-            // ─── Pass 3: O = P @ V ───
-            status = hipblasSgemmStridedBatched(
-                ctx.handle,
-                HIPBLAS_OP_N, HIPBLAS_OP_N,
-                head_dim, seq_len, kv_len,
-                &alpha_one,
-                V_kh, lda_v, strideA_pv,
-                ctx.scores_buf, kv_len, strideB_pv,
-                &beta_zero,
-                O_group, lda_o, strideC_pv,
-                local_group_size);
-            if (status != HIPBLAS_STATUS_SUCCESS) {
-                printf("[rocblas_prefill] PV GEMM failed: %d (kv_head %d)\n", (int)status, kh);
-                return -1;
-            }
-        }
-
-        // ─── Output fence: rejoin pool streams to caller's stream ───
-        // Event fence: makes hip_stream aware of pool completion so
-        // subsequent GPU work on hip_stream waits for attention output.
-        // No CPU-side sync needed — all downstream stages operate on hip_stream
-        // which will wait for the events before proceeding.
-        for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-            (void)hipEventRecord(pool[s].completion_event, pool[s].stream);
-            (void)hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
-        }
-    }
-
-    return 0;
-}
-
-// =============================================================================
-// FP16/Q8_1 KV Dequantization Kernels + rocBLAS Wrapper
-// =============================================================================
-// Strategy: dequantize K/V to a temporary FP32 buffer, then reuse the FP32
-// rocblas_prefill_impl. This avoids per-position HBM streaming and leverages
-// rocBLAS Tensile GEMM tiles for optimal throughput on gfx906.
-//
-// The dequant + SGEMM path trades a small dequant kernel launch for dramatically
-// better GEMM data reuse. On MI50 (no matrix cores), FP32 SGEMM is already the
-// optimal compute path, so pre-dequanting to FP32 has zero compute penalty.
-// =============================================================================
-
-/**
- * @brief Dequantize interleaved FP16 KV to FP32
- *
- * Layout: [batch_size, kv_len, n_kv_heads * head_dim] flattened into one
- * contiguous row span — one element per thread.
- * Each FP16 value is converted in-place to FP32 in the output buffer,
- * preserving the interleaved head layout for rocBLAS.
- */
-__global__ void dequant_fp16_to_fp32_kernel(
-    const half* __restrict__ src,
-    float* __restrict__ dst,
-    int total_elements)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        dst[idx] = __half2float(src[idx]);
-    }
-}
-
-/**
- * @brief Dequantize interleaved Q8_1 KV to FP32
- *
- * Layout: K/V are stored as Q8_1Blocks in interleaved head layout:
- *   [batch_size, kv_len, n_kv_heads, blocks_per_head] where
- *   blocks_per_head = head_dim / 32
- *
- * Each thread processes one Q8_1Block (32 elements): scale × int8 → float.
- * Output is written to the matching position in FP32 interleaved layout.
- */
-__global__ void dequant_q8_1_to_fp32_kernel(
-    const llaminar2::Q8_1Block* __restrict__ src,
-    float* __restrict__ dst,
-    int total_blocks,
-    int n_kv_heads,
-    int head_dim)
-{
-    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (block_idx >= total_blocks) return;
-
-    constexpr int BLOCK_SIZE = 32;  // Q8_1Block::BLOCK_SIZE
-    const int blocks_per_head = head_dim / BLOCK_SIZE;
-
-    // Decode the flattened [batch, kv_pos, kv_head, block_within_head]
-    // position. Batch and KV position can remain flattened because both the
-    // source and the rocBLAS destination use contiguous request-major rows.
-    const int blocks_per_row = n_kv_heads * blocks_per_head;
-    const int kv_pos = block_idx / blocks_per_row;
-    const int rem = block_idx % blocks_per_row;
-    const int kv_head = rem / blocks_per_head;
-    const int blk = rem % blocks_per_head;
-
-    const auto& block = src[block_idx];
-    // FP16 scale → FP32
-    float scale = __half2float(*reinterpret_cast<const half*>(&block.d));
-
-    // Output offset in FP32 request-major interleaved layout.
-    int dst_base = kv_pos * (n_kv_heads * head_dim) + kv_head * head_dim + blk * BLOCK_SIZE;
-
-    #pragma unroll
-    for (int i = 0; i < BLOCK_SIZE; i++) {
-        dst[dst_base + i] = scale * static_cast<float>(block.qs[i]);
-    }
-}
-
-// Cached dequant buffer (grow-only, per-device, for FP16/Q8_1 → FP32 KV)
-struct DequantBuf {
-    float* ptr = nullptr;
-    size_t cap = 0;
-};
-static std::mutex s_dequant_mtx;
-static std::unordered_map<int, DequantBuf> s_dequant_bufs;
-
-static float* get_dequant_buffer(int device_id, size_t required_bytes) {
-    std::lock_guard<std::mutex> lock(s_dequant_mtx);
-    auto& buf = s_dequant_bufs[device_id];
-    if (required_bytes > buf.cap) {
-        // Ensure allocation targets the correct device for multi-GPU TP
-        (void)hipSetDevice(device_id);
-        if (buf.ptr) (void)hipFree(buf.ptr);
-        hipError_t err = hipMalloc(&buf.ptr, required_bytes);
-        if (err != hipSuccess) {
-            printf("[rocblas_prefill] hipMalloc failed for dequant buffer (%zu bytes)\n", required_bytes);
-            buf.ptr = nullptr;
-            buf.cap = 0;
-            return nullptr;
-        }
-        buf.cap = required_bytes;
-    }
-    return buf.ptr;
-}
-
-/**
- * @brief rocBLAS prefill with FP16 KV cache
- *
- * Dequantizes K/V from FP16 to FP32 in a shared buffer, then delegates
- * to rocblas_prefill_impl. Single dequant buffer holds both K and V
- * sequentially: [K_fp32 | V_fp32].
- */
-static int rocblas_prefill_fp16_impl(
-    const float *Q, const void *K_fp16, const void *V_fp16, float *O,
-    int batch_size, int seq_len, int kv_len,
-    int n_heads, int n_kv_heads, int head_dim,
-    float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream,
-    const float *mask = nullptr,
-    int mask_stride = 0,
-    int head_start = 0, int gqa_n_rep = 0)
-{
-    int device_id = 0;
-    (void)hipGetDevice(&device_id);
-
-    // The rocBLAS consumer advances by one complete KV span per request. The
-    // conversion allocation and launch must therefore include every request,
-    // not merely the first request's kv_len rows.
-    const size_t kv_rows =
-        static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
-    const size_t kv_elements =
-        kv_rows * static_cast<size_t>(n_kv_heads) *
-        static_cast<size_t>(head_dim);
-    if (kv_elements > static_cast<size_t>(std::numeric_limits<int>::max()))
-    {
-        printf("[rocblas_prefill_fp16] Batched KV conversion exceeds kernel index range: %zu elements\n",
-               kv_elements);
-        return -1;
-    }
-    const size_t dequant_bytes = 2 * kv_elements * sizeof(float);  // K + V
-    float* dequant_buf = get_dequant_buffer(device_id, dequant_bytes);
-    if (!dequant_buf) return -1;
-
-    float* K_fp32 = dequant_buf;
-    float* V_fp32 = dequant_buf + kv_elements;
-
-    // Launch dequant kernels (can overlap on same stream since K and V are independent outputs)
-    constexpr int DEQUANT_BLOCK = 256;
-    const int dequant_elements = static_cast<int>(kv_elements);
-    int dequant_grid =
-        (dequant_elements + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;
-
-    hipLaunchKernelGGL(dequant_fp16_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const half*>(K_fp16), K_fp32, dequant_elements);
-
-    hipLaunchKernelGGL(dequant_fp16_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const half*>(V_fp16), V_fp32, dequant_elements);
-
-    // Delegate to FP32 rocBLAS path
-    return rocblas_prefill_impl(
-        Q, K_fp32, V_fp32, O,
-        batch_size, seq_len, kv_len,
-        n_heads, n_kv_heads, head_dim,
-        softmax_scale, causal, position_offset,
-        hip_stream,
-        mask, mask_stride,
-        head_start, gqa_n_rep);
-}
-
-/**
- * @brief rocBLAS prefill with Q8_1 KV cache
- *
- * Dequantizes K/V from Q8_1Block to FP32, then delegates to rocblas_prefill_impl.
- */
-static int rocblas_prefill_q8_1_impl(
-    const float *Q, const void *K_q8, const void *V_q8, float *O,
-    int batch_size, int seq_len, int kv_len,
-    int n_heads, int n_kv_heads, int head_dim,
-    float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream,
-    const float *mask = nullptr,
-    int mask_stride = 0,
-    int head_start = 0, int gqa_n_rep = 0)
-{
-    int device_id = 0;
-    (void)hipGetDevice(&device_id);
-
-    const size_t kv_rows =
-        static_cast<size_t>(batch_size) * static_cast<size_t>(kv_len);
-    const size_t kv_elements =
-        kv_rows * static_cast<size_t>(n_kv_heads) *
-        static_cast<size_t>(head_dim);
-    const size_t dequant_bytes = 2 * kv_elements * sizeof(float);
-    float* dequant_buf = get_dequant_buffer(device_id, dequant_bytes);
-    if (!dequant_buf) return -1;
-
-    float* K_fp32 = dequant_buf;
-    float* V_fp32 = dequant_buf + kv_elements;
-
-    // Total Q8_1 blocks for one K or V tensor
-    const int blocks_per_head = head_dim / 32;
-    const size_t total_blocks_size =
-        kv_rows * static_cast<size_t>(n_kv_heads) *
-        static_cast<size_t>(blocks_per_head);
-    if (total_blocks_size >
-        static_cast<size_t>(std::numeric_limits<int>::max()))
-    {
-        printf("[rocblas_prefill_q8_1] Batched KV conversion exceeds kernel index range: %zu blocks\n",
-               total_blocks_size);
-        return -1;
-    }
-    const int total_blocks = static_cast<int>(total_blocks_size);
-
-    constexpr int DEQUANT_BLOCK = 256;
-    int dequant_grid = (total_blocks + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;
-
-    hipLaunchKernelGGL(dequant_q8_1_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const llaminar2::Q8_1Block*>(K_q8), K_fp32,
-        total_blocks, n_kv_heads, head_dim);
-
-    hipLaunchKernelGGL(dequant_q8_1_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const llaminar2::Q8_1Block*>(V_q8), V_fp32,
-        total_blocks, n_kv_heads, head_dim);
-
-    return rocblas_prefill_impl(
-        Q, K_fp32, V_fp32, O,
-        batch_size, seq_len, kv_len,
-        n_heads, n_kv_heads, head_dim,
-        softmax_scale, causal, position_offset,
-        hip_stream,
-        mask, mask_stride,
-        head_start, gqa_n_rep);
-}
-
-} // anonymous namespace
-
-// =============================================================================
 // Extern "C" Wrapper Functions
 // =============================================================================
 
@@ -2934,120 +2611,14 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        // Input validation
-        if (head_dim <= 0 || head_dim > 256)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Error: head_dim=%d must be in [1, 256]\n", head_dim);
-            return -1;
-        }
-        if (n_heads % n_kv_heads != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Error: n_heads must be divisible by n_kv_heads\n");
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // rocBLAS two-pass prefill: uses Tensile-optimized GEMM tiles for QK^T and PV.
-        if (head_dim >= 64) {
-            return rocblas_prefill_impl(
-                Q, K, V, O,
-                batch_size, seq_len, kv_len,
-                n_heads, n_kv_heads, head_dim,
-                softmax_scale, causal, position_offset,
-                hip_stream, mask, kv_len, head_start, gqa_n_rep);
-        }
-
-        // Fall through to existing tiled kernel for head_dim < 64
-
-        // Adaptively select tile sizes based on LDS constraints.
-        // Prefer larger tile area, then larger tile_q (better Q reuse / fewer blocks).
-        int tile_q = FA2_TILE_Q;
-        int tile_kv = FA2_TILE_KV;
-        FA2LDSLayout lds_layout;
-
-        struct TileCandidate
-        {
-            int q;
-            int kv;
-        };
-
-        // Keep candidates conservative and power-of-two for predictable behavior.
-        // NOTE: 64x32 is intentionally included; for head_dim=128 it often fits
-        // where 64x64 does not, and is usually better than dropping to 32x32.
-        constexpr TileCandidate candidates[] = {
-            {64, 64},
-            {64, 32},
-            {32, 64},
-            {32, 32},
-            {16, 32},
-        };
-
-        int best_q = -1;
-        int best_kv = -1;
-        int best_area = -1;
-        FA2LDSLayout best_layout{};
-
-        for (const auto &c : candidates)
-        {
-            FA2LDSLayout cand_layout;
-            cand_layout.compute(head_dim, c.q, c.kv);
-            if (cand_layout.total_size > LDS_SIZE_BYTES)
-                continue;
-
-            const int area = c.q * c.kv;
-            const bool better =
-                (area > best_area) ||
-                (area == best_area && c.q > best_q);
-
-            if (better)
-            {
-                best_q = c.q;
-                best_kv = c.kv;
-                best_area = area;
-                best_layout = cand_layout;
-            }
-        }
-
-        if (best_area < 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Error: Cannot fit head_dim=%d in LDS with supported tiles\n",
-                   head_dim);
-            return -1;
-        }
-
-        tile_q = best_q;
-        tile_kv = best_kv;
-        lds_layout = best_layout;
-
-        // Grid configuration
-        const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
-        dim3 grid(n_heads, num_q_tiles, batch_size);
-        dim3 block(FA2_THREADS_PER_BLOCK);
-
-        // Launch kernel
-        hipLaunchKernelGGL(
-            flash_attention_2_mi50_kernel,
-            grid, block, lds_layout.total_size, hip_stream,
+        return launch_device_resident_prefill<KVTypeTag::FP32>(
             Q, K, V, O,
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, window_size, position_offset,
+            causal, window_size, position_offset,
             device_params, mask,
-            tile_q, tile_kv,
+            static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
-
-        (void)hipGetLastError();  // Clear stale errors
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Kernel launch failed: %s\n", hipGetErrorString(err));
-            return -1;
-        }
-
-        return 0;
     }
 
     /**
@@ -3070,34 +2641,40 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        if (head_dim <= 0 || head_dim > 256)
-        {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: head_dim=%d must be in [1, 256]\n", head_dim);
-            return -1;
-        }
-        if (n_heads % n_kv_heads != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: n_heads must be divisible by n_kv_heads\n");
-            return -1;
-        }
-        if (head_dim < 64)
-        {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: FP16 KV requires head_dim >= 64 (got %d)\n", head_dim);
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // rocBLAS path: dequant FP16→FP32 then Tensile SGEMM
-        return rocblas_prefill_fp16_impl(
+        return launch_device_resident_prefill<KVTypeTag::FP16>(
             Q, K, V, O,
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, position_offset,
-            hip_stream,
-            mask, kv_len,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch device-resident prefill over a native BF16 KV cache.
+     *
+     * BF16 values remain two-byte resident data through HBM and are converted
+     * only while the current tile enters LDS.  This avoids the packed FP32
+     * shadow whose request stride could not follow a growing captured cache.
+     */
+    int hipFlashAttn_prefill_fa2_bf16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<KVTypeTag::BF16>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
     }
 
@@ -3120,39 +2697,13 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        if (head_dim <= 0 || head_dim > 256)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim=%d must be in [1, 256]\n", head_dim);
-            return -1;
-        }
-        if (n_heads % n_kv_heads != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: n_heads must be divisible by n_kv_heads\n");
-            return -1;
-        }
-        if (head_dim < 64)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: Q8_1 KV requires head_dim >= 64 (got %d)\n", head_dim);
-            return -1;
-        }
-        if (head_dim % 32 != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim must be multiple of 32 for Q8_1 (got %d)\n", head_dim);
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // rocBLAS path: dequant Q8_1→FP32 then Tensile SGEMM
-        return rocblas_prefill_q8_1_impl(
+        return launch_device_resident_prefill<KVTypeTag::Q8_1>(
             Q, K, V, O,
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, position_offset,
-            hip_stream,
-            mask, kv_len,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
     }
 
@@ -3194,6 +2745,27 @@ extern "C"
         int head_start, int gqa_n_rep)
     {
         return launch_decode<KVTypeTag::FP16>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            batch_size, kv_len, n_heads, n_kv_heads, head_dim,
+            num_splits, device_params, static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch ordinary split-K decode with native BF16 K/V reads.
+     */
+    int hipFlashAttn_decode_bf16(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_decode<KVTypeTag::BF16>(
             Q, K_cache, V_cache, O,
             O_partial, m_partial, l_partial,
             batch_size, kv_len, n_heads, n_kv_heads, head_dim,
@@ -3272,6 +2844,33 @@ extern "C"
     {
         return launch_grouped_decode<
             KVTypeTag::FP16,
+            FlashDecodeRowMode::SharedKVVerifier>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            verifier_rows,
+            /*query_rows_per_request=*/1,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch shared-cache verifier rows with native BF16 K/V reads.
+     */
+    int hipFlashAttn_decode_bf16_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::BF16,
             FlashDecodeRowMode::SharedKVVerifier>(
             Q, K_cache, V_cache, O,
             O_partial, m_partial, l_partial,
@@ -3368,6 +2967,33 @@ extern "C"
     }
 
     /**
+     * @brief Launch independent request banks with native BF16 K/V reads.
+     */
+    int hipFlashAttn_decode_bf16_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::BF16,
+            FlashDecodeRowMode::IndependentRequest>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            request_count * query_rows,
+            query_rows,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
      * @brief Launch independent Q8_1 request banks through one grouped decode.
      */
     int hipFlashAttn_decode_q8_1_grouped_request_rows(
@@ -3404,10 +3030,11 @@ extern "C"
         const int *post_append_cached_tokens,
         int seq_len,
         int query_rows,
+        int kv_stride,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
-            query_rows <= 0 ||
+            query_rows <= 0 || kv_stride <= 0 ||
             query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
         {
             return -1;
@@ -3418,7 +3045,8 @@ extern "C"
                            static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
                            post_append_cached_tokens,
                            seq_len,
-                           query_rows);
+                           query_rows,
+                           kv_stride);
         const hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -3435,11 +3063,13 @@ extern "C"
     int hipFlashAttn_prepare_device_params_from_geometry(
         void *device_params,
         int kv_len,
+        int kv_stride,
         int position_offset,
         int query_rows,
         void *stream)
     {
-        if (!device_params || kv_len <= 0 || position_offset < 0 ||
+        if (!device_params || kv_len <= 0 || kv_stride < kv_len ||
+            position_offset < 0 ||
             query_rows <= 0 ||
             query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
         {
@@ -3454,6 +3084,7 @@ extern "C"
             static_cast<hipStream_t>(stream),
             static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
             kv_len,
+            kv_stride,
             position_offset,
             query_rows);
         const hipError_t error = hipGetLastError();
@@ -3475,11 +3106,12 @@ extern "C"
         const int *post_append_cached_tokens,
         int request_count,
         int query_rows,
+        int kv_stride,
         void *stream)
     {
         const int total_rows = request_count * query_rows;
         if (!device_params || !post_append_cached_tokens || request_count < 2 ||
-            query_rows <= 0 || total_rows > 4 || !stream)
+            query_rows <= 0 || total_rows > 4 || kv_stride <= 0 || !stream)
         {
             return -1;
         }
@@ -3493,7 +3125,8 @@ extern "C"
             static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
             post_append_cached_tokens,
             request_count,
-            query_rows);
+            query_rows,
+            kv_stride);
         const hipError_t error = hipGetLastError();
         if (error != hipSuccess)
         {

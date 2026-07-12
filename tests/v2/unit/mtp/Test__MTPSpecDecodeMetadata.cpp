@@ -1092,6 +1092,7 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactAcceptAll
         /*bonus_ready_token=*/4,
         /*has_bonus_ready_token=*/1,
         output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
         meta.data());
 
     ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
@@ -1163,6 +1164,7 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactRejectFir
         /*bonus_ready_token=*/-1,
         /*has_bonus_ready_token=*/0,
         output_tokens.data() + kSpeculativeBatchMaxOutputTokens,
+        kSpeculativeBatchMaxOutputTokens,
         request_meta);
 
     ASSERT_EQ(request_meta[kSpecBatchMetaOk], 1);
@@ -1226,6 +1228,7 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
         /*bonus_ready_token=*/4,
         /*has_bonus_ready_token=*/1,
         output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
         meta.data());
 
     ASSERT_EQ(meta[kSpecBatchMetaOk], 1);

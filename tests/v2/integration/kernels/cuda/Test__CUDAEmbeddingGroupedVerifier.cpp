@@ -5,8 +5,8 @@
  * Every supported quantized embedding table is prepared through the same
  * model-owned PreparedEmbeddingWeights API used by graph construction. Token
  * IDs are uploaded once by the fixture and then supplied to the kernel as a
- * device pointer. For M=2,3,4, one grouped lookup is compared byte-for-byte
- * against M production M=1 lookups on the same explicit CUDA stream.
+ * device pointer. For every certified runtime M, one grouped lookup is compared
+ * byte-for-byte against M production M=1 lookups on the same explicit stream.
  *
  * The route counter is part of the assertion: equality alone is insufficient
  * if a test accidentally exercises host token upload or non-prepared weights.
@@ -22,6 +22,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../utils/EmbeddingVerifierFormats.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -186,9 +187,12 @@ namespace
     {
         constexpr int vocab_size = 67;
         constexpr int d_model = 256;
-        constexpr int max_rows = 4;
+        constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
         const DeviceId device = DeviceId::cuda(0);
-        const std::array<int, max_rows> tokens = {3, vocab_size - 1, 17, vocab_size / 2};
+        std::array<int, max_rows> tokens{};
+        for (int row = 0; row < max_rows; ++row)
+            tokens[static_cast<size_t>(row)] = (3 + row * 17) % vocab_size;
+        tokens[1] = vocab_size - 1;
 
         auto embedding_table = format.create({vocab_size, d_model}, seed);
         ASSERT_NE(embedding_table, nullptr);
@@ -231,7 +235,7 @@ namespace
         ASSERT_TRUE(workspace.allocate(requirements));
         kernel.bindWorkspace(&workspace);
 
-        for (int verifier_rows : {2, 3, 4})
+        for (int verifier_rows : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE(std::string(format.label) + " M=" + std::to_string(verifier_rows));
             FP32Tensor grouped_output(
@@ -299,7 +303,7 @@ protected:
 
 /** @brief Sweep every embedding codebook through real prepared/device-owned execution. */
 TEST_F(Test__CUDAEmbeddingGroupedVerifier,
-       AllWeightFormatsDeviceTokensM234MatchSerialDecodeBytes)
+       AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes)
 {
     ScopedCudaStream stream;
     ASSERT_TRUE(stream.create());

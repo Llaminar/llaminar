@@ -13,6 +13,9 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 
+#include <array>
+#include <string_view>
+
 using namespace llaminar2;
 
 // ============================================================================
@@ -38,6 +41,8 @@ static const BufferDescriptor *findBuf(
  */
 static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
 {
+    if (!config.custom_formulas.contains("mtp_target_query_rows"))
+        config.custom_formulas["mtp_target_query_rows"] = 4;
     config.custom_formulas["mtp_global_gather_rows"] = 1;
     config.custom_formulas["mtp_global_gather_vocab"] = 1;
 }
@@ -78,6 +83,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.custom_formulas["gdn_time_step_rank"] = 32;
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
+    config.custom_formulas["mtp_target_query_rows"] = 4;
     configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
@@ -283,7 +289,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
         << "Single-device MTP must not reserve a redundant gathered vocabulary.";
 }
 
-TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
+TEST(Test__Qwen35BufferSizes, LayerBuffers_AllMTPSidecarRowsScalePastLegacyLimits)
 {
     Qwen35SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -305,15 +311,46 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
     config.custom_formulas["gdn_time_step_rank"] = 32;
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
-    config.custom_formulas["mtp_target_query_rows"] = 8;
+    constexpr size_t target_query_rows = 64;
+    config.custom_formulas["mtp_target_query_rows"] = target_query_rows;
     configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
-    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
-    ASSERT_NE(lm_head_input_rows, nullptr);
-    ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
-    EXPECT_EQ(lm_head_input_rows->shape[0], 8u);
-    EXPECT_EQ(lm_head_input_rows->shape[1], 2560u);
+    const std::array<const char *, 21> row_capacity_buffers = {
+        "lm_head_input_rows",
+        "mtp_embedding",
+        "mtp_norm_hidden",
+        "mtp_norm_embedding",
+        "mtp_concat",
+        "mtp_projected",
+        "mtp_hidden",
+        "mtp_q_raw",
+        "mtp_q_gate",
+        "mtp_q",
+        "mtp_k",
+        "mtp_v",
+        "mtp_k_full_prefill",
+        "mtp_v_full_prefill",
+        "mtp_attn_output",
+        "mtp_attn_proj",
+        "mtp_gate",
+        "mtp_up",
+        "mtp_ffn_output",
+        "mtp_logits",
+        "mtp_logits_gathered",
+    };
+    for (const char *name : row_capacity_buffers)
+    {
+        const BufferDescriptor *buffer = findBuf(reqs, name);
+        ASSERT_NE(buffer, nullptr) << "missing declarative MTP buffer " << name;
+        ASSERT_EQ(buffer->shape.size(), 2u) << name;
+        const size_t expected_rows =
+            std::string_view(name) == "mtp_logits_gathered"
+                ? 1u
+                : target_query_rows;
+        EXPECT_EQ(buffer->shape[0], expected_rows)
+            << name << " retained a fixed small-M row capacity";
+    }
 }
 
 TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPAttnOutputUsesHybridAttnOutputDim)
@@ -463,6 +500,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
     config.custom_formulas["gdn_time_step_rank"] = 16;
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
+    config.custom_formulas["mtp_target_query_rows"] = 4;
     config.custom_formulas["mtp_global_gather_rows"] = 4;
     config.custom_formulas["mtp_global_gather_vocab"] = 248320;
 

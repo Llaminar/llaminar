@@ -521,33 +521,21 @@ namespace llaminar2
              */
             const bool ambiguous_demote_signal =
                 decision.zero_accept_rate < catastrophic_zero_accept_rate;
-            const bool upward_probe_enters_deepest =
-                upward_probe_depth == config_.max_depth &&
-                config_.max_depth >= 3;
             /*
              * A bad intermediate depth proves this candidate is poor, but it
              * does not always prove deeper candidates are poor.  Probe
-             * shallower intermediate depths once before settling downward.
-             * The deepest lane is expensive enough that entering it is a
-             * generated-policy decision, not a handwritten fallback guess.
+             * unrejected higher depths once before settling downward. The
+             * configured maximum is an ordinary candidate: a trained policy
+             * may hold below it for measured economy, but generic policy must
+             * not make that final row unreachable merely because it is last.
              */
             if (config_.mode == MTPDepthPolicyMode::Dynamic &&
                 current_depth_ > std::max(config_.min_depth, 1) &&
                 upward_probe_depth > current_depth_ &&
-                ambiguous_demote_signal &&
-                !upward_probe_enters_deepest)
+                ambiguous_demote_signal)
             {
                 proposed_depth = upward_probe_depth;
                 decision.reason = MTPDepthDecisionReason::ProbeHigherBeforeDemote;
-            }
-            else if (config_.mode == MTPDepthPolicyMode::Dynamic &&
-                     current_depth_ > std::max(config_.min_depth, 1) &&
-                     upward_probe_depth > current_depth_ &&
-                     ambiguous_demote_signal &&
-                     upward_probe_enters_deepest)
-            {
-                proposed_depth = current_depth_;
-                decision.reason = MTPDepthDecisionReason::Hold;
             }
             else
             {
@@ -586,14 +574,7 @@ namespace llaminar2
                 next_depth_was_rejected &&
                 current_depth_ + 1 == config_.max_depth &&
                 config_.max_depth >= 3;
-            const bool fallback_enters_deepest =
-                current_depth_ + 1 == config_.max_depth &&
-                config_.max_depth >= 3;
             if (blocked_rejected_deepest_retry)
-            {
-                decision.reason = MTPDepthDecisionReason::Hold;
-            }
-            else if (fallback_enters_deepest)
             {
                 decision.reason = MTPDepthDecisionReason::Hold;
             }

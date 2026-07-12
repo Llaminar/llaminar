@@ -45,13 +45,14 @@ namespace
     /**
      * @brief Advance one or more request-local GDN rows with scalar-decode arithmetic.
      *
-     * The temporal recurrence is inherently serial.  Grouped MTP verification
-     * therefore gains useful work by keeping a block resident for M=2..4 rows,
-     * not by partitioning the `d_k` dot products and changing their reduction
-     * tree.  Scalar decode calls this exact kernel with `request_seq_len == 1`;
-     * grouped verification calls it with a small larger value.  Both routes
-     * consequently execute the same preprocessing, the same `j=0..d_k-1`
-     * accumulation order, and the same state update expressions.
+     * The temporal recurrence is inherently serial. Grouped MTP verification
+     * therefore gains useful work by keeping a block resident across the
+     * runtime-sized verifier matrix, not by partitioning the `d_k` dot products
+     * and changing their reduction tree. Scalar decode calls this exact kernel
+     * with `request_seq_len == 1`; grouped verification calls it with every row
+     * that fits the graph's declared capacity. Both routes consequently execute
+     * the same preprocessing, `j=0..d_k-1` accumulation order, and state update
+     * expressions.
      *
      * Request identity is flattened into grid X while grid Y owns independent
      * value-column tiles.  A block processes its request rows in order and
@@ -777,11 +778,12 @@ namespace
     /**
      * @brief Decode-equivalent grouped short-conv kernel for MTP verifier rows.
      *
-     * MTP verifier groups are tiny (M=2..4).  The long-prefill kernel uses a
-     * second launch to update live state safely; doing that for verifier rows
-     * burns most of the M=2 win.  This kernel keeps one lane responsible for a
-     * channel, walks the small row group in causal order, writes every row
-     * snapshot, and only then publishes the channel's final live state.
+     * The long-prefill kernel uses a second launch to update live state safely.
+     * A verifier already needs every post-row snapshot, so this kernel keeps one
+     * lane responsible for a channel, walks the runtime-sized row group in
+     * causal order, writes every snapshot, and only then commits the channel's
+     * final speculative state. There is one launch for the complete matrix and
+     * no host or launch-level row replay.
      */
     __global__ void cuda_short_conv1d_small_m_kernel(
         const float *__restrict__ input,
@@ -2067,15 +2069,22 @@ extern "C"
             return false;
         }
 
+        const int required_snapshot_stride = n_heads * d_k * d_v;
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= seq_len;
+
         /*
-         * MTP verifier groups contain at most four rows, while request-batched
-         * execution may pad the same real rows into a slightly wider matrix.
-         * Keep widths through eight on the exact scalar recurrent-step kernel
-         * with `(request, head)` packed into grid X. M=1 continuation, M=2..4
-         * verification, and small padded batches therefore share one compiled
-         * arithmetic path and one launch.
+         * Small request matrices use the exact scalar recurrence because launch
+         * economy is better than the row-split prefill route. More importantly,
+         * every verifier transaction that supplied a complete post-row state
+         * matrix must use this path regardless of M: publication can select any
+         * row, so each snapshot and output must have scalar decode's arithmetic
+         * schedule. Ordinary long prefill has no complete capture matrix and
+         * retains the throughput-oriented row-split implementation below.
          */
-        if (request_seq_len <= 8)
+        if (request_seq_len <= 8 || complete_verifier_capture)
         {
             if (llaminar2::debugEnv().runtime_debug.cuda_gdn_pointer_trace)
             {
@@ -2305,7 +2314,31 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (seq_len == 1)
+        const int required_snapshot_stride = channels * (kernel_size - 1);
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= seq_len;
+
+        /*
+         * A complete capture matrix identifies verifier execution. Route it
+         * through the one-channel-owner kernel even at M=1 so every post-row
+         * state is materialized for device-side publication. Ordinary decode
+         * and prefill retain their dedicated throughput paths.
+         */
+        if (complete_verifier_capture)
+        {
+            int threads = 256;
+            int blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                input, weight, bias, output, conv_state,
+                nullptr,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        }
+        else if (seq_len == 1)
         {
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
@@ -2365,7 +2398,25 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (seq_len == 1)
+        const int required_snapshot_stride = channels * (kernel_size - 1);
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= seq_len;
+
+        if (complete_verifier_capture)
+        {
+            int threads = 256;
+            int blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                input, weight, bias, output, conv_state,
+                device_effective_seq_len,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        }
+        else if (seq_len == 1)
         {
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
@@ -2442,7 +2493,12 @@ extern "C"
         }
 
         constexpr int threads = 256;
-        if (request_seq_len <= 4)
+        const int required_snapshot_stride = channels * (kernel_size - 1);
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (request_seq_len <= 4 || complete_verifier_capture)
         {
             const int channel_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_batched_small_m_kernel<<<

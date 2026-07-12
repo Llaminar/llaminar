@@ -196,7 +196,6 @@ namespace llaminar2
             return (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                    layout.compute_all_positions &&
                    layout.seq_len > 1 &&
-                   layout.seq_len <= 4 &&
                    config.usesMTPGroupedDecodeEquivalentRows();
         }
 
@@ -984,7 +983,6 @@ namespace llaminar2
         lb.attn_proj = toBase(arena_->getTensor(BufferId::ATTN_PROJ));
         lb.workspace_scores = toBase(arena_->getTensor(BufferId::ATTN_SCORES_WORKSPACE));
         lb.workspace_context = toBase(arena_->getTensor(BufferId::ATTN_CONTEXT_WORKSPACE));
-        lb.workspace_mask = toBase(arena_->getTensor(BufferId::GEMM_WORKSPACE));
         lb.gate = toBase(arena_->getTensor(BufferId::GATE_PROJ));
         lb.up = toBase(arena_->getTensor(BufferId::UP_PROJ));
         lb.ffn_output = toBase(arena_->getTensor(BufferId::FFN_OUTPUT));
@@ -2682,7 +2680,6 @@ namespace llaminar2
         const bool force_decode_equivalent_ffn_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
             config_.usesMTPGroupedDecodeEquivalentRows();
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *gate_proj_binding =
@@ -3432,16 +3429,14 @@ namespace llaminar2
         int total_tokens,
         const int *position_ids,
         const void *position_ids_device,
-        DeviceId device,
-        bool force_apply_rope_to_k)
+        DeviceId device)
     {
         const std::string node_name = prefix + "rope";
         int pos_offset = position_ids ? position_ids[0] : 0;
         const bool force_decode_equivalent_rope_verifier_prefill =
             device.is_cpu() &&
             config_.usesMTPGroupedDecodeEquivalentRows() &&
-            total_tokens > 1 &&
-            total_tokens <= 4;
+            total_tokens > 1;
 
         graph.addNode(node_name,
                       ComputeStageFactory::createRoPE({
@@ -3457,7 +3452,7 @@ namespace llaminar2
                           .partial_rotary_factor = config_.partial_rotary_factor,
                           .position_ids = position_ids,
                           .position_ids_device = position_ids_device,
-                          .skip_k = config_.rope_on_read && !force_apply_rope_to_k,
+                          .skip_k = config_.rope_on_read,
                           .force_decode_equivalent_verifier_prefill =
                               force_decode_equivalent_rope_verifier_prefill,
                           .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
@@ -3572,7 +3567,7 @@ namespace llaminar2
                               }),
                               device);
 
-                if (!cache_source_dependencies.empty())
+                if (config_.rope_on_read && !cache_source_dependencies.empty())
                 {
                     for (const auto &dep : cache_source_dependencies)
                     {
@@ -3582,17 +3577,14 @@ namespace llaminar2
                 }
                 else
                 {
+                    /*
+                     * Without RoPE-on-read the replicated cache must receive
+                     * post-RoPE K. Make the full-row allgather consume the RoPE
+                     * output directly. With RoPE-on-read, the branch above
+                     * gathers pre-RoPE K while Q RoPE proceeds independently.
+                     */
                     graph.addDependency(handoff_node, rope_dependency);
                 }
-
-                /*
-                 * The replicated decode cache stores pre-RoPE K so decode can
-                 * apply rope-on-read with its own logical positions. RoPE still
-                 * mutates buffers.K in-place for local prefill attention, so it
-                 * must wait until the handoff has copied the pre-RoPE rows.
-                 */
-                if (!rope_dependency.empty())
-                    graph.addDependency(rope_dependency, handoff_node);
 
                 append_K = buffers.K_full_prefill;
                 append_V = buffers.V_full_prefill;
@@ -3614,7 +3606,7 @@ namespace llaminar2
                               .seq_len = seq_len,
                               .append_semantics =
                                   config_.compute_all_position_logits &&
-                                          seq_len >= 2 && seq_len <= 4
+                                          seq_len >= 2
                                       ? KVCacheAppendSemantics::DecodeEquivalentVerifier
                                       : KVCacheAppendSemantics::Standard,
                               .request_sequence_lengths_device =
@@ -3762,11 +3754,23 @@ namespace llaminar2
             attn_params.seq_len = seq_len;
             attn_params.kv_len = kv_len;
             attn_params.n_heads = local_n_heads;
-            attn_params.n_kv_heads = local_n_kv_heads;
+            /*
+             * Phase-split prefill seeds an unsharded cache so replicated decode
+             * can run without a KV collective. Prefill must consume that same
+             * post-append cache to remain numerically identical across full and
+             * chunked requests. The attention kernel therefore sees global KV
+             * geometry while its Q heads remain TP-local; head_start plus
+             * gqa_n_rep maps each local Q head to the correct replicated KV head.
+             */
+            const int attention_n_kv_heads =
+                phase_split_handoff ? config_.n_kv_heads : local_n_kv_heads;
+            attn_params.n_kv_heads = attention_n_kv_heads;
             attn_params.head_dim = config_.head_dim;
             attn_params.head_start = config_.head_start;
             // GQA rep: only when KV heads are replicated (not column-parallel)
-            if (local_n_kv_heads == config_.n_kv_heads && config_.n_kv_heads > 0 && local_n_heads != config_.n_heads)
+            if (attention_n_kv_heads == config_.n_kv_heads &&
+                config_.n_kv_heads > 0 &&
+                local_n_heads != config_.n_heads)
                 attn_params.gqa_n_rep = config_.n_heads / config_.n_kv_heads;
             attn_params.causal = true;
             attn_params.window_size = -1;
@@ -3774,36 +3778,28 @@ namespace llaminar2
             attn_params.auto_detect_mode = true;
             attn_params.workspace_scores = buffers.workspace_scores;
             attn_params.workspace_context = buffers.workspace_context;
-            attn_params.workspace_mask = buffers.workspace_mask;
+            /*
+             * Qwen attention has no external additive mask tensor. CUDA and
+             * ROCm FA2 derive causal, sliding-window, and continuation bounds
+             * from their device-owned attention geometry. Historically this
+             * field aliased GEMM_WORKSPACE even though no stage populated it
+             * as a mask; graph replay could consequently interpret recycled
+             * GEMM bytes with a new live-KV stride. Leave the optional mask
+             * null here. Explicit-mask kernel and stage callers retain their
+             * separate API contract.
+             */
             attn_params.kv_cache = kv_cache;
             attn_params.layer_idx = kv_stage_layer;
-            const bool cache_is_q8_1 =
-                kv_cache &&
-                kv_cache->k_precision() == ActivationPrecision::Q8_1 &&
-                kv_cache->v_precision() == ActivationPrecision::Q8_1;
-            const bool cache_is_turboquant =
-                kv_cache &&
-                (kv_cache->k_precision() == ActivationPrecision::TQ8 ||
-                 kv_cache->k_precision() == ActivationPrecision::TQ4 ||
-                 kv_cache->v_precision() == ActivationPrecision::TQ8 ||
-                 kv_cache->v_precision() == ActivationPrecision::TQ4);
-            const bool cache_storage_needs_converted_rope_read =
-                config_.rope_on_read && (cache_is_q8_1 || cache_is_turboquant);
-            const bool cache_storage_directly_readable =
-                !kv_cache || (!cache_is_q8_1 && !cache_is_turboquant);
             /*
-             * RoPE-on-read is the intentional production path for quantized GPU
-             * KV caches: attention consumes the converted post-append cache view,
-             * not the tiny current-token K/V tensor.  Excluding Q8_1/TQ caches
-             * here makes grouped verifier rows attend over only their local
-             * candidate rows, which is fast but not serial-decode equivalent.
-             * Backends that cannot materialize the converted view should fail in
-             * AttentionComputeStage rather than silently taking the wrong path.
+             * GPU attention has one production source: the post-append,
+             * device-owned KV cache. This is true for prefill, continuation
+             * prefill, serial decode, and grouped verifier rows. Selecting the
+             * transient projection buffer for one phase changes both precision
+             * and RoPE timing, breaking batch invariance. Backends missing a
+             * native or converted grouped cache view fail at that contract
+             * boundary; there is no projection-buffer fallback.
              */
-            attn_params.read_kv_from_cache = !phase_split_handoff &&
-                                             device.is_gpu() &&
-                                             (cache_storage_directly_readable ||
-                                              cache_storage_needs_converted_rope_read);
+            attn_params.read_kv_from_cache = kv_cache && device.is_gpu();
             attn_params.position_offset = position_ids ? position_ids[0] : 0;
             attn_params.mpi_ctx = mpi_ctx_.get();
             attn_params.q_buffer_id = buffers.idFor(BufferId::Q_PROJ);
@@ -3814,7 +3810,7 @@ namespace llaminar2
             attn_params.turboquant_ctx = config_.turboquant_ctx;
             attn_params.kv_rotation = config_.kv_rotation;
 
-            if (config_.rope_on_read && !phase_split_handoff)
+            if (config_.rope_on_read)
             {
                 attn_params.apply_rope_to_k = true;
                 attn_params.rope_theta = config_.rope_theta;
@@ -3862,14 +3858,13 @@ namespace llaminar2
          * Grouped verifier rows are promoted through the attention output
          * projection as a normal small-M GEMM.  The serial M=1 verifier loop is
          * kept available inside GEMMStage for explicit diagnostics, but the
-         * production graph relies on the Phase 9.8 dense verifier proof
-         * (cosine/relative-L2/KL/sample equality for M=2..4) instead of paying a
-         * row-copy loop in every attention block.
+         * production graph relies on the Phase 9.8 dense verifier proof of
+         * byte-identical runtime-M grouped output instead of paying a row-copy
+         * loop in every attention block.
          */
         const bool force_decode_equivalent_wo_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
             config_.usesMTPGroupedDecodeEquivalentRows();
 
         std::string wo_node = prefix + wo_node_suffix;

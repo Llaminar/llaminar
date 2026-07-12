@@ -55,22 +55,6 @@ namespace
             const auto it = record.tags.find(key);
             return it != record.tags.end() && it->second == value;
         };
-        auto tag_is_one_of = [](const PerfStatRecord &record,
-                                const char *key,
-                                std::initializer_list<const char *> values) -> bool
-        {
-            const auto it = record.tags.find(key);
-            if (it == record.tags.end())
-            {
-                return false;
-            }
-            return std::any_of(values.begin(),
-                               values.end(),
-                               [&](const char *value)
-                               {
-                                   return it->second == value;
-                               });
-        };
         auto tag_int_in_range = [](const PerfStatRecord &record,
                                    const char *key,
                                    int lower_bound,
@@ -89,23 +73,18 @@ namespace
         const int expected_routed_top_k = 8;
         const int expected_routed_experts = 256;
         const int expected_total_slots = expected_seq_len * expected_routed_top_k;
-        // ROCm keeps Qwen3.6 MoE verifier buckets, including M=3/4, on the
-        // compact tile-M=2 grouped-prefill lane. CUDA uses tile-M=4 for M=3/4,
-        // but the ROCm MI50 evidence favored tile-M=2. The durable contract is
-        // routed expert grouping plus the grouped table-prefill shared-expert owner.
-        // The routed implementation may choose either fused or K-part gate/up
-        // internals.
-        const int expected_tile_m = 2;
+        // ROCm owns each routed gate/up row and each final token/down column in
+        // fixed grouped launches. This byte-exact contract admits no
+        // batch-shaped fused or K-part publication branch.
         const std::string seq_len_tag = std::to_string(expected_seq_len);
         const std::string total_slots_tag = std::to_string(expected_total_slots);
-        const std::string tile_m_tag = std::to_string(expected_tile_m);
 
         const auto routed_grouped = std::find_if(
             records.begin(),
             records.end(),
             [&](const PerfStatRecord &record)
             {
-                return record.name == "rocm_moe_grouped_prefill_active_expert_grid_calls" &&
+                return record.name == "rocm_moe_grouped_prefill_batch_invariant_calls" &&
                        tag_equals(record, "seq_len", seq_len_tag.c_str()) &&
                        tag_equals(record, "top_k", "8") &&
                        tag_equals(record, "total_slots", total_slots_tag.c_str()) &&
@@ -114,14 +93,17 @@ namespace
                                         1,
                                         expected_total_slots) &&
                        tag_equals(record, "num_experts", "256") &&
-                       tag_equals(record, "tile_m", tile_m_tag.c_str()) &&
-                       tag_is_one_of(record,
-                                     "gateup_route",
-                                     {"kpart_prefill", "fused_prefill"});
+                       tag_equals(record,
+                                  "gateup_route",
+                                  "route_owned_router_q8") &&
+                       tag_equals(record,
+                                  "down_route",
+                                  "direct_ordered_publish") &&
+                       tag_equals(record, "row_tile", "1");
             });
         ASSERT_NE(routed_grouped, records.end())
             << "ROCm Qwen3.6 MoE MTP verifier should stay on the current "
-            << "graph-capturable active-expert grouped prefill path for verifier "
+            << "graph-capturable route-owned grouped prefill path for verifier "
             << "rows while shared-expert work is owned by the standalone "
             << "decode-equivalent grouped table-prefill verifier stage.\n"
             << PerfStatsCollector::summaryString({"kernel", "mtp"});

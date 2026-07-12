@@ -4739,19 +4739,23 @@ namespace llaminar2
 
         int stochastic_target_row_capacity_ = 0;
         int stochastic_draft_row_capacity_ = 0;
-        int stochastic_batch_output_request_capacity_ = 1;
+        int stochastic_batch_output_request_capacity_ = 1; ///< Configured request count owned by grouped MTP transactions on every backend.
+        int mtp_max_draft_depth_ = 1; ///< Largest configured fixed/dynamic draft depth owned by this runner.
+        int mtp_max_verifier_rows_ = 2; ///< Per-request draft rows plus the terminal bonus row.
+        int stochastic_batch_output_token_stride_ = 2; ///< Per-request compact output capacity.
         void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [target_rows, 256]
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [target_rows, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [draft_rows, 256]
         void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [draft_rows, 256]
         void *stochastic_processed_logits_dev_ = nullptr; ///< FP32 staging [target_rows, vocab]
         void *stochastic_inverse_rejection_samples_dev_ = nullptr; ///< FP32 [draft_rows, vocab]
-        void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, 4]
-        void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, 3]
-        void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, 3], p(sampled draft token)
+        void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, stochastic_target_row_capacity_]
+        void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, stochastic_draft_row_capacity_]
+        void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, stochastic_draft_row_capacity_], p(sampled draft token)
         void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1, mtp_sidecar_condition_token_capacity_]
         int mtp_sidecar_condition_token_capacity_ = 0; ///< Total staged condition-token scalars across all sidecar slots.
-        void *mtp_sidecar_position_ids_dev_ = nullptr; ///< INT32 [request_batch], stable positions for chained device sidecars.
+        int mtp_sidecar_condition_token_slot_width_ = 2; ///< Flattened runtime row capacity reserved for each captured sidecar role.
+        void *mtp_sidecar_position_ids_dev_ = nullptr; ///< INT32 [mtp_sidecar_condition_token_slot_width_], stable positions for chained device sidecars.
         void *request_sequence_lengths_dev_ = nullptr; ///< INT32 [batch], immutable real rows admitted before GPU prefill.
         int request_sequence_lengths_capacity_ = 0; ///< Number of request rows reserved in the arena allocation.
         int request_sequence_lengths_active_count_ = 0; ///< Rows populated for the current request-batched prefill.
@@ -4762,11 +4766,11 @@ namespace llaminar2
         void *stochastic_draft_topk_partial_vals_dev_ = nullptr; ///< FP32 MTP-draft top-k partial scratch.
         void *stochastic_draft_topk_partial_idxs_dev_ = nullptr; ///< INT32 MTP-draft top-k partial scratch.
         int stochastic_draft_topk_partial_capacity_ = 0;
-        void *stochastic_verify_tokens_dev_ = nullptr;    ///< INT32 [1, 4]
-        void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]
-        void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, 4]
-        void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
-        void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, 5]
+        void *stochastic_verify_tokens_dev_ = nullptr;    ///< INT32 [1, stochastic_target_row_capacity_]
+        void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, stochastic_target_row_capacity_]
+        void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, stochastic_target_row_capacity_]
+        void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, stochastic_target_row_capacity_]
+        void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, stochastic_batch_output_token_stride_]
         void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [request, 10]
         std::unique_ptr<PinnedHostScratch> stochastic_batch_output_host_scratch_;
 
@@ -4940,8 +4944,7 @@ namespace llaminar2
             int first_draft_slot = 0;
             int draft_token_count = 0;
             int total_verifier_input_tokens = 0;
-            std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows + 1>
-                host_tokens{};
+            std::vector<int32_t> host_tokens;
         };
         std::optional<PendingMTPVerifierDeviceTokenPlan>
             pending_mtp_verifier_device_token_plan_;
@@ -4949,9 +4952,7 @@ namespace llaminar2
         {
             int request_count = 0;
             int padded_seq_len = 0;
-            std::array<DeviceMTPVerifierInputBatchRequest,
-                       sampling_math::kSpeculativeBatchMaxRows>
-                requests{};
+            std::vector<DeviceMTPVerifierInputBatchRequest> requests;
         };
         std::optional<PendingMTPVerifierDeviceTokenBatchPlan>
             pending_mtp_verifier_device_token_batch_plan_;

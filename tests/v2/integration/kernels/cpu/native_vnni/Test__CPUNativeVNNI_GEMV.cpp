@@ -24,6 +24,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -42,6 +43,7 @@
 #include "fort.hpp"
 
 #include "utils/QuantizedVerifierFormats.h"
+#include "utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -1109,89 +1111,94 @@ namespace
         const int K = 256;
         const int N0 = 384;
         const int N1 = 320;
-        const std::array<int, 3> verifier_rows = {2, 3, 4};
+        const auto &verifier_rows = kGroupedVerifierRuntimeRows;
 
         setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_native_vnni_grouped_verifier.json", 1);
         PerfStatsCollector::reset();
 
-        for (const auto &fmt0 : ALL_FORMATS)
+        /*
+         * A full format cross-product only repeats the descriptor scheduler:
+         * each projection is independently type-erased after validation. Pair
+         * every format with its successor instead. The cyclic pairing places
+         * every codebook in both descriptor positions while leaving enough
+         * budget to certify every runtime M contiguously.
+         */
+        for (size_t format_index = 0; format_index < ALL_FORMATS.size(); ++format_index)
         {
-            for (const auto &fmt1 : ALL_FORMATS)
+            const auto &fmt0 = ALL_FORMATS[format_index];
+            const auto &fmt1 = ALL_FORMATS[(format_index + 1) % ALL_FORMATS.size()];
+            SCOPED_TRACE(fmt0.name + std::string("_proj0/") + fmt1.name + "_proj1");
+
+            auto weights0 = createWeightsForFormat(fmt0.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt1.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << "Failed to create " << fmt0.name << " weights";
+            ASSERT_NE(weights1, nullptr) << "Failed to create " << fmt1.name << " weights";
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt0.name << " failed to pack";
+            ASSERT_TRUE(kernel1.isValid()) << fmt1.name << " failed to pack";
+
+            for (int M : verifier_rows)
             {
-                SCOPED_TRACE(fmt0.name + std::string("_proj0/") + fmt1.name + "_proj1");
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f,
+                    static_cast<uint32_t>(1700 + M + format_index * 257));
+                ASSERT_NE(input, nullptr);
 
-                auto weights0 = createWeightsForFormat(fmt0.name, N0, K);
-                auto weights1 = createWeightsForFormat(fmt1.name, N1, K);
-                ASSERT_NE(weights0, nullptr) << "Failed to create " << fmt0.name << " weights";
-                ASSERT_NE(weights1, nullptr) << "Failed to create " << fmt1.name << " weights";
+                FP32Tensor batched0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor batched1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &batched0, N0, nullptr, "mtp_verifier_projection0"},
+                    {&kernel1, &batched1, N1, nullptr, "mtp_verifier_projection1"}};
+                ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(), projections, M, K))
+                    << fmt0.name << "/" << fmt1.name
+                    << " grouped verifier GEMM hook failed at M=" << M;
 
-                CPUNativeVNNIGemmKernel kernel0(weights0.get());
-                CPUNativeVNNIGemmKernel kernel1(weights1.get());
-                ASSERT_TRUE(kernel0.isValid()) << fmt0.name << " failed to pack";
-                ASSERT_TRUE(kernel1.isValid()) << fmt1.name << " failed to pack";
-
-                for (int M : verifier_rows)
+                std::vector<float> serial0(
+                    static_cast<size_t>(M) * static_cast<size_t>(N0),
+                    0.0f);
+                std::vector<float> serial1(
+                    static_cast<size_t>(M) * static_cast<size_t>(N1),
+                    0.0f);
+                for (int row = 0; row < M; ++row)
                 {
-                    SCOPED_TRACE(std::string("M=") + std::to_string(M));
-                    auto input = TestTensorFactory::createFP32Random(
-                        {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f,
-                        static_cast<uint32_t>(
-                            1700 + M + fmt0.name.size() * 31 + fmt1.name.size() * 131));
-                    ASSERT_NE(input, nullptr);
-
-                    FP32Tensor batched0({static_cast<size_t>(M), static_cast<size_t>(N0)});
-                    FP32Tensor batched1({static_cast<size_t>(M), static_cast<size_t>(N1)});
-                    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                        {&kernel0, &batched0, N0, nullptr, "mtp_verifier_projection0"},
-                        {&kernel1, &batched1, N1, nullptr, "mtp_verifier_projection1"}};
-                    ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
-                        input.get(), projections, M, K))
-                        << fmt0.name << "/" << fmt1.name
-                        << " grouped verifier GEMM hook failed at M=" << M;
-
-                    std::vector<float> serial0(
-                        static_cast<size_t>(M) * static_cast<size_t>(N0),
-                        0.0f);
-                    std::vector<float> serial1(
-                        static_cast<size_t>(M) * static_cast<size_t>(N1),
-                        0.0f);
-                    for (int row = 0; row < M; ++row)
-                    {
-                        ASSERT_TRUE(multiplyViaTensor(
-                            kernel0,
-                            input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
-                            serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
-                            1,
-                            N0,
-                            K))
-                            << fmt0.name << " serial decode GEMV failed at M=" << M
-                            << " row=" << row;
-                        ASSERT_TRUE(multiplyViaTensor(
-                            kernel1,
-                            input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
-                            serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
-                            1,
-                            N1,
-                            K))
-                            << fmt1.name << " serial decode GEMV failed at M=" << M
-                            << " row=" << row;
-                    }
-
-                    expectBitwiseEqualFloatRows(
-                        fmt0.name + std::string("/") + fmt1.name +
-                            " CPU grouped verifier projection0 M=" + std::to_string(M),
-                        batched0.data(),
-                        serial0.data(),
-                        serial0.size(),
-                        static_cast<size_t>(N0));
-                    expectBitwiseEqualFloatRows(
-                        fmt0.name + std::string("/") + fmt1.name +
-                            " CPU grouped verifier projection1 M=" + std::to_string(M),
-                        batched1.data(),
-                        serial1.data(),
-                        serial1.size(),
-                        static_cast<size_t>(N1));
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel0,
+                        input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
+                        1,
+                        N0,
+                        K))
+                        << fmt0.name << " serial decode GEMV failed at M=" << M
+                        << " row=" << row;
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel1,
+                        input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
+                        serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
+                        1,
+                        N1,
+                        K))
+                        << fmt1.name << " serial decode GEMV failed at M=" << M
+                        << " row=" << row;
                 }
+
+                expectBitwiseEqualFloatRows(
+                    fmt0.name + std::string("/") + fmt1.name +
+                        " CPU grouped verifier projection0 M=" + std::to_string(M),
+                    batched0.data(),
+                    serial0.data(),
+                    serial0.size(),
+                    static_cast<size_t>(N0));
+                expectBitwiseEqualFloatRows(
+                    fmt0.name + std::string("/") + fmt1.name +
+                        " CPU grouped verifier projection1 M=" + std::to_string(M),
+                    batched1.data(),
+                    serial1.data(),
+                    serial1.size(),
+                    static_cast<size_t>(N1));
             }
         }
 
@@ -1208,8 +1215,8 @@ namespace
             {
                 EXPECT_EQ(record.tags.at("k"), std::to_string(K));
                 EXPECT_EQ(record.tags.at("projections"), "2");
-                const std::string &m_tag = record.tags.at("m");
-                EXPECT_TRUE(m_tag == "2" || m_tag == "3" || m_tag == "4");
+                const int m_tag = std::stoi(record.tags.at("m"));
+                EXPECT_TRUE((m_tag >= 2 && m_tag <= 16) || m_tag == 31);
                 fused_grouped_verifier_calls += record.count;
             }
             if (record.domain == "kernel" &&
@@ -1221,8 +1228,8 @@ namespace
         }
         EXPECT_EQ(
             fused_grouped_verifier_calls,
-            ALL_FORMATS.size() * ALL_FORMATS.size() * verifier_rows.size())
-            << "Every CPU NativeVNNI mixed-format projection bundle and M=2/3/4 "
+            ALL_FORMATS.size() * verifier_rows.size())
+            << "Every CPU NativeVNNI mixed-format projection bundle and certified runtime-M "
                "shape must enter the fused grouped verifier path";
         EXPECT_EQ(per_projection_grouped_calls, 0u)
             << "Mixed-format CPU verifier bundles must not quietly drop to the "
@@ -1231,12 +1238,148 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+    /**
+     * @test Prove the bounded wide-row tile over every runtime M and format.
+     *
+     * The production selector learns a physical row tile, not a speculative
+     * depth specialization. A WideRows decision must therefore compose four-row
+     * tiles and 1/2/3-row tails for M=5 and above. This regression forces that
+     * candidate through both the ordinary full-K launch and the K-part launch,
+     * then compares every FP32 byte with independent production M=1 decode.
+     * PerfStats route checks make a normalized Pairwise execution visible.
+     */
+    TEST_F(CPUNativeVNNIGemvTest,
+           MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows)
+    {
+        constexpr int N = 130;
+        const auto &verifier_rows = kGroupedVerifierRuntimeRows;
+
+        auto run_k_tile_regime = [&](int K, int forced_k_tiles)
+        {
+            SCOPED_TRACE(
+                std::string("K=") + std::to_string(K) +
+                " k_tiles=" + std::to_string(forced_k_tiles));
+            ScopedCPUVNNIEnv force_k_tiles(
+                "LLAMINAR_CPU_VNNI_K_TILES",
+                std::to_string(forced_k_tiles).c_str());
+            setenv(
+                "LLAMINAR_PERF_STATS_JSON",
+                "/tmp/llaminar_cpu_native_vnni_forced_wide_runtime_m.json",
+                1);
+            PerfStatsCollector::reset();
+
+            for (size_t format_index = 0; format_index < ALL_FORMATS.size(); ++format_index)
+            {
+                const auto &fmt = ALL_FORMATS[format_index];
+                SCOPED_TRACE(fmt.name);
+                auto weights = createWeightsForFormat(fmt.name, N, K);
+                ASSERT_NE(weights, nullptr) << fmt.name;
+                CPUNativeVNNIGemmKernel kernel(weights.get());
+                ASSERT_TRUE(kernel.isValid()) << fmt.name;
+                const auto &packed = kernel.packedWeights();
+
+                for (int M : verifier_rows)
+                {
+                    SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                    auto input = TestTensorFactory::createFP32Random(
+                        {static_cast<size_t>(M), static_cast<size_t>(K)},
+                        -1.0f,
+                        1.0f,
+                        static_cast<uint32_t>(
+                            0x5100u + M * 131u + K + format_index * 977u));
+                    ASSERT_NE(input, nullptr);
+
+                    std::vector<Q8_1Block> quantized_rows(
+                        static_cast<size_t>(M) * packed.blocks_per_row);
+                    quantize_activations_to_q8_1(
+                        input->data(),
+                        quantized_rows.data(),
+                        M,
+                        K,
+                        packed.blocks_per_row);
+
+                    std::vector<float> grouped(
+                        static_cast<size_t>(M) * N,
+                        0.0f);
+                    std::vector<float> serial(
+                        static_cast<size_t>(M) * N,
+                        0.0f);
+                    gemm_native_vnni_preq_decode_equivalent_rows(
+                        packed,
+                        quantized_rows.data(),
+                        grouped.data(),
+                        M,
+                        N,
+                        ISAPath::AUTO,
+                        VerifierRowsPolicy::WideRows);
+                    for (int row = 0; row < M; ++row)
+                    {
+                        gemv_native_vnni_preq(
+                            packed,
+                            quantized_rows.data() +
+                                static_cast<size_t>(row) * packed.blocks_per_row,
+                            serial.data() + static_cast<size_t>(row) * N,
+                            ISAPath::AUTO);
+                    }
+                    expectBitwiseEqualFloatRows(
+                        fmt.name + std::string(" forced WideRows M=") +
+                            std::to_string(M) + " K=" + std::to_string(K),
+                        grouped.data(),
+                        serial.data(),
+                        grouped.size(),
+                        N);
+                }
+            }
+
+            uint64_t observed_calls = 0;
+            uint64_t effective_wide_calls = 0;
+            for (const auto &record : PerfStatsCollector::snapshot(
+                     {"kernel.cpu_native_vnni_verifier_rows_launch"}))
+            {
+                if (record.domain != "kernel" ||
+                    record.name != "cpu_native_vnni_verifier_rows_launch" ||
+                    record.kind != PerfStatRecord::Kind::Counter)
+                {
+                    continue;
+                }
+                EXPECT_EQ(record.tags.at("requested_policy"), "WideRows");
+                EXPECT_EQ(
+                    record.tags.at("k_tiles"),
+                    std::to_string(forced_k_tiles));
+                const int tagged_m = std::stoi(record.tags.at("m"));
+                const bool should_be_wide =
+                    activeISALevel() == ISALevel::AVX512 && tagged_m >= 3;
+                EXPECT_EQ(
+                    record.tags.at("effective_policy"),
+                    should_be_wide ? "WideRows" : "Pairwise");
+                observed_calls += record.count;
+                if (record.tags.at("effective_policy") == "WideRows")
+                    effective_wide_calls += record.count;
+            }
+            EXPECT_EQ(
+                observed_calls,
+                ALL_FORMATS.size() * verifier_rows.size());
+            if (activeISALevel() == ISALevel::AVX512)
+            {
+                EXPECT_EQ(
+                    effective_wide_calls,
+                    ALL_FORMATS.size() * (verifier_rows.size() - 1));
+            }
+
+            PerfStatsCollector::reset();
+            unsetenv("LLAMINAR_PERF_STATS_JSON");
+        };
+
+        run_k_tile_regime(/*K=*/256, /*forced_k_tiles=*/1);
+        run_k_tile_regime(/*K=*/4096, /*forced_k_tiles=*/4);
+    }
+
     TEST_F(CPUNativeVNNIGemvTest, MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows)
     {
         constexpr int K = 4096;
         constexpr int N0 = 384;
         constexpr int N1 = 320;
-        const std::array<int, 3> verifier_rows = {2, 3, 4};
+        const auto &verifier_rows = kGroupedVerifierRuntimeRows;
 
         ScopedCPUVNNIEnv force_k_tiles("LLAMINAR_CPU_VNNI_K_TILES", "4");
         setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_native_vnni_kparallel_grouped_verifier.json", 1);
@@ -1329,8 +1472,10 @@ namespace
         }
 
         const auto records = PerfStatsCollector::snapshot({
-            "kernel.cpu_native_vnni_fused_grouped_verifier_projection_calls"});
+            "kernel.cpu_native_vnni_fused_grouped_verifier_projection_calls",
+            "kernel.cpu_native_vnni_fused_verifier_rows_projection_launch"});
         uint64_t fused_grouped_verifier_calls = 0;
+        uint64_t grouped_k_parallel_projection_launches = 0;
         for (const auto &record : records)
         {
             if (record.domain == "kernel" &&
@@ -1341,12 +1486,37 @@ namespace
                 EXPECT_EQ(record.tags.at("projections"), "2");
                 fused_grouped_verifier_calls += record.count;
             }
+            if (record.domain == "kernel" &&
+                record.name ==
+                    "cpu_native_vnni_fused_verifier_rows_projection_launch" &&
+                record.kind == PerfStatRecord::Kind::Counter)
+            {
+                EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+                EXPECT_EQ(record.tags.at("k_tiles"), "4");
+                EXPECT_EQ(
+                    record.tags.at("physical_row_tile"),
+                    activeISALevel() == ISALevel::AVX512 ? "4" : "2");
+                EXPECT_EQ(
+                    record.tags.at("isa"),
+                    activeISALevel() == ISALevel::AVX512 ? "AVX512" : "AVX2");
+                EXPECT_EQ(
+                    record.tags.at("route"),
+                    "grouped_k_parallel_row_tiles");
+                const int tagged_m = std::stoi(record.tags.at("m"));
+                EXPECT_TRUE((tagged_m >= 2 && tagged_m <= 16) || tagged_m == 31);
+                grouped_k_parallel_projection_launches += record.count;
+            }
         }
         EXPECT_EQ(
             fused_grouped_verifier_calls,
             ALL_FORMATS.size() * verifier_rows.size())
-            << "Every CPU NativeVNNI format and M=2/3/4 shape must enter the "
+            << "Every CPU NativeVNNI format and certified runtime-M shape must enter the "
                "fused grouped verifier route under forced K-parallel tiling";
+        EXPECT_EQ(
+            grouped_k_parallel_projection_launches,
+            ALL_FORMATS.size() * verifier_rows.size() * 2)
+            << "Each projection must use a shared physical row tile; a one-row "
+               "K-part scheduler is not an economical grouped verifier path";
 
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
@@ -1359,7 +1529,7 @@ namespace
         const int N0 = 192;
         const int N1 = 128;
         const int NDown = 160;
-        const std::array<int, 3> verifier_rows = {2, 3, 4};
+        const auto &verifier_rows = kGroupedVerifierRuntimeRows;
 
         setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_fp32_grouped_verifier.json", 1);
         PerfStatsCollector::reset();
@@ -1484,7 +1654,7 @@ namespace
             }
         }
         EXPECT_EQ(projection_calls, verifier_rows.size())
-            << "CPU FP32 projection verifier must enter the grouped path for M=2/3/4";
+            << "CPU FP32 projection verifier must enter the grouped path for every runtime M";
 
         uint64_t swiglu_calls = 0;
         for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_fp32_grouped_verifier_swiglu_down_calls"}))
@@ -1499,7 +1669,7 @@ namespace
             }
         }
         EXPECT_EQ(swiglu_calls, verifier_rows.size())
-            << "CPU FP32 SwiGLU-down verifier must enter the grouped path for M=2/3/4";
+            << "CPU FP32 SwiGLU-down verifier must enter the grouped path for every runtime M";
 
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
@@ -1519,7 +1689,7 @@ namespace
         const int N0 = 96;
         const int N1 = 64;
         const int NDown = 80;
-        const std::array<int, 3> verifier_rows = {2, 3, 4};
+        const auto &verifier_rows = kGroupedVerifierRuntimeRows;
 
         setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_fp16_bf16_grouped_verifier.json", 1);
         PerfStatsCollector::reset();
@@ -1767,8 +1937,8 @@ namespace
             {
                 continue;
             }
-            const std::string &m_tag = record.tags.at("m");
-            if (!(m_tag == "2" || m_tag == "3" || m_tag == "4"))
+            const int m_tag = std::stoi(record.tags.at("m"));
+            if (!((m_tag >= 2 && m_tag <= 16) || m_tag == 31))
                 continue;
             if (record.tags.at("dtype") == "fp16")
                 fp16_swiglu_calls += record.count;
@@ -1783,64 +1953,127 @@ namespace
     }
 #endif
 
-    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRowsUntrainedShapeUsesPairwiseFloor)
+    TEST_F(CPUNativeVNNIGemvTest, MTP_UncertifiedVerifierThreadRegimeHardFails)
     {
         /**
-         * Phase 9.8 regression: the generated verifier-row policy table only
-         * promotes shapes that were measured by the trainer.  The square
-         * 5120x5120 Q4_K probe is intentionally not a production Qwen3.6
-         * projection key, and the wide M=3 candidate is much slower there.
-         * Unknown keys must therefore use Pairwise, the conservative grouped
-         * floor, instead of silently guessing a wide-row policy.
+         * Learned CPU policy rows are certified for an explicit OpenMP thread
+         * count as well as build/runtime ISA. Silently choosing Pairwise for an
+         * unseen topology would turn a missing policy into an unmeasured
+         * production path. Use a deliberately uncertified thread count and
+         * prove the resolver fails closed instead.
          */
-        const int N = 5120;
-        const int K = 5120;
+        const int N = 128;
+        const int K = 256;
         const int M = 3;
 
-        auto weights = createWeightsForFormat("Q4_K", N, K);
+        auto weights = createWeightsForFormat("Q8_K", N, K);
         ASSERT_NE(weights, nullptr);
 
         CPUNativeVNNIGemmKernel kernel(weights.get());
         ASSERT_TRUE(kernel.isValid());
         const auto &packed = kernel.packedWeights();
-        ASSERT_EQ(
-            selectVerifierRowsPolicy(packed, M, N, K),
-            VerifierRowsPolicy::Pairwise);
+        const int original_threads = omp_get_max_threads();
+        omp_set_num_threads(7);
+        std::string error;
+        try
+        {
+            (void)selectVerifierRowsPolicy(packed, M, N, K);
+        }
+        catch (const std::runtime_error &exception)
+        {
+            error = exception.what();
+        }
+        omp_set_num_threads(original_threads);
 
-        auto input = TestTensorFactory::createFP32Random(
-            {static_cast<size_t>(M), static_cast<size_t>(K)},
-            -1.0f,
-            1.0f,
-            9603u);
-        ASSERT_NE(input, nullptr);
+        EXPECT_FALSE(error.empty());
+        EXPECT_NE(error.find("No certified CPU NativeVNNI"), std::string::npos)
+            << error;
+        EXPECT_NE(error.find("threads=7"), std::string::npos) << error;
+    }
 
-        FP32Tensor batched({static_cast<size_t>(M), static_cast<size_t>(N)});
-        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-            {&kernel, &batched, N, nullptr, "untrained_square_verifier_projection"}};
-        ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
-            input.get(), projections, M, K));
+    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRoutePublishesBuildAndRuntimeISA)
+    {
+        /**
+         * The trainer treats build ISA and effective runtime ISA as policy-key
+         * dimensions. This regression exercises the production grouped entry
+         * point, checks byte equality against serial M=1 rows, and then proves
+         * the route counter publishes the same dimensions consumed by the
+         * strong-evidence adapter.
+         */
+        constexpr int M = 3;
+        constexpr int N = 128;
+        constexpr int K = 256;
+        auto weights = createWeightsForFormat("Q8_K", N, K);
+        ASSERT_NE(weights, nullptr);
+        CPUNativeVNNIGemmKernel kernel(weights.get());
+        ASSERT_TRUE(kernel.isValid());
+        const auto &packed = kernel.packedWeights();
 
-        std::vector<float> serial(
-            static_cast<size_t>(M) * static_cast<size_t>(N),
-            0.0f);
+        std::mt19937 rng(0x15A5u);
+        std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+        std::vector<float> input(static_cast<size_t>(M) * K);
+        for (float &value : input)
+            value = distribution(rng);
+
+        std::vector<Q8_1Block> quantized(
+            static_cast<size_t>(M) * packed.blocks_per_row);
+        quantize_activations_to_q8_1(
+            input.data(),
+            quantized.data(),
+            M,
+            K,
+            packed.blocks_per_row);
+        std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+        std::vector<float> serial(static_cast<size_t>(M) * N, 0.0f);
+
+        setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+        PerfStatsCollector::reset();
+        gemm_native_vnni_preq_decode_equivalent_rows(
+            packed,
+            quantized.data(),
+            grouped.data(),
+            M,
+            N,
+            ISAPath::AUTO,
+            VerifierRowsPolicy::WideRows);
         for (int row = 0; row < M; ++row)
         {
-            ASSERT_TRUE(multiplyViaTensor(
-                kernel,
-                input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
-                serial.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
-                1,
-                N,
-                K));
+            gemv_native_vnni_preq(
+                packed,
+                quantized.data() +
+                    static_cast<size_t>(row) * packed.blocks_per_row,
+                serial.data() + static_cast<size_t>(row) * N,
+                ISAPath::AUTO);
         }
-
-        const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
         expectBitwiseEqualFloatRows(
-            "CPU Q4_K untrained-shape verifier rows must match pairwise serial decode",
-            batched.data(),
+            "CPU ISA-aware verifier telemetry probe",
+            grouped.data(),
             serial.data(),
-            count,
-            static_cast<size_t>(N));
+            grouped.size(),
+            N);
+
+        const char *expected_runtime_isa =
+            activeISALevel() == ISALevel::AVX512 ? "AVX512" : "AVX2";
+        const char *expected_policy =
+            activeISALevel() == ISALevel::AVX512 ? "WideRows" : "Pairwise";
+        uint64_t route_count = 0;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_verifier_rows_launch"}))
+        {
+            if (record.name != "cpu_native_vnni_verifier_rows_launch")
+                continue;
+            EXPECT_EQ(record.tags.at("build_isa"),
+                      compiledNativeVNNIBuildISAName());
+            EXPECT_EQ(record.tags.at("isa"), expected_runtime_isa);
+            EXPECT_EQ(record.tags.at("requested_policy"), "WideRows");
+            EXPECT_EQ(record.tags.at("effective_policy"), expected_policy);
+            EXPECT_EQ(record.tags.at("threads"),
+                      std::to_string(omp_get_max_threads()));
+            route_count += record.count;
+        }
+        EXPECT_EQ(route_count, 1u);
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)

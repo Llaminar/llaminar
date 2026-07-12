@@ -81,6 +81,174 @@ namespace
         hipStream_t stream_ = nullptr;
     };
 
+    /**
+     * @brief Prove one captured resident HIP gather follows a growing count.
+     *
+     * A prefill graph is captured at one chunk boundary and reused after the
+     * cache has accumulated more history. Therefore neither the request stride
+     * nor the gather launch horizon may be frozen to the eight rows visible at
+     * capture. This helper appends twelve additional rows and requires the
+     * unchanged graph to expose all twenty native rows byte for byte.
+     *
+     * @tparam Precision Native ROCm cache format under test.
+     * @param format_name Human-readable format included in assertion output.
+     */
+    template <ActivationPrecision Precision>
+    void runCapturedResidentGatherGrowthByteExact(const char *format_name)
+    {
+        using DataT = typename llaminar2::detail::ROCmKVCacheType<Precision>::Type;
+
+        constexpr int layer = 0;
+        constexpr int batch_size = 1;
+        constexpr int max_seq_len = 32;
+        constexpr int capture_rows = 8;
+        constexpr int continuation_rows = 12;
+        constexpr int live_rows = capture_rows + continuation_rows;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 32;
+        constexpr int logical_kv_dim = n_kv_heads * head_dim;
+        constexpr int storage_dim =
+            Precision == ActivationPrecision::Q8_1
+                ? logical_kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE)
+                : logical_kv_dim;
+
+        SCOPED_TRACE(format_name);
+        ASSERT_GT(storage_dim, 0);
+
+        ROCmRingKVCache<Precision> cache(
+            /*n_layers=*/1,
+            batch_size,
+            max_seq_len,
+            n_kv_heads,
+            head_dim,
+            /*device_id=*/0);
+        const WorkspaceRequirements requirements =
+            cache.getWorkspaceRequirements(
+                capture_rows,
+                batch_size,
+                head_dim);
+        DeviceWorkspaceManager workspace(
+            DeviceId::rocm(0),
+            requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        cache.bindWorkspace(&workspace);
+        ASSERT_TRUE(cache.hasWorkspace());
+
+        std::vector<DataT> source_k(
+            static_cast<size_t>(live_rows) * storage_dim);
+        std::vector<DataT> source_v(
+            static_cast<size_t>(live_rows) * storage_dim);
+        auto fillNativeBytes = [](std::vector<DataT> &values, uint8_t salt)
+        {
+            auto *bytes = reinterpret_cast<uint8_t *>(values.data());
+            const size_t byte_count = values.size() * sizeof(DataT);
+            for (size_t index = 0; index < byte_count; ++index)
+            {
+                bytes[index] = static_cast<uint8_t>(
+                    1u + ((static_cast<unsigned int>(salt) +
+                           static_cast<unsigned int>(index * 29u)) %
+                          251u));
+            }
+        };
+        fillNativeBytes(source_k, 17);
+        fillNativeBytes(source_v, 113);
+
+        ScopedHipStream stream;
+        DataT *device_k = nullptr;
+        DataT *device_v = nullptr;
+        const size_t source_bytes = source_k.size() * sizeof(DataT);
+        ASSERT_EQ(hipMalloc(&device_k, source_bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&device_v, source_bytes), hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_k, source_k.data(), source_bytes,
+                hipMemcpyHostToDevice, stream.stream()),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                device_v, source_v.data(), source_bytes,
+                hipMemcpyHostToDevice, stream.stream()),
+            hipSuccess);
+        ASSERT_TRUE(cache.append(
+            layer, /*seq_idx=*/0, device_k, device_v,
+            capture_rows, stream.stream()));
+
+        /*
+         * Construct stable cache-owned tensor wrappers before global capture;
+         * only the second call below is recorded in the graph.
+         */
+        ITensor *gathered_k = nullptr;
+        ITensor *gathered_v = nullptr;
+        ASSERT_TRUE(cache.get_kv_batched_device_view(
+            layer, /*first_seq_idx=*/0, batch_size,
+            &gathered_k, &gathered_v, stream.opaque()));
+        stream.synchronize();
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t graph_exec = nullptr;
+        ASSERT_EQ(
+            hipStreamBeginCapture(
+                stream.stream(), hipStreamCaptureModeGlobal),
+            hipSuccess);
+        bool capture_ok = false;
+        {
+            GraphCaptureGuard guard;
+            capture_ok = cache.get_kv_batched_device_view(
+                layer, /*first_seq_idx=*/0, batch_size,
+                &gathered_k, &gathered_v, stream.opaque());
+        }
+        ASSERT_EQ(hipStreamEndCapture(stream.stream(), &graph), hipSuccess);
+        ASSERT_TRUE(capture_ok);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(
+            hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+            hipSuccess);
+
+        ASSERT_TRUE(cache.append(
+            layer,
+            /*seq_idx=*/0,
+            device_k + static_cast<size_t>(capture_rows) * storage_dim,
+            device_v + static_cast<size_t>(capture_rows) * storage_dim,
+            continuation_rows,
+            stream.stream()));
+        ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+        stream.synchronize();
+
+        ASSERT_NE(gathered_k, nullptr);
+        ASSERT_NE(gathered_v, nullptr);
+        const size_t live_elements =
+            static_cast<size_t>(live_rows) * storage_dim;
+        std::vector<DataT> actual_k(live_elements);
+        std::vector<DataT> actual_v(live_elements);
+        const size_t live_bytes = live_elements * sizeof(DataT);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                actual_k.data(), gathered_k->gpu_data_ptr(), live_bytes,
+                hipMemcpyDeviceToHost, stream.stream()),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                actual_v.data(), gathered_v->gpu_data_ptr(), live_bytes,
+                hipMemcpyDeviceToHost, stream.stream()),
+            hipSuccess);
+        stream.synchronize();
+
+        EXPECT_EQ(
+            std::memcmp(actual_k.data(), source_k.data(), live_bytes), 0)
+            << "Captured resident K gather stopped at its capture-time horizon for "
+            << format_name;
+        EXPECT_EQ(
+            std::memcmp(actual_v.data(), source_v.data(), live_bytes), 0)
+            << "Captured resident V gather stopped at its capture-time horizon for "
+            << format_name;
+
+        EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+        EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        EXPECT_EQ(hipFree(device_k), hipSuccess);
+        EXPECT_EQ(hipFree(device_v), hipSuccess);
+        cache.unbindWorkspace();
+    }
+
     // Generate random FP32 data
     std::vector<float> generateRandomFP32(size_t count, unsigned seed = 42)
     {
@@ -107,6 +275,22 @@ namespace
     }
 
 } // namespace
+
+/**
+ * @brief Every standard ROCm cache format grows beyond capture byte-exactly.
+ */
+TEST(Test__ROCmRingKVCache, CapturedResidentGatherGrowthAllFormatsIsByteExact)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::FP32>("FP32");
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::FP16>("FP16");
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::BF16>("BF16");
+    runCapturedResidentGatherGrowthByteExact<ActivationPrecision::Q8_1>("Q8_1");
+}
 
 // =============================================================================
 // Test: Basic Append and Retrieval
@@ -825,6 +1009,56 @@ TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendUsesFusedConversionWith
     stream.synchronize();
     EXPECT_FALSE(workspace_consumer->hasWorkspace())
         << "Fused converted append must not allocate or bind an implicit workspace";
+}
+
+/**
+ * @brief Proves resident gather scratch cannot shrink to a prefill graph bucket.
+ *
+ * A bucket describes newly submitted rows. Attention still reads all rows from
+ * prior chunks, so a 16-row graph can require scratch for the cache's complete
+ * 64-row horizon. The cache also owns a fixed request capacity that must remain
+ * valid when the first captured request happens to use only one sequence.
+ */
+TEST(Test__ROCmRingKVCache, WorkspaceRequirementsCoverResidentHistoryBeyondGraphBucket)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int n_layers = 1;
+    constexpr int batch_size = 4;
+    constexpr int max_seq_len = 64;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 32;
+    constexpr int graph_bucket_tokens = 16;
+    constexpr int first_request_batch = 1;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP32>>(
+        n_layers,
+        batch_size,
+        max_seq_len,
+        n_kv_heads,
+        head_dim,
+        0);
+    ASSERT_NE(cache, nullptr);
+
+    const auto requirements = cache->getWorkspaceRequirements(
+        graph_bucket_tokens,
+        first_request_batch,
+        0);
+    ASSERT_EQ(requirements.buffers.size(), 2u);
+
+    const size_t expected_bytes =
+        static_cast<size_t>(max_seq_len) * batch_size *
+        n_kv_heads * head_dim * sizeof(float);
+    for (const auto &buffer : requirements.buffers)
+    {
+        EXPECT_TRUE(buffer.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K ||
+                    buffer.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+        EXPECT_GE(buffer.size_bytes, expected_bytes)
+            << "Resident KV gather scratch must cover history beyond the active graph bucket";
+    }
 }
 
 /**
@@ -1761,7 +1995,6 @@ namespace
         constexpr int kv_dim = n_kv_heads * head_dim;
         constexpr int long_rows = 10;
         constexpr int short_rows = 3;
-        constexpr int max_kv_len = 6;
 
         Cache cache(
             n_layers, batch_size, max_seq_len,
@@ -1793,7 +2026,7 @@ namespace
         const auto short_v = make_rows(short_rows, 193);
 
         const auto requirements =
-            cache.getWorkspaceRequirements(max_kv_len, batch_size, 0);
+            cache.getWorkspaceRequirements(max_seq_len, batch_size, 0);
         DeviceWorkspaceManager workspace(
             DeviceId::rocm(0),
             requirements.total_bytes_with_alignment() + 4096);
@@ -1847,14 +2080,14 @@ namespace
         ITensor *batched_k = nullptr;
         ITensor *batched_v = nullptr;
         ASSERT_TRUE(cache.get_kv_batched_device_view(
-            layer, /*first_seq_idx=*/0, batch_size, max_kv_len,
+            layer, /*first_seq_idx=*/0, batch_size,
             &batched_k, &batched_v, stream.opaque()));
         ASSERT_NE(batched_k, nullptr);
         ASSERT_NE(batched_v, nullptr);
         stream.synchronize();
 
         const size_t output_elements =
-            static_cast<size_t>(batch_size) * max_kv_len * storage_dim;
+            static_cast<size_t>(batch_size) * max_seq_len * storage_dim;
         std::vector<DataT> actual_k(output_elements);
         std::vector<DataT> actual_v(output_elements);
         ASSERT_EQ(hipMemcpy(
@@ -1866,42 +2099,37 @@ namespace
                       output_elements * sizeof(DataT), hipMemcpyDeviceToHost),
                   hipSuccess);
 
-        std::vector<DataT> expected_k(output_elements, DataT{});
-        std::vector<DataT> expected_v(output_elements, DataT{});
         const size_t row_bytes = static_cast<size_t>(storage_dim) * sizeof(DataT);
-        const int first_visible_long_row = long_rows - max_kv_len;
-        for (int row = 0; row < max_kv_len; ++row)
-        {
-            std::memcpy(
-                expected_k.data() + static_cast<size_t>(row) * storage_dim,
-                long_k.data() +
-                    static_cast<size_t>(first_visible_long_row + row) * storage_dim,
-                row_bytes);
-            std::memcpy(
-                expected_v.data() + static_cast<size_t>(row) * storage_dim,
-                long_v.data() +
-                    static_cast<size_t>(first_visible_long_row + row) * storage_dim,
-                row_bytes);
-        }
+        const int first_visible_long_row = long_rows - max_seq_len;
+        const size_t long_visible_bytes =
+            static_cast<size_t>(max_seq_len) * row_bytes;
         const size_t short_output_base =
-            static_cast<size_t>(max_kv_len) * storage_dim;
-        std::memcpy(
-            expected_k.data() + short_output_base,
-            short_k.data(), short_bytes);
-        std::memcpy(
-            expected_v.data() + short_output_base,
-            short_v.data(), short_bytes);
+            static_cast<size_t>(max_seq_len) * storage_dim;
 
         EXPECT_EQ(std::memcmp(
-                      actual_k.data(), expected_k.data(),
-                      output_elements * sizeof(DataT)),
+                      actual_k.data(),
+                      long_k.data() +
+                          static_cast<size_t>(first_visible_long_row) * storage_dim,
+                      long_visible_bytes),
                   0)
             << "Native device-state K gather changed bytes for " << format_name;
         EXPECT_EQ(std::memcmp(
-                      actual_v.data(), expected_v.data(),
-                      output_elements * sizeof(DataT)),
+                      actual_v.data(),
+                      long_v.data() +
+                          static_cast<size_t>(first_visible_long_row) * storage_dim,
+                      long_visible_bytes),
                   0)
             << "Native device-state V gather changed bytes for " << format_name;
+        EXPECT_EQ(std::memcmp(
+                      actual_k.data() + short_output_base,
+                      short_k.data(), short_bytes),
+                  0)
+            << "Native request-one K gather changed bytes for " << format_name;
+        EXPECT_EQ(std::memcmp(
+                      actual_v.data() + short_output_base,
+                      short_v.data(), short_bytes),
+                  0)
+            << "Native request-one V gather changed bytes for " << format_name;
 
         cache.unbindWorkspace();
         EXPECT_EQ(hipFree(d_long_k), hipSuccess);

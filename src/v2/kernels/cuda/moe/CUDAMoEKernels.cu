@@ -17,6 +17,7 @@
 #include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "utils/DebugEnv.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -7251,11 +7252,13 @@ namespace
     /**
      * @brief Decode-equivalent grouped FP32 router logits for verifier rows.
      *
-     * One block owns one expert and computes every verifier row for that expert.
-     * The gate vector is read once per K slice and reused across the row-local
-     * accumulators.  Each row still follows the same vectorized K traversal and
-     * block reduction as route_logits_kernel(), preserving serial decode math
-     * while removing redundant gate reads across MTP verifier rows.
+     * One block owns one expert and one fixed-size verifier-row tile. The gate
+     * vector is read once per K slice and reused across the row-local
+     * accumulators. A second grid dimension covers any runtime row count, so
+     * the fixed register tile never becomes a speculative-depth admission
+     * limit. Each row still follows the same vectorized K traversal and block
+     * reduction as route_logits_kernel(), preserving serial decode math while
+     * removing redundant gate reads across nearby MTP verifier rows.
      */
     __global__ void route_logits_fp32_grouped_verifier_kernel(
         const float *__restrict__ hidden,
@@ -7263,12 +7266,17 @@ namespace
         float *__restrict__ logits,
         int seq_len, int d_model, int num_experts)
     {
+        constexpr int kRowsPerBlock = 4;
         const int expert = blockIdx.x;
+        const int first_row = blockIdx.y * kRowsPerBlock;
         if (expert >= num_experts)
+            return;
+        const int tile_rows = min(kRowsPerBlock, seq_len - first_row);
+        if (tile_rows <= 0)
             return;
 
         const float *g = gate_weights + static_cast<size_t>(expert) * d_model;
-        float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float sums[kRowsPerBlock] = {0.0f, 0.0f, 0.0f, 0.0f};
         const bool can_vectorize =
             ((d_model & 3) == 0) &&
             ((reinterpret_cast<std::uintptr_t>(hidden) |
@@ -7281,18 +7289,23 @@ namespace
             for (int v = threadIdx.x; v < vec4; v += blockDim.x)
             {
                 const float4 gv = g4[v];
-                for (int row = 0; row < seq_len; ++row)
+                for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
                 {
+                    const int row = first_row + tile_row;
                     const float *h = hidden + static_cast<size_t>(row) * d_model;
                     const float4 hv = reinterpret_cast<const float4 *>(h)[v];
-                    sums[row] += hv.x * gv.x + hv.y * gv.y + hv.z * gv.z + hv.w * gv.w;
+                    sums[tile_row] +=
+                        hv.x * gv.x + hv.y * gv.y + hv.z * gv.z + hv.w * gv.w;
                 }
             }
             for (int j = (vec4 << 2) + threadIdx.x; j < d_model; j += blockDim.x)
             {
                 const float gv = g[j];
-                for (int row = 0; row < seq_len; ++row)
-                    sums[row] += hidden[static_cast<size_t>(row) * d_model + j] * gv;
+                for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+                {
+                    const int row = first_row + tile_row;
+                    sums[tile_row] += hidden[static_cast<size_t>(row) * d_model + j] * gv;
+                }
             }
         }
         else
@@ -7300,34 +7313,40 @@ namespace
             for (int j = threadIdx.x; j < d_model; j += blockDim.x)
             {
                 const float gv = g[j];
-                for (int row = 0; row < seq_len; ++row)
-                    sums[row] += hidden[static_cast<size_t>(row) * d_model + j] * gv;
+                for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+                {
+                    const int row = first_row + tile_row;
+                    sums[tile_row] += hidden[static_cast<size_t>(row) * d_model + j] * gv;
+                }
             }
         }
 
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
         const int num_warps = blockDim.x >> 5;
-        __shared__ float warp_sums[4][32];
-        for (int row = 0; row < seq_len; ++row)
+        __shared__ float warp_sums[kRowsPerBlock][32];
+        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
         {
-            float v = sums[row];
+            float v = sums[tile_row];
             for (int offset = 16; offset > 0; offset >>= 1)
                 v += __shfl_down_sync(0xffffffffu, v, offset);
             if (lane == 0)
-                warp_sums[row][warp] = v;
+                warp_sums[tile_row][warp] = v;
         }
         __syncthreads();
 
         if (warp == 0)
         {
-            for (int row = 0; row < seq_len; ++row)
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
             {
-                float v = (lane < num_warps) ? warp_sums[row][lane] : 0.0f;
+                float v = (lane < num_warps) ? warp_sums[tile_row][lane] : 0.0f;
                 for (int offset = 16; offset > 0; offset >>= 1)
                     v += __shfl_down_sync(0xffffffffu, v, offset);
                 if (lane == 0)
+                {
+                    const int row = first_row + tile_row;
                     logits[static_cast<size_t>(row) * num_experts + expert] = v;
+                }
             }
         }
     }
@@ -7336,7 +7355,8 @@ namespace
      * @brief Decode-equivalent grouped BF16 router logits for verifier rows.
      *
      * Mirrors route_logits_bf16_kernel() for each row but shares each BF16 gate
-     * load across all verifier rows in the expert-owned block.
+     * load across a fixed row tile in the expert-owned block. Grid-Y tiles make
+     * this implementation runtime-M without increasing per-thread registers.
      */
     __global__ void route_logits_bf16_grouped_verifier_kernel(
         const float *__restrict__ hidden,
@@ -7344,42 +7364,53 @@ namespace
         float *__restrict__ logits,
         int seq_len, int d_model, int num_experts)
     {
+        constexpr int kRowsPerBlock = 4;
         const int expert = blockIdx.x;
+        const int first_row = blockIdx.y * kRowsPerBlock;
         if (expert >= num_experts)
+            return;
+        const int tile_rows = min(kRowsPerBlock, seq_len - first_row);
+        if (tile_rows <= 0)
             return;
 
         const __nv_bfloat16 *g = gate_weights + static_cast<size_t>(expert) * d_model;
-        float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float sums[kRowsPerBlock] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int j = threadIdx.x; j < d_model; j += blockDim.x)
         {
             const float gv = __bfloat162float(g[j]);
-            for (int row = 0; row < seq_len; ++row)
-                sums[row] += hidden[static_cast<size_t>(row) * d_model + j] * gv;
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+            {
+                const int row = first_row + tile_row;
+                sums[tile_row] += hidden[static_cast<size_t>(row) * d_model + j] * gv;
+            }
         }
 
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
         const int num_warps = blockDim.x >> 5;
-        __shared__ float warp_sums[4][32];
-        for (int row = 0; row < seq_len; ++row)
+        __shared__ float warp_sums[kRowsPerBlock][32];
+        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
         {
-            float v = sums[row];
+            float v = sums[tile_row];
             for (int offset = 16; offset > 0; offset >>= 1)
                 v += __shfl_down_sync(0xffffffffu, v, offset);
             if (lane == 0)
-                warp_sums[row][warp] = v;
+                warp_sums[tile_row][warp] = v;
         }
         __syncthreads();
 
         if (warp == 0)
         {
-            for (int row = 0; row < seq_len; ++row)
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
             {
-                float v = (lane < num_warps) ? warp_sums[row][lane] : 0.0f;
+                float v = (lane < num_warps) ? warp_sums[tile_row][lane] : 0.0f;
                 for (int offset = 16; offset > 0; offset >>= 1)
                     v += __shfl_down_sync(0xffffffffu, v, offset);
                 if (lane == 0)
+                {
+                    const int row = first_row + tile_row;
                     logits[static_cast<size_t>(row) * num_experts + expert] = v;
+                }
             }
         }
     }
@@ -9864,12 +9895,13 @@ namespace
     /**
      * @brief Compute Q8 router logits for all verifier rows in one expert block.
      *
-     * One CUDA block owns one expert and accumulates up to four verifier rows.
+     * One CUDA block owns one expert and accumulates one four-row verifier tile.
      * The gate Q8 payload and gate scale for each 32-column block are loaded
      * once, then reused across the row-local DP4A accumulators.  Each row still
      * uses the same per-row hidden scales and the same K traversal order as
      * serial decode, so this is the economical grouped form of the serial Q8
-     * router rather than a row-replay launch hidden inside the backend.
+     * router rather than a row-replay launch hidden inside the backend. Grid-Y
+     * covers additional tiles, keeping arbitrary runtime M in one launch.
      */
     __global__ void router_gate_logits_q8_grouped_verifier_kernel(
         const int8_t *__restrict__ hidden_q8,
@@ -9882,12 +9914,17 @@ namespace
         int num_experts)
     {
         constexpr int kBlockSize = 32;
+        constexpr int kRowsPerBlock = 4;
         const int expert = blockIdx.x;
+        const int first_row = blockIdx.y * kRowsPerBlock;
         if (expert >= num_experts)
+            return;
+        const int tile_rows = min(kRowsPerBlock, seq_len - first_row);
+        if (tile_rows <= 0)
             return;
 
         const int blocks_per_row = K / kBlockSize;
-        float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float sums[kRowsPerBlock] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int block_idx = threadIdx.x; block_idx < blocks_per_row; block_idx += blockDim.x)
         {
             const size_t scale_idx = static_cast<size_t>(expert) * blocks_per_row + block_idx;
@@ -9899,8 +9936,9 @@ namespace
             for (int group = 0; group < 8; ++group)
                 w_values[group] = w4[group];
 
-            for (int row = 0; row < seq_len; ++row)
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
             {
+                const int row = first_row + tile_row;
                 const int8_t *row_hidden =
                     hidden_q8 + static_cast<size_t>(row) * static_cast<size_t>(K);
                 const float *row_scales =
@@ -9911,34 +9949,38 @@ namespace
 #pragma unroll
                 for (int group = 0; group < 8; ++group)
                     block_acc = __dp4a(h4[group], w_values[group], block_acc);
-                sums[row] += static_cast<float>(block_acc) * row_scales[block_idx] * gate_scale;
+                sums[tile_row] +=
+                    static_cast<float>(block_acc) * row_scales[block_idx] * gate_scale;
             }
         }
 
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
         const int num_warps = blockDim.x >> 5;
-        __shared__ float warp_sums[4][32];
+        __shared__ float warp_sums[kRowsPerBlock][32];
 
-        for (int row = 0; row < seq_len; ++row)
+        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
         {
-            float v = sums[row];
+            float v = sums[tile_row];
             for (int offset = 16; offset > 0; offset >>= 1)
                 v += __shfl_down_sync(0xffffffffu, v, offset);
             if (lane == 0)
-                warp_sums[row][warp] = v;
+                warp_sums[tile_row][warp] = v;
         }
         __syncthreads();
 
         if (warp == 0)
         {
-            for (int row = 0; row < seq_len; ++row)
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
             {
-                float v = (lane < num_warps) ? warp_sums[row][lane] : 0.0f;
+                float v = (lane < num_warps) ? warp_sums[tile_row][lane] : 0.0f;
                 for (int offset = 16; offset > 0; offset >>= 1)
                     v += __shfl_down_sync(0xffffffffu, v, offset);
                 if (lane == 0)
+                {
+                    const int row = first_row + tile_row;
                     logits[static_cast<size_t>(row) * num_experts + expert] = v;
+                }
             }
         }
     }
@@ -11023,54 +11065,51 @@ namespace
     }
 
     /**
-     * @brief Split-K gate/up projection for tiny grouped verifier-prefill rows.
+     * @brief Produce decode-equivalent gate/up partials for one verifier-row tile.
      *
-     * The ordinary grouped-prefill gate/up kernel launches one full-K CTA for
-     * each (expert, M-tile, N-tile).  For MTP verifier batches M is only 2..4,
-     * so that leaves the GPU under-filled even though each CTA has a long
-     * quantized-weight latency chain.  This variant mirrors the single-row
-     * decode split-K strategy: each CTA owns one K partition and writes partial
-     * gate/up sums into [grouped_slot][k_partition][N].  A second tiny reduce
-     * kernel sums partitions back into the normal grouped-prefill FP32
-     * gate/up scratch buffers.
+     * Grouped expert planning reorders route slots by expert so adjacent rows
+     * can reuse packed weights. The serial-decode oracle, however, quantizes
+     * and projects each original top-k route independently. This kernel keeps
+     * both properties: one launch covers a fixed tile of original verifier
+     * routes, while `original_to_grouped` redirects each route to the grouped
+     * activation row prepared by the planner.
+     *
+     * Scratch is indexed by the tile-local route number rather than the global
+     * grouped slot. Consequently, a graph can certify arbitrary runtime M by
+     * replaying fixed-size row tiles without allocating partial buffers in
+     * proportion to the complete context or speculative depth.
      */
-    template <uint8_t CodebookId, int kTileM>
-    __global__ void grouped_native_vnni_gate_up_prefill_kpart_kernel(
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        const int *__restrict__ expert_counts,
-        const int *__restrict__ expert_offsets,
-        const int *__restrict__ active_expert_ids,
-        int active_expert_slots,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_expert_ids,
         float *__restrict__ gate_partials,
         float *__restrict__ up_partials,
+        int original_slot_base,
+        int tile_route_slots,
         int N,
         int K,
+        int num_experts,
         int k_partitions)
     {
         constexpr int kTileN = 64;
         const int n = blockIdx.x * kTileN + threadIdx.x;
-        const int token_group = blockIdx.y;
-        const int expert_grid_index = blockIdx.z / k_partitions;
-        const int k_part = blockIdx.z - expert_grid_index * k_partitions;
-        if (n >= N || k_part >= k_partitions)
+        const int local_route = blockIdx.y;
+        const int k_part = blockIdx.z;
+        if (n >= N || local_route >= tile_route_slots ||
+            k_part >= k_partitions)
             return;
 
-        const int expert_id = (active_expert_slots > 0)
-                                  ? active_expert_ids[expert_grid_index]
-                                  : expert_grid_index;
-        if (expert_id < 0)
+        const int original_slot = original_slot_base + local_route;
+        const int grouped_slot = original_to_grouped[original_slot];
+        const int expert_id = original_expert_ids[original_slot];
+        if (grouped_slot < 0 || expert_id < 0 || expert_id >= num_experts)
             return;
 
-        const int count = expert_counts[expert_id];
-        const int first_token = token_group * kTileM;
-        if (first_token >= count)
-            return;
-
-        const int tokens_in_group = min(kTileM, count - first_token);
-        const int first_slot = expert_offsets[expert_id] + first_token;
         const int blocks_per_row = K / 32;
         const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
         const int b_start = k_part * blocks_per_part;
@@ -11084,31 +11123,25 @@ namespace
             !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
             return;
 
-#pragma unroll
-        for (int m = 0; m < kTileM; ++m)
+        const size_t partial_index =
+            (static_cast<size_t>(local_route) * static_cast<size_t>(k_partitions) +
+             static_cast<size_t>(k_part)) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        if (b_start >= b_end)
         {
-            if (m >= tokens_in_group)
-                break;
-            const int slot = first_slot + m;
-            const size_t partial_index =
-                (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) +
-                 static_cast<size_t>(k_part)) *
-                    static_cast<size_t>(N) +
-                static_cast<size_t>(n);
-            if (b_start >= b_end)
-            {
-                gate_partials[partial_index] = 0.0f;
-                up_partials[partial_index] = 0.0f;
-                continue;
-            }
-            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
-            const float *slot_scales =
-                scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            gate_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
-                gate_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-            up_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
-                up_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
         }
+
+        const int8_t *slot_A = A_int8 + static_cast<size_t>(grouped_slot) * K;
+        const float *slot_scales =
+            scales_A_blockwise + static_cast<size_t>(grouped_slot) * blocks_per_row;
+        gate_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+            gate_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
+        up_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+            up_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
     }
 
     /**
@@ -11120,26 +11153,34 @@ namespace
      * benefit is architectural: verifier graphs avoid a launch and a global
      * FP32 gate/up scratch round trip.
      */
-    __global__ void grouped_native_vnni_gate_up_prefill_kpart_reduce_swiglu_kernel(
+    __global__ void grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
+        const int *__restrict__ original_to_grouped,
         int8_t *__restrict__ swiglu_int8,
         float *__restrict__ swiglu_scales,
-        int total_slots,
+        int original_slot_base,
+        int tile_route_slots,
         int N,
         int k_partitions)
     {
         constexpr int kTileN = 32;
         const int lane = threadIdx.x;
         const int block_idx = blockIdx.x;
-        const int slot = blockIdx.y;
-        const int n = block_idx * kTileN + lane;
-        if (slot >= total_slots)
+        const int local_route = blockIdx.y;
+        if (local_route >= tile_route_slots)
             return;
 
+        const int grouped_slot =
+            original_to_grouped[original_slot_base + local_route];
+        if (grouped_slot < 0)
+            return;
+
+        const int n = block_idx * kTileN + lane;
         const bool active = n < N;
-        const size_t slot_base =
-            static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+        const size_t route_base =
+            static_cast<size_t>(local_route) *
+            static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
 
         float gate_sum = 0.0f;
         float up_sum = 0.0f;
@@ -11148,7 +11189,7 @@ namespace
             for (int k_part = 0; k_part < k_partitions; ++k_part)
             {
                 const size_t idx =
-                    slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                    route_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
                 gate_sum += gate_partials[idx];
                 up_sum += up_partials[idx];
             }
@@ -11163,82 +11204,15 @@ namespace
         const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
         const int blocks_per_row = (N + kTileN - 1) / kTileN;
         if (lane == 0)
-            swiglu_scales[static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row) +
+            swiglu_scales[static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
                           static_cast<size_t>(block_idx)] = scale;
 
         if (active)
         {
             const float q = value / scale;
-            swiglu_int8[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+            swiglu_int8[static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
                 static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
         }
-    }
-
-    template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_gate_up_decode_kernel(
-        const int8_t *__restrict__ A_int8,
-        const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        const int *__restrict__ expert_ids,
-        float *const *__restrict__ gate_outputs,
-        float *const *__restrict__ up_outputs,
-        int num_active,
-        int N,
-        int K)
-    {
-        constexpr int kTileN = 64;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
-        const int slot = blockIdx.y;
-        if (slot >= num_active || n >= N)
-            return;
-
-        const int expert_id = expert_ids[slot];
-        if (expert_id < 0)
-            return;
-
-        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        gate_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
-            gate_desc, n, A_int8, scales_A_blockwise, N, K);
-        up_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
-            up_desc, n, A_int8, scales_A_blockwise, N, K);
-    }
-
-    template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_down_decode_kernel(
-        const int8_t *__restrict__ A_int8,
-        const float *__restrict__ scales_A_blockwise,
-        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
-        const int *__restrict__ expert_ids,
-        const float *__restrict__ route_weights,
-        float *__restrict__ output,
-        int num_active,
-        int N,
-        int K)
-    {
-        constexpr int kTileN = 64;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
-        if (n >= N)
-            return;
-
-        const int blocks_per_row = K / 32;
-        float total = 0.0f;
-#pragma unroll 1
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            const int expert_id = expert_ids[slot];
-            if (expert_id < 0)
-                continue;
-
-            const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
-            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
-            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc_dispatch<CodebookId>(
-                desc, n, slot_A, slot_scales, N, K);
-            total += route_weights[slot] * expert_value;
-        }
-        output[n] = total;
     }
 
     /**
@@ -11360,8 +11334,8 @@ namespace
      * - original_expert_ids[seq_len * top_k] keeps the original route slot's
      *   expert id so the ordered publication does not have to infer ownership
      *   from grouped offsets.
-     * - partials[seq_len][k_partitions][N] stores one route-weighted partial
-     *   output row for each verifier token and K partition.
+     * - partials[tile_rows][k_partitions][N] stores one route-weighted partial
+     *   output row for the current fixed-size verifier tile and K partition.
      */
     template <uint8_t CodebookId>
     __global__ void grouped_prefill_down_ordered_kpart_scatter_kernel(
@@ -11372,7 +11346,8 @@ namespace
         const int *__restrict__ original_expert_ids,
         const float *__restrict__ grouped_weights,
         float *__restrict__ partials,
-        int seq_len,
+        int token_base,
+        int tile_rows,
         int top_k,
         int N,
         int K,
@@ -11382,9 +11357,10 @@ namespace
         constexpr int kTileN = 64;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int k_part = blockIdx.y;
-        const int token = blockIdx.z;
-        if (token >= seq_len || k_part >= k_partitions || n >= N)
+        const int local_token = blockIdx.z;
+        if (local_token >= tile_rows || k_part >= k_partitions || n >= N)
             return;
+        const int token = token_base + local_token;
 
         const int blocks_per_row = K / 32;
         const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -11394,7 +11370,7 @@ namespace
             b_end = blocks_per_row;
 
         const size_t partial_index =
-            (static_cast<size_t>(token) * static_cast<size_t>(k_partitions) +
+            (static_cast<size_t>(local_token) * static_cast<size_t>(k_partitions) +
              static_cast<size_t>(k_part)) *
                 static_cast<size_t>(N) +
             static_cast<size_t>(n);
@@ -11439,62 +11415,28 @@ namespace
     __global__ void grouped_prefill_down_ordered_kpart_reduce_kernel(
         const float *__restrict__ partials,
         float *__restrict__ output,
-        int seq_len,
+        int token_base,
+        int tile_rows,
         int N,
         int k_partitions)
     {
         constexpr int kTileN = 64;
         const int n = blockIdx.x * kTileN + threadIdx.x;
-        const int token = blockIdx.y;
-        if (token >= seq_len || n >= N)
+        const int local_token = blockIdx.y;
+        if (local_token >= tile_rows || n >= N)
             return;
+        const int token = token_base + local_token;
 
         float sum = 0.0f;
-        const size_t token_base =
-            static_cast<size_t>(token) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+        const size_t partial_base =
+            static_cast<size_t>(local_token) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
         for (int k_part = 0; k_part < k_partitions; ++k_part)
         {
-            sum += partials[token_base +
+            sum += partials[partial_base +
                             static_cast<size_t>(k_part) * static_cast<size_t>(N) +
                             static_cast<size_t>(n)];
         }
         output[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
-    }
-
-    template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_gate_up_decode_runtime_kernel(
-        const int8_t *__restrict__ A_int8,
-        const float *__restrict__ scales_A_blockwise,
-        const DeviceMoELayerRuntimeView *__restrict__ runtime,
-        const int *__restrict__ expert_ids,
-        float *const *__restrict__ gate_outputs,
-        float *const *__restrict__ up_outputs,
-        int num_active,
-        int N,
-        int K,
-        int num_experts)
-    {
-        constexpr int kTileN = 64;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
-        const int slot = blockIdx.y;
-        if (slot >= num_active || n >= N)
-            return;
-
-        const int expert_id = expert_ids[slot];
-        if (expert_id < 0 || expert_id >= num_experts)
-        {
-            gate_outputs[slot][n] = 0.0f;
-            up_outputs[slot][n] = 0.0f;
-            return;
-        }
-
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-        const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
-        const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
-        gate_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
-            gate_desc, n, A_int8, scales_A_blockwise, N, K);
-        up_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
-            up_desc, n, A_int8, scales_A_blockwise, N, K);
     }
 
     template <uint8_t CodebookId>
@@ -11552,44 +11494,6 @@ namespace
             gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         up_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
             up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-    }
-
-    template <uint8_t CodebookId>
-    __global__ void grouped_native_vnni_down_decode_runtime_kernel(
-        const int8_t *__restrict__ A_int8,
-        const float *__restrict__ scales_A_blockwise,
-        const DeviceMoELayerRuntimeView *__restrict__ runtime,
-        const int *__restrict__ expert_ids,
-        const float *__restrict__ route_weights,
-        float *__restrict__ output,
-        int num_active,
-        int N,
-        int K,
-        int num_experts)
-    {
-        constexpr int kTileN = 64;
-        const int n = blockIdx.x * kTileN + threadIdx.x;
-        if (n >= N)
-            return;
-
-        const int blocks_per_row = K / 32;
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
-        float total = 0.0f;
-#pragma unroll 1
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            const int expert_id = expert_ids[slot];
-            if (expert_id < 0 || expert_id >= num_experts)
-                continue;
-
-            const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
-            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
-            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc_dispatch<CodebookId>(
-                desc, n, slot_A, slot_scales, N, K);
-            total += route_weights[slot] * expert_value;
-        }
-        output[n] = total;
     }
 
     template <uint8_t CodebookId>
@@ -11664,9 +11568,9 @@ namespace
             break;
         }
 
-        // Tiny MTP verifier groups (M=2..4) are fastest with the compact
-        // two-row template on CUDA. Wider M tiles add per-block work without
-        // improving occupancy for these active expert groups.
+        // Tiny verifier groups are fastest with the compact two-row template
+        // on CUDA. Wider runtime-M groups select larger tiles without changing
+        // their row-wise arithmetic contract.
         if (max_tokens_per_expert <= 4)
             return 2;
         if (max_tokens_per_expert <= 8)
@@ -11740,7 +11644,7 @@ extern "C"
     {
         if (!hidden || !hidden_q8 || !hidden_scales ||
             !gate_weights_q8 || !gate_scales || !logits || !stream ||
-            seq_len <= 0 || seq_len > 4 ||
+            seq_len <= 0 ||
             d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_gate_logits_q8_weights_decode_equivalent_rows] invalid arguments\n");
@@ -11756,7 +11660,9 @@ extern "C"
             return false;
 
         constexpr int kRouterThreads = 128;
-        router_gate_logits_q8_grouped_verifier_kernel<<<num_experts, kRouterThreads, 0, cuda_stream>>>(
+        constexpr int kRowsPerBlock = 4;
+        const dim3 grid(num_experts, (seq_len + kRowsPerBlock - 1) / kRowsPerBlock);
+        router_gate_logits_q8_grouped_verifier_kernel<<<grid, kRouterThreads, 0, cuda_stream>>>(
             hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits,
             seq_len, d_model, num_experts);
         return finishLaunch("cudaMoE_gate_logits_q8_weights_decode_equivalent_rows");
@@ -11776,7 +11682,7 @@ extern "C"
         int device_idx, void *stream)
     {
         if (!hidden || !gate_weights || !logits || !stream ||
-            seq_len <= 0 || seq_len > 4 ||
+            seq_len <= 0 ||
             d_model <= 0 || num_experts <= 0)
         {
             std::fprintf(stderr, "[cudaMoE_route_logits_decode_equivalent_rows] invalid arguments\n");
@@ -11784,7 +11690,9 @@ extern "C"
         }
 
         cudaSetDevice(device_idx);
-        route_logits_fp32_grouped_verifier_kernel<<<num_experts, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        constexpr int kRowsPerBlock = 4;
+        const dim3 grid(num_experts, (seq_len + kRowsPerBlock - 1) / kRowsPerBlock);
+        route_logits_fp32_grouped_verifier_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, gate_weights, logits, seq_len, d_model, num_experts);
         return finishLaunch("cudaMoE_route_logits_decode_equivalent_rows");
     }
@@ -11798,7 +11706,7 @@ extern "C"
         int device_idx, void *stream)
     {
         if (!hidden || !gate_weights || !logits || !stream ||
-            seq_len <= 0 || seq_len > 4 ||
+            seq_len <= 0 ||
             d_model <= 0 || num_experts <= 0)
         {
             std::fprintf(stderr, "[cudaMoE_route_logits_bf16_decode_equivalent_rows] invalid arguments\n");
@@ -11806,7 +11714,9 @@ extern "C"
         }
 
         cudaSetDevice(device_idx);
-        route_logits_bf16_grouped_verifier_kernel<<<num_experts, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        constexpr int kRowsPerBlock = 4;
+        const dim3 grid(num_experts, (seq_len + kRowsPerBlock - 1) / kRowsPerBlock);
+        route_logits_bf16_grouped_verifier_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, static_cast<const __nv_bfloat16 *>(gate_weights), logits,
             seq_len, d_model, num_experts);
         return finishLaunch("cudaMoE_route_logits_bf16_decode_equivalent_rows");
@@ -13212,81 +13122,6 @@ extern "C"
         return finishLaunch("cudaMoE_scatter_expert_fixed");
     }
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_table(
-        const float *d_hidden,
-        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        int num_active,
-        int N,
-        int K,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream)
-    {
-        if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
-            !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
-            num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-        {
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table] invalid arguments\n");
-            return false;
-        }
-
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        if (!hidden_prequantized)
-        {
-            const int blocks_per_row = K / 32;
-            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
-                d_hidden, d_hidden_int8, d_hidden_scales, K);
-            if (!finishLaunch("cudaMoE_grouped_gate_up_hidden_quantize"))
-                return false;
-        }
-
-        constexpr int kTileN = 64;
-        dim3 grid((N + kTileN - 1) / kTileN, num_active);
-        dim3 block(kTileN);
-
-#define LAUNCH_GROUPED_GATE_UP(CB)                                                                  \
-    grouped_native_vnni_gate_up_decode_kernel<CB><<<grid, block, 0, cuda_stream>>>(                 \
-        d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
-        d_gate_outputs, d_up_outputs, num_active, N, K)
-
-        switch (codebook_id)
-        {
-        case 0:  LAUNCH_GROUPED_GATE_UP(0); break;
-        case 4:  LAUNCH_GROUPED_GATE_UP(4); break;
-        case 5:  LAUNCH_GROUPED_GATE_UP(5); break;
-        case 6:  LAUNCH_GROUPED_GATE_UP(6); break;
-        case 7:  LAUNCH_GROUPED_GATE_UP(7); break;
-        case 8:  LAUNCH_GROUPED_GATE_UP(8); break;
-        case 9:  LAUNCH_GROUPED_GATE_UP(9); break;
-        case 10: LAUNCH_GROUPED_GATE_UP(10); break;
-        case 11: LAUNCH_GROUPED_GATE_UP(11); break;
-        case 12: LAUNCH_GROUPED_GATE_UP(12); break;
-        case 13: LAUNCH_GROUPED_GATE_UP(13); break;
-        case 14: LAUNCH_GROUPED_GATE_UP(14); break;
-        case 15: LAUNCH_GROUPED_GATE_UP(15); break;
-        case 16: LAUNCH_GROUPED_GATE_UP(16); break;
-        case 17: LAUNCH_GROUPED_GATE_UP(17); break;
-        case 19: LAUNCH_GROUPED_GATE_UP(19); break;
-        case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP(kMixedCodebookSentinel); break;
-        default:
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table] unsupported codebook_id=%u\n",
-                         static_cast<unsigned>(codebook_id));
-            return false;
-        }
-
-#undef LAUNCH_GROUPED_GATE_UP
-
-        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table");
-    }
-
     bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
         const float *d_hidden,
         const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -13383,82 +13218,6 @@ extern "C"
         return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart");
     }
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
-        const float *d_hidden,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        int num_active,
-        int N,
-        int K,
-        int num_experts,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream)
-    {
-        if (!d_hidden || !d_runtime_layer || !d_expert_ids ||
-            !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
-            num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 || (K % 32) != 0)
-        {
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime] invalid arguments\n");
-            return false;
-        }
-
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        if (!hidden_prequantized)
-        {
-            const int blocks_per_row = K / 32;
-            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
-                d_hidden, d_hidden_int8, d_hidden_scales, K);
-            if (!finishLaunch("cudaMoE_grouped_gate_up_runtime_hidden_quantize"))
-                return false;
-        }
-
-        constexpr int kTileN = 64;
-        dim3 grid((N + kTileN - 1) / kTileN, num_active);
-        dim3 block(kTileN);
-        const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
-
-#define LAUNCH_GROUPED_GATE_UP_RUNTIME(CB)                                                       \
-    grouped_native_vnni_gate_up_decode_runtime_kernel<CB><<<grid, block, 0, cuda_stream>>>(       \
-        d_hidden_int8, d_hidden_scales, runtime, d_expert_ids,                                    \
-        d_gate_outputs, d_up_outputs, num_active, N, K, num_experts)
-
-        switch (codebook_id)
-        {
-        case 0:  LAUNCH_GROUPED_GATE_UP_RUNTIME(0); break;
-        case 4:  LAUNCH_GROUPED_GATE_UP_RUNTIME(4); break;
-        case 5:  LAUNCH_GROUPED_GATE_UP_RUNTIME(5); break;
-        case 6:  LAUNCH_GROUPED_GATE_UP_RUNTIME(6); break;
-        case 7:  LAUNCH_GROUPED_GATE_UP_RUNTIME(7); break;
-        case 8:  LAUNCH_GROUPED_GATE_UP_RUNTIME(8); break;
-        case 9:  LAUNCH_GROUPED_GATE_UP_RUNTIME(9); break;
-        case 10: LAUNCH_GROUPED_GATE_UP_RUNTIME(10); break;
-        case 11: LAUNCH_GROUPED_GATE_UP_RUNTIME(11); break;
-        case 12: LAUNCH_GROUPED_GATE_UP_RUNTIME(12); break;
-        case 13: LAUNCH_GROUPED_GATE_UP_RUNTIME(13); break;
-        case 14: LAUNCH_GROUPED_GATE_UP_RUNTIME(14); break;
-        case 15: LAUNCH_GROUPED_GATE_UP_RUNTIME(15); break;
-        case 16: LAUNCH_GROUPED_GATE_UP_RUNTIME(16); break;
-        case 17: LAUNCH_GROUPED_GATE_UP_RUNTIME(17); break;
-        case 19: LAUNCH_GROUPED_GATE_UP_RUNTIME(19); break;
-        case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_RUNTIME(kMixedCodebookSentinel); break;
-        default:
-            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime] unsupported codebook_id=%u\n",
-                         static_cast<unsigned>(codebook_id));
-            return false;
-        }
-
-#undef LAUNCH_GROUPED_GATE_UP_RUNTIME
-
-        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime");
-    }
-
     bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
         const float *d_hidden,
         const void *d_runtime_layer,
@@ -13550,76 +13309,6 @@ extern "C"
         return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart reduce");
     }
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const DeviceNativeVNNIMatrixDesc *d_desc_table,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        float *d_output,
-        int num_active,
-        int N,
-        int K,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream)
-    {
-        if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
-            !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
-            num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
-        {
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table] invalid arguments\n");
-            return false;
-        }
-
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, K);
-        if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
-            return false;
-
-        constexpr int kTileN = 64;
-        dim3 grid((N + kTileN - 1) / kTileN);
-        dim3 block(kTileN);
-
-#define LAUNCH_GROUPED_DOWN(CB)                                                                  \
-    grouped_native_vnni_down_decode_kernel<CB><<<grid, block, 0, cuda_stream>>>(                 \
-        d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,                   \
-        d_output, num_active, N, K)
-
-        switch (codebook_id)
-        {
-        case 0:  LAUNCH_GROUPED_DOWN(0); break;
-        case 4:  LAUNCH_GROUPED_DOWN(4); break;
-        case 5:  LAUNCH_GROUPED_DOWN(5); break;
-        case 6:  LAUNCH_GROUPED_DOWN(6); break;
-        case 7:  LAUNCH_GROUPED_DOWN(7); break;
-        case 8:  LAUNCH_GROUPED_DOWN(8); break;
-        case 9:  LAUNCH_GROUPED_DOWN(9); break;
-        case 10: LAUNCH_GROUPED_DOWN(10); break;
-        case 11: LAUNCH_GROUPED_DOWN(11); break;
-        case 12: LAUNCH_GROUPED_DOWN(12); break;
-        case 13: LAUNCH_GROUPED_DOWN(13); break;
-        case 14: LAUNCH_GROUPED_DOWN(14); break;
-        case 15: LAUNCH_GROUPED_DOWN(15); break;
-        case 16: LAUNCH_GROUPED_DOWN(16); break;
-        case 17: LAUNCH_GROUPED_DOWN(17); break;
-        case 19: LAUNCH_GROUPED_DOWN(19); break;
-        case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN(kMixedCodebookSentinel); break;
-        default:
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table] unsupported codebook_id=%u\n",
-                         static_cast<unsigned>(codebook_id));
-            return false;
-        }
-
-#undef LAUNCH_GROUPED_DOWN
-
-        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table");
-    }
-
     bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
@@ -13708,78 +13397,6 @@ extern "C"
             d_down_partials, d_output, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
-    }
-
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        float *d_output,
-        int num_active,
-        int N,
-        int K,
-        int num_experts,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream)
-    {
-        if (!d_gate_ptrs || !d_up_ptrs || !d_runtime_layer || !d_expert_ids || !d_weights ||
-            !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
-            num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 || (K % 32) != 0)
-        {
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime] invalid arguments\n");
-            return false;
-        }
-
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, K);
-        if (!finishLaunch("cudaMoE_grouped_swiglu_runtime_quantize"))
-            return false;
-
-        constexpr int kTileN = 64;
-        dim3 grid((N + kTileN - 1) / kTileN);
-        dim3 block(kTileN);
-        const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
-
-#define LAUNCH_GROUPED_DOWN_RUNTIME(CB)                                                        \
-    grouped_native_vnni_down_decode_runtime_kernel<CB><<<grid, block, 0, cuda_stream>>>(       \
-        d_swiglu_int8, d_swiglu_scales, runtime, d_expert_ids, d_weights,                      \
-        d_output, num_active, N, K, num_experts)
-
-        switch (codebook_id)
-        {
-        case 0:  LAUNCH_GROUPED_DOWN_RUNTIME(0); break;
-        case 4:  LAUNCH_GROUPED_DOWN_RUNTIME(4); break;
-        case 5:  LAUNCH_GROUPED_DOWN_RUNTIME(5); break;
-        case 6:  LAUNCH_GROUPED_DOWN_RUNTIME(6); break;
-        case 7:  LAUNCH_GROUPED_DOWN_RUNTIME(7); break;
-        case 8:  LAUNCH_GROUPED_DOWN_RUNTIME(8); break;
-        case 9:  LAUNCH_GROUPED_DOWN_RUNTIME(9); break;
-        case 10: LAUNCH_GROUPED_DOWN_RUNTIME(10); break;
-        case 11: LAUNCH_GROUPED_DOWN_RUNTIME(11); break;
-        case 12: LAUNCH_GROUPED_DOWN_RUNTIME(12); break;
-        case 13: LAUNCH_GROUPED_DOWN_RUNTIME(13); break;
-        case 14: LAUNCH_GROUPED_DOWN_RUNTIME(14); break;
-        case 15: LAUNCH_GROUPED_DOWN_RUNTIME(15); break;
-        case 16: LAUNCH_GROUPED_DOWN_RUNTIME(16); break;
-        case 17: LAUNCH_GROUPED_DOWN_RUNTIME(17); break;
-        case 19: LAUNCH_GROUPED_DOWN_RUNTIME(19); break;
-        case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_RUNTIME(kMixedCodebookSentinel); break;
-        default:
-            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime] unsupported codebook_id=%u\n",
-                         static_cast<unsigned>(codebook_id));
-            return false;
-        }
-
-#undef LAUNCH_GROUPED_DOWN_RUNTIME
-
-        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime");
     }
 
     bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
@@ -13908,6 +13525,7 @@ extern "C"
         uint32_t down_codebook_mask,
         int gateup_k_partitions,
         int down_k_partitions,
+        int splitk_tile_rows,
         int device_idx,
         void *stream)
     {
@@ -13924,24 +13542,32 @@ extern "C"
             return false;
         }
         const bool use_active_expert_grid = active_expert_slots > 0;
+        const bool valid_gateup_k_partitions =
+            (gateup_k_partitions == 2 || gateup_k_partitions == 4 ||
+             gateup_k_partitions == 8 || gateup_k_partitions == 16 ||
+             gateup_k_partitions == 32);
+        const bool gateup_kpart_requested = gateup_k_partitions > 0;
         const bool use_gateup_kpart =
-            use_active_expert_grid &&
-            max_tokens_per_expert <= 4 &&
-            gateup_k_partitions > 1 &&
-            d_gate_partials &&
-            d_up_partials;
+            use_active_expert_grid && gateup_kpart_requested &&
+            valid_gateup_k_partitions && d_gate_partials && d_up_partials &&
+            d_original_to_grouped && d_original_expert_ids;
         const bool valid_down_k_partitions =
             (down_k_partitions == 2 || down_k_partitions == 4 ||
              down_k_partitions == 8 || down_k_partitions == 16);
+        const bool down_kpart_requested = down_k_partitions > 0;
         const bool use_ordered_down_kpart =
-            use_active_expert_grid &&
-            max_tokens_per_expert <= 4 &&
+            use_active_expert_grid && down_kpart_requested &&
             d_original_to_grouped &&
             d_original_expert_ids &&
             d_down_partials &&
-            down_k_partitions > 1 &&
             valid_down_k_partitions;
+        if (gateup_kpart_requested && !use_gateup_kpart)
+            return false;
         if (down_k_partitions > 0 && !valid_down_k_partitions)
+            return false;
+        if (down_kpart_requested && !use_ordered_down_kpart)
+            return false;
+        if ((use_gateup_kpart || use_ordered_down_kpart) && splitk_tile_rows <= 0)
             return false;
         if (use_active_expert_grid &&
             (!d_active_expert_ids ||
@@ -13969,90 +13595,140 @@ extern "C"
                 return false;
         }
 
+        if (use_gateup_kpart)
+        {
+            constexpr int kTileN = 64;
+            constexpr int kReduceTileN = 32;
+            dim3 block(kTileN);
+            dim3 reduce_block(kReduceTileN);
+
+            for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
+            {
+                const int tile_rows = std::min(splitk_tile_rows, seq_len - token_base);
+                const int original_slot_base = token_base * top_k;
+                const int tile_route_slots = tile_rows * top_k;
+                dim3 scatter_grid(
+                    (intermediate + kTileN - 1) / kTileN,
+                    tile_route_slots,
+                    gateup_k_partitions);
+
+#define LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB)                                                   \
+    grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel<CB>                                  \
+        <<<scatter_grid, block, 0, cuda_stream>>>(                                                 \
+            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,               \
+            d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,          \
+            original_slot_base, tile_route_slots, intermediate, d_model, num_experts,              \
+            gateup_k_partitions)
+
+                bool launched_gateup = false;
+#define LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(CB)                                        \
+    do {                                                                                           \
+        if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                       \
+            LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB);                                               \
+            if (!finishGroupedPrefillLaunch(                                                       \
+                    "cudaMoE_grouped_gate_up_ordered_kpart_prefill", cuda_stream))                \
+                return false;                                                                      \
+            launched_gateup = true;                                                                \
+        }                                                                                          \
+    } while (0)
+
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(0);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(4);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(5);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(6);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(7);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(8);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(9);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(10);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(11);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(12);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(13);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(14);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(15);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(16);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(17);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(19);
+                if (!launched_gateup)
+                {
+                    std::fprintf(
+                        stderr,
+                        "[cudaMoE_grouped_prefill_pipeline] unsupported ordered kpart gate/up codebook_id=%u mask=0x%x\n",
+                        static_cast<unsigned>(gateup_codebook_id),
+                        static_cast<unsigned>(gateup_codebook_mask));
+                    return false;
+                }
+
+                dim3 reduce_grid(
+                    (intermediate + kReduceTileN - 1) / kReduceTileN,
+                    tile_route_slots);
+                grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel<<<
+                    reduce_grid, reduce_block, 0, cuda_stream>>>(
+                    d_gate_partials, d_up_partials, d_original_to_grouped,
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                    original_slot_base, tile_route_slots, intermediate,
+                    gateup_k_partitions);
+                if (!finishGroupedPrefillLaunch(
+                        "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
+                        cuda_stream))
+                {
+                    return false;
+                }
+
+#undef LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT
+#undef LAUNCH_GROUPED_GATEUP_ORDERED_KPART
+            }
+        }
+        else
         {
             const int requestedTileM =
                 llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
             const int kTileM =
                 select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
-            const bool tiny_active_verifier =
-                active_expert_slots > 0 && max_tokens_per_expert <= 4;
-            const int kTileN = tiny_active_verifier ? 64 : 128;
-            // When fusion is enabled the gate/up kernel computes SwiGLU + blockwise int8 quant
-            // in its epilogue, writing the down-projection input directly (no FP32 gate/up
-            // round-trip, no separate swiglu_quantize launch).
-            const bool fuse_swiglu = llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
-            dim3 grid((intermediate + kTileN - 1) / kTileN,
-                      (max_tokens_per_expert + kTileM - 1) / kTileM,
-                      expert_grid);
+            constexpr int kTileN = 128;
+            const bool fuse_swiglu =
+                llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
+            dim3 grid(
+                (intermediate + kTileN - 1) / kTileN,
+                (max_tokens_per_expert + kTileM - 1) / kTileM,
+                expert_grid);
             dim3 block(kTileN);
 
-#define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
-    do {                                                                                           \
-        dim3 cb_grid(grid.x, grid.y, expert_grid);                                                  \
-        if (kTileN == 64)                                                                            \
-            grouped_native_vnni_gate_up_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
-                d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
-                d_scratch_gate, d_scratch_up, intermediate, d_model);                               \
-        else                                                                                         \
-            grouped_native_vnni_gate_up_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
-                d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
-                d_scratch_gate, d_scratch_up, intermediate, d_model);                               \
-    } while (0)
-#define LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM(CB, TM)                                             \
-    do {                                                                                           \
-        dim3 cb_grid(grid.x, grid.y, expert_grid * gateup_k_partitions);                           \
-        grouped_native_vnni_gate_up_prefill_kpart_kernel<CB, TM><<<cb_grid, block, 0, cuda_stream>>>( \
-            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                 \
-            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,              \
-            d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions);            \
-    } while (0)
-#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
-    do {                                                                                           \
-        dim3 cb_grid(grid.x, grid.y, expert_grid);                                                  \
-        if (kTileN == 64)                                                                            \
-            grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
-                d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                    \
-                intermediate, d_model);                                                             \
-        else                                                                                         \
-            grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
-                d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,             \
-                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                    \
-                intermediate, d_model);                                                             \
-    } while (0)
-#define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
-    do {                                                                                           \
-        if (use_gateup_kpart) {                                                                     \
-            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM(CB, 16);                 \
-            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM(CB, 8);                  \
-            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM(CB, 4);                  \
-            else                   LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM(CB, 2);                  \
-        } else if (fuse_swiglu) {                                                                   \
-            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);                 \
-            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                  \
-            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 4);                  \
-            else                   LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 2);                  \
-        } else {                                                                                    \
-            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                        \
-            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                         \
-            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 4);                         \
-            else                   LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 2);                         \
-        }                                                                                           \
+#define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                  \
+    grouped_native_vnni_gate_up_prefill_kernel<CB, TM, kTileN>                                    \
+        <<<grid, block, 0, cuda_stream>>>(                                                         \
+            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,               \
+            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
+            d_scratch_gate, d_scratch_up, intermediate, d_model)
+#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                           \
+    grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, kTileN>                             \
+        <<<grid, block, 0, cuda_stream>>>(                                                         \
+            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,               \
+            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
+            d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model)
+#define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                         \
+    do {                                                                                          \
+        if (fuse_swiglu) {                                                                        \
+            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);               \
+            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                \
+            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 4);                \
+            else                   LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 2);                \
+        } else {                                                                                  \
+            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                      \
+            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                       \
+            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 4);                       \
+            else                   LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 2);                       \
+        }                                                                                         \
     } while (0)
 
             bool launched_gateup = false;
-#define LAUNCH_GROUPED_GATEUP_IF_PRESENT(CB)                                                       \
-    do {                                                                                           \
-        if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                        \
-            LAUNCH_GROUPED_GATEUP_PREFILL(CB);                                                      \
-            if (!finishGroupedPrefillLaunch("cudaMoE_grouped_gate_up_prefill", cuda_stream))        \
-                return false;                                                                       \
-            launched_gateup = true;                                                                 \
-        }                                                                                           \
+#define LAUNCH_GROUPED_GATEUP_IF_PRESENT(CB)                                                      \
+    do {                                                                                          \
+        if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                      \
+            LAUNCH_GROUPED_GATEUP_PREFILL(CB);                                                    \
+            if (!finishGroupedPrefillLaunch("cudaMoE_grouped_gate_up_prefill", cuda_stream))     \
+                return false;                                                                     \
+            launched_gateup = true;                                                               \
+        }                                                                                         \
     } while (0)
 
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(0);
@@ -14073,30 +13749,16 @@ extern "C"
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
             if (!launched_gateup)
             {
-                std::fprintf(stderr,
-                             "[cudaMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%u mask=0x%x\n",
-                             static_cast<unsigned>(gateup_codebook_id),
-                             static_cast<unsigned>(gateup_codebook_mask));
+                std::fprintf(
+                    stderr,
+                    "[cudaMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%u mask=0x%x\n",
+                    static_cast<unsigned>(gateup_codebook_id),
+                    static_cast<unsigned>(gateup_codebook_mask));
                 return false;
-            }
-
-            if (use_gateup_kpart)
-            {
-                constexpr int kReduceTileN = 32;
-                dim3 reduce_grid((intermediate + kReduceTileN - 1) / kReduceTileN, total_slots);
-                dim3 reduce_block(kReduceTileN);
-                grouped_native_vnni_gate_up_prefill_kpart_reduce_swiglu_kernel<<<
-                    reduce_grid, reduce_block, 0, cuda_stream>>>(
-                    d_gate_partials, d_up_partials,
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                    total_slots, intermediate, gateup_k_partitions);
-                if (!finishGroupedPrefillLaunch("cudaMoE_grouped_gate_up_prefill_kpart_reduce_swiglu", cuda_stream))
-                    return false;
             }
 
 #undef LAUNCH_GROUPED_GATEUP_IF_PRESENT
 #undef LAUNCH_GROUPED_GATEUP_PREFILL
-#undef LAUNCH_GROUPED_GATEUP_KPART_PREFILL_TM
 #undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM
 #undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
         }
@@ -14120,17 +13782,24 @@ extern "C"
             constexpr int kTileN = 64;
             const int N = d_model;
             const int K = intermediate;
-            dim3 scatter_grid((N + kTileN - 1) / kTileN, down_k_partitions, seq_len);
-            dim3 reduce_grid((N + kTileN - 1) / kTileN, seq_len);
             dim3 block(kTileN);
+
+            for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
+            {
+                const int tile_rows = std::min(splitk_tile_rows, seq_len - token_base);
+                dim3 scatter_grid(
+                    (N + kTileN - 1) / kTileN,
+                    down_k_partitions,
+                    tile_rows);
+                dim3 reduce_grid((N + kTileN - 1) / kTileN, tile_rows);
 
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART(CB)                                                     \
     grouped_prefill_down_ordered_kpart_scatter_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>( \
         d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                         \
         d_original_to_grouped, d_original_expert_ids, d_group_weights,                             \
-        d_down_partials, seq_len, top_k, N, K, num_experts, down_k_partitions)
+        d_down_partials, token_base, tile_rows, top_k, N, K, num_experts, down_k_partitions)
 
-            bool launched_down = false;
+                bool launched_down = false;
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(CB)                                           \
     do {                                                                                           \
         if (down_codebook_mask & (uint32_t{1} << (CB))) {                                          \
@@ -14141,48 +13810,60 @@ extern "C"
         }                                                                                           \
     } while (0)
 
-            if (down_codebook_id == kMixedCodebookSentinel)
-            {
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART(kMixedCodebookSentinel);
-                if (!finishGroupedPrefillLaunch("cudaMoE_grouped_down_ordered_kpart_prefill", cuda_stream))
+                if (down_codebook_id == kMixedCodebookSentinel)
+                {
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART(kMixedCodebookSentinel);
+                    if (!finishGroupedPrefillLaunch(
+                            "cudaMoE_grouped_down_ordered_kpart_prefill",
+                            cuda_stream))
+                    {
+                        return false;
+                    }
+                    launched_down = true;
+                }
+                else
+                {
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(0);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(4);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(5);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(6);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(7);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(8);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(9);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(10);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(11);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(12);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(13);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(14);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(15);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(16);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(17);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(19);
+                }
+                if (!launched_down)
+                {
+                    std::fprintf(
+                        stderr,
+                        "[cudaMoE_grouped_prefill_pipeline] unsupported ordered kpart down codebook_id=%u mask=0x%x\n",
+                        static_cast<unsigned>(down_codebook_id),
+                        static_cast<unsigned>(down_codebook_mask));
                     return false;
-                launched_down = true;
-            }
-            else
-            {
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(0);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(4);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(5);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(6);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(7);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(8);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(9);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(10);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(11);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(12);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(13);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(14);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(15);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(16);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(17);
-                LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(19);
-            }
-            if (!launched_down)
-            {
-                std::fprintf(stderr,
-                             "[cudaMoE_grouped_prefill_pipeline] unsupported ordered kpart down codebook_id=%u mask=0x%x\n",
-                             static_cast<unsigned>(down_codebook_id),
-                             static_cast<unsigned>(down_codebook_mask));
-                return false;
-            }
+                }
 
 #undef LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT
 #undef LAUNCH_GROUPED_DOWN_ORDERED_KPART
 
-            grouped_prefill_down_ordered_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
-                d_down_partials, d_output, seq_len, N, down_k_partitions);
-            if (!finishGroupedPrefillLaunch("cudaMoE_grouped_down_ordered_kpart_reduce_prefill", cuda_stream))
-                return false;
+                grouped_prefill_down_ordered_kpart_reduce_kernel<<<
+                    reduce_grid, block, 0, cuda_stream>>>(
+                    d_down_partials, d_output, token_base, tile_rows, N,
+                    down_k_partitions);
+                if (!finishGroupedPrefillLaunch(
+                        "cudaMoE_grouped_down_ordered_kpart_reduce_prefill",
+                        cuda_stream))
+                {
+                    return false;
+                }
+            }
         }
         else
         {

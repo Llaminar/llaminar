@@ -38,6 +38,7 @@
 #include "utils/CUDAKernelProfiler.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cuda_runtime.h>
 
@@ -167,24 +168,6 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
-            bool cudaNativeVNNIGemvTuned_m2_fp32(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                uint8_t codebook_id,
-                int cuda_device_id,
-                void *stream,
-                CUDAGemvContext *gemv_ctx,
-                CUDARowMajorWeights **rm_slot);
-
             bool cudaNativeVNNIGemvTuned_small_m_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
@@ -294,7 +277,7 @@ namespace llaminar2
          * @brief Mark CUDA NativeVNNI calls as publication-sensitive verifier work.
          *
          * The important distinction is subtle: this scope is about grouped
-         * M=2..4 verifier entry points.  Plain serial M=1 decode now always uses
+         * runtime-M verifier entry points. Plain serial M=1 decode always uses
          * the canonical direct GEMV helper, so verifier wrappers use this marker
          * to force a rowwise outer loop while each row still enters the exact
          * same M=1 reduction contract as ordinary decode.
@@ -2160,9 +2143,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m < 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M=1..4, got M="
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -2235,7 +2218,7 @@ namespace llaminar2
             }
 
             const bool explicit_small_m_verifier =
-                explicitSmallMVerifierScopeActive() && m > 1 && m <= 4;
+                explicitSmallMVerifierScopeActive() && m > 1;
             if (explicit_small_m_verifier)
             {
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
@@ -3071,7 +3054,7 @@ namespace llaminar2
 
             const bool verifier_small_m =
                 explicitSmallMVerifierScopeActive() &&
-                (m > 1 && m <= 4) &&
+                (m > 1) &&
                 (k % 32 == 0) &&
                 canUseNativeVNNIBlockwise(impl_.get(), 1, k);
             const bool use_blockwise =
@@ -3286,9 +3269,9 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
-            if (m < 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M=1..4, got M="
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -3307,7 +3290,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
                 return false;
             }
-            if (m <= 1 || m > 4 || n <= 0 || k <= 0)
+            if (m <= 1 || n <= 0 || k <= 0)
             {
                 return false;
             }
@@ -3385,7 +3368,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Null input, scale, or output");
                 return false;
             }
-            if (m <= 1 || m > 4 || n <= 0 || k <= 0 || (k % 32) != 0)
+            if (m <= 1 || n <= 0 || k <= 0 || (k % 32) != 0)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Invalid dimensions: M="
                           << m << " N=" << n << " K=" << k);
@@ -3433,20 +3416,6 @@ namespace llaminar2
                         {"k", std::to_string(k)},
                         {"route", route}});
 
-                if (m == 2)
-                {
-                    PerfStatsCollector::addCounter(
-                        "kernel",
-                        "cuda_native_vnni_m2_calls",
-                        1.0,
-                        "gemm",
-                        "cuda:" + std::to_string(cuda_device_id_),
-                        PerfStatsCollector::Tags{
-                            {"codebook", std::to_string(static_cast<int>(impl_->native_codebook_id))},
-                            {"n", std::to_string(n)},
-                            {"k", std::to_string(k)},
-                            {"route", route}});
-                }
             };
 
             if (!use_specialized_small_m_kernel)
@@ -3467,7 +3436,7 @@ namespace llaminar2
                  * keep their fixed two-phase reduction instead of changing to
                  * ROWPAR after an auxiliary transpose happens to exist.  The
                  * grouped verifier must make the same dispatch decision for
-                 * every row.  It remains one economical M=2..4 launch; only
+                 * every row. It remains one economical runtime-M launch; only
                  * the incompatible ROWPAR promotion is suppressed while the
                  * explicit decode-equivalent scope is active.
                  */
@@ -3706,7 +3675,7 @@ namespace llaminar2
                 LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
             }
 
-            if (explicitSmallMVerifierScopeActive() && m > 1 && m <= 4)
+            if (explicitSmallMVerifierScopeActive() && m > 1)
             {
                 if (multiply_fp32_to_fp32_small_m_gemv(
                         d_A, d_C, nullptr, m, n, k, alpha, beta))
@@ -3717,7 +3686,7 @@ namespace llaminar2
 
                 if (cudaNativeVNNIGemvSweep_isActive())
                 {
-                    // Training sweeps must fail closed for M=2..4. Falling
+                    // Training sweeps must fail closed for grouped runtime-M. Falling
                     // through to the generic M>1 GEMM path would time a
                     // different kernel family while labelling the CSV row as
                     // the requested small-M candidate.
@@ -3833,7 +3802,7 @@ namespace llaminar2
             }
 
             if (explicitSmallMVerifierScopeActive() &&
-                m > 1 && m <= 4 &&
+                m > 1 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
@@ -4114,7 +4083,10 @@ namespace llaminar2
              * declares large-M prefill scratch can otherwise leave the later
              * canonical decode GEMV with no reduction arena.
              */
-            const int gemv_workspace_m = std::clamp(m, 1, 4);
+            const int gemv_workspace_m = std::clamp(
+                m,
+                1,
+                kDefaultNativeVNNIVerifierRowCapacity);
             if (gemv_workspace_m > 0)
             {
                 const int k_groups = (k + 31) / 32;

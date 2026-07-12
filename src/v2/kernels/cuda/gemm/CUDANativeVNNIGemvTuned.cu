@@ -9,11 +9,13 @@
  *   - **Direct**:   Small N ≤ 512 (KV projections) — one thread per column, smem A broadcast
  *
  *   KPar Hybrid Reduction:
- *   Small partials (≤256KB): Two-phase — each CTA writes to d_partials[split_idx * N + n],
- *     then a reduce kernel sums partials → d_C[n].  Eliminates atomic contention.
- *   Large partials (>256KB):  Atomic — memset d_C, atomicAdd accumulation, then epilogue.
- *     Avoids the memory traffic overhead of the partials buffer.
- *   Threshold chosen empirically: 3B_Attn (128KB) gains +8.7%, 7B_Attn (401KB) loses -5.5%.
+ *   Small non-verifier partial sets (≤256KB) use two phases: each CTA writes
+ *     `d_partials[split_idx * N + n]`, then an ordered reducer publishes `d_C[n]`.
+ *   Large non-verifier partial sets may use atomic accumulation when the caller
+ *     does not require batch invariance. Publication-sensitive serial M=1 and
+ *     grouped verifier work always materializes partitions and reduces
+ *     them in increasing partition order. The verifier contract therefore keeps
+ *     K parallelism without allowing scheduler-dependent floating-point atomics.
  *
  * All kernels decode the compact native payload inline and use dp4a for INT8 dot products.
  * The A (activation) vector is cached in shared memory once per K-block, eliminating
@@ -27,6 +29,7 @@
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -114,9 +117,11 @@ namespace
         int target_waves = 0;
         int mkg = 0;
         int max_kb = 0;
+        int exact_kb = 0;
         int force_two_phase = 0; // 0=auto, 1=force 2-phase, 2=force atomic
     };
     static SweepOverride g_sweep;
+    static thread_local int g_last_effective_kb = 1;
 
     // =====================================================================
     // Shape classifier — tuned from the native-vnni sweep results.
@@ -136,7 +141,7 @@ namespace
     /**
      * @brief Accumulate one 32-element native-VNNI weight block exactly once.
      *
-     * MTP verifier publication compares grouped M=2..4 rows against the serial
+     * MTP verifier publication compares grouped runtime-M rows against serial
      * M=1 decode route bit-for-bit. CUDA may otherwise choose subtly different
      * multiply/add contraction when the same expression lives in the larger
      * grouped kernel body. This helper gives both the M=1 KPAR kernel and the
@@ -355,17 +360,78 @@ namespace
         return "unknown";
     }
 
+    static int resolveKparKBlocks(
+        int grid_n,
+        int k_groups,
+        int num_sms,
+        int target_waves,
+        int min_kgroups_per_cta,
+        int max_kb);
+
+    /**
+     * @brief Build the stable common-trainer identity for an observed launch.
+     *
+     * KPAR identity includes the effective partition count because changing KB
+     * changes FP32 parenthesization. Grouped verifier rows remain one semantic
+     * candidate: they inherit the complete frozen public-M1 schedule, including
+     * family, tile, and KB. Keeping this identity in production telemetry stops
+     * a trainer from treating target-wave spellings that resolve to the same
+     * launch as independent evidence.
+     */
+    static std::string effectiveCandidateName(
+        NativeGemvShape shape,
+        const GeneratedDispatchTuning &tuning,
+        int effective_kb,
+        int M,
+        bool verifier_serial_m1)
+    {
+        if (verifier_serial_m1 && M >= 2)
+            return "cuda.nvnni.decode.verifier.inherit_serial_m1";
+
+        if (M == 1 &&
+            (shape == NativeGemvShape::WIDE ||
+             shape == NativeGemvShape::DIRECT ||
+             shape == NativeGemvShape::KPAR))
+        {
+            std::string candidate =
+                "cuda.nvnni.decode.fast_m1." +
+                std::string(shapeName(shape)) +
+                ".tn" + std::to_string(tuning.tile_n) +
+                ".cpt" + std::to_string(tuning.cpt);
+            if (shape == NativeGemvShape::KPAR)
+                candidate += ".kb" + std::to_string(effective_kb);
+            return candidate;
+        }
+
+        return "unsupported:" + std::string(shapeName(shape));
+    }
+
     template <uint8_t CB>
     static void recordGemvDispatch(
         NativeGemvShape shape,
         const GeneratedDispatchTuning &tuning,
+        int M,
         int N,
         int K,
         bool rowmajor_available,
-        int cuda_device_id)
+        int cuda_device_id,
+        bool verifier_serial_m1,
+        CUDAGemvContext_ *gemv_ctx)
     {
         if (!llaminar2::PerfStatsCollector::isEnabled())
             return;
+
+        int effective_kb = 1;
+        if (shape == NativeGemvShape::KPAR)
+        {
+            effective_kb = resolveKparKBlocks(
+                (N + tuning.tile_n - 1) / tuning.tile_n,
+                K / BLOCK_K,
+                querySmCount(gemv_ctx),
+                tuning.target_waves,
+                tuning.mkg,
+                tuning.max_kb);
+        }
 
         llaminar2::PerfStatsCollector::addCounter(
             "kernel",
@@ -375,11 +441,19 @@ namespace
             "cuda:" + std::to_string(cuda_device_id),
             llaminar2::PerfStatsCollector::Tags{
                 {"codebook", std::to_string(static_cast<int>(CB))},
+                {"m", std::to_string(M)},
                 {"n", std::to_string(N)},
                 {"k", std::to_string(K)},
+                {"semantic_contract", verifier_serial_m1
+                                             ? "verifier_serial_m1_bitwise"
+                                             : "fast"},
+                {"effective_candidate_id",
+                 effectiveCandidateName(
+                     shape, tuning, effective_kb, M, verifier_serial_m1)},
                 {"route", shapeName(shape)},
                 {"tile_n", std::to_string(tuning.tile_n)},
                 {"cpt", std::to_string(tuning.cpt)},
+                {"effective_kb", std::to_string(effective_kb)},
                 {"target_waves", std::to_string(tuning.target_waves)},
                 {"mkg", std::to_string(tuning.mkg)},
                 {"max_kb", std::to_string(tuning.max_kb)},
@@ -430,6 +504,47 @@ namespace
             else if (best_hi > 0)
                 kb = best_hi;
         }
+        return std::max(1, kb);
+    }
+
+    /**
+     * @brief Resolve the effective K-partition count for one launch.
+     *
+     * Generated production policies express an occupancy target and optional
+     * cap. Trainer and regression sweeps additionally provide an exact KB so
+     * each measured candidate has one unambiguous reduction tree. Exact sweep
+     * values larger than the number of 32-element K groups are rejected rather
+     * than silently clamped and mislabeled.
+     */
+    static int resolveKparKBlocks(
+        int grid_n,
+        int k_groups,
+        int num_sms,
+        int target_waves,
+        int min_kgroups_per_cta,
+        int max_kb)
+    {
+        if (grid_n <= 0 || k_groups <= 0 || num_sms <= 0)
+            return 0;
+
+        int kb = 0;
+        if (g_sweep.active && g_sweep.exact_kb > 0)
+        {
+            if (g_sweep.exact_kb > k_groups)
+                return 0;
+            kb = g_sweep.exact_kb;
+        }
+        else
+        {
+            kb = selectKSplit(
+                grid_n, k_groups, num_sms,
+                target_waves, min_kgroups_per_cta);
+            if (max_kb > 0)
+                kb = std::min(kb, max_kb);
+        }
+
+        if (llaminar2::debugEnv().gemm.deterministic)
+            return 1;
         return std::max(1, kb);
     }
 
@@ -537,7 +652,7 @@ namespace
      * block into shared memory, decodes the same column-major payload, and writes
      * to `[row, n]`.
      */
-    template <int M, int TILE_N, int CPT, uint8_t CB>
+    template <int TILE_N, int CPT, uint8_t CB>
     __global__ void nativeVnniGemv_wide_small_m_serial_rows(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -546,12 +661,11 @@ namespace
         const uint32_t *__restrict__ d_emins,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
-        int N, int K,
+        int M, int N, int K,
         float alpha, float beta,
         const float *__restrict__ d_C_existing,
         const float *__restrict__ d_bias)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M verifier supports M=2..4");
         const int row = blockIdx.y;
         if (row >= M)
             return;
@@ -740,194 +854,6 @@ namespace
         }
     }
 
-    template <int TILE_N, int CPT, uint8_t CB, bool TWO_PHASE = false>
-    __global__ void nativeVnniGemv_kpar_m2(
-        const int8_t *__restrict__ d_A_int8,
-        const uint8_t *__restrict__ d_payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
-        float *__restrict__ d_C,
-        const float *__restrict__ d_scales_A,
-        int N, int K, int kb,
-        float alpha)
-    {
-        const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
-        const int split_idx = blockIdx.y;
-        if (n_base >= N)
-            return;
-
-        const int blocks_per_row = K / BLOCK_K;
-        const int blocks_per_split = (blocks_per_row + kb - 1) / kb;
-        const int blk_begin = split_idx * blocks_per_split;
-        const int blk_end = min(blocks_per_row, blk_begin + blocks_per_split);
-        if (blk_begin >= blocks_per_row)
-            return;
-
-        float acc0[CPT];
-        float acc1[CPT];
-#pragma unroll
-        for (int c = 0; c < CPT; ++c)
-        {
-            acc0[c] = 0.0f;
-            acc1[c] = 0.0f;
-        }
-
-        for (int blk = blk_begin; blk < blk_end; ++blk)
-        {
-            int32_t a0_vals[8];
-            int32_t a1_vals[8];
-            {
-                const int4 *a0_ptr128 = reinterpret_cast<const int4 *>(
-                    d_A_int8 + blk * BLOCK_K);
-                const int4 *a1_ptr128 = reinterpret_cast<const int4 *>(
-                    d_A_int8 + K + blk * BLOCK_K);
-                const int4 a0_lo = a0_ptr128[0];
-                const int4 a0_hi = a0_ptr128[1];
-                const int4 a1_lo = a1_ptr128[0];
-                const int4 a1_hi = a1_ptr128[1];
-                a0_vals[0] = a0_lo.x;
-                a0_vals[1] = a0_lo.y;
-                a0_vals[2] = a0_lo.z;
-                a0_vals[3] = a0_lo.w;
-                a0_vals[4] = a0_hi.x;
-                a0_vals[5] = a0_hi.y;
-                a0_vals[6] = a0_hi.z;
-                a0_vals[7] = a0_hi.w;
-                a1_vals[0] = a1_lo.x;
-                a1_vals[1] = a1_lo.y;
-                a1_vals[2] = a1_lo.z;
-                a1_vals[3] = a1_lo.w;
-                a1_vals[4] = a1_hi.x;
-                a1_vals[5] = a1_hi.y;
-                a1_vals[6] = a1_hi.z;
-                a1_vals[7] = a1_hi.w;
-            }
-
-            const float scale_a0 = d_scales_A[blk];
-            const float scale_a1 = d_scales_A[blocks_per_row + blk];
-
-#pragma unroll
-            for (int c = 0; c < CPT; ++c)
-            {
-                const int n = n_base + c;
-                if (n >= N)
-                    break;
-
-                const size_t linear = static_cast<size_t>(blk) * N + n;
-                const uint8_t *payload = d_payload + linear *
-                                                         llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CB>();
-
-                int32_t packed_groups[8];
-                llaminar2::cuda_native_vnni::decode_groups_vec<CB>(payload, packed_groups);
-
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
-                {
-                    int dot0_lo = 0, dot0_hi = 0;
-                    int dot1_lo = 0, dot1_hi = 0;
-                    int sum0_lo = 0, sum0_hi = 0;
-                    int sum1_lo = 0, sum1_hi = 0;
-
-#pragma unroll
-                    for (int g = 0; g < 4; ++g)
-                    {
-                        dot0_lo = __dp4a(a0_vals[g], packed_groups[g], dot0_lo);
-                        dot0_hi = __dp4a(a0_vals[g + 4], packed_groups[g + 4], dot0_hi);
-                        dot1_lo = __dp4a(a1_vals[g], packed_groups[g], dot1_lo);
-                        dot1_hi = __dp4a(a1_vals[g + 4], packed_groups[g + 4], dot1_hi);
-                        sum0_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[g]);
-                        sum0_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[g + 4]);
-                        sum1_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[g]);
-                        sum1_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[g + 4]);
-                    }
-
-                    const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    const float scale_hi = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                    acc0[c] += scale_a0 * (scale_lo * static_cast<float>(dot0_lo) + scale_hi * static_cast<float>(dot0_hi));
-                    acc1[c] += scale_a1 * (scale_lo * static_cast<float>(dot1_lo) + scale_hi * static_cast<float>(dot1_hi));
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
-                    {
-                        const uint32_t emin = d_emins ? d_emins[linear] : 0u;
-                        const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
-                        const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
-                        acc0[c] += scale_a0 * (min_lo * static_cast<float>(sum0_lo) + min_hi * static_cast<float>(sum0_hi));
-                        acc1[c] += scale_a1 * (min_lo * static_cast<float>(sum1_lo) + min_hi * static_cast<float>(sum1_hi));
-                    }
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
-                    {
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        const uint8_t qh0 = payload[4];
-                        const uint8_t qh1 = payload[5];
-                        const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const int sg0_0 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[0]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[1]);
-                        const int sg0_1 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[2]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[3]);
-                        const int sg0_2 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[4]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[5]);
-                        const int sg0_3 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[6]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[7]);
-                        const int sg1_0 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[0]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[1]);
-                        const int sg1_1 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[2]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[3]);
-                        const int sg1_2 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[4]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[5]);
-                        const int sg1_3 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[6]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[7]);
-                        acc0[c] += scale_a0 * ((d0 * static_cast<float>(sg0_0) + d1 * static_cast<float>(sg0_1)) * scale_lo +
-                                               (d2 * static_cast<float>(sg0_2) + d3 * static_cast<float>(sg0_3)) * scale_hi);
-                        acc1[c] += scale_a1 * ((d0 * static_cast<float>(sg1_0) + d1 * static_cast<float>(sg1_1)) * scale_lo +
-                                               (d2 * static_cast<float>(sg1_2) + d3 * static_cast<float>(sg1_3)) * scale_hi);
-                    }
-                }
-                else
-                {
-                    int dot0 = 0;
-                    int dot1 = 0;
-                    int sum0_a = 0;
-                    int sum1_a = 0;
-#pragma unroll
-                    for (int g = 0; g < 8; ++g)
-                    {
-                        dot0 = __dp4a(a0_vals[g], packed_groups[g], dot0);
-                        dot1 = __dp4a(a1_vals[g], packed_groups[g], dot1);
-                        sum0_a += llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[g]);
-                        sum1_a += llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[g]);
-                    }
-
-                    const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales[linear]);
-                    acc0[c] += scale_a0 * scale_b * static_cast<float>(dot0);
-                    acc1[c] += scale_a1 * scale_b * static_cast<float>(dot1);
-
-                    if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
-                    {
-                        const float min_b = d_mins ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins[linear]) : 0.0f;
-                        acc0[c] += scale_a0 * min_b * static_cast<float>(sum0_a);
-                        acc1[c] += scale_a1 * min_b * static_cast<float>(sum1_a);
-                    }
-                }
-            }
-        }
-
-#pragma unroll
-        for (int c = 0; c < CPT; ++c)
-        {
-            const int n = n_base + c;
-            if (n < N)
-            {
-                if constexpr (TWO_PHASE)
-                {
-                    d_C[(split_idx * 2) * N + n] = alpha * acc0[c];
-                    d_C[(split_idx * 2 + 1) * N + n] = alpha * acc1[c];
-                }
-                else
-                {
-                    atomicAdd(&d_C[n], alpha * acc0[c]);
-                    atomicAdd(&d_C[N + n], alpha * acc1[c]);
-                }
-            }
-        }
-    }
-
-    // =====================================================================
     // Kernel family 5: ROWPAR (Row-Parallel) — GEMV with one block per output row.
     //
     // Grid = N blocks, each block processes one output row with NWARPS warps.
@@ -1087,201 +1013,15 @@ namespace
         }
     }
 
-    // ROWPAR verifier kernel for M=2. Each CTA owns one output column and
-    // accumulates both activation rows while decoding the weight block once.
-    template <int NWARPS, uint8_t CB>
-    __global__ void nativeVnniGemv_rowpar_m2(
-        const int8_t *__restrict__ d_A_int8,
-        const uint8_t *__restrict__ d_payload_rm,
-        const uint16_t *__restrict__ d_scales_rm,
-        const uint16_t *__restrict__ d_mins_rm,
-        const uint32_t *__restrict__ d_emins_rm,
-        float *__restrict__ d_C,
-        const float *__restrict__ d_scales_A,
-        int N, int K,
-        float alpha, float beta,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias)
-    {
-        constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-        const int n = blockIdx.x;
-        if (n >= N)
-            return;
-
-        const int k_blocks = K / BLOCK_K;
-        const int tid = threadIdx.x;
-        const int lane_id = tid & 31;
-        const int warp_id = tid >> 5;
-
-        float acc0 = 0.0f;
-        float acc1 = 0.0f;
-
-        for (int blk = tid; blk < k_blocks; blk += NWARPS * 32)
-        {
-            const int4 *a0_ptr128 = reinterpret_cast<const int4 *>(
-                d_A_int8 + blk * BLOCK_K);
-            const int4 *a1_ptr128 = reinterpret_cast<const int4 *>(
-                d_A_int8 + K + blk * BLOCK_K);
-            const int4 a0_lo = a0_ptr128[0];
-            const int4 a0_hi = a0_ptr128[1];
-            const int4 a1_lo = a1_ptr128[0];
-            const int4 a1_hi = a1_ptr128[1];
-
-            int32_t a0_vals[8];
-            int32_t a1_vals[8];
-            a0_vals[0] = a0_lo.x;
-            a0_vals[1] = a0_lo.y;
-            a0_vals[2] = a0_lo.z;
-            a0_vals[3] = a0_lo.w;
-            a0_vals[4] = a0_hi.x;
-            a0_vals[5] = a0_hi.y;
-            a0_vals[6] = a0_hi.z;
-            a0_vals[7] = a0_hi.w;
-            a1_vals[0] = a1_lo.x;
-            a1_vals[1] = a1_lo.y;
-            a1_vals[2] = a1_lo.z;
-            a1_vals[3] = a1_lo.w;
-            a1_vals[4] = a1_hi.x;
-            a1_vals[5] = a1_hi.y;
-            a1_vals[6] = a1_hi.z;
-            a1_vals[7] = a1_hi.w;
-
-            const size_t linear = static_cast<size_t>(n) * k_blocks + blk;
-            const uint8_t *payload = d_payload_rm + linear * PB;
-
-            int32_t packed_groups[8];
-            llaminar2::cuda_native_vnni::decode_groups<CB>(payload, packed_groups);
-
-            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
-            {
-                int dot0_lo = 0, dot0_hi = 0;
-                int dot1_lo = 0, dot1_hi = 0;
-                int sum0_lo = 0, sum0_hi = 0;
-                int sum1_lo = 0, sum1_hi = 0;
-#pragma unroll
-                for (int g = 0; g < 4; ++g)
-                {
-                    dot0_lo = __dp4a(a0_vals[g], packed_groups[g], dot0_lo);
-                    dot0_hi = __dp4a(a0_vals[g + 4], packed_groups[g + 4], dot0_hi);
-                    dot1_lo = __dp4a(a1_vals[g], packed_groups[g], dot1_lo);
-                    dot1_hi = __dp4a(a1_vals[g + 4], packed_groups[g + 4], dot1_hi);
-                    sum0_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[g]);
-                    sum0_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[g + 4]);
-                    sum1_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[g]);
-                    sum1_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[g + 4]);
-                }
-
-                const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales_rm[linear]);
-                const float scale_hi = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
-                acc0 += d_scales_A[blk] * (scale_lo * static_cast<float>(dot0_lo) + scale_hi * static_cast<float>(dot0_hi));
-                acc1 += d_scales_A[k_blocks + blk] * (scale_lo * static_cast<float>(dot1_lo) + scale_hi * static_cast<float>(dot1_hi));
-
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
-                {
-                    const uint32_t emin = d_emins_rm ? d_emins_rm[linear] : 0u;
-                    const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
-                    const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
-                    acc0 += d_scales_A[blk] * (min_lo * static_cast<float>(sum0_lo) + min_hi * static_cast<float>(sum0_hi));
-                    acc1 += d_scales_A[k_blocks + blk] * (min_lo * static_cast<float>(sum1_lo) + min_hi * static_cast<float>(sum1_hi));
-                }
-
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
-                {
-                    constexpr float IQ1S_DELTA = 0.125f;
-                    const uint8_t qh0 = payload[4];
-                    const uint8_t qh1 = payload[5];
-                    const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                    const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                    const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                    const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                    const int sg0_0 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[0]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[1]);
-                    const int sg0_1 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[2]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[3]);
-                    const int sg0_2 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[4]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[5]);
-                    const int sg0_3 = llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[6]) + llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[7]);
-                    const int sg1_0 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[0]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[1]);
-                    const int sg1_1 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[2]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[3]);
-                    const int sg1_2 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[4]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[5]);
-                    const int sg1_3 = llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[6]) + llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[7]);
-                    acc0 += d_scales_A[blk] * ((d0 * static_cast<float>(sg0_0) + d1 * static_cast<float>(sg0_1)) * scale_lo +
-                                               (d2 * static_cast<float>(sg0_2) + d3 * static_cast<float>(sg0_3)) * scale_hi);
-                    acc1 += d_scales_A[k_blocks + blk] * ((d0 * static_cast<float>(sg1_0) + d1 * static_cast<float>(sg1_1)) * scale_lo +
-                                                          (d2 * static_cast<float>(sg1_2) + d3 * static_cast<float>(sg1_3)) * scale_hi);
-                }
-            }
-            else
-            {
-                int dot0 = 0;
-                int dot1 = 0;
-                int sum0_a = 0;
-                int sum1_a = 0;
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                {
-                    dot0 = __dp4a(a0_vals[g], packed_groups[g], dot0);
-                    dot1 = __dp4a(a1_vals[g], packed_groups[g], dot1);
-                    sum0_a += llaminar2::cuda_native_vnni::sum_packed_i8(a0_vals[g]);
-                    sum1_a += llaminar2::cuda_native_vnni::sum_packed_i8(a1_vals[g]);
-                }
-
-                const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales_rm[linear]);
-                acc0 += d_scales_A[blk] * scale_b * static_cast<float>(dot0);
-                acc1 += d_scales_A[k_blocks + blk] * scale_b * static_cast<float>(dot1);
-
-                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
-                {
-                    const float min_b = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
-                    acc0 += d_scales_A[blk] * min_b * static_cast<float>(sum0_a);
-                    acc1 += d_scales_A[k_blocks + blk] * min_b * static_cast<float>(sum1_a);
-                }
-            }
-        }
-
-        for (int mask = 16; mask > 0; mask >>= 1)
-        {
-            acc0 += __shfl_xor_sync(0xFFFFFFFF, acc0, mask);
-            acc1 += __shfl_xor_sync(0xFFFFFFFF, acc1, mask);
-        }
-
-        __shared__ float reduce0[NWARPS];
-        __shared__ float reduce1[NWARPS];
-        if (lane_id == 0)
-        {
-            reduce0[warp_id] = acc0;
-            reduce1[warp_id] = acc1;
-        }
-        __syncthreads();
-
-        if (tid == 0)
-        {
-            float sum0 = reduce0[0];
-            float sum1 = reduce1[0];
-#pragma unroll
-            for (int w = 1; w < NWARPS; ++w)
-            {
-                sum0 += reduce0[w];
-                sum1 += reduce1[w];
-            }
-
-            float out0 = alpha * sum0;
-            float out1 = alpha * sum1;
-            if (beta != 0.0f && d_C_existing)
-            {
-                out0 += beta * d_C_existing[n];
-                out1 += beta * d_C_existing[N + n];
-            }
-            if (d_bias)
-            {
-                out0 += d_bias[n];
-                out1 += d_bias[n];
-            }
-            d_C[n] = out0;
-            d_C[N + n] = out1;
-        }
-    }
-
-    // ROWPAR verifier kernel for M=2..4. Each CTA owns one output column and
-    // accumulates all activation rows while decoding the weight block once.
-    template <int M, int NWARPS, uint8_t CB>
+    /**
+     * @brief Runtime-row ROWPAR verifier kernel with pairwise weight reuse.
+     *
+     * Grid Y selects a fixed-size row tile. Every CTA owns one output column
+     * and performs the serial ROWPAR reduction order for each active row while
+     * reusing each decoded weight block across the rows in the tile. Runtime M
+     * only changes the number of independent row tiles in the grid.
+     */
+    template <int ROWS_PER_TILE, int NWARPS, uint8_t CB>
     __global__ void nativeVnniGemv_rowpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload_rm,
@@ -1290,14 +1030,15 @@ namespace
         const uint32_t *__restrict__ d_emins_rm,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
-        int N, int K,
+        int M, int N, int K,
         float alpha, float beta,
         const float *__restrict__ d_C_existing,
         const float *__restrict__ d_bias)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        static_assert(ROWS_PER_TILE > 0, "Verifier row tiles must contain at least one row");
         constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
         const int n = blockIdx.x;
+        const int row_base = blockIdx.y * ROWS_PER_TILE;
         if (n >= N)
             return;
 
@@ -1306,29 +1047,32 @@ namespace
         const int lane_id = tid & 31;
         const int warp_id = tid >> 5;
 
-        float acc[M];
+        float acc[ROWS_PER_TILE];
 #pragma unroll
-        for (int row = 0; row < M; ++row)
-            acc[row] = 0.0f;
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+            acc[tile_row] = 0.0f;
 
         for (int blk = tid; blk < k_blocks; blk += NWARPS * 32)
         {
-            int32_t a_vals[M][8];
+            int32_t a_vals[ROWS_PER_TILE][8];
 #pragma unroll
-            for (int row = 0; row < M; ++row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
+                const int row = row_base + tile_row;
+                if (row >= M)
+                    continue;
                 const int4 *a_ptr128 = reinterpret_cast<const int4 *>(
                     d_A_int8 + static_cast<size_t>(row) * K + blk * BLOCK_K);
                 const int4 a_lo = a_ptr128[0];
                 const int4 a_hi = a_ptr128[1];
-                a_vals[row][0] = a_lo.x;
-                a_vals[row][1] = a_lo.y;
-                a_vals[row][2] = a_lo.z;
-                a_vals[row][3] = a_lo.w;
-                a_vals[row][4] = a_hi.x;
-                a_vals[row][5] = a_hi.y;
-                a_vals[row][6] = a_hi.z;
-                a_vals[row][7] = a_hi.w;
+                a_vals[tile_row][0] = a_lo.x;
+                a_vals[tile_row][1] = a_lo.y;
+                a_vals[tile_row][2] = a_lo.z;
+                a_vals[tile_row][3] = a_lo.w;
+                a_vals[tile_row][4] = a_hi.x;
+                a_vals[tile_row][5] = a_hi.y;
+                a_vals[tile_row][6] = a_hi.z;
+                a_vals[tile_row][7] = a_hi.w;
             }
 
             const size_t linear = static_cast<size_t>(n) * k_blocks + blk;
@@ -1346,8 +1090,11 @@ namespace
                 const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
 
 #pragma unroll
-                for (int row = 0; row < M; ++row)
+                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
                 {
+                    const int row = row_base + tile_row;
+                    if (row >= M)
+                        continue;
                     int dot_lo = 0;
                     int dot_hi = 0;
                     int sum_lo = 0;
@@ -1355,20 +1102,20 @@ namespace
 #pragma unroll
                     for (int g = 0; g < 4; ++g)
                     {
-                        dot_lo = __dp4a(a_vals[row][g], packed_groups[g], dot_lo);
-                        dot_hi = __dp4a(a_vals[row][g + 4], packed_groups[g + 4], dot_hi);
-                        sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][g]);
-                        sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][g + 4]);
+                        dot_lo = __dp4a(a_vals[tile_row][g], packed_groups[g], dot_lo);
+                        dot_hi = __dp4a(a_vals[tile_row][g + 4], packed_groups[g + 4], dot_hi);
+                        sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][g]);
+                        sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][g + 4]);
                     }
 
                     const float scale_a = d_scales_A[static_cast<size_t>(row) * k_blocks + blk];
-                    acc[row] += scale_a * (scale_lo * static_cast<float>(dot_lo) +
-                                           scale_hi * static_cast<float>(dot_hi));
+                    acc[tile_row] += scale_a * (scale_lo * static_cast<float>(dot_lo) +
+                                                scale_hi * static_cast<float>(dot_hi));
 
                     if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
                     {
-                        acc[row] += scale_a * (min_lo * static_cast<float>(sum_lo) +
-                                               min_hi * static_cast<float>(sum_hi));
+                        acc[tile_row] += scale_a * (min_lo * static_cast<float>(sum_lo) +
+                                                    min_hi * static_cast<float>(sum_hi));
                     }
 
                     if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_iq1_m)
@@ -1380,16 +1127,16 @@ namespace
                         const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
                         const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                         const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][0]) +
-                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][1]);
-                        const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][2]) +
-                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][3]);
-                        const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][4]) +
-                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][5]);
-                        const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][6]) +
-                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][7]);
-                        acc[row] += scale_a * ((d0 * static_cast<float>(sg0) + d1 * static_cast<float>(sg1)) * scale_lo +
-                                               (d2 * static_cast<float>(sg2) + d3 * static_cast<float>(sg3)) * scale_hi);
+                        const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][0]) +
+                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][1]);
+                        const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][2]) +
+                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][3]);
+                        const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][4]) +
+                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][5]);
+                        const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][6]) +
+                                        llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][7]);
+                        acc[tile_row] += scale_a * ((d0 * static_cast<float>(sg0) + d1 * static_cast<float>(sg1)) * scale_lo +
+                                                    (d2 * static_cast<float>(sg2) + d3 * static_cast<float>(sg3)) * scale_hi);
                     }
                 }
             }
@@ -1399,53 +1146,59 @@ namespace
                 const float min_b = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
 
 #pragma unroll
-                for (int row = 0; row < M; ++row)
+                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
                 {
+                    const int row = row_base + tile_row;
+                    if (row >= M)
+                        continue;
                     int dot = 0;
                     int sum_a = 0;
 #pragma unroll
                     for (int g = 0; g < 8; ++g)
                     {
-                        dot = __dp4a(a_vals[row][g], packed_groups[g], dot);
-                        sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[row][g]);
+                        dot = __dp4a(a_vals[tile_row][g], packed_groups[g], dot);
+                        sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[tile_row][g]);
                     }
 
                     const float scale_a = d_scales_A[static_cast<size_t>(row) * k_blocks + blk];
-                    acc[row] += scale_a * scale_b * static_cast<float>(dot);
+                    acc[tile_row] += scale_a * scale_b * static_cast<float>(dot);
 
                     if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
                     {
-                        acc[row] += scale_a * min_b * static_cast<float>(sum_a);
+                        acc[tile_row] += scale_a * min_b * static_cast<float>(sum_a);
                     }
                 }
             }
         }
 
 #pragma unroll
-        for (int row = 0; row < M; ++row)
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
             for (int mask = 16; mask > 0; mask >>= 1)
-                acc[row] += __shfl_xor_sync(0xFFFFFFFF, acc[row], mask);
+                acc[tile_row] += __shfl_xor_sync(0xFFFFFFFF, acc[tile_row], mask);
         }
 
-        __shared__ float reduce[M][NWARPS];
+        __shared__ float reduce[ROWS_PER_TILE][NWARPS];
         if (lane_id == 0)
         {
 #pragma unroll
-            for (int row = 0; row < M; ++row)
-                reduce[row][warp_id] = acc[row];
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+                reduce[tile_row][warp_id] = acc[tile_row];
         }
         __syncthreads();
 
         if (tid == 0)
         {
 #pragma unroll
-            for (int row = 0; row < M; ++row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
-                float sum = reduce[row][0];
+                const int row = row_base + tile_row;
+                if (row >= M)
+                    continue;
+                float sum = reduce[tile_row][0];
 #pragma unroll
                 for (int w = 1; w < NWARPS; ++w)
-                    sum += reduce[row][w];
+                    sum += reduce[tile_row][w];
 
                 const size_t out_idx = static_cast<size_t>(row) * N + n;
                 float out = alpha * sum;
@@ -1489,39 +1242,6 @@ namespace
         d_C[n] = sum;
     }
 
-    __global__ void nativeVnniGemv_reduce_m2(
-        const float *__restrict__ d_partials,
-        float *__restrict__ d_C,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias,
-        int N, int kb, float beta)
-    {
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
-        if (n >= N)
-            return;
-
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
-        for (int k = 0; k < kb; ++k)
-        {
-            sum0 += d_partials[(k * 2) * N + n];
-            sum1 += d_partials[(k * 2 + 1) * N + n];
-        }
-
-        if (beta != 0.0f && d_C_existing)
-        {
-            sum0 += beta * d_C_existing[n];
-            sum1 += beta * d_C_existing[N + n];
-        }
-        if (d_bias)
-        {
-            sum0 += d_bias[n];
-            sum1 += d_bias[n];
-        }
-        d_C[n] = sum0;
-        d_C[N + n] = sum1;
-    }
-
     // =====================================================================
     // Epilogue kernel: apply beta/bias after atomic KPAR accumulation
     //
@@ -1543,28 +1263,17 @@ namespace
             d_C[n] += d_bias[n];
     }
 
-    __global__ void nativeVnniGemv_epilogue_m2(
-        float *__restrict__ d_C,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias,
-        int N, float beta)
-    {
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
-        if (n >= N)
-            return;
-        if (beta != 0.0f && d_C_existing)
-        {
-            d_C[n] += beta * d_C_existing[n];
-            d_C[N + n] += beta * d_C_existing[N + n];
-        }
-        if (d_bias)
-        {
-            d_C[n] += d_bias[n];
-            d_C[N + n] += d_bias[n];
-        }
-    }
-
-    template <int M, int TILE_N, int CPT, uint8_t CB, bool TWO_PHASE = false>
+    /**
+     * @brief Runtime-row K-parallel verifier kernel with bounded register use.
+     *
+     * Each CTA owns one K partition, one output-column tile, and a fixed-size
+     * row tile. The fixed row tile lets the CTA decode a weight block once and
+     * reuse it across verifier rows without making register pressure grow with
+     * the requested speculative depth. Increasing runtime @p M therefore adds
+     * independent Z-grid tiles instead of compiling another kernel or changing
+     * the arithmetic performed for an existing row.
+     */
+    template <int ROWS_PER_TILE, int TILE_N, int CPT, uint8_t CB, bool TWO_PHASE = false>
     __global__ void nativeVnniGemv_kpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -1573,12 +1282,13 @@ namespace
         const uint32_t *__restrict__ d_emins,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
-        int N, int K, int kb,
+        int M, int N, int K, int kb,
         float alpha)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        static_assert(ROWS_PER_TILE > 0, "Verifier row tiles must contain at least one row");
         const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
         const int split_idx = blockIdx.y;
+        const int row_base = blockIdx.z * ROWS_PER_TILE;
         if (n_base >= N)
             return;
 
@@ -1589,33 +1299,36 @@ namespace
         if (blk_begin >= blocks_per_row)
             return;
 
-        float acc[M][CPT];
+        float acc[ROWS_PER_TILE][CPT];
 #pragma unroll
-        for (int row = 0; row < M; ++row)
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
 #pragma unroll
             for (int c = 0; c < CPT; ++c)
-                acc[row][c] = 0.0f;
+                acc[tile_row][c] = 0.0f;
         }
 
         for (int blk = blk_begin; blk < blk_end; ++blk)
         {
-            int32_t a_vals[M][8];
+            int32_t a_vals[ROWS_PER_TILE][8];
 #pragma unroll
-            for (int row = 0; row < M; ++row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
+                const int row = row_base + tile_row;
+                if (row >= M)
+                    continue;
                 const int4 *a_ptr128 = reinterpret_cast<const int4 *>(
                     d_A_int8 + static_cast<size_t>(row) * K + blk * BLOCK_K);
                 const int4 a_lo = a_ptr128[0];
                 const int4 a_hi = a_ptr128[1];
-                a_vals[row][0] = a_lo.x;
-                a_vals[row][1] = a_lo.y;
-                a_vals[row][2] = a_lo.z;
-                a_vals[row][3] = a_lo.w;
-                a_vals[row][4] = a_hi.x;
-                a_vals[row][5] = a_hi.y;
-                a_vals[row][6] = a_hi.z;
-                a_vals[row][7] = a_hi.w;
+                a_vals[tile_row][0] = a_lo.x;
+                a_vals[tile_row][1] = a_lo.y;
+                a_vals[tile_row][2] = a_lo.z;
+                a_vals[tile_row][3] = a_lo.w;
+                a_vals[tile_row][4] = a_hi.x;
+                a_vals[tile_row][5] = a_hi.y;
+                a_vals[tile_row][6] = a_hi.z;
+                a_vals[tile_row][7] = a_hi.w;
             }
 
 #pragma unroll
@@ -1633,11 +1346,14 @@ namespace
                 llaminar2::cuda_native_vnni::decode_groups_vec<CB>(payload, packed_groups);
 
 #pragma unroll
-                for (int row = 0; row < M; ++row)
+                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
                 {
+                    const int row = row_base + tile_row;
+                    if (row >= M)
+                        continue;
                     const float scale_a = d_scales_A[static_cast<size_t>(row) * blocks_per_row + blk];
                     const float contribution = native_vnni_block_contribution_rn<CB>(
-                        a_vals[row],
+                        a_vals[tile_row],
                         packed_groups,
                         payload,
                         d_scales,
@@ -1645,7 +1361,7 @@ namespace
                         d_emins,
                         linear,
                         scale_a);
-                    acc[row][c] = __fadd_rn(acc[row][c], contribution);
+                    acc[tile_row][c] = __fadd_rn(acc[tile_row][c], contribution);
                 }
             }
         }
@@ -1657,75 +1373,57 @@ namespace
             if (n < N)
             {
 #pragma unroll
-                for (int row = 0; row < M; ++row)
+                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
                 {
+                    const int row = row_base + tile_row;
+                    if (row >= M)
+                        continue;
                     if constexpr (TWO_PHASE)
                     {
                         d_C[(static_cast<size_t>(split_idx) * M + row) * N + n] =
-                            alpha * acc[row][c];
+                            alpha * acc[tile_row][c];
                     }
                     else
                     {
                         atomicAdd(&d_C[static_cast<size_t>(row) * N + n],
-                                  alpha * acc[row][c]);
+                                  alpha * acc[tile_row][c]);
                     }
                 }
             }
         }
     }
 
-    template <int M>
+    /**
+     * @brief Publish one runtime verifier row from ordered K-partition partials.
+     *
+     * Grid Y owns the row, so reduction order and register state are independent
+     * of the total verifier depth. This is the same ascending-partition loop as
+     * serial M=1 publication, applied to the row's disjoint partial slice.
+     */
     __global__ void nativeVnniGemv_reduce_small_m(
         const float *__restrict__ d_partials,
         float *__restrict__ d_C,
         const float *__restrict__ d_C_existing,
         const float *__restrict__ d_bias,
-        int N, int kb, float beta)
+        int M, int N, int kb, float beta)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        const int row = blockIdx.y;
         const int n = blockIdx.x * blockDim.x + threadIdx.x;
-        if (n >= N)
+        if (row >= M || n >= N)
             return;
 
-#pragma unroll
-        for (int row = 0; row < M; ++row)
+        float sum = 0.0f;
+        for (int k = 0; k < kb; ++k)
         {
-            float sum = 0.0f;
-            for (int k = 0; k < kb; ++k)
-            {
-                sum += d_partials[(static_cast<size_t>(k) * M + row) * N + n];
-            }
-
-            const size_t out_idx = static_cast<size_t>(row) * N + n;
-            if (beta != 0.0f && d_C_existing)
-                sum += beta * d_C_existing[out_idx];
-            if (d_bias)
-                sum += d_bias[n];
-            d_C[out_idx] = sum;
+            sum += d_partials[(static_cast<size_t>(k) * M + row) * N + n];
         }
-    }
 
-    template <int M>
-    __global__ void nativeVnniGemv_epilogue_small_m(
-        float *__restrict__ d_C,
-        const float *__restrict__ d_C_existing,
-        const float *__restrict__ d_bias,
-        int N, float beta)
-    {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
-        if (n >= N)
-            return;
-
-#pragma unroll
-        for (int row = 0; row < M; ++row)
-        {
-            const size_t out_idx = static_cast<size_t>(row) * N + n;
-            if (beta != 0.0f && d_C_existing)
-                d_C[out_idx] += beta * d_C_existing[out_idx];
-            if (d_bias)
-                d_C[out_idx] += d_bias[n];
-        }
+        const size_t out_idx = static_cast<size_t>(row) * N + n;
+        if (beta != 0.0f && d_C_existing)
+            sum += beta * d_C_existing[out_idx];
+        if (d_bias)
+            sum += d_bias[n];
+        d_C[out_idx] = sum;
     }
 
     // =====================================================================
@@ -1912,17 +1610,29 @@ namespace
         const int grid_n = (N + TILE_N - 1) / TILE_N;
         const int k_groups = K / BLOCK_K;
         const int num_sms = querySmCount(gemv_ctx);
-        const int kb = selectKSplit(grid_n, k_groups, num_sms,
-                                    target_waves, min_kgroups_per_cta);
-        const bool deterministic =
-            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
-        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
-        const int kb_capped = deterministic ? 1 : kb_capped_auto;
+        const bool debug_deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const bool verifier_decode_equivalent = decodeEquivalentM1ConfigActive();
+        const int kb_capped = resolveKparKBlocks(
+            grid_n, k_groups, num_sms,
+            target_waves, min_kgroups_per_cta, max_kb);
+        if (kb_capped <= 0)
+            return false;
+        /*
+         * Global deterministic debugging retains its historical one-partition
+         * contract. MTP decode equivalence is different: serial M=1 and grouped
+         * grouped verifier rows execute the same generated K-partition geometry, write disjoint
+         * partials, and use the same ascending reducer. Collapsing that contract
+         * to KB=1 discarded useful output parallelism without improving the
+         * arithmetic identity shared by the two production entry points.
+         */
+        g_last_effective_kb = kb_capped;
 
         // Choose two-phase vs atomic based on partials buffer size.
-        // Deterministic mode always uses two-phase to avoid atomicAdd non-determinism.
+        // Verifier publication never permits scheduler-ordered atomic additions.
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
-        const bool use_two_phase = deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
+        const bool use_two_phase =
+            debug_deterministic || verifier_decode_equivalent ||
+            (partials_bytes <= kTwoPhaseMaxBytes);
 
         dim3 grid(grid_n, kb_capped);
 
@@ -1974,145 +1684,11 @@ namespace
     }
 
     template <int TILE_N, int CPT, uint8_t CB>
-    bool launchKparM2Impl(
-        const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing, const float *d_bias,
-        int target_waves, int min_kgroups_per_cta, int max_kb,
-        int force_two_phase,
-        int device_id, cudaStream_t stream,
-        CUDAGemvContext_ *gemv_ctx)
-    {
-        constexpr int THREADS = TILE_N / CPT;
-
-        const int grid_n = (N + TILE_N - 1) / TILE_N;
-        const int k_groups = K / BLOCK_K;
-        const int num_sms = querySmCount(gemv_ctx);
-        const int kb = selectKSplit(grid_n, k_groups, num_sms,
-                                    target_waves, min_kgroups_per_cta);
-        const bool deterministic =
-            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
-        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
-        const int kb_capped = deterministic ? 1 : kb_capped_auto;
-
-        const size_t partials_bytes = static_cast<size_t>(kb_capped) * 2 * N * sizeof(float);
-        bool use_two_phase;
-        if (deterministic)
-            use_two_phase = true;
-        else if (force_two_phase == 1)
-            use_two_phase = true;
-        else if (force_two_phase == 2)
-            use_two_phase = false;
-        else
-            use_two_phase = (partials_bytes <= kTwoPhaseMaxBytes);
-
-        dim3 grid(grid_n, kb_capped);
-
-        if (use_two_phase)
-        {
-            float *d_partials = getKparPartials(
-                gemv_ctx, static_cast<size_t>(kb_capped) * 2 * N);
-            if (!d_partials)
-                return false;
-
-            nativeVnniGemv_kpar_m2<TILE_N, CPT, CB, true><<<grid, THREADS, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_partials, d_scales_A, N, K, kb_capped, alpha);
-            {
-                cudaError_t le = cudaGetLastError();
-                if (le != cudaSuccess)
-                    return false;
-            }
-
-            const int rblk = (N + 255) / 256;
-            nativeVnniGemv_reduce_m2<<<rblk, 256, 0, stream>>>(
-                d_partials, d_C, d_C_existing, d_bias, N, kb_capped, beta);
-        }
-        else
-        {
-            cudaMemsetAsync(d_C, 0, static_cast<size_t>(2) * N * sizeof(float), stream);
-
-            nativeVnniGemv_kpar_m2<TILE_N, CPT, CB, false><<<grid, THREADS, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, kb_capped, alpha);
-            {
-                cudaError_t le = cudaGetLastError();
-                if (le != cudaSuccess)
-                    return false;
-            }
-
-            if ((beta != 0.0f && d_C_existing) || d_bias)
-            {
-                const int eblk = (N + 255) / 256;
-                nativeVnniGemv_epilogue_m2<<<eblk, 256, 0, stream>>>(
-                    d_C, d_C_existing, d_bias, N, beta);
-            }
-        }
-
-        return cudaGetLastError() == cudaSuccess;
-    }
-
-    template <uint8_t CB>
-    bool launchKparM2(
-        const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing, const float *d_bias,
-        CUDAGemvContext_ *gemv_ctx,
-        int cuda_device_id, cudaStream_t stream)
-    {
-        const auto t = selectKparTuning<CB>(N, K);
-        const int tw = t.target_waves;
-        const int mkg = t.min_kgroups_per_cta;
-        const int mkb = t.max_kb;
-
-        switch (t.tile)
-        {
-        case KparTile::T32_C1:
-            return launchKparM2Impl<32, 1, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
-        case KparTile::T64_C1:
-            return launchKparM2Impl<64, 1, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
-        case KparTile::T64_C2:
-            return launchKparM2Impl<64, 2, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
-        case KparTile::T128_C1:
-            return launchKparM2Impl<128, 1, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
-        case KparTile::T128_C2:
-            return launchKparM2Impl<128, 2, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
-        case KparTile::T256_C2:
-            return launchKparM2Impl<256, 2, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
-        }
-        return false;
-    }
-
-    template <int M, int TILE_N, int CPT, uint8_t CB>
     bool launchKparSmallMImpl(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
         const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
+        const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
@@ -2120,88 +1696,100 @@ namespace
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        constexpr int ROWS_PER_TILE = 2;
         constexpr int THREADS = TILE_N / CPT;
 
         const int grid_n = (N + TILE_N - 1) / TILE_N;
         const int k_groups = K / BLOCK_K;
         const int num_sms = querySmCount(gemv_ctx);
-        const int kb = selectKSplit(grid_n, k_groups, num_sms,
-                                    target_waves, min_kgroups_per_cta);
-        const bool deterministic =
-            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
-        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
-        const int kb_capped = deterministic ? 1 : kb_capped_auto;
+        const int kb_capped = resolveKparKBlocks(
+            grid_n, k_groups, num_sms,
+            target_waves, min_kgroups_per_cta, max_kb);
+        if (kb_capped <= 0)
+            return false;
+        g_last_effective_kb = kb_capped;
 
-        const size_t partials_bytes = static_cast<size_t>(kb_capped) * M * N * sizeof(float);
-        bool use_two_phase;
-        if (deterministic)
-            use_two_phase = true;
-        else if (force_two_phase == 1)
-            use_two_phase = true;
-        else if (force_two_phase == 2)
-            use_two_phase = false;
-        else
-            use_two_phase = (partials_bytes <= kTwoPhaseMaxBytes);
+        /*
+         * Grouped verifier publication is always two-phase. A force-atomic
+         * sweep candidate is rejected instead of silently measuring a schedule-
+         * dependent kernel that can never satisfy batch invariance.
+         */
+        if (force_two_phase == 2 && g_sweep.active)
+            return false;
 
-        dim3 grid(grid_n, kb_capped);
+        /*
+         * The reduction arena is a reusable row tile, not a semantic M limit.
+         * A configured verifier wider than the default graph capacity records
+         * several grouped kernel/reducer pairs in the same graph. Each pair
+         * still owns multiple rows and reuses one packed-weight traversal; no
+         * row is replayed through the scalar public API.
+         */
+        const int workspace_tile_rows = std::min(
+            M,
+            llaminar2::kDefaultNativeVNNIVerifierRowCapacity);
+        float *d_partials = getKparPartials(
+            gemv_ctx,
+            static_cast<size_t>(kb_capped) * workspace_tile_rows * N);
+        if (!d_partials)
+            return false;
 
-        if (use_two_phase)
+        const int activation_blocks_per_row = K / BLOCK_K;
+        for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
         {
-            float *d_partials = getKparPartials(
-                gemv_ctx, static_cast<size_t>(kb_capped) * M * N);
-            if (!d_partials)
+            const int tile_m = std::min(workspace_tile_rows, M - row_base);
+            const int row_tiles =
+                (tile_m + ROWS_PER_TILE - 1) / ROWS_PER_TILE;
+            const dim3 grid(grid_n, kb_capped, row_tiles);
+
+            const int8_t *tile_a =
+                d_A_int8 + static_cast<size_t>(row_base) * K;
+            const float *tile_scales =
+                d_scales_A +
+                static_cast<size_t>(row_base) * activation_blocks_per_row;
+            float *tile_c =
+                d_C + static_cast<size_t>(row_base) * N;
+            const float *tile_existing =
+                d_C_existing
+                    ? d_C_existing + static_cast<size_t>(row_base) * N
+                    : nullptr;
+
+            nativeVnniGemv_kpar_small_m<ROWS_PER_TILE, TILE_N, CPT, CB, true>
+                <<<grid, THREADS, 0, stream>>>(
+                    tile_a, d_payload, d_scales, d_mins, d_emins,
+                    d_partials, tile_scales, tile_m, N, K, kb_capped, alpha);
+            const cudaError_t launch_error = cudaGetLastError();
+            if (launch_error != cudaSuccess)
                 return false;
 
-            nativeVnniGemv_kpar_small_m<M, TILE_N, CPT, CB, true><<<grid, THREADS, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_partials, d_scales_A, N, K, kb_capped, alpha);
-            {
-                cudaError_t le = cudaGetLastError();
-                if (le != cudaSuccess)
-                    return false;
-            }
-
-            const int rblk = (N + 255) / 256;
-            nativeVnniGemv_reduce_small_m<M><<<rblk, 256, 0, stream>>>(
-                d_partials, d_C, d_C_existing, d_bias, N, kb_capped, beta);
-        }
-        else
-        {
-            cudaMemsetAsync(d_C, 0, static_cast<size_t>(M) * N * sizeof(float), stream);
-
-            nativeVnniGemv_kpar_small_m<M, TILE_N, CPT, CB, false><<<grid, THREADS, 0, stream>>>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, kb_capped, alpha);
-            {
-                cudaError_t le = cudaGetLastError();
-                if (le != cudaSuccess)
-                    return false;
-            }
-
-            if ((beta != 0.0f && d_C_existing) || d_bias)
-            {
-                const int eblk = (N + 255) / 256;
-                nativeVnniGemv_epilogue_small_m<M><<<eblk, 256, 0, stream>>>(
-                    d_C, d_C_existing, d_bias, N, beta);
-            }
+            const int reduction_blocks = (N + 255) / 256;
+            nativeVnniGemv_reduce_small_m<<<
+                dim3(reduction_blocks, tile_m), 256, 0, stream>>>(
+                d_partials,
+                tile_c,
+                tile_existing,
+                d_bias,
+                tile_m,
+                N,
+                kb_capped,
+                beta);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
         }
 
-        return cudaGetLastError() == cudaSuccess;
+        return true;
     }
 
-    template <int M, uint8_t CB>
+    template <uint8_t CB>
     bool launchKparSmallM(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
         const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
+        const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
         int cuda_device_id, cudaStream_t stream)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
         const auto t = selectKparTuning<CB>(N, K);
         const int tw = t.target_waves;
         const int mkg = t.min_kgroups_per_cta;
@@ -2210,34 +1798,34 @@ namespace
         switch (t.tile)
         {
         case KparTile::T32_C1:
-            return launchKparSmallMImpl<M, 32, 1, CB>(
+            return launchKparSmallMImpl<32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
+                d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C1:
-            return launchKparSmallMImpl<M, 64, 1, CB>(
+            return launchKparSmallMImpl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
+                d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C2:
-            return launchKparSmallMImpl<M, 64, 2, CB>(
+            return launchKparSmallMImpl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
+                d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C1:
-            return launchKparSmallMImpl<M, 128, 1, CB>(
+            return launchKparSmallMImpl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
+                d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C2:
-            return launchKparSmallMImpl<M, 128, 2, CB>(
+            return launchKparSmallMImpl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
+                d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         case KparTile::T256_C2:
-            return launchKparSmallMImpl<M, 256, 2, CB>(
+            return launchKparSmallMImpl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta,
+                d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
         }
         return false;
@@ -2394,47 +1982,6 @@ namespace
     }
 
     template <uint8_t CB>
-    bool launchRowParM2(
-        const int8_t *d_A_int8,
-        const uint8_t *d_payload_rm,
-        const uint16_t *d_scales_rm,
-        const uint16_t *d_mins_rm,
-        const uint32_t *d_emins_rm,
-        float *d_C,
-        const float *d_scales_A, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing, const float *d_bias,
-        int nwarps,
-        cudaStream_t stream)
-    {
-        switch (nwarps)
-        {
-        case 2:
-            nativeVnniGemv_rowpar_m2<2, CB><<<N, 64, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
-            break;
-        case 4:
-            nativeVnniGemv_rowpar_m2<4, CB><<<N, 128, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
-            break;
-        case 8:
-            nativeVnniGemv_rowpar_m2<8, CB><<<N, 256, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
-            break;
-        default:
-            nativeVnniGemv_rowpar_m2<4, CB><<<N, 128, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
-            break;
-        }
-
-        return cudaGetLastError() == cudaSuccess;
-    }
-
-    template <int M, uint8_t CB>
     bool launchRowParSmallM(
         const int8_t *d_A_int8,
         const uint8_t *d_payload_rm,
@@ -2442,34 +1989,35 @@ namespace
         const uint16_t *d_mins_rm,
         const uint32_t *d_emins_rm,
         float *d_C,
-        const float *d_scales_A, int N, int K,
+        const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int nwarps,
         cudaStream_t stream)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        constexpr int ROWS_PER_TILE = 2;
+        const dim3 grid(N, (M + ROWS_PER_TILE - 1) / ROWS_PER_TILE);
         switch (nwarps)
         {
         case 2:
-            nativeVnniGemv_rowpar_small_m<M, 2, CB><<<N, 64, 0, stream>>>(
+            nativeVnniGemv_rowpar_small_m<ROWS_PER_TILE, 2, CB><<<grid, 64, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             break;
         case 4:
-            nativeVnniGemv_rowpar_small_m<M, 4, CB><<<N, 128, 0, stream>>>(
+            nativeVnniGemv_rowpar_small_m<ROWS_PER_TILE, 4, CB><<<grid, 128, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             break;
         case 8:
-            nativeVnniGemv_rowpar_small_m<M, 8, CB><<<N, 256, 0, stream>>>(
+            nativeVnniGemv_rowpar_small_m<ROWS_PER_TILE, 8, CB><<<grid, 256, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             break;
         default:
-            nativeVnniGemv_rowpar_small_m<M, 4, CB><<<N, 128, 0, stream>>>(
+            nativeVnniGemv_rowpar_small_m<ROWS_PER_TILE, 4, CB><<<grid, 128, 0, stream>>>(
                 d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             break;
         }
 
@@ -2491,6 +2039,7 @@ namespace
         CUDARowMajorWeights_ *rowmajor,
         int cuda_device_id, cudaStream_t stream)
     {
+        g_last_effective_kb = 1;
         const int tile_key = tuning.tile_n * 100 + tuning.cpt;
 
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
@@ -2647,136 +2196,81 @@ namespace
         int device_id, cudaStream_t stream);
 
     template <uint8_t CB>
-    bool dispatchKparM2Generated(
-        const GeneratedDispatchTuning &tuning,
-        const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing, const float *d_bias,
-        CUDAGemvContext_ *gemv_ctx,
-        int cuda_device_id, cudaStream_t stream)
-    {
-        switch (tuning.tile_n * 100 + tuning.cpt)
-        {
-        case 32 * 100 + 1:
-            return launchKparM2Impl<32, 1, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                tuning.target_waves, tuning.mkg, tuning.max_kb,
-                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
-        case 64 * 100 + 1:
-            return launchKparM2Impl<64, 1, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                tuning.target_waves, tuning.mkg, tuning.max_kb,
-                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
-        case 64 * 100 + 2:
-            return launchKparM2Impl<64, 2, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                tuning.target_waves, tuning.mkg, tuning.max_kb,
-                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
-        case 128 * 100 + 1:
-            return launchKparM2Impl<128, 1, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                tuning.target_waves, tuning.mkg, tuning.max_kb,
-                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
-        case 128 * 100 + 2:
-            return launchKparM2Impl<128, 2, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                tuning.target_waves, tuning.mkg, tuning.max_kb,
-                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
-        case 256 * 100 + 2:
-            return launchKparM2Impl<256, 2, CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                tuning.target_waves, tuning.mkg, tuning.max_kb,
-                tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
-        default:
-            return false;
-        }
-    }
-
-    template <int M, uint8_t CB>
     bool dispatchWideSmallMSerialRowsGenerated(
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
         const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
+        const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         cudaStream_t stream)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M verifier supports M=2..4");
+        g_last_effective_kb = 1;
         switch (tuning.tile_n * 100 + tuning.cpt)
         {
         case 32 * 100 + 1:
         {
             const int grid_n = (N + 32 - 1) / 32;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 32, 1, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<32, 1, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 64 * 100 + 1:
         {
             const int grid_n = (N + 64 - 1) / 64;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 64, 1, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<64, 1, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 64 * 100 + 2:
         {
             const int grid_n = (N + 64 - 1) / 64;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 64, 2, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<64, 2, CB><<<dim3(grid_n, M), 32, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 128 * 100 + 1:
         {
             const int grid_n = (N + 128 - 1) / 128;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 128, 1, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<128, 1, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 128 * 100 + 2:
         {
             const int grid_n = (N + 128 - 1) / 128;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 128, 2, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<128, 2, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 256 * 100 + 2:
         {
             const int grid_n = (N + 256 - 1) / 256;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 256, 2, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<256, 2, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 256 * 100 + 4:
         {
             const int grid_n = (N + 256 - 1) / 256;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 256, 4, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<256, 4, CB><<<dim3(grid_n, M), 64, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         case 512 * 100 + 4:
         {
             const int grid_n = (N + 512 - 1) / 512;
-            nativeVnniGemv_wide_small_m_serial_rows<M, 512, 4, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
+            nativeVnniGemv_wide_small_m_serial_rows<512, 4, CB><<<dim3(grid_n, M), 128, 0, stream>>>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias);
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias);
             return cudaGetLastError() == cudaSuccess;
         }
         default:
@@ -2784,55 +2278,54 @@ namespace
         }
     }
 
-    template <int M, uint8_t CB>
+    template <uint8_t CB>
     bool dispatchKparSmallMGenerated(
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
         const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
+        const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
         int cuda_device_id, cudaStream_t stream)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
         switch (tuning.tile_n * 100 + tuning.cpt)
         {
         case 32 * 100 + 1:
-            return launchKparSmallMImpl<M, 32, 1, CB>(
+            return launchKparSmallMImpl<32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 64 * 100 + 1:
-            return launchKparSmallMImpl<M, 64, 1, CB>(
+            return launchKparSmallMImpl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 64 * 100 + 2:
-            return launchKparSmallMImpl<M, 64, 2, CB>(
+            return launchKparSmallMImpl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 128 * 100 + 1:
-            return launchKparSmallMImpl<M, 128, 1, CB>(
+            return launchKparSmallMImpl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 128 * 100 + 2:
-            return launchKparSmallMImpl<M, 128, 2, CB>(
+            return launchKparSmallMImpl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 256 * 100 + 2:
-            return launchKparSmallMImpl<M, 256, 2, CB>(
+            return launchKparSmallMImpl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 256 * 100 + 4:
@@ -2841,11 +2334,11 @@ namespace
              * IQ2_XXS at `N=1024, K=5120`, use 256 output columns with four
              * columns per thread.  The grouped kernel supports the same
              * 64-thread tile natively; omitting this dispatch case forced an
-             * otherwise valid decode-equivalent M=2..4 projection to fail.
+             * otherwise valid decode-equivalent projection to fail.
              */
-            return launchKparSmallMImpl<M, 256, 4, CB>(
+            return launchKparSmallMImpl<256, 4, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         default:
@@ -2921,10 +2414,13 @@ namespace
             recordGemvDispatch<CB>(
                 shape,
                 tuning,
+                1,
                 N,
                 K,
                 rm_slot && *rm_slot && (*rm_slot)->d_payload,
-                cuda_device_id);
+                cuda_device_id,
+                false,
+                gemv_ctx);
 
             return dispatchGeneratedTuning<CB>(
                 shape, tuning,
@@ -2969,10 +2465,13 @@ namespace
         recordGemvDispatch<CB>(
             shape,
             tuning,
+            1,
             N,
             K,
             rm_slot && *rm_slot && (*rm_slot)->d_payload,
-            cuda_device_id);
+            cuda_device_id,
+            false,
+            gemv_ctx);
 
         return dispatchGeneratedTuning<CB>(
             shape, tuning,
@@ -2983,70 +2482,18 @@ namespace
     }
 
     template <uint8_t CB>
-    bool dispatchCodebookM2RowPar(
-        const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing, const float *d_bias,
-        CUDAGemvContext_ *gemv_ctx,
-        CUDARowMajorWeights_ **rm_slot,
-        int cuda_device_id, cudaStream_t stream)
-    {
-        const NativeGemvShape shape = classifyShapeGenerated<CB>(2, N, K);
-        const GeneratedDispatchTuning tuning = selectGeneratedTuning<CB>(2, N, K);
-        if (shape == NativeGemvShape::WIDE)
-            return false;
-
-        if constexpr (CB != 19)
-        {
-            if (shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
-            {
-                if (!*rm_slot)
-                {
-                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                    *rm_slot = cudaRowMajorWeights_create(
-                        d_payload, d_scales, d_mins, d_emins,
-                        N, K, PB, cuda_device_id, stream);
-                }
-                if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
-                {
-                    return launchRowParM2<CB>(
-                        d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
-                        (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
-                        d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                        tuning.tile_n, stream);
-                }
-
-                cudaGetLastError(); // Clear row-major allocation/launch errors before the KPAR route.
-            }
-        }
-
-        if (shape == NativeGemvShape::KPAR)
-        {
-            return dispatchKparM2Generated<CB>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
-                gemv_ctx, cuda_device_id, stream);
-        }
-
-        return false;
-    }
-
-    template <int M, uint8_t CB>
     bool dispatchCodebookSmallMRowPar(
         const int8_t *d_A_int8, const uint8_t *d_payload,
         const uint16_t *d_scales, const uint16_t *d_mins,
         const uint32_t *d_emins, float *d_C,
-        const float *d_scales_A, int N, int K,
+        const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
         CUDARowMajorWeights_ **rm_slot,
         int cuda_device_id, cudaStream_t stream)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
+        g_last_effective_kb = 1;
         NativeGemvShape shape = NativeGemvShape::KPAR;
         GeneratedDispatchTuning tuning{};
 
@@ -3054,7 +2501,7 @@ namespace
         {
             /**
              * The generated-dispatch trainer drives this path for verifier
-             * buckets M=2..4.  Keep the sweep override local to backend
+             * runtime-M buckets. Keep the sweep override local to backend
              * tuning: production dispatch still comes from the generated
              * classifier below, while the perf harness can time real KPAR
              * small-M candidates instead of accidentally timing the current
@@ -3105,13 +2552,23 @@ namespace
         }
 
         const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
+        recordGemvDispatch<CB>(
+            shape,
+            tuning,
+            M,
+            N,
+            K,
+            rm_slot && *rm_slot && (*rm_slot)->d_payload,
+            cuda_device_id,
+            decode_equivalent_m1,
+            gemv_ctx);
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
         {
             if (!decode_equivalent_m1)
                 return false;
-            return dispatchWideSmallMSerialRowsGenerated<M, CB>(
+            return dispatchWideSmallMSerialRowsGenerated<CB>(
                 tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                d_C, d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 stream);
         }
 
@@ -3121,7 +2578,7 @@ namespace
              * Serial M=1 decode promotes generated KPAR shapes to ROWPAR when
              * row-major weights are available.  Verifier publication has to
              * match that true public decode route, not just the raw generated
-             * classifier result, so the grouped M=2..4 path applies the same
+             * classifier result, so the grouped runtime-M path applies the same
              * promotion while still executing all verifier rows in one launch.
              */
             if (decode_equivalent_m1 && shape == NativeGemvShape::KPAR &&
@@ -3138,10 +2595,10 @@ namespace
                 {
                     const int k_blocks = K / BLOCK_K;
                     const int nwarps = (k_blocks >= 256) ? 4 : 2;
-                    return launchRowParSmallM<M, CB>(
+                    return launchRowParSmallM<CB>(
                         d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
                         (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
-                        d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                        d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                         nwarps, stream);
                 }
 
@@ -3160,10 +2617,10 @@ namespace
                 }
                 if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
                 {
-                    return launchRowParSmallM<M, CB>(
+                    return launchRowParSmallM<CB>(
                         d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
                         (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
-                        d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                        d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                         tuning.tile_n, stream);
                 }
 
@@ -3173,16 +2630,15 @@ namespace
 
         if (shape == NativeGemvShape::KPAR)
         {
-            return dispatchKparSmallMGenerated<M, CB>(
+            return dispatchKparSmallMGenerated<CB>(
                 tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
-                d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 gemv_ctx, cuda_device_id, stream);
         }
 
         return false;
     }
 
-    template <int M>
     bool dispatchSmallMByCodebook(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
@@ -3191,7 +2647,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
-        int N, int K,
+        int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing,
         const float *d_bias,
@@ -3201,41 +2657,40 @@ namespace
         CUDAGemvContext_ *gemv_ctx,
         CUDARowMajorWeights_ **rm_slot)
     {
-        static_assert(M >= 2 && M <= 4, "CUDA native-VNNI small-M GEMV supports M=2..4");
         switch (codebook_id)
         {
         case 0:
-            return dispatchCodebookSmallMRowPar<M, 0>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<0>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 4:
-            return dispatchCodebookSmallMRowPar<M, 4>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<4>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 5:
-            return dispatchCodebookSmallMRowPar<M, 5>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<5>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 6:
-            return dispatchCodebookSmallMRowPar<M, 6>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<6>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 7:
-            return dispatchCodebookSmallMRowPar<M, 7>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<7>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 8:
-            return dispatchCodebookSmallMRowPar<M, 8>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<8>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 9:
-            return dispatchCodebookSmallMRowPar<M, 9>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<9>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 10:
-            return dispatchCodebookSmallMRowPar<M, 10>(d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<10>(d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 11:
-            return dispatchCodebookSmallMRowPar<M, 11>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<11>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 12:
-            return dispatchCodebookSmallMRowPar<M, 12>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<12>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 13:
-            return dispatchCodebookSmallMRowPar<M, 13>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<13>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 14:
-            return dispatchCodebookSmallMRowPar<M, 14>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<14>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 15:
-            return dispatchCodebookSmallMRowPar<M, 15>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<15>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 16:
-            return dispatchCodebookSmallMRowPar<M, 16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<16>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 17:
-            return dispatchCodebookSmallMRowPar<M, 17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<17>(d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         case 19:
-            return dispatchCodebookSmallMRowPar<M, 19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
+            return dispatchCodebookSmallMRowPar<19>(d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, gemv_ctx, rm_slot, cuda_device_id, cuda_stream);
         default:
             return false;
         }
@@ -3262,16 +2717,18 @@ namespace
         const int grid_n = (N + TILE_N - 1) / TILE_N;
         const int k_groups = K / BLOCK_K;
         const int num_sms = querySmCount(gemv_ctx);
-        const int kb = selectKSplit(grid_n, k_groups, num_sms,
-                                    target_waves, min_kgroups_per_cta);
-        const bool deterministic =
-            llaminar2::debugEnv().gemm.deterministic || decodeEquivalentM1ConfigActive();
-        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
-        const int kb_capped = deterministic ? 1 : kb_capped_auto;
+        const bool debug_deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const bool verifier_decode_equivalent = decodeEquivalentM1ConfigActive();
+        const int kb_capped = resolveKparKBlocks(
+            grid_n, k_groups, num_sms,
+            target_waves, min_kgroups_per_cta, max_kb);
+        if (kb_capped <= 0)
+            return false;
+        g_last_effective_kb = kb_capped;
 
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
         bool use_two_phase;
-        if (deterministic)
+        if (debug_deterministic || verifier_decode_equivalent)
             use_two_phase = true;
         else if (force_two_phase == 1)
             use_two_phase = true;
@@ -3451,7 +2908,7 @@ extern "C"
     {
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
-        if (M < 2 || M > 4 || N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
+        if (M < 2 || N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
             return false;
         if (!cudaNativeVNNIGemvTuned_supportsCodebook(codebook_id))
             return false;
@@ -3464,67 +2921,11 @@ extern "C"
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
-        switch (M)
-        {
-        case 2:
-            return dispatchSmallMByCodebook<2>(d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                                               d_C_fp32, d_scales_A_block, N, K, alpha, beta,
-                                               d_C_existing, d_bias, codebook_id, cuda_device_id,
-                                               cuda_stream, gemv_ctx, rm_slot);
-        case 3:
-            return dispatchSmallMByCodebook<3>(d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                                               d_C_fp32, d_scales_A_block, N, K, alpha, beta,
-                                               d_C_existing, d_bias, codebook_id, cuda_device_id,
-                                               cuda_stream, gemv_ctx, rm_slot);
-        case 4:
-            return dispatchSmallMByCodebook<4>(d_A_int8, d_payload, d_scales, d_mins, d_emins,
-                                               d_C_fp32, d_scales_A_block, N, K, alpha, beta,
-                                               d_C_existing, d_bias, codebook_id, cuda_device_id,
-                                               cuda_stream, gemv_ctx, rm_slot);
-        default:
-            return false;
-        }
-    }
-
-    bool cudaNativeVNNIGemvTuned_m2_fp32(
-        const int8_t *d_A_int8,
-        const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
-        float *d_C_fp32,
-        const float *d_scales_A_block,
-        int N, int K,
-        float alpha, float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        uint8_t codebook_id,
-        int cuda_device_id,
-        void *stream,
-        CUDAGemvContext *gemv_ctx,
-        CUDARowMajorWeights **rm_slot)
-    {
-        return cudaNativeVNNIGemvTuned_small_m_fp32(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
-            d_C_fp32,
-            d_scales_A_block,
-            2,
-            N,
-            K,
-            alpha,
-            beta,
-            d_C_existing,
-            d_bias,
-            codebook_id,
-            cuda_device_id,
-            stream,
-            gemv_ctx,
-            rm_slot);
-
+        return dispatchSmallMByCodebook(
+            d_A_int8, d_payload, d_scales, d_mins, d_emins,
+            d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,
+            d_C_existing, d_bias, codebook_id, cuda_device_id,
+            cuda_stream, gemv_ctx, rm_slot);
     }
 
     bool cudaNativeVNNIInitIQGridTables_tuned()
@@ -3537,11 +2938,13 @@ extern "C"
     // reads to bypass heuristics during automated tuning sweeps.
     //
     // kernel_family: 0=WIDE, 1=KPAR, 2=DIRECT
+    // exact_kb: 0=generated occupancy policy, >0=one exact trainer schedule
     // force_two_phase: 0=auto, 1=force two-phase, 2=force atomic
     // =====================================================================
     void cudaNativeVNNIGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
         int target_waves, int mkg, int max_kb,
+        int exact_kb,
         int force_two_phase)
     {
         g_sweep.active = true;
@@ -3551,6 +2954,7 @@ extern "C"
         g_sweep.target_waves = target_waves;
         g_sweep.mkg = mkg;
         g_sweep.max_kb = max_kb;
+        g_sweep.exact_kb = exact_kb;
         g_sweep.force_two_phase = force_two_phase;
     }
 
@@ -3562,6 +2966,11 @@ extern "C"
     bool cudaNativeVNNIGemvSweep_isActive()
     {
         return g_sweep.active;
+    }
+
+    int cudaNativeVNNIGemvTuned_getLastEffectiveKBlocks()
+    {
+        return g_last_effective_kb;
     }
 
     void cudaNativeVNNIGemvTuned_clearStaticState()

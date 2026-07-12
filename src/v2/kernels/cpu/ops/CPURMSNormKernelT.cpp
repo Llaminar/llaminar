@@ -74,21 +74,21 @@ namespace llaminar2
     }
 
     /**
-     * @brief Record one economical small-M RMSNorm invocation.
+     * @brief Record one economical runtime-M RMSNorm invocation.
      *
      * RMSNorm has no cross-row arithmetic dependency, so its production grouped
-     * implementation is one cache-streaming kernel call over M=2..4 rows. For
-     * these tiny batches, opening an OpenMP region is usually more expensive
-     * than walking the rows in the caller thread; the counter records that
-     * deliberate scheduling decision so verifier tests reject hidden M=1 API
-     * replay while allowing the economical cache-serial row schedule.
+     * implementation accepts every positive runtime row count in one API call.
+     * Small verifier groups walk cache-resident rows on the caller thread, while
+     * larger groups distribute complete rows through one OpenMP workshare. The
+     * counter deliberately omits M=1 serial witnesses so integration tests can
+     * prove that an M>=2 request entered the grouped implementation exactly once.
      */
     inline void record_grouped_rmsnorm_call(const char *input_format,
                                             const char *output_format,
                                             int rows,
                                             int cols)
     {
-        if (rows < 2 || rows > 4)
+        if (rows < 2)
             return;
 
         PerfStatsCollector::addCounter(

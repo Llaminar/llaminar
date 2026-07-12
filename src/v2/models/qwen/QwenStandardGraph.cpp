@@ -126,7 +126,6 @@ namespace llaminar2
             const bool force_decode_equivalent_qkv_verifier_prefill =
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
-                total_tokens <= 4 &&
                 config_.usesMTPGroupedDecodeEquivalentRows();
 
             LOG_DEBUG("[QwenStandardGraph] Layer " << layer_idx << " QKV dims: q_n=" << q_n
@@ -175,8 +174,6 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
-        const bool phase_split_prefill_kv_handoff =
-            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
         std::vector<std::string> cache_source_dependencies;
         if (has_qk_norms)
         {
@@ -192,8 +189,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device,
-            phase_split_prefill_kv_handoff);
+            position_ids, position_ids_device, device);
 
         // Wire RoPE dependencies
         if (has_qk_norms)

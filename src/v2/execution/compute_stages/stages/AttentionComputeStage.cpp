@@ -348,6 +348,7 @@ namespace llaminar2
                 !rocm_env.fa_disable_native_kv &&
                 params_.head_dim >= 64 &&
                 ((kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
+                 (kp == ActivationPrecision::BF16 && vp == ActivationPrecision::BF16) ||
                  (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1 &&
                   params_.head_dim % 32 == 0));
             const bool small_native_decode =
@@ -451,7 +452,11 @@ namespace llaminar2
             params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
         if (!will_derive_from_device_count &&
             !cached_kernel_->prepareDynamicAttnParams(
-                kv_len, logical_pos_offset, query_rows_for_params, gpuStream()))
+                kv_len,
+                logical_pos_offset,
+                query_rows_for_params,
+                gpuStream(),
+                cache_capacity))
         {
             const std::string msg =
                 "[AttentionComputeStage] Failed to prepare dynamic attention params for layer " +
@@ -718,6 +723,13 @@ namespace llaminar2
             LOG_ERROR("[AttentionComputeStage] GPU attention/KV read requires an explicit non-null stage stream");
             return false;
         }
+        if (gpu_stage && params_.kv_cache && !params_.read_kv_from_cache)
+        {
+            LOG_ERROR("[AttentionComputeStage] GPU attention with a KV cache requires the device-owned post-append cache path"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.toString());
+            return false;
+        }
 
         const bool padded_prefill_replay =
             prefill_replay_params_set_ &&
@@ -766,6 +778,10 @@ namespace llaminar2
             LOG_TRACE("[AttentionComputeStage] Dynamic kv_len from cache: " << effective_kv_len
                                                                             << " (static was: " << params_.kv_len << ")");
         }
+        const int effective_kv_stride =
+            gpu_stage && params_.kv_cache
+                ? std::max(1, params_.kv_cache->max_seq_len())
+                : std::max(1, effective_kv_len);
         // Read K/V from cache at execution time when requested.
         // This allows GPU prefill to use the FP16 tensors in the KV cache
         // (populated by KVCacheAppendStage) instead of the Q8_1 projection
@@ -1007,7 +1023,6 @@ namespace llaminar2
                                 params_.layer_idx,
                                 /*first_seq_idx=*/0,
                                 params_.batch_size,
-                                effective_kv_len,
                                 ActivationPrecision::FP16,
                                 &cache_k,
                                 &cache_v,
@@ -1019,7 +1034,6 @@ namespace llaminar2
                             params_.layer_idx,
                             /*first_seq_idx=*/0,
                             params_.batch_size,
-                            effective_kv_len,
                             &cache_k,
                             &cache_v,
                             gpuStream());
@@ -1137,7 +1151,8 @@ namespace llaminar2
                             device_cached_tokens,
                             logical_seq_len,
                             query_rows_for_params,
-                            gpuStream()))
+                            gpuStream(),
+                            effective_kv_stride))
                     {
                         LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
                                   << params_.layer_idx << " on " << params_.device_id.toString());
@@ -1169,7 +1184,8 @@ namespace llaminar2
                         effective_kv_len,
                         logical_position_offset,
                         query_rows_for_params,
-                        gpuStream()))
+                        gpuStream(),
+                        effective_kv_stride))
                 {
                     LOG_ERROR("[AttentionComputeStage] Failed to establish static attention params for layer "
                               << params_.layer_idx << " on "
@@ -1423,10 +1439,21 @@ namespace llaminar2
             const size_t effective_request_count =
                 gpu_stage ? static_cast<size_t>(std::max(1, params_.batch_size))
                           : size_t{1};
+            /*
+             * GPU resident views retain one max-sequence-capacity bank per
+             * request. Snapshot copy nodes are part of the captured graph, so
+             * their byte count must use that immutable physical stride rather
+             * than the host logical length observed during capture. Consumers
+             * still use device-owned live counts; inactive capacity is copied
+             * only for diagnostics and never enters attention arithmetic.
+             */
+            const size_t diagnostic_kv_stride =
+                gpu_stage ? static_cast<size_t>(effective_kv_stride)
+                          : static_cast<size_t>(effective_kv_len);
             const size_t k_rows =
-                effective_request_count * static_cast<size_t>(effective_kv_len);
+                effective_request_count * diagnostic_kv_stride;
             const size_t v_rows =
-                effective_request_count * static_cast<size_t>(effective_kv_len);
+                effective_request_count * diagnostic_kv_stride;
             // CPU get_kv_converted() shadows are flat [max_seq_len * kv_dim]
             // tensors, while ROCm cache views are [kv_len, kv_dim]. Compare
             // the logical attention layout consumed by the kernel.
@@ -1504,7 +1531,8 @@ namespace llaminar2
                       << " layer=" << params_.layer_idx
                       << " requests=" << params_.batch_size
                       << " query_rows=" << logical_seq_len
-                      << " max_kv_len=" << effective_kv_len);
+                      << " logical_kv_len=" << effective_kv_len
+                      << " resident_kv_stride=" << effective_kv_stride);
             success = kernel->compute_device_request_batch_decode_equivalent(
                 params_.Q,
                 effective_K,
@@ -1513,7 +1541,7 @@ namespace llaminar2
                 params_.output,
                 params_.batch_size,
                 logical_seq_len,
-                effective_kv_len,
+                effective_kv_stride,
                 params_.n_heads,
                 params_.n_kv_heads,
                 params_.head_dim,
@@ -1672,7 +1700,22 @@ namespace llaminar2
         // stale before execute() has a chance to re-query the cache. Snapshot
         // and validation metadata must therefore refresh cache-backed K/V views
         // here, mirroring the execution path's live-cache read.
-        if (params_.kv_cache && params_.layer_idx >= 0)
+        if (isGraphCaptureActive() && debug_effective_k_tensor_ &&
+            debug_effective_v_tensor_)
+        {
+            /*
+             * Snapshot capture records this metadata while the GPU stream is
+             * inside beginCapture()/endCapture(). The exact cache-owned views
+             * were resolved by execute() and remain allocation-stable, so use
+             * them directly. Reading a host token count here would violate the
+             * fully device-owned replay contract and can invalidate capture.
+             */
+            dump_K = debug_effective_k_tensor_;
+            dump_V = debug_effective_v_tensor_;
+            total_kv_tokens = debug_effective_k_rows_;
+        }
+        else if (params_.kv_cache && params_.layer_idx >= 0 &&
+                 !isGraphCaptureActive())
         {
             const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
             const bool should_read_cache = cached_tokens > 0 &&
@@ -1735,9 +1778,21 @@ namespace llaminar2
         if (debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
-            const size_t expected_kv_rows = total_kv_tokens > 0
-                                                ? total_kv_tokens
-                                                : static_cast<size_t>(params_.seq_len > 0 ? params_.seq_len : 0);
+            /*
+             * GPU cache/projection buffers are allocated at request capacity,
+             * and the captured D2D snapshot node must retain one immutable byte
+             * count across warmup, capture, and replay. The live logical token
+             * count still governs attention arithmetic through device-owned
+             * params; it must not resize diagnostic graph nodes. CPU snapshots
+             * remain synchronous and may describe only their logical rows.
+             */
+            const size_t expected_kv_rows =
+                params_.device_id.is_gpu() && params_.kv_cache
+                    ? static_cast<size_t>(std::max(1, params_.batch_size)) *
+                          static_cast<size_t>(std::max(1, params_.kv_cache->max_seq_len()))
+                    : (total_kv_tokens > 0
+                           ? total_kv_tokens
+                           : static_cast<size_t>(params_.seq_len > 0 ? params_.seq_len : 0));
             const size_t expected_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
             /*
              * execute() resolves the exact cache-owned view consumed by the
@@ -1748,10 +1803,22 @@ namespace llaminar2
              * later request appear zero even though the grouped kernel consumed
              * the correctly gathered request-major tensor.
              */
+            /*
+             * GPU effective-K/V diagnostics exist only after execute() resolves
+             * the production cache view. Omitting an unresolved diagnostic from
+             * pre-execution metadata is intentional: the executor requires a
+             * finalized warmup manifest before capture and hard-fails if the
+             * post-execute outputs disappear or change. CPU execution remains
+             * synchronous and may describe its directly selected dump tensors.
+             */
             const ITensor *effective_k_tensor =
-                debug_effective_k_tensor_ ? debug_effective_k_tensor_ : dump_K;
+                debug_effective_k_tensor_
+                    ? debug_effective_k_tensor_
+                    : (params_.device_id.is_gpu() ? nullptr : dump_K);
             const ITensor *effective_v_tensor =
-                debug_effective_v_tensor_ ? debug_effective_v_tensor_ : dump_V;
+                debug_effective_v_tensor_
+                    ? debug_effective_v_tensor_
+                    : (params_.device_id.is_gpu() ? nullptr : dump_V);
             const size_t effective_k_rows = debug_effective_k_rows_ > 0 ? debug_effective_k_rows_ : expected_kv_rows;
             const size_t effective_v_rows = debug_effective_v_rows_ > 0 ? debug_effective_v_rows_ : expected_kv_rows;
             const size_t effective_k_cols = debug_effective_k_cols_ > 0 ? debug_effective_k_cols_ : expected_kv_cols;

@@ -97,9 +97,8 @@ namespace llaminar2
      *
      * Phase 9.7 promotes verifier implementations only by model family, row
      * count, and sampling mode.  Keeping those facts in a plain value type
-     * makes capability reporting precise: a runner can advertise that shared
-     * stepwise replay is proven for M=1..4 while direct all-position
-     * publication remains disabled for MoE, for example.
+     * makes equivalence evidence precise: a runner can record the contiguous
+     * runtime-M range proven for a model family and sampling mode.
      */
     struct MTPVerifierRowEquivalenceSpec
     {

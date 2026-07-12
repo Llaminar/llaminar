@@ -147,7 +147,8 @@ namespace
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         const int *__restrict__ post_append_cached_tokens,
         int seq_len,
-        int query_rows)
+        int query_rows,
+        int kv_stride)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
@@ -158,6 +159,7 @@ namespace
         const int base_position = max(0, kv_len - logical_seq_len);
         const int row_kv_len = max(1, kv_len - (query_rows - 1 - row));
         out[row].kv_len = row_kv_len;
+        out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = base_position + row;
         out[row].mask_stride = kv_len;
     }
@@ -178,6 +180,7 @@ namespace
     __global__ void cuda_write_attention_params_from_geometry_kernel(
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         int kv_len,
+        int kv_stride,
         int position_offset,
         int query_rows)
     {
@@ -187,6 +190,7 @@ namespace
 
         const int row_kv_len = max(1, kv_len - (query_rows - 1 - row));
         out[row].kv_len = row_kv_len;
+        out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = position_offset + row;
         out[row].mask_stride = kv_len;
     }
@@ -204,7 +208,8 @@ namespace
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         const int *__restrict__ post_append_cached_tokens,
         int request_count,
-        int query_rows)
+        int query_rows,
+        int kv_stride)
     {
         const int flat_row = static_cast<int>(threadIdx.x);
         const int total_rows = request_count * query_rows;
@@ -219,6 +224,7 @@ namespace
             max(1, post_append_kv_len - (query_rows - 1 - query_row));
 
         out[flat_row].kv_len = row_kv_len;
+        out[flat_row].kv_stride = max(post_append_kv_len, kv_stride);
         out[flat_row].position_offset = base_position + query_row;
         out[flat_row].mask_stride = post_append_kv_len;
     }
@@ -442,6 +448,7 @@ namespace
         if (device_params)
         {
             kv_len_runtime = device_params->kv_len;
+            kv_stride = device_params->kv_stride;
             position_offset_runtime = device_params->position_offset;
             mask_stride = device_params->mask_stride;
         }
@@ -1006,6 +1013,7 @@ namespace
         if (device_params)
         {
             kv_len_runtime = device_params->kv_len;
+            kv_stride = device_params->kv_stride;
         }
 
         const int head_idx = blockIdx.x;
@@ -1285,12 +1293,13 @@ namespace
         constexpr bool SHARED_KV =
             ROW_MODE == FlashDecodeRowMode::SharedKVVerifier;
 
-        const int kv_stride = kv_len;
+        int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
         if (device_params)
         {
             const int param_row = ROW_LOCAL_PARAMS ? blockIdx.z : 0;
             kv_len_runtime = device_params[param_row].kv_len;
+            kv_stride = device_params[param_row].kv_stride;
         }
 
         const int head_idx = blockIdx.x;
@@ -1590,6 +1599,7 @@ namespace
         if (device_params)
         {
             kv_len_runtime = device_params->kv_len;
+            kv_stride = device_params->kv_stride;
         }
 
         const int head_idx = blockIdx.x;
@@ -2812,10 +2822,11 @@ extern "C"
         const int *post_append_cached_tokens,
         int seq_len,
         int query_rows,
+        int kv_stride,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
-            query_rows <= 0 ||
+            query_rows <= 0 || kv_stride <= 0 ||
             query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
         {
             return -1;
@@ -2826,7 +2837,8 @@ extern "C"
             static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
             post_append_cached_tokens,
             seq_len,
-            query_rows);
+            query_rows,
+            kv_stride);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -2843,11 +2855,13 @@ extern "C"
     int cudaFlashAttn_prepare_device_params_from_geometry(
         void *device_params,
         int kv_len,
+        int kv_stride,
         int position_offset,
         int query_rows,
         void *stream)
     {
-        if (!device_params || kv_len <= 0 || position_offset < 0 ||
+        if (!device_params || kv_len <= 0 || kv_stride < kv_len ||
+            position_offset < 0 ||
             query_rows <= 0 ||
             query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
         {
@@ -2858,6 +2872,7 @@ extern "C"
             <<<1, query_rows, 0, static_cast<cudaStream_t>(stream)>>>(
                 static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
                 kv_len,
+                kv_stride,
                 position_offset,
                 query_rows);
         const cudaError_t err = cudaGetLastError();
@@ -2879,11 +2894,13 @@ extern "C"
         const int *post_append_cached_tokens,
         int request_count,
         int query_rows,
+        int kv_stride,
         void *stream)
     {
         const int total_rows = request_count * query_rows;
         if (!device_params || !post_append_cached_tokens ||
-            request_count < 2 || query_rows <= 0 || total_rows > 4 || !stream)
+            request_count < 2 || query_rows <= 0 || total_rows > 4 ||
+            kv_stride <= 0 || !stream)
         {
             return -1;
         }
@@ -2893,7 +2910,8 @@ extern "C"
                 static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
                 post_append_cached_tokens,
                 request_count,
-                query_rows);
+                query_rows,
+                kv_stride);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

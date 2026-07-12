@@ -3,7 +3,7 @@
  * @brief Shared all-format grouped RMSNorm decode-equivalence integration sweep.
  *
  * CUDA and ROCm both provide native FP32, BF16, and FP16 RMSNorm kernels. MTP
- * executes two through four verifier rows in one production launch, whereas
+ * executes a runtime-sized verifier group in one production launch, whereas
  * ordinary decode executes one row. This harness proves that grouping does not
  * alter any native output byte and that the production tensor-aware API emits
  * exactly one economical grouped-route observation.
@@ -22,6 +22,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -186,7 +187,7 @@ namespace llaminar2::test::gpu_rmsnorm_verifier
     /**
      * @brief Require native byte equality and identify the first differing byte.
      *
-     * @param grouped Bytes produced by one M=2..4 production launch.
+     * @param grouped Bytes produced by one runtime-M production launch.
      * @param serial Bytes produced by M independent production M=1 launches.
      * @param label Matrix-cell description printed on failure.
      */
@@ -302,15 +303,16 @@ namespace llaminar2::test::gpu_rmsnorm_verifier
         // synthetic approximation.  Its five values per 1024-thread lane make
         // it a materially different reduction tree from the 4096-wide case.
         constexpr std::array<int, 3> column_counts = {128, 4096, 5120};
+        constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
 
         for (int cols : column_counts)
         {
             const auto source = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x6D545000u ^ static_cast<uint32_t>(cols));
             const auto gamma_values = makeGamma(static_cast<size_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string(backend_label) + " format=" + format_label +

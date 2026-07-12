@@ -24,6 +24,7 @@
 #endif
 
 #include "../../../utils/CUDATestUtils.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <cmath>
@@ -526,23 +527,22 @@ namespace
     }
 
     /**
-     * @brief Verifies that verifier publication refreshed the host state mirror.
+     * @brief Compares an observed device-owned live state with one capture row.
      *
-     * CUDA GDN kernels keep the live decode state in device memory, while the
-     * hybrid KV cache also owns a host mirror used when graph rebuilds happen
-     * after an MTP publication boundary.  The mirror must be the same accepted
-     * verifier row as the device state restore; otherwise a rebuild can resume
-     * from stale recurrent/conv state even though captured replay is correct.
+     * Production publication never writes or consults a host mirror. Tests may
+     * synchronize the explicit stream and export the resident state afterward
+     * as a diagnostic observation. This helper then proves that the device copy
+     * selected exactly the requested post-row snapshot.
      */
-    void expectHostMirrorMatchesSnapshotRow(
-        const std::vector<float> &host_mirror,
+    void expectPublishedDeviceStateMatchesSnapshotRow(
+        const std::vector<float> &published_device_state,
         const CudaFloatBuffer &snapshots,
         int row,
         int state_floats)
     {
         ASSERT_GE(row, 0);
         ASSERT_GT(state_floats, 0);
-        ASSERT_EQ(host_mirror.size(), static_cast<size_t>(state_floats));
+        ASSERT_EQ(published_device_state.size(), static_cast<size_t>(state_floats));
         const std::vector<float> snapshot_host = snapshots.toHost();
         const size_t offset =
             static_cast<size_t>(row) * static_cast<size_t>(state_floats);
@@ -551,7 +551,7 @@ namespace
         for (int i = 0; i < state_floats; ++i)
         {
             EXPECT_FLOAT_EQ(
-                host_mirror[static_cast<size_t>(i)],
+                published_device_state[static_cast<size_t>(i)],
                 snapshot_host[offset + static_cast<size_t>(i)])
                 << "state_float=" << i << " row=" << row;
         }
@@ -1785,13 +1785,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(verifier recurrence capture)");
     std::vector<float> live_state_before_publish(static_cast<size_t>(state_floats));
     ASSERT_TRUE(verifier_kernel.exportState(live_state_before_publish.data(), nullptr, nullptr));
-    std::vector<float> restored_host_mirror(
-        static_cast<size_t>(state_floats),
-        -123.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
-    expectHostMirrorMatchesSnapshotRow(
-        restored_host_mirror,
+        nullptr, accepted_rows - 1, stream.stream));
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(publish recurrence snapshot)");
+    std::vector<float> published_device_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(
+        published_device_state.data(), nullptr, nullptr));
+    expectPublishedDeviceStateMatchesSnapshotRow(
+        published_device_state,
         d_snapshots,
         accepted_rows - 1,
         state_floats);
@@ -2565,13 +2568,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatc
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
-    std::vector<float> restored_host_mirror(
-        static_cast<size_t>(state_floats),
-        -456.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
-    expectHostMirrorMatchesSnapshotRow(
-        restored_host_mirror,
+        nullptr, accepted_rows - 1, stream.stream));
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(publish two-row recurrence snapshot)");
+    std::vector<float> published_device_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(
+        published_device_state.data(), nullptr, nullptr));
+    expectPublishedDeviceStateMatchesSnapshotRow(
+        published_device_state,
         d_snapshots,
         accepted_rows - 1,
         state_floats);
@@ -2684,13 +2690,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
-    std::vector<float> restored_host_mirror(
-        static_cast<size_t>(state_floats),
-        -789.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
-    expectHostMirrorMatchesSnapshotRow(
-        restored_host_mirror,
+        nullptr, accepted_rows - 1, stream.stream));
+    checkCuda(
+        cudaStreamSynchronize(stream.stream),
+        "cudaStreamSynchronize(publish multi-row recurrence snapshot)");
+    std::vector<float> published_device_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(
+        published_device_state.data(), nullptr, nullptr));
+    expectPublishedDeviceStateMatchesSnapshotRow(
+        published_device_state,
         d_snapshots,
         accepted_rows - 1,
         state_floats);
@@ -3349,10 +3358,12 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
  * grouped verifier work advances isolated speculative state, and a device row
  * index publishes the accepted snapshot back into live state.  Replaying the
  * original executable must then be byte-identical to serial decode without a
- * recapture.  Every accepted row at verifier depths 2, 3, and 4 is covered so
- * the test cannot accidentally validate only the final-row fast path.
+ * recapture. Every accepted row at M=2..16 and M=31 is covered, and every
+ * grouped output row is compared directly with its scalar M=1 counterpart.
+ * This catches both old four-row admission limits and a kernel that snapshots
+ * correct state while returning numerically different verifier activations.
  */
-TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDeviceIndexedPublicationM2ToM4)
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublicationRuntimeM)
 {
     SKIP_IF_NO_CUDA();
     checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
@@ -3360,7 +3371,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDevice
     constexpr int n_heads = 2;
     constexpr int d_k = 128;
     constexpr int d_v = 128;
-    constexpr int max_verifier_rows = 4;
+    constexpr int max_verifier_rows =
+        llaminar2::test::kGroupedVerifierRuntimeRows.back();
     constexpr int qk_width = n_heads * d_k;
     constexpr int value_width = n_heads * d_v;
     constexpr int state_floats = n_heads * d_k * d_v;
@@ -3441,8 +3453,34 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDevice
     oracle_kernel.allocateGPUState(state_floats);
     oracle_kernel.setGPUStream(stream.stream);
 
-    for (int verifier_rows = 2; verifier_rows <= max_verifier_rows; ++verifier_rows)
+    for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
+        live_kernel.bindVerifierStateCaptureWorkspace(
+            d_snapshots.ptr, verifier_rows, state_floats);
+        live_kernel.bindSpeculativeStateWorkspace(
+            d_speculative_state.ptr, state_floats);
+        CudaCapturedGraph captured_verifier(
+            stream.stream,
+            [&]()
+            {
+                return live_kernel.chunk_forward(
+                    d_q_rows.ptr,
+                    d_k_rows.ptr,
+                    d_v_rows.ptr,
+                    d_alpha_rows.ptr,
+                    d_beta_rows.ptr,
+                    d_a_log.ptr,
+                    d_dt_bias.ptr,
+                    d_grouped_output.ptr,
+                    nullptr,
+                    verifier_rows,
+                    n_heads,
+                    d_k,
+                    d_v,
+                    /*chunk_size=*/64,
+                    /*use_qk_l2norm=*/true);
+            });
+
         for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
         {
             SCOPED_TRACE(
@@ -3454,22 +3492,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDevice
                 d_snapshots.ptr, verifier_rows, state_floats);
             live_kernel.bindSpeculativeStateWorkspace(
                 d_speculative_state.ptr, state_floats);
-            ASSERT_TRUE(live_kernel.chunk_forward(
-                d_q_rows.ptr,
-                d_k_rows.ptr,
-                d_v_rows.ptr,
-                d_alpha_rows.ptr,
-                d_beta_rows.ptr,
-                d_a_log.ptr,
-                d_dt_bias.ptr,
-                d_grouped_output.ptr,
-                nullptr,
-                verifier_rows,
-                n_heads,
-                d_k,
-                d_v,
-                /*chunk_size=*/64,
-                /*use_qk_l2norm=*/true));
+            captured_verifier.launch(stream.stream);
 
             CudaIntBuffer d_accepted_row(accepted_row);
             ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -3525,6 +3548,19 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDevice
             ASSERT_TRUE(oracle_kernel.exportState(
                 oracle_state.data(), nullptr, stream.stream));
 
+            const auto grouped_rows = d_grouped_output.toHost();
+            const size_t grouped_row_begin =
+                static_cast<size_t>(accepted_row) * value_width;
+            const std::vector<float> grouped_row(
+                grouped_rows.begin() + grouped_row_begin,
+                grouped_rows.begin() + grouped_row_begin + value_width);
+            expectByteExactEquivalent(
+                "CUDA grouped GDN verifier output row",
+                grouped_row,
+                d_oracle_row_output.toHost(),
+                /*offset=*/0,
+                grouped_row.size());
+
             const auto replay_output = d_replay_output.toHost();
             const auto oracle_output = d_oracle_output.toHost();
             expectByteExactEquivalent(
@@ -3548,18 +3584,20 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedRecurrenceDecodeReplaysAfterDevice
  *
  * Qwen3.6 feeds its 10,240-wide merged QKV projection through short-conv in
  * place.  The captured graph therefore includes both the convolution kernel
- * and its scratch-to-output copy.  This sweep publishes every possible row for
- * M=2/3/4 through a device scalar, then requires the original executable and
- * resulting live history bytes to match serial M=1 continuation exactly.
+ * and its scratch-to-output copy. This sweep publishes every possible row for
+ * M=2..16 and M=31 through a device scalar, compares every grouped output row
+ * with scalar decode, then requires the original executable and resulting live
+ * history bytes to match serial M=1 continuation exactly.
  */
-TEST_F(Test__CUDAGDNPaddedRealLength, CapturedShortConvDecodeReplaysAfterDeviceIndexedPublicationM2ToM4)
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicationRuntimeM)
 {
     SKIP_IF_NO_CUDA();
     checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
 
     constexpr int channels = 10240;
     constexpr int kernel_size = 4;
-    constexpr int max_verifier_rows = 4;
+    constexpr int max_verifier_rows =
+        llaminar2::test::kGroupedVerifierRuntimeRows.back();
     constexpr int state_floats = channels * (kernel_size - 1);
 
     const auto verifier_input = makeSequenceRows(
@@ -3611,8 +3649,28 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedShortConvDecodeReplaysAfterDeviceI
     ASSERT_TRUE(oracle_kernel.allocateGPUScratch(max_verifier_rows * channels));
     oracle_kernel.setGPUStream(stream.stream);
 
-    for (int verifier_rows = 2; verifier_rows <= max_verifier_rows; ++verifier_rows)
+    for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
+        live_kernel.bindVerifierStateCaptureWorkspace(
+            d_snapshots.ptr, verifier_rows, state_floats);
+        live_kernel.bindSpeculativeStateWorkspace(
+            d_speculative_state.ptr, state_floats);
+        CudaCapturedGraph captured_verifier(
+            stream.stream,
+            [&]()
+            {
+                return live_kernel.forward(
+                    d_live_verifier.ptr,
+                    d_weight.ptr,
+                    d_bias.ptr,
+                    d_live_verifier.ptr,
+                    nullptr,
+                    verifier_rows,
+                    channels,
+                    kernel_size,
+                    /*apply_silu=*/true);
+            });
+
         for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
         {
             SCOPED_TRACE(
@@ -3626,16 +3684,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedShortConvDecodeReplaysAfterDeviceI
                 d_snapshots.ptr, verifier_rows, state_floats);
             live_kernel.bindSpeculativeStateWorkspace(
                 d_speculative_state.ptr, state_floats);
-            ASSERT_TRUE(live_kernel.forward(
-                d_live_verifier.ptr,
-                d_weight.ptr,
-                d_bias.ptr,
-                d_live_verifier.ptr,
-                nullptr,
-                verifier_rows,
-                channels,
-                kernel_size,
-                /*apply_silu=*/true));
+            captured_verifier.launch(stream.stream);
 
             CudaIntBuffer d_accepted_row(accepted_row);
             ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -3684,6 +3733,23 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedShortConvDecodeReplaysAfterDeviceI
             std::vector<float> oracle_state(static_cast<size_t>(state_floats));
             ASSERT_TRUE(oracle_kernel.exportState(
                 oracle_state.data(), nullptr, stream.stream));
+
+            const auto grouped_rows = d_live_verifier.toHost();
+            const auto scalar_rows = d_oracle_verifier.toHost();
+            const size_t grouped_row_begin =
+                static_cast<size_t>(accepted_row) * channels;
+            const std::vector<float> grouped_row(
+                grouped_rows.begin() + grouped_row_begin,
+                grouped_rows.begin() + grouped_row_begin + channels);
+            const std::vector<float> scalar_row(
+                scalar_rows.begin() + grouped_row_begin,
+                scalar_rows.begin() + grouped_row_begin + channels);
+            expectByteExactEquivalent(
+                "CUDA grouped short-conv verifier output row",
+                grouped_row,
+                scalar_row,
+                /*offset=*/0,
+                grouped_row.size());
 
             const auto replay_output = d_replay_continuation.toHost();
             const auto oracle_output = d_oracle_continuation.toHost();

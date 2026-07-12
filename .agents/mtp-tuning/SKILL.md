@@ -104,10 +104,17 @@ Use strict gates before promoting any MTP optimization:
 - Decode-equivalent continuation: accepted-state publication must match serial
   decode after continuing for enough rows to expose KV/GDN/short-conv mistakes.
 
-For grouped verifier rows, prove M=1,2,3,4 bitwise against serial decode for
-every backend that claims support and for every advertised tensor codebook or
-floating-point tensor format. If a grouped path is not faster, keep it out of
-the hot path and track the performance debt in the plan/dashboard.
+Grouped verifier APIs and kernels must accept runtime M up to the graph and
+workspace capacity; never encode speculative depth as an `M=2..4` template or
+admission limit. M=1 is the independent production serial-decode oracle. The
+canonical grouped inventory proves every integer M=2..16 plus M=31 for every
+backend and every advertised tensor codebook or floating-point tensor format.
+M=31 is a deliberate deeper sentinel for speculative regimes beyond the usual
+fifteen drafts; it is not a maximum. A larger configured graph capacity must
+extend the contiguous sweep through that capacity rather than sample only its
+endpoint. Use fixed-size physical row tiles to bound register pressure and
+preserve weight reuse as M grows; do not generate one kernel specialization per
+speculative depth.
 
 Prefer dedicated integration tests before wiring a new kernel into graph
 execution. Good test names to search for include:
@@ -143,6 +150,12 @@ codebook family, floating-point tensor format, or backend lane is added, extend
 the corresponding sweep in the same slice before tuning or claiming the lane is
 complete.
 
+The CUDA all-format gate must include the production fused projection,
+large-K KPAR, fused SwiGLU/down, FP32, FP16, and BF16 runtime-M tests. Search for
+`RuntimeM2To16` in `Test__CUDAGemmParity.cpp`; the low-level NativeVNNI case also
+captures and replays every format/depth combination. Equivalent CPU and ROCm
+lanes must use the same contiguous row inventory.
+
 Routed MoE format sweeps must enter through the production router before the
 grouped expert pass and validate the router-to-expert Q8 publication counter;
 precomputed host route IDs do not prove this optimization. The canonical
@@ -166,8 +179,9 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_CU
 ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_ROCm_" --output-on-failure --parallel
 ```
 
-As of 2026-07-10 the prefix gate discovers 47 substantive lanes: 13 CPU, 15
-CUDA, and 19 ROCm. The inventory includes all-format GEMM, MoE codegroups and
+As of 2026-07-11 the prefix gate discovers 49 substantive lanes: 13 CPU, 16
+CUDA, and 20 ROCm (`50` CTest entries including the model fixture). The
+inventory includes all-format GEMM, MoE codegroups and
 expert paths, floating formats, dense QKV/GDN projections, replicated LocalTP
 output projection, embedding, RMSNorm, fused residual norm, residual add,
 SwiGLU, RoPE, attention, KV-cache append, GDN recurrence, and short-conv. The
@@ -320,7 +334,8 @@ GEMM/SwiGLU/down replay, not against another unproven grouped shortcut.
 
 Prioritize these paths:
 
-- Quantized GEMV/GEMM M=2..4 for all Q, K, and IQ codebook families.
+- Quantized GEMV/GEMM for every M through the configured verifier capacity and
+  all Q, K, and IQ codebook families.
 - Fused gate/up and fused SwiGLU/down.
 - LM head target/bonus rows without unnecessary all-position rows.
 - Attention verifier rows.
@@ -334,7 +349,56 @@ Dispatch policy must be trained/generated, not hand hardcoded:
 - Train/select by codebook family, M, aspect ratio, and work-size buckets.
 - Use exact shape winners only as overlays above the generic policy.
 - Validate generated includes before installing them.
-- Keep CUDA and ROCm trainer behavior comparable.
+- Keep CPU, CUDA, and ROCm trainer behavior comparable through the common
+  observation schema, exact oracle, learner, and certification gates.
+
+For CPU, build ISA and effective runtime ISA are separate policy dimensions.
+Train all three supported regimes: AVX2 build/AVX2 runtime, AVX512 build/forced
+AVX2 runtime, and AVX512 build/AVX512 runtime. Thread count is also part of the
+runtime key. Never train only the native ISA of the build and assume forced
+runtime dispatch has identical economics. Keep oneDNN artifacts isolated in
+`external/onednn/build-avx2` and `external/onednn/build-avx512` so configuring
+one build cannot rewrite the dependency used by the other.
+
+The canonical CPU production refresh is:
+
+```bash
+scripts/refresh_native_vnni_dispatch_tables.sh \
+  --backend cpu \
+  --profile qwen36 \
+  --cpu-threads 28 \
+  --cpu-avx2-sweep-bin build_v2_release/tests/v2/v2_perf_cpu_native_vnni_gemv \
+  --cpu-avx512-sweep-bin build_v2_release_avx512/tests/v2/v2_perf_cpu_native_vnni_gemv \
+  --output-dir benchmark_results/native_vnni_dispatch/<run-id> \
+  --install
+```
+
+Use the physical cores per socket for `--cpu-threads` on the blessed training
+host. The wrapper runs the AVX512 binary twice with distinct runtime dispatch,
+requires the complete ISA matrix, and permits `--install` only for a production
+Qwen 3.6/all-shape profile. Retain the aggregate CSV, timing sidecar, common
+observation CSV, generated include, and summary from every production run.
+
+After a CPU refresh, rebuild both binaries and run these gates:
+
+```bash
+cmake --build build_v2_release --parallel --target v2_perf_cpu_native_vnni_gemv
+cmake --build build_v2_release_avx512 --parallel --target v2_perf_cpu_native_vnni_gemv
+cmake --build build_v2_integration --parallel --target v2_integration_cpu_native_vnni_gemv
+ctest --test-dir build_v2_integration -R "^V2_Integration_CPUNativeVNNIVerifierISAResolver$" --output-on-failure
+ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_CPU_AllFormats$" --output-on-failure
+ctest --test-dir build_v2_integration -R "^V2_Integration_CPUNativeVNNI_GEMV$" --output-on-failure
+```
+
+The ISA resolver gate must validate production route counters for build ISA,
+effective runtime ISA, thread count, and selected grouped policy. Missing
+certification is a hard failure; do not add a Pairwise or serial-row fallback.
+The strong CPU trainer also executes a two-projection fused descriptor bundle
+twice in every format/M cell. It requires serial-row byte equality, repeat byte
+equality, and the `cpu_native_vnni_fused_verifier_rows_projection_launch`
+counter with a two-row AVX2 or four-row AVX512 physical K-part tile. This proof
+must remain enabled in all three CPU regimes; a byte-equal trainer candidate
+alone does not prove the production fused scheduler is economical.
 
 If user asks whether to tune a single known model shape, do the experiment, but
 convert any durable result into the general training pipeline before landing it.

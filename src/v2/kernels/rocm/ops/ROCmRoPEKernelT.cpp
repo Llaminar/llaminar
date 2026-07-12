@@ -287,7 +287,7 @@ namespace
         int device,
         const char *position_route)
     {
-        if (verifier_rows < 2 || verifier_rows > 4)
+        if (verifier_rows < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(

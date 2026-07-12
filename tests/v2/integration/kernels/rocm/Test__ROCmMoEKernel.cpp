@@ -48,6 +48,7 @@
 #endif
 
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 
@@ -67,6 +68,7 @@
 #include <filesystem>
 #include <functional>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -102,25 +104,21 @@ extern "C" bool hipMoE_build_runtime_original_to_grouped(
     int device_idx,
     void *stream);
 
-extern "C" bool hipMoE_gate_logits_small_m(
-    const float *hidden, const float *gate_weights, float *logits,
-    int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream);
-
-extern "C" bool hipMoE_gate_logits_small_m_bf16_weights(
-    const float *hidden, const void *gate_weights_bf16, float *logits,
-    int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream);
-
-extern "C" bool hipMoE_gate_logits_single_token(
-    const float *hidden, const float *gate_weights, float *logits,
-    int d_model, int num_experts,
-    int device_idx, void *stream);
-
-extern "C" bool hipMoE_gate_logits_single_token_bf16_weights(
-    const float *hidden, const void *gate_weights_bf16, float *logits,
-    int d_model, int num_experts,
-    int device_idx, void *stream);
+/**
+ * @brief Query the exact generated long-prefill tile selected by production.
+ *
+ * The all-format integration sweep uses this read-only host query to validate
+ * PerfStats telemetry. Kernel execution and correctness remain entirely on the
+ * device; the query does not participate in production graph execution.
+ */
+extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
+    uint8_t codebook_id,
+    int projection_role,
+    int m,
+    int n,
+    int k,
+    int *tile_m,
+    int *tile_n);
 
 extern "C" bool hipMoE_softmax_topk(
     float *logits,
@@ -765,7 +763,7 @@ namespace
     }
 
     /**
-     * @brief Enforce decode-equivalent top-k routing for verifier-sized M=1..4 batches.
+     * @brief Enforce decode-equivalent top-k routing for runtime-M verifier batches.
      */
     void expectStrictTopKRowsEquivalent(
         const std::vector<float> &batched_indices,
@@ -9339,7 +9337,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
               << cosine << " l2_err=" << l2_err << std::endl;
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRows)
+TEST(Test__ROCmMoEKernel, SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows)
 {
     SKIP_IF_NO_ROCM();
 
@@ -9353,7 +9351,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRows)
     static_cast<ITensorKernel &>(gpu_kernel).setGPUStream(stream);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(
         gpu_kernel,
-        /*max_seq_len=*/4,
+        /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
         d_model,
         /*intermediate=*/512,
         /*num_experts=*/1,
@@ -9371,7 +9369,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRows)
     std::copy(gate_values.begin(), gate_values.end(), gate->mutable_data());
     ASSERT_TRUE(gate->ensureOnDevice(device, stream));
 
-    for (int seq_len : {1, 2, 3, 4})
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
     {
         std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
         std::vector<float> shared_values(static_cast<size_t>(seq_len) * d_model);
@@ -9507,7 +9505,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRows)
  * The Qwen3.6 LocalTP MoE graph writes `combined = routed_partial +
  * gate * shared_partial` on every participant and then allreduces those
  * row-parallel partials.  This regression exercises two real ROCm participants
- * with production fused gate-add kernels, compares grouped M=2/3/4 verifier
+ * with production fused gate-add kernels, compares grouped runtime-M verifier
  * rows to serial M=1 row replay, and requires byte-identical allreduced FP32
  * results.  There is intentionally no CPU oracle in this test: the contract is
  * backend serial-decode equivalence on the real GPU path.
@@ -9562,7 +9560,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllr
             sum[i] += partial[i];
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE("seq_len=" + std::to_string(seq_len));
         const size_t element_count = static_cast<size_t>(seq_len) * d_model;
@@ -9713,7 +9711,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllr
  * @brief Prove RCCL LocalTP verifier allreduce is invariant to row grouping.
  *
  * The production grouped verifier allreduces `M * d_model` FP32 elements for
- * M=2..4, while serial decode performs one `d_model` allreduce per row. The
+ * runtime-M, while serial decode performs one `d_model` allreduce per row. The
  * transport-precision decision must therefore depend on the logical row width,
  * not the aggregate grouped element count. Otherwise a threshold can select
  * FP32 for M=1 and FP16 for M>1, making an otherwise exact grouped verifier
@@ -9725,7 +9723,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllr
  * row-wise RCCL output byte for byte, and validates perfstats records so a host
  * sum or another non-production transport cannot satisfy the test accidentally.
  */
-TEST(Test__ROCmMoEKernel, LocalTPRCCLVerifierRowAllreduceM234MatchesSerialRows)
+TEST(Test__ROCmMoEKernel, LocalTPRCCLVerifierRowAllreduceRuntimeMMatchesSerialRows)
 {
     SKIP_IF_NO_ROCM();
 
@@ -9788,7 +9786,7 @@ TEST(Test__ROCmMoEKernel, LocalTPRCCLVerifierRowAllreduceM234MatchesSerialRows)
         ASSERT_TRUE(ok[1]) << stage_name << " participant 1";
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE("seq_len=" + std::to_string(seq_len));
         const size_t element_count =
@@ -13259,164 +13257,11 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_RejectsNullStream)
         /*stream=*/nullptr));
 }
 
-TEST(Test__ROCmMoEKernel, SmallMGateLogits_RejectsNullStream)
-{
-    SKIP_IF_NO_ROCM();
-
-    float *d_hidden = nullptr;
-    float *d_gate = nullptr;
-    float *d_logits = nullptr;
-    ASSERT_EQ(hipMalloc(&d_hidden, 2 * 32 * sizeof(float)), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_gate, 8 * 32 * sizeof(float)), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_logits, 2 * 8 * sizeof(float)), hipSuccess);
-
-    EXPECT_FALSE(hipMoE_gate_logits_small_m(
-        d_hidden,
-        d_gate,
-        d_logits,
-        /*seq_len=*/2,
-        /*d_model=*/32,
-        /*num_experts=*/8,
-        /*device_idx=*/0,
-        /*stream=*/nullptr));
-
-    (void)hipFree(d_hidden);
-    (void)hipFree(d_gate);
-    (void)hipFree(d_logits);
-}
-
-TEST(Test__ROCmMoEKernel, SmallMGateLogits_ModelShapeMatchesSingleTokenLaunches)
-{
-    SKIP_IF_NO_ROCM();
-
-    constexpr int d_model = 2048;
-    constexpr int num_experts = 256;
-    const DeviceId device = DeviceId::rocm(0);
-
-    auto gate_weights = TestTensorFactory::createFP32Random(
-        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)},
-        -0.5f, 0.5f, 20260607);
-    ASSERT_TRUE(gate_weights->ensureOnDevice(device));
-
-    for (int seq_len : {1, 2, 3, 4})
-    {
-        auto hidden = TestTensorFactory::createFP32Random(
-            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
-            -0.5f, 0.5f, 20260606 + seq_len);
-        auto fused_logits = TestTensorFactory::createFP32(
-            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-        auto row_logits = TestTensorFactory::createFP32(
-            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-
-        ASSERT_TRUE(hidden->ensureOnDevice(device));
-        ASSERT_TRUE(fused_logits->ensureOnDevice(device));
-        ASSERT_TRUE(row_logits->ensureOnDevice(device));
-
-        hipStream_t stream = nullptr;
-        ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
-        ASSERT_TRUE(hipMoE_gate_logits_small_m(
-            static_cast<const float *>(hidden->gpu_data_ptr()),
-            static_cast<const float *>(gate_weights->gpu_data_ptr()),
-            static_cast<float *>(fused_logits->gpu_data_ptr()),
-            seq_len, d_model, num_experts,
-            /*device_idx=*/0,
-            stream));
-        for (int row = 0; row < seq_len; ++row)
-        {
-            ASSERT_TRUE(hipMoE_gate_logits_single_token(
-                static_cast<const float *>(hidden->gpu_data_ptr()) + static_cast<size_t>(row) * d_model,
-                static_cast<const float *>(gate_weights->gpu_data_ptr()),
-                static_cast<float *>(row_logits->gpu_data_ptr()) + static_cast<size_t>(row) * num_experts,
-                d_model, num_experts,
-                /*device_idx=*/0,
-                stream));
-        }
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
-
-        fused_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        row_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        const float *fused = fused_logits->data();
-        const float *rowwise = row_logits->data();
-
-        float max_abs_diff = 0.0f;
-        for (int i = 0; i < seq_len * num_experts; ++i)
-            max_abs_diff = std::max(max_abs_diff, std::fabs(fused[i] - rowwise[i]));
-        EXPECT_LE(max_abs_diff, 1e-5f) << "seq_len=" << seq_len;
-    }
-}
-
-TEST(Test__ROCmMoEKernel, SmallMBF16GateLogits_ModelShapeMatchesSingleTokenLaunches)
-{
-    SKIP_IF_NO_ROCM();
-
-    constexpr int d_model = 2048;
-    constexpr int num_experts = 256;
-    const DeviceId device = DeviceId::rocm(0);
-
-    std::vector<float> gate_weights_fp32(
-        static_cast<size_t>(num_experts) * d_model);
-    fillRandom(gate_weights_fp32, -0.5f, 0.5f, 20260608);
-    auto gate_weights = TestTensorFactory::createBF16(
-        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)});
-    gate_weights->from_fp32(gate_weights_fp32.data(), gate_weights_fp32.size());
-    ASSERT_TRUE(gate_weights->ensureOnDevice(device));
-
-    for (int seq_len : {1, 2, 3, 4})
-    {
-        auto hidden = TestTensorFactory::createFP32Random(
-            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
-            -0.5f, 0.5f, 20260609 + seq_len);
-        auto fused_logits = TestTensorFactory::createFP32(
-            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-        auto row_logits = TestTensorFactory::createFP32(
-            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-
-        ASSERT_TRUE(hidden->ensureOnDevice(device));
-        ASSERT_TRUE(fused_logits->ensureOnDevice(device));
-        ASSERT_TRUE(row_logits->ensureOnDevice(device));
-
-        hipStream_t stream = nullptr;
-        ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
-        ASSERT_TRUE(hipMoE_gate_logits_small_m_bf16_weights(
-            static_cast<const float *>(hidden->gpu_data_ptr()),
-            gate_weights->gpu_data_ptr(),
-            static_cast<float *>(fused_logits->gpu_data_ptr()),
-            seq_len, d_model, num_experts,
-            /*device_idx=*/0,
-            stream));
-        for (int row = 0; row < seq_len; ++row)
-        {
-            ASSERT_TRUE(hipMoE_gate_logits_single_token_bf16_weights(
-                static_cast<const float *>(hidden->gpu_data_ptr()) +
-                    static_cast<size_t>(row) * d_model,
-                gate_weights->gpu_data_ptr(),
-                static_cast<float *>(row_logits->gpu_data_ptr()) +
-                    static_cast<size_t>(row) * num_experts,
-                d_model, num_experts,
-                /*device_idx=*/0,
-                stream));
-        }
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
-
-        fused_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        row_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        const float *fused = fused_logits->data();
-        const float *rowwise = row_logits->data();
-
-        float max_abs_diff = 0.0f;
-        for (int i = 0; i < seq_len * num_experts; ++i)
-            max_abs_diff = std::max(max_abs_diff, std::fabs(fused[i] - rowwise[i]));
-        EXPECT_LE(max_abs_diff, 1e-3f) << "seq_len=" << seq_len;
-    }
-}
-
 TEST(Test__ROCmMoEKernel, VerifierRowsBF16RouteUsesDecodeEquivalentRouter)
 {
     SKIP_IF_NO_ROCM();
 
-    constexpr int seq_len = 4;
+    constexpr int seq_len = kGroupedVerifierRuntimeRows.back();
     constexpr int d_model = 64;
     constexpr int num_experts = 16;
     constexpr int top_k = 4;
@@ -13466,7 +13311,7 @@ TEST(Test__ROCmMoEKernel, VerifierRowsBF16RouteUsesDecodeEquivalentRouter)
 
     double decode_equivalent_router_calls = 0.0;
     bool saw_grouped_route = false;
-    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_decode_equivalent_small_m_router_calls"}))
+    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_decode_equivalent_runtime_m_router_calls"}))
     {
         decode_equivalent_router_calls += record.value;
         const auto route_it = record.tags.find("route");
@@ -13568,7 +13413,7 @@ TEST(Test__ROCmMoEKernel, VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesH
 
     ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
 
-    constexpr int seq_len = 4;
+    constexpr int seq_len = kGroupedVerifierRuntimeRows.back();
     constexpr int d_model = 32;
     constexpr int num_experts = 12;
     constexpr int top_k = 4;
@@ -13609,7 +13454,7 @@ TEST(Test__ROCmMoEKernel, VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesH
 
     double decode_equivalent_router_calls = 0.0;
     bool saw_grouped_route = false;
-    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_decode_equivalent_small_m_router_calls"}))
+    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_decode_equivalent_runtime_m_router_calls"}))
     {
         decode_equivalent_router_calls += record.value;
         const auto route_it = record.tags.find("route");
@@ -13745,7 +13590,7 @@ TEST(Test__ROCmMoEKernel, VerifierRowsRouteMatchesSerialDecodeRouter)
     std::copy(gate_values.begin(), gate_values.end(), gate_weights->mutable_data());
     ASSERT_TRUE(gate_weights->ensureOnDevice(device, stream));
 
-    for (int seq_len : {1, 2, 3, 4})
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
     {
         std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
         for (size_t i = 0; i < hidden_values.size(); ++i)
@@ -13840,7 +13685,7 @@ TEST(Test__ROCmMoEKernel, VerifierRowsRouteMatchesSerialDecodeRouter)
     }
 
     bool saw_q8_grouped_route = false;
-    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_decode_equivalent_small_m_router_calls"}))
+    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_decode_equivalent_runtime_m_router_calls"}))
     {
         const auto route_it = record.tags.find("route");
         saw_q8_grouped_route = saw_q8_grouped_route ||
@@ -14449,20 +14294,14 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
             << "verifier-sized fixed-topology prefill should use fused small-M grouping";
     }
     {
-        const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"});
-        double active_grid_calls = 0.0;
-        bool saw_verifier_tile = false;
+        const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+        double batch_invariant_calls = 0.0;
         for (const auto &record : records)
         {
-            active_grid_calls += record.value;
-            const auto tile_it = record.tags.find("tile_m");
-            saw_verifier_tile = saw_verifier_tile ||
-                                (tile_it != record.tags.end() && tile_it->second == "2");
+            batch_invariant_calls += record.value;
         }
-        EXPECT_GT(active_grid_calls, 0.0)
-            << "verifier-sized fixed-topology prefill should launch over compact active experts";
-        EXPECT_TRUE(saw_verifier_tile)
-            << "ROCm two-row verifier grouped prefill should use the M=2 kernel bucket";
+        EXPECT_GT(batch_invariant_calls, 0.0)
+            << "verifier-sized fixed-topology prefill should use batch-invariant grouped publication";
     }
     PerfStatsCollector::reset();
 
@@ -14607,7 +14446,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
 }
 
 template <typename GateFactory, typename UpFactory, typename DownFactory>
-void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
+void runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecode(
     const char *format_label,
     GateFactory make_gate,
     UpFactory make_up,
@@ -14677,7 +14516,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
         params.intermediate = intermediate;
         /*
          * ROCm production verifier rows use the shared grouped table-prefill
-         * route for M=2..4, and ordinary grouped shared decode for M=1.  This
+         * route for runtime-M, and ordinary grouped shared decode for M=1. This
          * stage-level regression intentionally follows graph wiring rather than
          * dense GEMM verifier hooks, because the latter can be numerically close
          * but not byte-identical to the serial decode path.
@@ -14700,13 +14539,19 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
         return stage;
     };
 
+    constexpr int kVerifierRowCapacity = kGroupedVerifierRuntimeRows.back();
     auto planning_input = TestTensorFactory::createFP32(
-        {4u, static_cast<size_t>(d_model)});
+        {static_cast<size_t>(kVerifierRowCapacity), static_cast<size_t>(d_model)});
     auto planning_output = TestTensorFactory::createFP32(
-        {4u, static_cast<size_t>(d_model)});
+        {static_cast<size_t>(kVerifierRowCapacity), static_cast<size_t>(d_model)});
     auto planning_stage = make_stage(
-        make_params(planning_input.get(), planning_output.get(), 4, true));
-    auto reqs = planning_stage->getWorkspaceRequirements(4, d_model, intermediate);
+        make_params(
+            planning_input.get(),
+            planning_output.get(),
+            kVerifierRowCapacity,
+            true));
+    auto reqs = planning_stage->getWorkspaceRequirements(
+        kVerifierRowCapacity, d_model, intermediate);
     /*
      * A real Qwen3.6 graph places 256-entry routed tables and one-entry shared
      * tables in the same descriptor arena.  Reserve that production width in
@@ -14715,7 +14560,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
      */
     constexpr int routed_experts = 256;
     reqs.merge(MoEWorkspaceBuffers::rocmMoE(
-        /*max_seq_len=*/4,
+        /*max_seq_len=*/kVerifierRowCapacity,
         d_model,
         intermediate,
         routed_experts,
@@ -14902,7 +14747,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
         kLayer31ProductionM2HiddenBits.size() ==
         static_cast<size_t>(2 * d_model));
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE("format=" + format_name + " seq_len=" + std::to_string(seq_len));
 
@@ -14914,7 +14759,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
                 /*
                  * Rows 0 and 1 are the exact layer-31 normalized activations
                  * from the intermittent M=2 model failure.  Reuse them for every
-                 * M bucket, then synthesize only the additional M=3/4 rows.  This
+                 * M bucket, then synthesize only the additional runtime rows. This
                  * turns one checkpoint-specific symptom into an all-codebook
                  * router-Q8/shared-expert regression.
                  */
@@ -15139,6 +14984,36 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
             grouped_output->numel(),
             static_cast<size_t>(d_model));
 
+        if (seq_len == 8)
+        {
+            const auto records = PerfStatsCollector::snapshot(
+                {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+            const auto ordered_publish = std::find_if(
+                records.begin(),
+                records.end(),
+                [](const PerfStatRecord &record)
+                {
+                    const auto tag_equals = [&](const char *name, const char *value)
+                    {
+                        const auto it = record.tags.find(name);
+                        return it != record.tags.end() && it->second == value;
+                    };
+                    return record.name ==
+                               "rocm_moe_grouped_prefill_batch_invariant_calls" &&
+                           tag_equals("seq_len", "8") &&
+                           tag_equals("grouping", "static") &&
+                           tag_equals("gateup_route", "route_owned_router_q8") &&
+                           tag_equals("down_route", "direct_ordered_publish") &&
+                           tag_equals("row_tile", "1") &&
+                           record.count > 0;
+                });
+            EXPECT_NE(ordered_publish, records.end())
+                << format_name
+                << " M=8 must use the production batch-invariant ordered down publisher\n"
+                << PerfStatsCollector::summaryString(
+                       {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+        }
+
         EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
         grouped_stage->unbindWorkspace();
@@ -15163,8 +15038,11 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
             saw_grouped_table_route = true;
         }
     }
-    EXPECT_EQ(static_cast<int>(grouped_table_rows), 18)
-        << "Eager and captured M=2/3/4 production rows must be counted on the ROCm grouped table-prefill route\n"
+    int expected_grouped_table_rows = 0;
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
+        expected_grouped_table_rows += 2 * seq_len;
+    EXPECT_EQ(static_cast<int>(grouped_table_rows), expected_grouped_table_rows)
+        << "Every eager and captured runtime-M row must be counted on the ROCm grouped table-prefill route\n"
         << PerfStatsCollector::summaryString({"mtp"});
     EXPECT_TRUE(saw_grouped_table_route)
         << "ROCm production stage verifier rows must exercise grouped table prefill\n"
@@ -15172,7 +15050,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
 
     const auto reuse_records = PerfStatsCollector::snapshot(
         {"kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls"});
-    for (const int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierRuntimeRows)
     {
         double routed_reuse_calls = 0.0;
         double shared_reuse_calls = 0.0;
@@ -15213,7 +15091,7 @@ void runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_M234MatchSerialStageDecode)
+TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode)
 {
     for (const int intermediate : {512, 256})
     {
@@ -15221,7 +15099,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFo
         for (const auto &format : allMoEVerifierFormatCases())
         {
             SCOPED_TRACE(format.name);
-            runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
+            runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecode(
                 format.name,
                 format.make,
                 format.make,
@@ -15231,7 +15109,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFo
     }
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchSerialStageDecode)
+TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchSerialStageDecode)
 {
     /*
      * The model-level ROCm failure came from a mixed shared-expert projection:
@@ -15239,7 +15117,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUp
      * as an explicit stage-level regression in addition to the homogeneous
      * all-format sweep above.
      */
-    runSharedExpertFFNStageVerifierRowsQwen36ShapeM234MatchSerialStageDecode(
+    runSharedExpertFFNStageVerifierRowsQwen36ShapeRuntimeMMatchSerialStageDecode(
         "IQ2S_gateup_IQ4XS_down",
         [](std::vector<size_t> shape, int seed) -> std::unique_ptr<TensorBase>
         {
@@ -15256,7 +15134,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUp
 }
 
 template <typename GateFactory, typename UpFactory, typename DownFactory>
-void runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     const char *format_label,
     GateFactory make_gate,
     UpFactory make_up,
@@ -15319,12 +15197,16 @@ void runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     ASSERT_NE(up_workspace, nullptr);
     ASSERT_NE(down_workspace, nullptr);
 
+    constexpr int kVerifierRowCapacity = kGroupedVerifierRuntimeRows.back();
     WorkspaceRequirements gemm_reqs;
-    gemm_reqs.merge(gate_workspace->getWorkspaceRequirements(4, intermediate, d_model));
+    gemm_reqs.merge(gate_workspace->getWorkspaceRequirements(
+        kVerifierRowCapacity, intermediate, d_model));
     gemm_reqs.merge(gate_workspace->getWorkspaceRequirements(1, intermediate, d_model));
-    gemm_reqs.merge(up_workspace->getWorkspaceRequirements(4, intermediate, d_model));
+    gemm_reqs.merge(up_workspace->getWorkspaceRequirements(
+        kVerifierRowCapacity, intermediate, d_model));
     gemm_reqs.merge(up_workspace->getWorkspaceRequirements(1, intermediate, d_model));
-    gemm_reqs.merge(down_workspace->getWorkspaceRequirements(4, d_model, intermediate));
+    gemm_reqs.merge(down_workspace->getWorkspaceRequirements(
+        kVerifierRowCapacity, d_model, intermediate));
     gemm_reqs.merge(down_workspace->getWorkspaceRequirements(1, d_model, intermediate));
     auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 256 * 1024 * 1024);
     ASSERT_TRUE(gemm_workspace->allocate(gemm_reqs));
@@ -15349,7 +15231,7 @@ void runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
-        /*max_seq_len=*/4,
+        /*max_seq_len=*/kVerifierRowCapacity,
         d_model,
         intermediate,
         num_experts,
@@ -15481,7 +15363,7 @@ void runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
             static_cast<size_t>(d_model));
     };
 
-    for (int seq_len : {1, 2, 3, 4})
+    for (const int seq_len : kGroupedVerifierBoundaryRows)
     {
         for (const HiddenPattern &pattern : hidden_patterns)
         {
@@ -15493,12 +15375,12 @@ void runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowByRowDecode)
 {
     for (const auto &format : allMoEVerifierFormatCases())
     {
         SCOPED_TRACE(format.name);
-        runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+        runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             format.name,
             format.make,
             format.make,
@@ -15506,7 +15388,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats
     }
 }
 
-TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode)
 {
     /*
      * Qwen3.6 MoE can pack shared gate/up and down projections with different
@@ -15514,7 +15396,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
      * homogeneous triplet, while this mixed-format case mirrors the model-level
      * IQ2_S gate/up plus IQ4_XS down layout that first exposed shared-expert drift.
      */
-    runSharedExpertVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+    runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         "IQ2S_gateup_IQ4XS_down",
         [](std::vector<size_t> shape, int seed) -> std::unique_ptr<TensorBase>
         {
@@ -15531,13 +15413,14 @@ TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
 }
 
 template <typename GateFactory, typename UpFactory, typename DownFactory>
-void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     const char *format_label,
     GateFactory make_gate,
     UpFactory make_up,
     DownFactory make_down,
     bool masked_local_tp = false,
-    bool exercise_router_q8_publication = false)
+    bool exercise_router_q8_publication = false,
+    std::span<const int> row_inventory = kGroupedVerifierRuntimeRows)
 {
     SKIP_IF_NO_ROCM();
 
@@ -15548,6 +15431,8 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     constexpr int num_experts = 256;
     constexpr int top_k = 8;
     constexpr int routed_variants = 16;
+    ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    PerfStatsCollector::reset();
     std::array<uint8_t, num_experts> local_expert_mask{};
     if (masked_local_tp)
     {
@@ -15570,7 +15455,7 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
-        /*max_seq_len=*/4,
+        /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
         d_model,
         intermediate,
         num_experts,
@@ -15635,16 +15520,19 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     auto *workspace_probe = dynamic_cast<IWorkspaceConsumer *>(routed[0].gate);
     ASSERT_NE(workspace_probe, nullptr);
     WorkspaceRequirements gemm_reqs;
-    gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(4, intermediate, d_model));
+    gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(
+        kGroupedVerifierRuntimeRows.back(), intermediate, d_model));
     gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(1, intermediate, d_model));
     if (auto *up_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].up))
     {
-        gemm_reqs.merge(up_workspace->getWorkspaceRequirements(4, intermediate, d_model));
+        gemm_reqs.merge(up_workspace->getWorkspaceRequirements(
+            kGroupedVerifierRuntimeRows.back(), intermediate, d_model));
         gemm_reqs.merge(up_workspace->getWorkspaceRequirements(1, intermediate, d_model));
     }
     if (auto *down_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].down))
     {
-        gemm_reqs.merge(down_workspace->getWorkspaceRequirements(4, d_model, intermediate));
+        gemm_reqs.merge(down_workspace->getWorkspaceRequirements(
+            kGroupedVerifierRuntimeRows.back(), d_model, intermediate));
         gemm_reqs.merge(down_workspace->getWorkspaceRequirements(1, d_model, intermediate));
     }
     auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 256 * 1024 * 1024);
@@ -15718,8 +15606,9 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
             for (int route = 0; route < top_k; ++route)
             {
                 const int slot = row * top_k + route;
+                const int pattern_slot = (row % 4) * top_k + route;
                 indices[static_cast<size_t>(slot)] =
-                    static_cast<float>(kExperts[static_cast<size_t>(slot)]);
+                    static_cast<float>(kExperts[static_cast<size_t>(pattern_slot)]);
                 weights[static_cast<size_t>(slot)] =
                     0.09f + 0.013f * static_cast<float>((slot * 5 + 3) % 11);
                 sum += weights[static_cast<size_t>(slot)];
@@ -15921,14 +15810,20 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
         }
     };
 
-    for (int seq_len : {1, 2, 3, 4})
+    /*
+     * The caller selects either the complete runtime-M certification inventory
+     * or the production-shape boundary inventory.  Both cross the direct and
+     * generated tiled publication regimes and include M=31, which catches a
+     * hidden sixteen-row admission limit without inventing a separate kernel.
+     */
+    for (const int seq_len : row_inventory)
     {
         run_grouped_and_check(seq_len, "initial workspace");
     }
 
     auto rebound_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
-        /*max_seq_len=*/4,
+        /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
         d_model,
         intermediate,
         num_experts,
@@ -15936,7 +15831,7 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
     moe_workspace.reset();
 
     SCOPED_TRACE("ROCm grouped verifier scratch pointers must be rebound after workspace handoff");
-    run_grouped_and_check(4, "after workspace rebind");
+    run_grouped_and_check(row_inventory.back(), "after workspace rebind");
 
     if (exercise_router_q8_publication)
     {
@@ -15977,7 +15872,7 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
         runtime_config.num_experts = num_experts;
         runtime_config.top_k = top_k;
         runtime_config.mirror_to_device = true;
-        runtime_config.prefill_token_capacity = 4;
+        runtime_config.prefill_token_capacity = kGroupedVerifierRuntimeRows.back();
         DeviceMoERuntimeTable runtime_table(runtime_config);
         auto &runtime_host_state = runtime_table.hostLayerState(0);
         populateRuntimeDescriptors(
@@ -15990,7 +15885,7 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
                   hipSuccess);
 
         PerfStatsCollector::reset();
-        for (int seq_len : {2, 3, 4})
+        for (const int seq_len : row_inventory)
         {
             auto hidden = make_hidden(seq_len);
             ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
@@ -16007,7 +15902,13 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
             ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
             ASSERT_TRUE(runtime_grouped_output->ensureOnDevice(device, stream));
 
-            ASSERT_TRUE(moe_kernel.routeVerifierRowsDecodeEquivalent(
+            /*
+             * Every tested row count enters through the production verifier
+             * router. The API is runtime-M; wider rows are handled by grouped
+             * device tiles and must never silently switch to ordinary prefill
+             * math merely because they exceed the historical four-row depth.
+             */
+            const bool route_ok = moe_kernel.routeVerifierRowsDecodeEquivalent(
                 hidden.get(),
                 router_gate.get(),
                 seq_len,
@@ -16016,7 +15917,8 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
                 top_k,
                 /*normalize_weights=*/true,
                 routing_indices.get(),
-                routing_weights.get()))
+                routing_weights.get());
+            ASSERT_TRUE(route_ok)
                 << format_name << " production grouped router M=" << seq_len;
             ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
                 routing_indices.get(),
@@ -16178,6 +16080,121 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
             EXPECT_NE(runtime_reuse_record, reuse_records.end())
                 << format_name << " M=" << seq_len
                 << " must consume router-Q8 rows through runtime placement";
+
+            if (seq_len == 8 || seq_len == row_inventory.back())
+            {
+                const std::string production_seq_len = std::to_string(seq_len);
+                const char *expected_gateup_route =
+                    seq_len > 8 ? "expert_tiled_router_q8" : "route_owned_router_q8";
+                const char *expected_down_route =
+                    seq_len > 8
+                        ? "expert_tiled_partials_ordered_publish"
+                        : "direct_ordered_publish";
+                int expected_gateup_tile_m = 1;
+                int expected_gateup_tile_n = 64;
+                int expected_down_tile_m = 1;
+                int expected_down_tile_n = 64;
+                if (seq_len > 8)
+                {
+                    ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
+                        gate_descs.front().codebook_id,
+                        /*projection_role=*/0,
+                        seq_len,
+                        intermediate,
+                        d_model,
+                        &expected_gateup_tile_m,
+                        &expected_gateup_tile_n))
+                        << format_name << " missing generated gate/up policy";
+                    ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
+                        down_descs.front().codebook_id,
+                        /*projection_role=*/1,
+                        seq_len,
+                        d_model,
+                        intermediate,
+                        &expected_down_tile_m,
+                        &expected_down_tile_n))
+                        << format_name << " missing generated down policy";
+                }
+                const std::string expected_gateup_tile_m_text =
+                    std::to_string(expected_gateup_tile_m);
+                const std::string expected_gateup_tile_n_text =
+                    std::to_string(expected_gateup_tile_n);
+                const std::string expected_down_tile_m_text =
+                    std::to_string(expected_down_tile_m);
+                const std::string expected_down_tile_n_text =
+                    std::to_string(expected_down_tile_n);
+                const std::string expected_common_row_tile =
+                    expected_gateup_tile_m == expected_down_tile_m
+                        ? expected_gateup_tile_m_text
+                        : "mixed";
+                const std::string expected_router_tile_count =
+                    std::to_string((seq_len + 15) / 16);
+                const auto router_records = PerfStatsCollector::snapshot(
+                    {"kernel.rocm_moe_decode_equivalent_runtime_m_router_calls"});
+                const auto grouped_q8_router = std::find_if(
+                    router_records.begin(),
+                    router_records.end(),
+                    [&](const PerfStatRecord &record)
+                    {
+                        const auto tag_equals = [&](const char *name, const char *value)
+                        {
+                            const auto it = record.tags.find(name);
+                            return it != record.tags.end() && it->second == value;
+                        };
+                        return record.name ==
+                                   "rocm_moe_decode_equivalent_runtime_m_router_calls" &&
+                               tag_equals("seq_len", production_seq_len.c_str()) &&
+                               tag_equals("row_tile", "16") &&
+                               tag_equals(
+                                   "tile_count",
+                                   expected_router_tile_count.c_str()) &&
+                               tag_equals(
+                                   "route",
+                                   "grouped_decode_equivalent_q8") &&
+                               record.count > 0;
+                    });
+                EXPECT_NE(grouped_q8_router, router_records.end())
+                    << format_name
+                    << " M=" << seq_len
+                    << " must enter the production sixteen-row-tiled Q8 router\n"
+                    << PerfStatsCollector::summaryString(
+                           {"kernel.rocm_moe_decode_equivalent_runtime_m_router_calls"});
+
+                const auto publication_records = PerfStatsCollector::snapshot(
+                    {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
+                auto saw_ordered_publication = [&](const char *grouping)
+                {
+                    return std::any_of(
+                        publication_records.begin(),
+                        publication_records.end(),
+                        [&](const PerfStatRecord &record)
+                        {
+                            const auto tag_equals = [&](const char *name, const char *value)
+                            {
+                                const auto it = record.tags.find(name);
+                                return it != record.tags.end() && it->second == value;
+                            };
+                            return record.name ==
+                                       "rocm_moe_grouped_prefill_batch_invariant_calls" &&
+                                   tag_equals("seq_len", production_seq_len.c_str()) &&
+                                   tag_equals("grouping", grouping) &&
+                                   tag_equals("gateup_route", expected_gateup_route) &&
+                                   tag_equals("down_route", expected_down_route) &&
+                                   tag_equals("gateup_tile_m", expected_gateup_tile_m_text.c_str()) &&
+                                   tag_equals("gateup_tile_n", expected_gateup_tile_n_text.c_str()) &&
+                                   tag_equals("down_tile_m", expected_down_tile_m_text.c_str()) &&
+                                   tag_equals("down_tile_n", expected_down_tile_n_text.c_str()) &&
+                                   tag_equals("row_tile", expected_common_row_tile.c_str()) &&
+                                   record.count > 0;
+                        });
+                };
+                EXPECT_TRUE(saw_ordered_publication("static"))
+                    << format_name << " M=" << seq_len
+                    << " static descriptors must use ordered down publication";
+                EXPECT_TRUE(saw_ordered_publication("runtime"))
+                    << format_name << " M=" << seq_len
+                    << " runtime descriptors must use ordered down publication";
+            }
         }
 
         EXPECT_EQ(hipFree(device_runtime), hipSuccess);
@@ -16188,7 +16205,7 @@ void runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
 }
 
 
-TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode)
 {
     ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
@@ -16198,7 +16215,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36AllNativeVNNIFormats_M
     for (const auto &format : allMoEVerifierFormatCases())
     {
         SCOPED_TRACE(format.name);
-        runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+        runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             format.name,
             format.make,
             format.make,
@@ -16208,13 +16225,13 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36AllNativeVNNIFormats_M
     }
 }
 
-TEST(Test__ROCmMoEKernel, MaskedLocalTPVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode)
 {
     ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     for (const auto &format : allMoEVerifierFormatCases())
     {
         SCOPED_TRACE(format.name);
-        runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+        runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             format.name,
             format.make,
             format.make,
@@ -16223,9 +16240,13 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPVerifierPrefill_Qwen36AllNativeVNNIFormat
     }
 }
 
-TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundariesMatchRowDecode)
 {
-    runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    ScopedROCmEnvOverride q8_router("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
+    ScopedROCmEnvOverride q8_reuse(
+        "LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN", "1");
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         "IQ2S_gateup_IQ4XS_down",
         [](std::vector<size_t> shape, int seed) -> std::unique_ptr<TensorBase>
         {
@@ -16238,10 +16259,13 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36ShapeM234MatchesRowByR
         [](std::vector<size_t> shape, int seed) -> std::unique_ptr<TensorBase>
         {
             return TestTensorFactory::createIQ4_XSRandom(shape, seed);
-        });
+        },
+        /*masked_local_tp=*/false,
+        /*exercise_router_q8_publication=*/true,
+        kGroupedVerifierBoundaryRows);
 }
 
-TEST(Test__ROCmMoEKernel, MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchesRowByRowDecode)
+TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRowDecode)
 {
     /*
      * Qwen3.6 expert-overlay participants execute only the experts resident on
@@ -16252,7 +16276,7 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4X
      * explicit so the full parity harness is not the first place to discover
      * masked LocalTP drift.
      */
-    runRoutedOnlyVerifierPrefillQwen36ShapeM234MatchesRowByRowDecode(
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         "IQ2S_gateup_IQ4XS_down",
         [](std::vector<size_t> shape, int seed) -> std::unique_ptr<TensorBase>
         {
@@ -16266,7 +16290,9 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4X
         {
             return TestTensorFactory::createIQ4_XSRandom(shape, seed);
         },
-        /*masked_local_tp=*/true);
+        /*masked_local_tp=*/true,
+        /*exercise_router_q8_publication=*/false,
+        kGroupedVerifierBoundaryRows);
 }
 
 /**
@@ -16281,7 +16307,7 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4X
  * each verifier row, otherwise a small early MoE drift can be amplified by
  * later attention, GDN, and routing stages.
  */
-TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1234MatchesRuntimeDecode)
+TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRuntimeDecode)
 {
     SKIP_IF_NO_ROCM();
 
@@ -16301,7 +16327,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
-        /*max_seq_len=*/4,
+        /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
         d_model,
         intermediate,
         num_experts,
@@ -16373,16 +16399,19 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1
     auto *workspace_probe = dynamic_cast<IWorkspaceConsumer *>(routed[0].gate);
     ASSERT_NE(workspace_probe, nullptr);
     WorkspaceRequirements gemm_reqs;
-    gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(4, intermediate, d_model));
+    gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(
+        kGroupedVerifierRuntimeRows.back(), intermediate, d_model));
     gemm_reqs.merge(workspace_probe->getWorkspaceRequirements(1, intermediate, d_model));
     if (auto *up_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].up))
     {
-        gemm_reqs.merge(up_workspace->getWorkspaceRequirements(4, intermediate, d_model));
+        gemm_reqs.merge(up_workspace->getWorkspaceRequirements(
+            kGroupedVerifierRuntimeRows.back(), intermediate, d_model));
         gemm_reqs.merge(up_workspace->getWorkspaceRequirements(1, intermediate, d_model));
     }
     if (auto *down_workspace = dynamic_cast<IWorkspaceConsumer *>(routed[0].down))
     {
-        gemm_reqs.merge(down_workspace->getWorkspaceRequirements(4, d_model, intermediate));
+        gemm_reqs.merge(down_workspace->getWorkspaceRequirements(
+            kGroupedVerifierRuntimeRows.back(), d_model, intermediate));
         gemm_reqs.merge(down_workspace->getWorkspaceRequirements(1, d_model, intermediate));
     }
     auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 256 * 1024 * 1024);
@@ -16437,7 +16466,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1
     runtime_config.num_experts = num_experts;
     runtime_config.top_k = top_k;
     runtime_config.mirror_to_device = true;
-    runtime_config.prefill_token_capacity = 4;
+    runtime_config.prefill_token_capacity = kGroupedVerifierRuntimeRows.back();
     DeviceMoERuntimeTable prefill_runtime_table(runtime_config);
     auto &runtime_prefill_state = prefill_runtime_table.hostLayerState(0);
     populateRuntimeDescriptors(runtime_prefill_state, &gate_descs, &up_descs, &down_descs);
@@ -16478,8 +16507,9 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1
             for (int route = 0; route < top_k; ++route)
             {
                 const int slot = row * top_k + route;
+                const int pattern_slot = (row % 4) * top_k + route;
                 indices[static_cast<size_t>(slot)] =
-                    static_cast<float>(kExperts[static_cast<size_t>(slot)]);
+                    static_cast<float>(kExperts[static_cast<size_t>(pattern_slot)]);
                 weights[static_cast<size_t>(slot)] =
                     0.09f + 0.013f * static_cast<float>((slot * 5 + 3) % 11);
                 sum += weights[static_cast<size_t>(slot)];
@@ -16492,7 +16522,7 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_M1
         }
     };
 
-    for (int seq_len : {1, 2, 3, 4})
+    for (const int seq_len : kGroupedVerifierBoundaryRows)
     {
         auto hidden = make_hidden(seq_len);
         ASSERT_TRUE(hidden->ensureOnDevice(device, stream));

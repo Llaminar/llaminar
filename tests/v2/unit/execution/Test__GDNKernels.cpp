@@ -60,6 +60,7 @@
 #include "tensors/TensorKernels.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "../../utils/VerifierRowTestInventory.h"
 #include "../../utils/TestTensorFactory.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 
@@ -1819,11 +1820,11 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
         << "Verifier capture must not mutate the live state buffer";
 }
 
-TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeM2ToM4)
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeRuntimeM)
 {
     ScopedPerfStatsEnv perfstats;
 
-    static constexpr int max_rows = 4;
+    static constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
     static constexpr int n_heads = 32;
     static constexpr int d_k = 128;
     static constexpr int d_v = 128;
@@ -1832,7 +1833,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
     static constexpr int v_stride = n_heads * d_v;
 
     /*
-     * The verifier can run M=2,3,4 rows.  The grouped CPU kernel may parallelize
+     * The verifier can run any configured row count. The grouped CPU kernel may parallelize
      * across heads, but for each head it must advance the recurrent state in the
      * same order as serial decode and publish each post-row snapshot exactly.
      */
@@ -1866,7 +1867,7 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQw
         initial_state[static_cast<size_t>(i)] =
             0.0001f * static_cast<float>((i % 43) - 21);
 
-    for (int rows = 2; rows <= max_rows; ++rows)
+    for (int rows : test::kGroupedVerifierRuntimeRows)
     {
         PerfStatsCollector::reset();
         CPUGatedDeltaNet verifier_kernel;

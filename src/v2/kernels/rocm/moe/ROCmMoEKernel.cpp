@@ -130,28 +130,6 @@ namespace
         return codebook_id == 10; // Q2_K stores embedded min correction separately.
     }
 
-    int selectGroupedPrefillTileM(int requested_tile_m, int max_tokens_per_expert)
-    {
-        switch (requested_tile_m)
-        {
-        case 2:
-        case 4:
-        case 8:
-            return requested_tile_m;
-        default:
-            break;
-        }
-
-        if (max_tokens_per_expert <= 2)
-            return 2;
-        if (max_tokens_per_expert <= 4)
-            return 2;
-        // Keep tile-4 compiled for targeted sweeps, but the model-level
-        // Qwen3.6 MoE MTP matrix favors the compact tile-2 path for verifier
-        // M=3/4 buckets. Larger prompt-prefill buckets keep the broader tile.
-        return 8;
-    }
-
     constexpr uint8_t kROCmMoEMixedCodebookSentinel = 0xff;
 
     uint32_t groupedPrefillCodebookBit(uint8_t codebook_id)
@@ -357,21 +335,6 @@ extern "C"
         int d_model, int num_experts,
         int device_idx, void *stream);
 
-    bool hipMoE_gate_logits_small_m(
-        const float *hidden, const float *gate_weights, float *logits,
-        int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
-
-    bool hipMoE_gate_logits_small_m_fp16_weights(
-        const float *hidden, const void *gate_weights_fp16, float *logits,
-        int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
-
-    bool hipMoE_gate_logits_small_m_bf16_weights(
-        const float *hidden, const void *gate_weights_bf16, float *logits,
-        int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
-
     bool hipMoE_gate_logits_single_token_kpart(
         const float *hidden, const float *gate_weights, float *logits,
         float *partials,
@@ -405,17 +368,20 @@ extern "C"
     bool hipMoE_gate_logits_fp32_decode_equivalent_rows(
         const float *hidden, const float *gate_weights, float *logits,
         int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len = nullptr);
 
     bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
         const float *hidden, const void *gate_weights_fp16, float *logits,
         int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len = nullptr);
 
     bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
         const float *hidden, const void *gate_weights_bf16, float *logits,
         int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len = nullptr);
 
     bool hipMoE_quantize_router_gate_q8(
         const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
@@ -432,7 +398,8 @@ extern "C"
         const float *hidden, int8_t *hidden_q8, float *hidden_scales,
         const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
         int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len = nullptr);
 
     bool hipMoE_softmax_topk(
         float *logits,
@@ -491,7 +458,8 @@ extern "C"
         int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int *device_effective_seq_len = nullptr);
 
     bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         const float *partials,
@@ -1172,39 +1140,120 @@ extern "C"
         const int *d_original_to_grouped,
         const int *d_original_expert_ids,
         const float *d_group_weights,
-        const int *d_active_expert_ids,
+        int *d_group_work_directory,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
         float *d_scratch_gate,
         float *d_scratch_up,
-        float *d_gate_partials,
-        float *d_up_partials,
         int8_t *d_scratch_swiglu_int8,
         float *d_scratch_swiglu_scales,
-        float *d_scratch_down_out,
         float *d_output,
         int num_experts,
         int d_model,
         int intermediate,
-        int max_tokens_per_expert,
         int total_slots,
         int top_k,
-        int active_expert_slots,
         int grouped_indices_are_route_slots,
-        int original_slot_atomic_scatter,
-        uint8_t gateup_codebook_id,
-        uint8_t down_codebook_id,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
-        int requested_tile_m,
-        int gateup_k_partitions,
         int device_id,
         void *stream);
+
+    bool rocmMoE_grouped_prefill_query_tile_config(
+        uint8_t codebook_id,
+        int projection_role,
+        int m,
+        int n,
+        int k,
+        int *tile_m,
+        int *tile_n);
 
 }
 
 namespace
 {
+    /**
+     * @brief Human-readable generated-policy values attached to PerfStats.
+     *
+     * Descriptor tables may contain one execution codebook or a heterogeneous
+     * mixture. The telemetry deliberately uses strings so mixed tables and an
+     * impossible policy miss remain visible instead of being misreported as a
+     * numeric legacy default.
+     */
+    struct MoEPrefillPolicyTags
+    {
+        std::string tile_m;
+        std::string tile_n;
+    };
+
+    /**
+     * @brief Recover one codebook id from a descriptor-table bit mask.
+     *
+     * @param codebook_mask Bit @c n is set when codebook @c n occurs in the
+     *                      uploaded descriptor table.
+     * @return The unique codebook id, or -1 when the table is empty or mixed.
+     */
+    int singleCodebookFromMask(uint32_t codebook_mask)
+    {
+        if (codebook_mask == 0 ||
+            (codebook_mask & (codebook_mask - 1u)) != 0u)
+        {
+            return -1;
+        }
+        int codebook = 0;
+        while ((codebook_mask >>= 1u) != 0u)
+            ++codebook;
+        return codebook;
+    }
+
+    /**
+     * @brief Describe the exact grouped-prefill policy used by one projection.
+     *
+     * Direct M<=8 execution has a fixed one-row, 64-column launch and bypasses
+     * the long-prefill trainer. Long-prefill tables with one codebook query the
+     * same generated selector used by the HIP launcher. Heterogeneous tables are
+     * reported as @c mixed because each instantiated codebook can select a
+     * different tile inside the same pipeline call. A @c missing value indicates
+     * an internal invariant violation: the pipeline should already have failed
+     * before publishing telemetry when no generated policy exists.
+     *
+     * @param codebook_mask Descriptor-table execution-codebook mask.
+     * @param projection_role Zero for gate/up and one for down projection.
+     * @param seq_len Number of original token rows in this prefill call.
+     * @param n Projection output width.
+     * @param k Projection reduction width.
+     * @return String values suitable for stable PerfStats tags.
+     */
+    MoEPrefillPolicyTags queryMoEPrefillPolicyTags(
+        uint32_t codebook_mask,
+        int projection_role,
+        int seq_len,
+        int n,
+        int k)
+    {
+        if (seq_len <= 8)
+            return {"1", "64"};
+
+        const int codebook = singleCodebookFromMask(codebook_mask);
+        if (codebook < 0)
+            return {"mixed", "mixed"};
+
+        int tile_m = 0;
+        int tile_n = 0;
+        if (!rocmMoE_grouped_prefill_query_tile_config(
+                static_cast<uint8_t>(codebook),
+                projection_role,
+                seq_len,
+                n,
+                k,
+                &tile_m,
+                &tile_n))
+        {
+            return {"missing", "missing"};
+        }
+        return {std::to_string(tile_m), std::to_string(tile_n)};
+    }
+
     bool tryGroupedDecodeGateLogits(
         const float *hidden,
         const float *gate_weights,
@@ -1296,59 +1345,6 @@ namespace
         }
     }
 
-    bool launchSmallMGateLogits(
-        const float *hidden,
-        const void *gate_weights,
-        llaminar2::TensorType gate_type,
-        float *logits,
-        int seq_len,
-        int d_model,
-        int num_experts,
-        int device_ordinal,
-        void *stream)
-    {
-        if (seq_len < 2 || seq_len > 4)
-            return false;
-
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmMoEKernel::routeCore] small-M rowwise router requires an explicit stream");
-            return false;
-        }
-
-        bool launched = false;
-        switch (gate_type)
-        {
-        case llaminar2::TensorType::FP32:
-            launched = hipMoE_gate_logits_small_m(
-                hidden, static_cast<const float *>(gate_weights), logits,
-                seq_len, d_model, num_experts, device_ordinal, stream);
-            break;
-        case llaminar2::TensorType::FP16:
-            launched = hipMoE_gate_logits_small_m_fp16_weights(
-                hidden, gate_weights, logits,
-                seq_len, d_model, num_experts, device_ordinal, stream);
-            break;
-        case llaminar2::TensorType::BF16:
-            launched = hipMoE_gate_logits_small_m_bf16_weights(
-                hidden, gate_weights, logits,
-                seq_len, d_model, num_experts, device_ordinal, stream);
-            break;
-        default:
-            LOG_ERROR("[ROCmMoEKernel::routeCore] unsupported small-M router gate dtype "
-                      << llaminar2::tensorTypeName(gate_type));
-            return false;
-        }
-
-        if (!launched)
-        {
-            LOG_ERROR("[ROCmMoEKernel::routeCore] small-M fused router kernel failed for gate dtype "
-                      << llaminar2::tensorTypeName(gate_type));
-            return false;
-        }
-
-        return true;
-    }
 }
 
 namespace llaminar2
@@ -1554,6 +1550,7 @@ namespace llaminar2
         route_logits_capacity_ = 0;
         route_topk_capacity_ = 0;
         route_logits_partials_capacity_ = 0;
+        router_q8_hidden_rows_cap_ = 0;
         router_q8_hidden_d_model_cap_ = 0;
         router_q8_hidden_blocks_cap_ = 0;
         invalidateRouterQ8HiddenPublication();
@@ -1824,13 +1821,14 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::ensureRouterQ8HiddenScratchCapacity(int d_model)
+    bool ROCmMoEKernel::ensureRouterQ8HiddenScratchCapacity(int rows, int d_model)
     {
-        if (d_model <= 0 || (d_model % 32) != 0)
+        if (rows <= 0 || d_model <= 0 || (d_model % 32) != 0)
             return false;
 
         const int blocks_per_row = d_model / 32;
-        if (d_model <= router_q8_hidden_d_model_cap_ &&
+        if (rows <= router_q8_hidden_rows_cap_ &&
+            d_model <= router_q8_hidden_d_model_cap_ &&
             blocks_per_row <= router_q8_hidden_blocks_cap_ &&
             d_router_q8_hidden_ && d_router_q8_hidden_scales_)
         {
@@ -1839,22 +1837,24 @@ namespace llaminar2
 
         if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_router_q8_hidden_),
                                  MoEWorkspaceBuffers::ROCM_ROUTER_Q8_HIDDEN,
-                                 static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                 static_cast<size_t>(rows) *
                                      static_cast<size_t>(d_model) * sizeof(int8_t),
                                  "ensureRouterQ8HiddenScratchCapacity(hidden)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_router_q8_hidden_scales_),
                                  MoEWorkspaceBuffers::ROCM_ROUTER_Q8_SCALES,
-                                 static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                 static_cast<size_t>(rows) *
                                      static_cast<size_t>(blocks_per_row) * sizeof(float),
                                  "ensureRouterQ8HiddenScratchCapacity(scales)"))
         {
             d_router_q8_hidden_ = nullptr;
             d_router_q8_hidden_scales_ = nullptr;
+            router_q8_hidden_rows_cap_ = 0;
             router_q8_hidden_d_model_cap_ = 0;
             router_q8_hidden_blocks_cap_ = 0;
             return false;
         }
 
+        router_q8_hidden_rows_cap_ = rows;
         router_q8_hidden_d_model_cap_ = d_model;
         router_q8_hidden_blocks_cap_ = blocks_per_row;
         return true;
@@ -1874,7 +1874,7 @@ namespace llaminar2
         bool recorded_during_capture) noexcept
     {
         if (!source || rows <= 0 ||
-            rows > static_cast<int>(MoEWorkspaceBuffers::kMaxVerifierRows) ||
+            rows > router_q8_hidden_rows_cap_ ||
             !d_router_q8_hidden_ || !d_router_q8_hidden_scales_)
         {
             invalidateRouterQ8HiddenPublication();
@@ -1896,6 +1896,7 @@ namespace llaminar2
             !router_q8_hidden_valid_ ||
             router_q8_hidden_source_ != source ||
             router_q8_hidden_rows_ < rows ||
+            router_q8_hidden_rows_cap_ < rows ||
             rows <= 0 ||
             d_model <= 0 ||
             router_q8_hidden_d_model_cap_ < d_model ||
@@ -2197,7 +2198,8 @@ namespace llaminar2
         const float *hidden, const void *gate_weights, TensorType gate_type,
         int seq_len, int d_model, int num_experts, int top_k,
         bool normalize_weights, DeviceRouteBuffers &bufs,
-        const int *device_effective_seq_len)
+        const int *device_effective_seq_len,
+        ITensor *gate_weights_tensor)
     {
         bufs.logits_count = static_cast<size_t>(seq_len) * num_experts;
         bufs.topk_count = static_cast<size_t>(seq_len) * top_k;
@@ -2219,6 +2221,9 @@ namespace llaminar2
         }
 
         const bool decode_single_token = (seq_len == 1);
+        bool used_q8_grouped_router = false;
+        bool used_fp16_grouped_router = false;
+        invalidateRouterQ8HiddenPublication();
         if (decode_single_token)
         {
             if (!launchDecodeGateLogitsForGateType(
@@ -2231,31 +2236,180 @@ namespace llaminar2
                 return false;
             }
         }
-        else if (gate_type != TensorType::FP32)
+        else
         {
-            LOG_ERROR("[ROCmMoEKernel::routeCore] prefill routing requires FP32 gate weights; got "
-                      << tensorTypeName(gate_type));
-            bufs = {};
-            return false;
+            /*
+             * Prefill routing is part of autoregressive state construction, so
+             * changing the prefill bucket must not change a row's logits or
+             * top-k weights.  Every native gate format therefore uses the same
+             * expert-owned, four-row-tiled reduction shape as serial decode.
+             * The tile shares weight loads across rows without introducing a
+             * batch-shaped GEMM reduction or floating-point atomic publication.
+             */
+            bool logits_ready = false;
+            if (gate_type == TensorType::FP32)
+            {
+                const auto &rocm_env = debugEnv().rocm;
+                if (rocm_env.moe_router_q8)
+                {
+                    if (!gate_weights_tensor || (d_model % 32) != 0 ||
+                        !ensureRouterQ8HiddenScratchCapacity(seq_len, d_model))
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::routeCore] batch-invariant Q8 prefill router "
+                                  "requires a tensor identity, 32-column blocks, and declared row scratch");
+                        bufs = {};
+                        return false;
+                    }
+                    const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                        gate_weights_tensor,
+                        static_cast<const float *>(gate_weights),
+                        d_model,
+                        num_experts);
+                    if (!q8_gate)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::routeCore] Q8 prefill router gate cache unavailable");
+                        bufs = {};
+                        return false;
+                    }
+                    logits_ready = hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
+                        hidden,
+                        d_router_q8_hidden_,
+                        d_router_q8_hidden_scales_,
+                        q8_gate->d_gate_weights_q8,
+                        q8_gate->d_gate_scales,
+                        bufs.d_logits,
+                        seq_len,
+                        d_model,
+                        num_experts,
+                        device_ordinal_,
+                        getStream(),
+                        device_effective_seq_len);
+                    if (logits_ready)
+                    {
+                        used_q8_grouped_router = true;
+                        publishRouterQ8Hidden(
+                            hidden,
+                            seq_len,
+                            isGraphCaptureActive() ||
+                                (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
+                                isHipStreamCapturing(getStream()));
+                    }
+                }
+                else if (rocm_env.moe_router_fp16)
+                {
+                    const void *gate_fp16 = getOrCreateFP16RouterGateCache(
+                        gate_weights_tensor,
+                        static_cast<const float *>(gate_weights),
+                        d_model,
+                        num_experts);
+                    if (!gate_fp16)
+                    {
+                        LOG_ERROR("[ROCmMoEKernel::routeCore] FP16 prefill router gate cache unavailable");
+                        bufs = {};
+                        return false;
+                    }
+                    logits_ready = hipMoE_gate_logits_fp16_decode_equivalent_rows(
+                        hidden,
+                        gate_fp16,
+                        bufs.d_logits,
+                        seq_len,
+                        d_model,
+                        num_experts,
+                        device_ordinal_,
+                        getStream(),
+                        device_effective_seq_len);
+                    used_fp16_grouped_router = logits_ready;
+                }
+                else
+                {
+                    logits_ready = hipMoE_gate_logits_fp32_decode_equivalent_rows(
+                        hidden,
+                        static_cast<const float *>(gate_weights),
+                        bufs.d_logits,
+                        seq_len,
+                        d_model,
+                        num_experts,
+                        device_ordinal_,
+                        getStream(),
+                        device_effective_seq_len);
+                }
+            }
+            else if (gate_type == TensorType::FP16)
+            {
+                logits_ready = hipMoE_gate_logits_fp16_decode_equivalent_rows(
+                    hidden,
+                    gate_weights,
+                    bufs.d_logits,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    getStream(),
+                    device_effective_seq_len);
+                used_fp16_grouped_router = logits_ready;
+            }
+            else if (gate_type == TensorType::BF16)
+            {
+                logits_ready = hipMoE_gate_logits_bf16_decode_equivalent_rows(
+                    hidden,
+                    gate_weights,
+                    bufs.d_logits,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    getStream(),
+                    device_effective_seq_len);
+            }
+            else
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeCore] unsupported batch-invariant prefill router gate type "
+                          << tensorTypeName(gate_type));
+                bufs = {};
+                return false;
+            }
+
+            if (!logits_ready)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeCore] batch-invariant grouped prefill logits failed");
+                bufs = {};
+                return false;
+            }
         }
-        else if (!blas_gemm_->execute(hidden, static_cast<const float *>(gate_weights), bufs.d_logits,
-                                      seq_len, num_experts, d_model,
-                                      /*transA=*/false, /*transB=*/true))
+
+        // The row-owned top-k kernel mirrors serial decode and independently
+        // handles every padded graph row from the device effective-length scalar.
+        if (!hipMoE_softmax_topk_decode_equivalent_rows(
+                bufs.d_logits,
+                bufs.d_indices,
+                bufs.d_weights,
+                seq_len,
+                num_experts,
+                top_k,
+                normalize_weights,
+                device_ordinal_,
+                getStream(),
+                device_effective_seq_len))
         {
-            LOG_ERROR("[ROCmMoEKernel::routeCore] hipBLAS gate logits GEMM failed");
             bufs = {};
             return false;
         }
 
-        // Softmax + top-k selection
-        if (!hipMoE_softmax_topk(bufs.d_logits, bufs.d_indices, bufs.d_weights,
-                                 seq_len, num_experts, top_k,
-                                 normalize_weights,
-                                 device_ordinal_, getStream(),
-                                 device_effective_seq_len))
+        if (!decode_single_token)
         {
-            bufs = {};
-            return false;
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_batch_invariant_prefill_router_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"row_tile", "16"},
+                 {"route", used_q8_grouped_router
+                               ? "grouped_q8"
+                               : (used_fp16_grouped_router ? "grouped_fp16"
+                                                          : "grouped_native")},
+                 {"device_effective_len", device_effective_seq_len ? "1" : "0"}});
         }
 
         return true;
@@ -3368,7 +3522,8 @@ namespace llaminar2
         DeviceRouteBuffers bufs;
         if (!routeCore(h, g, gate_type, seq_len, d_model, num_experts, top_k,
                        normalize_weights, bufs,
-                       device_effective_seq_len))
+                       device_effective_seq_len,
+                       gate_weights))
             return false;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -3553,7 +3708,7 @@ namespace llaminar2
             return false;
         }
 
-        if (seq_len < 1 || seq_len > 4 || d_model <= 0 ||
+        if (seq_len < 1 || d_model <= 0 ||
             num_experts <= 0 || top_k <= 0 || top_k > num_experts)
         {
             LOG_ERROR("[" << kContext << "] invalid verifier routing shape seq_len="
@@ -3658,7 +3813,7 @@ namespace llaminar2
         invalidateRouterQ8HiddenPublication();
         if (q8_router_requested)
         {
-            if (!ensureRouterQ8HiddenScratchCapacity(d_model))
+            if (!ensureRouterQ8HiddenScratchCapacity(seq_len, d_model))
             {
                 LOG_ERROR("[" << kContext << "] Q8 router hidden scratch unavailable for d_model="
                               << d_model);
@@ -3814,7 +3969,7 @@ namespace llaminar2
         markDeviceWritten(output_weights, device, getStream());
         PerfStatsCollector::addCounter(
             "kernel",
-            "rocm_moe_decode_equivalent_small_m_router_calls",
+            "rocm_moe_decode_equivalent_runtime_m_router_calls",
             1.0,
             {},
             {},
@@ -3822,6 +3977,8 @@ namespace llaminar2
              {"d_model", std::to_string(d_model)},
              {"num_experts", std::to_string(num_experts)},
              {"top_k", std::to_string(top_k)},
+             {"row_tile", "16"},
+             {"tile_count", std::to_string((seq_len + 15) / 16)},
              {"route", used_q8_grouped_router ? "grouped_decode_equivalent_q8"
                                                : (used_fp16_grouped_router
                                                       ? "grouped_decode_equivalent_fp16"
@@ -3908,7 +4065,7 @@ namespace llaminar2
         }
         if (q8_router_requested)
         {
-            if (!ensureRouterQ8HiddenScratchCapacity(d_model))
+            if (!ensureRouterQ8HiddenScratchCapacity(/*rows=*/1, d_model))
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router hidden scratch unavailable for d_model="
                           << d_model);
@@ -4189,7 +4346,7 @@ namespace llaminar2
         }
         if (q8_router_requested)
         {
-            if (!ensureRouterQ8HiddenScratchCapacity(d_model))
+            if (!ensureRouterQ8HiddenScratchCapacity(/*rows=*/1, d_model))
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router hidden scratch unavailable for d_model="
                           << d_model);
@@ -6010,7 +6167,7 @@ namespace llaminar2
         /*
          * Masked explicit-routing decode is the M=1 production contract for
          * LocalTP expert-id-apportioned verifier rows. Non-local route slots are
-         * represented as -1 entries, and the grouped M=2..4 verifier publisher
+         * represented as -1 entries, and the grouped runtime-M verifier publisher
          * must be byte-identical to this path before its partial output is
          * allreduced with peer shards.  Split-K gate/up changes the FP32 reduction
          * tree, so masked verifier decode stays on the single-reduction grouped
@@ -6396,7 +6553,7 @@ namespace llaminar2
          * batch-invariant against grouped verifier rows because the atomic
          * arrival order is not the serial top-k accumulation order.  Use the
          * ordered serial-down publication in runtime decode so M=1 serial rows
-         * and grouped M=1..4 verifier rows share one byte-stable contract.
+         * and grouped runtime-M verifier rows share one byte-stable contract.
          */
         const bool use_parallel_down = false;
         if (use_parallel_down && !groupedDecodeSupportsCodebook(down_table.codebook_id))
@@ -7886,6 +8043,26 @@ namespace llaminar2
             return false;
         }
 
+        if (PerfStatsCollector::isEnabled())
+        {
+            /*
+             * Wider runtime-M verifier groups intentionally use the scalable
+             * count/scan/scatter planner. Publishing this route separately
+             * lets correctness gates prove that a missing compact-planner
+             * counter is a policy transition, not an unobserved fallback.
+             */
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_general_prefill_grouping_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                PerfStatsCollector::Tags{
+                    {"total_slots", std::to_string(total_slots)},
+                    {"num_experts", std::to_string(num_experts)},
+                    {"top_k", std::to_string(top_k)}});
+        }
+
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
@@ -8253,11 +8430,12 @@ namespace llaminar2
         const int max_dim = (d_model > intermediate) ? d_model : intermediate;
         const int max_blocks = max_dim / 32;
 
-        // K1 produces A_int8/scales and the fused K2 consumes them while also
-        // writing SwiGLU INT8/scales. Those lifetimes overlap across CTAs, so
-        // the fused path requires distinct workspace buffers. K3 can still
-        // reuse the larger FP32 gate buffer for down-projection output after
-        // the fused K2 launch has completed.
+        // Hidden-row Q8 data remains live through gate/up, while the exact
+        // SwiGLU Q8 rows remain live through down projection. Those lifetimes
+        // overlap across CTAs, so they require distinct device buffers. Once
+        // SwiGLU has consumed the FP32 gate rows, long-prefill down projection
+        // reuses the larger gate allocation for deterministic route partials;
+        // the ordered publisher then folds those rows in original top-k order.
         if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_A_int8_),
                                  MoEWorkspaceBuffers::PREFILL_A_INT8,
                                  static_cast<size_t>(total_slots) * max_dim * sizeof(int8_t),
@@ -8339,47 +8517,19 @@ namespace llaminar2
             return false;
         }
 
-        // Grid sizing for K2/K4 GEMM kernels.
-        // Use seq_len as conservative upper bound — no host sync needed.
-        // Each layer has independent routing (different gate weights), so
-        // max_tokens_per_expert varies per layer and per input. A cache would
-        // need (layer_id, input_hash) as key — not worth the complexity.
-        // The K2/K4 kernels early-exit via per-expert d_group_counts check,
-        // so overprovision only costs empty-block dispatch (~4ms / 437ms < 1%).
-        // The device-side max (d_group_max_tokens_) is still computed async for
-        // potential future use (e.g., separate-stream approach or graph capture).
         const int total_slots = seq_len * top_k;
-        const int max_tokens_per_expert = seq_len;
         const int active_expert_slots = group_active_expert_slots_;
-        const int *d_active_expert_ids =
+        int *d_group_work_directory =
             (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
-        if (active_expert_slots > 0 && !d_active_expert_ids)
+        if (active_expert_slots > 0 && !d_group_work_directory)
         {
-            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] compact active expert list missing");
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] grouped work-directory storage missing");
             return false;
         }
-
-        const int gateup_k_partitions = debugEnv().rocm.moe_gateup_kparts;
-        const bool use_gateup_kpart =
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
-            debugEnv().rocm.moe_gateup_kpart_decode &&
-            ensureGroupedGateUpKPartScratchCapacity(
-                total_slots,
-                gateup_k_partitions,
-                intermediate);
 
         // Ensure scratch buffers
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
             return false;
-
-        const bool verifier_decode_equivalent_gateup =
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
-            d_prefill_gate_ != nullptr &&
-            d_prefill_up_ != nullptr;
-        const bool pipeline_use_gateup_kpart =
-            use_gateup_kpart && !verifier_decode_equivalent_gateup;
 
         // Ensure hidden and output are on device
         hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
@@ -8394,62 +8544,29 @@ namespace llaminar2
             return false;
         }
         const bool reuse_router_q8_hidden =
-            verifier_decode_equivalent_gateup &&
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
-
         /*
-         * Ordered scatter writes every output element exactly once and matches
-         * the byte-stable serial top-k decode contract.  Non-verifier prefill
-         * may still opt into route-slot atomics below, but verifier-sized
-         * batches keep the deterministic ordered publisher even when the global
-         * ROCm parallel-down toggle is enabled.
+         * Ordered publication is the sole grouped-prefill contract. One lane
+         * owns each token/column and accumulates routes in top-k order. Small
+         * verifier buckets compute each route directly; long prefill first
+         * materializes deterministic route partials so decoded weights can be
+         * reused across expert-row tiles. Neither variant relies on a
+         * scheduler-dependent floating-point atomic reduction.
          */
-        const bool original_slot_atomic_scatter =
-            !verifier_decode_equivalent_gateup &&
-            debugEnv().rocm.moe_parallel_down_decode &&
-            top_k > 1;
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
         const bool shared_singleton_expert = (num_experts == 1 && top_k == 1);
-        /*
-         * Small-M verifier prefill has two decode-equivalent publication
-         * contracts:
-         *
-         * 1. Non-verifier prefill may still request the original route-slot
-         *    atomic grid when ROCm parallel down is enabled.  MTP verifier rows
-         *    deliberately do not: atomics make route contribution order depend
-         *    on scheduler arrival, which breaks byte equality against the
-         *    serial top-k decode contract.
-         *
-         * 2. ROCm serial decode without parallel down accumulates routes in
-         *    top-k order for each token/column.  In that mode ordered publish
-         *    overwrites every output element exactly once and avoids atomics.
-         */
-        const bool verifier_decode_equivalent_ordered_down =
-            verifier_decode_equivalent_gateup &&
-            ordered_scatter_overwrites_output &&
-            !original_slot_atomic_scatter &&
-            (shared_singleton_expert || d_group_int_indices_ != nullptr);
-        const bool scatter_overwrites_output =
-            ordered_scatter_overwrites_output &&
-            (verifier_decode_equivalent_ordered_down || !original_slot_atomic_scatter);
-        const int *d_original_expert_ids_for_pipeline =
-            (verifier_decode_equivalent_ordered_down || original_slot_atomic_scatter)
-                ? (shared_singleton_expert ? nullptr : d_group_int_indices_)
-                : nullptr;
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
-        if (!scatter_overwrites_output)
+        if (!ordered_scatter_overwrites_output ||
+            (!shared_singleton_expert && !d_group_int_indices_))
         {
-            hipError_t memset_err = hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
-            if (memset_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] output zero failed: "
-                          << hipGetErrorString(memset_err));
-                return false;
-            }
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] "
+                      "batch-invariant grouped prefill requires the original route map and expert ids");
+            return false;
         }
+        const int *d_original_expert_ids_for_pipeline =
+            shared_singleton_expert ? nullptr : d_group_int_indices_;
 
-        // Call the fully-grouped pipeline (5 kernel launches, zero sync)
+        // Launch the fixed, fully grouped pipeline without a host synchronization.
         const bool ok = rocmMoE_grouped_prefill_pipeline(
             d_hidden,
             reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
@@ -8460,35 +8577,25 @@ namespace llaminar2
             d_group_counts_,
             d_group_offsets_,
             d_group_token_indices_,
-            ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
+            d_group_original_to_grouped_,
             d_original_expert_ids_for_pipeline,
             d_group_weights_,
-            d_active_expert_ids,
+            d_group_work_directory,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            pipeline_use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
-            pipeline_use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
-            d_prefill_gate_,
             d_output,
             num_experts,
             d_model,
             intermediate,
-            max_tokens_per_expert,
             total_slots,
             top_k,
-            active_expert_slots,
             0,
-            original_slot_atomic_scatter ? 1 : 0,
-            gateup_table.codebook_id,
-            down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
-            debugEnv().rocm.moe_prefill_tile_m,
-            pipeline_use_gateup_kpart ? gateup_k_partitions : 0,
             device_ordinal_,
             getStream());
 
@@ -8515,14 +8622,27 @@ namespace llaminar2
                              DeviceId::rocm(device_ordinal_));
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
-            const int selected_tile_m =
-                (num_experts == 1 && top_k == 1)
-                    ? 2
-                    : selectGroupedPrefillTileM(debugEnv().rocm.moe_prefill_tile_m,
-                                                max_tokens_per_expert);
+            const MoEPrefillPolicyTags gateup_policy =
+                queryMoEPrefillPolicyTags(
+                    gateup_table.codebook_mask,
+                    /*projection_role=*/0,
+                    seq_len,
+                    intermediate,
+                    d_model);
+            const MoEPrefillPolicyTags down_policy =
+                queryMoEPrefillPolicyTags(
+                    down_table.codebook_mask,
+                    /*projection_role=*/1,
+                    seq_len,
+                    d_model,
+                    intermediate);
+            const std::string common_row_tile =
+                gateup_policy.tile_m == down_policy.tile_m
+                    ? gateup_policy.tile_m
+                    : "mixed";
             PerfStatsCollector::addCounter(
                 "kernel",
-                "rocm_moe_grouped_prefill_active_expert_grid_calls",
+                "rocm_moe_grouped_prefill_batch_invariant_calls",
                 1.0,
                 "moe",
                 DeviceId::rocm(device_ordinal_).to_string(),
@@ -8532,22 +8652,24 @@ namespace llaminar2
                     {"total_slots", std::to_string(total_slots)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
-                    {"tile_m", std::to_string(selected_tile_m)},
                     {"gateup_route",
-                     verifier_decode_equivalent_gateup
+                     seq_len > 8
                          ? (reuse_router_q8_hidden
-                                ? "decode_equiv_router_q8"
-                                : "decode_equiv_prefill")
-                         : (pipeline_use_gateup_kpart ? "kpart_prefill" : "fused_prefill")},
+                                ? "expert_tiled_router_q8"
+                                : "expert_tiled_original_row_quant")
+                         : (reuse_router_q8_hidden
+                                ? "route_owned_router_q8"
+                                : "route_owned_original_row_quant")},
                     {"down_route",
-                     verifier_decode_equivalent_ordered_down
-                         ? "decode_equiv_ordered_publish"
-                         : (original_slot_atomic_scatter
-                                ? "original_slot_atomic"
-                                : (ordered_scatter_overwrites_output
-                                       ? "ordered_scatter"
-                                       : "atomic_scatter"))},
-                    {"gateup_kparts", std::to_string(pipeline_use_gateup_kpart ? gateup_k_partitions : 0)}});
+                     seq_len > 8
+                         ? "expert_tiled_partials_ordered_publish"
+                         : "direct_ordered_publish"},
+                    {"gateup_tile_m", gateup_policy.tile_m},
+                    {"gateup_tile_n", gateup_policy.tile_n},
+                    {"down_tile_m", down_policy.tile_m},
+                    {"down_tile_n", down_policy.tile_n},
+                    {"row_tile", common_row_tile},
+                    {"grouping", "static"}});
         }
         return true;
     }
@@ -8577,7 +8699,8 @@ namespace llaminar2
             !runtime_host_layer.expert_counts ||
             !runtime_host_layer.expert_offsets ||
             !runtime_host_layer.grouped_token_ids ||
-            !runtime_host_layer.grouped_route_weights)
+            !runtime_host_layer.grouped_route_weights ||
+            !runtime_host_layer.route_expert_ids)
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid runtime scratch contract"
                       << " expert_count=" << runtime_host_layer.expert_count
@@ -8614,7 +8737,6 @@ namespace llaminar2
         }
 
         const int total_slots = seq_len * top_k;
-        const int max_tokens_per_expert = seq_len;
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             !ensureRuntimePrefillDescriptorCapacity(num_experts))
             return false;
@@ -8679,10 +8801,8 @@ namespace llaminar2
 
         /*
          * Runtime LLEP grouped prefill stores route slots in grouped_token_ids.
-         * Rebuilding the inverse map lets the scatter stage publish in original
-         * route-slot order.  Deterministic ordered scatter matches serial
-         * non-parallel decode; original-slot atomic scatter matches ROCm
-         * parallel-down decode.
+         * Rebuilding the inverse map lets one token/column lane publish in
+         * original top-k order for every M bucket.
          */
         if (!hipMoE_build_runtime_original_to_grouped(
                 device_runtime_layer,
@@ -8698,48 +8818,8 @@ namespace llaminar2
             return false;
         }
 
-        const bool verifier_decode_equivalent_gateup =
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
-            d_prefill_gate_ != nullptr &&
-            d_prefill_up_ != nullptr;
         const bool reuse_router_q8_hidden =
-            verifier_decode_equivalent_gateup &&
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
-        /*
-         * Runtime-table verifier prefill is the production MTP path for ROCm
-         * least-loaded or static-owner apportioned execution. Keep it on the same batch-invariant contract
-         * as the direct grouped path: every output element is owned by one
-         * token/column worker, and that worker accumulates original top-k
-         * routes in serial decode order.  The global parallel-down toggle can
-         * still select original-slot atomics for larger non-verifier prefill,
-         * but atomics are not a valid verifier publication strategy because
-         * scheduler arrival order is not bitwise stable.
-         */
-        const bool original_slot_atomic_scatter =
-            !verifier_decode_equivalent_gateup &&
-            debugEnv().rocm.moe_parallel_down_decode &&
-            top_k > 1;
-        const bool verifier_decode_equivalent_ordered_down =
-            verifier_decode_equivalent_gateup &&
-            d_group_original_to_grouped_ != nullptr &&
-            !original_slot_atomic_scatter &&
-            runtime_host_layer.route_expert_ids != nullptr;
-        if (original_slot_atomic_scatter)
-        {
-            hipError_t memset_err = hipMemsetAsync(
-                d_output,
-                0,
-                static_cast<size_t>(seq_len) * static_cast<size_t>(d_model) * sizeof(float),
-                static_cast<hipStream_t>(getStream()));
-            if (memset_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] output zero failed: "
-                          << hipGetErrorString(memset_err));
-                return false;
-            }
-        }
-
         const bool ok = rocmMoE_grouped_prefill_pipeline(
             d_hidden,
             reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
@@ -8751,36 +8831,24 @@ namespace llaminar2
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
             d_group_original_to_grouped_,
-            (verifier_decode_equivalent_ordered_down || original_slot_atomic_scatter)
-                ? runtime_host_layer.route_expert_ids
-                : nullptr,
+            runtime_host_layer.route_expert_ids,
             runtime_host_layer.grouped_route_weights,
             d_group_active_expert_ids_,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            nullptr,
-            nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
-            d_prefill_gate_,
             d_output,
             num_experts,
             d_model,
             intermediate,
-            max_tokens_per_expert,
             total_slots,
             top_k,
-            active_expert_slots,
             1,
-            original_slot_atomic_scatter ? 1 : 0,
-            gateup_table.codebook_id,
-            down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
-            debugEnv().rocm.moe_prefill_tile_m,
-            0,
             device_ordinal_,
             getStream());
         if (!ok)
@@ -8806,12 +8874,27 @@ namespace llaminar2
                              DeviceId::rocm(device_ordinal_));
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
-            const int selected_tile_m =
-                selectGroupedPrefillTileM(debugEnv().rocm.moe_prefill_tile_m,
-                                          max_tokens_per_expert);
+            const MoEPrefillPolicyTags gateup_policy =
+                queryMoEPrefillPolicyTags(
+                    gateup_table.codebook_mask,
+                    /*projection_role=*/0,
+                    seq_len,
+                    intermediate,
+                    d_model);
+            const MoEPrefillPolicyTags down_policy =
+                queryMoEPrefillPolicyTags(
+                    down_table.codebook_mask,
+                    /*projection_role=*/1,
+                    seq_len,
+                    d_model,
+                    intermediate);
+            const std::string common_row_tile =
+                gateup_policy.tile_m == down_policy.tile_m
+                    ? gateup_policy.tile_m
+                    : "mixed";
             PerfStatsCollector::addCounter(
                 "kernel",
-                "rocm_moe_grouped_prefill_active_expert_grid_calls",
+                "rocm_moe_grouped_prefill_batch_invariant_calls",
                 1.0,
                 "moe",
                 DeviceId::rocm(device_ordinal_).to_string(),
@@ -8821,18 +8904,23 @@ namespace llaminar2
                     {"total_slots", std::to_string(total_slots)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
-                    {"tile_m", std::to_string(selected_tile_m)},
                     {"gateup_route",
-                     verifier_decode_equivalent_gateup
-                         ? "decode_equiv_prefill"
-                         : "fused_prefill"},
+                     seq_len > 8
+                         ? (reuse_router_q8_hidden
+                                ? "expert_tiled_router_q8"
+                                : "expert_tiled_original_row_quant")
+                         : (reuse_router_q8_hidden
+                                ? "route_owned_router_q8"
+                                : "route_owned_original_row_quant")},
                     {"down_route",
-                     verifier_decode_equivalent_ordered_down
-                         ? "decode_equiv_ordered_publish"
-                         : (original_slot_atomic_scatter
-                                ? "original_slot_atomic"
-                                : "ordered_scatter")},
-                    {"gateup_kparts", "0"},
+                     seq_len > 8
+                         ? "expert_tiled_partials_ordered_publish"
+                         : "direct_ordered_publish"},
+                    {"gateup_tile_m", gateup_policy.tile_m},
+                    {"gateup_tile_n", gateup_policy.tile_n},
+                    {"down_tile_m", down_policy.tile_m},
+                    {"down_tile_n", down_policy.tile_n},
+                    {"row_tile", common_row_tile},
                     {"grouping", "runtime"}});
         }
         return true;

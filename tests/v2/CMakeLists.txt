@@ -1788,8 +1788,94 @@ add_test(NAME V2_Unit_NativeVNNIDispatchRefreshScript
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_dispatch_refresh.py
 )
 set_tests_properties(V2_Unit_NativeVNNIDispatchRefreshScript PROPERTIES
-    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dispatch;Trainer;Regression"
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Regression"
     TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ROCmMoEGroupedPrefillTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_moe_grouped_prefill_trainer.py
+)
+set_tests_properties(V2_Unit_ROCmMoEGroupedPrefillTrainer PROPERTIES
+    LABELS "V2;Unit;MoE;MTP;ROCm;NativeVNNI;Dispatch;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ROCmNativeVNNIDecodeAdapter
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_adapter.py
+)
+set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;ROCm;NativeVNNI;Decode;Evidence;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ROCmNativeVNNIDecodeTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_trainer.py
+)
+set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;ROCm;NativeVNNI;Decode;Dispatch;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIVerifierAdapter
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_verifier_adapter.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIVerifierAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Evidence;ISA;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIVerifierTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_verifier_trainer.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIVerifierTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;ISA;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNICommonDispatchPolicy
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_dispatch_policy.py
+)
+set_tests_properties(V2_Unit_NativeVNNICommonDispatchPolicy PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;Certification;Regression"
+    TIMEOUT 30
+)
+
+add_executable(v2_test_native_vnni_trainer_evidence
+    unit/utils/Test__NativeVNNITrainerEvidence.cpp
+)
+target_include_directories(v2_test_native_vnni_trainer_evidence PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_test_native_vnni_trainer_evidence
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_NativeVNNITrainerEvidence
+    COMMAND $<TARGET_FILE:v2_test_native_vnni_trainer_evidence>
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Trainer;Evidence;Regression"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_rocm_moe_grouped_prefill_dispatch
+    unit/kernels/rocm/Test__ROCmMoEGroupedPrefillDispatch.cpp
+)
+target_include_directories(v2_test_rocm_moe_grouped_prefill_dispatch PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+target_link_libraries(v2_test_rocm_moe_grouped_prefill_dispatch
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ROCmMoEGroupedPrefillDispatch
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_grouped_prefill_dispatch>
+    LABELS "V2;Unit;MoE;MTP;ROCm;NativeVNNI;Dispatch;Generated;Regression"
+    MPI_PROCS 1
 )
 
 add_test(NAME V2_Unit_Qwen36MoEGPURebalanceSprintScript
@@ -2849,7 +2935,7 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_FP32
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
-            --gtest_filter=Test__CPUFlashAttentionKernelT.GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_M2ToM4
+            --gtest_filter=Test__CPUFlashAttentionKernelT.GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_RuntimeM
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;FP32;Regression"
     MPI_PROCS 1
@@ -2882,7 +2968,7 @@ add_v2_test(V2_Unit_Q16DecodeHeadMajor
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_Q16
     COMMAND $<TARGET_FILE:v2_test_q16_decode_head_major>
-            --gtest_filter=Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_M2ToM4:Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_M2ToM4
+            --gtest_filter=Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_RuntimeM:Test__Q16DecodeHeadMajor.GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_RuntimeBoundaries
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;Q16_1;HeadMajor;Regression"
     MPI_PROCS 1
@@ -3484,7 +3570,7 @@ add_v2_test(V2_Unit_IKVCacheLogicalBlockIO
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_KVCacheAppend
     COMMAND $<TARGET_FILE:v2_test_ikv_cache_logical_block_io>
-            --gtest_filter=Test__IKVCacheLogicalBlockIO.AllCPUFormatsGroupedVerifierAppendM234MatchesSerialDecodeBytes
+            --gtest_filter=Test__IKVCacheLogicalBlockIO.AllCPUFormatsGroupedVerifierAppendRuntimeMMatchesSerialDecodeBytes
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;KVCache;StatePublication;AllFormats;FP32;BF16;FP16;Q8_1;Q16_1;TQ4;TQ8;Regression"
     MPI_PROCS 1
@@ -4801,10 +4887,10 @@ add_v2_test(V2_Perf_PrefixCacheMTP
     MPI_PROCS 1
 )
 
-# Focused MoE MTP verifier-prefill speedometer.
-# Times CUDA/ROCm grouped verifier prefill for M=2/3/4 routed and shared expert
-# cases, with strict parity and graph-vs-reference economy assertions before
-# reporting CSV rows.
+# Focused MoE MTP and batch-invariant prefill speedometer.
+# Times CUDA/ROCm verifier rows plus ROCm production M=8/32/256 routing and
+# routed-expert publication. Native-bit parity and graph-vs-serial economy are
+# mandatory before the harness reports a successful CSV row.
 add_executable(v2_perf_moe_verifier_prefill
     performance/kernels/moe/Perf__MoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp
@@ -4921,7 +5007,7 @@ add_v2_test(V2_Integration_CUDAGemmParity
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_SmallM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_M234MatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_M234MatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_M234MatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
+            --gtest_filter=Test__CUDAGemmParity.NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats:Test__CUDAGemmParity.MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode:Test__CUDAGemmParity.MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode:Test__CUDAGemmParity.MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI:Test__CUDAGemmParity.MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs:Test__CUDAGemmParity.Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;FP32;FP16;BF16;Regression"
     MPI_PROCS 1
@@ -4931,6 +5017,13 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_LocalTPWo
             --gtest_filter=Test__CUDAGemmParity.LocalTPWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict:Test__CUDAGemmParity.LocalTPWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict:Test__CUDAGemmParity.ReplicatedWoAllQuantizedFormatsGroupedVerifierRowsMatchSerialDecodeStrict:Test__CUDAGemmParity.ReplicatedWoFloatingPointFormatsGroupedVerifierRowsMatchSerialDecodeStrict
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;LocalTP;Wo;ReplicatedWo;AllFormats;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNProjection
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.Q6_K_Qwen36MoEGDNOutLocalTP_RuntimeMMatchesSerialDecodeGEMVs:Test__CUDAGemmParity.GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSerialStageRows:Test__CUDAGemmParity.GDNProjectionStage_Qwen36MoELocalTPShardQ6K_RuntimeMMatchesSerialStageRows
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;RuntimeM;LocalTP;Regression"
     MPI_PROCS 1
 )
 
@@ -4955,7 +5048,7 @@ add_v2_test(V2_Integration_CUDAMoEKernel
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_M234MatchRowByRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
+            --gtest_filter=Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;Regression"
     MPI_PROCS 1
@@ -4982,7 +5075,7 @@ add_v2_test(V2_Integration_CUDAEmbeddingGroupedVerifier
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Embedding
     COMMAND $<TARGET_FILE:v2_integration_cuda_embedding_grouped_verifier>
-            --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensM234MatchSerialDecodeBytes:Test__CUDAEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
+            --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__CUDAEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;Regression"
     MPI_PROCS 1
@@ -5177,14 +5270,14 @@ add_v2_test(V2_Integration_CUDAGDNPaddedRealLength
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
-            --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedRecurrenceDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__CUDAGDNPaddedRealLength.RecurrenceM2VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.RecurrenceM4VerifierSnapshotsMatchStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedVerifierAndDecodeRecurrencePublicationRuntimeM
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
     MPI_PROCS 1
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ShortConv
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
-            --gtest_filter=Test__CUDAGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedShortConvDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedVerifierAndDecodeShortConvPublicationRuntimeM
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression"
     MPI_PROCS 1
@@ -5222,6 +5315,19 @@ target_link_libraries(v2_perf_cuda_blockwise_tensorcore_gemm_sweep llaminar2_cor
 add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
     COMMAND $<TARGET_FILE:v2_perf_cuda_blockwise_tensorcore_gemm_sweep>
     LABELS "V2;Performance;CUDA;GEMV;Decode;NativeVNNI;Codebook;Qwen;Tuning;Sweep;Trainer"
+    MPI_PROCS 1
+)
+
+# NativeVNNI decode/verifier trainer. This executable sweeps exact CUDA launch
+# schedules for serial M=1 and grouped runtime-M rows, emits replayable evidence
+# CSVs, and is intentionally run through the Performance gate rather than Unit.
+add_executable(v2_perf_cuda_native_vnni_decode_trainer
+    performance/kernels/cuda/gemm/Perf__CUDANativeVNNIDecodeTrainer.cpp)
+target_link_libraries(v2_perf_cuda_native_vnni_decode_trainer
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDANativeVNNIDecodeTrainer
+    COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_decode_trainer>
+    LABELS "V2;Performance;CUDA;GEMV;Decode;MTP;GroupedVerifierRows;NativeVNNI;AllFormats;BatchInvariant;Trainer"
     MPI_PROCS 1
 )
 
@@ -5980,7 +6086,6 @@ if(ZLIB_FOUND)
             APPEND PROPERTY ENVIRONMENT
             "LLAMINAR_GPU_GRAPHS=1"
             "LLAMINAR_ROCM_CONCURRENT_DECODE=0"
-            "LLAMINAR_ROCM_CONCURRENT_M2_ROWS=0"
         )
     endif()
 
@@ -6016,7 +6121,6 @@ if(ZLIB_FOUND)
             APPEND PROPERTY ENVIRONMENT
             "LLAMINAR_GPU_GRAPHS=1"
             "LLAMINAR_ROCM_CONCURRENT_DECODE=0"
-            "LLAMINAR_ROCM_CONCURRENT_M2_ROWS=0"
         )
     endif()
 
@@ -9311,9 +9415,16 @@ add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters
+            --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters
             --gtest_brief=1
     LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;oneDNN;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CPUNativeVNNIVerifierISAResolver
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+            --gtest_filter=CPUNativeVNNIGemvTest.MTP_UncertifiedVerifierThreadRegimeHardFails:CPUNativeVNNIGemvTest.MTP_VerifierRoutePublishesBuildAndRuntimeISA
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;NativeVNNI;ISA;Dispatch;PerfStats;Regression"
     MPI_PROCS 1
 )
 
@@ -10156,21 +10267,21 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEAllCodegroups
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.ROCmMoERoutedVerifierSmallM234_AllNativeCodegroupsMatchSerialDecode
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.ROCmMoERoutedVerifierRuntimeM_AllNativeCodegroupsMatchSerialDecode
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllCodegroups;NativeVNNI;Regression"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_DenseQKV
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.FusedIQ3SQwen36QKVSmallMMatchesSerialM1DecodeRowsStrict
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.FusedIQ3SQwen36QKVRuntimeMMatchesSerialM1DecodeRowsStrict
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;Attention;MTP;GroupedVerifierRows;DecodeEquivalent;IQ3_S;NativeVNNI;Regression"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNProjection
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNIQ4XSQwen36MoEQkvZPairSmallMMatchesSerialM1DecodeRowsStrict
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNIQ4XSQwen36MoEQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.MixedCodebookQwen36GDNQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.Qwen36MoEGDNProjectionStageQ6KVerifierRowsMatchSerialDecodeStrict
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;IQ4_XS;NativeVNNI;Regression"
         MPI_PROCS 1
@@ -10184,7 +10295,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_FloatingFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.FloatingProjectionAllFormatsGroupedVerifierRowsMatchSerialDecodeStrict:Test__ROCmQuantisedGemmSmallM.FloatingSwiGLUDownAllFormatsGroupedVerifierRowsMatchSerialDecodeStrict
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.FloatingProjectionAllFormatsRuntimeMMatchSerialDecodeStrict:Test__ROCmQuantisedGemmSmallM.FloatingSwiGLUDownAllFormatsRuntimeMMatchSerialDecodeStrict
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;FP32;FP16;BF16;SwiGLU;Regression"
         MPI_PROCS 1
@@ -10227,9 +10338,23 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_AllFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.ProductionPreparedAllQuantizedFormatsM234MatchSerialDecodeBytes
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.ProductionPreparedAllQuantizedFormatsRuntimeMMatchSerialDecodeBytes:Test__ROCmQuantisedGemmSmallM.FusedQ4KQKVRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.MixedCodebookProjectionRuntimeMMatchesSerialM1DecodeRowsStrict
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;NativeVNNI;Regression"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_NativeVNNIRuntimeM
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
+                --gtest_filter=NativeVNNIGEMVTest.RuntimeM_AllNativeFormatsDirectAndSplitKMatchSerialGEMVsAndCapture
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMV;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;RuntimeM;GraphCapture;DeviceResident;NativeVNNI;Regression"
+        MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCm_NativeVNNI_SerialM1RouteTelemetry
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.ProductionSerialM1RouteTelemetryMatchesResolver
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMM;MTP;SerialDecode;RouteProof;PerfStats;NativeVNNI;Regression"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added native-VNNI GEMV integration tests (16 formats)")
@@ -10791,14 +10916,14 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNRecurrence
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
-                --gtest_filter=Test__ROCmGDNPaddedRealLength.MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM4Qwen36DenseShapeVerifierCaptureIsolatesLiveState:Test__ROCmGDNPaddedRealLength.CapturedRecurrenceDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict:Test__ROCmGDNPaddedRealLength.MergedQKVM4Qwen36DenseShapeVerifierCaptureIsolatesLiveState:Test__ROCmGDNPaddedRealLength.CapturedVerifierAndDecodeRecurrencePublicationRuntimeM
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression;gfx906"
         MPI_PROCS 1
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_ShortConv
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
-                --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.CapturedShortConvDecodeReplaysAfterDeviceIndexedPublicationM2ToM4
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.CapturedVerifierAndDecodeShortConvPublicationRuntimeM
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression;gfx906"
         MPI_PROCS 1
@@ -11000,7 +11125,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Embedding
         COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_grouped_verifier>
-                --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensM234MatchSerialDecodeBytes:Test__ROCmEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
+                --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__ROCmEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;Regression;gfx906"
         MPI_PROCS 1
@@ -11232,11 +11357,17 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoEKernel.SharedExpertGateVerifierRowsM234MatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_M234MatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchSerialStageDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.MaskedLocalTPVerifierPrefill_Qwen36AllNativeVNNIFormats_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.MaskedLocalTPVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_M234MatchesRowByRowDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer3RealWeights_M3MatchesRuntimeDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer27RealWeights_M3MatchesRuntimeDecode
+                --gtest_filter=Test__ROCmMoEKernel.VerifierRowsBF16RouteUsesDecodeEquivalentRouter:Test__ROCmMoEKernel.VerifierRowsRouteUsesDecodeEquivalentRouterAndMatchesHostReference:Test__ROCmMoEKernel.VerifierRowsRouteMatchesSerialDecodeRouter:Test__ROCmMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__ROCmMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__ROCmMoEKernel.LocalTPRCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36AllNativeVNNIFormats_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertFFNStageVerifierRows_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchSerialStageDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.GroupedPrefillMaskedTopK8MatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats_RuntimeMMatchesRowDecode:Test__ROCmMoEKernel.RoutedOnlyGroupedPrefill_Qwen36ShapeRuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.MaskedLocalTPGroupedPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRowDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_RuntimeMBoundariesMatchRuntimeDecode:Test__ROCmMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer3RealWeights_M3MatchesRuntimeDecode:Test__ROCmMoEKernel.RoutedOnlyVerifierPrefill_Qwen36Layer27RealWeights_M3MatchesRuntimeDecode
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;LocalTP;RealModel;Regression"
         MPI_PROCS 1
     )
+    if(TEST V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths)
+        set_tests_properties(
+            V2_Integration_GroupedVerifierRows_ROCm_MoEExpertPaths
+            PROPERTIES
+                ENVIRONMENT_MODIFICATION "LLAMINAR_LOG_LEVEL=set:WARN")
+    endif()
     message(STATUS "V2 Tests: Added ROCm MoE kernel integration tests")
 endif()
 
@@ -12214,47 +12345,32 @@ foreach(_prefill_graph_cache_test
 endforeach()
 message(STATUS "V2 Tests: Added PrefillGraphCacheExecution integration tests")
 
-# Test: CachedGraphReplayExecution - Integration test for cached GPU graph replay
-add_executable(v2_test_cached_graph_replay_execution integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp)
-if(LLAMINAR_SHARED_CORE)
-    target_link_libraries(v2_test_cached_graph_replay_execution PRIVATE
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
-    )
-elseif(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
-    set(_gpu_backends_whole_sgce "")
-    if(HAVE_CUDA)
-        list(APPEND _gpu_backends_whole_sgce -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
-    endif()
-    if(HAVE_ROCM)
-        list(APPEND _gpu_backends_whole_sgce -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
-    endif()
-    target_link_libraries(v2_test_cached_graph_replay_execution PRIVATE
-        -Wl,--start-group
-        llaminar2_core
-        ${_gpu_backends_whole_sgce}
-        -Wl,--end-group
-        GTest::gtest
-        GTest::gtest_main
-    )
-else()
-    target_link_libraries(v2_test_cached_graph_replay_execution PRIVATE
-        llaminar2_core
-        GTest::gtest
-        GTest::gtest_main
+# Tests: CachedGraphReplayExecution - explicit CUDA and ROCm graph-replay suites.
+# A combined binary used to probe whichever factory happened to be registered
+# first and could report a successful skip without executing either backend.
+add_v2_gpu_backend_test(
+    v2_test_cached_graph_replay_execution
+    integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp
+    V2_Integration_CachedGraphReplayExecution
+    V2 Integration Execution GraphCapture CachedReplay
+)
+# This suite explicitly registers one backend per binary and has no static
+# dual-runtime probing. Keep its CUDA lane active even when the broader legacy
+# GPU-context group remains opt-in in heterogeneous builds.
+if(TEST V2_Integration_CachedGraphReplayExecution_CUDA)
+    set_tests_properties(V2_Integration_CachedGraphReplayExecution_CUDA PROPERTIES
+        DISABLED FALSE
     )
 endif()
-add_v2_test(V2_Integration_CachedGraphReplayExecution
-    COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution>
-    LABELS "V2;Integration;Execution;GraphCapture;CachedReplay;CUDA;ROCm"
-    MPI_PROCS 1
-)
-if(NOT V2_PERF_TESTS_ONLY)
-set_tests_properties(V2_Integration_CachedGraphReplayExecution PROPERTIES
-    ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
-)
-endif()
+foreach(_cached_graph_replay_test
+        V2_Integration_CachedGraphReplayExecution_ROCm
+        V2_Integration_CachedGraphReplayExecution_CUDA)
+    if(NOT V2_PERF_TESTS_ONLY AND TEST ${_cached_graph_replay_test})
+        set_tests_properties(${_cached_graph_replay_test} PROPERTIES
+            ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
+        )
+    endif()
+endforeach()
 message(STATUS "V2 Tests: Added CachedGraphReplayExecution integration tests")
 
 # =============================================================================
@@ -12736,7 +12852,7 @@ if(HAVE_ROCM)
 endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_GDNRecurrence
     COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
-            --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeM2ToM4
+            --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeRuntimeM
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
     MPI_PROCS 1
@@ -12759,7 +12875,7 @@ add_v2_test(V2_Unit_GDNMathematicalCorrectness
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_ShortConv
     COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
-            --gtest_filter=Test__GDNMathematicalCorrectness.ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeM2ToM4
+            --gtest_filter=Test__GDNMathematicalCorrectness.ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeRuntimeM
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression"
     MPI_PROCS 1
@@ -13099,7 +13215,7 @@ add_v2_test(V2_Unit_MoEExpertComputeStage
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage>
-            --gtest_filter=MoEExpertComputeStageTest.SharedExpert_M234VerifierAllNativeFormatsMatchSerialDecodeByteExact:MoEExpertComputeStageTest.MoEFFN_M234VerifierMatchesSerialDecode_*
+            --gtest_filter=MoEExpertComputeStageTest.SharedExpert_RuntimeMVerifierAllNativeFormatsMatchSerialDecodeByteExact:MoEExpertComputeStageTest.MoEFFN_RuntimeMVerifierMatchesSerialDecode_*
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;Regression"
     MPI_PROCS 1

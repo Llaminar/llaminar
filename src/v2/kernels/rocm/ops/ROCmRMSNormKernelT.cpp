@@ -33,10 +33,10 @@ namespace
     /**
      * @brief Record one successful production ROCm RMSNorm verifier launch.
      *
-     * The HIP kernels use one workgroup per logical row. Grouping M=2..4 rows
-     * consequently keeps every row's M=1 reduction order intact while issuing
-     * a single kernel launch. This counter is omitted for serial M=1 witnesses
-     * so the integration gate can reject hidden row replay or multiple launches.
+     * The HIP kernels use one workgroup per logical row. Grouping any runtime
+     * M therefore keeps every row's M=1 reduction order intact while issuing a
+     * single kernel launch. This counter is omitted for serial M=1 witnesses so
+     * the integration gate can reject hidden row replay or multiple launches.
      *
      * @param tensor_format Native activation/output representation.
      * @param verifier_rows Number of MTP verifier rows in this launch.
@@ -49,7 +49,7 @@ namespace
         int cols,
         int device)
     {
-        if (verifier_rows < 2 || verifier_rows > 4)
+        if (verifier_rows < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(

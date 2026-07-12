@@ -153,9 +153,9 @@ namespace llaminar2
          * @brief Publish one successful grouped production route to perfstats.
          *
          * M=1 serial witnesses intentionally do not emit this metric. Focused
-         * integration tests can therefore reset immediately before an M=2..4
-         * invocation and require exactly one record, proving the grouped stage
-         * actually ran instead of merely comparing precomputed bytes.
+         * integration tests can therefore reset immediately before any runtime
+         * M>=2 invocation and require exactly one record, proving the grouped
+         * stage actually ran instead of merely comparing precomputed bytes.
          */
         void recordGroupedRoute(
             const char *backend,
@@ -166,7 +166,7 @@ namespace llaminar2
             const char *implementation,
             const char *invocation_policy)
         {
-            if (rows < 2 || rows > 4)
+            if (rows < 2)
                 return;
 
             PerfStatsCollector::addCounter(
@@ -356,9 +356,10 @@ namespace llaminar2
 #endif
 
         // CPU path: fused residual add + RMSNorm
-        // For FP32 with small seq_len (decode), use a single fused primitive
-        // that avoids two separate kernel dispatches and their OMP overhead.
-        if (input_base->native_type() == TensorType::FP32 && seq_len <= 4)
+        // FP32 verifier and decode rows share one fused primitive for every M.
+        // This avoids two separate kernel dispatches while preserving the same
+        // per-row residual and RMS reduction order at every speculative depth.
+        if (input_base->native_type() == TensorType::FP32)
         {
             KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
 

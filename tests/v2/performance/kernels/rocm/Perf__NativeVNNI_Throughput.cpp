@@ -58,6 +58,10 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
+#include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/NativeVNNITrainerEvidence.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -66,6 +70,12 @@
 #include "GpuVerification.h"
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
+extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
+    uint8_t codebook_id,
+    int N,
+    int K,
+    int *kb,
+    int *target_waves_per_cu);
 #endif
 
 using namespace llaminar2;
@@ -189,6 +199,10 @@ namespace
         // through IINT8Unpackable below before dispatching codebook 19.
         {"Q8_0", 8.5, false, [](size_t N, size_t K)
          { return TestTensorFactory::createQ8_0Random({N, K}); }},
+        {"Q8_1", 8.5, false, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_1Random({N, K}); }},
+        {"Q8_K", 8.5, true, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_KRandom({N, K}); }},
     };
 
     // Model-realistic GEMV shapes (N×K)
@@ -293,19 +307,143 @@ namespace
         return filters.empty() || filters.count(toLower(name)) > 0;
     }
 
+    /** Numerical role of one forceable ROCm decode trainer candidate. */
+    enum class DecodeCandidateKind
+    {
+        FastExplicitKB,
+        VerifierInheritSerialM1,
+    };
+
+    /** Production execution surfaces measured independently by the trainer. */
+    enum class DecodeExecutionMode
+    {
+        Eager,
+        GraphCaptured,
+    };
+
+    static const char *decodeExecutionModeName(DecodeExecutionMode mode)
+    {
+        return mode == DecodeExecutionMode::Eager ? "eager" : "graph_captured";
+    }
+
+    /**
+     * @brief Stable candidate identity used by the ROCm decode trainer.
+     *
+     * An explicit KB is a real M=1 schedule choice.  Target-wave overrides are
+     * deliberately absent: once KB is explicit they do not alter the launch
+     * grid, arithmetic, or workspace and therefore are not distinct effective
+     * candidates.  The grouped verifier has a separate candidate that inherits
+     * the frozen serial-M1 split policy instead of pretending it may retune KB.
+     */
     struct DecodeVariant
     {
         std::string name;
-        int kb = 0;
-        int target_waves = 0;
-        bool auto_dispatch = false;
+        DecodeCandidateKind kind = DecodeCandidateKind::FastExplicitKB;
+        int kb = -1;
+
+        [[nodiscard]] bool appliesToM(int M) const
+        {
+            return (M == 1 && kind == DecodeCandidateKind::FastExplicitKB) ||
+                   (M >= 2 && M <= 4 &&
+                    kind == DecodeCandidateKind::VerifierInheritSerialM1);
+        }
     };
 
+#ifdef HAVE_ROCM
+    /** Scope one normalized candidate route around a measured production call. */
+    class DecodeTuningGuard
+    {
+    public:
+        explicit DecodeTuningGuard(const DecodeVariant &variant)
+        {
+            if (variant.kind == DecodeCandidateKind::VerifierInheritSerialM1)
+                rocmGemv_native_vnni_reset_tuning_overrides();
+            else
+                rocmGemv_native_vnni_set_tuning_overrides(variant.kb, -1);
+        }
+
+        ~DecodeTuningGuard()
+        {
+            rocmGemv_native_vnni_reset_tuning_overrides();
+        }
+
+        DecodeTuningGuard(const DecodeTuningGuard &) = delete;
+        DecodeTuningGuard &operator=(const DecodeTuningGuard &) = delete;
+    };
+
+    /**
+     * @brief Own one captured production launch and its executable graph.
+     *
+     * Capture invokes the same kernel object and stable device pointers used by
+     * eager execution.  No allocation, upload, or host callback is admitted to
+     * the graph.  Perfstats route telemetry is emitted by the production
+     * launcher while nodes are captured, then replay timing measures only
+     * ``hipGraphLaunch`` work on the explicit stream.
+     */
+    class CapturedDecodeLaunch
+    {
+    public:
+        CapturedDecodeLaunch() = default;
+
+        ~CapturedDecodeLaunch()
+        {
+            reset();
+        }
+
+        template <typename Launch>
+        bool capture(hipStream_t stream, Launch &&launch)
+        {
+            reset();
+            if (hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal) != hipSuccess)
+                return false;
+            const bool launch_ok = launch();
+            const hipError_t end_status = hipStreamEndCapture(stream, &graph_);
+            if (!launch_ok || end_status != hipSuccess || graph_ == nullptr)
+            {
+                reset();
+                return false;
+            }
+            if (hipGraphInstantiate(&executable_, graph_, nullptr, nullptr, 0) != hipSuccess ||
+                executable_ == nullptr)
+            {
+                reset();
+                return false;
+            }
+            return true;
+        }
+
+        bool launch(hipStream_t stream) const
+        {
+            return executable_ != nullptr &&
+                   hipGraphLaunch(executable_, stream) == hipSuccess;
+        }
+
+        void reset()
+        {
+            if (executable_)
+                (void)hipGraphExecDestroy(executable_);
+            if (graph_)
+                (void)hipGraphDestroy(graph_);
+            executable_ = nullptr;
+            graph_ = nullptr;
+        }
+
+        CapturedDecodeLaunch(const CapturedDecodeLaunch &) = delete;
+        CapturedDecodeLaunch &operator=(const CapturedDecodeLaunch &) = delete;
+
+    private:
+        hipGraph_t graph_ = nullptr;
+        hipGraphExec_t executable_ = nullptr;
+    };
+#endif
+
+    /** Parse a canonical candidate or a reviewed legacy KB/TW alias. */
     static DecodeVariant parseDecodeVariantToken(const std::string &token)
     {
         const std::string value = toLower(trim(token));
         if (value.empty() || value == "auto")
-            return DecodeVariant{"AUTO", 0, 0, true};
+            throw std::runtime_error(
+                "AUTO is resolver behavior, not a forceable ROCm decode candidate");
 
         std::string compact;
         compact.reserve(value.size());
@@ -315,36 +453,120 @@ namespace
                 compact.push_back(static_cast<char>(c));
         }
 
+        if (compact == "inheritserialm1" || compact == "serialm1")
+        {
+            return DecodeVariant{
+                "INHERIT_SERIAL_M1",
+                DecodeCandidateKind::VerifierInheritSerialM1,
+                -1};
+        }
+
         const auto kb_pos = compact.find("kb");
         const auto tw_pos = compact.find("tw");
-        if (kb_pos == std::string::npos || tw_pos == std::string::npos || tw_pos <= kb_pos + 2)
+        if (kb_pos != 0)
             throw std::runtime_error("Invalid ROCm NativeVNNI decode variant: " + token);
 
-        const int kb = std::atoi(compact.substr(kb_pos + 2, tw_pos - (kb_pos + 2)).c_str());
-        const int tw = std::atoi(compact.substr(tw_pos + 2).c_str());
-        if (kb <= 0 || tw <= 0 || kb > 64)
+        const std::string kb_text =
+            tw_pos == std::string::npos
+                ? compact.substr(kb_pos + 2)
+                : compact.substr(kb_pos + 2, tw_pos - (kb_pos + 2));
+        const int kb = std::atoi(kb_text.c_str());
+        if (kb <= 0 || kb > 64)
             throw std::runtime_error("Invalid ROCm NativeVNNI decode variant values: " + token);
+        if (tw_pos != std::string::npos &&
+            std::atoi(compact.substr(tw_pos + 2).c_str()) <= 0)
+        {
+            throw std::runtime_error("Invalid nominal target-wave alias: " + token);
+        }
 
-        return DecodeVariant{"KB" + std::to_string(kb) + "/TW" + std::to_string(tw), kb, tw, false};
+        return DecodeVariant{
+            "KB" + std::to_string(kb),
+            DecodeCandidateKind::FastExplicitKB,
+            kb};
     }
 
+    /** Return the complete normalized M=1 and grouped-verifier inventory. */
     static std::vector<DecodeVariant> getDecodeVariants()
     {
         const char *raw = std::getenv("LLAMINAR_ROCM_NVNNI_DECODE_VARIANTS");
-        const std::string spec = (raw && *raw) ? raw : "auto,kb1tw4,kb1tw8,kb2tw8,kb4tw12,kb8tw24,kb16tw24";
-
         std::vector<DecodeVariant> variants;
+        if (raw && *raw)
+        {
+            std::stringstream stream(raw);
+            std::string token;
+            while (std::getline(stream, token, ','))
+            {
+                token = trim(token);
+                if (!token.empty())
+                    variants.push_back(parseDecodeVariantToken(token));
+            }
+        }
+        else
+        {
+            /*
+             * Every graph-safe split count is forceable.  Unsupported values
+             * for a short K dimension remain measured route failures in the
+             * corpus instead of silently disappearing from the matrix.
+             */
+            for (int kb = 1; kb <= 64; ++kb)
+            {
+                variants.push_back(DecodeVariant{
+                    "KB" + std::to_string(kb),
+                    DecodeCandidateKind::FastExplicitKB,
+                    kb});
+            }
+            variants.push_back(DecodeVariant{
+                "INHERIT_SERIAL_M1",
+                DecodeCandidateKind::VerifierInheritSerialM1,
+                -1});
+        }
+        if (variants.empty())
+            throw std::runtime_error("ROCm decode trainer selected no explicit candidates");
+
+        std::vector<DecodeVariant> normalized;
+        normalized.reserve(variants.size());
+        for (const auto &variant : variants)
+        {
+            const bool duplicate = std::any_of(
+                normalized.begin(),
+                normalized.end(),
+                [&](const DecodeVariant &existing)
+                {
+                    return existing.kind == variant.kind &&
+                           existing.kb == variant.kb;
+                });
+            if (!duplicate)
+                normalized.push_back(variant);
+        }
+        return normalized;
+    }
+
+    /** Parse the eager/captured production surfaces selected for one sweep. */
+    static std::vector<DecodeExecutionMode> getDecodeExecutionModes()
+    {
+        const char *raw = std::getenv("LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES");
+        const std::string spec = (raw && *raw) ? raw : "eager,graph_captured";
+        std::vector<DecodeExecutionMode> modes;
         std::stringstream stream(spec);
         std::string token;
         while (std::getline(stream, token, ','))
         {
-            token = trim(token);
-            if (!token.empty())
-                variants.push_back(parseDecodeVariantToken(token));
+            token = toLower(trim(token));
+            DecodeExecutionMode mode;
+            if (token == "eager")
+                mode = DecodeExecutionMode::Eager;
+            else if (token == "graph" || token == "captured" ||
+                     token == "graph_captured")
+                mode = DecodeExecutionMode::GraphCaptured;
+            else
+                throw std::runtime_error(
+                    "Invalid ROCm NativeVNNI decode execution mode: " + token);
+            if (std::find(modes.begin(), modes.end(), mode) == modes.end())
+                modes.push_back(mode);
         }
-        if (variants.empty())
-            variants.push_back(DecodeVariant{"AUTO", 0, 0, true});
-        return variants;
+        if (modes.empty())
+            throw std::runtime_error("ROCm decode trainer selected no execution modes");
+        return modes;
     }
 
     static std::vector<int> getDecodeMValues()
@@ -361,7 +583,7 @@ namespace
             if (token.empty())
                 continue;
             const int m = std::atoi(token.c_str());
-            if (m <= 0)
+            if (m <= 0 || m > 4)
                 throw std::runtime_error("Invalid ROCm NativeVNNI decode M value: " + token);
             values.push_back(m);
         }
@@ -370,47 +592,6 @@ namespace
         std::sort(values.begin(), values.end());
         values.erase(std::unique(values.begin(), values.end()), values.end());
         return values;
-    }
-
-    enum class DecodeReferenceMode
-    {
-        FP32HipBLAS,
-        NativeAuto,
-    };
-
-    static DecodeReferenceMode getDecodeReferenceMode()
-    {
-        std::string raw = toLower(getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE"));
-        if (raw.empty() || raw == "fp32" || raw == "hipblas" || raw == "fp32-hipblas")
-            return DecodeReferenceMode::FP32HipBLAS;
-        if (raw == "native" || raw == "native-auto" || raw == "native_auto" || raw == "auto")
-            return DecodeReferenceMode::NativeAuto;
-        throw std::runtime_error("Invalid LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE: " + raw);
-    }
-
-    static const char *referenceModeName(DecodeReferenceMode mode)
-    {
-        switch (mode)
-        {
-        case DecodeReferenceMode::FP32HipBLAS:
-            return "fp32";
-        case DecodeReferenceMode::NativeAuto:
-            return "native-auto";
-        }
-        return "unknown";
-    }
-
-    static float reference_gate_for(const std::string &format_name, DecodeReferenceMode mode)
-    {
-        if (mode == DecodeReferenceMode::NativeAuto)
-        {
-            // The native-auto reference compares two quantized NativeVNNI paths
-            // with identical input and packed weights. Use a stricter gate than
-            // the FP32 health proxy; exact model correctness is still gated by
-            // integration parity before generated table installation.
-            return 0.99999f;
-        }
-        return cosine_gate_for(format_name);
     }
 
     static double nativePackedWeightBytes(const ROCmPackedWeights &packed)
@@ -588,27 +769,6 @@ namespace
         std::string device_name_;
 
 #ifdef HAVE_ROCM
-        class DecodeTuningOverrideGuard
-        {
-        public:
-            explicit DecodeTuningOverrideGuard(const DecodeVariant &variant)
-            {
-                if (variant.auto_dispatch)
-                    rocmGemv_native_vnni_reset_tuning_overrides();
-                else
-                    rocmGemv_native_vnni_set_tuning_overrides(
-                        variant.kb, variant.target_waves);
-            }
-
-            ~DecodeTuningOverrideGuard()
-            {
-                rocmGemv_native_vnni_reset_tuning_overrides();
-            }
-
-            DecodeTuningOverrideGuard(const DecodeTuningOverrideGuard &) = delete;
-            DecodeTuningOverrideGuard &operator=(const DecodeTuningOverrideGuard &) = delete;
-        };
-
         /// Time a GEMV kernel on a specific device. Returns sorted timing vector in μs.
         static std::vector<double> timeKernel(ROCmQuantisedGemmKernel &kernel,
                                               TensorBase *input, TensorBase *output,
@@ -718,8 +878,6 @@ namespace
                                            double packed_weight_bytes,
                                            const GpuWeightsCache *gpu_weights,
                                            TensorBase *shared_input,
-                                           DecodeReferenceMode reference_mode,
-                                           const float *d_native_reference_output,
                                            int device_id)
         {
             (void)hipSetDevice(device_id);
@@ -827,17 +985,7 @@ namespace
                 const float *d_gpu_output = reinterpret_cast<const float *>(
                     dynamic_cast<FP32Tensor *>(output.get())->gpu_data_ptr());
 
-                if (reference_mode == DecodeReferenceMode::NativeAuto)
-                {
-                    if (d_gpu_output && d_native_reference_output)
-                    {
-                        result.cosine_sim = gpuCosineSimilarity(
-                            d_gpu_output, d_native_reference_output, out_elems, device_id);
-                        result.correctness_pass =
-                            (result.cosine_sim >= reference_gate_for(result.format_name, reference_mode));
-                    }
-                }
-                else if (gpu_weights && gpu_weights->d_weights)
+                if (gpu_weights && gpu_weights->d_weights)
                 {
                     auto *in_fp32 = dynamic_cast<FP32Tensor *>(input);
                     const float *d_input = reinterpret_cast<const float *>(
@@ -859,7 +1007,7 @@ namespace
                                 result.cosine_sim = gpuCosineSimilarity(
                                     d_gpu_output, d_ref_output, out_elems, device_id);
                                 result.correctness_pass =
-                                    (result.cosine_sim >= reference_gate_for(result.format_name, reference_mode));
+                                    (result.cosine_sim >= cosine_gate_for(result.format_name));
                             }
                             (void)hipFree(d_ref_output);
                         }
@@ -936,85 +1084,502 @@ namespace
                                    nativePackedWeightBytes(packed),
                                    gpu_weights,
                                    nullptr,
-                                   DecodeReferenceMode::FP32HipBLAS,
-                                   nullptr,
                                    device_id);
         }
 
-        /// Compute the canonical reset-AUTO native output for one trainer case.
-        ///
-        /// This is used for very large LM-head sweeps where materializing the
-        /// full FP32 weight matrix for hipBLAS would dominate the training run.
-        /// The returned tensor owns device output memory and must outlive all
-        /// candidate comparisons for the same `(format, shape, M, input)` case.
-        static std::unique_ptr<TensorBase> computeNativeAutoReferenceOutput(
-            ROCmPackedWeights *packed_weights,
-            const GEMVShape &shape,
-            int M,
-            TensorBase *input,
-            int device_id)
-        {
-            if (!packed_weights || !input)
-                return nullptr;
-
-            DecodeTuningOverrideGuard guard(DecodeVariant{"AUTO", 0, 0, true});
-            ROCmQuantisedGemmKernel kernel(packed_weights, device_id);
-            hipStream_t stream = nullptr;
-            if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess || !stream)
-            {
-                std::fprintf(stderr,
-                             "[ROCmNativeVNNI][DECODE][TRAINER][ERROR] native-auto stream create failed for %s M=%d\n",
-                             shape.name.c_str(), M);
-                return nullptr;
-            }
-            kernel.setGPUStream(stream);
-            auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
-            const size_t budget = reqs.total_bytes_with_alignment() + (4 * 1024 * 1024);
-            auto workspace = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(device_id), budget);
-            if (!workspace->allocate(reqs))
-            {
-                std::fprintf(stderr,
-                             "[ROCmNativeVNNI][DECODE][TRAINER][ERROR] native-auto workspace allocation failed for %s M=%d bytes=%zu\n",
-                             shape.name.c_str(),
-                             M,
-                             reqs.total_bytes_with_alignment());
-                (void)hipStreamDestroy(stream);
-                return nullptr;
-            }
-            kernel.bindWorkspace(workspace.get());
-
-            auto output = TestTensorFactory::createFP32(
-                {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
-            if (!input->ensureOnDevice(DeviceId::rocm(device_id)) ||
-                !output->allocateOnDevice(DeviceId::rocm(device_id)))
-            {
-                std::fprintf(stderr,
-                             "[ROCmNativeVNNI][DECODE][TRAINER][ERROR] native-auto tensor allocation/upload failed for %s M=%d\n",
-                             shape.name.c_str(), M);
-                kernel.unbindWorkspace();
-                (void)hipStreamDestroy(stream);
-                return nullptr;
-            }
-
-            if (!kernel.multiply_tensor(input, output.get(), M, shape.N, shape.K))
-            {
-                std::fprintf(stderr,
-                             "[ROCmNativeVNNI][DECODE][TRAINER][ERROR] native-auto multiply failed for %s M=%d\n",
-                             shape.name.c_str(), M);
-                kernel.unbindWorkspace();
-                (void)hipStreamDestroy(stream);
-                return nullptr;
-            }
-            (void)hipStreamSynchronize(stream);
-            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-
-            kernel.unbindWorkspace();
-            (void)hipStreamDestroy(stream);
-            return output;
-        }
 #endif
     };
+
+#ifdef HAVE_ROCM
+    /**
+     * @brief Restore one environment variable after a trainer-only override.
+     */
+    class ScopedTrainerEnvironment
+    {
+    public:
+        ScopedTrainerEnvironment(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *previous = std::getenv(name))
+            {
+                had_previous_ = true;
+                previous_ = previous;
+            }
+            (void)setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedTrainerEnvironment()
+        {
+            if (had_previous_)
+                (void)setenv(name_.c_str(), previous_.c_str(), 1);
+            else
+                (void)unsetenv(name_.c_str());
+        }
+
+        ScopedTrainerEnvironment(const ScopedTrainerEnvironment &) = delete;
+        ScopedTrainerEnvironment &operator=(const ScopedTrainerEnvironment &) = delete;
+
+    private:
+        std::string name_;
+        bool had_previous_ = false;
+        std::string previous_;
+    };
+
+    /** Device and route evidence for the production serial-M1 oracle. */
+    struct SerialM1TrainerEvidence
+    {
+        bool valid = false;
+        std::string failure_reason;
+        std::vector<float> output;
+        int kb = 0;
+        int target_waves = 0;
+        bool route_counter_ok = false;
+        std::string output_digest;
+    };
+
+    /** Complete measured evidence for one explicit ROCm decode candidate. */
+    struct DecodeCandidateTrainerEvidence
+    {
+        bool valid = false;
+        std::string failure_reason;
+        llaminar2::test::trainer::TimingEvidence timing;
+        std::vector<double> timing_samples_us;
+        llaminar2::test::trainer::FP32Evidence comparison;
+        size_t repeat_byte_mismatches = 0;
+        bool numerical_correctness = false;
+        bool route_counter_ok = false;
+        int observed_kb = 0;
+        int observed_target_waves = 0;
+        std::string observed_candidate_id = "missing";
+        std::string observed_path = "missing";
+        double effective_bandwidth_gbs = 0.0;
+    };
+
+    /**
+     * @brief Copy one device-resident FP32 tensor through the explicit stream.
+     */
+    static bool copyTrainerOutputToHost(
+        TensorBase *output,
+        size_t count,
+        hipStream_t stream,
+        std::vector<float> &host)
+    {
+        if (!output || !output->gpu_data_ptr() || stream == nullptr)
+            return false;
+        host.resize(count);
+        return hipMemcpyAsync(
+                   host.data(),
+                   output->gpu_data_ptr(),
+                   count * sizeof(float),
+                   hipMemcpyDeviceToHost,
+                   stream) == hipSuccess &&
+               hipStreamSynchronize(stream) == hipSuccess;
+    }
+
+    /**
+     * @brief Prove that PerfStats observed one requested NativeVNNI route.
+     *
+     * Route identity is part of correctness evidence. Without this check, a
+     * byte-equal fallback or a clamped KB value could be mislabeled as the
+     * candidate the generated table later attempts to dispatch.
+     */
+    static bool findObservedDecodeRoute(
+        int M,
+        int N,
+        int K,
+        uint8_t codebook,
+        int &kb,
+        int &target_waves,
+        std::string &path,
+        uint64_t *count = nullptr)
+    {
+        uint64_t observed_count = 0;
+        bool matched_shape = false;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.rocm_native_vnni_small_m_launch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "rocm_native_vnni_small_m_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const auto tag = [&](const char *name) -> std::string
+            {
+                const auto iterator = record.tags.find(name);
+                return iterator == record.tags.end() ? std::string{} : iterator->second;
+            };
+            if (tag("m") != std::to_string(M) ||
+                tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) ||
+                tag("codebook") != std::to_string(static_cast<unsigned>(codebook)))
+            {
+                continue;
+            }
+            matched_shape = true;
+            kb = std::stoi(tag("kb"));
+            target_waves = std::stoi(tag("target_waves_per_cu"));
+            path = tag("path");
+            observed_count += record.count;
+        }
+        if (count)
+            *count = observed_count;
+        return matched_shape && observed_count > 0;
+    }
+
+    /**
+     * @brief Execute the production prepared kernel one row at a time.
+     *
+     * Row replay is a test oracle only. It never participates in production
+     * execution or candidate timing. Each row calls the ordinary production
+     * M=1 kernel under the generated serial policy, and the observed route must
+     * agree with the query API before grouped verifier evidence is accepted.
+     */
+    static SerialM1TrainerEvidence runProductionSerialM1Oracle(
+        ROCmQuantisedGemmKernel &kernel,
+        TensorBase *grouped_input,
+        int M,
+        int N,
+        int K,
+        uint8_t execution_codebook,
+        int device_id)
+    {
+        SerialM1TrainerEvidence result;
+        auto fail = [&](const char *reason)
+        {
+            result.failure_reason = reason;
+            return result;
+        };
+        if (!grouped_input || M <= 0 || N <= 0 || K <= 0)
+            return fail("invalid_arguments");
+        if (!rocmGemv_native_vnni_query_serial_m1_config(
+                execution_codebook,
+                N,
+                K,
+                &result.kb,
+                &result.target_waves))
+        {
+            return fail("serial_policy_query");
+        }
+
+        rocmGemv_native_vnni_reset_tuning_overrides();
+        PerfStatsCollector::reset();
+        hipStream_t stream = nullptr;
+        if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess ||
+            stream == nullptr)
+        {
+            return fail("stream_create");
+        }
+        kernel.setGPUStream(stream);
+        const auto requirements = kernel.getWorkspaceRequirements(1, N, K);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(device_id),
+            requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
+        if (!workspace->allocate(requirements))
+        {
+            kernel.setGPUStream(nullptr);
+            (void)hipStreamDestroy(stream);
+            return fail("workspace_allocate");
+        }
+        kernel.bindWorkspace(workspace.get());
+
+        const float *grouped_host = grouped_input->data();
+        result.output.resize(static_cast<size_t>(M) * static_cast<size_t>(N));
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_input = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(K)});
+            std::copy_n(
+                grouped_host + static_cast<size_t>(row) * static_cast<size_t>(K),
+                K,
+                row_input->mutable_data());
+            auto row_output = TestTensorFactory::createFP32(
+                {1, static_cast<size_t>(N)});
+            if (!row_input->ensureOnDevice(DeviceId::rocm(device_id), stream) ||
+                !row_output->allocateOnDevice(DeviceId::rocm(device_id)) ||
+                !kernel.multiply_tensor(row_input.get(), row_output.get(), 1, N, K) ||
+                hipStreamSynchronize(stream) != hipSuccess)
+            {
+                kernel.unbindWorkspace();
+                kernel.setGPUStream(nullptr);
+                (void)hipStreamDestroy(stream);
+                return fail("serial_row_launch");
+            }
+            if (hipMemcpyAsync(
+                    result.output.data() + static_cast<size_t>(row) * static_cast<size_t>(N),
+                    row_output->gpu_data_ptr(),
+                    static_cast<size_t>(N) * sizeof(float),
+                    hipMemcpyDeviceToHost,
+                    stream) != hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess)
+            {
+                kernel.unbindWorkspace();
+                kernel.setGPUStream(nullptr);
+                (void)hipStreamDestroy(stream);
+                return fail("serial_row_download");
+            }
+        }
+
+        int observed_kb = 0;
+        int observed_waves = 0;
+        std::string observed_path;
+        uint64_t observed_count = 0;
+        result.route_counter_ok = findObservedDecodeRoute(
+            1,
+            N,
+            K,
+            execution_codebook,
+            observed_kb,
+            observed_waves,
+            observed_path,
+            &observed_count) &&
+                                  observed_count >= static_cast<uint64_t>(M) &&
+                                  observed_kb == result.kb &&
+                                  observed_waves == result.target_waves;
+        result.output_digest =
+            llaminar2::test::trainer::nativeByteDigest(result.output);
+        result.valid = result.route_counter_ok;
+        if (!result.valid)
+            result.failure_reason = "serial_route_proof";
+
+        kernel.unbindWorkspace();
+        kernel.setGPUStream(nullptr);
+        (void)hipStreamDestroy(stream);
+        return result;
+    }
+
+    /**
+     * @brief Measure one explicit production candidate against serial M=1.
+     */
+    static DecodeCandidateTrainerEvidence runProductionDecodeCandidate(
+        ROCmQuantisedGemmKernel &kernel,
+        TensorBase *input,
+        const SerialM1TrainerEvidence &serial,
+        const DecodeVariant &variant,
+        DecodeExecutionMode execution_mode,
+        const std::string &source_format,
+        int M,
+        int N,
+        int K,
+        uint8_t execution_codebook,
+        double weight_bytes,
+        int warmups,
+        int timing_samples,
+        int device_id)
+    {
+        DecodeCandidateTrainerEvidence result;
+        auto fail = [&](const char *reason)
+        {
+            result.failure_reason = reason;
+            return result;
+        };
+        if (!serial.valid || !input || warmups < 0 || timing_samples <= 0)
+            return fail("invalid_arguments");
+        if (!variant.appliesToM(M))
+            return fail("candidate_contract_mismatch");
+
+        DecodeTuningGuard tuning(variant);
+        hipStream_t stream = nullptr;
+        if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess ||
+            stream == nullptr)
+        {
+            return fail("stream_create");
+        }
+        kernel.setGPUStream(stream);
+        const auto requirements = kernel.getWorkspaceRequirements(M, N, K);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(device_id),
+            requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
+        if (!workspace->allocate(requirements))
+        {
+            kernel.setGPUStream(nullptr);
+            (void)hipStreamDestroy(stream);
+            return fail("workspace_allocate");
+        }
+        kernel.bindWorkspace(workspace.get());
+
+        auto output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+        if (!input->ensureOnDevice(DeviceId::rocm(device_id), stream) ||
+            !output->allocateOnDevice(DeviceId::rocm(device_id)))
+        {
+            kernel.unbindWorkspace();
+            kernel.setGPUStream(nullptr);
+            (void)hipStreamDestroy(stream);
+            return fail("tensor_prepare");
+        }
+
+        const auto run_once = [&]() -> bool
+        {
+            if (M >= 2 && M <= 4)
+            {
+                auto verifier_scope = kernel.beginVerifierDecodeEquivalentScope();
+                return kernel.multiply_tensor(input, output.get(), M, N, K);
+            }
+            return kernel.multiply_tensor(input, output.get(), M, N, K);
+        };
+
+        PerfStatsCollector::reset();
+        CapturedDecodeLaunch captured_launch;
+        if (execution_mode == DecodeExecutionMode::GraphCaptured &&
+            !captured_launch.capture(stream, run_once))
+        {
+            kernel.unbindWorkspace();
+            kernel.setGPUStream(nullptr);
+            (void)hipStreamDestroy(stream);
+            return fail("graph_capture");
+        }
+        const auto execute_once = [&]() -> bool
+        {
+            return execution_mode == DecodeExecutionMode::GraphCaptured
+                       ? captured_launch.launch(stream)
+                       : run_once();
+        };
+        const auto cleanup = [&]()
+        {
+            captured_launch.reset();
+            kernel.unbindWorkspace();
+            kernel.setGPUStream(nullptr);
+            (void)hipStreamDestroy(stream);
+        };
+        if (!execute_once() || hipStreamSynchronize(stream) != hipSuccess)
+        {
+            cleanup();
+            return fail("candidate_launch");
+        }
+        uint64_t observed_count = 0;
+        const bool observed = findObservedDecodeRoute(
+            M,
+            N,
+            K,
+            execution_codebook,
+            result.observed_kb,
+            result.observed_target_waves,
+            result.observed_path,
+            &observed_count);
+        result.observed_candidate_id =
+            !observed
+                ? "missing"
+                : (variant.kind == DecodeCandidateKind::VerifierInheritSerialM1
+                       ? variant.name
+                       : "KB" + std::to_string(result.observed_kb));
+        const int expected_kb =
+            variant.kind == DecodeCandidateKind::VerifierInheritSerialM1
+                ? serial.kb
+                : variant.kb;
+        const bool inherited_waves_match =
+            variant.kind != DecodeCandidateKind::VerifierInheritSerialM1 ||
+            result.observed_target_waves == serial.target_waves;
+        result.route_counter_ok = observed && observed_count > 0 &&
+                                  result.observed_kb == expected_kb &&
+                                  inherited_waves_match &&
+                                  !(M >= 2 && M <= 4 &&
+                                    result.observed_path == "atomic_reduce");
+
+        std::vector<float> first_output;
+        if (!copyTrainerOutputToHost(
+                output.get(),
+                static_cast<size_t>(M) * static_cast<size_t>(N),
+                stream,
+                first_output) ||
+            !execute_once() ||
+            hipStreamSynchronize(stream) != hipSuccess)
+        {
+            cleanup();
+            return fail("repeat_launch");
+        }
+        std::vector<float> repeated_output;
+        if (!copyTrainerOutputToHost(
+                output.get(),
+                static_cast<size_t>(M) * static_cast<size_t>(N),
+                stream,
+                repeated_output))
+        {
+            cleanup();
+            return fail("repeat_download");
+        }
+
+        result.repeat_byte_mismatches =
+            llaminar2::test::trainer::nativeByteMismatchCount(
+                first_output, repeated_output);
+        result.comparison = llaminar2::test::trainer::compareFP32(
+            repeated_output,
+            serial.output,
+            static_cast<size_t>(N));
+        result.numerical_correctness =
+            result.comparison.nonfinite_count == 0 &&
+            result.comparison.cosine >=
+                static_cast<double>(cosine_gate_for(source_format));
+
+        for (int warmup = 0; warmup < warmups; ++warmup)
+        {
+            if (!execute_once())
+            {
+                cleanup();
+                return fail("warmup_launch");
+            }
+        }
+        if (hipStreamSynchronize(stream) != hipSuccess)
+        {
+            cleanup();
+            return fail("warmup_sync");
+        }
+
+        hipEvent_t start = nullptr;
+        hipEvent_t stop = nullptr;
+        if (hipEventCreate(&start) != hipSuccess ||
+            hipEventCreate(&stop) != hipSuccess)
+        {
+            if (start)
+                (void)hipEventDestroy(start);
+            if (stop)
+                (void)hipEventDestroy(stop);
+            cleanup();
+            return fail("event_create");
+        }
+        result.timing_samples_us.reserve(static_cast<size_t>(timing_samples));
+        for (int sample = 0; sample < timing_samples; ++sample)
+        {
+            if (hipEventRecord(start, stream) != hipSuccess ||
+                !execute_once() ||
+                hipEventRecord(stop, stream) != hipSuccess ||
+                hipEventSynchronize(stop) != hipSuccess)
+            {
+                (void)hipEventDestroy(start);
+                (void)hipEventDestroy(stop);
+                cleanup();
+                return fail("timed_launch");
+            }
+            float elapsed_ms = 0.0f;
+            if (hipEventElapsedTime(&elapsed_ms, start, stop) != hipSuccess)
+            {
+                (void)hipEventDestroy(start);
+                (void)hipEventDestroy(stop);
+                cleanup();
+                return fail("timed_read");
+            }
+            result.timing_samples_us.push_back(
+                static_cast<double>(elapsed_ms) * 1000.0);
+        }
+        (void)hipEventDestroy(start);
+        (void)hipEventDestroy(stop);
+        std::sort(
+            result.timing_samples_us.begin(),
+            result.timing_samples_us.end());
+        result.timing =
+            llaminar2::test::trainer::summarizeSortedTimingSamples(
+                result.timing_samples_us);
+        if (result.timing.median > 0.0)
+        {
+            result.effective_bandwidth_gbs =
+                weight_bytes / (result.timing.median * 1.0e-6) / 1.0e9;
+        }
+        result.valid = true;
+
+        cleanup();
+        return result;
+    }
+#endif
 
     // =============================================================================
     // Test: Single-shape sweep across all 18 formats (quick CI check)
@@ -1100,25 +1665,54 @@ namespace
             shape_filters.insert("0.5b_attnout");
         const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_MAX_CASES").value_or(1));
         const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_CSV");
+        const std::string timing_csv_path =
+            getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV");
+        const int trainer_warmups = std::max(
+            0,
+            getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_WARMUPS").value_or(5));
+        const int trainer_samples = std::max(
+            1,
+            getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_SAMPLES").value_or(30));
         const std::vector<DecodeVariant> variants = getDecodeVariants();
+        const std::vector<DecodeExecutionMode> execution_modes =
+            getDecodeExecutionModes();
         const std::vector<int> m_values = getDecodeMValues();
-        const DecodeReferenceMode reference_mode = getDecodeReferenceMode();
-
-        std::fprintf(stderr,
-                     "[ROCmNativeVNNI][DECODE][TRAINER] reference=%s\n",
-                     referenceModeName(reference_mode));
+        ScopedTrainerEnvironment stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
 
         std::FILE *csv = nullptr;
         if (!csv_path.empty())
         {
             csv = std::fopen(csv_path.c_str(), "w");
             ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeVNNI decode CSV: " << csv_path;
-            std::fprintf(csv,
-                         "backend,phase,format,codebook,shape,m,n,k,variant,kb,target_waves,weight_bytes,min_us,mean_us,stddev_us,eff_bw_gbs,bw_efficiency,speedup_vs_int8,theoretical_speedup,kernel_efficiency,cosine,correctness_pass,is_best\n");
+            std::fprintf(
+                csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,kb,target_waves,weight_bytes,"
+                "warmup_count,sample_count,min_us,median_us,p95_us,mad_us,cv,"
+                "effective_bandwidth_gbs,bit_mismatches,first_bit_mismatch,"
+                "repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,"
+                "grouped_output_digest,serial_output_digest,timing_sample_digest,"
+                "route_counter_ok,observed_candidate_id,observed_path,serial_m1_kb,"
+                "serial_m1_target_waves,serial_route_counter_ok,numerical_correctness,"
+                "correctness_pass,is_winner\n");
+        }
+        std::FILE *timing_csv = nullptr;
+        if (!timing_csv_path.empty())
+        {
+            timing_csv = std::fopen(timing_csv_path.c_str(), "w");
+            ASSERT_NE(timing_csv, nullptr)
+                << "Failed to open ROCm NativeVNNI raw timing CSV: "
+                << timing_csv_path;
+            std::fprintf(
+                timing_csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,kb,target_waves,"
+                "sample_index,timed_replays,latency_us,latency_us_hex\n");
         }
 
         int executed_cases = 0;
         int executed_rows = 0;
+        uint64_t preparation_id = 1;
         for (const auto &fmt : ALL_PERF_FORMATS)
         {
             if (!shouldRunName(format_filters, fmt.name))
@@ -1129,28 +1723,33 @@ namespace
                 if (!shouldRunName(shape_filters, shape.name))
                     continue;
 
-                auto weights = fmt.create(static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
-                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), fmt.name).codebook_id;
-                ROCmPackedWeights packed;
-                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed))
-                    << "Failed to pack " << fmt.name << "/" << shape.name;
-                ASSERT_TRUE(ensureNativeVNNIPayloadForDecodeTrainer(
-                    weights.get(), packed, shape.N, shape.K, fmt.name))
-                    << fmt.name << "/" << shape.name << " did not produce a native-VNNI payload";
-                const double packed_weight_bytes = nativePackedWeightBytes(packed);
-
-                GpuWeightsCache gpu_w;
-                if (weights && reference_mode == DecodeReferenceMode::FP32HipBLAS)
-                {
-                    std::vector<float> fp32(static_cast<size_t>(shape.N) * shape.K);
-                    weights->to_fp32(fp32.data());
-                    gpu_w.upload(fp32.data(), shape.N, shape.K, 0);
-                }
+                auto weights = fmt.create(
+                    static_cast<size_t>(shape.N),
+                    static_cast<size_t>(shape.K));
+                ASSERT_NE(weights, nullptr) << fmt.name << '/' << shape.name;
+                const auto &format_metadata =
+                    llaminar2::test::quantizedVerifierFormat(fmt.name);
+                auto prepared = llaminar2::test::makeGpuPreparedGemm(
+                    weights.get(),
+                    DeviceId::rocm(0),
+                    "perf.rocm.nvnni.decode." + fmt.name + "." + shape.name,
+                    ModelContextId{preparation_id++});
+                auto *kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(prepared.kernel);
+                ASSERT_NE(kernel, nullptr)
+                    << fmt.name << '/' << shape.name
+                    << " did not produce a production ROCm prepared kernel";
+                const uint8_t execution_codebook =
+                    format_metadata.device_execution_codebook_id;
+                const double weight_bytes = static_cast<double>(
+                    llaminar2::test::quantizedRawBytesForGpuPreparedTest(*weights));
 
                 struct VariantRow
                 {
                     DecodeVariant variant;
-                    BenchResult result;
+                    DecodeExecutionMode execution_mode = DecodeExecutionMode::Eager;
+                    size_t execution_mode_index = 0;
+                    DecodeCandidateTrainerEvidence result;
+                    bool eligible = false;
                 };
 
                 for (int M : m_values)
@@ -1158,56 +1757,98 @@ namespace
                     if (executed_cases >= max_cases)
                         break;
 
-                    const double int8_us = benchmarkINT8Reference(shape, M, 0);
                     auto input = TestTensorFactory::createFP32Random(
-                        {static_cast<size_t>(M), static_cast<size_t>(shape.K)});
-                    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)))
-                        << "Failed to upload shared trainer input for " << fmt.name
-                        << "/" << shape.name << " M=" << M;
+                        {static_cast<size_t>(M), static_cast<size_t>(shape.K)},
+                        -0.35f,
+                        0.35f,
+                        static_cast<uint32_t>(
+                            0xC001u + M * 131u + fmt.name.size() * 17u +
+                            shape.name.size()));
+                    const SerialM1TrainerEvidence serial =
+                        runProductionSerialM1Oracle(
+                            *kernel,
+                            input.get(),
+                            M,
+                            shape.N,
+                            shape.K,
+                            execution_codebook,
+                            0);
+                    ASSERT_TRUE(serial.valid)
+                        << fmt.name << '/' << shape.name << " M=" << M
+                        << " serial M1 oracle failed: " << serial.failure_reason;
 
-                    std::unique_ptr<TensorBase> native_auto_reference;
-                    const float *d_native_reference_output = nullptr;
-                    if (reference_mode == DecodeReferenceMode::NativeAuto)
-                    {
-                        native_auto_reference = computeNativeAutoReferenceOutput(
-                            &packed, shape, M, input.get(), 0);
-                        ASSERT_TRUE(native_auto_reference)
-                            << "Failed to compute native-auto reference for "
-                            << fmt.name << "/" << shape.name << " M=" << M;
-                        d_native_reference_output = reinterpret_cast<const float *>(
-                            dynamic_cast<FP32Tensor *>(native_auto_reference.get())->gpu_data_ptr());
-                        ASSERT_NE(d_native_reference_output, nullptr)
-                            << "Native-auto reference has no device pointer";
-                    }
+                    const size_t applicable_candidates = static_cast<size_t>(
+                        std::count_if(
+                            variants.begin(),
+                            variants.end(),
+                            [M](const DecodeVariant &variant)
+                            { return variant.appliesToM(M); }));
+                    ASSERT_GT(applicable_candidates, 0u)
+                        << "No candidate selected for the required "
+                        << (M == 1 ? "Fast M=1" : "VerifierSerialM1Bitwise")
+                        << " contract at M=" << M;
 
                     std::vector<VariantRow> rows;
-                    rows.reserve(variants.size());
-                    for (const auto &variant : variants)
+                    rows.reserve(applicable_candidates * execution_modes.size());
+                    for (size_t mode_index = 0;
+                         mode_index < execution_modes.size();
+                         ++mode_index)
                     {
-                        DecodeTuningOverrideGuard guard(variant);
-                        rows.push_back(VariantRow{
-                            variant,
-                            benchmarkFormat(fmt,
-                                            shape,
-                                            M,
-                                            int8_us,
-                                            weights.get(),
-                                            &packed,
-                                            packed_weight_bytes,
-                                            reference_mode == DecodeReferenceMode::FP32HipBLAS ? &gpu_w : nullptr,
-                                            input.get(),
-                                            reference_mode,
-                                            d_native_reference_output,
-                                            0)});
+                        const DecodeExecutionMode execution_mode =
+                            execution_modes[mode_index];
+                        for (const auto &variant : variants)
+                        {
+                            if (!variant.appliesToM(M))
+                                continue;
+                            DecodeCandidateTrainerEvidence result =
+                                runProductionDecodeCandidate(
+                                    *kernel,
+                                    input.get(),
+                                    serial,
+                                    variant,
+                                    execution_mode,
+                                    fmt.name,
+                                    M,
+                                    shape.N,
+                                    shape.K,
+                                    execution_codebook,
+                                    weight_bytes,
+                                    trainer_warmups,
+                                    trainer_samples,
+                                    0);
+                            ASSERT_TRUE(result.valid)
+                                << fmt.name << '/' << shape.name << " M=" << M
+                                << ' ' << variant.name << ' '
+                                << decodeExecutionModeName(execution_mode)
+                                << " candidate failed: " << result.failure_reason;
+                            const bool verifier_exact =
+                                M == 1 || result.comparison.bitwiseEqual();
+                            const bool eligible =
+                                result.route_counter_ok &&
+                                result.repeat_byte_mismatches == 0 &&
+                                result.numerical_correctness &&
+                                verifier_exact;
+                            rows.push_back(VariantRow{
+                                variant,
+                                execution_mode,
+                                mode_index,
+                                std::move(result),
+                                eligible});
+                        }
                     }
 
-                    int best_index = -1;
+                    std::vector<int> best_indices(execution_modes.size(), -1);
                     for (size_t row_index = 0; row_index < rows.size(); ++row_index)
                     {
-                        const auto &candidate = rows[row_index].result;
-                        if (!candidate.correctness_pass || candidate.min_us <= 0.0)
+                        const auto &candidate = rows[row_index];
+                        if (!candidate.eligible ||
+                            candidate.result.timing.median <= 0.0)
                             continue;
-                        if (best_index < 0 || candidate.min_us < rows[static_cast<size_t>(best_index)].result.min_us)
+                        int &best_index =
+                            best_indices[candidate.execution_mode_index];
+                        if (best_index < 0 ||
+                            candidate.result.timing.median <
+                                rows[static_cast<size_t>(best_index)].result.timing.median)
                             best_index = static_cast<int>(row_index);
                     }
 
@@ -1217,66 +1858,142 @@ namespace
                         {
                             const auto &row = rows[row_index];
                             const auto &r = row.result;
-                            std::fprintf(csv,
-                                         "rocm,decode,%s,%u,%s,%d,%d,%d,%s,%d,%d,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.6f,%.6f,%.3f,%.6f,%d,%d\n",
-                                         fmt.name.c_str(),
-                                         static_cast<unsigned>(codebook_id),
-                                         shape.name.c_str(),
-                                         r.M,
-                                         shape.N,
-                                         shape.K,
-                                         row.variant.name.c_str(),
-                                         row.variant.kb,
-                                         row.variant.target_waves,
-                                         r.weight_bytes,
-                                         r.min_us,
-                                         r.mean_us,
-                                         r.stddev_us,
-                                         r.eff_bw_gbps,
-                                         r.bw_efficiency,
-                                         r.speedup_vs_int8,
-                                         r.theoretical_speedup,
-                                         r.kernel_efficiency,
-                                         r.cosine_sim,
-                                         r.correctness_pass ? 1 : 0,
-                                         best_index >= 0 && static_cast<int>(row_index) == best_index ? 1 : 0);
+                            std::fprintf(
+                                csv,
+                                "rocm,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%d,%d,"
+                                "%.0f,%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,"
+                                "%zu,%.9g,%.9g,%.9g,%.9g,%s,%s,%s,%d,%s,%s,%d,%d,"
+                                "%d,%d,%d,%d\n",
+                                fmt.name.c_str(),
+                                static_cast<unsigned>(format_metadata.source_codebook_id),
+                                static_cast<unsigned>(execution_codebook),
+                                shape.name.c_str(),
+                                decodeExecutionModeName(row.execution_mode),
+                                M,
+                                shape.N,
+                                shape.K,
+                                row.variant.name.c_str(),
+                                r.observed_kb,
+                                r.observed_target_waves,
+                                weight_bytes,
+                                trainer_warmups,
+                                trainer_samples,
+                                r.timing.min,
+                                r.timing.median,
+                                r.timing.p95,
+                                r.timing.mad,
+                                r.timing.cv,
+                                r.effective_bandwidth_gbs,
+                                r.comparison.mismatch_count,
+                                r.comparison.first_mismatch_index,
+                                r.repeat_byte_mismatches,
+                                r.comparison.max_abs,
+                                r.comparison.relative_l2,
+                                r.comparison.cosine,
+                                r.comparison.symmetric_kld,
+                                r.comparison.actual_digest.c_str(),
+                                serial.output_digest.c_str(),
+                                r.timing.digest.c_str(),
+                                r.route_counter_ok ? 1 : 0,
+                                r.observed_candidate_id.c_str(),
+                                r.observed_path.c_str(),
+                                serial.kb,
+                                serial.target_waves,
+                                serial.route_counter_ok ? 1 : 0,
+                                r.numerical_correctness ? 1 : 0,
+                                row.eligible ? 1 : 0,
+                                best_indices[row.execution_mode_index] >= 0 &&
+                                        static_cast<int>(row_index) ==
+                                            best_indices[row.execution_mode_index]
+                                    ? 1
+                                    : 0);
                             ++executed_rows;
+
+                            if (timing_csv)
+                            {
+                                for (size_t sample_index = 0;
+                                     sample_index < r.timing_samples_us.size();
+                                     ++sample_index)
+                                {
+                                    std::fprintf(
+                                        timing_csv,
+                                        "rocm,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,"
+                                        "%d,%d,%zu,1,%.9f,%a\n",
+                                        fmt.name.c_str(),
+                                        static_cast<unsigned>(
+                                            format_metadata.source_codebook_id),
+                                        static_cast<unsigned>(execution_codebook),
+                                        shape.name.c_str(),
+                                        decodeExecutionModeName(row.execution_mode),
+                                        M,
+                                        shape.N,
+                                        shape.K,
+                                        row.variant.name.c_str(),
+                                        r.observed_kb,
+                                        r.observed_target_waves,
+                                        sample_index,
+                                        r.timing_samples_us[sample_index],
+                                        r.timing_samples_us[sample_index]);
+                                }
+                                std::fflush(timing_csv);
+                            }
                         }
                         std::fflush(csv);
                     }
 
-                    if (best_index < 0)
+                    for (size_t mode_index = 0;
+                         mode_index < execution_modes.size();
+                         ++mode_index)
                     {
-                        for (const auto &row : rows)
+                        const int best_index = best_indices[mode_index];
+                        if (best_index < 0)
                         {
-                            std::fprintf(stderr,
-                                         "[ROCmNativeVNNI][DECODE][TRAINER][CANDIDATE] format=%s shape=%s M=%d variant=%s time_us=%.3f cosine=%.6f correctness=%d\n",
-                                         fmt.name.c_str(),
-                                         shape.name.c_str(),
-                                         M,
-                                         row.variant.name.c_str(),
-                                         row.result.min_us,
-                                         row.result.cosine_sim,
-                                         row.result.correctness_pass ? 1 : 0);
+                            for (const auto &row : rows)
+                            {
+                                if (row.execution_mode_index != mode_index)
+                                    continue;
+                                std::fprintf(
+                                    stderr,
+                                    "[ROCmNativeVNNI][DECODE][TRAINER][CANDIDATE] format=%s shape=%s mode=%s M=%d variant=%s time_us=%.3f cosine=%.6f correctness=%d\n",
+                                    fmt.name.c_str(),
+                                    shape.name.c_str(),
+                                    decodeExecutionModeName(row.execution_mode),
+                                    M,
+                                    row.variant.name.c_str(),
+                                    row.result.timing.median,
+                                    row.result.comparison.cosine,
+                                    row.eligible ? 1 : 0);
+                            }
                         }
-                    }
-                    ASSERT_GE(best_index, 0) << "No correct ROCm NativeVNNI decode variant for "
-                                             << fmt.name << "/" << shape.name << " M=" << M;
+                        ASSERT_GE(best_index, 0)
+                            << "No correct ROCm NativeVNNI decode variant for "
+                            << fmt.name << "/" << shape.name << " M=" << M
+                            << " mode="
+                            << decodeExecutionModeName(execution_modes[mode_index]);
 
-                    const auto &best = rows[static_cast<size_t>(best_index)];
-                    std::fprintf(stderr,
-                                 "[ROCmNativeVNNI][DECODE][TRAINER] format=%s codebook=%u shape=%s M=%d best=%s time_us=%.3f cosine=%.6f speedup_vs_int8=%.3fx\n",
-                                 fmt.name.c_str(),
-                                 static_cast<unsigned>(codebook_id),
-                                 shape.name.c_str(),
-                                 M,
-                                 best.variant.name.c_str(),
-                                 best.result.min_us,
-                                 best.result.cosine_sim,
-                                 best.result.speedup_vs_int8);
-                    ASSERT_TRUE(best.result.correctness_pass)
-                        << fmt.name << "/" << shape.name << " M=" << M
-                        << " cosine=" << best.result.cosine_sim;
+                        const auto &best = rows[static_cast<size_t>(best_index)];
+                        std::fprintf(stderr,
+                                     "[ROCmNativeVNNI][DECODE][TRAINER] format=%s "
+                                     "source_codebook=%u execution_codebook=%u shape=%s "
+                                     "mode=%s M=%d best=%s median_us=%.3f bit_mismatches=%zu "
+                                     "repeat_byte_mismatches=%zu route=%s\n",
+                                     fmt.name.c_str(),
+                                     static_cast<unsigned>(format_metadata.source_codebook_id),
+                                     static_cast<unsigned>(execution_codebook),
+                                     shape.name.c_str(),
+                                     decodeExecutionModeName(best.execution_mode),
+                                     M,
+                                     best.variant.name.c_str(),
+                                     best.result.timing.median,
+                                     best.result.comparison.mismatch_count,
+                                     best.result.repeat_byte_mismatches,
+                                     best.result.observed_candidate_id.c_str());
+                        ASSERT_TRUE(best.eligible)
+                            << fmt.name << "/" << shape.name << " M=" << M
+                            << " mode=" << decodeExecutionModeName(best.execution_mode)
+                            << " first_bit_mismatch="
+                            << best.result.comparison.first_mismatch_index;
+                    }
                     ++executed_cases;
                 }
                 if (executed_cases >= max_cases)
@@ -1289,6 +2006,8 @@ namespace
             std::fclose(csv);
             ASSERT_GT(executed_rows, 0) << "ROCm NativeVNNI decode trainer CSV had no rows.";
         }
+        if (timing_csv)
+            ASSERT_EQ(std::fclose(timing_csv), 0);
         ASSERT_GT(executed_cases, 0) << "No ROCm NativeVNNI decode trainer cases selected.";
 #endif
     }

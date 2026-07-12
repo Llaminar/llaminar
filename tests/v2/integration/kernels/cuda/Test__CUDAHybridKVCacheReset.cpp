@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -23,12 +24,15 @@
 #include <cuda_runtime.h>
 
 #include "backends/DeviceId.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/IKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
+#include "tensors/SIMDHelpers.h"
 #include "tensors/TensorKernels.h"
+#include "tensors/Tensors.h"
 #endif
 
 namespace
@@ -210,6 +214,39 @@ namespace
         return handle;
     }
 
+    /**
+     * @brief Create a CUDA hybrid cache with explicit KV format and row shape.
+     *
+     * Converted resident-read tests sweep every standard GPU KV format. A
+     * 32-element head is also the smallest complete Q8_1 block, so using one
+     * configurable factory keeps the floating-point and block-quantized cases
+     * on the same compressed-layer fixture.
+     */
+    HybridCacheHandle createHybridCacheWithShape(
+        const llaminar2::HybridKVCacheConfig &hybrid_config,
+        llaminar2::ActivationPrecision precision,
+        int max_seq_len,
+        int n_kv_heads,
+        int head_dim)
+    {
+        llaminar::v2::kernels::KVCacheConfig config;
+        config.precision = precision;
+        config.device = llaminar2::DeviceId::cuda(0);
+        config.num_layers = static_cast<int>(hybrid_config.layer_types.size());
+        config.batch_size = 1;
+        config.max_seq_len = max_seq_len;
+        config.n_kv_heads = n_kv_heads;
+        config.head_dim = head_dim;
+        config.hybrid_config = &hybrid_config;
+
+        HybridCacheHandle handle;
+        handle.owner = KernelFactory::createKVCache(config);
+        handle.hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(handle.owner.get());
+        if (!handle.hybrid)
+            throw std::runtime_error("KernelFactory did not create an IHybridKVCache");
+        return handle;
+    }
+
     /// @brief Creates the default tiny CUDA hybrid cache used by reset tests.
     HybridCacheHandle createHybridCache()
     {
@@ -238,6 +275,67 @@ namespace
         for (size_t i = 0; i < count; ++i)
             values[i] = base + static_cast<float>(i) * 0.125f;
         return values;
+    }
+
+    /**
+     * @brief Encode deterministic FP32 rows in one native cache tensor format.
+     *
+     * Stream-aware append accepts a native tensor without conversion scratch.
+     * Building the real representation here lets the compressed-layer
+     * regression sweep floating-point and Q8_1 storage through the identical
+     * production append contract.
+     */
+    std::unique_ptr<llaminar2::ITensor> makeNativeCacheTensor(
+        llaminar2::ActivationPrecision precision,
+        const std::vector<float> &values,
+        size_t rows,
+        size_t cols)
+    {
+        const std::vector<size_t> shape = {rows, cols};
+        switch (precision)
+        {
+        case llaminar2::ActivationPrecision::FP32:
+        {
+            auto tensor = std::make_unique<llaminar2::FP32Tensor>(
+                shape,
+                llaminar2::DeviceId::cpu());
+            std::copy(values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case llaminar2::ActivationPrecision::FP16:
+        {
+            std::vector<uint16_t> encoded(values.size());
+            std::transform(
+                values.begin(), values.end(), encoded.begin(),
+                [](float value)
+                {
+                    return llaminar2::simd::fp32_to_fp16(value);
+                });
+            return std::make_unique<llaminar2::FP16Tensor>(shape, encoded);
+        }
+        case llaminar2::ActivationPrecision::BF16:
+        {
+            std::vector<uint16_t> encoded(values.size());
+            std::transform(
+                values.begin(), values.end(), encoded.begin(),
+                [](float value)
+                {
+                    return llaminar2::simd::fp32_to_bf16(value);
+                });
+            return std::make_unique<llaminar2::BF16Tensor>(shape, encoded);
+        }
+        case llaminar2::ActivationPrecision::Q8_1:
+        {
+            auto quantized = llaminar2::Q8_1Tensor::quantize_from_fp32(
+                values.data(),
+                shape);
+            if (!quantized)
+                throw std::runtime_error("Q8_1 test tensor quantization failed");
+            return std::make_unique<llaminar2::Q8_1Tensor>(*quantized);
+        }
+        default:
+            throw std::runtime_error("unsupported native CUDA hybrid cache test format");
+        }
     }
 
     /// @brief Host snapshot of the local live GDN bank exported through GPU kernels.
@@ -945,6 +1043,196 @@ TEST(Test__CUDAHybridKVCacheReset, GetKVUsesCompressedFullAttentionSlot)
     EXPECT_NE(ck, nullptr);
     EXPECT_NE(cv, nullptr);
     EXPECT_EQ(const_kv_len, 2);
+}
+
+/**
+ * @brief Every converted resident format honors the hybrid FA layer map.
+ *
+ * Qwen3.6 layer 3 is global model layer 3 but compressed KV slot 0. The old
+ * inherited implementation forwarded `3` directly to the parent ring, where
+ * it was also a valid slot and therefore returned a later FA layer without an
+ * error. Populating both slots with deliberately different rows makes that
+ * silent alias visible. A plain one-layer ring runs the same grouped resident
+ * kernel as an unambiguous slot-zero oracle, so the test makes no assumptions
+ * about scalar shadow-view conversion policy.
+ */
+TEST(Test__CUDAHybridKVCacheReset, ConvertedResidentReadAllFormatsUsesCompressedFullAttentionSlot)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    constexpr int global_first_fa_layer = 3;
+    constexpr int global_fourth_fa_layer = 6;
+    constexpr int token_count = 2;
+    constexpr int max_seq_len = 8;
+    constexpr int n_kv_heads = 1;
+    constexpr int head_dim = 32;
+    constexpr size_t live_elements =
+        static_cast<size_t>(token_count) * n_kv_heads * head_dim;
+
+    const std::array<llaminar2::ActivationPrecision, 4> formats = {
+        llaminar2::ActivationPrecision::FP32,
+        llaminar2::ActivationPrecision::FP16,
+        llaminar2::ActivationPrecision::BF16,
+        llaminar2::ActivationPrecision::Q8_1,
+    };
+
+    for (const auto precision : formats)
+    {
+        SCOPED_TRACE(llaminar2::activationPrecisionToString(precision));
+        const auto hybrid_config = makeOffsetFullAttentionHybridConfig();
+        auto cache = createHybridCacheWithShape(
+            hybrid_config,
+            precision,
+            max_seq_len,
+            n_kv_heads,
+            head_dim);
+        llaminar::v2::kernels::KVCacheConfig oracle_config;
+        oracle_config.precision = precision;
+        oracle_config.device = llaminar2::DeviceId::cuda(0);
+        oracle_config.num_layers = 1;
+        oracle_config.batch_size = 1;
+        oracle_config.max_seq_len = max_seq_len;
+        oracle_config.n_kv_heads = n_kv_heads;
+        oracle_config.head_dim = head_dim;
+        auto oracle_cache = KernelFactory::createKVCache(oracle_config);
+        ASSERT_NE(oracle_cache, nullptr);
+
+        auto *workspace_consumer =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(cache.owner.get());
+        auto *oracle_workspace_consumer =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(oracle_cache.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        ASSERT_NE(oracle_workspace_consumer, nullptr);
+
+        const auto requirements = workspace_consumer->getWorkspaceRequirements(
+            token_count,
+            /*n=*/1,
+            head_dim);
+        llaminar2::DeviceWorkspaceManager workspace(
+            llaminar2::DeviceId::cuda(0),
+            requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        workspace_consumer->bindWorkspace(&workspace);
+        const auto oracle_requirements =
+            oracle_workspace_consumer->getWorkspaceRequirements(
+                token_count,
+                /*n=*/1,
+                head_dim);
+        llaminar2::DeviceWorkspaceManager oracle_workspace(
+            llaminar2::DeviceId::cuda(0),
+            oracle_requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(oracle_workspace.allocate(oracle_requirements));
+        oracle_workspace_consumer->bindWorkspace(&oracle_workspace);
+
+        const std::vector<float> first_k = statePattern(live_elements, 0.25f);
+        const std::vector<float> first_v = statePattern(live_elements, -0.75f);
+        const std::vector<float> fourth_k = statePattern(live_elements, 8.25f);
+        const std::vector<float> fourth_v = statePattern(live_elements, -9.75f);
+        auto first_k_tensor = makeNativeCacheTensor(
+            precision, first_k, token_count, n_kv_heads * head_dim);
+        auto first_v_tensor = makeNativeCacheTensor(
+            precision, first_v, token_count, n_kv_heads * head_dim);
+        auto fourth_k_tensor = makeNativeCacheTensor(
+            precision, fourth_k, token_count, n_kv_heads * head_dim);
+        auto fourth_v_tensor = makeNativeCacheTensor(
+            precision, fourth_v, token_count, n_kv_heads * head_dim);
+        CudaStream stream;
+
+        ASSERT_TRUE(cache.owner->appendWithStream(
+            global_first_fa_layer,
+            /*seq_idx=*/0,
+            first_k_tensor.get(),
+            first_v_tensor.get(),
+            token_count,
+            stream.opaque()));
+        ASSERT_TRUE(cache.owner->appendWithStream(
+            global_fourth_fa_layer,
+            /*seq_idx=*/0,
+            fourth_k_tensor.get(),
+            fourth_v_tensor.get(),
+            token_count,
+            stream.opaque()));
+        ASSERT_TRUE(oracle_cache->appendWithStream(
+            /*layer=*/0,
+            /*seq_idx=*/0,
+            first_k_tensor.get(),
+            first_v_tensor.get(),
+            token_count,
+            stream.opaque()));
+        stream.synchronize("cudaStreamSynchronize after hybrid append");
+
+        llaminar2::IKVCache::KVReadParams read;
+        read.n_kv_heads = n_kv_heads;
+        read.head_dim = head_dim;
+        read.rope_dim = head_dim;
+        read.gpu_stream = stream.opaque();
+
+        llaminar2::ITensor *resident_k = nullptr;
+        llaminar2::ITensor *resident_v = nullptr;
+        ASSERT_TRUE(cache.owner->get_kv_batched_converted_device_view(
+            global_first_fa_layer,
+            /*first_seq_idx=*/0,
+            /*request_count=*/1,
+            llaminar2::ActivationPrecision::FP16,
+            &resident_k,
+            &resident_v,
+            read));
+        ASSERT_NE(resident_k, nullptr);
+        ASSERT_NE(resident_v, nullptr);
+
+        std::vector<uint16_t> actual_k(live_elements);
+        std::vector<uint16_t> actual_v(live_elements);
+        checkCuda(
+            cudaMemcpyAsync(
+                actual_k.data(), resident_k->gpu_data_ptr(),
+                actual_k.size() * sizeof(uint16_t),
+                cudaMemcpyDeviceToHost, stream.stream),
+            "cudaMemcpyAsync resident K");
+        checkCuda(
+            cudaMemcpyAsync(
+                actual_v.data(), resident_v->gpu_data_ptr(),
+                actual_v.size() * sizeof(uint16_t),
+                cudaMemcpyDeviceToHost, stream.stream),
+            "cudaMemcpyAsync resident V");
+        stream.synchronize("cudaStreamSynchronize after resident read");
+
+        llaminar2::ITensor *oracle_k = nullptr;
+        llaminar2::ITensor *oracle_v = nullptr;
+        ASSERT_TRUE(oracle_cache->get_kv_batched_converted_device_view(
+            /*layer=*/0,
+            /*first_seq_idx=*/0,
+            /*request_count=*/1,
+            llaminar2::ActivationPrecision::FP16,
+            &oracle_k,
+            &oracle_v,
+            read));
+        ASSERT_NE(oracle_k, nullptr);
+        ASSERT_NE(oracle_v, nullptr);
+
+        std::vector<uint16_t> expected_k(live_elements);
+        std::vector<uint16_t> expected_v(live_elements);
+        checkCuda(
+            cudaMemcpyAsync(
+                expected_k.data(), oracle_k->gpu_data_ptr(),
+                expected_k.size() * sizeof(uint16_t),
+                cudaMemcpyDeviceToHost, stream.stream),
+            "cudaMemcpyAsync oracle K");
+        checkCuda(
+            cudaMemcpyAsync(
+                expected_v.data(), oracle_v->gpu_data_ptr(),
+                expected_v.size() * sizeof(uint16_t),
+                cudaMemcpyDeviceToHost, stream.stream),
+            "cudaMemcpyAsync oracle V");
+        stream.synchronize("cudaStreamSynchronize after scalar oracle read");
+
+        EXPECT_EQ(actual_k, expected_k)
+            << "resident K read selected the wrong compressed FA slot";
+        EXPECT_EQ(actual_v, expected_v)
+            << "resident V read selected the wrong compressed FA slot";
+        workspace_consumer->unbindWorkspace();
+        oracle_workspace_consumer->unbindWorkspace();
+    }
 }
 
 #else

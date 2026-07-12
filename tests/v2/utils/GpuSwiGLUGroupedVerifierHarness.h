@@ -3,10 +3,10 @@
  * @brief Shared all-format grouped SwiGLU byte-equivalence GPU sweep.
  *
  * Standalone SwiGLU remains a production activation path when a fused GEMM
- * implementation is not involved. CUDA and ROCm must process M=2..4 verifier
- * rows in one flat launch while preserving the exact native bytes emitted by
- * their own M=1 decode kernels. This harness proves that contract for FP32,
- * BF16, and FP16 on explicit non-default streams.
+ * implementation is not involved. CUDA and ROCm must process every configured
+ * runtime verifier depth in one flat launch while preserving the exact native
+ * bytes emitted by their own M=1 decode kernels. This harness proves that
+ * contract for FP32, BF16, and FP16 on explicit non-default streams.
  */
 
 #pragma once
@@ -18,6 +18,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -199,7 +200,7 @@ namespace llaminar2::test::gpu_swiglu_verifier
     }
 
     /**
-     * @brief Sweep one native format across M=2..4 and two FFN widths.
+     * @brief Sweep one native format across runtime M and two FFN widths.
      *
      * A 544-column row has 17 Q8-sized blocks and catches accidental cross-row
      * block pairing. A 4864-column row represents a real dense Qwen FFN width.
@@ -215,17 +216,18 @@ namespace llaminar2::test::gpu_swiglu_verifier
         const char *format_label)
     {
         constexpr std::array<int, 2> column_counts = {544, 4864};
+        constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
 
         for (int cols : column_counts)
         {
             const auto gate_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x711A0000u ^ static_cast<uint32_t>(cols));
             const auto up_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x822B0000u ^ static_cast<uint32_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string(backend_label) + " format=" + format_label +

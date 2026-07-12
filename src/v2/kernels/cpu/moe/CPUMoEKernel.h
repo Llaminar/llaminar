@@ -108,7 +108,7 @@ namespace llaminar2
         void invalidateRouterQ8HiddenPublication() noexcept;
 
         /**
-         * @brief Quantize and publish M=1..4 router inputs for NativeVNNI experts.
+         * @brief Quantize and publish runtime-M router inputs for NativeVNNI experts.
          *
          * The implementation deliberately uses the same Q8_1 block primitives
          * as serial NativeVNNI decode.  Keeping this transform in the router

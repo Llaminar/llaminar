@@ -1226,9 +1226,11 @@ TEST(Test__CUDARingKVCacheTQ, CrossPath_CPUQuantize_GPUDequant)
  * therefore builds two independent compressed rings, wraps request zero, and
  * leaves request one shorter. The production grouped API is recorded in a CUDA
  * graph and must reproduce the established scalar TQ8-K/TQ4-V FP16 bytes for
- * every live row while zeroing the shorter request's padding. Running both TQ
- * block dimensions prevents a 64-only implementation from silently excluding
- * models whose KV heads are 128 elements wide.
+ * every live row. Inactive resident capacity is deliberately not inspected:
+ * production attention is bounded by the same device count, and clearing a
+ * full maximum-context buffer on each decode would be uneconomical. Running
+ * both TQ block dimensions prevents a 64-only implementation from silently
+ * excluding models whose KV heads are 128 elements wide.
  */
 TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBytes)
 {
@@ -1325,7 +1327,6 @@ TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
                 /*layer=*/0,
                 /*first_seq_idx=*/0,
                 batch_size,
-                max_seq_len,
                 &grouped_k,
                 &grouped_v,
                 stream.opaque());
@@ -1371,12 +1372,6 @@ TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
                             live_elements * sizeof(uint16_t)),
                 0)
                 << "TQ4 V grouped bytes differ for request " << request;
-            for (size_t index = live_elements;
-                 index < static_cast<size_t>(max_seq_len) * kv_dim; ++index)
-            {
-                EXPECT_EQ(actual_k[request_offset + index], uint16_t{0});
-                EXPECT_EQ(actual_v[request_offset + index], uint16_t{0});
-            }
         }
 
         ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
@@ -1737,7 +1732,7 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
             GraphCaptureGuard guard;
             capture_ok = append_stage.execute(nullptr) &&
                          actual.get_kv_batched_converted_device_view(
-                             0, 0, /*request_count=*/1, max_seq_len,
+                             0, 0, /*request_count=*/1,
                              ActivationPrecision::FP16,
                              &captured_k, &captured_v, read_params);
         }

@@ -3,7 +3,7 @@
  * @brief Graph-capturable fixed-order small/output floating verifier projections.
  *
  * These kernels back MTP verifier publication for floating-point GDN-style
- * projections.  They keep M=1 serial decode and M=2..4 grouped verifier rows
+ * projections. They keep M=1 serial decode and runtime grouped verifier rows
  * on the same explicit HIP stream and the same reduction tree, avoiding
  * hipBLAS shape-dependent accumulation changes in publication-sensitive state.
  */
@@ -266,7 +266,7 @@ namespace
      * @brief Fixed-order fused SwiGLU plus floating down projection.
      *
      * MTP shared-expert verifier rows publish the result of `down(swiglu(g,u))`
-     * into live state.  This kernel keeps serial M=1 and grouped M=2..4 rows on
+     * into live state. This kernel keeps serial M=1 and runtime grouped rows on
      * the same HIP code path: one block owns one output element, every thread
      * walks a deterministic strided K subsequence, and the block reduction tree
      * is identical for all M values.
@@ -518,7 +518,7 @@ extern "C" bool rocmFloating_swiglu_down_projection(
     void *stream)
 {
     if (!d_gate || !d_up || !d_weights || !d_output ||
-        M <= 0 || M > 4 ||
+        M <= 0 ||
         N <= 0 ||
         K <= 0 ||
         (weight_dtype != SMALL_SWIGLU_DOWN_WEIGHT_FP32 &&

@@ -176,6 +176,7 @@ namespace
             /*stop_tokens=*/nullptr,
             /*stop_token_count=*/0,
             expected_tokens.data(),
+            static_cast<int>(expected_tokens.size()),
             expected_meta.data());
 
         for (int i = 0; i < sampling_math::kSpeculativeBatchMetaCount; ++i)
@@ -297,6 +298,7 @@ namespace
                     /*stop_token_count=*/0,
                     device_id,
                     stream,
+                    sampling_math::kSpeculativeBatchMaxOutputTokens,
                     d_output_tokens.get(),
                     d_output_meta.get()))
             {
@@ -638,6 +640,7 @@ namespace
                     /*has_bonus_token=*/true,
                     device_id,
                     stream,
+                    sampling_math::kSpeculativeBatchMaxOutputTokens,
                     d_output_tokens.get(),
                     d_output_meta.get()))
             {
@@ -763,6 +766,7 @@ namespace
                 kFirstToken, nullptr, 0,
                 static_cast<int *>(d_verify_tokens.get()) + row_count,
                 true, device_id, stream,
+                sampling_math::kSpeculativeBatchMaxOutputTokens,
                 d_output_tokens.get(), d_output_meta.get());
         });
 
@@ -1021,6 +1025,7 @@ namespace
                 accepted_prefix == row_count,
                 device_id,
                 stream,
+                sampling_math::kSpeculativeBatchMaxOutputTokens,
                 d_output_tokens.get(),
                 d_output_meta.get());
         };
@@ -1367,6 +1372,7 @@ namespace
                 accepted_prefix == row_count,
                 device_id,
                 stream,
+                sampling_math::kSpeculativeBatchMaxOutputTokens,
                 d_output_tokens.get(),
                 d_output_meta.get());
         };
@@ -1579,6 +1585,7 @@ namespace
                 true,
                 device_id,
                 stream,
+                sampling_math::kSpeculativeBatchMaxOutputTokens,
                 d_output_tokens.get(),
                 d_output_meta.get());
         });

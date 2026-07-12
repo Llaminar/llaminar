@@ -55,9 +55,12 @@
 #include "kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "fort.hpp"
 
+#include "utils/NativeVNNITrainerEvidence.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -223,7 +226,7 @@ namespace
 
     static const std::vector<FormatSpec> MTP_SMALL_M_FORMATS = {
         {"Q4_0"}, {"Q4_1"}, {"Q5_0"}, {"Q5_1"},
-        {"Q8_0"}, {"Q8_1"}, {"Q2_K"}, {"Q3_K"},
+        {"Q8_0"}, {"Q8_1"}, {"Q8_K"}, {"Q2_K"}, {"Q3_K"},
         {"Q4_K"}, {"Q5_K"}, {"Q6_K"}, {"IQ4_NL"},
         {"IQ4_XS"}, {"IQ3_S"}, {"IQ3_XXS"}, {"IQ2_S"},
         {"IQ2_XS"}, {"IQ2_XXS"}, {"IQ1_S"}, {"IQ1_M"},
@@ -491,6 +494,102 @@ namespace
         return summary;
     }
 
+    /** Exact sorted samples and common robust aggregates for policy training. */
+    struct StrongTimingMeasurement
+    {
+        std::vector<double> samples_us;
+        llaminar2::test::trainer::TimingEvidence evidence;
+    };
+
+    /**
+     * @brief Time one CPU candidate with the backend-neutral trainer protocol.
+     *
+     * The raw samples remain available for a retained sidecar.  Policy code
+     * consumes the upper median and dispersion reconstructed from those exact
+     * native doubles rather than trusting a rounded aggregate CSV field.
+     */
+    template <typename Fn>
+    StrongTimingMeasurement timeStrongTrainerCandidate(
+        int warmup,
+        int iterations,
+        Fn &&fn)
+    {
+        for (int index = 0; index < warmup; ++index)
+            fn();
+
+        StrongTimingMeasurement result;
+        result.samples_us.reserve(static_cast<size_t>(iterations));
+        for (int index = 0; index < iterations; ++index)
+        {
+            const auto begin = std::chrono::steady_clock::now();
+            fn();
+            const auto end = std::chrono::steady_clock::now();
+            result.samples_us.push_back(
+                std::chrono::duration<double, std::micro>(end - begin).count());
+        }
+        std::sort(result.samples_us.begin(), result.samples_us.end());
+        result.evidence =
+            llaminar2::test::trainer::summarizeSortedTimingSamples(
+                result.samples_us);
+        return result;
+    }
+
+    /** Route identity observed from the real grouped verifier entry point. */
+    struct CPUVerifierRouteEvidence
+    {
+        bool found = false;
+        std::string effective_policy;
+        std::string build_isa;
+        std::string isa;
+        int k_tiles = 0;
+        int n_block_chunks = 0;
+        int threads = 0;
+        uint64_t count = 0;
+    };
+
+    /** Find the exact candidate route recorded for one CPU verifier shape. */
+    CPUVerifierRouteEvidence findCPUVerifierRoute(
+        int M,
+        int N,
+        int K,
+        uint8_t codebook)
+    {
+        CPUVerifierRouteEvidence result;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_verifier_rows_launch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_verifier_rows_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const auto tag = [&](const char *name) -> std::string
+            {
+                const auto iterator = record.tags.find(name);
+                return iterator == record.tags.end()
+                           ? std::string{}
+                           : iterator->second;
+            };
+            if (tag("m") != std::to_string(M) ||
+                tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) ||
+                tag("codebook") != std::to_string(codebook))
+            {
+                continue;
+            }
+            result.found = true;
+            result.effective_policy = tag("effective_policy");
+            result.build_isa = tag("build_isa");
+            result.isa = tag("isa");
+            result.k_tiles = std::stoi(tag("k_tiles"));
+            result.n_block_chunks = std::stoi(tag("n_block_chunks"));
+            result.threads = std::stoi(tag("threads"));
+            result.count += record.count;
+        }
+        return result;
+    }
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
     /**
      * @brief Convert a ZMM INT32 accumulator into a cheap scalar checksum.
@@ -687,6 +786,43 @@ namespace
         }
     }
 
+    /** Return the ISA selected by the production runtime dispatcher. */
+    const char *activeISANameForVerifierTrainer()
+    {
+        switch (activeISALevel())
+        {
+        case ISALevel::AVX512:
+            return "AVX512";
+        case ISALevel::AVX2:
+            return "AVX2";
+        case ISALevel::Scalar:
+        default:
+            return "SCALAR";
+        }
+    }
+
+    /**
+     * @brief Normalize the ambient runtime-ISA request for evidence provenance.
+     *
+     * activeISALevel() is cached on first use, so a trainer must launch a
+     * fresh process for every requested regime. Recording the request beside
+     * the effective route catches a mislabeled AVX512-build/AVX2-runtime shard
+     * before it reaches the policy compiler.
+     */
+    std::string requestedISANameForVerifierTrainer()
+    {
+        const std::string raw = toLower(getEnvString("LLAMINAR_ISA_LEVEL"));
+        if (raw.empty())
+            return "AUTO";
+        if (raw == "avx512")
+            return "AVX512";
+        if (raw == "avx2")
+            return "AVX2";
+        if (raw == "scalar")
+            return "SCALAR";
+        return "INVALID:" + raw;
+    }
+
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
     bool verifierBenchUsesAVX512(ISAPath path)
     {
@@ -712,6 +848,8 @@ namespace
             return TestTensorFactory::createQ8_0Random({N, K});
         if (fmt_name == "Q8_1")
             return TestTensorFactory::createQ8_1Random({N, K});
+        if (fmt_name == "Q8_K")
+            return TestTensorFactory::createQ8_KRandom({N, K});
         if (fmt_name == "Q2_K")
             return TestTensorFactory::createQ2_KRandom({N, K});
         if (fmt_name == "Q3_K")
@@ -2360,6 +2498,557 @@ namespace
         std::cout << "\n=== CPU NativeVNNI Verifier Rows: Grouped vs Serial Decode GEMVs ===\n"
                   << "Pre-quantized Q8_1 activations; strict cosine/L2/KL equivalence against serial M decode GEMVs.\n\n"
                   << table.to_string() << std::endl;
+    }
+
+    /**
+     * @test Emit promotion-grade CPU grouped-verifier candidate evidence.
+     *
+     * This is the only CPU verifier-row surface intended for learned-policy
+     * refresh.  Every explicit policy runs through the production grouped
+     * entry point, publishes its effective route, repeats byte-identically,
+     * and compares all FP32 words against independent serial M=1 GEMVs.  The
+     * older table-oriented benchmark above remains a performance diagnostic;
+     * its relaxed metrics are never consumed by the common policy compiler.
+     */
+    TEST_F(CPUNativeVNNIGemvTest, TrainerCsv_StrongVerifierRows_AllFormats)
+    {
+        applyVerifierRowsThreadCapForStandalonePerf();
+
+        const int N = getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_N").value_or(5120);
+        const int K = getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_K").value_or(5120);
+        ASSERT_GT(N, 0);
+        ASSERT_GT(K, 0);
+        ASSERT_EQ(K % 32, 0);
+
+        std::string shape_name =
+            getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME");
+        if (shape_name.empty())
+            shape_name = "Qwen36Verifier";
+        std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS");
+        if (format_filters.empty())
+            format_filters = {toLower("Q4_K")};
+        if (format_filters.count("all") != 0)
+            format_filters.clear();
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_VERIFIER_M");
+        std::vector<int> verifier_rows;
+        if (m_filters.empty())
+        {
+            verifier_rows.assign(
+                kGroupedVerifierRuntimeRows.begin(),
+                kGroupedVerifierRuntimeRows.end());
+        }
+        else
+        {
+            for (const std::string &raw_m : m_filters)
+            {
+                size_t consumed = 0;
+                const int parsed_m = std::stoi(raw_m, &consumed);
+                ASSERT_EQ(consumed, raw_m.size())
+                    << "Invalid CPU verifier M value: " << raw_m;
+                if (parsed_m == 1)
+                    continue;
+                ASSERT_GT(parsed_m, 1)
+                    << "Grouped CPU verifier M must be at least two";
+                verifier_rows.push_back(parsed_m);
+            }
+            std::sort(verifier_rows.begin(), verifier_rows.end());
+            verifier_rows.erase(
+                std::unique(verifier_rows.begin(), verifier_rows.end()),
+                verifier_rows.end());
+        }
+        ASSERT_FALSE(verifier_rows.empty())
+            << "CPU verifier trainer selected no grouped runtime-M rows";
+        const int warmups = std::max(
+            0,
+            getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP").value_or(5));
+        const int samples = std::max(
+            1,
+            getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS").value_or(30));
+        const int max_cases = std::max(
+            1,
+            getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_MAX_CASES").value_or(1000000));
+        /*
+         * Promotion evidence must exercise the same ambient runtime dispatch
+         * as inference. The older diagnostic can still force ISAPath directly,
+         * but this strong trainer intentionally uses AUTO and relies on a fresh
+         * process with LLAMINAR_ISA_LEVEL set by the refresh driver.
+         */
+        constexpr ISAPath isa_path = ISAPath::AUTO;
+        const std::string build_isa = compiledNativeVNNIBuildISAName();
+        const std::string requested_runtime_isa =
+            requestedISANameForVerifierTrainer();
+        const std::string effective_runtime_isa =
+            activeISANameForVerifierTrainer();
+        ASSERT_TRUE(
+            requested_runtime_isa == "AUTO" ||
+            requested_runtime_isa == "AVX2" ||
+            requested_runtime_isa == "AVX512")
+            << "Strong CPU NativeVNNI training requires AVX2 or AVX512, got "
+            << requested_runtime_isa;
+        ASSERT_TRUE(
+            effective_runtime_isa == "AVX2" ||
+            effective_runtime_isa == "AVX512")
+            << "Strong CPU NativeVNNI training cannot certify scalar dispatch";
+        if (requested_runtime_isa != "AUTO")
+        {
+            ASSERT_EQ(requested_runtime_isa, effective_runtime_isa)
+                << "Requested CPU ISA was not available in this build/runtime";
+        }
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV");
+        const std::string timing_csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_TIMING_CSV");
+
+        (void)setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+        PerfStatsCollector::reset();
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr)
+                << "Failed to open strong CPU verifier CSV: " << csv_path;
+            std::fprintf(
+                csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,build_isa,"
+                "runtime_isa_requested,runtime_isa_effective,threads,weight_bytes,"
+                "warmup_count,sample_count,min_us,median_us,p95_us,mad_us,cv,"
+                "serial_median_us,speedup,bit_mismatches,first_bit_mismatch,"
+                "repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,"
+                "grouped_output_digest,serial_output_digest,timing_sample_digest,"
+                "route_counter_ok,observed_candidate_id,k_tiles,n_block_chunks,"
+                "numerical_correctness,correctness_pass,is_winner\n");
+        }
+
+        std::FILE *timing_csv = nullptr;
+        if (!timing_csv_path.empty())
+        {
+            timing_csv = std::fopen(timing_csv_path.c_str(), "w");
+            ASSERT_NE(timing_csv, nullptr)
+                << "Failed to open strong CPU timing sidecar: "
+                << timing_csv_path;
+            std::fprintf(
+                timing_csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,build_isa,"
+                "runtime_isa_requested,runtime_isa_effective,sample_index,"
+                "latency_us,latency_us_hex\n");
+        }
+
+        struct Candidate
+        {
+            const char *name;
+            VerifierRowsPolicy policy;
+        };
+        constexpr std::array<Candidate, 2> CANDIDATES = {{
+            {"Pairwise", VerifierRowsPolicy::Pairwise},
+            {"WideRows", VerifierRowsPolicy::WideRows},
+        }};
+
+        struct CandidateRow
+        {
+            Candidate candidate{};
+            StrongTimingMeasurement timing;
+            llaminar2::test::trainer::FP32Evidence comparison;
+            CPUVerifierRouteEvidence route;
+            size_t repeat_byte_mismatches = 0;
+            double speedup = 0.0;
+            int timing_warmup_count = 0;
+            bool route_ok = false;
+            bool numerical_correctness = false;
+            bool correctness_pass = false;
+        };
+
+        int executed_cases = 0;
+        int emitted_rows = 0;
+        for (const auto &format : MTP_SMALL_M_FORMATS)
+        {
+            if (!shouldRunName(format_filters, format.name))
+                continue;
+
+            auto weights = createWeightsForFormat(
+                format.name,
+                static_cast<size_t>(N),
+                static_cast<size_t>(K));
+            ASSERT_NE(weights, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << format.name;
+            const auto &packed = kernel.packedWeights();
+            const size_t weight_bytes =
+                packed.native_interleaved.size() + packed.payload.size();
+
+            for (int M : verifier_rows)
+            {
+                if (executed_cases >= max_cases)
+                    break;
+
+                std::mt19937 rng(static_cast<uint32_t>(
+                    0xC0DEu + M * 131u + N + K + format.name.size()));
+                std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+                std::vector<float> input(static_cast<size_t>(M) * K);
+                for (float &value : input)
+                    value = distribution(rng);
+
+                const int K_blocks = packed.blocks_per_row;
+                std::vector<Q8_1Block> quantized_rows(
+                    static_cast<size_t>(M) * static_cast<size_t>(K_blocks));
+                quantize_activations_to_q8_1(
+                    input.data(),
+                    quantized_rows.data(),
+                    M,
+                    K,
+                    K_blocks);
+
+                std::vector<float> serial(
+                    static_cast<size_t>(M) * static_cast<size_t>(N),
+                    0.0f);
+                const auto run_serial = [&]()
+                {
+                    for (int row = 0; row < M; ++row)
+                    {
+                        gemv_native_vnni_preq(
+                            packed,
+                            quantized_rows.data() +
+                                static_cast<size_t>(row) * K_blocks,
+                            serial.data() + static_cast<size_t>(row) * N,
+                            isa_path);
+                    }
+                };
+                run_serial();
+                const std::string serial_digest =
+                    llaminar2::test::trainer::nativeByteDigest(serial);
+                const StrongTimingMeasurement serial_timing =
+                    timeStrongTrainerCandidate(warmups, samples, run_serial);
+
+                /*
+                 * A single-projection candidate can be byte exact while the
+                 * production fused descriptor scheduler still decomposes a
+                 * deeper runtime M into independent one-row tasks. Exercise a
+                 * two-projection bundle in every trainer cell so AVX2-build,
+                 * AVX512-build/AVX2-runtime, and AVX512-runtime evidence all
+                 * prove the real grouped projection route as well.
+                 */
+                std::vector<float> fused_projection0(
+                    static_cast<size_t>(M) * static_cast<size_t>(N),
+                    0.0f);
+                std::vector<float> fused_projection1(
+                    static_cast<size_t>(M) * static_cast<size_t>(N),
+                    0.0f);
+                std::array<FusedVerifierRowsDesc, 2> fused_descriptors = {{
+                    {&packed, fused_projection0.data(), nullptr, N, N},
+                    {&packed, fused_projection1.data(), nullptr, N, N},
+                }};
+                const auto run_fused_projection_bundle = [&]()
+                {
+                    return gemm_native_vnni_fused_verifier_rows_preq(
+                        quantized_rows.data(),
+                        fused_descriptors.data(),
+                        static_cast<int>(fused_descriptors.size()),
+                        M,
+                        K_blocks,
+                        isa_path);
+                };
+
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(run_fused_projection_bundle());
+                const std::vector<float> first_fused_projection0 =
+                    fused_projection0;
+                const std::vector<float> first_fused_projection1 =
+                    fused_projection1;
+                ASSERT_TRUE(run_fused_projection_bundle());
+                EXPECT_EQ(
+                    llaminar2::test::trainer::nativeByteMismatchCount(
+                        fused_projection0, serial),
+                    0u)
+                    << format.name << " M=" << M
+                    << " fused projection 0 differs from serial M=1 decode";
+                EXPECT_EQ(
+                    llaminar2::test::trainer::nativeByteMismatchCount(
+                        fused_projection1, serial),
+                    0u)
+                    << format.name << " M=" << M
+                    << " fused projection 1 differs from serial M=1 decode";
+                EXPECT_EQ(
+                    llaminar2::test::trainer::nativeByteMismatchCount(
+                        fused_projection0, first_fused_projection0),
+                    0u)
+                    << format.name << " M=" << M
+                    << " fused projection 0 changed across repeats";
+                EXPECT_EQ(
+                    llaminar2::test::trainer::nativeByteMismatchCount(
+                        fused_projection1, first_fused_projection1),
+                    0u)
+                    << format.name << " M=" << M
+                    << " fused projection 1 changed across repeats";
+
+                uint64_t fused_route_count = 0;
+                for (const auto &record : PerfStatsCollector::snapshot(
+                         {"kernel.cpu_native_vnni_fused_verifier_rows_projection_launch"}))
+                {
+                    if (record.name !=
+                        "cpu_native_vnni_fused_verifier_rows_projection_launch")
+                    {
+                        continue;
+                    }
+                    EXPECT_EQ(record.tags.at("m"), std::to_string(M));
+                    EXPECT_EQ(record.tags.at("n"), std::to_string(N));
+                    EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+                    EXPECT_EQ(
+                        record.tags.at("codebook"),
+                        std::to_string(packed.codebook_id));
+                    EXPECT_EQ(record.tags.at("isa"), effective_runtime_isa);
+                    const int observed_k_tiles =
+                        std::stoi(record.tags.at("k_tiles"));
+                    const bool grouped_k_parallel = observed_k_tiles > 1;
+                    EXPECT_EQ(
+                        record.tags.at("route"),
+                        grouped_k_parallel
+                            ? "grouped_k_parallel_row_tiles"
+                            : "grouped_full_k_pair_tiles");
+                    EXPECT_EQ(
+                        record.tags.at("physical_row_tile"),
+                        grouped_k_parallel && effective_runtime_isa == "AVX512"
+                            ? "4"
+                            : "2");
+                    fused_route_count += record.count;
+                }
+                EXPECT_EQ(
+                    fused_route_count,
+                    2u * fused_descriptors.size())
+                    << format.name << " M=" << M
+                    << " did not publish one fused grouped route per projection "
+                       "and repeat";
+
+                std::vector<CandidateRow> rows;
+                rows.reserve(CANDIDATES.size());
+                for (const Candidate &candidate : CANDIDATES)
+                {
+                    std::vector<float> grouped(
+                        static_cast<size_t>(M) * static_cast<size_t>(N),
+                        0.0f);
+                    const auto run_candidate = [&]()
+                    {
+                        gemm_native_vnni_preq_decode_equivalent_rows(
+                            packed,
+                            quantized_rows.data(),
+                            grouped.data(),
+                            M,
+                            N,
+                            isa_path,
+                            candidate.policy);
+                    };
+
+                    PerfStatsCollector::reset();
+                    run_candidate();
+                    const CPUVerifierRouteEvidence route =
+                        findCPUVerifierRoute(M, N, K, packed.codebook_id);
+                    const std::vector<float> first_output = grouped;
+                    run_candidate();
+                    const size_t repeat_byte_mismatches =
+                        llaminar2::test::trainer::nativeByteMismatchCount(
+                            first_output,
+                            grouped);
+                    const auto comparison =
+                        llaminar2::test::trainer::compareFP32(
+                            grouped,
+                            serial,
+                            static_cast<size_t>(N));
+                    const bool route_ok =
+                        route.found && route.count > 0 &&
+                        route.build_isa == build_isa &&
+                        route.isa == effective_runtime_isa &&
+                        route.effective_policy == candidate.name;
+                    /*
+                     * A normalized request is retained as negative support
+                     * evidence, but it is not an independently forceable
+                     * candidate and therefore cannot win dispatch. One sample
+                     * proves the observed call remains executable without
+                     * spending the promotion timing budget on the same
+                     * effective Pairwise route a second time.
+                     */
+                    const int candidate_warmups = route_ok ? warmups : 0;
+                    const int candidate_samples = route_ok ? samples : 1;
+                    const StrongTimingMeasurement timing =
+                        timeStrongTrainerCandidate(
+                            candidate_warmups,
+                            candidate_samples,
+                            run_candidate);
+                    const bool numerical_correctness =
+                        comparison.nonfinite_count == 0;
+                    const bool correctness_pass =
+                        route_ok &&
+                        comparison.bitwiseEqual() &&
+                        repeat_byte_mismatches == 0 &&
+                        numerical_correctness;
+                    if (route_ok)
+                    {
+                        EXPECT_TRUE(comparison.bitwiseEqual())
+                            << format.name << " M=" << M << " candidate="
+                            << candidate.name
+                            << " is a forceable production grouped route and "
+                               "must be byte-identical to serial M=1 decode";
+                        EXPECT_EQ(repeat_byte_mismatches, 0u)
+                            << format.name << " M=" << M << " candidate="
+                            << candidate.name
+                            << " changed native output bytes across repeats";
+                    }
+                    const double speedup =
+                        timing.evidence.median > 0.0
+                            ? serial_timing.evidence.median /
+                                  timing.evidence.median
+                            : 0.0;
+                    rows.push_back(CandidateRow{
+                        candidate,
+                        timing,
+                        comparison,
+                        route,
+                        repeat_byte_mismatches,
+                        speedup,
+                        candidate_warmups,
+                        route_ok,
+                        numerical_correctness,
+                        correctness_pass});
+                }
+
+                int best_index = -1;
+                for (size_t index = 0; index < rows.size(); ++index)
+                {
+                    if (!rows[index].correctness_pass)
+                        continue;
+                    if (best_index < 0 ||
+                        rows[index].timing.evidence.median <
+                            rows[static_cast<size_t>(best_index)]
+                                .timing.evidence.median)
+                    {
+                        best_index = static_cast<int>(index);
+                    }
+                }
+                ASSERT_GE(best_index, 0)
+                    << format.name << " M=" << M
+                    << " has no byte-exact production grouped candidate";
+
+                for (size_t index = 0; index < rows.size(); ++index)
+                {
+                    const CandidateRow &row = rows[index];
+                    if (csv)
+                    {
+                        std::fprintf(
+                            csv,
+                            "cpu,verifier_rows,%s,%u,%u,%s,eager,%d,%d,%d,%s,%s,%s,%s,%d,%zu,"
+                            "%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,"
+                            "%.9g,%.9g,%.9g,%.9g,%s,%s,%s,%d,%s,%d,%d,%d,%d,%d\n",
+                            format.name.c_str(),
+                            static_cast<unsigned>(packed.codebook_id),
+                            static_cast<unsigned>(packed.codebook_id),
+                            shape_name.c_str(),
+                            M,
+                            N,
+                            K,
+                            row.candidate.name,
+                            row.route.build_isa.c_str(),
+                            requested_runtime_isa.c_str(),
+                            row.route.isa.c_str(),
+                            row.route.threads,
+                            weight_bytes,
+                            row.timing_warmup_count,
+                            static_cast<int>(row.timing.samples_us.size()),
+                            row.timing.evidence.min,
+                            row.timing.evidence.median,
+                            row.timing.evidence.p95,
+                            row.timing.evidence.mad,
+                            row.timing.evidence.cv,
+                            serial_timing.evidence.median,
+                            row.speedup,
+                            row.comparison.mismatch_count,
+                            row.comparison.first_mismatch_index,
+                            row.repeat_byte_mismatches,
+                            row.comparison.max_abs,
+                            row.comparison.relative_l2,
+                            row.comparison.cosine,
+                            row.comparison.symmetric_kld,
+                            row.comparison.actual_digest.c_str(),
+                            serial_digest.c_str(),
+                            row.timing.evidence.digest.c_str(),
+                            row.route_ok ? 1 : 0,
+                            row.route.effective_policy.c_str(),
+                            row.route.k_tiles,
+                            row.route.n_block_chunks,
+                            row.numerical_correctness ? 1 : 0,
+                            row.correctness_pass ? 1 : 0,
+                            static_cast<int>(index) == best_index ? 1 : 0);
+                        ++emitted_rows;
+                    }
+
+                    if (timing_csv)
+                    {
+                        for (size_t sample_index = 0;
+                             sample_index < row.timing.samples_us.size();
+                             ++sample_index)
+                        {
+                            const double latency_us =
+                                row.timing.samples_us[sample_index];
+                            std::fprintf(
+                                timing_csv,
+                                "cpu,verifier_rows,%s,%u,%u,%s,eager,%d,%d,%d,%s,%s,%s,%s,%zu,%.9f,%a\n",
+                                format.name.c_str(),
+                                static_cast<unsigned>(packed.codebook_id),
+                                static_cast<unsigned>(packed.codebook_id),
+                                shape_name.c_str(),
+                                M,
+                                N,
+                                K,
+                                row.candidate.name,
+                                row.route.build_isa.c_str(),
+                                requested_runtime_isa.c_str(),
+                                row.route.isa.c_str(),
+                                sample_index,
+                                latency_us,
+                                latency_us);
+                        }
+                    }
+                }
+                if (csv)
+                    std::fflush(csv);
+                if (timing_csv)
+                    std::fflush(timing_csv);
+
+                const CandidateRow &best =
+                    rows[static_cast<size_t>(best_index)];
+                std::fprintf(
+                    stderr,
+                    "[CPUNativeVNNI][VERIFIER][STRONG] format=%s codebook=%u shape=%s M=%d candidate=%s build_isa=%s requested_runtime_isa=%s effective_runtime_isa=%s median_us=%.3f speedup=%.3f bit_mismatches=%zu repeat_byte_mismatches=%zu\n",
+                    format.name.c_str(),
+                    static_cast<unsigned>(packed.codebook_id),
+                    shape_name.c_str(),
+                    M,
+                    best.candidate.name,
+                    best.route.build_isa.c_str(),
+                    requested_runtime_isa.c_str(),
+                    best.route.isa.c_str(),
+                    best.timing.evidence.median,
+                    best.speedup,
+                    best.comparison.mismatch_count,
+                    best.repeat_byte_mismatches);
+                ++executed_cases;
+            }
+
+            if (executed_cases >= max_cases)
+                break;
+        }
+
+        if (csv)
+        {
+            ASSERT_EQ(std::fclose(csv), 0);
+            ASSERT_GT(emitted_rows, 0);
+        }
+        if (timing_csv)
+            ASSERT_EQ(std::fclose(timing_csv), 0);
+        ASSERT_GT(executed_cases, 0)
+            << "No strong CPU verifier-row cases selected";
+        PerfStatsCollector::reset();
     }
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRows_VNNIInstructionFloor_Synthetic)

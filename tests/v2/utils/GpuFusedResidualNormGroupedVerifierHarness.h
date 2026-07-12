@@ -19,6 +19,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -271,18 +272,19 @@ namespace llaminar2::test::gpu_fused_residual_norm_verifier
         // previously exposed model-only grouped verifier drift that a 4096
         // matrix could not detect.
         constexpr std::array<int, 3> column_counts = {128, 4096, 5120};
+        constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
 
         for (int cols : column_counts)
         {
             const auto input_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0xF2010000u ^ static_cast<uint32_t>(cols));
             const auto residual_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0xF2020000u ^ static_cast<uint32_t>(cols));
             const auto gamma_values = makeGamma(static_cast<size_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string(backend_label) + " format=" + format_label +

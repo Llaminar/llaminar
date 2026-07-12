@@ -378,7 +378,7 @@ namespace llaminar2
             /*
              * FP16/BF16 floating weights currently pair with FP32 hidden rows
              * and FP32 projection outputs in the graph pipeline.  For verifier
-             * M=1..4 rows, use the same fixed-order custom kernel as grouped
+             * runtime-M rows, use the same fixed-order custom kernel as grouped
              * publication so serial decode and grouped verifier rows share one
              * device-resident numerical contract.  Larger non-verifier FP16/BF16
              * GEMMs are intentionally not routed through the FP32 cuBLAS adapter:
@@ -388,11 +388,11 @@ namespace llaminar2
             {
                 DeviceWorkspaceManager *effective_workspace = workspace ? workspace : bound_workspace_;
                 if (!transpose_B || alpha != 1.0f || beta != 0.0f || d_bias ||
-                    m < 1 || m > 4 || n <= 0 || k <= 0 || !d_weights_ ||
+                    m < 1 || n <= 0 || k <= 0 || !d_weights_ ||
                     !gpu_stream_ || !effective_workspace)
                 {
                     LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] FP32x16 verifier projection requires "
-                              << "transpose_B, alpha=1, beta=0, no bias, M=1..4, stream, and workspace"
+                              << "transpose_B, alpha=1, beta=0, no bias, M>=1, stream, and workspace"
                               << " M=" << m << " N=" << n << " K=" << k
                               << " precision=" << static_cast<int>(precision_)
                               << " stream=" << gpu_stream_
@@ -472,7 +472,7 @@ namespace llaminar2
             /*
              * Decode-sized FP32 stage projections need the same treatment as
              * FP16/BF16 above: cuBLAS is free to choose different reduction
-             * schedules for M=1 and M=2..4, which is legal GEMM behavior but
+             * schedules for serial and grouped shapes, which is legal GEMM behavior but
              * not legal for MTP verifier rows that may publish live state.
              *
              * When a graph/stage workspace is bound, route small FP32 rows
@@ -489,7 +489,7 @@ namespace llaminar2
                 alpha == 1.0f &&
                 beta == 0.0f &&
                 !d_bias &&
-                m >= 1 && m <= 4 &&
+                m == 1 &&
                 n > 0 &&
                 k > 0 &&
                 d_weights_ &&
@@ -944,9 +944,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m < 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[CUDAFloatingPointGemmKernel] grouped verifier projection requires M=1..4, got M="
+                LOG_ERROR("[CUDAFloatingPointGemmKernel] grouped verifier projection requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -1271,12 +1271,12 @@ namespace llaminar2
                           << " weights=" << (d_weights_ != nullptr));
                 return false;
             }
-            if (m < 1 || m > 4 || n <= 0 || k <= 0 ||
+            if (m < 1 || n <= 0 || k <= 0 ||
                 static_cast<size_t>(n) != N_ ||
                 static_cast<size_t>(k) != K_)
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
-                          << "requires M=1..4 and dimensions matching the down weights"
+                          << "requires M>=1 and dimensions matching the down weights"
                           << " M=" << m << " N=" << n << " K=" << k
                           << " weight_N=" << N_ << " weight_K=" << K_);
                 return false;

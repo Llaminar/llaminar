@@ -40,8 +40,7 @@ namespace llaminar2
         int shmemSpinTimeoutMs()
         {
             return collective_timeout_policy::effectiveCollectTimeoutMs(
-                debugEnv().tp_collect_timeout_ms,
-                /*cold_start_completed=*/true);
+                debugEnv().tp_collect_timeout_ms);
         }
 
         std::string makeUniqueShmemName(int domain_id)

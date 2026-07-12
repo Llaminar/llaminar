@@ -34,6 +34,7 @@ namespace llaminar2
         struct AttentionDeviceParams
         {
             int kv_len = 0;          ///< Visible KV positions for this query row.
+            int kv_stride = 0;       ///< Physical request-major K/V row capacity.
             int position_offset = 0; ///< Absolute model position of this query row.
             int mask_stride = 0;     ///< Row stride of the optional attention mask.
         };

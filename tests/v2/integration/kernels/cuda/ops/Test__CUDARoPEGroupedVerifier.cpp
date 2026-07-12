@@ -4,7 +4,7 @@
  *
  * This explicit CUDA suite drives CUDARoPEKernelT through its tensor-aware
  * production API on a non-default stream. The shared harness covers every CUDA
- * activation format, M=2..4, full and supported partial RoPE, and both device
+ * activation format, every certified runtime M, full and supported partial RoPE, and both device
  * position owners while requiring native byte equality against CUDA M=1 decode.
  */
 

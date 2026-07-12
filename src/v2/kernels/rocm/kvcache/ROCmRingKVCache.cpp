@@ -84,18 +84,18 @@ namespace llaminar2
 
     extern "C" hipError_t hip_ring_gather_batched_device_state_fp32(
         float *, float *, const float *const *, const float *const *,
-        const int *, const int *, int, int, int, int, int, hipStream_t);
+        const int *, const int *, int, int, int, int, int, bool, hipStream_t);
     extern "C" hipError_t hip_ring_gather_batched_device_state_fp16(
         _Float16 *, _Float16 *, const _Float16 *const *, const _Float16 *const *,
-        const int *, const int *, int, int, int, int, int, hipStream_t);
+        const int *, const int *, int, int, int, int, int, bool, hipStream_t);
     extern "C" hipError_t hip_ring_gather_batched_device_state_bf16(
         hip_bfloat16 *, hip_bfloat16 *,
         const hip_bfloat16 *const *, const hip_bfloat16 *const *,
-        const int *, const int *, int, int, int, int, int, hipStream_t);
+        const int *, const int *, int, int, int, int, int, bool, hipStream_t);
     extern "C" hipError_t hip_ring_gather_batched_device_state_q8_1(
         Q8_1Block *, Q8_1Block *,
         const Q8_1Block *const *, const Q8_1Block *const *,
-        const int *, const int *, int, int, int, int, int, hipStream_t);
+        const int *, const int *, int, int, int, int, int, bool, hipStream_t);
     extern "C" hipError_t hip_ring_gather_batched_converted_device_state_fp32(
         _Float16 *, _Float16 *, const float *const *, const float *const *,
         const int *, const int *, int, int, int, int, int, int, int,
@@ -880,7 +880,7 @@ namespace llaminar2
     {
         if (layer < 0 || layer >= n_layers_ ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
-            verifier_rows < 1 || verifier_rows > 4 ||
+            verifier_rows < 1 ||
             !K || !V || !gpu_stream)
         {
             LOG_ERROR("[ROCmRingKVCache] Invalid verifier append request: layer="
@@ -1754,7 +1754,8 @@ namespace llaminar2
                 const_cast<const float *const *>(d_batched_k_entry_table_),
                 const_cast<const float *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, num_seqs,
-                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                out_max_kv_len, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/true, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
@@ -1763,7 +1764,8 @@ namespace llaminar2
                 const_cast<const _Float16 *const *>(d_batched_k_entry_table_),
                 const_cast<const _Float16 *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, num_seqs,
-                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                out_max_kv_len, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/true, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
@@ -1772,7 +1774,8 @@ namespace llaminar2
                 const_cast<const hip_bfloat16 *const *>(d_batched_k_entry_table_),
                 const_cast<const hip_bfloat16 *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, num_seqs,
-                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                out_max_kv_len, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/true, stream);
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
@@ -1781,7 +1784,8 @@ namespace llaminar2
                 const_cast<const Q8_1Block *const *>(d_batched_k_entry_table_),
                 const_cast<const Q8_1Block *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, num_seqs,
-                out_max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                out_max_kv_len, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/true, stream);
         }
         if (launch_error != hipSuccess)
             return -1;
@@ -1794,7 +1798,6 @@ namespace llaminar2
         int layer,
         int first_seq_idx,
         int request_count,
-        int max_kv_len,
         ITensor **out_k,
         ITensor **out_v,
         void *gpu_stream)
@@ -1809,7 +1812,6 @@ namespace llaminar2
             request_count <= batch_size_ &&
             first_seq_idx <= batch_size_ - request_count;
         if (layer < 0 || layer >= n_layers_ || !request_range_valid ||
-            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
             !gpu_stream || !workspace_ || !workspace_->isAllocated() ||
             !d_head_params_ || !d_count_params_ ||
             !batched_pointer_tables_ready_)
@@ -1818,7 +1820,6 @@ namespace llaminar2
                       << " layer=" << layer
                       << " first_seq=" << first_seq_idx
                       << " requests=" << request_count
-                      << " max_kv_len=" << max_kv_len
                       << " batch_capacity=" << batch_size_
                       << " max_seq_len=" << max_seq_len_
                       << " stream=" << gpu_stream
@@ -1829,7 +1830,8 @@ namespace llaminar2
         }
 
         const size_t rows =
-            static_cast<size_t>(request_count) * static_cast<size_t>(max_kv_len);
+            static_cast<size_t>(request_count) *
+            static_cast<size_t>(max_seq_len_);
         if (kv_storage_dim_ <= 0 ||
             rows > std::numeric_limits<size_t>::max() /
                        static_cast<size_t>(kv_storage_dim_) ||
@@ -1866,7 +1868,8 @@ namespace llaminar2
                 const_cast<const float *const *>(d_batched_k_entry_table_),
                 const_cast<const float *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                max_seq_len_, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/false, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
         {
@@ -1876,7 +1879,8 @@ namespace llaminar2
                 const_cast<const _Float16 *const *>(d_batched_k_entry_table_),
                 const_cast<const _Float16 *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                max_seq_len_, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/false, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
@@ -1886,7 +1890,8 @@ namespace llaminar2
                 const_cast<const hip_bfloat16 *const *>(d_batched_k_entry_table_),
                 const_cast<const hip_bfloat16 *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                max_seq_len_, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/false, stream);
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
@@ -1896,7 +1901,8 @@ namespace llaminar2
                 const_cast<const Q8_1Block *const *>(d_batched_k_entry_table_),
                 const_cast<const Q8_1Block *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_storage_dim_, stream);
+                max_seq_len_, max_seq_len_, kv_storage_dim_,
+                /*zero_inactive_rows=*/false, stream);
         }
         if (launch_error != hipSuccess)
         {
@@ -1948,7 +1954,6 @@ namespace llaminar2
         int layer,
         int first_seq_idx,
         int request_count,
-        int max_kv_len,
         ActivationPrecision target,
         ITensor **out_k,
         ITensor **out_v,
@@ -1968,7 +1973,6 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
             request_count <= 0 ||
             first_seq_idx > batch_size_ - request_count ||
-            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
             target != ActivationPrecision::FP16 || !read.gpu_stream ||
             requested_heads != local_n_kv_heads_ ||
             requested_head_dim != head_dim_ ||
@@ -1982,7 +1986,6 @@ namespace llaminar2
                       << " layer=" << layer
                       << " first_seq=" << first_seq_idx
                       << " requests=" << request_count
-                      << " max_kv_len=" << max_kv_len
                       << " target=" << activationPrecisionToString(target)
                       << " heads=" << requested_heads
                       << " head_dim=" << requested_head_dim
@@ -1992,7 +1995,7 @@ namespace llaminar2
         }
 
         const size_t rows =
-            static_cast<size_t>(request_count) * max_kv_len;
+            static_cast<size_t>(request_count) * max_seq_len_;
         const size_t required_bytes =
             rows * static_cast<size_t>(kv_dim_) * sizeof(_Float16);
         if (!ensureConvScratch(required_bytes) ||
@@ -2015,7 +2018,7 @@ namespace llaminar2
                 const_cast<const float *const *>(d_batched_k_entry_table_),
                 const_cast<const float *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                max_seq_len_, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
                 read.rope_theta, read.position_start, effective_rope_dim, stream);
         }
         else if constexpr (Precision == ActivationPrecision::FP16)
@@ -2025,7 +2028,7 @@ namespace llaminar2
                 const_cast<const _Float16 *const *>(d_batched_k_entry_table_),
                 const_cast<const _Float16 *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                max_seq_len_, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
                 read.rope_theta, read.position_start, effective_rope_dim, stream);
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
@@ -2035,7 +2038,7 @@ namespace llaminar2
                 const_cast<const hip_bfloat16 *const *>(d_batched_k_entry_table_),
                 const_cast<const hip_bfloat16 *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                max_seq_len_, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
                 read.rope_theta, read.position_start, effective_rope_dim, stream);
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
@@ -2045,7 +2048,7 @@ namespace llaminar2
                 const_cast<const Q8_1Block *const *>(d_batched_k_entry_table_),
                 const_cast<const Q8_1Block *const *>(d_batched_v_entry_table_),
                 d_head_params_, d_count_params_, entry_offset, request_count,
-                max_kv_len, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
+                max_seq_len_, max_seq_len_, kv_dim_, local_n_kv_heads_, head_dim_,
                 read.rope_theta, read.position_start, effective_rope_dim, stream);
         }
         if (status != hipSuccess)
@@ -2364,13 +2367,22 @@ namespace llaminar2
     WorkspaceRequirements ROCmRingKVCache<Precision>::getWorkspaceRequirements(
         int m, int n, int k) const
     {
-        // New callers pass m=max graph tokens and n=batch size so conversion
-        // scratch can follow bucket/chunk size. Legacy one-arg callers used
-        // m=batch size; keep that behavior and size scratch to max_seq_len_.
+        /*
+         * New callers pass m as the active graph bucket and n as the request
+         * batch. Resident attention gathers the complete post-append KV horizon,
+         * which can exceed the current prefill chunk after the first chunk. Size
+         * conversion scratch to the cache's configured sequence horizon so graph
+         * replay never outgrows its stable workspace pointers.
+         *
+         * Legacy one-argument callers use m as a batch hint. Preserve that API
+         * and reserve at least the cache's configured batch capacity.
+         */
         (void)k;
         const bool has_token_hint = n > 0;
         const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
-        const int scratch_tokens = has_token_hint ? m : max_seq_len_;
+        const int scratch_tokens = has_token_hint
+                                       ? std::max(m, max_seq_len_)
+                                       : max_seq_len_;
         const int bounded_batch_size =
             std::max(std::max(1, actual_batch_size), batch_size_);
         const int bounded_scratch_tokens = std::max(1, scratch_tokens);

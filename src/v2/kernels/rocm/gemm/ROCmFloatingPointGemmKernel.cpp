@@ -396,7 +396,7 @@ namespace llaminar2
             /*
              * FP16/BF16 persistent floating weights still consume FP32 hidden
              * rows and produce FP32 projection outputs in the current graph
-             * pipeline.  Verifier M=1..4 rows must use the same fixed-order
+             * pipeline.  Runtime verifier rows must use the same fixed-order
              * device path as grouped publication; otherwise serial decode and
              * grouped MTP rows could diverge through different hipBLAS choices.
              */
@@ -404,11 +404,11 @@ namespace llaminar2
             {
                 DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
                 if (!transpose_B || alpha != 1.0f || beta != 0.0f || d_bias ||
-                    m < 1 || m > 4 || n <= 0 || k <= 0 || !d_weights_ ||
+                    m < 1 || n <= 0 || k <= 0 || !d_weights_ ||
                     !gpu_stream_ || !effective_workspace)
                 {
                     LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] FP32x16 verifier projection requires "
-                              << "transpose_B, alpha=1, beta=0, no bias, M=1..4, stream, and workspace"
+                              << "transpose_B, alpha=1, beta=0, no bias, M>=1, stream, and workspace"
                               << " M=" << m << " N=" << n << " K=" << k
                               << " precision=" << static_cast<int>(precision_)
                               << " stream=" << gpu_stream_
@@ -928,9 +928,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m < 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] grouped verifier projection requires M=1..4, got M="
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] grouped verifier projection requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -1160,12 +1160,12 @@ namespace llaminar2
                           << " weights=" << (d_weights_ != nullptr));
                 return false;
             }
-            if (m < 1 || m > 4 || n <= 0 || k <= 0 ||
+            if (m < 1 || n <= 0 || k <= 0 ||
                 static_cast<size_t>(n) != N_ ||
                 static_cast<size_t>(k) != K_)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] "
-                          << "requires M=1..4 and dimensions matching the down weights"
+                          << "requires M>=1 and dimensions matching the down weights"
                           << " M=" << m << " N=" << n << " K=" << k
                           << " weight_N=" << N_ << " weight_K=" << K_);
                 return false;

@@ -26,6 +26,7 @@
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -37,6 +38,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -156,6 +158,8 @@ extern "C" bool cudaMoE_build_runtime_original_to_grouped(
 namespace
 {
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
+    using llaminar2::test::kGroupedVerifierBoundaryRows;
+    using llaminar2::test::kGroupedVerifierRuntimeRows;
 
     std::shared_ptr<llaminar2::FP32Tensor> makeTensor(const std::vector<size_t> &shape,
                                                       const std::vector<float> &values)
@@ -660,9 +664,7 @@ namespace
     {
     public:
         ScopedCudaMoEGemmConfig()
-            : old_gateup_kpart_decode_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kpart_decode),
-              old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
-              old_down_kpart_decode_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
+            : old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
               old_down_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kparts)
         {
         }
@@ -670,25 +672,19 @@ namespace
         ~ScopedCudaMoEGemmConfig()
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kpart_decode = old_gateup_kpart_decode_;
             gemm.cuda_moe_gateup_kparts = old_gateup_kparts_;
-            gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
             gemm.cuda_moe_down_kparts = old_down_kparts_;
         }
 
-        void set(bool gateup_kpart, int gateup_kparts, bool down_kpart, int down_kparts)
+        void set(int gateup_kparts, int down_kparts)
         {
             auto &gemm = llaminar2::mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kpart_decode = gateup_kpart;
             gemm.cuda_moe_gateup_kparts = gateup_kparts;
-            gemm.cuda_moe_down_kpart_decode = down_kpart;
             gemm.cuda_moe_down_kparts = down_kparts;
         }
 
     private:
-        bool old_gateup_kpart_decode_ = true;
         int old_gateup_kparts_ = 16;
-        bool old_down_kpart_decode_ = true;
         int old_down_kparts_ = 16;
     };
 
@@ -865,8 +861,21 @@ namespace
         const std::string expected_active_slots = std::to_string(active_slots);
         const std::string expected_num_experts = std::to_string(num_experts);
         const std::string expected_tile = std::to_string(expected_tile_m);
+        const bool expected_kpart_gateup =
+            expected_gateup_route &&
+            std::string(expected_gateup_route) == "kpart_prefill";
+        const int splitk_tile_rows = std::min(
+            seq_len,
+            llaminar2::MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const std::string expected_splitk_tile_rows =
+            std::to_string(splitk_tile_rows);
+        const std::string expected_splitk_tile_count =
+            std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
         const std::string expected_tile_n =
-            std::to_string((active_slots > 0 && seq_len <= 4) ? 64 : 128);
+            std::to_string(
+                (active_slots > 0 && (seq_len <= 4 || expected_kpart_gateup))
+                    ? 64
+                    : 128);
         const auto match = std::find_if(
             records.begin(),
             records.end(),
@@ -877,24 +886,38 @@ namespace
                     const auto it = record.tags.find(key);
                     return it != record.tags.end() && it->second == value;
                 };
+                const auto tile_it = record.tags.find("tile_m");
+                const bool valid_runtime_tile =
+                    tile_it != record.tags.end() &&
+                    (tile_it->second == "2" || tile_it->second == "4" ||
+                     tile_it->second == "8" || tile_it->second == "16");
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals("swiglu_path", expected_path) &&
                        tag_equals("total_slots", expected_total_slots) &&
                        tag_equals("activation_quant_rows", std::to_string(seq_len)) &&
                        tag_equals("active_expert_slots", expected_active_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
-                       tag_equals("tile_m", expected_tile) &&
+                       (expected_tile_m > 0
+                            ? tag_equals("tile_m", expected_tile)
+                            : valid_runtime_tile) &&
                        tag_equals("tile_n", expected_tile_n) &&
                        (!expected_gateup_route ||
                         tag_equals("gateup_route", std::string(expected_gateup_route))) &&
                        (!expected_down_route ||
                         tag_equals("down_route", std::string(expected_down_route))) &&
                        (!expected_down_accumulation ||
-                        tag_equals("down_accumulation", std::string(expected_down_accumulation)));
+                        tag_equals("down_accumulation", std::string(expected_down_accumulation))) &&
+                       (!expected_kpart_gateup ||
+                        (tag_equals("splitk_tile_rows", expected_splitk_tile_rows) &&
+                         tag_equals("splitk_tile_count", expected_splitk_tile_count)));
             });
         ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
                                         << swiglu_path << " seq_len=" << seq_len
-                                        << " tile_m=" << expected_tile_m << "\n"
+                                        << " tile_m="
+                                        << (expected_tile_m > 0
+                                                ? expected_tile
+                                                : std::string("runtime_policy"))
+                                        << "\n"
                                         << llaminar2::PerfStatsCollector::jsonString(
                                                {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
         EXPECT_GE(match->count, 1u);
@@ -9375,7 +9398,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    constexpr int seq_len = 2;
+    constexpr int seq_len = llaminar2::test::kGroupedVerifierRuntimeRows.back();
     constexpr int d_model = 2048;
     constexpr int num_experts = 256;
     constexpr int top_k = 8;
@@ -9444,7 +9467,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
     expectNearArray(captured_weights.data(), cpu_weights->data(), captured_weights.size(), 1.0e-4f);
 
     const auto records =
-        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_decode_equivalent_small_m_calls"});
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_decode_equivalent_runtime_m_calls"});
     const auto match = std::find_if(records.begin(), records.end(), [&](const llaminar2::PerfStatRecord &record)
                                     {
                                         auto tag_equals = [&](const char *key, const std::string &value)
@@ -9452,7 +9475,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
                                             const auto it = record.tags.find(key);
                                             return it != record.tags.end() && it->second == value;
                                         };
-                                        return record.name == "cuda_moe_router_decode_equivalent_small_m_calls" &&
+                                        return record.name == "cuda_moe_router_decode_equivalent_runtime_m_calls" &&
                                                tag_equals("seq_len", std::to_string(seq_len)) &&
                                                tag_equals("d_model", std::to_string(d_model)) &&
                                                tag_equals("num_experts", std::to_string(num_experts)) &&
@@ -9513,7 +9536,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecode
                          0.0007f * static_cast<float>(static_cast<int>(i % 23) - 11);
     auto gate = makeTensor({num_experts, d_model}, gate_values);
 
-    for (int seq_len : {1, 2, 3, 4})
+    for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
         std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
         for (size_t i = 0; i < hidden_values.size(); ++i)
@@ -9597,11 +9620,11 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecode
     }
 
     const auto records =
-        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_decode_equivalent_small_m_calls"});
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_router_decode_equivalent_runtime_m_calls"});
     const auto q8_match = std::find_if(records.begin(), records.end(), [](const llaminar2::PerfStatRecord &record)
                                        {
                                            const auto route_it = record.tags.find("route");
-                                           return record.name == "cuda_moe_router_decode_equivalent_small_m_calls" &&
+                                           return record.name == "cuda_moe_router_decode_equivalent_runtime_m_calls" &&
                                                   route_it != record.tags.end() &&
                                                   route_it->second == "grouped_decode_equivalent_q8";
                                        });
@@ -9861,7 +9884,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddFromTensorsMatchesCPU)
     expectNearArray(shared_cuda->data(), shared_cpu->data(), shared_cuda->numel(), 0.0f);
 }
 
-TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRows)
+TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -9883,7 +9906,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRow
     auto gate = makeTensor({static_cast<size_t>(d_model)}, gate_values);
     ASSERT_TRUE(gate->ensureOnDevice(device, stream_));
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
         std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
         std::vector<float> shared_values(static_cast<size_t>(seq_len) * d_model);
@@ -9998,7 +10021,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateVerifierRowsM234MatchSerialDecodeRow
  * partial `combined = routed_partial + gate * shared_partial`, then the TP
  * collective sums those partials.  Single-device gate tests cannot catch bugs in
  * that participant-sum contract, so this regression runs two real CUDA devices,
- * compares grouped M=2/3/4 verifier rows against M=1 serial rows, and requires
+ * compares grouped runtime-M verifier rows against M=1 serial rows, and requires
  * the allreduced FP32 byte stream to match exactly.
  */
 TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce)
@@ -10044,7 +10067,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAl
             sum[i] += partial[i];
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE("seq_len=" + std::to_string(seq_len));
         const size_t element_count = static_cast<size_t>(seq_len) * d_model;
@@ -10180,7 +10203,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAl
 /**
  * @brief Prove NCCL LocalTP verifier allreduce is invariant to row grouping.
  *
- * The model-level grouped verifier runs M=2..4 rows through the target graph and
+ * The model-level grouped verifier runs runtime-M rows through the target graph and
  * allreduces `M * d_model` FP32 elements, while ordinary serial decode allreduces
  * exactly one `d_model` row per token.  For MTP publication those two schedules
  * must produce the same bytes for every row.  This test uses the production
@@ -10189,7 +10212,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAl
  * FP16 transport and 5120-wide Qwen hidden state reproduce the threshold bug:
  * one row is below the 8192 cutoff while every grouped depth is above it.
  */
-TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows)
+TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -10240,7 +10263,7 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceM234MatchesSerialRows
         ASSERT_TRUE(ok[1]) << stage_name << " participant 1";
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE("seq_len=" + std::to_string(seq_len));
         const size_t element_count = static_cast<size_t>(seq_len) * d_model;
@@ -10363,11 +10386,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
     ScopedCudaMoERouterQ8Config router_q8_config(
         /*router_q8=*/true,
         /*reuse_router_q8_hidden=*/true);
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     const auto formats = cudaMoEGroupedNativeFormats();
@@ -10482,11 +10501,20 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
              * below.  That is intentional: row replay is a test oracle here, never the
              * production verifier path.
              */
-            auto planning_input = makeZeros({4u, static_cast<size_t>(d_model)});
-            auto planning_output = makeZeros({4u, static_cast<size_t>(d_model)});
+            constexpr int kVerifierRowCapacity =
+                llaminar2::test::kGroupedVerifierRuntimeRows.back();
+            auto planning_input = makeZeros(
+                {static_cast<size_t>(kVerifierRowCapacity), static_cast<size_t>(d_model)});
+            auto planning_output = makeZeros(
+                {static_cast<size_t>(kVerifierRowCapacity), static_cast<size_t>(d_model)});
             auto planning_stage = make_stage(
-                make_params(planning_input.get(), planning_output.get(), 4, true));
-            auto reqs = planning_stage->getWorkspaceRequirements(4, d_model, intermediate);
+                make_params(
+                    planning_input.get(),
+                    planning_output.get(),
+                    kVerifierRowCapacity,
+                    true));
+            auto reqs = planning_stage->getWorkspaceRequirements(
+                kVerifierRowCapacity, d_model, intermediate);
             /*
              * Production Qwen3.6 graphs colocate 256-entry routed tables and
              * singleton shared tables.  Reserve the routed width here so the
@@ -10494,7 +10522,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
              * instead of an isolated one-expert allocation.
              */
             reqs.merge(llaminar2::MoEWorkspaceBuffers::cudaMoE(
-                /*max_seq_len=*/4,
+                /*max_seq_len=*/kVerifierRowCapacity,
                 d_model,
                 intermediate,
                 routed_experts,
@@ -10652,7 +10680,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
 
             llaminar2::CUDADeviceContext ctx(device, 0);
 
-            for (int seq_len : {2, 3, 4})
+            for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
             {
                 std::vector<float> input_values(static_cast<size_t>(seq_len) * d_model);
                 for (size_t i = 0; i < input_values.size(); ++i)
@@ -10946,12 +10974,15 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertFFNStageVerifierRowsQwen36AllNativeForma
                     grouped_table_rows += record.value;
                 }
             }
-            EXPECT_EQ(static_cast<int>(grouped_table_rows), 18)
-                << "Eager and captured M=2/3/4 rows must all execute the CUDA grouped table-prefill route for "
+            int expected_grouped_table_rows = 0;
+            for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
+                expected_grouped_table_rows += 2 * seq_len;
+            EXPECT_EQ(static_cast<int>(grouped_table_rows), expected_grouped_table_rows)
+                << "Every eager and captured runtime-M row must execute the CUDA grouped table-prefill route for "
                 << format.label << "\n"
                 << llaminar2::PerfStatsCollector::summaryString({"kernel", "mtp"});
 
-            for (const int seq_len : {2, 3, 4})
+            for (const int seq_len : llaminar2::test::kGroupedVerifierRuntimeRows)
             {
                 double routed_reuse_calls = 0.0;
                 double shared_reuse_calls = 0.0;
@@ -12017,11 +12048,7 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ASSERT_TRUE(llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
@@ -12161,51 +12188,6 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
         decode_output->data(),
         decode_output->data() + decode_output->numel());
 
-    gemm_config.set(
-        /*gateup_kpart=*/false,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/false,
-        /*down_kparts=*/16);
-    auto serial_gate0 = makeZeros({intermediate});
-    auto serial_gate1 = makeZeros({intermediate});
-    auto serial_gate2 = makeZeros({intermediate});
-    auto serial_gate3 = makeZeros({intermediate});
-    auto serial_gate4 = makeZeros({intermediate});
-    auto serial_gate5 = makeZeros({intermediate});
-    auto serial_gate6 = makeZeros({intermediate});
-    auto serial_gate7 = makeZeros({intermediate});
-    auto serial_up0 = makeZeros({intermediate});
-    auto serial_up1 = makeZeros({intermediate});
-    auto serial_up2 = makeZeros({intermediate});
-    auto serial_up3 = makeZeros({intermediate});
-    auto serial_up4 = makeZeros({intermediate});
-    auto serial_up5 = makeZeros({intermediate});
-    auto serial_up6 = makeZeros({intermediate});
-    auto serial_up7 = makeZeros({intermediate});
-    std::array<llaminar2::ITensor *, top_k> serial_gate_outputs = {
-        serial_gate0.get(), serial_gate1.get(), serial_gate2.get(), serial_gate3.get(),
-        serial_gate4.get(), serial_gate5.get(), serial_gate6.get(), serial_gate7.get()};
-    std::array<llaminar2::ITensor *, top_k> serial_up_outputs = {
-        serial_up0.get(), serial_up1.get(), serial_up2.get(), serial_up3.get(),
-        serial_up4.get(), serial_up5.get(), serial_up6.get(), serial_up7.get()};
-    auto serial_decode_output = makeZeros({d_model});
-    ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
-        hidden.get(), expert_ids.data(), gateup_table, top_k,
-        serial_gate_outputs.data(), serial_up_outputs.data(), d_model, intermediate));
-    ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
-        serial_gate_outputs.data(), serial_up_outputs.data(), expert_ids.data(), expert_weights.data(),
-        down_table, top_k, serial_decode_output.get(), d_model, intermediate));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    std::vector<float> serial_decode_values(
-        serial_decode_output->data(),
-        serial_decode_output->data() + serial_decode_output->numel());
-
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
-
     auto prefill_output = makeZeros({seq_len, d_model});
     ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
         routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
@@ -12217,43 +12199,9 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
         prefill_output->data(),
         prefill_output->data() + prefill_output->numel());
 
-    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
-    auto split_prefill_output = makeZeros({seq_len, d_model});
-    ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
-        routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
-    ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
-        hidden.get(), split_prefill_output.get(), gateup_table, down_table,
-        seq_len, d_model, intermediate, num_experts, top_k));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    std::vector<float> split_prefill_values(
-        split_prefill_output->data(),
-        split_prefill_output->data() + split_prefill_output->numel());
-
-    expectVectorsClose(serial_decode_values, split_prefill_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
-    expectVectorsClose(prefill_values, split_prefill_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
-    expectVectorsClose(serial_decode_values, prefill_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
-    expectVectorsClose(decode_values, serial_decode_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
-    expectVectorsClose(decode_values, prefill_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
+    expectBitwiseFP32RowsEqual(
+        "single-token grouped prefill versus serial grouped decode",
+        prefill_values.data(), decode_values.data(), decode_values.size(), d_model);
 #endif
 }
 
@@ -12267,11 +12215,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     using llaminar2::DeviceMoERuntimeTable;
@@ -12471,11 +12415,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     auto &gemm = llaminar2::mutableDebugEnv().gemm;
     const bool old_router_q8 = gemm.cuda_moe_router_q8;
     const bool old_reuse_router_q8_hidden = gemm.cuda_moe_reuse_router_q8_hidden;
@@ -12641,11 +12581,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/false,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/false,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
 
     constexpr int num_experts = 2;
     constexpr int top_k = 1;
@@ -12843,7 +12779,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures)
+TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -12855,11 +12791,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     constexpr int top_k = 8;
@@ -12985,7 +12917,14 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         const std::string expected_num_experts = std::to_string(num_experts);
         const std::string expected_tile = std::to_string(expected_tile_m);
         const std::string expected_tile_n =
-            std::to_string((active_slots > 0 && seq_len <= 4) ? 64 : 128);
+            std::to_string(active_slots > 0 ? 64 : 128);
+        const int splitk_tile_rows = std::min(
+            seq_len,
+            llaminar2::MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const std::string expected_splitk_tile_rows =
+            std::to_string(splitk_tile_rows);
+        const std::string expected_splitk_tile_count =
+            std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
         const auto it = std::find_if(
             records.begin(),
             records.end(),
@@ -12996,17 +12935,26 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
                     const auto tag = record.tags.find(key);
                     return tag != record.tags.end() && tag->second == value;
                 };
+                const auto tile = record.tags.find("tile_m");
+                const bool valid_runtime_tile =
+                    tile != record.tags.end() &&
+                    (tile->second == "2" || tile->second == "4" ||
+                     tile->second == "8" || tile->second == "16");
                 return tag_equals("total_slots", expected_total_slots) &&
                        tag_equals("active_expert_slots", expected_active_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
-                       tag_equals("tile_m", expected_tile) &&
-                       tag_equals("tile_n", expected_tile_n);
+                       (expected_tile_m > 0
+                            ? tag_equals("tile_m", expected_tile)
+                            : valid_runtime_tile) &&
+                       tag_equals("tile_n", expected_tile_n) &&
+                       tag_equals("splitk_tile_rows", expected_splitk_tile_rows) &&
+                       tag_equals("splitk_tile_count", expected_splitk_tile_count);
             });
         ASSERT_NE(it, records.end()) << "missing verifier small-M prefill counter for seq_len="
                                      << seq_len << " tile_m=" << expected_tile_m;
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierBoundaryRows)
     {
         const auto hidden_values = make_hidden_values(seq_len);
         const auto routing_indices_values = make_routing_indices(seq_len);
@@ -13066,7 +13014,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
                            /*min_row_cosine=*/0.9998,
                            /*max_row_relative_l2=*/0.008,
                            /*max_row_kl=*/1.0e-4);
-        expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2,
+        expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                       "kpart_prefill",
                                       "ordered_kpart_prefill",
                                       "row_ordered_kpart");
@@ -13149,9 +13097,9 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         for (size_t i = 0; i < prefill_output->numel(); ++i)
             ASSERT_TRUE(std::isfinite(captured_output[i])) << "captured output element " << i;
 
-        expect_prefill_record(seq_len, 2);
+        expect_prefill_record(seq_len, 0);
         expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
-                                      2,
+                                      0,
                                       "kpart_prefill",
                                       "ordered_kpart_prefill",
                                       "row_ordered_kpart");
@@ -13161,6 +13109,25 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_small_prefill_grouping_calls"});
     ASSERT_FALSE(grouping_records.empty())
         << "MTP verifier-sized MoE prefill must keep the compact device grouping route";
+    const auto general_grouping_records =
+        llaminar2::PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_general_prefill_grouping_calls"});
+    const auto extended_depth_group = std::find_if(
+        general_grouping_records.begin(),
+        general_grouping_records.end(),
+        [](const llaminar2::PerfStatRecord &record)
+        {
+            const auto seq_len = record.tags.find("seq_len");
+            const auto total_slots = record.tags.find("total_slots");
+            return record.name == "cuda_moe_general_prefill_grouping_calls" &&
+                   seq_len != record.tags.end() && seq_len->second == "31" &&
+                   total_slots != record.tags.end() && total_slots->second == "248" &&
+                   record.count > 0;
+        });
+    EXPECT_NE(extended_depth_group, general_grouping_records.end())
+        << "M=31 must exercise CUDA's scalable count/scan/scatter planner\n"
+        << llaminar2::PerfStatsCollector::summaryString(
+               {"kernel.cuda_moe_general_prefill_grouping_calls"});
     llaminar2::PerfStatsCollector::reset();
 #endif
 }
@@ -13177,11 +13144,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     auto &cuda_moe_config = llaminar2::mutableDebugEnv().gemm;
     cuda_moe_config.cuda_moe_router_q8 = true;
     cuda_moe_config.cuda_moe_reuse_router_q8_hidden = true;
@@ -13200,7 +13163,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         llaminar2::PerfStatsCollector::reset();
 
         auto moe_reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
-            /*max_seq_len=*/4,
+            /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
             d_model,
             intermediate,
             num_experts,
@@ -13287,7 +13250,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         runtime_config.num_experts = num_experts;
         runtime_config.top_k = top_k;
         runtime_config.mirror_to_device = true;
-        runtime_config.prefill_token_capacity = 4;
+        runtime_config.prefill_token_capacity = kGroupedVerifierRuntimeRows.back();
         llaminar2::DeviceMoERuntimeTable runtime_table(runtime_config);
 
         llaminar2::MoEPlacementUpdate update;
@@ -13338,7 +13301,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             router_gate_values);
         ASSERT_TRUE(router_gate->ensureOnDevice(device, stream_));
 
-        for (int seq_len : {2, 3, 4})
+        for (const int seq_len : kGroupedVerifierRuntimeRows)
         {
             std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
             for (size_t i = 0; i < hidden_values.size(); ++i)
@@ -13475,7 +13438,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 serial_values.data(),
                 grouped_values.size(),
                 static_cast<size_t>(d_model));
-            expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2,
+            expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                           "kpart_prefill",
                                           "ordered_kpart_prefill",
                                           "row_ordered_kpart");
@@ -13528,7 +13491,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures)
+TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -13540,11 +13503,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRo
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
     llaminar2::PerfStatsCollector::reset();
 
     constexpr int num_experts = 1;
@@ -13641,7 +13600,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRo
                                      << seq_len;
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierBoundaryRows)
     {
         const auto hidden_values = make_hidden_values(seq_len);
         auto hidden = makeTensor({static_cast<size_t>(seq_len), d_model}, hidden_values);
@@ -13715,9 +13674,8 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRo
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 
         expect_shared_group_record(seq_len);
-        constexpr int kExpectedSharedExpertTileM = 2;
         expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
-                                      kExpectedSharedExpertTileM,
+                                      /*expected_tile_m=*/0,
                                       "kpart_prefill",
                                       "ordered_kpart_prefill",
                                       "row_ordered_kpart",
@@ -13736,10 +13694,11 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRo
  * ordinary one-row grouped table-decode helpers.  The model-level parity path
  * can amplify a single layer-0 ULP mismatch into a logits failure after many
  * layers, so this focused regression keeps the exact production shape
- * (`d_model=2048`, `intermediate=512`) and requires the grouped M=1..4 byte
- * stream to equal row-by-row M=1 decode for every NativeVNNI tensor format.
+ * (`d_model=2048`, `intermediate=512`) and requires each runtime-M boundary
+ * row's byte stream to equal row-by-row M=1 decode for every NativeVNNI tensor
+ * format.
  */
-TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsM1234MatchRowByRowDecode)
+TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -13751,11 +13710,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsM12
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
 
     constexpr int num_experts = 1;
     constexpr int top_k = 1;
@@ -13851,7 +13806,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsM12
             down_descs.data(), num_experts, d_model, intermediate);
         ASSERT_GE(down_table, 0);
 
-        for (int seq_len : {1, 2, 3, 4})
+        for (const int seq_len : kGroupedVerifierBoundaryRows)
         {
             SCOPED_TRACE("seq_len=" + std::to_string(seq_len));
             const auto hidden_values = make_hidden_values(seq_len);
@@ -13936,7 +13891,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsM12
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDecode)
+TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_RuntimeMBoundariesMatchRowDecode)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -13948,7 +13903,8 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
      * This is the routed-only companion to the combined shared-expert IQ3_S
      * regression above.  Qwen3.6 MoE production MTP verifier rows often have no
      * shared expert path, so the grouped routed expert pipeline itself must be
-     * decode-equivalent for M=2..4 before the graph can publish verifier rows
+     * decode-equivalent at every runtime-M tile and capacity boundary before
+     * the graph can publish verifier rows
      * from it.
      */
     constexpr int d_model = 2048;
@@ -13961,11 +13917,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/16,
-        /*down_kpart=*/true,
-        /*down_kparts=*/16);
+    gemm_config.set(/*gateup_kparts=*/16, /*down_kparts=*/16);
 
     std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
     std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
@@ -14073,8 +14025,9 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
             for (int route = 0; route < top_k; ++route)
             {
                 const int slot = row * top_k + route;
+                const int pattern_slot = (row % 4) * top_k + route;
                 indices[static_cast<size_t>(slot)] =
-                    static_cast<float>(kExperts[static_cast<size_t>(slot)]);
+                    static_cast<float>(kExperts[static_cast<size_t>(pattern_slot)]);
                 weights[static_cast<size_t>(slot)] =
                     0.09f + 0.013f * static_cast<float>((slot * 5 + 3) % 11);
                 sum += weights[static_cast<size_t>(slot)];
@@ -14087,7 +14040,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
         }
     };
 
-    for (int seq_len : {2, 3, 4})
+    for (const int seq_len : kGroupedVerifierBoundaryRows)
     {
         auto hidden = make_hidden(seq_len);
         ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
@@ -14195,7 +14148,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedOnlyVerifierPrefill_IQ3S_M234MatchesRowByRowDe
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_M234MatchRowByRowDecode)
+TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -14223,13 +14176,42 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
-    gemm_config.set(
-        /*gateup_kpart=*/true,
-        /*gateup_kparts=*/4,
-        /*down_kpart=*/true,
-        /*down_kparts=*/4);
+    gemm_config.set(/*gateup_kparts=*/4, /*down_kparts=*/4);
 
     const auto formats = cudaMoEGroupedNativeFormats();
+    auto expect_unmasked_grouping_record = [&](int seq_len)
+    {
+        const bool compact = seq_len <= 4 && seq_len * top_k <= 64;
+        const std::string counter_name =
+            compact
+                ? "cuda_moe_small_prefill_grouping_calls"
+                : "cuda_moe_general_prefill_grouping_calls";
+        const auto records = llaminar2::PerfStatsCollector::snapshot(
+            {"kernel." + counter_name});
+        const std::string expected_seq_len = std::to_string(seq_len);
+        const std::string expected_total_slots = std::to_string(seq_len * top_k);
+        const auto record = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &candidate)
+            {
+                const auto seq = candidate.tags.find("seq_len");
+                const auto slots = candidate.tags.find("total_slots");
+                return candidate.name == counter_name &&
+                       seq != candidate.tags.end() &&
+                       seq->second == expected_seq_len &&
+                       slots != candidate.tags.end() &&
+                       slots->second == expected_total_slots &&
+                       candidate.count > 0;
+            });
+        EXPECT_NE(record, records.end())
+            << "CUDA grouped verifier M=" << seq_len
+            << " must exercise the " << (compact ? "compact" : "scalable")
+            << " device planner\n"
+            << llaminar2::PerfStatsCollector::summaryString(
+                   {"kernel." + counter_name});
+    };
+
     for (const auto &gateup_format : formats)
     {
         for (const auto &down_format : formats)
@@ -14240,7 +14222,7 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             std::string(gateup_format.label) + "/" + down_format.label;
 
         auto moe_reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
-            /*max_seq_len=*/4,
+            /*max_seq_len=*/kGroupedVerifierRuntimeRows.back(),
             d_model,
             intermediate,
             num_experts,
@@ -14349,12 +14331,17 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             down_descs.data(), num_experts, d_model, intermediate);
         ASSERT_GE(down_table, 0) << case_label << " down descriptor table";
 
-        std::array<std::vector<float>, 3> routed_only_outputs;
+        const std::span<const int> row_inventory =
+            gateup_format.codebook_id == down_format.codebook_id
+                ? std::span<const int>(kGroupedVerifierRuntimeRows)
+                : std::span<const int>(kGroupedVerifierBoundaryRows);
+        std::vector<std::vector<float>> routed_only_outputs(row_inventory.size());
         for (const bool masked_local_tp : {false, true})
         {
         SCOPED_TRACE(masked_local_tp ? "masked LocalTP" : "routed-only");
-        for (int seq_len : {2, 3, 4})
+        for (size_t row_case = 0; row_case < row_inventory.size(); ++row_case)
         {
+            const int seq_len = row_inventory[row_case];
             auto hidden = llaminar2::test::TestTensorFactory::createFP32(
                 {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
             for (size_t i = 0; i < hidden->numel(); ++i)
@@ -14554,13 +14541,12 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                 rowwise_expected.data(),
                 grouped_values.size(),
                 static_cast<size_t>(d_model));
-            const size_t output_slot = static_cast<size_t>(seq_len - 2);
             if (masked_local_tp)
             {
-                ASSERT_EQ(routed_only_outputs[output_slot].size(), grouped_values.size());
+                ASSERT_EQ(routed_only_outputs[row_case].size(), grouped_values.size());
                 EXPECT_NE(
                     std::memcmp(
-                        routed_only_outputs[output_slot].data(),
+                        routed_only_outputs[row_case].data(),
                         grouped_values.data(),
                         grouped_values.size() * sizeof(float)),
                     0)
@@ -14569,14 +14555,16 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
             }
             else
             {
-                routed_only_outputs[output_slot] = grouped_values;
+                routed_only_outputs[row_case] = grouped_values;
             }
-            expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 2,
+            expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                           "kpart_prefill",
                                           "ordered_kpart_prefill",
                                           "row_ordered_kpart",
                                           /*expected_active_expert_slots=*/
                                               masked_local_tp ? num_experts / 2 : num_experts);
+            if (!masked_local_tp)
+                expect_unmasked_grouping_record(seq_len);
             if (masked_local_tp)
             {
                 const auto records = llaminar2::PerfStatsCollector::snapshot(
@@ -14706,9 +14694,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
     EXPECT_FALSE(active_grid_records.empty())
         << "large prompt prefill should use the graph-capturable compact active-expert grid";
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 16,
-                                  "fullk_fused_swiglu_prefill",
-                                  "grouped_prefill",
-                                  "row_ordered");
+                                  "kpart_prefill",
+                                  "ordered_kpart_prefill",
+                                  "row_ordered_kpart");
 
     ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
@@ -14877,9 +14865,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 16,
-                                  "fullk_fused_swiglu_prefill",
-                                  "grouped_prefill",
-                                  "row_ordered");
+                                  "kpart_prefill",
+                                  "ordered_kpart_prefill",
+                                  "row_ordered_kpart");
 
     const float *output_data = output->data();
     int nonzero_real_rows = 0;
@@ -15067,9 +15055,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSpli
                        /*max_row_kl=*/1.0e-4);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
                                   16,
-                                  "fullk_fused_swiglu_prefill",
-                                  "grouped_prefill",
-                                  "row_ordered");
+                                  "kpart_prefill",
+                                  "ordered_kpart_prefill",
+                                  "row_ordered_kpart");
 
     ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
     ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
@@ -15305,9 +15293,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillIQ3SFusedMatchesSp
                        /*max_row_kl=*/1.0e-4);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
                                   16,
-                                  "fullk_fused_swiglu_prefill",
-                                  "grouped_prefill",
-                                  "row_ordered");
+                                  "kpart_prefill",
+                                  "ordered_kpart_prefill",
+                                  "row_ordered_kpart");
 
     ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
     ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
@@ -15542,9 +15530,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ6KFusedMatchesSpl
                        /*max_row_kl=*/1.0e-4);
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
                                   16,
-                                  "fullk_fused_swiglu_prefill",
-                                  "grouped_prefill",
-                                  "row_ordered");
+                                  "kpart_prefill",
+                                  "ordered_kpart_prefill",
+                                  "row_ordered_kpart");
 
     ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
     ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);

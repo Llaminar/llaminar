@@ -22,6 +22,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
+#include "../../utils/VerifierRowTestInventory.h"
 
 #include <array>
 #include <cstdint>
@@ -126,7 +127,7 @@ namespace
     }
 
     /**
-     * @brief Run M2/M3/M4 grouped-vs-serial proof for one weight/output pair.
+     * @brief Run the runtime-M grouped-vs-serial proof for one weight/output pair.
      *
      * The same production kernel object serves both sides. This matters for
      * quantized tables because it exercises the real cached EmbedQ8 preparation
@@ -140,9 +141,15 @@ namespace
         int d_model)
     {
         CPUEmbeddingKernelT<OutputTensorT> kernel;
-        const std::array<int, 4> tokens = {3, vocab_size - 1, 17, vocab_size / 2};
+        std::vector<int> tokens(
+            static_cast<size_t>(kGroupedVerifierRuntimeRows.back()));
+        for (size_t row = 0; row < tokens.size(); ++row)
+        {
+            tokens[row] = static_cast<int>(
+                (3u + row * 17u) % static_cast<size_t>(vocab_size));
+        }
 
-        for (int verifier_rows : {2, 3, 4})
+        for (int verifier_rows : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE(std::string(format.label) + " M=" + std::to_string(verifier_rows));
 

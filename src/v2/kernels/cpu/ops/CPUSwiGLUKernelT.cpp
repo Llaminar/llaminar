@@ -28,9 +28,9 @@ namespace
      * @brief Record one economical CPU grouped SwiGLU production call.
      *
      * M=1 serial witnesses intentionally emit no counter. Every supported CPU
-     * format processes the complete verifier group in one primitive invocation;
-     * the element schedule identifies whether that invocation partitions FP
-     * values or native Q8 blocks.
+     * format processes the complete runtime-M verifier group in one primitive
+     * invocation; the element schedule identifies whether that invocation
+     * partitions FP values or native Q8 blocks.
      */
     void recordCPUGroupedSwiGLUCall(
         const char *tensor_format,
@@ -38,7 +38,7 @@ namespace
         int cols,
         const char *element_schedule)
     {
-        if (rows < 2 || rows > 4)
+        if (rows < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(

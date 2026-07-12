@@ -4,7 +4,7 @@
  *
  * This explicit CUDA suite drives CUDARMSNormKernelT through the tensor-aware
  * production API on a non-default stream. The shared matrix covers every native
- * activation format, M=2..4, and both narrow per-head and wide hidden-state
+ * activation format, every certified runtime M, and both narrow per-head and wide hidden-state
  * reductions. Grouped output must equal CUDA M=1 decode byte for byte, and the
  * production route counter must prove one block-per-row grouped launch.
  */

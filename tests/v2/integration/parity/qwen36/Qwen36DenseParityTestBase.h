@@ -4975,7 +4975,6 @@ namespace llaminar2::test::parity::qwen36
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
 

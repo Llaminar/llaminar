@@ -609,19 +609,39 @@ namespace llaminar2
     };
 
     /**
+     * @brief Resolve the largest draft depth that runtime planning must own.
+     *
+     * Fixed mode executes exactly @ref MTPRuntimeConfig::draft_tokens. Dynamic
+     * and observe modes may promote as far as the policy maximum, so graph and
+     * workspace planning must reserve that larger value even when the initial
+     * depth is smaller. The result is a capacity request, not a kernel
+     * specialization or an architectural maximum.
+     */
+    inline int resolveMTPMaximumDraftDepth(const MTPRuntimeConfig &config)
+    {
+        if (config.depth_policy.mode == MTPDepthPolicyMode::Fixed)
+            return std::max(1, config.draft_tokens);
+        return std::max(
+            1,
+            config.depth_policy.max_depth > 0
+                ? config.depth_policy.max_depth
+                : config.draft_tokens);
+    }
+
+    /**
      * @brief Resolve compact target-verifier row capacity for MTP graph buffers.
      *
-     * A single request at depth 3 needs `draft_tokens + 1 == 4` target rows:
-     * one row per draft comparison plus the bonus row.  Request-batched MTP
-     * flattens those per-request rows into one compact LM-head input tensor, so
-     * the capacity scales with `max_request_batch`.  The historical four-row
-     * floor is kept so default single-request graphs preserve their shape.
+     * A single request needs `maximum draft depth + 1` target rows: one row per
+     * draft comparison plus the bonus row. Request-batched MTP flattens those
+     * per-request rows into one compact LM-head input tensor, so capacity also
+     * scales with `max_request_batch`. The default sixteen-row certification
+     * is not a hard limit; larger configured policies produce larger graphs.
      */
     inline int resolveMTPMaxTargetQueryRows(const MTPRuntimeConfig &config)
     {
         const int request_count = std::max(1, config.max_request_batch);
-        const int draft_count = std::max(1, config.draft_tokens);
-        return std::max(4, request_count * (draft_count + 1));
+        const int draft_count = resolveMTPMaximumDraftDepth(config);
+        return request_count * (draft_count + 1);
     }
 
     /**

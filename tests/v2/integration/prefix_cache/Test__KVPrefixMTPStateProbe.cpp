@@ -98,6 +98,8 @@ namespace
             "Q_ROPE",
             "K_ROPE",
             "FA_GATE",
+            "ATTENTION_EFFECTIVE_K",
+            "ATTENTION_EFFECTIVE_V",
             "ATTENTION_CONTEXT",
             "ATTENTION_CONTEXT_GATED",
             "ATTENTION_OUTPUT",
@@ -105,6 +107,16 @@ namespace
             "ATTENTION_RESIDUAL",
             "FFN_NORM_RESIDUAL_OUT",
             "FFN_NORM",
+            "MOE_ROUTER_OUTPUT",
+            "MOE_ROUTING_INDICES",
+            "MOE_ROUTING_WEIGHTS",
+            "MOE_SHARED_EXPERT_OUTPUT",
+            "MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED",
+            "MOE_EXPERT_OUTPUT",
+            "MOE_EXPERT_OUTPUT_ALLREDUCED",
+            "MOE_SHARED_GATE_OUTPUT",
+            "MOE_COMBINED_OUTPUT",
+            "MOE_COMBINED_OUTPUT_ALLREDUCED",
             "FFN_GATE",
             "FFN_UP",
             "FFN_SWIGLU",
@@ -160,6 +172,162 @@ namespace
             snapshots.emplace(semantic_key, std::move(snapshot));
         }
         return snapshots;
+    }
+
+    /**
+     * @brief Select the early-layer snapshots needed to localize prefill replay drift.
+     *
+     * The long-context state probe already proves that an eager suffix and a
+     * graph-replayed suffix eventually disagree.  This diagnostic narrows the
+     * first changed production operation without enabling snapshots for the
+     * entire 41-layer model.  Snapshot copies are recorded on the stage stream
+     * as graph nodes, so the captured values preserve point-in-time semantics
+     * even when several stages reuse the same arena tensor.
+     *
+     * @param last_layer Inclusive final transformer layer to capture.
+     * @return Semantic snapshot keys in forward execution order.
+     */
+    std::vector<std::string> prefillReplayContinuitySnapshotKeys(int last_layer)
+    {
+        std::vector<std::string> selected;
+        for (const std::string &key : requestBatchPrefillSnapshotKeys())
+        {
+            if (key == "EMBEDDING")
+            {
+                selected.push_back(key);
+                continue;
+            }
+            if (key.rfind("layer", 0) != 0)
+                continue;
+
+            const size_t separator = key.find('_', 5);
+            if (separator == std::string::npos)
+                continue;
+            const int layer = std::stoi(key.substr(5, separator - 5));
+            if (layer <= last_layer)
+                selected.push_back(key);
+        }
+        return selected;
+    }
+
+    /**
+     * @brief Compare two captured suffix passes using raw FP32 bytes.
+     *
+     * Relaxed tensor metrics are intentionally unsuitable here: the verifier
+     * and continuation paths require batch-invariant arithmetic, and one ULP
+     * can later change routing or sampling.  The result names the first stage
+     * in forward order and the first changed IEEE-754 word.
+     */
+    ::testing::AssertionResult prefillReplaySnapshotsByteIdentical(
+        const std::map<std::string, RequestBatchStageSnapshot> &eager,
+        const std::map<std::string, RequestBatchStageSnapshot> &replayed,
+        const std::vector<std::string> &ordered_keys)
+    {
+        size_t comparable = 0;
+        for (const std::string &key : ordered_keys)
+        {
+            const auto eager_it = eager.find(key);
+            const auto replay_it = replayed.find(key);
+            if (eager_it == eager.end() || replay_it == replayed.end())
+                continue;
+
+            ++comparable;
+            const auto &left = eager_it->second.data;
+            const auto &right = replay_it->second.data;
+            if (left.size() != right.size())
+            {
+                return ::testing::AssertionFailure()
+                       << "snapshot size mismatch at " << key
+                       << " eager=" << left.size()
+                       << " replay=" << right.size();
+            }
+            if (std::memcmp(left.data(), right.data(), left.size() * sizeof(float)) == 0)
+                continue;
+
+            for (size_t index = 0; index < left.size(); ++index)
+            {
+                uint32_t eager_bits = 0;
+                uint32_t replay_bits = 0;
+                std::memcpy(&eager_bits, &left[index], sizeof(eager_bits));
+                std::memcpy(&replay_bits, &right[index], sizeof(replay_bits));
+                if (eager_bits == replay_bits)
+                    continue;
+
+                auto firstIndexOfBits = [](const std::vector<float> &values,
+                                           uint32_t wanted)
+                    -> std::optional<size_t>
+                {
+                    for (size_t candidate = 0; candidate < values.size(); ++candidate)
+                    {
+                        uint32_t candidate_bits = 0;
+                        std::memcpy(
+                            &candidate_bits,
+                            &values[candidate],
+                            sizeof(candidate_bits));
+                        if (candidate_bits == wanted)
+                            return candidate;
+                    }
+                    return std::nullopt;
+                };
+
+                auto failure = ::testing::AssertionFailure();
+                failure << "first snapshot byte mismatch at " << key
+                        << " index=" << index
+                        << " eager=" << left[index]
+                        << " replay=" << right[index]
+                        << " eager_bits=0x" << std::hex << std::setw(8)
+                        << std::setfill('0') << eager_bits
+                        << " replay_bits=0x" << std::setw(8) << replay_bits
+                        << std::dec << std::setfill(' ');
+
+                if (key.find("ATTENTION_EFFECTIVE_") != std::string::npos)
+                {
+                    const auto replay_in_eager =
+                        firstIndexOfBits(left, replay_bits);
+                    const auto eager_in_replay =
+                        firstIndexOfBits(right, eager_bits);
+                    failure << " replay_value_in_eager="
+                            << (replay_in_eager
+                                    ? std::to_string(*replay_in_eager)
+                                    : std::string("absent"))
+                            << " eager_value_in_replay="
+                            << (eager_in_replay
+                                    ? std::to_string(*eager_in_replay)
+                                    : std::string("absent"));
+
+                    const size_t layer_separator = key.find('_');
+                    const std::string layer_prefix =
+                        layer_separator == std::string::npos
+                            ? std::string{}
+                            : key.substr(0, layer_separator);
+                    for (const char *suffix : {
+                             "_K_PROJECTION",
+                             "_K_NORM",
+                             "_K_ROPE",
+                         })
+                    {
+                        const std::string related_key = layer_prefix + suffix;
+                        const auto eager_related = eager.find(related_key);
+                        const auto replayed_related = replayed.find(related_key);
+                        if (eager_related == eager.end() ||
+                            replayed_related == replayed.end() ||
+                            eager_related->second.data.empty() ||
+                            replayed_related->second.data.empty())
+                        {
+                            continue;
+                        }
+                        failure << ' ' << related_key
+                                << "[0]=" << eager_related->second.data[0]
+                                << '/' << replayed_related->second.data[0];
+                    }
+                }
+                return failure;
+            }
+        }
+
+        if (comparable == 0)
+            return ::testing::AssertionFailure() << "no comparable prefill stage snapshots";
+        return ::testing::AssertionSuccess();
     }
 
     /**
@@ -1026,6 +1194,19 @@ namespace
         return plan;
     }
 
+    /**
+     * @brief Render the state owners needed to diagnose split-prefill drift.
+     *
+     * A full-attention KV mismatch is often only the first durable downstream
+     * symptom of an earlier GDN carry-state error.  Keep both owners in the
+     * same failure summary and include the prefill graph lifecycle so a test
+     * failure says whether each exact shape ran eagerly, warmed a graph, or
+     * replayed a previously captured executable.
+     *
+     * @param probe Request-boundary state snapshot to render.
+     * @param layer_limit Maximum number of full-attention KV layers to print.
+     * @return Compact single-line diagnostic suitable for a GoogleTest error.
+     */
     std::string summarizeStateContinuityProbe(
         const PrefixRuntimeStateSnapshot &probe,
         size_t layer_limit = 4)
@@ -1070,6 +1251,139 @@ namespace
             if (emitted >= layer_limit)
                 break;
         }
+
+        for (const auto &layer : probe.gdn_layers)
+        {
+            oss << " GDN" << layer.global_layer
+                << "/rec_bytes=" << layer.recurrence_device_bytes
+                << "/rec=" << layer.recurrence_device_hash
+                << "/conv_bytes=" << layer.conv_device_bytes
+                << "/conv=" << layer.conv_device_hash
+                << "/local_rec=" << layer.recurrence_local_device_hash
+                << "/local_conv=" << layer.conv_local_device_hash;
+        }
+
+        for (const auto &graph : probe.prefill_graphs)
+        {
+            oss << " GRAPH"
+                << "/bucket=" << graph.bucket_seq_len
+                << "/real=" << graph.real_token_start
+                << ":" << graph.real_token_end
+                << "/phase=" << graph.phase
+                << "/capture=" << graph.capture_phase
+                << "/warmups=" << graph.warmup_count
+                << "/captures=" << graph.capture_count
+                << "/replays=" << graph.replay_count
+                << "/reason=" << graph.recapture_reason;
+        }
+        return oss.str();
+    }
+
+    /**
+     * @brief List every recurrent and KV payload owner that differs.
+     *
+     * compareMTPRuntimeStateSnapshots() intentionally returns the first broken
+     * invariant.  Long-context debugging needs the wider propagation pattern:
+     * a GDN mismatch at layer 4 followed by a KV mismatch at layer 7 points to
+     * a very different producer than an isolated layer-7 append error.  This
+     * helper reports that pattern without copying model tensors to the host.
+     *
+     * @param oracle State produced by one monolithic prefill.
+     * @param candidate State produced by split prefill or prefix restoration.
+     * @return Compact mismatch inventory based on device-owned byte hashes.
+     */
+    std::string summarizeStateContinuityDifferences(
+        const PrefixRuntimeStateSnapshot &oracle,
+        const PrefixRuntimeStateSnapshot &candidate)
+    {
+        std::ostringstream oss;
+        oss << "differences:";
+        bool found = false;
+
+        const size_t gdn_count = std::min(
+            oracle.gdn_layers.size(),
+            candidate.gdn_layers.size());
+        for (size_t index = 0; index < gdn_count; ++index)
+        {
+            const auto &lhs = oracle.gdn_layers[index];
+            const auto &rhs = candidate.gdn_layers[index];
+            if (lhs.global_layer != rhs.global_layer ||
+                lhs.recurrence_device_bytes != rhs.recurrence_device_bytes ||
+                lhs.conv_device_bytes != rhs.conv_device_bytes ||
+                lhs.recurrence_device_hash != rhs.recurrence_device_hash ||
+                lhs.conv_device_hash != rhs.conv_device_hash ||
+                lhs.recurrence_local_device_hash != rhs.recurrence_local_device_hash ||
+                lhs.conv_local_device_hash != rhs.conv_local_device_hash)
+            {
+                found = true;
+                oss << " GDN[" << lhs.global_layer << "/" << rhs.global_layer
+                    << "] rec=" << lhs.recurrence_device_hash
+                    << "/" << rhs.recurrence_device_hash
+                    << " conv=" << lhs.conv_device_hash
+                    << "/" << rhs.conv_device_hash
+                    << " local_rec=" << lhs.recurrence_local_device_hash
+                    << "/" << rhs.recurrence_local_device_hash
+                    << " local_conv=" << lhs.conv_local_device_hash
+                    << "/" << rhs.conv_local_device_hash;
+            }
+        }
+        if (oracle.gdn_layers.size() != candidate.gdn_layers.size())
+        {
+            found = true;
+            oss << " GDN_count=" << oracle.gdn_layers.size()
+                << "/" << candidate.gdn_layers.size();
+        }
+
+        const size_t cache_count = std::min(
+            oracle.kv_caches.size(),
+            candidate.kv_caches.size());
+        for (size_t cache_index = 0; cache_index < cache_count; ++cache_index)
+        {
+            const auto &lhs_cache = oracle.kv_caches[cache_index];
+            const auto &rhs_cache = candidate.kv_caches[cache_index];
+            const size_t layer_count = std::min(
+                lhs_cache.layers.size(),
+                rhs_cache.layers.size());
+            for (size_t layer_index = 0; layer_index < layer_count; ++layer_index)
+            {
+                const auto &lhs = lhs_cache.layers[layer_index];
+                const auto &rhs = rhs_cache.layers[layer_index];
+                if (lhs.global_layer != rhs.global_layer ||
+                    lhs.cached_tokens != rhs.cached_tokens ||
+                    lhs.ring_head != rhs.ring_head ||
+                    lhs.k_payload_hash != rhs.k_payload_hash ||
+                    lhs.v_payload_hash != rhs.v_payload_hash)
+                {
+                    found = true;
+                    oss << " KV" << cache_index
+                        << "[" << lhs.global_layer << "/" << rhs.global_layer
+                        << "] tokens=" << lhs.cached_tokens
+                        << "/" << rhs.cached_tokens
+                        << " ring=" << lhs.ring_head
+                        << "/" << rhs.ring_head
+                        << " k=" << lhs.k_payload_hash
+                        << "/" << rhs.k_payload_hash
+                        << " v=" << lhs.v_payload_hash
+                        << "/" << rhs.v_payload_hash;
+                }
+            }
+            if (lhs_cache.layers.size() != rhs_cache.layers.size())
+            {
+                found = true;
+                oss << " KV" << cache_index << "_layer_count="
+                    << lhs_cache.layers.size() << "/"
+                    << rhs_cache.layers.size();
+            }
+        }
+        if (oracle.kv_caches.size() != candidate.kv_caches.size())
+        {
+            found = true;
+            oss << " KV_cache_count=" << oracle.kv_caches.size()
+                << "/" << candidate.kv_caches.size();
+        }
+
+        if (!found)
+            oss << " none in device GDN/KV hashes";
         return oss.str();
     }
 
@@ -1524,7 +1838,6 @@ namespace
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_greedy_mtp_graph_stats.json"},
             {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
         });
@@ -1664,7 +1977,6 @@ namespace
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_mtp_stats.json"},
             {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
         });
@@ -1976,7 +2288,6 @@ namespace
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
             {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER", "3"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_request_batch_prefill_stats.json"},
@@ -2385,7 +2696,6 @@ namespace
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_first_token_stats.json"},
             {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
         });
@@ -3592,7 +3902,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
     });
 
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
@@ -3885,7 +4194,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_chained_mtp_forward_graph_stats.json"},
         {"LLAMINAR_PERF_STATS_FILTER", "forward_graph"},
     });
@@ -3991,7 +4299,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegressio
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
     });
 
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
@@ -4080,7 +4387,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
         {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "600"},
         {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_padded_prefill_bucket_stats.json"},
         {"LLAMINAR_PERF_STATS_FILTER", "forward_graph"},
     });
@@ -4216,7 +4522,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
     });
 
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
@@ -4336,7 +4641,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
     });
 
@@ -4400,7 +4704,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPExplicitSegmentedCollectiv
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
     });
 
@@ -4463,7 +4766,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
     });
 
@@ -4595,17 +4897,19 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
 
     ScopedDebugEnv env({
         {"LLAMINAR_LOG_LEVEL", "WARN"},
-        {"LLAMINAR_GPU_GRAPHS", "0"},
+        // Match the production LocalTP E2E lane: decode and collective work is
+        // graph captured, while this topology deliberately uses unbucketed
+        // prefill. Do not disable ROCm/CUDA production scheduling knobs here.
+        {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
-        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+        {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
+        {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER", "3"},
         {"LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", std::to_string(block_size).c_str()},
         {"LLAMINAR_PREFIX_PROBE_KV_SEGMENTS", kv_segments.str().c_str()},
     });
@@ -4686,6 +4990,14 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
     std::vector<int32_t> prompt;
     std::vector<int32_t> seed_prompt;
     std::vector<int32_t> suffix_prompt;
+    const bool capture_stage_continuity =
+        DebugEnv::isTruthyEnv("LLAMINAR_QWEN36_MOE_OVERLAY_STAGE_CONTINUITY_DIAG");
+    const std::vector<std::string> stage_continuity_keys =
+        capture_stage_continuity
+            ? prefillReplayContinuitySnapshotKeys(/*last_layer=*/7)
+            : std::vector<std::string>{};
+    std::map<std::string, RequestBatchStageSnapshot> full_prefill_stage_snapshots;
+    std::map<std::string, RequestBatchStageSnapshot> split_prefill_stage_snapshots;
 
     {
         auto baseline = factory->createFromOrchestrationConfig(make_config(false));
@@ -4704,10 +5016,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
             prompt.begin() + static_cast<std::ptrdiff_t>(block_size),
             prompt.end());
         baseline->setSamplingParams(greedy);
+        if (capture_stage_continuity)
+        {
+            baseline->setSnapshotCaptureFilter(stage_continuity_keys);
+            baseline->enableSnapshotCapture();
+            baseline->clearSnapshots();
+        }
 
         ASSERT_TRUE(baseline->prefill(prompt))
             << baseline->lastError();
         full_prefill_probe = baseline->prefixStateProbe();
+        if (capture_stage_continuity)
+        {
+            full_prefill_stage_snapshots = captureRequestBatchSnapshots(
+                *baseline,
+                stage_continuity_keys);
+        }
         full_decode = decodeGreedyTokens(
             *baseline,
             decode_steps,
@@ -4718,16 +5042,34 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         baseline->clearCache();
         ASSERT_TRUE(baseline->prefill(seed_prompt))
             << baseline->lastError();
+        if (capture_stage_continuity)
+            baseline->clearSnapshots();
         ASSERT_TRUE(baseline->prefill(suffix_prompt))
             << baseline->lastError();
         split_prefill_probe = baseline->prefixStateProbe();
+        if (capture_stage_continuity)
+        {
+            split_prefill_stage_snapshots = captureRequestBatchSnapshots(
+                *baseline,
+                stage_continuity_keys);
+        }
         split_decode = decodeGreedyTokens(
             *baseline,
             decode_steps,
             "split-prefill baseline decode");
         ASSERT_TRUE(split_decode.error.empty()) << split_decode.error;
         ASSERT_EQ(split_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        if (capture_stage_continuity)
+            baseline->disableSnapshotCapture();
         baseline->shutdown();
+    }
+
+    if (capture_stage_continuity)
+    {
+        ASSERT_TRUE(prefillReplaySnapshotsByteIdentical(
+            full_prefill_stage_snapshots,
+            split_prefill_stage_snapshots,
+            stage_continuity_keys));
     }
 
     {
@@ -4776,6 +5118,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
     ASSERT_TRUE(full_vs_split)
         << "Qwen3.6 MoE ExpertOverlay LLEP split-prefill state drifted from "
         << "single-request full prefill: " << full_vs_split.reason
+        << "\n" << summarizeStateContinuityDifferences(
+               full_prefill_probe,
+               split_prefill_probe)
         << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
         << "\nsplit: " << summarizeStateContinuityProbe(split_prefill_probe);
 
@@ -4787,6 +5132,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
     ASSERT_TRUE(full_vs_restored)
         << "Qwen3.6 MoE ExpertOverlay LLEP prefix-restored state drifted from "
         << "single-request full prefill: " << full_vs_restored.reason
+        << "\n" << summarizeStateContinuityDifferences(
+               full_prefill_probe,
+               restored_prefill_probe)
         << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
         << "\nrestored: " << summarizeStateContinuityProbe(restored_prefill_probe);
 
@@ -4826,17 +5174,19 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
 
     ScopedDebugEnv env({
         {"LLAMINAR_LOG_LEVEL", "WARN"},
-        {"LLAMINAR_GPU_GRAPHS", "0"},
+        // Match the production LocalTP E2E lane: decode and collective work is
+        // graph captured, while this topology deliberately uses unbucketed
+        // prefill. Do not disable ROCm/CUDA production scheduling knobs here.
+        {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
-        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+        {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
+        {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER", "3"},
         {"LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", std::to_string(block_size).c_str()},
         {"LLAMINAR_PREFIX_PROBE_KV_SEGMENTS", kv_segments.str().c_str()},
     });
@@ -4917,6 +5267,14 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
     std::vector<int32_t> prompt;
     std::vector<int32_t> seed_prompt;
     std::vector<int32_t> suffix_prompt;
+    const bool capture_stage_continuity =
+        DebugEnv::isTruthyEnv("LLAMINAR_QWEN36_MOE_OVERLAY_STAGE_CONTINUITY_DIAG");
+    const std::vector<std::string> stage_continuity_keys =
+        capture_stage_continuity
+            ? prefillReplayContinuitySnapshotKeys(/*last_layer=*/7)
+            : std::vector<std::string>{};
+    std::map<std::string, RequestBatchStageSnapshot> full_prefill_stage_snapshots;
+    std::map<std::string, RequestBatchStageSnapshot> split_prefill_stage_snapshots;
 
     {
         auto baseline = factory->createFromOrchestrationConfig(make_config(false));
@@ -4935,10 +5293,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
             prompt.begin() + static_cast<std::ptrdiff_t>(block_size),
             prompt.end());
         baseline->setSamplingParams(greedy);
+        if (capture_stage_continuity)
+        {
+            baseline->setSnapshotCaptureFilter(stage_continuity_keys);
+            baseline->enableSnapshotCapture();
+            baseline->clearSnapshots();
+        }
 
         ASSERT_TRUE(baseline->prefill(prompt))
             << baseline->lastError();
         full_prefill_probe = baseline->prefixStateProbe();
+        if (capture_stage_continuity)
+        {
+            full_prefill_stage_snapshots = captureRequestBatchSnapshots(
+                *baseline,
+                stage_continuity_keys);
+        }
         full_decode = decodeGreedyTokens(
             *baseline,
             decode_steps,
@@ -4949,16 +5319,34 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         baseline->clearCache();
         ASSERT_TRUE(baseline->prefill(seed_prompt))
             << baseline->lastError();
+        if (capture_stage_continuity)
+            baseline->clearSnapshots();
         ASSERT_TRUE(baseline->prefill(suffix_prompt))
             << baseline->lastError();
         split_prefill_probe = baseline->prefixStateProbe();
+        if (capture_stage_continuity)
+        {
+            split_prefill_stage_snapshots = captureRequestBatchSnapshots(
+                *baseline,
+                stage_continuity_keys);
+        }
         split_decode = decodeGreedyTokens(
             *baseline,
             decode_steps,
             "split-prefill baseline decode");
         ASSERT_TRUE(split_decode.error.empty()) << split_decode.error;
         ASSERT_EQ(split_decode.tokens.size(), static_cast<size_t>(decode_steps));
+        if (capture_stage_continuity)
+            baseline->disableSnapshotCapture();
         baseline->shutdown();
+    }
+
+    if (capture_stage_continuity)
+    {
+        ASSERT_TRUE(prefillReplaySnapshotsByteIdentical(
+            full_prefill_stage_snapshots,
+            split_prefill_stage_snapshots,
+            stage_continuity_keys));
     }
 
     {
@@ -5007,6 +5395,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
     ASSERT_TRUE(full_vs_split)
         << "Qwen3.6 MoE ExpertOverlay CUDA LLEP split-prefill state drifted from "
         << "single-request full prefill: " << full_vs_split.reason
+        << "\n" << summarizeStateContinuityDifferences(
+               full_prefill_probe,
+               split_prefill_probe)
         << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
         << "\nsplit: " << summarizeStateContinuityProbe(split_prefill_probe);
 
@@ -5018,6 +5409,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
     ASSERT_TRUE(full_vs_restored)
         << "Qwen3.6 MoE ExpertOverlay CUDA LLEP prefix-restored state drifted from "
         << "single-request full prefill: " << full_vs_restored.reason
+        << "\n" << summarizeStateContinuityDifferences(
+               full_prefill_probe,
+               restored_prefill_probe)
         << "\nfull: " << summarizeStateContinuityProbe(full_prefill_probe)
         << "\nrestored: " << summarizeStateContinuityProbe(restored_prefill_probe);
 
@@ -5030,12 +5424,11 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
 TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallMatchesROCm2TP)
 {
     ScopedDebugEnv env({
-        {"LLAMINAR_GPU_GRAPHS", "0"},
+        // Preserve the production graph/concurrency profile while keeping the
+        // unsupported LocalTP prefill-bucket optimization disabled.
+        {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
-        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
     });
@@ -5235,12 +5628,11 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
 TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallMatchesCUDA2TP)
 {
     ScopedDebugEnv env({
-        {"LLAMINAR_GPU_GRAPHS", "0"},
+        // Preserve the production graph/concurrency profile while keeping the
+        // unsupported LocalTP prefill-bucket optimization disabled.
+        {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
-        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1000000000"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
         {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
     });

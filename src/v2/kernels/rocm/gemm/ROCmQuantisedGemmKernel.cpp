@@ -91,6 +91,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/Assertions.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "utils/WeightLoadingProfiler.h"
 
 #include <stdexcept>
@@ -1289,9 +1290,9 @@ namespace llaminar2
          *
          * The grouped verifier has to match the normal M=1 serial decode path,
          * not merely an idealized direct GEMV. ROCm NativeVNNI dispatch is
-         * generated per shape and M; choosing the M=2..4 split policy can alter
+         * generated per shape and M; choosing a grouped-M split policy can alter
          * FP32 partial-reduction order relative to the serial baseline. While
-         * this scope is active, M=2..4 verifier rows reuse the generated M=1
+         * this scope is active, every grouped verifier depth reuses the generated M=1
          * policy for the same projection shape. That keeps the path economical
          * and graph-capturable while preserving serial-decode equivalence.
          */
@@ -2396,7 +2397,7 @@ namespace llaminar2
             // =========================================================================
             if (use_gpu_path &&
                 g_rocm_native_vnni_decode_equivalent_scope &&
-                m > 1 && m <= 4)
+                m > 1)
             {
                 ensureWeightsConverted();
 
@@ -2461,138 +2462,9 @@ namespace llaminar2
                           << m << " N=" << n << " K=" << k
                           << (d_bias ? " +bias" : ""));
 
-#ifdef HAVE_ROCM
-                if (m == 2 && impl_->has_native_vnni &&
-                    !C_fp32->isMapped() && beta == 0.0f &&
-                    debugEnv().rocm.concurrent_m2_rows)
-                {
-                    if ((k % 32) != 0)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent native-VNNI M=2 requires K multiple of 32, got K="
-                                  << k);
-                        return false;
-                    }
-
-                    if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
-                            d_input,
-                            impl_->d_A_int8,
-                            impl_->d_scales_A_blockwise,
-                            impl_->d_sums_A_blockwise,
-                            m,
-                            k,
-                            rocm_device_id_,
-                            gpu_stream_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M blockwise activation quantization failed");
-                        return false;
-                    }
-
-                    constexpr int SCATTER_KB_MAX = 64;
-                    const int scale_blocks_per_row = k / 32;
-                    auto &pool = getSharedPrefillPool(rocm_device_id_, m);
-                    const auto check_hip = [&](hipError_t err, const char *operation) -> bool
-                    {
-                        if (err == hipSuccess)
-                            return true;
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M native-VNNI "
-                                  << operation << " failed: " << hipGetErrorString(err));
-                        return false;
-                    };
-
-                    if (!check_hip(
-                            hipEventRecord(pool.quant_ready,
-                                           static_cast<hipStream_t>(gpu_stream_)),
-                            "record quant-ready event"))
-                    {
-                        return false;
-                    }
-
-                    for (int row = 0; row < m; ++row)
-                    {
-                        const int stream_idx = row % pool.count;
-                        const size_t partial_elements = static_cast<size_t>(SCATTER_KB_MAX) * n;
-                        if (!pool.ensureScatterPartial(stream_idx, partial_elements))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to allocate concurrent native-VNNI scatter partial for row "
-                                      << row << " (" << (partial_elements * sizeof(float)) << " bytes)");
-                            return false;
-                        }
-
-                        if (!check_hip(
-                                hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0),
-                                "wait for quant-ready event"))
-                        {
-                            return false;
-                        }
-
-                        const int8_t *d_A_row = impl_->d_A_int8 + static_cast<size_t>(row) * k;
-                        const float *d_scale_row = impl_->d_scales_A + row;
-                        const float *d_scale_block_row = impl_->d_scales_A_blockwise + static_cast<size_t>(row) * scale_blocks_per_row;
-                        float *d_output_row = d_output + static_cast<size_t>(row) * n;
-
-                        if (!rocmGemv_native_vnni_fp32(
-                                d_A_row,
-                                impl_->d_weights_native_vnni,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
-                                d_output_row,
-                                d_scale_row,
-                                pool.scatter_partial[stream_idx],
-                                n, k,
-                                impl_->native_vnni_codebook_id,
-                                rocm_device_id_, pool.streams[stream_idx],
-                                d_scale_block_row))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M native-VNNI GEMV failed at row "
-                                      << row);
-                            return false;
-                        }
-
-                        if (alpha != 1.0f || d_bias)
-                        {
-                            if (!rocmQuantGemm_applyFp32Epilogue(
-                                    d_output_row,
-                                    d_bias,
-                                    1,
-                                    n,
-                                    alpha,
-                                    rocm_device_id_,
-                                    pool.streams[stream_idx]))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M native-VNNI epilogue failed at row "
-                                          << row);
-                                return false;
-                            }
-                        }
-
-                        if (!check_hip(
-                                hipEventRecord(pool.completion[stream_idx],
-                                               pool.streams[stream_idx]),
-                                "record row-completion event"))
-                        {
-                            return false;
-                        }
-                    }
-
-                    for (int row = 0; row < m; ++row)
-                    {
-                        if (!check_hip(
-                                hipStreamWaitEvent(
-                                    static_cast<hipStream_t>(gpu_stream_),
-                                    pool.completion[row % pool.count], 0),
-                                "wait for row-completion event"))
-                        {
-                            return false;
-                        }
-                    }
-
-                    return true;
-                }
-#endif
 
                 const bool supports_native_small_m =
-                    impl_->has_native_vnni && m >= 2 && m <= 4;
+                    impl_->has_native_vnni && m >= 2;
                 if (supports_native_small_m &&
                     !gemv_output_needs_copyout && beta == 0.0f)
                 {
@@ -2665,19 +2537,6 @@ namespace llaminar2
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)}});
 
-                        if (m == 2)
-                        {
-                            PerfStatsCollector::addCounter(
-                                "kernel",
-                                "rocm_native_vnni_m2_calls",
-                                1.0,
-                                "gemm",
-                                "rocm:" + std::to_string(rocm_device_id_),
-                                PerfStatsCollector::Tags{
-                                    {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
-                                    {"n", std::to_string(n)},
-                                    {"k", std::to_string(k)}});
-                        }
                     }
 
                     if (PerfStatsCollector::isEnabled())
@@ -3504,7 +3363,7 @@ namespace llaminar2
 
                 const bool needs_block_sums =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    all_projections_native_vnni && m >= 2 && m <= 4 && (k % 32) == 0;
+                    all_projections_native_vnni && m >= 2 && (k % 32) == 0;
                 const bool quant_ok = needs_block_sums
                     ? rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
                           const_cast<float *>(d_input),
@@ -3525,7 +3384,7 @@ namespace llaminar2
 
                 fused_uses_blockwise_shared_quant = all_projections_have_vnni_weights;
 
-                if (m >= 2 && m <= 4 && projections.size() >= 2 && PerfStatsCollector::isEnabled())
+                if (m >= 2 && projections.size() >= 2 && PerfStatsCollector::isEnabled())
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -3604,7 +3463,7 @@ namespace llaminar2
 #ifdef HAVE_ROCM
             const bool small_m_native_verifier_fused =
                 g_rocm_native_vnni_decode_equivalent_scope &&
-                all_projections_native_vnni && m >= 2 && m <= 4;
+                all_projections_native_vnni && m >= 2;
             if (m > 2 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
                 !small_m_native_verifier_fused &&
@@ -4301,7 +4160,7 @@ namespace llaminar2
                              * Decode-equivalent verifier publication is a
                              * state-commit path, not a generic M-aware GEMV
                              * throughput path.  Grouping projections by the
-                             * M=2..4 table can choose a different split-K
+                             * grouped-M table can choose a different split-K
                              * policy than the row-by-row decode oracle, which
                              * changes FP32 reduction order and breaks strict
                              * row equivalence.  Use the explicit serial-M1
@@ -4758,7 +4617,7 @@ namespace llaminar2
 
                 const bool supports_native_small_m =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    native_vnni_fused && m >= 2 && m <= 4;
+                    native_vnni_fused && m >= 2;
                 if (supports_native_small_m)
                 {
                     if ((k % 32) != 0)
@@ -4858,20 +4717,6 @@ namespace llaminar2
                                 {"k", std::to_string(k)},
                                 {"shared_quant", "true"}});
 
-                        if (m == 2)
-                        {
-                            PerfStatsCollector::addCounter(
-                                "kernel",
-                                "rocm_native_vnni_m2_calls",
-                                1.0,
-                                "gemm",
-                                "rocm:" + std::to_string(rocm_device_id_),
-                                PerfStatsCollector::Tags{
-                                    {"codebook", std::to_string(static_cast<int>(rocm_kernel->impl_->native_vnni_codebook_id))},
-                                    {"n", std::to_string(n)},
-                                    {"k", std::to_string(k)},
-                                    {"shared_quant", "true"}});
-                        }
                     }
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
@@ -5016,9 +4861,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m < 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier projection requires M=1..4, got M="
+                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier projection requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -5120,15 +4965,20 @@ namespace llaminar2
             // file but is no longer reachable in normal execution. This saves
             // up to N×K bytes (≈1.27 GB for a Q4_K LM head).
 
-            // Scatter+reduce partial buffer: KB_MAX × rows × N × sizeof(float).
-            // The graph-safe native-VNNI M=2/3/4 verifier route stores every
-            // verifier row in one split-K partial buffer; serial M=1 paths use one row.
+            // Scatter+reduce partial buffer: KB_MAX x rows x N x sizeof(float).
+            // Runtime verifier kernels support any M that fits the declared
+            // graph capacity.  The default declaration certifies sixteen rows
+            // without making a large prompt-prefill bucket allocate prompt-M
+            // GEMV partials that it will never use.
             // KB_MAX=64 is the maximum k-blocks the scatter dispatch can produce.
             // The workspace manager takes max across all kernel instances, so
             // the largest N (LM Head: 152064) determines the actual allocation.
-            // M=4 LM head size: 64 × 4 × 152064 × 4 ≈ 149 MB — reused across layers.
+            // The same arena is reused across layers and verifier replays.
             constexpr int SCATTER_KB_MAX = 64;
-            const int scatter_rows = (m >= 2 && m <= 4) ? m : 1;
+            const int scatter_rows = std::clamp(
+                m,
+                1,
+                kDefaultNativeVNNIVerifierRowCapacity);
             size_t scatter_partial_bytes = static_cast<size_t>(SCATTER_KB_MAX) *
                                            static_cast<size_t>(scatter_rows) *
                                            static_cast<size_t>(n) * sizeof(float);
@@ -6016,7 +5866,7 @@ namespace llaminar2
                 // Step 1: Fused SwiGLU + blockwise quantize → d_A_int8 + d_scales_A_blockwise
                 const bool needs_block_sums =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    impl_->has_native_vnni && m >= 2 && m <= 4 && (k % 32) == 0;
+                    impl_->has_native_vnni && m >= 2 && (k % 32) == 0;
                 const bool swiglu_quant_ok = needs_block_sums
                     ? hipOps_fused_swiglu_quantize_blockwise_with_sums(
                           d_gate, d_up,
@@ -6034,12 +5884,12 @@ namespace llaminar2
                     return false;
                 }
 
-                // Step 2: Native-VNNI small-M verifier path. MTP verifier batches
-                // are tiny (M=2..4), so do not fall through to the generic prefill
-                // GEMM once this route is selected.
+                // Step 2: Native-VNNI grouped verifier path. Once the explicit
+                // verifier API selects this route, runtime M must stay on the
+                // grouped decode-equivalent kernel instead of generic prefill.
                 const bool supports_native_small_m =
                     g_rocm_native_vnni_decode_equivalent_scope &&
-                    impl_->has_native_vnni && m >= 2 && m <= 4 &&
+                    impl_->has_native_vnni && m >= 2 &&
                     alpha == 1.0f && beta == 0.0f;
                 if (supports_native_small_m)
                 {
@@ -6096,21 +5946,6 @@ namespace llaminar2
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)},
                                 {"source", "fused_swiglu"}});
-
-                        if (m == 2)
-                        {
-                            PerfStatsCollector::addCounter(
-                                "kernel",
-                                "rocm_native_vnni_m2_calls",
-                                1.0,
-                                "gemm",
-                                "rocm:" + std::to_string(rocm_device_id_),
-                                PerfStatsCollector::Tags{
-                                    {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
-                                    {"n", std::to_string(n)},
-                                    {"k", std::to_string(k)},
-                                    {"source", "fused_swiglu"}});
-                        }
 
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -6206,9 +6041,9 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
-            if (m < 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier SwiGLU requires M=1..4, got M="
+                LOG_ERROR("[ROCmQuantisedGemmKernel] grouped verifier SwiGLU requires M>=1, got M="
                           << m);
                 return false;
             }

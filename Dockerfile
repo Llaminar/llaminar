@@ -111,17 +111,19 @@ WORKDIR /src
 # when ONEDNN_GIT_REF is bumped here OR when an earlier layer changes.
 #
 # The src/v2/CMakeLists.txt OneDNN integration script detects the prebuilt
-# tree at external/onednn/build/include/oneapi/dnnl/dnnl.hpp and skips its
+# ISA-specific tree at external/onednn/build-<isa>/include/oneapi/dnnl/dnnl.hpp
+# and skips its
 # own clone+build entirely. Keep ONEDNN_GIT_REF in sync with the pin in
 # src/v2/CMakeLists.txt (search for ONEDNN_GIT_REF).
 # ---------------------------------------------------------------------------
 ARG ONEDNN_GIT_REF=v3.11.3
 RUN set -e; \
     case "${LLAMINAR_CPU_ISA}" in \
-        AVX512) ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni" ;; \
-        AVX2) ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt" ;; \
+        AVX512) ONEDNN_ISA_SUFFIX=avx512; ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni" ;; \
+        AVX2) ONEDNN_ISA_SUFFIX=avx2; ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt" ;; \
         *) echo "Unsupported LLAMINAR_CPU_ISA='${LLAMINAR_CPU_ISA}'. Use AVX512 or AVX2." >&2; exit 1 ;; \
     esac; \
+    ONEDNN_BUILD_DIR="/src/external/onednn/build-${ONEDNN_ISA_SUFFIX}"; \
     mkdir -p /src/external; \
     ONEDNN_TARBALL_URL="https://codeload.github.com/uxlfoundation/oneDNN/tar.gz/refs/tags/${ONEDNN_GIT_REF}"; \
     echo "==> [onednn] fetch ${ONEDNN_GIT_REF} from ${ONEDNN_TARBALL_URL}"; \
@@ -142,22 +144,22 @@ RUN set -e; \
     done; \
     rm -f /tmp/onednn.tar.gz; \
     printf '%s\n' "${ONEDNN_GIT_REF}" > /src/external/onednn/.llaminar-onednn-source-ref; \
-    cmake -B /src/external/onednn/build -S /src/external/onednn \
+    cmake -B "${ONEDNN_BUILD_DIR}" -S /src/external/onednn \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/src/external/onednn/build \
+        -DCMAKE_INSTALL_PREFIX="${ONEDNN_BUILD_DIR}" \
         -DDNNL_CPU_RUNTIME=OMP \
         -DDNNL_BUILD_TESTS=OFF \
         -DDNNL_BUILD_EXAMPLES=OFF \
         -DDNNL_EXPERIMENTAL_UKERNEL=ON \
         -DCMAKE_CXX_FLAGS="${ONEDNN_CPU_FLAGS}" \
         -DCMAKE_C_FLAGS="${ONEDNN_CPU_FLAGS}"; \
-    cmake --build /src/external/onednn/build --parallel --target install; \
+    cmake --build "${ONEDNN_BUILD_DIR}" --parallel --target install; \
     printf '%s\n' "${ONEDNN_GIT_REF};isa=${LLAMINAR_CPU_ISA}" \
-        > /src/external/onednn/build/.llaminar-onednn-commit; \
+        > "${ONEDNN_BUILD_DIR}/.llaminar-onednn-commit"; \
     # Drop OneDNN's intermediate .o / .d files but keep the installed lib +
     # headers + source ref marker used by CMake cache validation.
-    find /src/external/onednn/build \
+    find "${ONEDNN_BUILD_DIR}" \
         \( -name '*.o' -o -name '*.d' -o -name CMakeFiles \) \
         -prune -exec rm -rf {} +
 
@@ -341,7 +343,7 @@ RUN --mount=type=cache,target=/root/.ccache \
  && mkdir -p /src/runtime-bin /src/runtime-libs \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
- && cp external/onednn/build/lib/libdnnl.so.3.11 /src/runtime-libs/ \
+ && cp "external/onednn/build-$(printf '%s' "${LLAMINAR_CPU_ISA}" | tr '[:upper:]' '[:lower:]')/lib/libdnnl.so.3.11" /src/runtime-libs/ \
  && if [ -e external/rccl/build/librccl.so.1.0 ]; then cp external/rccl/build/librccl.so.1.0 /src/runtime-libs/; fi \
  && echo "==> [release] done; final size: $(du -sh build_v2_release | cut -f1)"
 

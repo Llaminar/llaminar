@@ -1192,10 +1192,18 @@ namespace llaminar2::test
             EXPECT_NE(body.find("active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr"),
                       std::string::npos)
                 << name << " ordered scatter validity must not rely on a stale workspace pointer alone";
-            EXPECT_NE(body.find("if (!scatter_overwrites_output)"),
-                      std::string::npos)
-                << name << " must only pre-zero output for the atomic scatter fallback";
+            EXPECT_EQ(body.find("atomic scatter fallback"), std::string::npos)
+                << name << " production grouped prefill must not retain an atomic publication fallback";
         }
+        EXPECT_NE(rocm_body.find("if (!ordered_scatter_overwrites_output ||"),
+                  std::string::npos)
+            << "ROCm must fail hard when active routes lack ordered publication metadata";
+        EXPECT_NE(cuda_body.find("active_expert_slots > 0 && !ordered_scatter_overwrites_output"),
+                  std::string::npos)
+            << "CUDA must fail hard when active routes lack ordered publication metadata";
+        EXPECT_NE(cuda_body.find("if (active_expert_slots == 0)"),
+                  std::string::npos)
+            << "A CUDA participant with no local routes must publish a zero collective contribution";
 
         const fs::path cuda_kernels_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
         ASSERT_TRUE(fs::exists(cuda_kernels_path)) << cuda_kernels_path;
@@ -3606,7 +3614,7 @@ namespace llaminar2::test
 
         const std::vector<std::pair<std::string, std::string>> decode_required_tokens = {
             {"descriptor validator", "native_vnni_desc_shape_ok"},
-            {"negative runtime expert guard", "if (expert_id < 0)"},
+            {"runtime expert bounds guard", "if (expert_id < 0 || expert_id >= num_experts)"},
             {"negative descriptor index guard", "if (desc_idx < 0)"},
             {"blank descriptor guard", "!native_vnni_desc_shape_ok<FMT>(desc, N, K)"},
             {"invalid k-partial zero fill", "gate_partials[partial_index] = 0.0f;"},
@@ -3621,7 +3629,7 @@ namespace llaminar2::test
 
         const std::vector<std::pair<std::string, std::string>> prefill_required_tokens = {
             {"descriptor validator", "prefill_native_vnni_desc_shape_ok"},
-            {"negative runtime expert guard", "if (expert_id < 0)"},
+            {"runtime expert bounds guard", "if (expert_id < 0 || expert_id >= num_experts)"},
             {"blank descriptor guard", "!prefill_native_vnni_desc_shape_ok<FMT>"},
         };
         for (const auto &[label, token] : prefill_required_tokens)
@@ -3982,10 +3990,10 @@ namespace llaminar2::test
         for (const auto &[begin, end] : cuda_bodies)
             require_no_soft_retry(body_between(cuda, begin, end, begin.c_str()), begin.c_str());
 
-        EXPECT_NE(cuda.find("K-part gate/up decode was requested but scratch allocation failed"),
+        EXPECT_NE(cuda.find("mandatory K-part gate/up scratch allocation failed"),
                   std::string::npos)
             << "CUDA grouped decode must fail hard when explicit gate/up K-part scratch is unavailable";
-        EXPECT_NE(cuda.find("K-part down decode was requested but scratch allocation failed"),
+        EXPECT_NE(cuda.find("mandatory K-part down scratch allocation failed"),
                   std::string::npos)
             << "CUDA grouped decode must fail hard when explicit down K-part scratch is unavailable";
 
@@ -4402,7 +4410,7 @@ namespace llaminar2::test
         }
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, GraphCapturedSnapshotsDeferHostPublication)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, GraphCapturedSnapshotsPublishOnlyFromImmutableDeviceManifest)
     {
         const fs::path root = findRepoRoot();
         const fs::path executor_path =
@@ -4422,31 +4430,69 @@ namespace llaminar2::test
         const std::string snapshot_block =
             source.substr(contract_start, profiling_end - contract_start);
 
-        const size_t capture_branch =
-            snapshot_block.find("if (graph_capture_active)");
-        ASSERT_NE(capture_branch, std::string::npos)
-            << "Active graph capture must have a dedicated snapshot branch.";
-        const size_t eager_branch =
-            snapshot_block.find("else if", capture_branch);
-        ASSERT_NE(eager_branch, std::string::npos);
-        const std::string capture_only =
-            snapshot_block.substr(capture_branch, eager_branch - capture_branch);
+        const size_t gpu_branch =
+            snapshot_block.find("if (snapshot_device.is_gpu())");
+        ASSERT_NE(gpu_branch, std::string::npos)
+            << "GPU snapshots must have an explicit device-owned publication branch.";
+        const size_t cpu_branch =
+            snapshot_block.find("StageDumpInfo snapshot_dump_info", gpu_branch);
+        ASSERT_NE(cpu_branch, std::string::npos);
+        const std::string gpu_snapshot_only =
+            snapshot_block.substr(gpu_branch, cpu_branch - gpu_branch);
 
-        EXPECT_NE(capture_only.find("captureGraphSnapshotCopies"),
+        EXPECT_NE(gpu_snapshot_only.find("captureGraphSnapshotCopies"),
                   std::string::npos)
             << "Captured graphs must still record device-to-device snapshot copy nodes.";
-        EXPECT_EQ(capture_only.find("materializeGraphSnapshotCopies"),
+        EXPECT_NE(gpu_snapshot_only.find("!graph_capture_active"),
                   std::string::npos)
-            << "Graph capture must not materialize snapshots to host inside the captured body.";
-        EXPECT_EQ(capture_only.find("ensureOutputsOnHost"),
+            << "Only eager GPU execution may publish immediately; capture/replay publication belongs after launch.";
+        EXPECT_NE(gpu_snapshot_only.find("publishGraphSnapshotCopies"),
+                  std::string::npos)
+            << "Eager GPU snapshots must use the same immutable device manifest as graph replay.";
+        EXPECT_EQ(gpu_snapshot_only.find("refreshDumpInfoSnapshot"),
+                  std::string::npos)
+            << "GPU snapshot publication must never re-enter mutable stage dump descriptors.";
+        EXPECT_EQ(gpu_snapshot_only.find("materializeGraphSnapshotCopies"),
+                  std::string::npos)
+            << "The retired live-descriptor merge path must not return.";
+        EXPECT_EQ(gpu_snapshot_only.find("ensureOutputsOnHost"),
                   std::string::npos)
             << "Graph capture must not enqueue D2H snapshot publication inside the captured body.";
-        EXPECT_EQ(capture_only.find("config_.snapshot_callback"),
+        EXPECT_EQ(gpu_snapshot_only.find("config_.snapshot_callback"),
                   std::string::npos)
             << "Host callbacks belong after graph launch, not inside capture.";
 
+        EXPECT_EQ(source.find("materializeGraphSnapshotCopies"),
+                  std::string::npos)
+            << "GPU snapshots must not merge captured storage with live post-launch stage descriptors.";
+
+        const size_t manifest_publish_start =
+            source.find("bool DeviceGraphExecutor::publishGraphSnapshotCopies(");
+        ASSERT_NE(manifest_publish_start, std::string::npos);
+        const size_t post_graph_start =
+            source.find("bool DeviceGraphExecutor::publishSnapshotsAfterGraphExecution(",
+                        manifest_publish_start);
+        ASSERT_NE(post_graph_start, std::string::npos);
+        const std::string manifest_publish =
+            source.substr(manifest_publish_start, post_graph_start - manifest_publish_start);
+        EXPECT_NE(manifest_publish.find("graph_snapshot_copies_.find(stage_name)"),
+                  std::string::npos)
+            << "GPU publication must resolve the immutable per-stage captured-slot manifest.";
+        EXPECT_NE(manifest_publish.find("output.tensor = copy.storage.get()"),
+                  std::string::npos)
+            << "Published descriptors must refer directly to graph-stable snapshot storage.";
+        EXPECT_NE(manifest_publish.find("ensureOutputsOnHost"),
+                  std::string::npos)
+            << "The manifest publisher owns the post-launch D2H transfer.";
+        EXPECT_NE(manifest_publish.find("config_.snapshot_callback"),
+                  std::string::npos)
+            << "The manifest publisher owns the post-launch host callback.";
+        EXPECT_EQ(manifest_publish.find("refreshDumpInfoSnapshot"),
+                  std::string::npos)
+            << "Manifest publication must not consult mutable stage state.";
+
         const size_t publish_start =
-            source.find("bool DeviceGraphExecutor::publishSnapshotsAfterGraphExecution(");
+            post_graph_start;
         ASSERT_NE(publish_start, std::string::npos);
         const size_t terminal_publish =
             source.find("bool DeviceGraphExecutor::publishCapturedTerminalStateAfterGraphExecution(",
@@ -4454,25 +4500,48 @@ namespace llaminar2::test
         ASSERT_NE(terminal_publish, std::string::npos);
         const std::string post_graph_publish =
             source.substr(publish_start, terminal_publish - publish_start);
-        EXPECT_NE(post_graph_publish.find("materializeGraphSnapshotCopies"),
+        EXPECT_NE(post_graph_publish.find("publishGraphSnapshotCopies"),
                   std::string::npos)
-            << "Post-graph publication must own graph snapshot materialization.";
-        EXPECT_NE(post_graph_publish.find("ensureOutputsOnHost"),
+            << "Post-graph GPU publication must dispatch through the immutable manifest publisher.";
+        const size_t post_graph_gpu_branch =
+            post_graph_publish.find("if (snapshot_device.is_gpu())");
+        ASSERT_NE(post_graph_gpu_branch, std::string::npos);
+        const size_t post_graph_cpu_branch =
+            post_graph_publish.find("else", post_graph_gpu_branch);
+        ASSERT_NE(post_graph_cpu_branch, std::string::npos);
+        const std::string post_graph_gpu_only =
+            post_graph_publish.substr(post_graph_gpu_branch,
+                                      post_graph_cpu_branch - post_graph_gpu_branch);
+        EXPECT_NE(post_graph_gpu_only.find("publishGraphSnapshotCopies"),
+                  std::string::npos);
+        EXPECT_EQ(post_graph_gpu_only.find("refreshDumpInfoSnapshot"),
                   std::string::npos)
-            << "Post-graph publication must own D2H snapshot transfer.";
-        EXPECT_NE(post_graph_publish.find("config_.snapshot_callback"),
+            << "Captured GPU replay must not rebuild snapshots from live stage state.";
+        EXPECT_EQ(post_graph_gpu_only.find("ensureOutputsOnHost"),
                   std::string::npos)
-            << "Post-graph publication must invoke the host snapshot callback.";
+            << "Only the manifest publisher may perform GPU D2H publication.";
 
         const size_t copy_start =
             source.find("bool DeviceGraphExecutor::prepareOrRecordGraphSnapshotCopies(");
         ASSERT_NE(copy_start, std::string::npos);
-        const size_t materialize_start =
-            source.find("bool DeviceGraphExecutor::materializeGraphSnapshotCopies(",
-                        copy_start);
-        ASSERT_NE(materialize_start, std::string::npos);
+        const size_t materialize_start = manifest_publish_start;
         const std::string copy_body =
             source.substr(copy_start, materialize_start - copy_start);
+        EXPECT_NE(copy_body.find("if (!record_device_copy && !capture_active)"),
+                  std::string::npos)
+            << "Allocation-only pre-capture preparation must validate the descriptor finalized by warmup execution.";
+        EXPECT_NE(copy_body.find("reached capture preparation before warmup finalized its device manifest"),
+                  std::string::npos)
+            << "Missing warmup snapshot manifests must hard-fail instead of substituting pre-execution stage tensors.";
+        EXPECT_NE(copy_body.find("graph_snapshot_outputless_stages_.contains(node.name)"),
+                  std::string::npos)
+            << "Warmup-observed outputless stages need an explicit finalized manifest state.";
+        EXPECT_NE(copy_body.find("lost all tensor-backed outputs during graph capture"),
+                  std::string::npos)
+            << "A producer that loses warmed outputs during capture must hard-fail.";
+        EXPECT_NE(copy_body.find("copy.descriptor_finalized = true"),
+                  std::string::npos)
+            << "A successful point-in-time D2D copy must finalize its production descriptor.";
         const size_t event_contract =
             copy_body.find("The D2D copy has been recorded as a graph node");
         ASSERT_NE(event_contract, std::string::npos)

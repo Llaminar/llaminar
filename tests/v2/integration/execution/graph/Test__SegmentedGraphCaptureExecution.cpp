@@ -1,10 +1,17 @@
 /**
  * @file Test__SegmentedGraphCaptureExecution.cpp
- * @brief Integration tests for cached GPU graph replay via DeviceGraphExecutor::executeWithCachedGraphReplay()
+ * @brief Backend-bound integration tests for cached GPU graph replay.
  *
- * Phase 0 coverage:
- * 1. Warmup → capture → replay lifecycle executes successfully.
+ * This source is compiled once for CUDA and once for ROCm.  Each resulting
+ * binary explicitly registers only the backend named by its compile-time test
+ * binding, preventing an unregistered factory from turning real GPU coverage
+ * into a successful gtest skip.
+ *
+ * Coverage:
+ * 1. Warmup -> capture -> replay lifecycle executes successfully.
  * 2. Collective-marked segmented mode remains functional.
+ * 3. Graph-stable snapshot slots preserve point-in-time outputs when a later
+ *    stage overwrites the producer's arena storage.
  */
 
 #include <gtest/gtest.h>
@@ -29,12 +36,33 @@
 using namespace llaminar2;
 using namespace llaminar2::test;
 
-#define SKIP_IF_NO_GPU()                                            \
-    if (!GPUDeviceContextPool::instance().hasNvidiaSupport() &&     \
-        !GPUDeviceContextPool::instance().hasAMDSupport())          \
-    {                                                               \
-        GTEST_SKIP() << "No GPU available (neither CUDA nor ROCm)"; \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#define ENSURE_LINKED_GPU_BACKEND() ensureNvidiaFactoryRegistered()
+#define HAS_LINKED_GPU_SUPPORT() GPUDeviceContextPool::instance().hasNvidiaSupport()
+#define LINKED_GPU_CONTEXT() GPUDeviceContextPool::instance().getNvidiaContext(0)
+#define LINKED_GPU_DEVICE_ID() DeviceId::cuda(0)
+#define LINKED_GPU_SKIP_MESSAGE "CUDA not available"
+#elif defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#define ENSURE_LINKED_GPU_BACKEND() ensureAMDFactoryRegistered()
+#define HAS_LINKED_GPU_SUPPORT() GPUDeviceContextPool::instance().hasAMDSupport()
+#define LINKED_GPU_CONTEXT() GPUDeviceContextPool::instance().getAMDContext(0)
+#define LINKED_GPU_DEVICE_ID() DeviceId::rocm(0)
+#define LINKED_GPU_SKIP_MESSAGE "ROCm not available"
+#else
+#define ENSURE_LINKED_GPU_BACKEND() ((void)0)
+#define HAS_LINKED_GPU_SUPPORT() false
+#define LINKED_GPU_CONTEXT() GPUDeviceContextPool::instance().getContext("", 0)
+#define LINKED_GPU_DEVICE_ID() DeviceId::cpu()
+#define LINKED_GPU_SKIP_MESSAGE "No GPU backend linked in this test binary"
+#endif
+
+#define SKIP_IF_NO_GPU()                                      \
+    do                                                        \
+    {                                                         \
+        ENSURE_LINKED_GPU_BACKEND();                          \
+        if (!HAS_LINKED_GPU_SUPPORT())                        \
+            GTEST_SKIP() << LINKED_GPU_SKIP_MESSAGE;          \
+    } while (false)
 
 class CachedGraphReplayExecutionTest : public ::testing::Test
 {
@@ -45,17 +73,11 @@ protected:
 
     void SetUp() override
     {
-        auto &pool = GPUDeviceContextPool::instance();
-
-        if (pool.hasAMDSupport())
+        ENSURE_LINKED_GPU_BACKEND();
+        if (HAS_LINKED_GPU_SUPPORT())
         {
-            gpu_ctx_ = &pool.getAMDContext(0);
-            device_ctx_ = IDeviceContext::create(DeviceId::rocm(0), 1);
-        }
-        else if (pool.hasNvidiaSupport())
-        {
-            gpu_ctx_ = &pool.getNvidiaContext(0);
-            device_ctx_ = IDeviceContext::create(DeviceId::cuda(0), 1);
+            gpu_ctx_ = &LINKED_GPU_CONTEXT();
+            device_ctx_ = IDeviceContext::create(LINKED_GPU_DEVICE_ID(), 1);
         }
     }
 
@@ -74,11 +96,45 @@ protected:
         return static_cast<FP32Tensor *>(ptr);
     }
 
+    /**
+     * @brief Allocate and upload every fixture-owned tensor before graph warmup.
+     *
+     * Cached replay creates a dedicated stream internally.  These synthetic
+     * stages do not use arena BufferIds, so the executor cannot discover and
+     * cohere their raw tensor parameters on our behalf.  Uploading on the
+     * context's default stream and synchronizing once establishes stable device
+     * addresses before warmup, capture, and replay bind the stages to their
+     * dedicated stream.
+     *
+     * @return true when every tensor is resident and the upload stream has
+     *         completed; false on allocation, transfer, or synchronization
+     *         failure.
+     */
+    bool prepareFixtureTensorsForGPUExecution()
+    {
+        if (!gpu_ctx_ || !device_ctx_)
+            return false;
+
+        void *upload_stream = gpu_ctx_->defaultStream();
+        if (!upload_stream)
+            return false;
+
+        const DeviceId device = device_ctx_->deviceId();
+        for (const auto &tensor : tensor_storage_)
+        {
+            if (!tensor || !tensor->ensureOnDevice(device, upload_stream))
+                return false;
+        }
+
+        return gpu_ctx_->synchronizeStreamChecked(upload_stream);
+    }
+
     ComputeGraph buildNormResidualGraph(size_t seq_len, size_t d_model,
                                         FP32Tensor *&norm_input,
                                         FP32Tensor *&residual,
                                         FP32Tensor *&result_output)
     {
+        const DeviceId device = device_ctx_->deviceId();
         norm_input = createFP32Tensor({seq_len, d_model});
         auto *norm_output = createFP32Tensor({seq_len, d_model});
         auto *gamma = createFP32Tensor({d_model});
@@ -99,16 +155,18 @@ protected:
         norm_params.gamma = gamma;
         norm_params.eps = 1e-5f;
         norm_params.seq_len = static_cast<int>(seq_len);
+        norm_params.device_id = device;
 
         ResidualAddStage::Params res_params;
         res_params.input = norm_output;
         res_params.residual = residual;
         res_params.output = result_output;
         res_params.num_elements = num_elements;
+        res_params.device_id = device;
 
         ComputeGraph graph;
-        graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), device_ctx_->deviceId());
-        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), device_ctx_->deviceId());
+        graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), device);
+        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), device);
         graph.addDependency("residual_add", "rmsnorm");
         return graph;
     }
@@ -249,6 +307,7 @@ TEST_F(CachedGraphReplayExecutionTest, WarmupCaptureReplay_LifecycleStable)
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
@@ -305,6 +364,7 @@ TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunc
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
@@ -360,6 +420,7 @@ TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamFo
     FP32Tensor *residual = nullptr;
     FP32Tensor *result = nullptr;
     auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
@@ -414,6 +475,7 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     FP32Tensor *norm_input = nullptr;
     FP32Tensor *scratch = nullptr;
     auto graph = buildSnapshotOverwriteGraph(seq_len, d_model, norm_input, scratch);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
 
     std::unordered_map<std::string, std::vector<float>> snapshots;
     GraphExecutorConfig exec_config;

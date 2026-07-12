@@ -259,7 +259,7 @@ namespace llaminar2
          * the single-device path.
          */
         bool fillRankSpeculativeVerifyOutcomeFromMeta(
-            const std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens> &output_tokens,
+            const std::vector<int32_t> &output_tokens,
             const std::array<int, sampling_math::kSpeculativeBatchMetaCount> &meta,
             DeviceSpeculativeVerifyBatchOutcome *out)
         {
@@ -267,7 +267,8 @@ namespace llaminar2
             if (!out ||
                 meta[kSpecBatchMetaOk] == 0 ||
                 meta[kSpecBatchMetaOutputCount] < 0 ||
-                meta[kSpecBatchMetaOutputCount] > kSpeculativeBatchMaxOutputTokens)
+                meta[kSpecBatchMetaOutputCount] >
+                    static_cast<int>(output_tokens.size()))
             {
                 return false;
             }
@@ -737,6 +738,7 @@ namespace llaminar2
         {
             throw std::invalid_argument("Invalid RankOrchestrator configuration");
         }
+        initializeRankMTPScratch();
 
         // Initialize stage sharding map from model architecture
         stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(model_ctx_->architecture());
@@ -821,6 +823,8 @@ namespace llaminar2
           external_device_backend_access_enabled_(false),
           current_batch_size_(std::max(1, config.batch_size))
     {
+        initializeRankMTPScratch();
+
         // Initialize stage sharding map from model architecture (if registered)
         const auto arch = model_ctx_->architecture();
         if (SchemaFactoryRegistry::isSupported(arch))
@@ -865,6 +869,46 @@ namespace llaminar2
     // Move operations
     RankOrchestrator::RankOrchestrator(RankOrchestrator &&) noexcept = default;
     RankOrchestrator &RankOrchestrator::operator=(RankOrchestrator &&) noexcept = default;
+
+    void RankOrchestrator::initializeRankMTPScratch()
+    {
+        rank_max_draft_depth_ = resolveMTPMaximumDraftDepth(config_.mtp);
+        rank_max_verifier_rows_ = rank_max_draft_depth_ + 1;
+        rank_compact_output_token_stride_ = rank_max_verifier_rows_;
+
+        /*
+         * Target slots include one bonus row per request. Reusing that larger
+         * capacity for the rank's draft-token bookkeeping costs only a handful
+         * of integers and keeps every slot validation on one explicit bound.
+         */
+        rank_stochastic_slot_capacity_ =
+            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
+
+        rank_compact_output_tokens_.assign(
+            static_cast<size_t>(rank_compact_output_token_stride_),
+            -1);
+        const size_t distribution_entry_capacity =
+            static_cast<size_t>(rank_stochastic_slot_capacity_) *
+            static_cast<size_t>(sampling_math::kMaxTopK);
+        rank_stochastic_target_token_ids_.assign(
+            distribution_entry_capacity,
+            -1);
+        rank_stochastic_target_probs_.assign(
+            distribution_entry_capacity,
+            0.0f);
+        rank_stochastic_target_top_k_.assign(
+            static_cast<size_t>(rank_stochastic_slot_capacity_),
+            0);
+        rank_stochastic_target_sample_tokens_.assign(
+            static_cast<size_t>(rank_stochastic_slot_capacity_),
+            -1);
+        rank_stochastic_draft_sample_tokens_.assign(
+            static_cast<size_t>(rank_stochastic_slot_capacity_),
+            -1);
+        rank_mirrored_target_distribution_ready_.assign(
+            static_cast<size_t>(rank_stochastic_slot_capacity_),
+            false);
+    }
 
     // =========================================================================
     // Private Methods
@@ -3892,7 +3936,7 @@ namespace llaminar2
         }
         if (!supportsMTPDeviceDraftTokenInput() ||
             draft_sample_slot < 0 ||
-            draft_sample_slot >= kRankStochasticMaxSlots ||
+            draft_sample_slot >= rank_stochastic_slot_capacity_ ||
             position_id < 0)
         {
             LOG_ERROR("[RankOrchestrator] LocalTP device-draft sidecar requires staged child draft slots on every participant");
@@ -4019,7 +4063,7 @@ namespace llaminar2
         }
         if (!supportsMTPDeviceDraftTokenInput() ||
             target_sample_slot < 0 ||
-            target_sample_slot >= kRankStochasticMaxSlots ||
+            target_sample_slot >= rank_stochastic_slot_capacity_ ||
             position_id < 0)
         {
             LOG_ERROR("[RankOrchestrator] LocalTP device-target sidecar requires staged child target slots on every participant");
@@ -4476,7 +4520,7 @@ namespace llaminar2
             first_condition_slot < 0 ||
             condition_slot_stride <= 0 ||
             last_condition_slot < 0 ||
-            last_condition_slot >= kRankStochasticMaxSlots ||
+            last_condition_slot >= rank_stochastic_slot_capacity_ ||
             position_offset <= 0)
         {
             LOG_ERROR("[RankOrchestrator] Chained resident request-batched MTP received invalid source-slot or depth geometry"
@@ -4565,7 +4609,7 @@ namespace llaminar2
             first_draft_slot < 0 ||
             draft_slot_stride <= 0 ||
             last_draft_slot < 0 ||
-            last_draft_slot >= kRankStochasticMaxSlots)
+            last_draft_slot >= rank_stochastic_slot_capacity_)
         {
             return fail(
                 "invalid destination-slot geometry: request_batch=" +
@@ -6385,7 +6429,7 @@ namespace llaminar2
         if (usesMirroredLocalTPMTPHeadForVerifier())
         {
             if (target_sample_slot < 0 ||
-                target_sample_slot >= kRankStochasticMaxSlots ||
+                target_sample_slot >= rank_stochastic_slot_capacity_ ||
                 device_runners_.size() < 2)
             {
                 return false;
@@ -6689,9 +6733,9 @@ namespace llaminar2
         if (device_runners_.size() < 2 ||
             !draft_tokens ||
             draft_token_count <= 0 ||
-            draft_token_count > kSpeculativeBatchMaxRows ||
+            draft_token_count > rank_max_verifier_rows_ ||
             compare_rows < 0 ||
-            compare_rows > kSpeculativeBatchMaxRows ||
+            compare_rows > rank_max_draft_depth_ ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens))
@@ -6715,8 +6759,9 @@ namespace llaminar2
          * avoids gathering full logits and keeps accepted-count/ready-token
          * semantics identical to serial greedy decode.
          */
-        std::array<int32_t, kSpeculativeBatchMaxRows> verifier_tokens_i32{};
-        verifier_tokens_i32.fill(-1);
+        std::vector<int32_t> verifier_tokens_i32(
+            static_cast<size_t>(draft_token_count),
+            -1);
         if (!sampleGreedyFromAllPositionLogitsOnDeviceRows(
                 /*start_row=*/0,
                 draft_token_count,
@@ -6725,10 +6770,12 @@ namespace llaminar2
             return false;
         }
 
-        std::array<int, kSpeculativeBatchMaxRows> verifier_tokens{};
-        std::array<int, kSpeculativeBatchMaxRows> packed_draft_tokens{};
-        verifier_tokens.fill(-1);
-        packed_draft_tokens.fill(-1);
+        std::vector<int> verifier_tokens(
+            static_cast<size_t>(draft_token_count),
+            -1);
+        std::vector<int> packed_draft_tokens(
+            static_cast<size_t>(draft_token_count),
+            -1);
         for (int row = 0; row < draft_token_count; ++row)
         {
             verifier_tokens[static_cast<size_t>(row)] =
@@ -6742,9 +6789,10 @@ namespace llaminar2
         for (int i = 0; i < stop_token_count; ++i)
             packed_stop_tokens[static_cast<size_t>(i)] = stop_tokens[i];
 
-        std::array<int, kSpeculativeBatchMaxOutputTokens> output_tokens_int{};
+        std::vector<int> output_tokens_int(
+            static_cast<size_t>(rank_compact_output_token_stride_),
+            -1);
         std::array<int, kSpeculativeBatchMetaCount> meta{};
-        output_tokens_int.fill(-1);
         meta.fill(0);
         summarize_greedy_speculative_verify_batch(
             static_cast<int>(resolved_draft_tokens[0]),
@@ -6754,10 +6802,12 @@ namespace llaminar2
             packed_stop_tokens.data(),
             stop_token_count,
             output_tokens_int.data(),
+            static_cast<int>(output_tokens_int.size()),
             meta.data());
 
-        std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
-        output_tokens.fill(-1);
+        std::vector<int32_t> output_tokens(
+            static_cast<size_t>(rank_compact_output_token_stride_),
+            -1);
         for (size_t i = 0; i < output_tokens.size(); ++i)
             output_tokens[i] = static_cast<int32_t>(output_tokens_int[i]);
 
@@ -6855,7 +6905,16 @@ namespace llaminar2
          * runner is re-entered here, and no verifier row is replayed.
          */
         using namespace sampling_math;
-        rank_compact_output_tokens_ = outcome.output_tokens;
+        if (outcome.output_tokens.size() > rank_compact_output_tokens_.size())
+            return false;
+        std::fill(
+            rank_compact_output_tokens_.begin(),
+            rank_compact_output_tokens_.end(),
+            -1);
+        std::copy(
+            outcome.output_tokens.begin(),
+            outcome.output_tokens.end(),
+            rank_compact_output_tokens_.begin());
         rank_compact_output_meta_.fill(0);
         rank_compact_outcome_kind_ = RankCompactOutcomeKind::Greedy;
         rank_compact_output_meta_[kSpecBatchMetaOk] = outcome.ok ? 1 : 0;
@@ -6893,7 +6952,7 @@ namespace llaminar2
         out_handle->output_tokens_device = rank_compact_output_tokens_.data();
         out_handle->meta_device = rank_compact_output_meta_.data();
         out_handle->request_count = 1;
-        out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
+        out_handle->output_token_stride = rank_compact_output_token_stride_;
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = primaryDeviceId();
         out_handle->stream = &rank_compact_outcome_stream_token_;
@@ -6932,9 +6991,9 @@ namespace llaminar2
         if (device_runners_.size() < 2 ||
             !draft_tokens ||
             draft_token_count <= 0 ||
-            draft_token_count > kSpeculativeBatchMaxRows ||
+            draft_token_count > rank_max_verifier_rows_ ||
             compare_rows < 0 ||
-            compare_rows > kSpeculativeBatchMaxRows ||
+            compare_rows > rank_max_draft_depth_ ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens ||
             (stop_token_count > 0 && !stop_tokens))
@@ -7401,7 +7460,7 @@ namespace llaminar2
             device_runners_.size() < 2 ||
             row < 0 ||
             slot < 0 ||
-            slot >= kRankStochasticMaxSlots ||
+            slot >= rank_stochastic_slot_capacity_ ||
             params.top_k <= 0 ||
             params.top_k > sampling_math::kMaxTopK ||
             vocab_size <= 0)
@@ -7636,7 +7695,7 @@ namespace llaminar2
             first_row < 0 ||
             first_slot < 0 ||
             row_count <= 0 ||
-            first_slot + row_count > kRankStochasticMaxSlots ||
+            first_slot + row_count > rank_stochastic_slot_capacity_ ||
             params.top_k <= 0 ||
             params.top_k > sampling_math::kMaxTopK ||
             vocab_size <= 0)
@@ -7854,7 +7913,7 @@ namespace llaminar2
     {
         if (buffer != DeviceDistributionBuffer::Target ||
             slot < 0 ||
-            slot >= kRankStochasticMaxSlots)
+            slot >= rank_stochastic_slot_capacity_)
         {
             return false;
         }
@@ -7911,7 +7970,7 @@ namespace llaminar2
     {
         if (device_runners_.size() < 2 ||
             draft_sample_slot < 0 ||
-            draft_sample_slot >= kRankStochasticMaxSlots)
+            draft_sample_slot >= rank_stochastic_slot_capacity_)
         {
             return false;
         }
@@ -7971,7 +8030,7 @@ namespace llaminar2
     {
         if (device_runners_.size() < 2 ||
             target_sample_slot < 0 ||
-            target_sample_slot >= kRankStochasticMaxSlots)
+            target_sample_slot >= rank_stochastic_slot_capacity_)
         {
             return false;
         }
@@ -8046,7 +8105,7 @@ namespace llaminar2
     {
         if (device_runners_.size() < 2 ||
             slot < 0 ||
-            slot >= kRankStochasticMaxSlots ||
+            slot >= rank_stochastic_slot_capacity_ ||
             token < 0)
         {
             return false;
@@ -8088,7 +8147,7 @@ namespace llaminar2
             !tokens ||
             token_count <= 0 ||
             first_slot < 0 ||
-            first_slot + token_count > kRankStochasticMaxSlots)
+            first_slot + token_count > rank_stochastic_slot_capacity_)
         {
             return false;
         }
@@ -8137,7 +8196,7 @@ namespace llaminar2
             (buffer != DeviceDistributionBuffer::Target &&
              buffer != DeviceDistributionBuffer::Draft) ||
             slot < 0 ||
-            slot >= kRankStochasticMaxSlots)
+            slot >= rank_stochastic_slot_capacity_)
         {
             return false;
         }
@@ -8340,13 +8399,13 @@ namespace llaminar2
             draft_token_count < 0 ||
             draft_token_count + 1 != total_verifier_input_tokens ||
             first_draft_slot < 0 ||
-            first_draft_slot + draft_token_count > kRankStochasticMaxSlots)
+            first_draft_slot + draft_token_count > rank_stochastic_slot_capacity_)
         {
             return nullptr;
         }
         if (first_token_from_device &&
             (first_target_sample_slot < 0 ||
-             first_target_sample_slot >= kRankStochasticMaxSlots))
+             first_target_sample_slot >= rank_stochastic_slot_capacity_))
         {
             return nullptr;
         }
@@ -8447,14 +8506,14 @@ namespace llaminar2
 
     int32_t RankOrchestrator::rankStochasticDraftSampleToken(int slot) const
     {
-        if (slot < 0 || slot >= kRankStochasticMaxSlots)
+        if (slot < 0 || slot >= rank_stochastic_slot_capacity_)
             return -1;
         return rank_stochastic_draft_sample_tokens_[static_cast<size_t>(slot)];
     }
 
     int32_t RankOrchestrator::rankStochasticTargetSampleToken(int slot) const
     {
-        if (slot < 0 || slot >= kRankStochasticMaxSlots)
+        if (slot < 0 || slot >= rank_stochastic_slot_capacity_)
             return -1;
         return rank_stochastic_target_sample_tokens_[static_cast<size_t>(slot)];
     }
@@ -8562,7 +8621,7 @@ namespace llaminar2
                 params,
                 vocab_size);
         }
-        if (slot >= 0 && slot < kRankStochasticMaxSlots)
+        if (slot >= 0 && slot < rank_stochastic_slot_capacity_)
         {
             rank_mirrored_target_distribution_ready_[
                 static_cast<size_t>(slot)] = false;
@@ -8573,7 +8632,7 @@ namespace llaminar2
         {
             if (buffer != DeviceDistributionBuffer::Target ||
                 slot < 0 ||
-                slot >= kRankStochasticMaxSlots ||
+                slot >= rank_stochastic_slot_capacity_ ||
                 device_runners_.size() < 2)
             {
                 return false;
@@ -8821,7 +8880,7 @@ namespace llaminar2
         if (source != DeviceLogitsSource::MTP ||
             row < 0 ||
             slot < 0 ||
-            slot >= kRankStochasticMaxSlots ||
+            slot >= rank_stochastic_slot_capacity_ ||
             device_runners_.size() < 2)
         {
             return -1;
@@ -8964,7 +9023,7 @@ namespace llaminar2
         {
             if (row < 0 ||
                 slot < 0 ||
-                slot >= kRankStochasticMaxSlots ||
+                slot >= rank_stochastic_slot_capacity_ ||
                 device_runners_.size() < 2)
             {
                 return false;
@@ -9054,7 +9113,7 @@ namespace llaminar2
 
         if (buffer == DeviceDistributionBuffer::Target &&
             slot >= 0 &&
-            slot < kRankStochasticMaxSlots &&
+            slot < rank_stochastic_slot_capacity_ &&
             rank_mirrored_target_distribution_ready_[
                 static_cast<size_t>(slot)])
         {
@@ -9120,7 +9179,7 @@ namespace llaminar2
         }
         if (buffer == DeviceDistributionBuffer::Target &&
             slot >= 0 &&
-            slot < kRankStochasticMaxSlots &&
+            slot < rank_stochastic_slot_capacity_ &&
             rank_mirrored_target_distribution_ready_[
                 static_cast<size_t>(slot)])
         {
@@ -9213,13 +9272,18 @@ namespace llaminar2
             !draft_tokens ||
             draft_token_count <= 0 ||
             first_draft_slot < 0 ||
-            first_draft_slot + draft_token_count > kRankStochasticMaxSlots)
+            first_draft_slot + draft_token_count > rank_stochastic_slot_capacity_)
         {
             return false;
         }
 
         if (first_draft_slot == 0)
-            rank_stochastic_draft_sample_tokens_.fill(-1);
+        {
+            std::fill(
+                rank_stochastic_draft_sample_tokens_.begin(),
+                rank_stochastic_draft_sample_tokens_.end(),
+                -1);
+        }
         if (rank_stochastic_staged_draft_tokens_.size() <
             static_cast<size_t>(first_draft_slot + draft_token_count))
         {
@@ -9821,16 +9885,24 @@ namespace llaminar2
 
         const DeviceStochasticBatchOutcomeRequest &request = requests[0];
         if (request.row_count <= 0 ||
-            request.row_count > kSpeculativeBatchMaxRows ||
+            request.row_count > rank_max_draft_depth_ ||
             request.first_target_slot < 0 ||
             request.first_draft_slot < 0 ||
             request.first_target_slot + request.row_count >
-                kRankStochasticMaxSlots ||
+                rank_stochastic_slot_capacity_ ||
             request.first_draft_slot + request.row_count >
-                kRankStochasticMaxSlots ||
+                rank_stochastic_slot_capacity_ ||
             request.stop_token_count < 0 ||
             request.stop_token_count > kSpeculativeBatchMaxStopTokens ||
-            (request.bonus_target_slot >= kRankStochasticMaxSlots))
+            (request.bonus_target_slot >= rank_stochastic_slot_capacity_) ||
+            (!request.use_device_draft_tokens &&
+             request.draft_tokens.size() <
+                 static_cast<size_t>(request.row_count)) ||
+            (!request.derive_thresholds_from_seed &&
+             (request.accept_thresholds.size() <
+                  static_cast<size_t>(request.row_count) ||
+              request.residual_thresholds.size() <
+                  static_cast<size_t>(request.row_count))))
         {
             return false;
         }
@@ -9847,8 +9919,12 @@ namespace llaminar2
             LOG_ERROR("[RankOrchestrator] CPU rank stochastic verifier cannot consume a device-owned draw-position descriptor");
             return false;
         }
-        std::array<float, kSpeculativeBatchMaxRows> accept_thresholds{};
-        std::array<float, kSpeculativeBatchMaxRows> residual_thresholds{};
+        std::vector<float> accept_thresholds(
+            static_cast<size_t>(request.row_count),
+            0.0f);
+        std::vector<float> residual_thresholds(
+            static_cast<size_t>(request.row_count),
+            0.0f);
         for (int row = 0; row < request.row_count; ++row)
         {
             if (derive_thresholds)
@@ -9888,10 +9964,12 @@ namespace llaminar2
             static_cast<size_t>(request.row_count + 1));
         actual_draft_tokens.push_back(first_token);
 
-        std::array<int, kSpeculativeBatchMaxRows> row_tokens{};
-        std::array<int, kSpeculativeBatchMaxRows> row_accepted{};
-        row_tokens.fill(-1);
-        row_accepted.fill(0);
+        std::vector<int> row_tokens(
+            static_cast<size_t>(request.row_count),
+            -1);
+        std::vector<int> row_accepted(
+            static_cast<size_t>(request.row_count),
+            0);
 
         for (int row = 0; row < request.row_count; ++row)
         {
@@ -9976,10 +10054,11 @@ namespace llaminar2
             has_bonus = 1;
         }
 
-        std::array<int, kSpeculativeBatchMaxOutputTokens> output_tokens_int{};
+        std::vector<int> output_tokens_int(
+            static_cast<size_t>(rank_compact_output_token_stride_),
+            -1);
         std::array<int, kSpeculativeBatchMetaCount> meta{};
         std::array<int, kSpeculativeBatchMaxStopTokens> packed_stop_tokens{};
-        output_tokens_int.fill(-1);
         meta.fill(0);
         packed_stop_tokens.fill(-1);
         for (int i = 0; i < request.stop_token_count; ++i)
@@ -9997,11 +10076,15 @@ namespace llaminar2
             bonus_token,
             has_bonus,
             output_tokens_int.data(),
+            static_cast<int>(output_tokens_int.size()),
             meta.data());
         if (meta[kSpecBatchMetaOk] == 0)
             return false;
 
-        rank_compact_output_tokens_.fill(-1);
+        std::fill(
+            rank_compact_output_tokens_.begin(),
+            rank_compact_output_tokens_.end(),
+            -1);
         for (size_t i = 0; i < rank_compact_output_tokens_.size(); ++i)
         {
             rank_compact_output_tokens_[i] =
@@ -10019,7 +10102,7 @@ namespace llaminar2
         out_handle->output_tokens_device = rank_compact_output_tokens_.data();
         out_handle->meta_device = rank_compact_output_meta_.data();
         out_handle->request_count = 1;
-        out_handle->output_token_stride = kSpeculativeBatchMaxOutputTokens;
+        out_handle->output_token_stride = rank_compact_output_token_stride_;
         out_handle->meta_stride = kSpeculativeBatchMetaCount;
         out_handle->device = primaryDeviceId();
         out_handle->stream = &rank_compact_outcome_stream_token_;
@@ -10256,8 +10339,7 @@ namespace llaminar2
             handle.output_tokens_device != rank_compact_output_tokens_.data() ||
             handle.meta_device != rank_compact_output_meta_.data() ||
             handle.request_count != 1 ||
-            handle.output_token_stride !=
-                sampling_math::kSpeculativeBatchMaxOutputTokens ||
+            handle.output_token_stride != rank_compact_output_token_stride_ ||
             handle.meta_stride != sampling_math::kSpeculativeBatchMetaCount)
         {
             return false;
@@ -12006,14 +12088,35 @@ namespace llaminar2
         current_sequence_lengths_.assign(
             static_cast<size_t>(std::max(1, config_.batch_size)),
             0);
-        rank_stochastic_target_token_ids_.fill(-1);
-        rank_stochastic_target_probs_.fill(0.0f);
-        rank_stochastic_target_top_k_.fill(0);
-        rank_stochastic_target_sample_tokens_.fill(-1);
-        rank_stochastic_draft_sample_tokens_.fill(-1);
-        rank_mirrored_target_distribution_ready_.fill(false);
+        std::fill(
+            rank_stochastic_target_token_ids_.begin(),
+            rank_stochastic_target_token_ids_.end(),
+            -1);
+        std::fill(
+            rank_stochastic_target_probs_.begin(),
+            rank_stochastic_target_probs_.end(),
+            0.0f);
+        std::fill(
+            rank_stochastic_target_top_k_.begin(),
+            rank_stochastic_target_top_k_.end(),
+            0);
+        std::fill(
+            rank_stochastic_target_sample_tokens_.begin(),
+            rank_stochastic_target_sample_tokens_.end(),
+            -1);
+        std::fill(
+            rank_stochastic_draft_sample_tokens_.begin(),
+            rank_stochastic_draft_sample_tokens_.end(),
+            -1);
+        std::fill(
+            rank_mirrored_target_distribution_ready_.begin(),
+            rank_mirrored_target_distribution_ready_.end(),
+            false);
         rank_stochastic_staged_draft_tokens_.clear();
-        rank_compact_output_tokens_.fill(-1);
+        std::fill(
+            rank_compact_output_tokens_.begin(),
+            rank_compact_output_tokens_.end(),
+            -1);
         rank_compact_output_meta_.fill(0);
         rank_compact_outcome_kind_ = RankCompactOutcomeKind::None;
         rank_compact_last_draft_tokens_.clear();

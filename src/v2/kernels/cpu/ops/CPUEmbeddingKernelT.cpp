@@ -104,7 +104,7 @@ namespace llaminar2
             int d_model,
             const char *weight_route)
         {
-            if (num_tokens < 2 || num_tokens > 4)
+            if (num_tokens < 2)
                 return;
 
             PerfStatsCollector::addCounter(

@@ -2,28 +2,31 @@
  * @file ROCmMoEGroupedPrefillKernels.hip
  * @brief Grouped MoE prefill kernels for AMD MI50/MI60 (gfx906)
  *
- * These kernels process ALL experts in a single launch, eliminating the
- * per-expert host dispatch loop and hipStreamSynchronize that caused 99.9%
- * host overhead in prefill. Fully graph-capturable (no host-device sync).
+ * The pipeline is entirely device-owned and graph-capturable. It consumes the
+ * route groups and descriptor tables already resident on the GPU; no launch
+ * reads route counts on the host and no stream synchronization is required.
  *
- * Pipeline (4 launches per MoE layer, replaces ~800):
- *   1. grouped_gather_quantize_prefill - gather + INT8 quantize for all experts
- *   2. grouped_gate_up_swiglu_prefill  - gate+up GEMM fused with SwiGLU quant
- *   3. grouped_down_prefill_gemm       - down projection for all experts
- *   4. grouped_weighted_scatter_prefill - scatter-add results to output
+ * Small verifier buckets (M <= 8) use direct route-owned projections because
+ * their latency is dominated by launch and directory overhead. Longer prefill
+ * uses a compact device-built tile directory and a generated policy trained
+ * across every execution codebook, reciprocal aspect ratio, and M anchor:
  *
- * Key design: all kernels read expert counts/offsets from DEVICE memory
- * (d_group_counts, d_group_offsets) — no host reads required.
+ *   1. Reuse router-owned Q8 rows, or quantize each original hidden row once.
+ *   2. Build a packed expert/tile directory entirely on the device.
+ *   3. Decode each gate/up weight block once for a trained 4/8/12/16-row tile
+ *      while retaining the exact increasing-K accumulation order of serial decode.
+ *   4. Quantize exact SwiGLU rows for the down projection.
+ *   5. Decode each down weight block once per independently trained row tile
+ *      into route partials.
+ *   6. Publish those partials with one writer per token/output column, adding
+ *      routes in original top-k order.
  *
- * Grid strategy: dim3(N_tiles, max_M_tiles, num_experts)
- *   - blockIdx.z = expert index
- *   - Blocks where blockIdx.y * TILE_M >= count[expert] early-exit
- *   - This over-provisions M-tiles but avoids host sync entirely
- *
- * Verifier-sized MTP forwards usually have M=2..4.  Keep those rows on
- * dedicated small-M instantiations so each thread owns fewer accumulators and
- * the HIP compiler does not burn verifier time carrying TILE_M=8 register
- * state for rows that do not exist.
+ * The long-prefill projection kernels expose 64/128/256 output-column lanes and
+ * 4/8/12/16-row tiles. Production dispatch comes exclusively from the checked-in
+ * all-format trainer output; a missing policy is a hard failure. No production
+ * path uses floating-point atomics, row replay, host-authored work metadata, or
+ * scheduler-dependent reduction order, so grouped verifier publication remains
+ * byte-identical to serial row decode.
  *
  * @see ROCmGemvKernel_native_VNNI.hip for decode grouped kernels (M=1)
  * @see ROCmQuantisedGemmKernel_native_VNNI.hip for non-grouped prefill GEMM
@@ -35,6 +38,8 @@
 #include <cstdio>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../utils/DebugEnv.h"
+#include "ROCmMoEGroupedPrefillDispatchGenerated.inc"
 
 // Local copy of DeviceNativeVNNIMatrixDesc to avoid pulling in x86-only headers
 // Must stay in sync with src/v2/tensors/TensorKernels.h
@@ -199,29 +204,6 @@ __device__ __forceinline__ float moe_prefill_native_vnni_dual_scale_correction(
     return correction;
 }
 
-__host__ __device__ inline int rocm_moe_select_grouped_prefill_tile_m(
-    int requested_tile_m,
-    int max_tokens_per_expert)
-{
-    switch (requested_tile_m)
-    {
-    case 2:
-    case 4:
-    case 8:
-        return requested_tile_m;
-    default:
-        break;
-    }
-
-    if (max_tokens_per_expert <= 2) return 2;
-    if (max_tokens_per_expert <= 4) return 2;
-    // The tile-4 instantiation is kept for explicit sweeps, but the
-    // production Qwen3.6 MoE verifier gate favors tile-2 for 3/4-row buckets.
-    // Keep the selector shape-based and generic rather than special-casing
-    // individual codebooks.
-    return 8;
-}
-
 // IQ grid lookup tables (separate copies for this TU — initialized via
 // rocmInitIQGridTables_moe_prefill, same data as GEMV/GEMM TUs)
 __device__ __constant__ uint32_t d_pf_iq3s_grid[512];
@@ -268,50 +250,32 @@ __device__ inline uint32_t pf_iq_apply_signs_4(uint32_t grid4, uint8_t sign_lo4)
 
 
 // ============================================================================
-// Kernel 1: Grouped Gather + Quantize (all experts, single launch)
+// Kernel 1: Original-Row Quantization (all tokens, single launch)
 //
-// FLAT GRID: grid(blocks_per_row, total_slots) — no empty blocks.
-// Each block handles one 32-element quantization block of one token slot.
+// Each routed expert consumes the same hidden row. Quantizing `[seq_len, K]`
+// once avoids writing `top_k` byte-identical copies before expert grouping.
 //
-// Grid: dim3(blocks_per_row, total_slots)
+// Grid: dim3(blocks_per_row, seq_len)
 //   blockIdx.x = quantization block within the row
-//   blockIdx.y = global slot index (0..total_slots-1)
+//   blockIdx.y = original token row
 // Block: 32 threads (warp-cooperative quantization)
 // ============================================================================
 
 __global__ __launch_bounds__(32)
-void moe_grouped_gather_quantize_prefill_kernel(
+void moe_prefill_hidden_quantize_rows_kernel(
     const float* __restrict__ hidden,            // [seq_len, d_model]
-    int8_t*      __restrict__ A_int8_out,        // [total_slots, K] gathered + quantized
-    float*       __restrict__ scales_out,        // [total_slots, blocks_per_row] per-block scales
-    const int*   __restrict__ d_group_token_indices, // [total_slots] token rows or route slots
-    int max_tokens,
-    int top_k,
-    int grouped_indices_are_route_slots,
+    int8_t*      __restrict__ A_int8_out,        // [seq_len, K] quantized original rows
+    float*       __restrict__ scales_out,        // [seq_len, blocks_per_row] per-block scales
+    int seq_len,
     int K)                                       // d_model (columns)
 {
     const int block_in_row = blockIdx.x;   // which 32-element block in the row
-    const int global_slot = blockIdx.y;    // which slot (flat across all experts)
-
-    const int source_index = d_group_token_indices[global_slot];
-    const int original_token =
-        grouped_indices_are_route_slots ? (source_index / top_k) : source_index;
+    const int original_token = blockIdx.y;
 
     const int lane = threadIdx.x;  // 0..31
     const int k = block_in_row * 32 + lane;
-    if (k >= K) return;
-    if (original_token < 0 || original_token >= max_tokens)
-    {
-        if (block_in_row == 0 && lane == 0)
-        {
-            printf("rocm_grouped_prefill_invalid_source_token slot=%d index=%d token=%d "
-                   "max_tokens=%d top_k=%d route_slot_mode=%d\n",
-                   global_slot, source_index, original_token, max_tokens, top_k,
-                   grouped_indices_are_route_slots);
-        }
-        moe_prefill_fail_fast_invalid_grouped_index();
+    if (original_token >= seq_len || k >= K)
         return;
-    }
 
     // Load one element from the hidden state
     const float val = hidden[static_cast<size_t>(original_token) * K + k];
@@ -328,11 +292,11 @@ void moe_grouped_gather_quantize_prefill_kernel(
     // Write scale (one per block, lane 0 writes)
     const int blocks_per_row = K / 32;
     if (lane == 0)
-        scales_out[static_cast<size_t>(global_slot) * blocks_per_row + block_in_row] = scale;
+        scales_out[static_cast<size_t>(original_token) * blocks_per_row + block_in_row] = scale;
 
     // Quantize and write
     const float qval = val * inv_scale;
-    A_int8_out[static_cast<size_t>(global_slot) * K + k] =
+    A_int8_out[static_cast<size_t>(original_token) * K + k] =
         static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
 }
 
@@ -631,13 +595,100 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
 }
 
 /**
+ * @brief Accumulate one decoded NativeVNNI K block into an FP32 row result.
+ *
+ * Serial decode and grouped prefill must execute the same floating-point
+ * expression for every row.  Keeping the expression in one helper is more than
+ * code reuse: it prevents a row-tiled optimization from accidentally changing
+ * the order of a dual-scale base term, an asymmetric minimum correction, or an
+ * IQ1_M delta correction.  The caller may share the decoded weight payload
+ * across several independent rows, but each row invokes this helper once per K
+ * block and therefore retains serial decode's increasing-K accumulation order.
+ *
+ * @tparam FMT NativeVNNI codebook represented by @p desc.
+ * @param desc Prepared device descriptor for one expert matrix.
+ * @param linear Block-major descriptor index, `k_block * N + output_column`.
+ * @param payload Pointer to the encoded weight payload for @p linear.
+ * @param packed_groups Eight packed INT8 groups decoded from @p payload.
+ * @param a4 Eight packed INT8 activation groups for the current row/K block.
+ * @param scale_ab Per-row activation scale for the current K block.
+ * @param acc Running FP32 accumulator for this row and output column.
+ * @return The accumulator after exactly one serial-shaped K-block update.
+ */
+template <NativeVNNIFormatPrefill FMT>
+__device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    size_t linear,
+    const uint8_t* __restrict__ payload,
+    const int32_t* __restrict__ packed_groups,
+    const int32_t* __restrict__ a4,
+    float scale_ab,
+    float acc)
+{
+    using Traits = PrefillNVNNITraits<FMT>;
+    const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
+    const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
+    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
+
+    if constexpr (Traits::is_dual_scale)
+    {
+        int32_t acc_lo = 0;
+        int32_t acc_hi = 0;
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+            acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+#pragma unroll
+        for (int g = 4; g < 8; ++g)
+            acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+
+        const uint16_t scale_lo_bits = scale_base[linear];
+        const uint16_t scale_hi_bits = min_base[linear];
+        const float scale_lo =
+            __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
+        const float scale_hi =
+            __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
+        acc += (static_cast<float>(acc_lo) * scale_lo +
+                static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+        acc += moe_prefill_native_vnni_dual_scale_correction<FMT>(
+            a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
+    }
+    else
+    {
+        int32_t dot = 0;
+#pragma unroll
+        for (int g = 0; g < 8; ++g)
+            dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
+
+        const uint16_t scale_bits = scale_base[linear];
+        const float block_d =
+            __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+        acc += static_cast<float>(dot) * block_d * scale_ab;
+
+        if constexpr (Traits::is_asymmetric)
+        {
+            constexpr int32_t ones = 0x01010101;
+            int32_t sum_a = 0;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+                sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+
+            const uint16_t min_bits = min_base[linear];
+            const float block_m =
+                __half2float(*reinterpret_cast<const __half*>(&min_bits));
+            acc += static_cast<float>(sum_a) * block_m * scale_ab;
+        }
+    }
+
+    return acc;
+}
+
+/**
  * @brief Compute one NativeVNNI dot product over a bounded K-block range.
  *
- * Tiny MTP verifier batches need more parallelism across the reduction
- * dimension than a single full-K block provides.  This helper keeps the format
- * math shared by the split-K prefill path: every Q/K/IQ codebook follows the
- * same dequantization, dual-scale, min-correction, and IQ1_M delta rules as
- * the fused gate/up prefill kernel above.
+ * This is the canonical single-row expression used by grouped prefill and its
+ * serial-row oracle.  Long-prefill kernels below share decoded weights across
+ * rows but deliberately call the same per-block accumulator so optimization
+ * cannot relax byte equality.
  */
 template <NativeVNNIFormatPrefill FMT>
 __device__ __forceinline__ float moe_prefill_dot_desc_range(
@@ -665,9 +716,6 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     }
 
     const uint8_t* payload_base = desc.payload;
-    const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
-    const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
-    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
     float acc = 0.0f;
 
     for (int b = b_start; b < b_end; ++b)
@@ -680,530 +728,345 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
         moe_prefill_decode_groups<FMT>(payload, packed_groups);
 
         const int32_t* a4 = reinterpret_cast<const int32_t*>(slot_A + b * 32);
-        const float scale_ab = slot_scales[b];
-
-        if constexpr (Traits::is_dual_scale)
-        {
-            int32_t acc_lo = 0;
-            int32_t acc_hi = 0;
-#pragma unroll
-            for (int g = 0; g < 4; ++g)
-                acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
-#pragma unroll
-            for (int g = 4; g < 8; ++g)
-                acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
-
-            const uint16_t scale_lo_bits = scale_base[linear];
-            const uint16_t scale_hi_bits = min_base[linear];
-            const float s_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-            const float s_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-            acc += (static_cast<float>(acc_lo) * s_lo +
-                    static_cast<float>(acc_hi) * s_hi) * scale_ab;
-            acc += moe_prefill_native_vnni_dual_scale_correction<FMT>(
-                a4, payload, emin_base, linear, s_lo, s_hi, scale_ab);
-        }
-        else
-        {
-            int32_t dot = 0;
-#pragma unroll
-            for (int g = 0; g < 8; ++g)
-                dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
-
-            const uint16_t scale_bits = scale_base[linear];
-            const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-            acc += static_cast<float>(dot) * block_d * scale_ab;
-
-            if constexpr (Traits::is_asymmetric)
-            {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum_a = 0;
-#pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
-                const uint16_t min_bits = min_base[linear];
-                const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                acc += static_cast<float>(sum_a) * block_m * scale_ab;
-            }
-        }
+        acc = moe_prefill_accumulate_decoded_block<FMT>(
+            desc, linear, payload, packed_groups, a4, slot_scales[b], acc);
     }
 
     return acc;
 }
 
+namespace
+{
+    /** Number of low bits reserved for an expert id in a packed work item. */
+    constexpr uint32_t kMoEPrefillExpertBits = 9u;
+    /** Maximum expert id representable by the compact device work directory. */
+    constexpr uint32_t kMoEPrefillExpertMask =
+        (uint32_t{1} << kMoEPrefillExpertBits) - 1u;
+    /** Sentinel written to unused graph-captured work-directory entries. */
+    constexpr uint32_t kMoEPrefillUnusedTile = UINT32_MAX;
+}
+
 /**
- * @brief Split-K gate/up prefill kernel for tiny verifier batches.
+ * @brief Build a compact device-owned directory of populated expert row tiles.
  *
- * Each CTA owns one output-column tile, one token group, one active expert,
- * and one K partition.  It writes FP32 partials into
- * `[grouped_slot][k_partition][intermediate]`.  A small reduce kernel then
- * restores the normal contiguous gate/up scratch layout consumed by the
- * existing SwiGLU quantizer.
+ * A graph-captured prefill launch cannot read the current maximum expert count
+ * on the host.  Launching a rectangular
+ * `num_experts * ceil(seq_len / TILE_M)` grid would preserve device ownership,
+ * but most workgroups would immediately exit and long-prefill throughput would
+ * collapse. This one-block planner performs a parallel inclusive scan over the
+ * already device-resident grouping counts and writes only populated
+ * `(expert, first_row)` tiles into @p directory.
+ * The following projection kernels launch against a conservative fixed capacity
+ * and skip the `UINT32_MAX` tail.
+ *
+ * Each directory entry uses nine low bits for the expert id and the remaining
+ * bits for the first row local to that expert.  Llaminar's device MoE runtime is
+ * capped at 256 experts, so nine bits leave one explicit guard value while still
+ * supporting millions of grouped rows.  Planning is deterministic, contains no
+ * host synchronization, and is safe to capture and replay as part of the full
+ * GPU graph.
+ *
+ * @tparam TILE_M Number of consecutive grouped rows consumed by one projection
+ *                 workgroup.
  */
-template <NativeVNNIFormatPrefill FMT, int TILE_M>
-__global__ __launch_bounds__(64)
-void moe_grouped_gate_up_prefill_kpart_kernel(
+template <int TILE_M>
+__global__ __launch_bounds__(256, 1)
+void moe_grouped_build_prefill_tile_directory_kernel(
+    const int* __restrict__ group_counts,
+    uint32_t* __restrict__ directory,
+    int num_experts,
+    int max_directory_tiles)
+{
+    static_assert(TILE_M == 4 || TILE_M == 8 ||
+                  TILE_M == 12 || TILE_M == 16,
+                  "grouped-prefill sweep supports row tiles 4/8/12/16");
+    constexpr int MAX_EXPERTS = 256;
+    const int tid = threadIdx.x;
+
+    if (num_experts <= 0 || num_experts > MAX_EXPERTS ||
+        max_directory_tiles <= 0)
+    {
+        if (tid == 0)
+            moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+
+    for (int tile = tid; tile < max_directory_tiles; tile += blockDim.x)
+        directory[tile] = kMoEPrefillUnusedTile;
+
+    __shared__ int inclusive_tile_counts[MAX_EXPERTS];
+    int count = tid < num_experts ? group_counts[tid] : 0;
+    if (count < 0)
+    {
+        if (tid < num_experts)
+            moe_prefill_fail_fast_invalid_grouped_index();
+        count = 0;
+    }
+    inclusive_tile_counts[tid] = (count + TILE_M - 1) / TILE_M;
+    __syncthreads();
+
+    // Hillis-Steele is deliberately used for this tiny 256-element directory:
+    // its regular barriers are graph-capture friendly and much cheaper than a
+    // lane-zero serial scan on gfx906.
+    for (int stride = 1; stride < MAX_EXPERTS; stride <<= 1)
+    {
+        const int addend = tid >= stride
+                               ? inclusive_tile_counts[tid - stride]
+                               : 0;
+        __syncthreads();
+        inclusive_tile_counts[tid] += addend;
+        __syncthreads();
+    }
+
+    const int total_tiles = inclusive_tile_counts[MAX_EXPERTS - 1];
+    if (total_tiles > max_directory_tiles)
+    {
+        if (tid == 0)
+            moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+
+    if (tid < num_experts)
+    {
+        const int first_tile = tid == 0 ? 0 : inclusive_tile_counts[tid - 1];
+        const int expert_tiles = (count + TILE_M - 1) / TILE_M;
+        for (int tile = 0; tile < expert_tiles; ++tile)
+        {
+            const uint32_t first_row = static_cast<uint32_t>(tile * TILE_M);
+            directory[first_tile + tile] =
+                (first_row << kMoEPrefillExpertBits) |
+                static_cast<uint32_t>(tid);
+        }
+    }
+}
+
+/**
+ * @brief Batch-invariant expert-tiled gate/up projection for long prefill.
+ *
+ * One workgroup owns one populated expert tile, one 64-column output tile, and
+ * one projection role (`gate` or `up`).  The expert weight payload is decoded
+ * once per K block and reused across `TILE_M` independent routed rows.  Each row
+ * still visits K blocks in increasing order and updates its own FP32 accumulator
+ * through @ref moe_prefill_accumulate_decoded_block, so the optimization changes
+ * data reuse without changing a row's serial-decode arithmetic.
+ *
+ * The activation block is staged in a very small LDS tile.  This prevents all 64
+ * output-column lanes from redundantly loading the same routed activation while
+ * retaining four-wave occupancy on gfx906.  Gate and up use separate workgroups
+ * in one launch (`blockIdx.z`) to keep their accumulator lifetimes disjoint and
+ * avoid register pressure from halving MI50 occupancy.
+ *
+ * @tparam FMT NativeVNNI codebook for experts handled by this launch.
+ * @tparam TILE_M Trained expert-row tile (4, 8, 12, or 16 rows).
+ * @tparam TILE_N Trained output-column tile (64, 128, or 256 lanes).
+ */
+template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
+__global__ __launch_bounds__(TILE_N, 2)
+void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
+    const int* __restrict__ group_token_indices,
+    const int* __restrict__ group_counts,
+    const int* __restrict__ group_offsets,
+    const uint32_t* __restrict__ work_directory,
     const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
     const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
-    const int* __restrict__ d_group_counts,
-    const int* __restrict__ d_group_offsets,
-    const int* __restrict__ d_active_expert_ids,
-    float* __restrict__ gate_partials,
-    float* __restrict__ up_partials,
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out,
+    int max_directory_tiles,
+    int seq_len,
+    int top_k,
+    int grouped_indices_are_route_slots,
+    int input_is_original_rows,
     int N,
     int K,
-    int k_partitions)
+    int num_experts)
 {
-    static_assert(TILE_M == 2 || TILE_M == 4 || TILE_M == 8,
-                  "ROCm grouped MoE split-K prefill only instantiates verifier-sized TILE_M buckets");
-    constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_group = blockIdx.y;
-    const int expert_grid_index = blockIdx.z / k_partitions;
-    const int k_part = blockIdx.z - expert_grid_index * k_partitions;
-    if (n >= N || k_part >= k_partitions)
+    static_assert(TILE_M == 4 || TILE_M == 8 ||
+                  TILE_M == 12 || TILE_M == 16,
+                  "grouped-prefill gate/up supports row tiles 4/8/12/16");
+    static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
+                  "grouped-prefill gate/up supports column tiles 64/128/256");
+    const int n = static_cast<int>(blockIdx.x) * TILE_N + threadIdx.x;
+    const int directory_index = static_cast<int>(blockIdx.y);
+    const int projection_role = static_cast<int>(blockIdx.z);
+    if (directory_index >= max_directory_tiles || n >= N || projection_role > 1)
         return;
 
-    const int expert_id = d_active_expert_ids ? d_active_expert_ids[expert_grid_index]
-                                              : expert_grid_index;
-    if (expert_id < 0)
+    const uint32_t packed_tile = work_directory[directory_index];
+    if (packed_tile == kMoEPrefillUnusedTile)
         return;
 
-    const int count = d_group_counts[expert_id];
-    const int first_token = token_group * TILE_M;
-    if (first_token >= count)
+    const int expert_id =
+        static_cast<int>(packed_tile & kMoEPrefillExpertMask);
+    const int first_row =
+        static_cast<int>(packed_tile >> kMoEPrefillExpertBits);
+    if (expert_id < 0 || expert_id >= num_experts)
+    {
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+
+    const int count = group_counts[expert_id];
+    const int grouped_offset = group_offsets[expert_id];
+    if (first_row < 0 || first_row >= count || grouped_offset < 0)
+    {
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+    const int rows_in_tile = min(TILE_M, count - first_row);
+    const int first_grouped_slot = grouped_offset + first_row;
+
+    const DeviceNativeVNNIMatrixDesc desc =
+        projection_role == 0 ? gate_descs[expert_id] : up_descs[expert_id];
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
         return;
 
-    const int tokens_in_group = min(TILE_M, count - first_token);
-    const int first_slot = d_group_offsets[expert_id] + first_token;
+    float* projection_out = projection_role == 0 ? gate_out : up_out;
     const int blocks_per_row = K / 32;
-    const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
-    const int b_start = k_part * blocks_per_part;
-    int b_end = b_start + blocks_per_part;
-    if (b_end > blocks_per_row)
-        b_end = blocks_per_row;
+    const uint8_t* payload_base = desc.payload;
 
-    const DeviceNativeVNNIMatrixDesc& gate_desc = gate_descs[expert_id];
-    const DeviceNativeVNNIMatrixDesc& up_desc = up_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
-        !prefill_native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
-        return;
-
-#pragma unroll
-    for (int m = 0; m < TILE_M; ++m)
-    {
-        if (m >= tokens_in_group)
-            break;
-        const int slot = first_slot + m;
-        const size_t partial_index =
-            (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) +
-             static_cast<size_t>(k_part)) *
-                static_cast<size_t>(N) +
-            static_cast<size_t>(n);
-        if (b_start >= b_end)
-        {
-            gate_partials[partial_index] = 0.0f;
-            up_partials[partial_index] = 0.0f;
-            continue;
-        }
-
-        const int8_t* slot_A = A_int8 + static_cast<size_t>(slot) * static_cast<size_t>(K);
-        const float* slot_scales =
-            scales_A_blockwise + static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row);
-        gate_partials[partial_index] =
-            moe_prefill_dot_desc_range<FMT>(gate_desc, n, slot_A, slot_scales, N, b_start, b_end);
-        up_partials[partial_index] =
-            moe_prefill_dot_desc_range<FMT>(up_desc, n, slot_A, slot_scales, N, b_start, b_end);
-    }
-}
-
-/**
- * @brief Reduce split-K gate/up partials and quantize SwiGLU in one pass.
- *
- * Each lane sums the k-partitions in the same order used by the former
- * reduce-then-quantize sequence, computes the same `silu(gate) * up` value, and
- * then uses the same 32-lane blockwise INT8 scaling contract consumed by the
- * down-projection kernel. Keeping this as one graph node removes one launch and
- * the FP32 gate/up scratch round trip from verifier-sized MoE batches.
- */
-__global__ __launch_bounds__(32)
-void moe_grouped_gate_up_prefill_kpart_reduce_swiglu_quantize_kernel(
-    const float* __restrict__ gate_partials,
-    const float* __restrict__ up_partials,
-    int8_t* __restrict__ swiglu_int8,
-    float* __restrict__ swiglu_scales,
-    int total_slots,
-    int N,
-    int k_partitions)
-{
-    constexpr int TILE_N = 32;
-    const int lane = threadIdx.x;
-    const int quant_block = blockIdx.x;
-    const int slot = blockIdx.y;
-    const int n = quant_block * TILE_N + lane;
-    if (slot >= total_slots)
-        return;
-
-    const bool active = n < N;
-    const size_t slot_base =
-        static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
-
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    if (active)
-    {
-        for (int k_part = 0; k_part < k_partitions; ++k_part)
-        {
-            const size_t idx =
-                slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
-            gate_sum += gate_partials[idx];
-            up_sum += up_partials[idx];
-        }
-    }
-
-    const float value = active ? ((gate_sum / (1.0f + expf(-gate_sum))) * up_sum) : 0.0f;
-    float abs_val = fabsf(value);
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
-
-    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-    const int blocks_per_row = (N + TILE_N - 1) / TILE_N;
-    if (lane == 0)
-        swiglu_scales[static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row) +
-                      static_cast<size_t>(quant_block)] = scale;
-
-    if (active)
-    {
-        const float qval = value / scale;
-        swiglu_int8[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
-            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
-    }
-}
-
-template <NativeVNNIFormatPrefill FMT, int TILE_M>
-__global__ __launch_bounds__(128)
-void moe_grouped_gate_up_swiglu_prefill_gemm_kernel(
-    const int8_t*  __restrict__ A_int8,              // [total_slots, K] quantized activations
-    const float*   __restrict__ scales_A_blockwise,  // [total_slots, blocks_per_row]
-    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs, // [num_experts]
-    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,   // [num_experts]
-    const int*     __restrict__ d_group_counts,      // [num_experts]
-    const int*     __restrict__ d_group_offsets,     // [num_experts]
-    const int*     __restrict__ d_active_expert_ids, // [active_expert_slots] or null
-    int8_t*        __restrict__ swiglu_int8,         // [total_slots, N]
-    float*         __restrict__ swiglu_scales,       // [total_slots, N / 32]
-    int N, int K)
-{
-    static_assert(TILE_M == 2 || TILE_M == 4 || TILE_M == 8,
-                  "ROCm grouped MoE prefill only instantiates verifier-sized TILE_M buckets");
-    constexpr int TILE_N = 128;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_group = blockIdx.y;  // group of TILE_M tokens
-    const int expert_id = d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
-    if (expert_id < 0) return;
-
-    const int count = d_group_counts[expert_id];
-    const int first_token = token_group * TILE_M;
-    if (first_token >= count) return;
-
-    // How many tokens in this group (1..TILE_M)
-    const int tokens_in_group = min(TILE_M, count - first_token);
-    const int offset = d_group_offsets[expert_id];
-    const int blocks_per_row = K / 32;
-    const bool active = n < N;
-
-    // Get weight descriptors for this expert
-    const DeviceNativeVNNIMatrixDesc& gate_desc = gate_descs[expert_id];
-    const DeviceNativeVNNIMatrixDesc& up_desc = up_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
-        !prefill_native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
-        return;
-
-    const uint8_t* gate_payload_base = gate_desc.payload;
-    const uint16_t* gate_scale_base = static_cast<const uint16_t*>(gate_desc.scales);
-    const uint16_t* gate_min_base = static_cast<const uint16_t*>(gate_desc.mins);
-    const uint32_t* gate_emin_base = static_cast<const uint32_t*>(gate_desc.emins);
-
-    const uint8_t* up_payload_base = up_desc.payload;
-    const uint16_t* up_scale_base = static_cast<const uint16_t*>(up_desc.scales);
-    const uint16_t* up_min_base = static_cast<const uint16_t*>(up_desc.mins);
-    const uint32_t* up_emin_base = static_cast<const uint32_t*>(up_desc.emins);
-
-    /*
-     * Stage the verifier-sized activation tile once per output-column block.
-     * Without this, every one of the 128 N-lane threads reloads the same
-     * TILE_Mx32 activation values from global memory for each K block.  CUDA's
-     * MoE verifier path already uses this pattern; keeping ROCm aligned avoids
-     * backend-specific performance drift while preserving graph capturability.
-     */
-    __shared__ __align__(16) int32_t s_a[TILE_M * 8];
-    __shared__ float s_scale[TILE_M];
-
-    // Accumulators for TILE_M tokens
-    float gate_acc[TILE_M] = {};
-    float up_acc[TILE_M] = {};
+    __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
+    __shared__ float staged_scales[TILE_M];
+    float accumulators[TILE_M] = {};
 
     for (int b = 0; b < blocks_per_row; ++b)
     {
-        const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
+        const size_t linear =
+            static_cast<size_t>(b) * static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
+        const uint8_t* payload = payload_base + linear * payload_bytes;
+        int32_t packed_groups[8];
+        moe_prefill_decode_groups<FMT>(payload, packed_groups);
 
-        // Decode weights ONCE per K-block (shared across all TILE_M tokens)
-        int32_t gate_groups[8];
-        int32_t up_groups[8];
-        if (active)
+        const int staged_words = rows_in_tile * 8;
+        for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
         {
-            constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
-            const uint8_t* gate_payload = gate_payload_base + linear * PB;
-            moe_prefill_decode_groups<FMT>(gate_payload, gate_groups);
-
-            const uint8_t* up_payload = up_payload_base + linear * PB;
-            moe_prefill_decode_groups<FMT>(up_payload, up_groups);
+            const int local_row = word >> 3;
+            const int group = word & 7;
+            const int grouped_slot = first_grouped_slot + local_row;
+            int input_row = grouped_slot;
+            if (input_is_original_rows)
+            {
+                const int source_index = group_token_indices[grouped_slot];
+                input_row = grouped_indices_are_route_slots
+                                ? (source_index / top_k)
+                                : source_index;
+            }
+            if (input_row < 0 ||
+                input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
+            {
+                moe_prefill_fail_fast_invalid_grouped_index();
+                return;
+            }
+            const int32_t* input_words = reinterpret_cast<const int32_t*>(
+                A_int8 + static_cast<size_t>(input_row) * static_cast<size_t>(K) +
+                static_cast<size_t>(b) * 32u);
+            staged_A[word] = input_words[group];
         }
-
-        const int staged_values = tokens_in_group * 8;
-        for (int idx = threadIdx.x; idx < staged_values; idx += TILE_N)
+        for (int local_row = threadIdx.x;
+             local_row < rows_in_tile;
+             local_row += blockDim.x)
         {
-            const int m = idx >> 3;
-            const int g = idx & 7;
-            const int global_slot = offset + first_token + m;
-            s_a[idx] = reinterpret_cast<const int32_t*>(
-                A_int8 + static_cast<size_t>(global_slot) * K + b * 32)[g];
-        }
-        for (int m = threadIdx.x; m < tokens_in_group; m += TILE_N)
-        {
-            const int global_slot = offset + first_token + m;
-            s_scale[m] = scales_A_blockwise[
-                static_cast<size_t>(global_slot) * blocks_per_row + b];
+            const int grouped_slot = first_grouped_slot + local_row;
+            int input_row = grouped_slot;
+            if (input_is_original_rows)
+            {
+                const int source_index = group_token_indices[grouped_slot];
+                input_row = grouped_indices_are_route_slots
+                                ? (source_index / top_k)
+                                : source_index;
+            }
+            if (input_row < 0 ||
+                input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
+            {
+                moe_prefill_fail_fast_invalid_grouped_index();
+                return;
+            }
+            staged_scales[local_row] = scales_A_blockwise[
+                static_cast<size_t>(input_row) * static_cast<size_t>(blocks_per_row) +
+                static_cast<size_t>(b)];
         }
         __syncthreads();
 
-        // Process each of TILE_M tokens with the same decoded weights
-        if (active)
+#pragma unroll
+        for (int local_row = 0; local_row < TILE_M; ++local_row)
         {
-            #pragma unroll
-            for (int m = 0; m < TILE_M; ++m)
-            {
-                if (m >= tokens_in_group) break;
-
-                const int32_t* a4 = s_a + m * 8;
-                const float scale_ab = s_scale[m];
-
-                if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale) {
-                    int32_t gate_acc_lo = 0, gate_acc_hi = 0;
-                    int32_t up_acc_lo = 0, up_acc_hi = 0;
-                    #pragma unroll
-                    for (int g = 0; g < 4; ++g) {
-                        gate_acc_lo = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_acc_lo, false);
-                        up_acc_lo = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_acc_lo, false);
-                    }
-                    #pragma unroll
-                    for (int g = 4; g < 8; ++g) {
-                        gate_acc_hi = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_acc_hi, false);
-                        up_acc_hi = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_acc_hi, false);
-                    }
-                    const uint16_t gate_scale_lo_bits = gate_scale_base[linear];
-                    const uint16_t gate_scale_hi_bits = gate_min_base[linear];
-                    const float gate_s_lo = __half2float(*reinterpret_cast<const __half*>(&gate_scale_lo_bits));
-                    const float gate_s_hi = __half2float(*reinterpret_cast<const __half*>(&gate_scale_hi_bits));
-                    gate_acc[m] += (static_cast<float>(gate_acc_lo) * gate_s_lo +
-                                    static_cast<float>(gate_acc_hi) * gate_s_hi) * scale_ab;
-
-                    const uint16_t up_scale_lo_bits = up_scale_base[linear];
-                    const uint16_t up_scale_hi_bits = up_min_base[linear];
-                    const float up_s_lo = __half2float(*reinterpret_cast<const __half*>(&up_scale_lo_bits));
-                    const float up_s_hi = __half2float(*reinterpret_cast<const __half*>(&up_scale_hi_bits));
-                    up_acc[m] += (static_cast<float>(up_acc_lo) * up_s_lo +
-                                  static_cast<float>(up_acc_hi) * up_s_hi) * scale_ab;
-
-                    // Q2_K: per-sub-block emin correction (asymmetric dual-scale)
-                    if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale_asym) {
-                        constexpr int32_t ones = 0x01010101;
-                        int32_t sum_a_lo = 0, sum_a_hi = 0;
-                        #pragma unroll
-                        for (int g = 0; g < 4; ++g)
-                            sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
-                        #pragma unroll
-                        for (int g = 4; g < 8; ++g)
-                            sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
-
-                        const uint32_t gate_emin_packed = gate_emin_base[linear];
-                        const uint16_t gate_emin_lo_bits = static_cast<uint16_t>(gate_emin_packed);
-                        const uint16_t gate_emin_hi_bits = static_cast<uint16_t>(gate_emin_packed >> 16);
-                        const float gate_emin_lo = __half2float(*reinterpret_cast<const __half*>(&gate_emin_lo_bits));
-                        const float gate_emin_hi = __half2float(*reinterpret_cast<const __half*>(&gate_emin_hi_bits));
-                        gate_acc[m] += (static_cast<float>(sum_a_lo) * gate_emin_lo
-                                     + static_cast<float>(sum_a_hi) * gate_emin_hi) * scale_ab;
-
-                        const uint32_t up_emin_packed = up_emin_base[linear];
-                        const uint16_t up_emin_lo_bits = static_cast<uint16_t>(up_emin_packed);
-                        const uint16_t up_emin_hi_bits = static_cast<uint16_t>(up_emin_packed >> 16);
-                        const float up_emin_lo = __half2float(*reinterpret_cast<const __half*>(&up_emin_lo_bits));
-                        const float up_emin_hi = __half2float(*reinterpret_cast<const __half*>(&up_emin_hi_bits));
-                        up_acc[m] += (static_cast<float>(sum_a_lo) * up_emin_lo
-                                   + static_cast<float>(sum_a_hi) * up_emin_hi) * scale_ab;
-                    }
-
-                    // IQ1_M: ±IQ1S_DELTA per-group correction
-                    if constexpr (FMT == NVNNI_PF_IQ1_M) {
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        constexpr int32_t ones = 0x01010101;
-                        constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
-                        const uint8_t* gate_pay = gate_payload_base + linear * PB;
-                        const uint8_t gate_qh0 = gate_pay[4], gate_qh1 = gate_pay[5];
-
-                        int32_t sa_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
-                                        __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-                        int32_t sa_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
-                                        __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-                        int32_t sa_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
-                                        __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-                        int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
-                                        __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
-
-                        const float gate_d0 = (gate_qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float gate_d1 = (gate_qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float gate_d2 = (gate_qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float gate_d3 = (gate_qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        gate_acc[m] += ((gate_d0 * static_cast<float>(sa_g0) +
-                                         gate_d1 * static_cast<float>(sa_g1)) * gate_s_lo +
-                                        (gate_d2 * static_cast<float>(sa_g2) +
-                                         gate_d3 * static_cast<float>(sa_g3)) * gate_s_hi) *
-                                       scale_ab;
-
-                        const uint8_t* up_pay = up_payload_base + linear * PB;
-                        const uint8_t up_qh0 = up_pay[4], up_qh1 = up_pay[5];
-                        const float up_d0 = (up_qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float up_d1 = (up_qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float up_d2 = (up_qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float up_d3 = (up_qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        up_acc[m] += ((up_d0 * static_cast<float>(sa_g0) +
-                                       up_d1 * static_cast<float>(sa_g1)) * up_s_lo +
-                                      (up_d2 * static_cast<float>(sa_g2) +
-                                       up_d3 * static_cast<float>(sa_g3)) * up_s_hi) *
-                                     scale_ab;
-                    }
-                }
-                else {
-                    int32_t gate_dot = 0, up_dot = 0;
-                    #pragma unroll
-                    for (int g = 0; g < 8; ++g) {
-                        gate_dot = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_dot, false);
-                        up_dot = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_dot, false);
-                    }
-
-                    const uint16_t gate_scale_bits = gate_scale_base[linear];
-                    const float gate_d = __half2float(*reinterpret_cast<const __half*>(&gate_scale_bits));
-                    gate_acc[m] += static_cast<float>(gate_dot) * gate_d * scale_ab;
-
-                    const uint16_t up_scale_bits = up_scale_base[linear];
-                    const float up_d = __half2float(*reinterpret_cast<const __half*>(&up_scale_bits));
-                    up_acc[m] += static_cast<float>(up_dot) * up_d * scale_ab;
-
-                    if constexpr (PrefillNVNNITraits<FMT>::is_asymmetric) {
-                        constexpr int32_t ones = 0x01010101;
-                        int32_t sum_a = 0;
-                        #pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                            sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
-                        const uint16_t gate_min_bits = gate_min_base[linear];
-                        const float gate_m = __half2float(*reinterpret_cast<const __half*>(&gate_min_bits));
-                        gate_acc[m] += static_cast<float>(sum_a) * gate_m * scale_ab;
-
-                        const uint16_t up_min_bits = up_min_base[linear];
-                        const float up_m = __half2float(*reinterpret_cast<const __half*>(&up_min_bits));
-                        up_acc[m] += static_cast<float>(sum_a) * up_m * scale_ab;
-                    }
-                }
-            }
+            if (local_row >= rows_in_tile)
+                break;
+            accumulators[local_row] = moe_prefill_accumulate_decoded_block<FMT>(
+                desc,
+                linear,
+                payload,
+                packed_groups,
+                staged_A + local_row * 8,
+                staged_scales[local_row],
+                accumulators[local_row]);
         }
         __syncthreads();
     }
 
-    /*
-     * Fused SwiGLU + blockwise INT8 quantization.
-     *
-     * CUDA already uses this contract for verifier-prefill.  Keeping ROCm on
-     * the same graph-native path removes the FP32 gate/up global round trip and
-     * the extra SwiGLU launch while preserving the same row/block layout consumed
-     * by the down-projection kernel.  Each warp owns one 32-column quant block.
-     */
-    const int lane = threadIdx.x & 31;
-    const int blocks_per_row_out = N / 32;
-    const int quant_block = n >> 5;
 #pragma unroll
-    for (int m = 0; m < TILE_M; ++m)
+    for (int local_row = 0; local_row < TILE_M; ++local_row)
     {
-        if (m >= tokens_in_group) break;
-
-        const int global_slot = offset + first_token + m;
-        const float gate_value = gate_acc[m];
-        const float value = active ? ((gate_value / (1.0f + expf(-gate_value))) * up_acc[m]) : 0.0f;
-
-        float abs_val = fabsf(value);
-#pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1)
-            abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
-
-        const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-        if (active)
-        {
-            if (lane == 0)
-                swiglu_scales[static_cast<size_t>(global_slot) * blocks_per_row_out + quant_block] = scale;
-            const float qval = value / scale;
-            swiglu_int8[static_cast<size_t>(global_slot) * N + n] =
-                static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
-        }
+        if (local_row >= rows_in_tile)
+            break;
+        const int grouped_slot = first_grouped_slot + local_row;
+        projection_out[
+            static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
+            static_cast<size_t>(n)] = accumulators[local_row];
     }
 }
 
+
 /**
- * @brief Decode-equivalent grouped gate/up projection for verifier-sized rows.
+ * @brief Decode-equivalent grouped gate/up projection for routed prefill rows.
  *
- * The fused prefill gate/up kernel above is fast, but it combines projection,
- * SwiGLU, and quantization in one register-resident path.  MTP verifier rows
- * need a stricter contract: their grouped publication must match rowwise serial
- * decode byte-for-byte.  This kernel keeps the economical grouped launch shape
- * (all active experts and all verifier slots in one dispatch) while writing
- * FP32 gate/up scratch exactly like the M=1 decode-table path before a separate
- * SwiGLU quantization pass consumes it.
+ * Grouped publication must match rowwise serial decode byte-for-byte for every
+ * prefill bucket, not only MTP verifier rows. One block owns one original route
+ * slot and a 64-column
+ * output tile. The route-to-grouped inverse map skips non-local routes and
+ * directs valid results to compact expert scratch, so the launch has exactly
+ * `seq_len * top_k` row work rather than a sparse expert-by-max-M rectangle.
+ * FP32 gate/up scratch is written exactly like the M=1 decode-table path before
+ * one grouped SwiGLU quantization pass consumes it.
  */
 template <NativeVNNIFormatPrefill FMT>
 __global__ __launch_bounds__(64)
 void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, K]
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, K / 32]
-    const int*     __restrict__ d_group_token_indices, // [total_slots] token rows or route slots
+    const int*     __restrict__ original_to_grouped, // [total_slots] original route -> grouped slot
+    const int*     __restrict__ original_expert_ids, // [total_slots], null only for singleton expert
     const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs, // [num_experts]
     const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,   // [num_experts]
-    const int*     __restrict__ d_group_counts,      // [num_experts]
-    const int*     __restrict__ d_group_offsets,     // [num_experts]
-    const int*     __restrict__ d_active_expert_ids, // [active_expert_slots]
     float*         __restrict__ gate_out,            // [total_slots, N]
     float*         __restrict__ up_out,              // [total_slots, N]
+    int total_slots,
     int seq_len,
     int top_k,
-    int grouped_indices_are_route_slots,
     int input_is_original_rows,
     int N,
-    int K)
+    int K,
+    int num_experts)
 {
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_in_expert = blockIdx.y;
-    const int expert_id =
-        d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
-    if (expert_id < 0 || n >= N)
+    const int original_slot = blockIdx.y;
+    if (original_slot >= total_slots || n >= N)
         return;
 
-    const int count = d_group_counts[expert_id];
-    if (token_in_expert >= count)
+    const int grouped_slot = original_to_grouped[original_slot];
+    if (grouped_slot < 0 || grouped_slot >= total_slots)
         return;
 
-    const int grouped_slot = d_group_offsets[expert_id] + token_in_expert;
+    const int expert_id = original_expert_ids
+                              ? original_expert_ids[original_slot]
+                              : ((num_experts == 1) ? 0 : -1);
+    if (expert_id < 0 || expert_id >= num_experts)
+        return;
+
     const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
     const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
     if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
@@ -1216,10 +1079,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     int input_row = grouped_slot;
     if (input_is_original_rows)
     {
-        const int source_index = d_group_token_indices[grouped_slot];
-        input_row = grouped_indices_are_route_slots
-                        ? (source_index / top_k)
-                        : source_index;
+        input_row = original_slot / top_k;
         if (input_row < 0 || input_row >= seq_len)
             return;
     }
@@ -1284,304 +1144,184 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
         static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
 }
 
-
-// ============================================================================
-// Kernel 4: Grouped Down GEMM (all experts, single launch)
-//
-// Same structure as gate+up but for the down projection.
-// Output is FP32 (not quantized) since it goes directly to scatter.
-// M-tiled: each block processes TILE_M tokens, amortizing weight decode.
-//
-// Grid: dim3((d_model + TILE_N - 1) / TILE_N, ceil(max_tokens/TILE_M), num_experts)
-// Block: 64 threads
-// ============================================================================
-
+/**
+ * @brief Batch-invariant expert-tiled down projection for long prefill.
+ *
+ * The kernel mirrors the gate/up row tile: one decoded expert weight block is
+ * reused across several grouped SwiGLU rows, while every row owns an independent
+ * accumulator whose K-block order matches serial decode.  Results are written to
+ * per-route FP32 rows in @p down_partials.  A following ordered publisher reads
+ * those rows in original router order; separating projection from publication is
+ * what permits weight reuse without reintroducing nondeterministic FP32 atomics.
+ *
+ * @tparam FMT NativeVNNI codebook for experts handled by this launch.
+ * @tparam TILE_M Trained expert-row tile (4, 8, 12, or 16 rows).
+ * @tparam TILE_N Trained output-column tile (64, 128, or 256 lanes).
+ */
 template <NativeVNNIFormatPrefill FMT, int TILE_M, int TILE_N>
-__global__ __launch_bounds__(128)
-void moe_grouped_down_prefill_gemm_kernel(
-    const int8_t*  __restrict__ A_int8,              // [total_slots, intermediate] (from SwiGLU output)
-    const float*   __restrict__ scales_A_blockwise,  // [total_slots, blocks_per_intermediate]
-    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs, // [num_experts]
-    const int*     __restrict__ d_group_counts,      // [num_experts]
-    const int*     __restrict__ d_group_offsets,     // [num_experts]
-    const int*     __restrict__ d_active_expert_ids, // [active_expert_slots] or null
-    float*         __restrict__ output,              // [total_slots, d_model]
-    int N,   // d_model (output columns)
-    int K)   // intermediate (input columns / reduction dim)
+__global__ __launch_bounds__(TILE_N, 2)
+void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const int* __restrict__ group_counts,
+    const int* __restrict__ group_offsets,
+    const uint32_t* __restrict__ work_directory,
+    float* __restrict__ down_partials,
+    int max_directory_tiles,
+    int N,
+    int K,
+    int num_experts)
 {
-    static_assert(TILE_M == 2 || TILE_M == 4 || TILE_M == 8,
-                  "ROCm grouped MoE prefill only instantiates verifier-sized TILE_M buckets");
-    static_assert(TILE_N == 64 || TILE_N == 128,
-                  "ROCm grouped MoE down prefill only supports 64- or 128-column tiles");
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_group = blockIdx.y;
-    const int expert_id = d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
-    if (expert_id < 0) return;
-
-    const int count = d_group_counts[expert_id];
-    const int first_token = token_group * TILE_M;
-    if (first_token >= count) return;
-
-    const int tokens_in_group = min(TILE_M, count - first_token);
-    const int offset = d_group_offsets[expert_id];
-    const int blocks_per_row = K / 32;
-    const bool active = n < N;
-
-    const DeviceNativeVNNIMatrixDesc& desc = down_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    static_assert(TILE_M == 4 || TILE_M == 8 ||
+                  TILE_M == 12 || TILE_M == 16,
+                  "grouped-prefill down supports row tiles 4/8/12/16");
+    static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
+                  "grouped-prefill down supports column tiles 64/128/256");
+    const int n = static_cast<int>(blockIdx.x) * TILE_N + threadIdx.x;
+    const int directory_index = static_cast<int>(blockIdx.y);
+    if (directory_index >= max_directory_tiles || n >= N)
         return;
 
-    const uint8_t* payload_base = desc.payload;
-    const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
-    const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
-    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
+    const uint32_t packed_tile = work_directory[directory_index];
+    if (packed_tile == kMoEPrefillUnusedTile)
+        return;
 
-    /*
-     * The down projection consumes the quantized SwiGLU rows produced by the
-     * previous kernel. Stage those TILE_Mx32 rows once per block before all
-     * output-column lanes reuse them. Tiny verifier batches use TILE_N=64 to
-     * match CUDA's active-verifier geometry and reduce the per-block lane
-     * footprint when the grouped path has only M=2..4 rows to amortize work.
-     */
-    __shared__ __align__(16) int32_t s_a[TILE_M * 8];
-    __shared__ float s_scale[TILE_M];
-
-    float acc[TILE_M] = {};
-
-    for (int b = 0; b < blocks_per_row; ++b)
+    const int expert_id =
+        static_cast<int>(packed_tile & kMoEPrefillExpertMask);
+    const int first_row =
+        static_cast<int>(packed_tile >> kMoEPrefillExpertBits);
+    if (expert_id < 0 || expert_id >= num_experts)
     {
-        const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-
-        // Decode weights ONCE per K-block (shared across TILE_M tokens)
-        int32_t packed_groups[8];
-        if (active)
-        {
-            constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
-            const uint8_t* payload = payload_base + linear * PB;
-            moe_prefill_decode_groups<FMT>(payload, packed_groups);
-        }
-
-        const int staged_values = tokens_in_group * 8;
-        for (int idx = threadIdx.x; idx < staged_values; idx += TILE_N)
-        {
-            const int m = idx >> 3;
-            const int g = idx & 7;
-            const int global_slot = offset + first_token + m;
-            s_a[idx] = reinterpret_cast<const int32_t*>(
-                A_int8 + static_cast<size_t>(global_slot) * K + b * 32)[g];
-        }
-        for (int m = threadIdx.x; m < tokens_in_group; m += TILE_N)
-        {
-            const int global_slot = offset + first_token + m;
-            s_scale[m] = scales_A_blockwise[
-                static_cast<size_t>(global_slot) * blocks_per_row + b];
-        }
-        __syncthreads();
-
-        // Process TILE_M tokens with decoded weights
-        if (active)
-        {
-            #pragma unroll
-            for (int m = 0; m < TILE_M; ++m)
-            {
-                if (m >= tokens_in_group) break;
-
-                const int32_t* a4 = s_a + m * 8;
-                const float scale_ab = s_scale[m];
-
-                if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale) {
-                    int32_t acc_lo = 0, acc_hi = 0;
-                    #pragma unroll
-                    for (int g = 0; g < 4; ++g)
-                        acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
-                    #pragma unroll
-                    for (int g = 4; g < 8; ++g)
-                        acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
-
-                    const uint16_t scale_lo_bits = scale_base[linear];
-                    const uint16_t scale_hi_bits = min_base[linear];
-                    const float s_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-                    const float s_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-                    acc[m] += (static_cast<float>(acc_lo) * s_lo +
-                               static_cast<float>(acc_hi) * s_hi) * scale_ab;
-
-                    // Q2_K: per-sub-block emin correction (asymmetric dual-scale)
-                    if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale_asym) {
-                        constexpr int32_t ones = 0x01010101;
-                        int32_t sum_a_lo = 0, sum_a_hi = 0;
-                        #pragma unroll
-                        for (int g = 0; g < 4; ++g)
-                            sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
-                        #pragma unroll
-                        for (int g = 4; g < 8; ++g)
-                            sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
-
-                        const uint32_t emin_packed = emin_base[linear];
-                        const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
-                        const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
-                        const float emin_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
-                        const float emin_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
-                        acc[m] += (static_cast<float>(sum_a_lo) * emin_lo
-                                 + static_cast<float>(sum_a_hi) * emin_hi) * scale_ab;
-                    }
-
-                    // IQ1_M: ±IQ1S_DELTA per-group correction
-                    if constexpr (FMT == NVNNI_PF_IQ1_M) {
-                        constexpr float IQ1S_DELTA = 0.125f;
-                        constexpr int32_t ones = 0x01010101;
-                        constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
-                        const uint8_t* pay = payload_base + linear * PB;
-                        const uint8_t qh0 = pay[4], qh1 = pay[5];
-
-                        int32_t sa_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
-                                        __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-                        int32_t sa_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
-                                        __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-                        int32_t sa_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
-                                        __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-                        int32_t sa_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
-                                        __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
-
-                        const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-                        acc[m] += ((d0 * static_cast<float>(sa_g0) +
-                                    d1 * static_cast<float>(sa_g1)) * s_lo +
-                                   (d2 * static_cast<float>(sa_g2) +
-                                    d3 * static_cast<float>(sa_g3)) * s_hi) *
-                                  scale_ab;
-                    }
-                }
-                else {
-                    int32_t dot = 0;
-                    #pragma unroll
-                    for (int g = 0; g < 8; ++g)
-                        dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
-
-                    const uint16_t scale_bits = scale_base[linear];
-                    const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                    acc[m] += static_cast<float>(dot) * block_d * scale_ab;
-
-                    if constexpr (PrefillNVNNITraits<FMT>::is_asymmetric) {
-                        constexpr int32_t ones = 0x01010101;
-                        int32_t sum_a = 0;
-                        #pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                            sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
-                        const uint16_t min_bits = min_base[linear];
-                        const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                        acc[m] += static_cast<float>(sum_a) * block_m * scale_ab;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // Write outputs
-    if (active)
-    {
-        #pragma unroll
-        for (int m = 0; m < TILE_M; ++m)
-        {
-            if (m >= tokens_in_group) break;
-            const int global_slot = offset + first_token + m;
-            output[static_cast<size_t>(global_slot) * N + n] = acc[m];
-        }
-    }
-}
-
-
-// ============================================================================
-// Kernel 5: Grouped Weighted Scatter-Add (all experts, single launch)
-//
-// FLAT GRID: grid(tiles_per_row, total_slots) — no empty blocks.
-// For each slot: output[original_token, :] += weight * expert_result[slot, :]
-//
-// Grid: dim3((d_model + 63) / 64, total_slots)
-// Block: 64 threads
-//
-// Uses atomicAdd since multiple experts can contribute to the same output token.
-// ============================================================================
-
-__global__ __launch_bounds__(64)
-void moe_grouped_weighted_scatter_prefill_kernel(
-    float*       __restrict__ output,                // [seq_len, d_model]
-    const float* __restrict__ expert_results,        // [total_slots, d_model]
-    const int*   __restrict__ d_group_token_indices, // [total_slots] token rows or route slots
-    const float* __restrict__ d_group_weights,       // [total_slots] routing weights
-    int max_tokens,
-    int top_k,
-    int grouped_indices_are_route_slots,
-    int d_model)
-{
-    constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int global_slot = blockIdx.y;
-
-    if (n >= d_model) return;
-
-    const int source_index = d_group_token_indices[global_slot];
-    const int original_token =
-        grouped_indices_are_route_slots ? (source_index / top_k) : source_index;
-    if (original_token < 0 || original_token >= max_tokens)
-    {
-        if (n == 0)
-        {
-            printf("rocm_grouped_prefill_invalid_scatter_token slot=%d index=%d token=%d "
-                   "max_tokens=%d top_k=%d route_slot_mode=%d\n",
-                   global_slot, source_index, original_token, max_tokens, top_k,
-                   grouped_indices_are_route_slots);
-        }
         moe_prefill_fail_fast_invalid_grouped_index();
         return;
     }
-    const float weight = d_group_weights[global_slot];
 
-    const float val = expert_results[static_cast<size_t>(global_slot) * d_model + n];
-    atomicAdd(output + static_cast<size_t>(original_token) * d_model + n, weight * val);
+    const int count = group_counts[expert_id];
+    const int grouped_offset = group_offsets[expert_id];
+    if (first_row < 0 || first_row >= count || grouped_offset < 0)
+    {
+        moe_prefill_fail_fast_invalid_grouped_index();
+        return;
+    }
+    const int rows_in_tile = min(TILE_M, count - first_row);
+    const int first_grouped_slot = grouped_offset + first_row;
+
+    const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
+        return;
+
+    const int blocks_per_row = K / 32;
+    const uint8_t* payload_base = desc.payload;
+    __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
+    __shared__ float staged_scales[TILE_M];
+    float accumulators[TILE_M] = {};
+
+    for (int b = 0; b < blocks_per_row; ++b)
+    {
+        const size_t linear =
+            static_cast<size_t>(b) * static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
+        const uint8_t* payload = payload_base + linear * payload_bytes;
+        int32_t packed_groups[8];
+        moe_prefill_decode_groups<FMT>(payload, packed_groups);
+
+        const int staged_words = rows_in_tile * 8;
+        for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
+        {
+            const int local_row = word >> 3;
+            const int group = word & 7;
+            const int grouped_slot = first_grouped_slot + local_row;
+            const int32_t* input_words = reinterpret_cast<const int32_t*>(
+                A_int8 + static_cast<size_t>(grouped_slot) * static_cast<size_t>(K) +
+                static_cast<size_t>(b) * 32u);
+            staged_A[word] = input_words[group];
+        }
+        for (int local_row = threadIdx.x;
+             local_row < rows_in_tile;
+             local_row += blockDim.x)
+        {
+            const int grouped_slot = first_grouped_slot + local_row;
+            staged_scales[local_row] = scales_A_blockwise[
+                static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
+                static_cast<size_t>(b)];
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int local_row = 0; local_row < TILE_M; ++local_row)
+        {
+            if (local_row >= rows_in_tile)
+                break;
+            accumulators[local_row] = moe_prefill_accumulate_decoded_block<FMT>(
+                desc,
+                linear,
+                payload,
+                packed_groups,
+                staged_A + local_row * 8,
+                staged_scales[local_row],
+                accumulators[local_row]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int local_row = 0; local_row < TILE_M; ++local_row)
+    {
+        if (local_row >= rows_in_tile)
+            break;
+        const int grouped_slot = first_grouped_slot + local_row;
+        down_partials[
+            static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
+            static_cast<size_t>(n)] = accumulators[local_row];
+    }
 }
 
 /**
- * @brief Ordered verifier scatter for small grouped-prefill batches.
+ * @brief Publish precomputed down rows in original top-k order.
  *
- * The flat scatter above is a good generic fallback, but combined MTP verifier
- * rows have a fixed route order for each token: routed top-k plus one shared
- * expert.  CUDA uses this map to avoid atomics and to sum each token's routes
- * deterministically in one thread.  ROCm must follow the same contract so the
- * vLLM-style combined verifier path gets the intended speedup on both GPU
- * backends.
+ * Each lane owns exactly one token/output-column result.  It walks the router's
+ * original route slots, resolves each slot to its grouped partial row, and
+ * executes `total += weight * partial` in the same order as serial decode.  The
+ * kernel has one writer per output value, so publication is deterministic and
+ * contains no floating-point atomics.
  */
-__global__ __launch_bounds__(64)
-void moe_grouped_weighted_scatter_ordered_prefill_kernel(
-    float*       __restrict__ output,              // [seq_len, d_model]
-    const float* __restrict__ expert_results,      // [total_slots, d_model]
-    const int*   __restrict__ original_to_grouped, // [seq_len * top_k]
-    const float* __restrict__ grouped_weights,     // [total_slots]
+__global__ __launch_bounds__(64, 4)
+void moe_grouped_down_partials_ordered_publish_prefill_kernel(
+    const float* __restrict__ down_partials,
+    const int* __restrict__ original_to_grouped,
+    const float* __restrict__ grouped_weights,
+    float* __restrict__ output,
     int seq_len,
     int top_k,
     int d_model)
 {
     constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token = blockIdx.y;
-    if (token >= seq_len || n >= d_model) return;
+    const int n = static_cast<int>(blockIdx.x) * TILE_N + threadIdx.x;
+    const int token = static_cast<int>(blockIdx.y);
+    if (token >= seq_len || n >= d_model)
+        return;
 
-    float sum = 0.0f;
+    float total = 0.0f;
 #pragma unroll 1
-    for (int k = 0; k < top_k; ++k)
+    for (int route = 0; route < top_k; ++route)
     {
-        const int original_slot = token * top_k + k;
+        const int original_slot = token * top_k + route;
         const int grouped_slot = original_to_grouped[original_slot];
-        if (grouped_slot < 0) continue;
-        const float weight = grouped_weights[grouped_slot];
-        const float value = expert_results[static_cast<size_t>(grouped_slot) * d_model + n];
-        sum += weight * value;
+        if (grouped_slot < 0)
+            continue;
+        total += grouped_weights[grouped_slot] *
+                 down_partials[
+                     static_cast<size_t>(grouped_slot) * static_cast<size_t>(d_model) +
+                     static_cast<size_t>(n)];
     }
-    output[static_cast<size_t>(token) * d_model + n] = sum;
+
+    output[
+        static_cast<size_t>(token) * static_cast<size_t>(d_model) +
+        static_cast<size_t>(n)] = total;
 }
+
 
 /**
  * @brief Dispatch one NativeVNNI down dot by the descriptor's codebook id.
@@ -1593,7 +1333,7 @@ void moe_grouped_weighted_scatter_ordered_prefill_kernel(
  * codebook would either overwrite earlier partial sums or reintroduce atomic
  * ordering.  This small device-side switch keeps the ordered publication kernel
  * generic while still reusing the exact same per-codebook dot helper as the
- * grouped gate/up and down kernels.
+ * grouped gate/up kernels and serial decode.
  */
 __device__ __forceinline__ float moe_prefill_dot_desc_range_dispatch(
     const DeviceNativeVNNIMatrixDesc& desc,
@@ -1661,16 +1401,16 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range_dispatch(
 }
 
 /**
- * @brief Decode-equivalent ordered down projection and publication.
+ * @brief Batch-invariant ordered down projection and publication.
  *
- * This is the ROCm verifier counterpart to serial row decode's canonical down
- * contract: for each token/output column, one thread walks the original route
- * slots in top-k order, computes the down dot for that route's expert, applies
- * the route weight, and accumulates into a single FP32 total.  No per-route down
- * rows are materialized and no atomic add participates in the verifier result,
- * so the grouped prefill path is bitwise comparable to row-by-row decode.
+ * This is the canonical ROCm grouped-prefill down contract for every M bucket.
+ * For each token/output column, one thread walks the original route slots in
+ * top-k order, computes the down dot for that route's expert, applies the route
+ * weight, and accumulates into a single FP32 total.  No per-route down rows are
+ * materialized and no atomic add participates in the result, so full prefill,
+ * split prefill, and row-by-row decode all retain identical arithmetic order.
  *
- * The kernel is still a true grouped implementation: all verifier tokens, all
+ * The kernel is still a true grouped implementation: all request tokens, all
  * route slots, and all active experts are published by one graph-capturable
  * device dispatch.  The only serial loop is the tiny top-k route loop inside
  * each token/column lane, exactly where serial decode defines the mathematical
@@ -1726,77 +1466,155 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
     output[static_cast<size_t>(token) * static_cast<size_t>(N) + static_cast<size_t>(n)] = total;
 }
 
-/**
- * @brief Decode-equivalent down projection and publication for MTP verifier rows.
- *
- * Serial ROCm decode's parallel-down path does not materialize a per-route down
- * row and scatter it later.  Instead, each original top-k route slot computes
- * its down dot product and atomically publishes the weighted contribution to
- * the token output in the same kernel.  Grouped verifier prefill must preserve
- * that contract when it wants to be a drop-in replacement for serial decode:
- * the grouped gate/up phase is still economical, but publication is driven by
- * the original route-slot grid and by the original expert ids.
- *
- * The inverse map lets the kernel find the grouped SwiGLU row for each original
- * route.  Masked or non-local routes keep a -1 map entry and are skipped, which
- * is exactly what a LocalTP expert-id-apportioned participant does before the output
- * allreduce combines contributions from its peers.
- */
-template <NativeVNNIFormatPrefill FMT>
-__global__ __launch_bounds__(64)
-void moe_grouped_down_publish_original_slot_atomic_prefill_kernel(
-    const int8_t* __restrict__ swiglu_int8,          // [total_slots, intermediate]
-    const float* __restrict__ swiglu_scales,         // [total_slots, intermediate / 32]
-    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs, // [num_experts]
-    const int* __restrict__ original_to_grouped,     // [seq_len * top_k]
-    const int* __restrict__ original_expert_ids,     // [seq_len * top_k]
-    const float* __restrict__ grouped_weights,       // [total_slots]
-    float* __restrict__ output,                      // [seq_len, d_model], pre-zeroed
-    int seq_len,
-    int top_k,
-    int N,
-    int K,
-    int num_experts)
-{
-    constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int original_slot = blockIdx.y;
-    const int total_slots = seq_len * top_k;
-    if (original_slot >= total_slots || n >= N)
-        return;
-
-    const int grouped_slot = original_to_grouped[original_slot];
-    if (grouped_slot < 0)
-        return;
-
-    const int expert_id = original_expert_ids[original_slot];
-    if (expert_id < 0 || expert_id >= num_experts)
-        return;
-
-    const DeviceNativeVNNIMatrixDesc desc = down_descs[expert_id];
-    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
-        return;
-
-    const int blocks_per_row = K / 32;
-    const int8_t* slot_A = swiglu_int8 + static_cast<size_t>(grouped_slot) * K;
-    const float* slot_scales = swiglu_scales + static_cast<size_t>(grouped_slot) * blocks_per_row;
-    const float expert_acc = moe_prefill_dot_desc_range<FMT>(
-        desc, n, slot_A, slot_scales, N, 0, blocks_per_row);
-
-    const int token = original_slot / top_k;
-    const float weight = grouped_weights[grouped_slot];
-    atomicAdd(output + static_cast<size_t>(token) * N + n, weight * expert_acc);
-}
-
-
 // ============================================================================
 // C API: Full grouped MoE prefill pipeline (graph-capturable)
 //
-// Launches all 5 kernels in sequence on the same stream.
-// NO host-device synchronization — all data flow is device-to-device.
+// Launches one fixed, fully grouped pipeline on the caller's stream. Tiny MTP
+// buckets use direct route-owned projection. Long prefill builds a compact
+// device work directory, reuses decoded expert weights across row tiles, and
+// publishes materialized down rows in original top-k order. No path uses FP32
+// atomics, host synchronization, or host-authored launch metadata.
 // ============================================================================
 
+namespace
+{
+    /** Projection role with an independently trained grouped-prefill policy. */
+    enum class MoEPrefillProjectionRole : uint8_t
+    {
+        GateUp,
+        Down,
+    };
+
+    /** Compile-time candidate selected for one graph-captured projection. */
+    struct MoEPrefillTileConfig
+    {
+        int rows = 0;
+        int columns = 0;
+    };
+
+    bool moe_prefill_valid_tile_rows(int rows)
+    {
+        return rows == 4 || rows == 8 || rows == 12 || rows == 16;
+    }
+
+    bool moe_prefill_valid_tile_columns(int columns)
+    {
+        return columns == 64 || columns == 128 || columns == 256;
+    }
+
+    /**
+     * @brief Select a grouped projection candidate for capture or trainer use.
+     *
+     * Production is selected exclusively by the complete generated
+     * codebook/M/aspect-ratio table. Role-specific environment overrides are
+     * intentionally explicit trainer controls: they let the Perf__ sweep hold
+     * down projection fixed while training gate/up, then reverse the experiment,
+     * without introducing a second benchmark-only implementation. A generated
+     * policy miss returns an invalid zero tile and is rejected by the caller;
+     * there is no silent generic production fallback.
+     */
+    MoEPrefillTileConfig moe_prefill_select_tile_config(
+        MoEPrefillProjectionRole role,
+        NativeVNNIFormatPrefill format,
+        int m,
+        int n,
+        int k)
+    {
+        const auto& env = llaminar2::debugEnv().rocm;
+        MoEPrefillTileConfig config{};
+        llaminar2::rocm::generated::ROCmMoEGroupedPrefillConfig generated{};
+        const uint8_t role_id =
+            role == MoEPrefillProjectionRole::GateUp ? 0u : 1u;
+        if (!llaminar2::rocm::generated::selectROCmMoEGroupedPrefillGenerated(
+                static_cast<uint8_t>(format), role_id, m, n, k, generated))
+        {
+            return config;
+        }
+        config.rows = generated.tile_m;
+        config.columns = generated.tile_n;
+        if (role == MoEPrefillProjectionRole::GateUp)
+        {
+            if (env.moe_prefill_gateup_tile_m > 0)
+                config.rows = env.moe_prefill_gateup_tile_m;
+            if (env.moe_prefill_gateup_tile_n > 0)
+                config.columns = env.moe_prefill_gateup_tile_n;
+        }
+        else
+        {
+            if (env.moe_prefill_down_tile_m > 0)
+                config.rows = env.moe_prefill_down_tile_m;
+            if (env.moe_prefill_down_tile_n > 0)
+                config.columns = env.moe_prefill_down_tile_n;
+        }
+        return config;
+    }
+
+    int moe_prefill_directory_capacity(
+        int total_slots,
+        int num_experts,
+        int tile_rows)
+    {
+        const int active_expert_bound =
+            total_slots < num_experts ? total_slots : num_experts;
+        const int conservative_bound =
+            active_expert_bound + (total_slots + tile_rows - 1) / tile_rows;
+        return conservative_bound < total_slots
+                   ? conservative_bound
+                   : total_slots;
+    }
+}
+
 extern "C" {
+
+/**
+ * @brief Query the generated tile selected for one long-prefill projection.
+ *
+ * This host-only introspection entry point shares the production selector,
+ * including explicit trainer overrides. It performs no GPU work and is used by
+ * PerfStats and integration tests to prove that the policy advertised for a
+ * graph is the policy its capture launcher selected. M<=8 direct execution is
+ * intentionally handled by the caller because it bypasses this generated
+ * long-prefill surface.
+ *
+ * @param codebook_id NativeVNNI execution codebook stored in the descriptor.
+ * @param projection_role Zero for gate/up, one for down.
+ * @param m Number of original token rows.
+ * @param n Projection output width.
+ * @param k Projection reduction width.
+ * @param tile_m Receives the trained expert-row tile.
+ * @param tile_n Receives the trained output-column tile.
+ * @return true when the generated table contains a valid compiled candidate;
+ *         false for invalid arguments, unsupported codebooks, or a table miss.
+ */
+bool rocmMoE_grouped_prefill_query_tile_config(
+    uint8_t codebook_id,
+    int projection_role,
+    int m,
+    int n,
+    int k,
+    int* tile_m,
+    int* tile_n)
+{
+    if (!tile_m || !tile_n || projection_role < 0 || projection_role > 1)
+        return false;
+    const auto role = projection_role == 0
+                          ? MoEPrefillProjectionRole::GateUp
+                          : MoEPrefillProjectionRole::Down;
+    const MoEPrefillTileConfig config = moe_prefill_select_tile_config(
+        role,
+        static_cast<NativeVNNIFormatPrefill>(codebook_id),
+        m,
+        n,
+        k);
+    if (!moe_prefill_valid_tile_rows(config.rows) ||
+        !moe_prefill_valid_tile_columns(config.columns))
+    {
+        return false;
+    }
+    *tile_m = config.rows;
+    *tile_n = config.columns;
+    return true;
+}
 
 bool rocmMoE_grouped_prefill_pipeline(
     // Input
@@ -1811,178 +1629,205 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int*    d_group_counts,        // [num_experts] per-expert token count
     const int*    d_group_offsets,       // [num_experts] prefix-sum offsets
     const int*    d_group_token_indices, // [total_slots] original token indices
-    const int*    d_original_to_grouped,  // [seq_len * top_k] route slot -> grouped slot, optional
-    const int*    d_original_expert_ids,  // [seq_len * top_k] original route slot -> expert id, optional
+    const int*    d_original_to_grouped,  // [seq_len * top_k] required route slot -> grouped slot
+    const int*    d_original_expert_ids,  // [seq_len * top_k] required unless num_experts == 1
     const float*  d_group_weights,       // [total_slots] routing weights
-    const int*    d_active_expert_ids,   // [active_expert_slots] compact active experts, optional
+    int*          d_group_work_directory,// [max(total_slots,num_experts)], device scratch
     // Scratch buffers (caller provides, sized for total_slots)
     int8_t*       d_scratch_A_int8,      // [total_slots, max(d_model, intermediate)]
     float*        d_scratch_scales,      // [total_slots, max_blocks_per_row]
-    float*        d_scratch_gate,        // [total_slots, intermediate]
+    float*        d_scratch_gate,        // [total_slots, max(d_model, intermediate)]
     float*        d_scratch_up,          // [total_slots, intermediate]
-    float*        d_gate_partials,       // [total_slots, k_partitions, intermediate], optional
-    float*        d_up_partials,         // [total_slots, k_partitions, intermediate], optional
     int8_t*       d_scratch_swiglu_int8, // [total_slots, intermediate]
     float*        d_scratch_swiglu_scales,// [total_slots, blocks_per_intermediate]
-    float*        d_scratch_down_out,    // [total_slots, d_model]
     // Output
-    float*        d_output,              // [seq_len, d_model] accumulated output (must be pre-zeroed)
+    float*        d_output,              // [seq_len, d_model] overwritten in original top-k order
     // Dimensions
     int num_experts,
     int d_model,
     int intermediate,
-    int max_tokens_per_expert,           // upper bound on tokens any expert gets
     int total_slots,                     // seq_len * top_k
-    int top_k,                           // routes per token, needed by ordered scatter
-    int active_expert_slots,             // fixed graph-capturable expert grid, 0 => all experts
+    int top_k,                           // routes per token, needed by ordered publication
     int grouped_indices_are_route_slots, // d_group_token_indices stores route slots, not token rows
-    int original_slot_atomic_scatter,    // match serial parallel-down decode accumulation order
-    // Formats and device. Gate/up and down can differ on Qwen35 MoE
-    // (for example Q4_K gate/up with Q5_K down), so keep them separate.
-    uint8_t gateup_codebook_id,
-    uint8_t down_codebook_id,
+    // Format masks launch only the compiled NativeVNNI specializations present
+    // in each descriptor table. Mixed-codebook expert tables remain supported.
     uint32_t gateup_codebook_mask,
     uint32_t down_codebook_mask,
-    int requested_tile_m,
-    int gateup_k_partitions,
     int device_id,
     void* stream)
 {
-    if (num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
-        max_tokens_per_expert <= 0 || total_slots <= 0 || top_k <= 0 || !stream)
+    if (num_experts <= 0 || num_experts > 256 ||
+        d_model <= 0 || intermediate <= 0 ||
+        total_slots <= 0 || top_k <= 0 || (total_slots % top_k) != 0 ||
+        (d_model % 32) != 0 || (intermediate % 32) != 0 ||
+        gateup_codebook_mask == 0 || down_codebook_mask == 0 || !stream)
         return false;
-    const bool use_active_expert_grid = d_active_expert_ids && active_expert_slots > 0;
-    if (use_active_expert_grid &&
-        (active_expert_slots > total_slots || active_expert_slots > num_experts))
+    if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
+        !d_group_counts || !d_group_offsets || !d_group_token_indices ||
+        !d_original_to_grouped || !d_group_weights || !d_group_work_directory ||
+        !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate ||
+        !d_scratch_up || !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales ||
+        !d_output ||
+        (!d_original_expert_ids && num_experts != 1))
         return false;
-    if (original_slot_atomic_scatter &&
-        (!d_original_to_grouped || !d_original_expert_ids))
-        return false;
-    const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
     const int seq_len = total_slots / top_k;
+    const bool use_expert_row_tiles = seq_len > 8;
 
     llaminar2::HipDeviceGuard::setDevice(device_id);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError(); // clear prior errors
-    const bool verifier_decode_equivalent_gateup =
-        use_active_expert_grid &&
-        max_tokens_per_expert <= 4 &&
-        d_scratch_gate &&
-        d_scratch_up;
-    const bool reuse_prequantized_hidden =
-        verifier_decode_equivalent_gateup &&
-        d_prequantized_hidden &&
-        d_prequantized_hidden_scales;
-    const bool verifier_decode_equivalent_ordered_down =
-        verifier_decode_equivalent_gateup &&
-        !original_slot_atomic_scatter &&
-        d_original_to_grouped &&
-        (d_original_expert_ids || num_experts == 1);
-    const bool use_gateup_kpart =
-        !verifier_decode_equivalent_gateup &&
-        use_active_expert_grid &&
-        max_tokens_per_expert <= 4 &&
-        gateup_k_partitions > 1 &&
-        d_scratch_gate &&
-        d_scratch_up &&
-        d_gate_partials &&
-        d_up_partials;
+    const bool has_prequantized_hidden =
+        d_prequantized_hidden && d_prequantized_hidden_scales;
+    if ((d_prequantized_hidden == nullptr) !=
+        (d_prequantized_hidden_scales == nullptr))
+        return false;
+    const bool reuse_prequantized_hidden = has_prequantized_hidden;
+
+    int directory_tile_rows = 0;
+    int current_directory_capacity = 0;
+    const auto ensure_work_directory = [&](int tile_rows) -> int
+    {
+        if (!moe_prefill_valid_tile_rows(tile_rows))
+            return 0;
+
+        const int capacity = moe_prefill_directory_capacity(
+            total_slots, num_experts, tile_rows);
+        if (directory_tile_rows == tile_rows)
+            return current_directory_capacity;
+
+        dim3 directory_block(256);
+        switch (tile_rows)
+        {
+        case 4:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(moe_grouped_build_prefill_tile_directory_kernel<4>),
+                dim3(1), directory_block, 0, hip_stream,
+                d_group_counts,
+                reinterpret_cast<uint32_t*>(d_group_work_directory),
+                num_experts,
+                capacity);
+            break;
+        case 8:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(moe_grouped_build_prefill_tile_directory_kernel<8>),
+                dim3(1), directory_block, 0, hip_stream,
+                d_group_counts,
+                reinterpret_cast<uint32_t*>(d_group_work_directory),
+                num_experts,
+                capacity);
+            break;
+        case 12:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(moe_grouped_build_prefill_tile_directory_kernel<12>),
+                dim3(1), directory_block, 0, hip_stream,
+                d_group_counts,
+                reinterpret_cast<uint32_t*>(d_group_work_directory),
+                num_experts,
+                capacity);
+            break;
+        case 16:
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(moe_grouped_build_prefill_tile_directory_kernel<16>),
+                dim3(1), directory_block, 0, hip_stream,
+                d_group_counts,
+                reinterpret_cast<uint32_t*>(d_group_work_directory),
+                num_experts,
+                capacity);
+            break;
+        default:
+            return 0;
+        }
+
+        directory_tile_rows = tile_rows;
+        current_directory_capacity = capacity;
+        return capacity;
+    };
 
     const int blocks_per_d_model = d_model / 32;
 
     // =========================================================================
-    // Kernel 1: Gather + Quantize hidden → A_int8 (FLAT grid over total_slots)
+    // Kernel 1: Quantize each original hidden row once.
     //
     // A verifier router already quantizes every original row for its Q8 logits
     // GEMV.  When those device rows are published, gate/up addresses them
     // through d_group_token_indices and this launch is unnecessary.  Ordinary
-    // prefill and non-Q8 routing retain the grouped gather/quantize path.
+    // prefill and non-Q8 routing use the same row-owned Q8 contract here. The
+    // grouped projection resolves every expert slot back to this original row.
     // =========================================================================
     if (!reuse_prequantized_hidden)
     {
-        dim3 grid(blocks_per_d_model, total_slots);
+        dim3 grid(blocks_per_d_model, seq_len);
         dim3 block(32);
-        hipLaunchKernelGGL(moe_grouped_gather_quantize_prefill_kernel,
+        hipLaunchKernelGGL(moe_prefill_hidden_quantize_rows_kernel,
             grid, block, 0, hip_stream,
-            d_hidden, d_scratch_A_int8, d_scratch_scales,
-            d_group_token_indices, seq_len, top_k,
-            grouped_indices_are_route_slots, d_model);
+            d_hidden, d_scratch_A_int8, d_scratch_scales, seq_len, d_model);
     }
 
-    /*
-     * A shared-expert prefill group has exactly one expert and one routed slot
-     * per verifier row.  TILE_M=2 keeps the verifier live register set smaller
-     * for M=3/4, while routed expert groups continue to use the measured
-     * default selector.  This is role-based, not codebook-specific.
-     */
-    const bool shared_expert_group = num_experts == 1;
-    const int tile_m = shared_expert_group
-                           ? 2
-                           : rocm_moe_select_grouped_prefill_tile_m(requested_tile_m,
-                                                                    max_tokens_per_expert);
     // =========================================================================
-    // Kernel 2: Gate+Up GEMM.  Ordinary prefill keeps the fused SwiGLU path.
-    // Tiny verifier batches can instead split K to expose more parallelism,
-    // then reduce into FP32 gate/up scratch for the existing SwiGLU quantizer.
+    // Kernel 2: Batch-invariant gate/up projection.
+    //
+    // Verifier buckets retain the low-latency route-owned geometry. Long prefill
+    // consumes the compact device directory and amortizes weight decode across
+    // Trained expert-row tiles preserve every row's serial increasing-K order.
     // =========================================================================
     {
-        constexpr int kFusedTileN = 128;
-        constexpr int kKPartTileN = 64;
-        const int tile_n =
-            (use_gateup_kpart || verifier_decode_equivalent_gateup) ? kKPartTileN : kFusedTileN;
-        dim3 block(tile_n);
-        const int n_tiles = (intermediate + tile_n - 1) / tile_n;
-        const int m_tiles = (max_tokens_per_expert + tile_m - 1) / tile_m;
+        constexpr int route_tile_n = 64;
+        dim3 route_block(route_tile_n);
+        const int route_n_tiles =
+            (intermediate + route_tile_n - 1) / route_tile_n;
 
         const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
         const auto* up_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_up_desc_table);
 
-        #define LAUNCH_GATEUP_DECODE_EQUIV(FMT) \
+        #define LAUNCH_GATEUP_ROUTE_OWNED(FMT) \
             do { \
-                dim3 grid(n_tiles, max_tokens_per_expert, expert_grid); \
+                dim3 grid(route_n_tiles, total_slots); \
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT>), \
-                    grid, block, 0, hip_stream, \
+                    grid, route_block, 0, hip_stream, \
                     reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8, \
                     reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
-                    d_group_token_indices, gate_descs, up_descs, \
-                    d_group_counts, d_group_offsets, d_active_expert_ids, \
-                    d_scratch_gate, d_scratch_up, seq_len, top_k, \
-                    grouped_indices_are_route_slots, reuse_prequantized_hidden ? 1 : 0, \
-                    intermediate, d_model); \
+                    d_original_to_grouped, d_original_expert_ids, gate_descs, up_descs, \
+                    d_scratch_gate, d_scratch_up, total_slots, seq_len, top_k, \
+                    1, intermediate, d_model, num_experts); \
             } while (0)
-        #define LAUNCH_GATEUP_PREFILL_TM(FMT, TM) \
+        #define LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, TN) \
             do { \
-                dim3 grid(n_tiles, m_tiles, expert_grid); \
+                const int candidate_directory_capacity = ensure_work_directory(TM); \
+                if (candidate_directory_capacity <= 0) \
+                    return false; \
+                dim3 grid((intermediate + TN - 1) / TN, candidate_directory_capacity, 2); \
+                dim3 expert_block(TN); \
                 hipLaunchKernelGGL( \
-                    HIP_KERNEL_NAME(moe_grouped_gate_up_swiglu_prefill_gemm_kernel<FMT, TM>), \
-                    grid, block, 0, hip_stream, \
-                    d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                    d_group_counts, d_group_offsets, d_active_expert_ids, \
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model); \
+                    HIP_KERNEL_NAME(moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<FMT, TM, TN>), \
+                    grid, expert_block, 0, hip_stream, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8, \
+                    reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales, \
+                    d_group_token_indices, d_group_counts, d_group_offsets, \
+                    reinterpret_cast<const uint32_t*>(d_group_work_directory), \
+                    gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
+                    candidate_directory_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
+                    1, intermediate, d_model, num_experts); \
             } while (0)
-        #define LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, TM) \
+
+        #define DISPATCH_GATEUP_TILE_N(FMT, TM, CONFIG) \
             do { \
-                dim3 grid(n_tiles, m_tiles, expert_grid * gateup_k_partitions); \
-                hipLaunchKernelGGL( \
-                    HIP_KERNEL_NAME(moe_grouped_gate_up_prefill_kpart_kernel<FMT, TM>), \
-                    grid, block, 0, hip_stream, \
-                    d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                    d_group_counts, d_group_offsets, d_active_expert_ids, \
-                    d_gate_partials, d_up_partials, intermediate, d_model, gateup_k_partitions); \
+                switch ((CONFIG).columns) { \
+                case 64:  LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, 64); break; \
+                case 128: LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, 128); break; \
+                case 256: LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, 256); break; \
+                default: return false; \
+                } \
             } while (0)
-        #define LAUNCH_GATEUP_PREFILL(FMT) \
+
+        #define DISPATCH_GATEUP_CONFIG(FMT, CONFIG) \
             do { \
-                if (verifier_decode_equivalent_gateup) { \
-                    LAUNCH_GATEUP_DECODE_EQUIV(FMT); \
-                } else if (use_gateup_kpart) { \
-                    if (tile_m <= 2)      LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, 2); \
-                    else if (tile_m <= 4) LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, 4); \
-                    else                  LAUNCH_GATEUP_KPART_PREFILL_TM(FMT, 8); \
-                } else { \
-                    if (tile_m <= 2)      LAUNCH_GATEUP_PREFILL_TM(FMT, 2); \
-                    else if (tile_m <= 4) LAUNCH_GATEUP_PREFILL_TM(FMT, 4); \
-                    else                  LAUNCH_GATEUP_PREFILL_TM(FMT, 8); \
+                switch ((CONFIG).rows) { \
+                case 4:  DISPATCH_GATEUP_TILE_N(FMT, 4, CONFIG); break; \
+                case 8:  DISPATCH_GATEUP_TILE_N(FMT, 8, CONFIG); break; \
+                case 12: DISPATCH_GATEUP_TILE_N(FMT, 12, CONFIG); break; \
+                case 16: DISPATCH_GATEUP_TILE_N(FMT, 16, CONFIG); break; \
+                default: return false; \
                 } \
             } while (0)
 
@@ -1990,7 +1835,16 @@ bool rocmMoE_grouped_prefill_pipeline(
         #define LAUNCH_GATEUP_IF_PRESENT(FMT) \
             do { \
                 if (gateup_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
-                    LAUNCH_GATEUP_PREFILL(FMT); \
+                    if (!use_expert_row_tiles) { \
+                        LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
+                    } else { \
+                        const MoEPrefillTileConfig candidate = moe_prefill_select_tile_config( \
+                            MoEPrefillProjectionRole::GateUp, FMT, seq_len, intermediate, d_model); \
+                        if (!moe_prefill_valid_tile_rows(candidate.rows) || \
+                            !moe_prefill_valid_tile_columns(candidate.columns)) \
+                            return false; \
+                        DISPATCH_GATEUP_CONFIG(FMT, candidate); \
+                    } \
                     launched_gateup = true; \
                 } \
             } while (0)
@@ -2013,217 +1867,136 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q8_0);
         if (!launched_gateup)
         {
-                fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%d mask=0x%x\n",
-                        gateup_codebook_id, gateup_codebook_mask);
+                fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook mask=0x%x\n",
+                        gateup_codebook_mask);
                 return false;
         }
         #undef LAUNCH_GATEUP_IF_PRESENT
-        #undef LAUNCH_GATEUP_PREFILL
-        #undef LAUNCH_GATEUP_KPART_PREFILL_TM
-        #undef LAUNCH_GATEUP_PREFILL_TM
-        #undef LAUNCH_GATEUP_DECODE_EQUIV
+        #undef DISPATCH_GATEUP_CONFIG
+        #undef DISPATCH_GATEUP_TILE_N
+        #undef LAUNCH_GATEUP_EXPERT_TILED
+        #undef LAUNCH_GATEUP_ROUTE_OWNED
 
-        if (use_gateup_kpart)
-        {
-            constexpr int TILE_N = 32;
-            dim3 reduce_grid((intermediate + TILE_N - 1) / TILE_N, total_slots);
-            dim3 reduce_block(TILE_N);
-            hipLaunchKernelGGL(
-                moe_grouped_gate_up_prefill_kpart_reduce_swiglu_quantize_kernel,
-                reduce_grid, reduce_block, 0, hip_stream,
-                d_gate_partials, d_up_partials,
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                total_slots, intermediate, gateup_k_partitions);
-        }
-        else if (verifier_decode_equivalent_gateup)
-        {
-            /*
-             * Keep verifier rows on the same FP32 gate/up -> SwiGLU-quantize
-             * boundary as rowwise decode.  This is one extra graph node versus
-             * the fused prefill shortcut, but it is still a single grouped
-             * quantization pass over all route slots and avoids production row
-             * replay.
-             */
-            constexpr int TILE_N = 32;
-            dim3 quant_grid((intermediate + TILE_N - 1) / TILE_N, total_slots);
-            dim3 quant_block(TILE_N);
-            hipLaunchKernelGGL(
-                moe_grouped_swiglu_quantize_prefill_kernel,
-                quant_grid, quant_block, 0, hip_stream,
-                d_scratch_gate, d_scratch_up,
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                intermediate);
-        }
+        constexpr int TILE_N = 32;
+        dim3 quant_grid((intermediate + TILE_N - 1) / TILE_N, total_slots);
+        dim3 quant_block(TILE_N);
+        hipLaunchKernelGGL(
+            moe_grouped_swiglu_quantize_prefill_kernel,
+            quant_grid, quant_block, 0, hip_stream,
+            d_scratch_gate, d_scratch_up,
+            d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+            intermediate);
     }
 
     // =========================================================================
-    // Kernel 3: Down GEMM (same TILE_M bucket as gate/up)
-    // =========================================================================
-    if (!original_slot_atomic_scatter && !verifier_decode_equivalent_ordered_down)
-    {
-        /*
-         * CUDA's verifier path uses narrower down tiles for tiny active-expert
-         * batches. Mirror that geometry on ROCm so M=2..4 rows do not pay a
-         * full 128-lane column tile when there are too few rows to amortize it.
-         */
-        const bool tiny_active_verifier =
-            use_active_expert_grid && max_tokens_per_expert <= 4;
-        const int down_tile_n = tiny_active_verifier ? 64 : 128;
-        dim3 block(down_tile_n);
-        const int n_tiles = (d_model + down_tile_n - 1) / down_tile_n;
-        const int m_tiles = (max_tokens_per_expert + tile_m - 1) / tile_m;
-
-        const auto* down_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
-
-        #define LAUNCH_DOWN_PREFILL_TM(FMT, TM) \
-            do { \
-                dim3 grid(n_tiles, m_tiles, expert_grid); \
-                if (down_tile_n == 64) { \
-                    hipLaunchKernelGGL( \
-                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 64>), \
-                        grid, block, 0, hip_stream, \
-                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                        d_group_counts, d_group_offsets, d_active_expert_ids, \
-                        d_scratch_down_out, d_model, intermediate); \
-                } else { \
-                    hipLaunchKernelGGL( \
-                        HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT, TM, 128>), \
-                        grid, block, 0, hip_stream, \
-                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                        d_group_counts, d_group_offsets, d_active_expert_ids, \
-                        d_scratch_down_out, d_model, intermediate); \
-                } \
-            } while (0)
-        #define LAUNCH_DOWN_PREFILL(FMT) \
-            do { \
-                if (tile_m <= 2)      LAUNCH_DOWN_PREFILL_TM(FMT, 2); \
-                else if (tile_m <= 4) LAUNCH_DOWN_PREFILL_TM(FMT, 4); \
-                else                  LAUNCH_DOWN_PREFILL_TM(FMT, 8); \
-            } while (0)
-
-        bool launched_down = false;
-        #define LAUNCH_DOWN_IF_PRESENT(FMT) \
-            do { \
-                if (down_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
-                    LAUNCH_DOWN_PREFILL(FMT); \
-                    launched_down = true; \
-                } \
-            } while (0)
-
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_0);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_NL);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_1);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_0);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_1);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q6_K);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q3_K);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q2_K);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ3_S);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ3_XXS);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_S);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_XS);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_XXS);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_S);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_M);
-        LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q8_0);
-        if (!launched_down)
-        {
-                fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported down codebook_id=%d mask=0x%x\n",
-                        down_codebook_id, down_codebook_mask);
-                return false;
-        }
-        #undef LAUNCH_DOWN_IF_PRESENT
-        #undef LAUNCH_DOWN_PREFILL
-        #undef LAUNCH_DOWN_PREFILL_TM
-    }
-
-    // =========================================================================
-    // Kernel 4: Weighted Scatter-Add (FLAT grid over total_slots)
+    // Kernels 4-5: down projection and fixed-order publication.
+    //
+    // Tiny verifier buckets compute and publish directly. Long prefill writes
+    // row-tiled down partials into the now-dead gate scratch, then one owner per
+    // token/column reduces those rows in original top-k order.
     // =========================================================================
     {
         constexpr int TILE_N = 64;
         dim3 block(TILE_N);
-        if (d_original_to_grouped)
-        {
-            if (verifier_decode_equivalent_ordered_down)
-            {
-                /*
-                 * Verifier rows need the grouped path to be exactly comparable
-                 * with row-by-row decode.  Publish directly from grouped SwiGLU
-                 * rows in original route order instead of materializing per-slot
-                 * down rows or using atomics.
-                 */
-                const auto* down_descs =
-                    static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
-                dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
-                hipLaunchKernelGGL(
-                    moe_grouped_down_publish_original_token_ordered_prefill_kernel,
-                    grid, block, 0, hip_stream,
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs,
-                    d_original_to_grouped, d_original_expert_ids, d_group_weights,
-                    d_output, seq_len, top_k, d_model, intermediate, num_experts);
-            }
-            else if (original_slot_atomic_scatter)
-            {
-                const auto* down_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
-                dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots);
-                bool launched_publish = false;
-                #define LAUNCH_DOWN_PUBLISH_IF_PRESENT(FMT) \
-                    do { \
-                        if (down_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
-                            hipLaunchKernelGGL( \
-                                HIP_KERNEL_NAME(moe_grouped_down_publish_original_slot_atomic_prefill_kernel<FMT>), \
-                                grid, block, 0, hip_stream, \
-                                d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                                d_original_to_grouped, d_original_expert_ids, d_group_weights, \
-                                d_output, seq_len, top_k, d_model, intermediate, num_experts); \
-                            launched_publish = true; \
-                        } \
-                    } while (0)
+        const auto* down_descs =
+            static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
 
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q4_0);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ4_NL);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q4_1);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q5_0);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q5_1);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q6_K);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q3_K);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q2_K);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ3_S);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ3_XXS);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ2_S);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ2_XS);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ2_XXS);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ1_S);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_IQ1_M);
-                LAUNCH_DOWN_PUBLISH_IF_PRESENT(NVNNI_PF_Q8_0);
-                if (!launched_publish)
-                {
-                    fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported fused publish down codebook_id=%d mask=0x%x\n",
-                            down_codebook_id, down_codebook_mask);
-                    return false;
-                }
-                #undef LAUNCH_DOWN_PUBLISH_IF_PRESENT
-            }
-            else
-            {
-                dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
-                hipLaunchKernelGGL(moe_grouped_weighted_scatter_ordered_prefill_kernel,
-                    grid, block, 0, hip_stream,
-                    d_output, d_scratch_down_out,
-                    d_original_to_grouped, d_group_weights,
-                    seq_len, top_k, d_model);
-            }
+        if (!use_expert_row_tiles)
+        {
+            dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len);
+            hipLaunchKernelGGL(
+                moe_grouped_down_publish_original_token_ordered_prefill_kernel,
+                grid, block, 0, hip_stream,
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs,
+                d_original_to_grouped, d_original_expert_ids, d_group_weights,
+                d_output, seq_len, top_k, d_model, intermediate, num_experts);
         }
         else
         {
-            dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots);
-            hipLaunchKernelGGL(moe_grouped_weighted_scatter_prefill_kernel,
-                grid, block, 0, hip_stream,
-                d_output, d_scratch_down_out,
-                d_group_token_indices, d_group_weights,
-                seq_len, top_k, grouped_indices_are_route_slots,
-                d_model);
+            bool launched_down = false;
+            #define LAUNCH_DOWN_EXPERT_TILED(FMT, TM, TN) \
+                do { \
+                    const int candidate_directory_capacity = ensure_work_directory(TM); \
+                    if (candidate_directory_capacity <= 0) \
+                        return false; \
+                    dim3 grid((d_model + TN - 1) / TN, candidate_directory_capacity); \
+                    dim3 expert_block(TN); \
+                    hipLaunchKernelGGL( \
+                        HIP_KERNEL_NAME(moe_grouped_down_batch_invariant_tiled_prefill_kernel<FMT, TM, TN>), \
+                        grid, expert_block, 0, hip_stream, \
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
+                        d_group_counts, d_group_offsets, \
+                        reinterpret_cast<const uint32_t*>(d_group_work_directory), \
+                        d_scratch_gate, candidate_directory_capacity, d_model, intermediate, num_experts); \
+                } while (0)
+
+            #define DISPATCH_DOWN_TILE_N(FMT, TM, CONFIG) \
+                do { \
+                    switch ((CONFIG).columns) { \
+                    case 64:  LAUNCH_DOWN_EXPERT_TILED(FMT, TM, 64); break; \
+                    case 128: LAUNCH_DOWN_EXPERT_TILED(FMT, TM, 128); break; \
+                    case 256: LAUNCH_DOWN_EXPERT_TILED(FMT, TM, 256); break; \
+                    default: return false; \
+                    } \
+                } while (0)
+
+            #define DISPATCH_DOWN_CONFIG(FMT, CONFIG) \
+                do { \
+                    switch ((CONFIG).rows) { \
+                    case 4:  DISPATCH_DOWN_TILE_N(FMT, 4, CONFIG); break; \
+                    case 8:  DISPATCH_DOWN_TILE_N(FMT, 8, CONFIG); break; \
+                    case 12: DISPATCH_DOWN_TILE_N(FMT, 12, CONFIG); break; \
+                    case 16: DISPATCH_DOWN_TILE_N(FMT, 16, CONFIG); break; \
+                    default: return false; \
+                    } \
+                } while (0)
+            #define LAUNCH_DOWN_IF_PRESENT(FMT) \
+                do { \
+                    if (down_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
+                        const MoEPrefillTileConfig candidate = moe_prefill_select_tile_config( \
+                            MoEPrefillProjectionRole::Down, FMT, seq_len, d_model, intermediate); \
+                        if (!moe_prefill_valid_tile_rows(candidate.rows) || \
+                            !moe_prefill_valid_tile_columns(candidate.columns)) \
+                            return false; \
+                        DISPATCH_DOWN_CONFIG(FMT, candidate); \
+                        launched_down = true; \
+                    } \
+                } while (0)
+
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_0);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_NL);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_1);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_0);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_1);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q6_K);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q3_K);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q2_K);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ3_S);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ3_XXS);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_S);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_XS);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ2_XXS);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_S);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_M);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q8_0);
+            #undef LAUNCH_DOWN_IF_PRESENT
+            #undef DISPATCH_DOWN_CONFIG
+            #undef DISPATCH_DOWN_TILE_N
+            #undef LAUNCH_DOWN_EXPERT_TILED
+
+            if (!launched_down)
+            {
+                fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported down codebook mask=0x%x\n",
+                        down_codebook_mask);
+                return false;
+            }
+
+            dim3 publish_grid((d_model + TILE_N - 1) / TILE_N, seq_len);
+            hipLaunchKernelGGL(
+                moe_grouped_down_partials_ordered_publish_prefill_kernel,
+                publish_grid, block, 0, hip_stream,
+                d_scratch_gate, d_original_to_grouped, d_group_weights,
+                d_output, seq_len, top_k, d_model);
         }
     }
 

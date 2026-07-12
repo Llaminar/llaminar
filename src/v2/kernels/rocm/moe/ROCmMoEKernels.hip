@@ -7401,111 +7401,6 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
     }
 }
 
-__global__ void rocm_moe_gate_logits_small_m_kernel(
-    const float *__restrict__ hidden,       // [seq_len, d_model]
-    const float *__restrict__ gate_weights, // [num_experts, d_model]
-    float *__restrict__ logits,             // [seq_len, num_experts]
-    int seq_len, int d_model, int num_experts,
-    bool use_vec4)
-{
-    extern __shared__ float4 hidden_shared_vec4[];
-    float *hidden_shared = reinterpret_cast<float *>(hidden_shared_vec4);
-
-    const int row = blockIdx.y;
-    if (row >= seq_len) return;
-
-    const float *h = hidden + static_cast<size_t>(row) * d_model;
-
-    if (use_vec4)
-    {
-        const int vec_count = d_model >> 2;
-        const float4 *hidden4 = reinterpret_cast<const float4 *>(h);
-        for (int i = threadIdx.x; i < vec_count; i += blockDim.x)
-        {
-            hidden_shared_vec4[i] = hidden4[i];
-        }
-    }
-    else
-    {
-        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-            hidden_shared[i] = h[i];
-    }
-    __syncthreads();
-
-    const int lane = threadIdx.x % warpSize;
-    const int warp_id = threadIdx.x / warpSize;
-    if (warp_id >= kGateLogitsExpertsPerBlock)
-        return;
-
-    const int expert = blockIdx.x * kGateLogitsExpertsPerBlock + warp_id;
-    if (expert >= num_experts)
-        return;
-
-    const float *w = gate_weights + static_cast<size_t>(expert) * d_model;
-    float sum = 0.0f;
-
-    if (use_vec4)
-    {
-        const int vec_count = d_model >> 2;
-        const float4 *hidden4 = reinterpret_cast<const float4 *>(hidden_shared);
-        const float4 *w4 = reinterpret_cast<const float4 *>(w);
-        for (int i = lane; i < vec_count; i += warpSize)
-        {
-            const float4 hh = hidden4[i];
-            const float4 ww = w4[i];
-            sum += hh.x * ww.x + hh.y * ww.y + hh.z * ww.z + hh.w * ww.w;
-        }
-    }
-    else
-    {
-        for (int i = lane; i < d_model; i += warpSize)
-            sum += hidden_shared[i] * w[i];
-    }
-
-    sum = rocm_moe_wave_reduce_sum_f32(sum);
-
-    if (lane == 0)
-        logits[static_cast<size_t>(row) * num_experts + expert] = sum;
-}
-
-template <typename GateWeightT>
-__global__ void rocm_moe_gate_logits_small_m_mixed_weights_kernel(
-    const float *__restrict__ hidden,              // [seq_len, d_model]
-    const GateWeightT *__restrict__ gate_weights,  // [num_experts, d_model]
-    float *__restrict__ logits,                    // [seq_len, num_experts]
-    int seq_len, int d_model, int num_experts)
-{
-    extern __shared__ float hidden_shared[];
-
-    const int row = blockIdx.y;
-    if (row >= seq_len) return;
-
-    const float *h = hidden + static_cast<size_t>(row) * d_model;
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-        hidden_shared[i] = h[i];
-    __syncthreads();
-
-    const int lane = threadIdx.x % warpSize;
-    const int warp_id = threadIdx.x / warpSize;
-    if (warp_id >= kGateLogitsExpertsPerBlock)
-        return;
-
-    const int expert = blockIdx.x * kGateLogitsExpertsPerBlock + warp_id;
-    if (expert >= num_experts)
-        return;
-
-    const GateWeightT *w =
-        gate_weights + static_cast<size_t>(expert) * d_model;
-    float sum = 0.0f;
-    for (int i = lane; i < d_model; i += warpSize)
-        sum += hidden_shared[i] * route_weight_to_float(w[i]);
-
-    sum = rocm_moe_wave_reduce_sum_f32(sum);
-
-    if (lane == 0)
-        logits[static_cast<size_t>(row) * num_experts + expert] = sum;
-}
-
 __global__ void rocm_moe_gate_logits_single_token_kpart_kernel(
     const float *__restrict__ hidden,       // [d_model]
     const float *__restrict__ gate_weights, // [num_experts, d_model]
@@ -7745,9 +7640,9 @@ __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
 }
 
 /**
- * @brief Quantize every verifier hidden row with serial Q8 decode scales.
+ * @brief Quantize every active prefill row with serial Q8 decode scales.
  *
- * The grid is `[blocks_per_row, verifier_row]`; each HIP block computes the
+ * The grid is `[blocks_per_row, row]`; each HIP block computes the
  * exact same 32-column scale and int8 payload that the serial one-row router
  * would have produced for that row.  Keeping this row-local quantization is the
  * key serial-equivalence constraint before the grouped Q8 logits kernel below
@@ -7758,14 +7653,18 @@ __global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
     int8_t *__restrict__ hidden_q8,
     float *__restrict__ hidden_scales,
     int seq_len,
-    int d_model)
+    int d_model,
+    const int *__restrict__ device_effective_seq_len)
 {
     constexpr int BLOCK_SIZE = 32;
     const int block_idx = blockIdx.x;
     const int row = blockIdx.y;
     const int lane = threadIdx.x;
     const int k = block_idx * BLOCK_SIZE + lane;
-    if (row >= seq_len || lane >= BLOCK_SIZE || k >= d_model) return;
+    const int active_rows = device_effective_seq_len
+                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                : seq_len;
+    if (row >= active_rows || lane >= BLOCK_SIZE || k >= d_model) return;
 
     const int blocks_per_row = d_model / BLOCK_SIZE;
     const size_t row_offset = static_cast<size_t>(row) * static_cast<size_t>(d_model);
@@ -7788,15 +7687,16 @@ __global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
 }
 
 /**
- * @brief Economical grouped Q8 router logits for verifier rows.
+ * @brief Economical grouped Q8 router logits for arbitrary prefill rows.
  *
- * One block owns one expert and accumulates up to four row logits.  Gate Q8
- * payload and scales are loaded once per K block and reused for every verifier
- * row, while each row keeps the same K traversal and reduction order as serial
- * decode.  This is the grouped production primitive the verifier route calls;
- * row replay remains only in diagnostic test oracles.
+ * One block owns one expert and a fixed tile of up to sixteen rows. Gate Q8 payload
+ * and scales are loaded once per K block and reused inside that tile, while each
+ * row keeps the same K traversal and reduction order as serial decode. Larger
+ * prefill buckets add independent row tiles in `grid.y`; they never change a
+ * row's numerical reduction shape.
  */
-__global__ void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
+__global__ __launch_bounds__(64, 4)
+void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
     const int8_t *__restrict__ hidden_q8,
     const float *__restrict__ hidden_scales,
     const int8_t *__restrict__ gate_weights_q8,
@@ -7804,14 +7704,23 @@ __global__ void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
     float *__restrict__ logits,
     int seq_len,
     int d_model,
-    int num_experts)
+    int num_experts,
+    const int *__restrict__ device_effective_seq_len)
 {
     constexpr int BLOCK_SIZE = 32;
+    constexpr int ROWS_PER_BLOCK = 16;
     const int expert = blockIdx.x;
     if (expert >= num_experts) return;
 
+    const int active_rows = device_effective_seq_len
+                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                : seq_len;
+    const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
+    const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
+    if (rows_in_block <= 0) return;
+
     const int blocks_per_row = d_model / BLOCK_SIZE;
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sums[ROWS_PER_BLOCK] = {};
     for (int block_idx = threadIdx.x; block_idx < blocks_per_row; block_idx += blockDim.x)
     {
         const size_t scale_idx = static_cast<size_t>(expert) * blocks_per_row + block_idx;
@@ -7825,8 +7734,9 @@ __global__ void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
             w_values[group] = w4[group];
         }
 
-        for (int row = 0; row < seq_len; ++row)
+        for (int local_row = 0; local_row < rows_in_block; ++local_row)
         {
+            const int row = row_base + local_row;
             const int8_t *row_hidden =
                 hidden_q8 + static_cast<size_t>(row) * static_cast<size_t>(d_model);
             const float *row_scales =
@@ -7839,29 +7749,31 @@ __global__ void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
             {
                 block_acc = __builtin_amdgcn_sdot4(h4[group], w_values[group], block_acc, false);
             }
-            sums[row] += static_cast<float>(block_acc) * row_scales[block_idx] * gate_scale;
+            sums[local_row] +=
+                static_cast<float>(block_acc) * row_scales[block_idx] * gate_scale;
         }
     }
 
-    __shared__ float warp_sums[4][8];
+    __shared__ float warp_sums[ROWS_PER_BLOCK][8];
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int row = 0; row < seq_len; ++row)
+    for (int local_row = 0; local_row < rows_in_block; ++local_row)
     {
-        float reduced = rocm_moe_wave_reduce_sum_f32(sums[row]);
-        if (lane == 0) warp_sums[row][warp_id] = reduced;
+        float reduced = rocm_moe_wave_reduce_sum_f32(sums[local_row]);
+        if (lane == 0) warp_sums[local_row][warp_id] = reduced;
     }
     __syncthreads();
 
     if (warp_id == 0)
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        for (int row = 0; row < seq_len; ++row)
+        for (int local_row = 0; local_row < rows_in_block; ++local_row)
         {
-            float reduced = (lane < nw) ? warp_sums[row][lane] : 0.0f;
+            float reduced = (lane < nw) ? warp_sums[local_row][lane] : 0.0f;
             reduced = rocm_moe_wave_reduce_sum_f32(reduced);
             if (lane == 0)
             {
+                const int row = row_base + local_row;
                 logits[static_cast<size_t>(row) * num_experts + expert] = reduced;
             }
         }
@@ -7951,26 +7863,37 @@ __global__ void rocm_moe_gate_logits_single_token_bf16_weights_kernel(
 }
 
 /**
- * @brief Decode-equivalent grouped FP32 router logits for verifier rows.
+ * @brief Decode-equivalent grouped FP32 router logits for prefill rows.
  *
- * One HIP block owns one expert and computes all MTP verifier rows for that
- * expert.  Gate values are loaded once per K position and reused across rows,
- * but each row keeps the exact vectorized loop and wave/block reduction shape
- * used by rocm_moe_gate_logits_single_token_kernel().
+ * One HIP block owns one expert and a fixed sixteen-row tile. Gate values are
+ * loaded once per K position and reused inside the tile, but each row keeps the
+ * exact vectorized loop and wave/block reduction shape used by
+ * rocm_moe_gate_logits_single_token_kernel(). Additional prefill rows add
+ * independent `grid.y` tiles rather than changing the reduction tree.
  */
-__global__ void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
+__global__ __launch_bounds__(128, 2)
+void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
     const float *__restrict__ hidden,
     const float *__restrict__ gate_weights,
     float *__restrict__ logits,
     int seq_len,
     int d_model,
-    int num_experts)
+    int num_experts,
+    const int *__restrict__ device_effective_seq_len)
 {
+    constexpr int ROWS_PER_BLOCK = 16;
     const int expert = blockIdx.x;
     if (expert >= num_experts) return;
 
+    const int active_rows = device_effective_seq_len
+                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                : seq_len;
+    const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
+    const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
+    if (rows_in_block <= 0) return;
+
     const float *w = gate_weights + static_cast<size_t>(expert) * d_model;
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sums[ROWS_PER_BLOCK] = {};
 
     if ((d_model & 3) == 0)
     {
@@ -7979,14 +7902,14 @@ __global__ void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
         for (int i = threadIdx.x; i < vec_count; i += blockDim.x)
         {
             const float4 ww = w4[i];
-            const int h = i << 2;
-            for (int row = 0; row < seq_len; ++row)
+            for (int local_row = 0; local_row < rows_in_block; ++local_row)
             {
+                const int row = row_base + local_row;
                 const float4 hh =
                     reinterpret_cast<const float4 *>(hidden + static_cast<size_t>(row) * d_model)[i];
-                sums[row] += hh.x * ww.x + hh.y * ww.y + hh.z * ww.z + hh.w * ww.w;
+                sums[local_row] +=
+                    hh.x * ww.x + hh.y * ww.y + hh.z * ww.z + hh.w * ww.w;
             }
-            (void)h;
         }
     }
     else
@@ -7994,54 +7917,70 @@ __global__ void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
         for (int i = threadIdx.x; i < d_model; i += blockDim.x)
         {
             const float ww = w[i];
-            for (int row = 0; row < seq_len; ++row)
-                sums[row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+            for (int local_row = 0; local_row < rows_in_block; ++local_row)
+            {
+                const int row = row_base + local_row;
+                sums[local_row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+            }
         }
     }
 
-    __shared__ float warp_sums[4][8];
+    __shared__ float warp_sums[ROWS_PER_BLOCK][8];
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int row = 0; row < seq_len; ++row)
+    for (int local_row = 0; local_row < rows_in_block; ++local_row)
     {
-        float reduced = rocm_moe_wave_reduce_sum_f32(sums[row]);
-        if (lane == 0) warp_sums[row][warp_id] = reduced;
+        float reduced = rocm_moe_wave_reduce_sum_f32(sums[local_row]);
+        if (lane == 0) warp_sums[local_row][warp_id] = reduced;
     }
     __syncthreads();
 
     if (warp_id == 0)
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        for (int row = 0; row < seq_len; ++row)
+        for (int local_row = 0; local_row < rows_in_block; ++local_row)
         {
-            float reduced = (lane < nw) ? warp_sums[row][lane] : 0.0f;
+            float reduced = (lane < nw) ? warp_sums[local_row][lane] : 0.0f;
             reduced = rocm_moe_wave_reduce_sum_f32(reduced);
             if (lane == 0)
+            {
+                const int row = row_base + local_row;
                 logits[static_cast<size_t>(row) * num_experts + expert] = reduced;
+            }
         }
     }
 }
 
 /**
- * @brief Decode-equivalent grouped FP16-router logits for verifier rows.
+ * @brief Decode-equivalent grouped FP16-router logits for prefill rows.
  *
  * Mirrors rocm_moe_gate_logits_single_token_fp16_weights_kernel() per row,
  * including the half2 loop for even K, while sharing each gate load across the
- * verifier rows handled by the expert-owned block.
+ * sixteen-row tile handled by the expert-owned block.
  */
-__global__ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
+__global__ __launch_bounds__(128, 2)
+void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
     const float *__restrict__ hidden,
     const __half *__restrict__ gate_weights,
     float *__restrict__ logits,
     int seq_len,
     int d_model,
-    int num_experts)
+    int num_experts,
+    const int *__restrict__ device_effective_seq_len)
 {
+    constexpr int ROWS_PER_BLOCK = 16;
     const int expert = blockIdx.x;
     if (expert >= num_experts) return;
 
+    const int active_rows = device_effective_seq_len
+                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                : seq_len;
+    const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
+    const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
+    if (rows_in_block <= 0) return;
+
     const __half *w = gate_weights + static_cast<size_t>(expert) * d_model;
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sums[ROWS_PER_BLOCK] = {};
 
     if ((d_model & 1) == 0)
     {
@@ -8051,10 +7990,11 @@ __global__ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
         {
             const float2 ww = __half22float2(w2[i]);
             const int h = i << 1;
-            for (int row = 0; row < seq_len; ++row)
+            for (int local_row = 0; local_row < rows_in_block; ++local_row)
             {
+                const int row = row_base + local_row;
                 const float *row_hidden = hidden + static_cast<size_t>(row) * d_model;
-                sums[row] += row_hidden[h] * ww.x + row_hidden[h + 1] * ww.y;
+                sums[local_row] += row_hidden[h] * ww.x + row_hidden[h + 1] * ww.y;
             }
         }
     }
@@ -8063,76 +8003,98 @@ __global__ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
         for (int i = threadIdx.x; i < d_model; i += blockDim.x)
         {
             const float ww = __half2float(w[i]);
-            for (int row = 0; row < seq_len; ++row)
-                sums[row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+            for (int local_row = 0; local_row < rows_in_block; ++local_row)
+            {
+                const int row = row_base + local_row;
+                sums[local_row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+            }
         }
     }
 
-    __shared__ float warp_sums[4][8];
+    __shared__ float warp_sums[ROWS_PER_BLOCK][8];
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int row = 0; row < seq_len; ++row)
+    for (int local_row = 0; local_row < rows_in_block; ++local_row)
     {
-        float reduced = rocm_moe_wave_reduce_sum_f32(sums[row]);
-        if (lane == 0) warp_sums[row][warp_id] = reduced;
+        float reduced = rocm_moe_wave_reduce_sum_f32(sums[local_row]);
+        if (lane == 0) warp_sums[local_row][warp_id] = reduced;
     }
     __syncthreads();
 
     if (warp_id == 0)
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        for (int row = 0; row < seq_len; ++row)
+        for (int local_row = 0; local_row < rows_in_block; ++local_row)
         {
-            float reduced = (lane < nw) ? warp_sums[row][lane] : 0.0f;
+            float reduced = (lane < nw) ? warp_sums[local_row][lane] : 0.0f;
             reduced = rocm_moe_wave_reduce_sum_f32(reduced);
             if (lane == 0)
+            {
+                const int row = row_base + local_row;
                 logits[static_cast<size_t>(row) * num_experts + expert] = reduced;
+            }
         }
     }
 }
 
 /**
- * @brief Decode-equivalent grouped BF16-router logits for verifier rows.
+ * @brief Decode-equivalent grouped BF16-router logits for prefill rows.
  */
-__global__ void rocm_moe_gate_logits_bf16_grouped_verifier_kernel(
+__global__ __launch_bounds__(128, 2)
+void rocm_moe_gate_logits_bf16_grouped_verifier_kernel(
     const float *__restrict__ hidden,
     const hip_bfloat16 *__restrict__ gate_weights,
     float *__restrict__ logits,
     int seq_len,
     int d_model,
-    int num_experts)
+    int num_experts,
+    const int *__restrict__ device_effective_seq_len)
 {
+    constexpr int ROWS_PER_BLOCK = 16;
     const int expert = blockIdx.x;
     if (expert >= num_experts) return;
 
+    const int active_rows = device_effective_seq_len
+                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                : seq_len;
+    const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
+    const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
+    if (rows_in_block <= 0) return;
+
     const hip_bfloat16 *w = gate_weights + static_cast<size_t>(expert) * d_model;
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sums[ROWS_PER_BLOCK] = {};
     for (int i = threadIdx.x; i < d_model; i += blockDim.x)
     {
         const float ww = static_cast<float>(w[i]);
-        for (int row = 0; row < seq_len; ++row)
-            sums[row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+        for (int local_row = 0; local_row < rows_in_block; ++local_row)
+        {
+            const int row = row_base + local_row;
+            sums[local_row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+        }
     }
 
-    __shared__ float warp_sums[4][8];
+    __shared__ float warp_sums[ROWS_PER_BLOCK][8];
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int row = 0; row < seq_len; ++row)
+    for (int local_row = 0; local_row < rows_in_block; ++local_row)
     {
-        float reduced = rocm_moe_wave_reduce_sum_f32(sums[row]);
-        if (lane == 0) warp_sums[row][warp_id] = reduced;
+        float reduced = rocm_moe_wave_reduce_sum_f32(sums[local_row]);
+        if (lane == 0) warp_sums[local_row][warp_id] = reduced;
     }
     __syncthreads();
 
     if (warp_id == 0)
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        for (int row = 0; row < seq_len; ++row)
+        for (int local_row = 0; local_row < rows_in_block; ++local_row)
         {
-            float reduced = (lane < nw) ? warp_sums[row][lane] : 0.0f;
+            float reduced = (lane < nw) ? warp_sums[local_row][lane] : 0.0f;
             reduced = rocm_moe_wave_reduce_sum_f32(reduced);
             if (lane == 0)
+            {
+                const int row = row_base + local_row;
                 logits[static_cast<size_t>(row) * num_experts + expert] = reduced;
+            }
         }
     }
 }
@@ -8679,7 +8641,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
 }
 
 /**
- * @brief Decode-equivalent softmax/top-k for grouped MTP verifier rows.
+ * @brief Decode-equivalent softmax/top-k for grouped prefill rows.
  *
  * The MTP verifier is allowed to publish grouped rows into live decode state, so
  * its routing weights must be byte-identical to running each row through the
@@ -8693,13 +8655,28 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
     int *__restrict__ expert_indices,                 // [seq_len, top_k] OUT
     float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
     int seq_len, int num_experts, int top_k,
-    bool normalize_weights)
+    bool normalize_weights,
+    const int *__restrict__ device_effective_seq_len)
 {
     const int token = blockIdx.x;
+    const int active_rows = device_effective_seq_len
+                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                : seq_len;
     if (!logits || !expert_indices || !expert_weights ||
         token >= seq_len || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK)
     {
+        return;
+    }
+
+    if (token >= active_rows)
+    {
+        for (int slot = threadIdx.x; slot < top_k; slot += blockDim.x)
+        {
+            const size_t output_slot = static_cast<size_t>(token) * top_k + slot;
+            expert_indices[output_slot] = -1;
+            expert_weights[output_slot] = 0.0f;
+        }
         return;
     }
 
@@ -9091,7 +9068,7 @@ __global__ void rocm_moe_shared_expert_gate_dot_kernel(
     const float *x = input + token * d_model;
 
     /*
-     * MTP verifier rows compare the grouped M=2..4 shared-gate path against
+     * MTP verifier rows compare the grouped runtime-M shared-gate path against
      * serial M=1 decode row replay.  The serial ROCm decode kernel below
      * accumulates four contiguous FP32 products at a time before participating
      * in the block reduction.  Use the same per-lane accumulation order here;
@@ -9388,58 +9365,6 @@ __global__ void rocm_moe_weighted_add_kernel(
     output[idx] += weight * input[idx];
 }
 
-/**
- * @brief Launch the small-M router for FP16/BF16 gate weights.
- *
- * Request-batched MTP verification produces M=2..4 router rows. Those rows need
- * the same dtype support as decode's single-token router, but the C bridge must
- * stay non-templated so host code can link it predictably.
- */
-template <typename GateWeightT>
-bool launch_gate_logits_small_m_mixed_weights(
-    const float *hidden, const void *gate_weights, float *logits,
-    int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream,
-    const char *label)
-{
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    if (!stream || !hidden || !gate_weights || !logits ||
-        seq_len < 2 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
-    {
-        fprintf(stderr, "HIP MoE %s invalid arguments\n", label);
-        return false;
-    }
-
-    constexpr size_t kSmallMGroupedSharedCapBytes = 48 * 1024;
-    const size_t shared_mem_bytes = static_cast<size_t>(d_model) * sizeof(float);
-    if (shared_mem_bytes > kSmallMGroupedSharedCapBytes)
-    {
-        fprintf(stderr, "HIP MoE %s shared memory too large: requested=%zu cap=%zu\n",
-                label, shared_mem_bytes, kSmallMGroupedSharedCapBytes);
-        return false;
-    }
-
-    const int blocks =
-        (num_experts + kGateLogitsExpertsPerBlock - 1) /
-        kGateLogitsExpertsPerBlock;
-    hipLaunchKernelGGL(rocm_moe_gate_logits_small_m_mixed_weights_kernel<GateWeightT>,
-        dim3(blocks, seq_len), dim3(kGateLogitsGroupedThreads), shared_mem_bytes,
-        static_cast<hipStream_t>(stream),
-        hidden, static_cast<const GateWeightT *>(gate_weights), logits,
-        seq_len, d_model, num_experts);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE %s kernel launch failed: %s\n",
-                label, hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
 // =========================================================================
 // Extern "C" bridge functions — called from ROCmMoEKernel.cpp
 // =========================================================================
@@ -9467,67 +9392,6 @@ bool hipMoE_gate_logits_single_token(
         return false;
     }
     return true;
-}
-
-bool hipMoE_gate_logits_small_m(
-    const float *hidden, const float *gate_weights, float *logits,
-    int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
-{
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    if (!stream || !hidden || !gate_weights || !logits ||
-        seq_len < 2 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
-    {
-        fprintf(stderr, "HIP MoE gate_logits_small_m invalid arguments\n");
-        return false;
-    }
-
-    constexpr size_t kSmallMGroupedSharedCapBytes = 48 * 1024;
-    const size_t shared_mem_bytes = static_cast<size_t>(d_model) * sizeof(float);
-    if (shared_mem_bytes > kSmallMGroupedSharedCapBytes)
-    {
-        fprintf(stderr, "HIP MoE gate_logits_small_m shared memory too large: requested=%zu cap=%zu\n",
-                shared_mem_bytes, kSmallMGroupedSharedCapBytes);
-        return false;
-    }
-
-    const bool use_vec4 = ((d_model & 3) == 0) &&
-                          ((reinterpret_cast<uintptr_t>(hidden) & 0xfu) == 0) &&
-                          ((reinterpret_cast<uintptr_t>(gate_weights) & 0xfu) == 0);
-    const int blocks = (num_experts + kGateLogitsExpertsPerBlock - 1) / kGateLogitsExpertsPerBlock;
-    hipLaunchKernelGGL(rocm_moe_gate_logits_small_m_kernel,
-        dim3(blocks, seq_len), dim3(kGateLogitsGroupedThreads), shared_mem_bytes, static_cast<hipStream_t>(stream),
-        hidden, gate_weights, logits, seq_len, d_model, num_experts, use_vec4);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE gate_logits_small_m kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
-bool hipMoE_gate_logits_small_m_fp16_weights(
-    const float *hidden, const void *gate_weights_fp16, float *logits,
-    int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
-{
-    return launch_gate_logits_small_m_mixed_weights<__half>(
-        hidden, gate_weights_fp16, logits, seq_len, d_model, num_experts,
-        device_idx, stream, "gate_logits_small_m_fp16_weights");
-}
-
-bool hipMoE_gate_logits_small_m_bf16_weights(
-    const float *hidden, const void *gate_weights_bf16, float *logits,
-    int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
-{
-    return launch_gate_logits_small_m_mixed_weights<hip_bfloat16>(
-        hidden, gate_weights_bf16, logits, seq_len, d_model, num_experts,
-        device_idx, stream, "gate_logits_small_m_bf16_weights");
 }
 
 bool hipMoE_gate_logits_single_token_kpart(
@@ -9696,22 +9560,26 @@ bool hipMoE_gate_logits_single_token_bf16_weights(
 bool hipMoE_gate_logits_fp32_decode_equivalent_rows(
     const float *hidden, const float *gate_weights, float *logits,
     int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
 {
     if (!hidden || !gate_weights || !logits || !stream ||
-        seq_len <= 0 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
+        seq_len <= 0 || d_model <= 0 || num_experts <= 0)
     {
-        fprintf(stderr, "HIP MoE FP32 grouped verifier gate logits invalid args\n");
+        fprintf(stderr, "HIP MoE FP32 batch-invariant grouped gate logits invalid args\n");
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
+    constexpr int rows_per_block = 16;
     const int threads = 128;
     hipLaunchKernelGGL(rocm_moe_gate_logits_fp32_grouped_verifier_kernel,
-        dim3(num_experts), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        hidden, gate_weights, logits, seq_len, d_model, num_experts);
+        dim3(num_experts, (seq_len + rows_per_block - 1) / rows_per_block),
+        dim3(threads), 0, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, logits, seq_len, d_model, num_experts,
+        device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -9726,23 +9594,26 @@ bool hipMoE_gate_logits_fp32_decode_equivalent_rows(
 bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
     const float *hidden, const void *gate_weights_fp16, float *logits,
     int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
 {
     if (!hidden || !gate_weights_fp16 || !logits || !stream ||
-        seq_len <= 0 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
+        seq_len <= 0 || d_model <= 0 || num_experts <= 0)
     {
-        fprintf(stderr, "HIP MoE FP16 grouped verifier gate logits invalid args\n");
+        fprintf(stderr, "HIP MoE FP16 batch-invariant grouped gate logits invalid args\n");
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
+    constexpr int rows_per_block = 16;
     const int threads = 128;
     hipLaunchKernelGGL(rocm_moe_gate_logits_fp16_grouped_verifier_kernel,
-        dim3(num_experts), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        dim3(num_experts, (seq_len + rows_per_block - 1) / rows_per_block),
+        dim3(threads), 0, static_cast<hipStream_t>(stream),
         hidden, static_cast<const __half *>(gate_weights_fp16), logits,
-        seq_len, d_model, num_experts);
+        seq_len, d_model, num_experts, device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -9757,23 +9628,26 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
 bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
     const float *hidden, const void *gate_weights_bf16, float *logits,
     int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
 {
     if (!hidden || !gate_weights_bf16 || !logits || !stream ||
-        seq_len <= 0 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
+        seq_len <= 0 || d_model <= 0 || num_experts <= 0)
     {
-        fprintf(stderr, "HIP MoE BF16 grouped verifier gate logits invalid args\n");
+        fprintf(stderr, "HIP MoE BF16 batch-invariant grouped gate logits invalid args\n");
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
+    constexpr int rows_per_block = 16;
     const int threads = 128;
     hipLaunchKernelGGL(rocm_moe_gate_logits_bf16_grouped_verifier_kernel,
-        dim3(num_experts), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        dim3(num_experts, (seq_len + rows_per_block - 1) / rows_per_block),
+        dim3(threads), 0, static_cast<hipStream_t>(stream),
         hidden, static_cast<const hip_bfloat16 *>(gate_weights_bf16), logits,
-        seq_len, d_model, num_experts);
+        seq_len, d_model, num_experts, device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -9859,7 +9733,7 @@ bool hipMoE_gate_logits_single_token_q8_weights(
 }
 
 /**
- * @brief Grouped Q8 router logits for MTP verifier rows.
+ * @brief Grouped Q8 router logits for batch-invariant prefill rows.
  *
  * This is intentionally decode-equivalent rather than a generic prefill GEMM:
  * each hidden row is quantized independently with serial decode's block scales,
@@ -9869,13 +9743,14 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     const float *hidden, int8_t *hidden_q8, float *hidden_scales,
     const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
     int seq_len, int d_model, int num_experts,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
 {
     if (!hidden || !hidden_q8 || !hidden_scales || !gate_weights_q8 || !gate_scales || !logits ||
-        !stream || seq_len <= 0 || seq_len > 4 ||
+        !stream || seq_len <= 0 ||
         d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
     {
-        fprintf(stderr, "HIP MoE Q8 grouped verifier gate logits invalid args\n");
+        fprintf(stderr, "HIP MoE Q8 batch-invariant grouped gate logits invalid args\n");
         return false;
     }
 
@@ -9886,7 +9761,8 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     const int blocks_per_row = d_model / 32;
     hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
         dim3(blocks_per_row, seq_len), dim3(32), 0, hip_stream,
-        hidden, hidden_q8, hidden_scales, seq_len, d_model);
+        hidden, hidden_q8, hidden_scales, seq_len, d_model,
+        device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -9896,11 +9772,12 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
         return false;
     }
 
-    const int threads = 128;
+    constexpr int rows_per_block = 16;
     hipLaunchKernelGGL(rocm_moe_gate_logits_q8_grouped_verifier_kernel,
-        dim3(num_experts), dim3(threads), 0, hip_stream,
+        dim3(num_experts, (seq_len + rows_per_block - 1) / rows_per_block),
+        dim3(64), 0, hip_stream,
         hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits,
-        seq_len, d_model, num_experts);
+        seq_len, d_model, num_experts, device_effective_seq_len);
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -10130,13 +10007,14 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
     int *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
     if (!logits || !expert_indices || !expert_weights || !stream ||
-        seq_len <= 0 || seq_len > 4 ||
+        seq_len <= 0 ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts)
     {
@@ -10148,7 +10026,8 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
     hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_equivalent_rows_kernel,
         dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
         logits, expert_indices, expert_weights,
-        seq_len, num_experts, top_k, normalize_weights);
+        seq_len, num_experts, top_k, normalize_weights,
+        device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

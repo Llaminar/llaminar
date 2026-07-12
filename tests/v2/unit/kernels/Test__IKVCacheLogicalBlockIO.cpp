@@ -6,6 +6,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
+#include "../../utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -280,7 +281,7 @@ namespace
         {
             for (bool source_head_major : {false, true})
             {
-                for (int verifier_rows : {2, 3, 4})
+                for (int verifier_rows : test::kGroupedVerifierRuntimeRows)
                 {
                     SCOPED_TRACE(std::string(format_label) +
                                  " M=" + std::to_string(verifier_rows) +
@@ -675,7 +676,7 @@ TEST(Test__IKVCacheLogicalBlockIO, Q16HeadMajorGroupedVerifierAppendMatchesSeria
  * appendVerifierRowsDecodeEquivalent() call and must publish identical raw
  * cache bytes and ring metadata.
  */
-TEST(Test__IKVCacheLogicalBlockIO, AllCPUFormatsGroupedVerifierAppendM234MatchesSerialDecodeBytes)
+TEST(Test__IKVCacheLogicalBlockIO, AllCPUFormatsGroupedVerifierAppendRuntimeMMatchesSerialDecodeBytes)
 {
     ScopedPerfStats perfstats;
 

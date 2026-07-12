@@ -180,7 +180,7 @@ namespace llaminar2
              *
              * The current ROCm graph pipeline keeps gate/up activations and
              * down outputs in FP32.  This method provides the missing
-             * FP32/FP16/BF16 floating down path for M=1..4 without routing
+             * FP32/FP16/BF16 floating down path for runtime M without routing
              * through hipBLAS or materializing an intermediate SwiGLU tensor.
              */
             bool multiply_tensor_with_fused_swiglu(
@@ -194,7 +194,7 @@ namespace llaminar2
             /**
              * @brief Grouped verifier SwiGLU/down with serial-decode math order.
              *
-             * Rows M=1..4 are evaluated by one explicit-stream HIP kernel.  The
+             * Runtime rows are evaluated by one explicit-stream HIP kernel. The
              * grouped verifier call and the one-row decode call therefore share
              * the same K traversal, 16-bit conversion points, and reduction tree.
              */

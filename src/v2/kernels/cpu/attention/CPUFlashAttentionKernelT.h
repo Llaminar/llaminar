@@ -990,7 +990,7 @@ namespace llaminar2
             }
 
             if (!Q || !K || !V || !output ||
-                verifier_rows < 2 || verifier_rows > 4 ||
+                verifier_rows < 2 ||
                 kv_len <= verifier_rows ||
                 n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
                 !causal)

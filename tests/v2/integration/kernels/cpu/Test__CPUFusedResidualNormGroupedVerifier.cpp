@@ -6,7 +6,7 @@
  * so proving ResidualAdd and RMSNorm separately is insufficient. This suite enters
  * the production stage itself and compares both mutable outputs - the updated
  * residual stream and normalized activation - with independent production M=1
- * executions. FP32, BF16, and FP16 are swept at M=2..4 and at widths that cover
+ * executions. FP32, BF16, and FP16 are swept across runtime M and at widths that cover
  * small per-head reductions and real hidden-state reductions.
  */
 
@@ -18,6 +18,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -194,7 +195,7 @@ namespace
     }
 
     /**
-     * @brief Sweep one CPU native format over M=2..4 and two reduction widths.
+     * @brief Sweep one CPU native format over runtime M and two reduction widths.
      *
      * Each serial row begins from the exact native grouped input/residual bytes.
      * The grouped call is then made once over the full M-row tensors. Both stage
@@ -207,20 +208,21 @@ namespace
         const char *implementation)
     {
         constexpr std::array<int, 2> column_counts = {128, 4096};
+        constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
         constexpr const char *counter_name =
             "cpu_fused_residual_rmsnorm_grouped_verifier_rows_calls";
 
         for (int cols : column_counts)
         {
             const auto input_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0xF0010000u ^ static_cast<uint32_t>(cols));
             const auto residual_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0xF0020000u ^ static_cast<uint32_t>(cols));
             const auto gamma_values = makeGamma(static_cast<size_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : test::kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string("CPU format=") + format_label +

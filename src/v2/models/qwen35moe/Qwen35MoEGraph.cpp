@@ -2572,7 +2572,7 @@ namespace llaminar2
          * verifier is stateful: its row logits must match serial decode and the
          * accepted row may later publish KV/GDN/conv state.  The verifier path
          * treats M=1 as a real verifier bucket, but M=1 has no batching economy:
-         * it uses the explicit decode-equivalent oracle while M=2..4 GPU rows use
+         * it uses the explicit decode-equivalent oracle while multi-row GPU verifier batches use
          * the grouped-prefill machinery.  The router still emits serial-decode
          * top-k rows, and the shared expert uses GEMV verifier-row hooks rather
          * than the older MoE grouped prefill helper.
@@ -2581,14 +2581,12 @@ namespace llaminar2
         {
             return (candidate.is_cuda() || candidate.is_rocm()) &&
                    total_tokens > 1 &&
-                   total_tokens <= 4 &&
                    mtp_sidecar_context;
         };
         auto forceGpuSmallMMainVerifierPrefill = [&](DeviceId candidate)
         {
             return (candidate.is_cuda() || candidate.is_rocm()) &&
                    total_tokens > 1 &&
-                   total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
@@ -2602,7 +2600,7 @@ namespace llaminar2
             /*
              * The main verifier compares grouped all-position rows against
              * serial decode rows.  GPU M=1 has no grouped economy to recover,
-             * so it stays on ordinary production decode routing.  GPU M=2..4
+             * so it stays on ordinary production decode routing. Multi-row GPU verifier batches
              * still uses the decode-equivalent grouped router so the economical
              * expert kernels receive exactly the serial top-k rows.
             */
@@ -2610,7 +2608,6 @@ namespace llaminar2
                 (candidate.is_cuda() || candidate.is_rocm()) && total_tokens > 1;
             return (candidate.is_cpu() || gpu_grouped_verifier_rows) &&
                    total_tokens >= 1 &&
-                   total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
@@ -2618,7 +2615,6 @@ namespace llaminar2
         {
             return candidate.is_cpu() &&
                    total_tokens >= 1 &&
-                   total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
@@ -5213,7 +5209,7 @@ namespace llaminar2
              * not a separate dense GEMM oracle.  GPU serial decode uses the MoE
              * grouped table-decode helpers for the always-active shared expert,
              * so verifier-sized GPU batches use the sibling grouped table-prefill
-             * route.  This keeps M=2..4 economical while preserving the exact
+             * route. This keeps runtime-M verifier execution economical while preserving the exact
              * descriptor family, split-K layout, and reduction order exercised
              * by production M=1 decode.
              */
@@ -5273,8 +5269,7 @@ namespace llaminar2
             const bool main_verifier_rows =
                 !mtp_sidecar_context &&
                 config_.compute_all_position_logits &&
-                total_tokens >= 1 &&
-                total_tokens <= 4;
+                total_tokens >= 1;
             /*
              * The accepted shared-verifier routes own their branch-local math:
              * CUDA and ROCm use the grouped table-prefill verifier route. Any route

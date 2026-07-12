@@ -487,12 +487,6 @@ namespace llaminar2
     {
         if (!A_base || !C_base || !gemm)
             return false;
-        if (params_.m > 4)
-        {
-            LOG_ERROR("[GEMMStage] Decode-equivalent verifier prefill is only supported "
-                      << "for tiny MTP verifier batches, got m=" << params_.m);
-            return false;
-        }
         if (params_.alpha != 1.0f || params_.beta != 0.0f)
         {
             LOG_ERROR("[GEMMStage] Grouped verifier GEMM supports alpha=1,beta=0 only; got alpha="

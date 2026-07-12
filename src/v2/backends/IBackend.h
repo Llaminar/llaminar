@@ -1655,7 +1655,8 @@ namespace llaminar2
          * output tokens plus a small integer metadata table. Stop tokens are
          * host-side scalars copied into kernel arguments by backend wrappers;
          * the kernel never dereferences host memory. Requires an explicit
-         * non-null stream.
+         * non-null stream. `out_token_capacity` is the request stride and is
+         * initialized in full so unused output slots remain deterministic.
          */
         virtual bool enqueueSummarizeSpeculativeVerifyBatch(
             const void *verify_tokens_device,
@@ -1668,6 +1669,7 @@ namespace llaminar2
             bool has_bonus_token,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device)
         {
@@ -1681,6 +1683,7 @@ namespace llaminar2
             (void)has_bonus_token;
             (void)device_id;
             (void)stream;
+            (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
             return false;
@@ -1710,6 +1713,7 @@ namespace llaminar2
             bool has_bonus_token,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device)
         {
@@ -1723,6 +1727,7 @@ namespace llaminar2
             (void)has_bonus_token;
             (void)device_id;
             (void)stream;
+            (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
             return false;
@@ -1758,6 +1763,7 @@ namespace llaminar2
             int stop_token_count,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device)
         {
@@ -1769,6 +1775,7 @@ namespace llaminar2
             (void)stop_token_count;
             (void)device_id;
             (void)stream;
+            (void)out_token_capacity;
             (void)out_tokens_device;
             (void)out_meta_device;
             return false;

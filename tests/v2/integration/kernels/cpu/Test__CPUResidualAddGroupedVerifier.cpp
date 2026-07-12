@@ -5,7 +5,7 @@
  * Residual addition is row-independent, so the economical CPU implementation
  * is one flat OpenMP workshare over all active verifier values. This suite
  * compares FP32, BF16, and FP16 native output bytes against production M=1
- * decode at M=2..4 and requires exactly one grouped workshare counter.
+ * decode across the runtime-M inventory and requires exactly one grouped workshare counter.
  */
 
 #include <gtest/gtest.h>
@@ -15,6 +15,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -163,19 +164,20 @@ namespace
     void runNativeFormat(const char *format_label)
     {
         constexpr std::array<int, 2> column_counts = {128, 4096};
+        constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
         constexpr const char *counter_name =
             "cpu_residual_add_grouped_verifier_rows_calls";
 
         for (int cols : column_counts)
         {
             const auto input_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x13570000u ^ static_cast<uint32_t>(cols));
             const auto residual_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x24680000u ^ static_cast<uint32_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : test::kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string("CPU format=") + format_label +

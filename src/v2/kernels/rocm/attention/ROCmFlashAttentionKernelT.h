@@ -475,12 +475,14 @@ namespace llaminar2
             void setDynamicAttnParams(int kv_len, int position_offset) override;
             void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
             bool prepareDynamicAttnParams(
-                int kv_len, int position_offset, int query_rows, void *stream) override;
+                int kv_len, int position_offset, int query_rows, void *stream,
+                int kv_stride = -1) override;
             bool prepareDynamicAttnParamsFromDeviceSequenceState(
                 const int *post_append_cached_tokens_device,
                 int seq_len,
                 int query_rows,
-                void *stream) override;
+                void *stream,
+                int kv_stride = -1) override;
             void resetDynamicState() override;
 
             // =========================================================================
@@ -563,6 +565,7 @@ namespace llaminar2
             int small_decode_rows_ = 0;
             /// Last explicit geometry associated with the device parameter block.
             int dynamic_attn_kv_len_ = 0;
+            int dynamic_attn_kv_stride_ = 0;
             int dynamic_attn_position_offset_ = 0;
             int dynamic_attn_query_rows_ = 1;
             int dynamic_attn_param_rows_ = 1;
@@ -576,7 +579,11 @@ namespace llaminar2
              * allocates host storage and never records a host-to-device memcpy.
              */
             bool writeDynamicAttnParams(
-                int kv_len, int position_offset, int query_rows, void *stream);
+                int kv_len,
+                int kv_stride,
+                int position_offset,
+                int query_rows,
+                void *stream);
             bool dynamicAttnParamsReady(
                 int kv_len, int position_offset, int query_rows) const;
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);

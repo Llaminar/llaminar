@@ -359,7 +359,6 @@ namespace llaminar2
             int layer,
             int first_seq_idx,
             int request_count,
-            int max_kv_len,
             ITensor **out_k,
             ITensor **out_v,
             void *gpu_stream) override
@@ -377,10 +376,58 @@ namespace llaminar2
                 kv_idx,
                 first_seq_idx,
                 request_count,
-                max_kv_len,
                 out_k,
                 out_v,
                 gpu_stream);
+        }
+
+        /**
+         * @brief Remap a converted resident read to the compressed FA slot.
+         *
+         * RoPE-on-read calls this virtual interface with the graph's global
+         * model-layer id. The parent CUDA ring owns only full-attention layers,
+         * so forwarding that id unchanged can select a different compressed
+         * slot that happens to be numerically in range. Payload pointers,
+         * device head/count metadata, conversion, and grouped RoPE must all use
+         * the same remapped slot established by @ref HybridLayerMap.
+         *
+         * @param layer Global or pipeline-local model layer accepted by this
+         *        hybrid cache.
+         * @param first_seq_idx First independent request bank to materialize.
+         * @param request_count Number of contiguous request banks.
+         * @param target Converted activation precision requested by attention.
+         * @param out_k Receives the fixed-stride resident K view.
+         * @param out_v Receives the fixed-stride resident V view.
+         * @param read Device stream, RoPE geometry, and logical head metadata.
+         * @return true when the global layer is full-attention and the parent
+         *         cache enqueued the converted grouped read.
+         */
+        bool get_kv_batched_converted_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ActivationPrecision target,
+            ITensor **out_k,
+            ITensor **out_v,
+            const typename IKVCache::KVReadParams &read) override
+        {
+            const int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                return false;
+            }
+            return Base::get_kv_batched_converted_device_view(
+                kv_idx,
+                first_seq_idx,
+                request_count,
+                target,
+                out_k,
+                out_v,
+                read);
         }
 
         void clear() override

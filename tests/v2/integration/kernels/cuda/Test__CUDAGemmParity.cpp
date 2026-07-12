@@ -58,6 +58,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 
 #include <vector>
 #include <array>
@@ -468,14 +469,16 @@ namespace
                 ".rank" + std::to_string(rank),
             ModelContextId{static_cast<uint64_t>(81000 + seed + static_cast<uint32_t>(rank))});
 
+        const size_t row_capacity =
+            static_cast<size_t>(kGroupedVerifierRuntimeRows.back());
         auto input = TestTensorFactory::createFP32Random(
-            {4u, static_cast<size_t>(local_K)},
+            {row_capacity, static_cast<size_t>(local_K)},
             -0.75f,
             0.75f,
             seed + 500u + static_cast<uint32_t>(rank * 31));
         fixture.input_rows.assign(
             input->data(),
-            input->data() + static_cast<size_t>(4) * static_cast<size_t>(local_K));
+            input->data() + row_capacity * static_cast<size_t>(local_K));
         return fixture;
     }
 
@@ -1068,7 +1071,7 @@ namespace
                 seed));
         }
 
-        for (const int M : {2, 3, 4})
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
             PerfStatsCollector::reset();
             const double before = groupedVerifierGemmPerfCounterValue();
@@ -1148,14 +1151,16 @@ namespace
                 "." + shape_case.label,
             ModelContextId{static_cast<uint64_t>(91000 + seed)});
 
+        const size_t row_capacity =
+            static_cast<size_t>(kGroupedVerifierRuntimeRows.back());
         auto input = TestTensorFactory::createFP32Random(
-            {4u, static_cast<size_t>(K)},
+            {row_capacity, static_cast<size_t>(K)},
             -0.75f,
             0.75f,
             seed + 700u);
         fixture.input_rows.assign(
             input->data(),
-            input->data() + static_cast<size_t>(4) * static_cast<size_t>(K));
+            input->data() + row_capacity * static_cast<size_t>(K));
         return fixture;
     }
 
@@ -1250,7 +1255,7 @@ namespace
             << "device=" << device.to_string();
 
         auto fixture = makeCudaReplicatedWoFixture(format_case, shape_case, device, seed);
-        for (const int M : {2, 3, 4})
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
             PerfStatsCollector::reset();
             const double before = groupedVerifierGemmPerfCounterValue();
@@ -1481,7 +1486,7 @@ namespace
                 return with_gpu_coherence(gpu_device, {gate_tensor.get(), up_tensor.get()}, {C_tensor.get()},
                                           [&]
                                           {
-                                              if (M > 1 && M <= 4)
+                                              if (M > 1)
                                               {
                                                   return kernel->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                                                       gate_tensor.get(), up_tensor.get(), C_tensor.get(),
@@ -2723,10 +2728,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
         workspace_.get()));
 
     const auto records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls",
-                                      "kernel.cuda_native_vnni_m2_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
     uint64_t specialized_records = 0;
-    uint64_t specialized_m2_records = 0;
     for (const auto &record : records)
     {
         if (record.domain != "kernel" ||
@@ -2744,17 +2747,10 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
         {
             specialized_records += record.count;
         }
-        if (record.name == "cuda_native_vnni_m2_calls" &&
-            record.tags.at("route") == "specialized")
-        {
-            specialized_m2_records += record.count;
-        }
     }
 
     EXPECT_EQ(specialized_records, 1u)
         << "Q4_K M=2 verifier GEMM must use the specialized native-VNNI small-M route";
-    EXPECT_EQ(specialized_m2_records, 1u)
-        << "M=2 verifier GEMM must also emit the M2 route counter for tuning visibility";
 
     PerfStatsCollector::reset();
     cleanupWorkspaceIfNeeded(cuda_kernel);
@@ -2873,10 +2869,11 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs
  * The MoE model stores `ssm_out` as Q6_K. In LocalTP each participant projects
  * its local 2048-value-head slice into the full hidden width, then the graph
  * allreduces those partials.  This test isolates the grouped verifier GEMM used
- * before that allreduce: M=2/3/4 grouped rows must match repeated M=1 decode
- * rows for the exact local shard shape.
+ * before that allreduce. The production-size boundary inventory covers the
+ * smallest grouped depths, the first depth beyond the historical four-row
+ * assumption, the default graph capacity, and an over-capacity runtime probe.
  */
-TEST_F(Test__CUDAGemmParity, Q6_K_Qwen36MoEGDNOutLocalTP_M234MatchesSerialDecodeGEMVs)
+TEST_F(Test__CUDAGemmParity, Q6_K_Qwen36MoEGDNOutLocalTP_RuntimeMMatchesSerialDecodeGEMVs)
 {
     constexpr int N = 2048;
     constexpr int K = 2048;
@@ -2886,7 +2883,7 @@ TEST_F(Test__CUDAGemmParity, Q6_K_Qwen36MoEGDNOutLocalTP_M234MatchesSerialDecode
     auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    for (const int M : {2, 3, 4})
+    for (const int M : kGroupedVerifierBoundaryRows)
     {
         ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K))
             << "workspace for Qwen3.6 MoE GDN out M=" << M;
@@ -4036,18 +4033,16 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MixedCodebooks_M4MatchesFo
  * Dense Qwen3.6 M=4 tests did not cover this shape or codebook, while the
  * production continuation proof failed first around QKV/Z projection before
  * attention and MoE routing amplified the error.  This regression checks the
- * stage-level contract directly for every production verifier depth:
- * grouped M=2/3/4 rows must match repeated M=1 decode-stage rows under tight
- * cosine, relative-L2, max-absolute, and softmax symmetric-KL thresholds.
+ * stage-level contract directly at every important runtime-M boundary. Every
+ * grouped row must match repeated M=1 decode-stage rows byte-for-byte.
  */
-TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialStageRows)
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSerialStageRows)
 {
     constexpr int kK = 2048;
     constexpr int kNQKV = 8192;
     constexpr int kNZ = 4096;
     constexpr int kNAlpha = 32;
     constexpr int kNBeta = 32;
-    constexpr std::array<int, 3> kVerifierRows = {2, 3, 4};
 
     auto weights_qkv = TestTensorFactory::createQ6_KRandom(
         {static_cast<size_t>(kNQKV), static_cast<size_t>(kK)}, 5531);
@@ -4150,7 +4145,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialSt
         kernel_beta->resetDynamicState();
     };
 
-    for (int M : kVerifierRows)
+    for (const int M : kGroupedVerifierBoundaryRows)
     {
         const auto input_data = randomFP32(static_cast<size_t>(M) * kK);
         StageOutputs grouped = make_outputs(M);
@@ -4207,7 +4202,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialSt
  * `[16, 2048]`. This regression prevents the grouped verifier implementation
  * from being correct only for the unsharded GDN tensor geometry.
  */
-TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_M234MatchesSerialStageRows)
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_RuntimeMMatchesSerialStageRows)
 {
     constexpr int kK = 2048;
     constexpr int kNQKV = 6144;
@@ -4331,7 +4326,7 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_M234Mat
             count);
     };
 
-    for (const int M : {2, 3, 4})
+    for (const int M : kGroupedVerifierBoundaryRows)
     {
         const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(kK));
         StageOutputs grouped = make_outputs(M);
@@ -4395,9 +4390,9 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoELocalTPShardQ6K_M234Mat
  * - `ssm_alpha.weight` and `ssm_beta.weight`: FP32 column-parallel per-value
  *   head projections.
  *
- * Each local rank then runs the production `GDNProjectionStage` in grouped
- * verifier mode for M=2/3/4 and compares every grouped row to a separate M=1
- * stage execution with the same rank-local weights.  That is the exact
+ * Each local rank then runs the production `GDNProjectionStage` at the
+ * runtime-M boundary inventory and compares every grouped row to a separate
+ * M=1 stage execution with the same rank-local weights. That is the exact
  * decode-equivalence contract the graph relies on before recurrence, MoE, and
  * LM-head stages consume these rows.
  */
@@ -4574,7 +4569,7 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
             beta_prepared.kernel->resetDynamicState();
         };
 
-        for (const int M : {2, 3, 4})
+        for (const int M : kGroupedVerifierBoundaryRows)
         {
             const auto input_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(kK));
             StageOutputs grouped = make_outputs(M);
@@ -4632,8 +4627,9 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELocalTPGDNProjectionShardGroupedRowsMa
  * compact row-indexed LM head. Synthetic Q6_K tests cover the dispatch family,
  * but they do not prove the production `output.weight` geometry or the GPU
  * upload/repack path. This regression loads the real Q6_K LM head, executes
- * M=2/3/4 rows through the grouped verifier projection API used by
- * LMHeadStage, and compares each row to an ordinary M=1 decode projection.
+ * the runtime-M boundary inventory through the grouped verifier projection API
+ * used by LMHeadStage, and compares each row to an ordinary M=1 decode
+ * projection.
  */
 TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDecodeStrict)
 {
@@ -4669,7 +4665,7 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDe
         ModelContextId{36362});
     ASSERT_NE(prepared.kernel, nullptr);
 
-    for (const int M : {2, 3, 4})
+    for (const int M : kGroupedVerifierBoundaryRows)
     {
         ASSERT_TRUE(setupWorkspaceIfNeeded(prepared.kernel, M, N, K))
             << "workspace for Qwen3.6 MoE LM-head M=" << M;
@@ -4717,12 +4713,11 @@ TEST_F(Test__CUDAGemmParity, RealQwen36MoELMHeadGroupedVerifierRowsMatchSerialDe
     prepared.kernel->setGPUStream(nullptr);
 }
 
-TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
+TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
 {
     const int K = 256;
     const int N0 = 192;
     const int N1 = 128;
-    const std::array<int, 3> verifier_rows = {2, 3, 4};
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -4746,10 +4741,14 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
         ASSERT_NE(cuda_kernel0, nullptr) << fmt.name << " CUDA projection 0 kernel";
         ASSERT_NE(cuda_kernel1, nullptr) << fmt.name << " CUDA projection 1 kernel";
 
-        ASSERT_TRUE(setupSharedWorkspace({cuda_kernel0, cuda_kernel1}, 4, {N0, N1}, K))
+        ASSERT_TRUE(setupSharedWorkspace(
+            {cuda_kernel0, cuda_kernel1},
+            kGroupedVerifierRuntimeRows.back(),
+            {N0, N1},
+            K))
             << fmt.name << " shared workspace";
 
-        for (int M : verifier_rows)
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
             auto A_data = randomFP32(static_cast<size_t>(M) * K);
 
@@ -4894,7 +4893,8 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
             EXPECT_EQ(record.tags.at("projections"), "2");
             const std::string &m_tag = record.tags.at("m");
             const std::string &route_tag = record.tags.at("route");
-            EXPECT_TRUE(m_tag == "2" || m_tag == "3" || m_tag == "4");
+            EXPECT_GE(std::stoi(m_tag), 2);
+            EXPECT_LE(std::stoi(m_tag), kGroupedVerifierRuntimeRows.back());
             EXPECT_EQ(route_tag, "specialized")
                 << "CUDA verifier projections must use the grouped small-M native-VNNI route";
         }
@@ -4906,22 +4906,22 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
             EXPECT_EQ(record.tags.at("k"), std::to_string(K));
             EXPECT_EQ(record.tags.at("projections"), "2");
             const std::string &m_tag = record.tags.at("m");
-            EXPECT_TRUE(m_tag == "2" || m_tag == "3" || m_tag == "4");
+            EXPECT_GE(std::stoi(m_tag), 2);
+            EXPECT_LE(std::stoi(m_tag), kGroupedVerifierRuntimeRows.back());
             EXPECT_GE(std::stoi(record.tags.at("streams")), 2)
                 << "Concurrent CUDA verifier projection groups should use explicit side streams";
         }
     }
-    EXPECT_EQ(total_count, cudaSmallMNativeFormats().size() * verifier_rows.size())
-        << "Every CUDA native format and M=2/3/4 verifier shape should use the fused small-M route";
+    EXPECT_EQ(total_count, cudaSmallMNativeFormats().size() * kGroupedVerifierRuntimeRows.size())
+        << "Every CUDA native format and certified runtime-M verifier shape should use the grouped route";
 
     PerfStatsCollector::reset();
 }
 
-TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_M234MatchesSerialDecodeRows)
+TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows)
 {
     const int K = 256;
     const int N = 48;
-    const std::array<int, 3> verifier_rows = {2, 3, 4};
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -4950,10 +4950,14 @@ TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_M234MatchesSerialDe
     ASSERT_TRUE(cuda_alpha->supports_fused_projection());
     ASSERT_TRUE(cuda_beta->supports_fused_projection());
 
-    ASSERT_TRUE(setupSharedWorkspace({cuda_alpha, cuda_beta}, 4, {N, N}, K))
+    ASSERT_TRUE(setupSharedWorkspace(
+        {cuda_alpha, cuda_beta},
+        kGroupedVerifierRuntimeRows.back(),
+        {N, N},
+        K))
         << "CUDA FP32 grouped verifier workspace";
 
-    for (int M : verifier_rows)
+    for (const int M : kGroupedVerifierRuntimeRows)
     {
         SCOPED_TRACE(std::string("CUDA FP32 M=") + std::to_string(M));
         auto A_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
@@ -5050,18 +5054,19 @@ TEST_F(Test__CUDAGemmParity, MTP_FP32FloatingFusedProjection_M234MatchesSerialDe
             record.tags.at("projections") == "2")
         {
             const std::string &m_tag = record.tags.at("m");
-            if (m_tag == "2" || m_tag == "3" || m_tag == "4")
+            if (std::stoi(m_tag) >= 2 &&
+                std::stoi(m_tag) <= kGroupedVerifierRuntimeRows.back())
                 grouped_small_n_calls += record.count;
         }
     }
-    EXPECT_EQ(grouped_small_n_calls, verifier_rows.size())
-        << "CUDA FP32 verifier rows must use the fixed-order grouped verifier projection route for M=2/3/4";
+    EXPECT_EQ(grouped_small_n_calls, kGroupedVerifierRuntimeRows.size())
+        << "CUDA FP32 verifier rows must use the fixed-order grouped runtime-M projection route";
 
     cleanupSharedWorkspace({cuda_alpha, cuda_beta});
     PerfStatsCollector::reset();
 }
 
-TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_M234MatchesSerialDecodeRows)
+TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_RuntimeMMatchesSerialDecodeRows)
 {
     /**
      * FP16/BF16 floating weight tensors use FP32 verifier hidden rows on CUDA.
@@ -5072,7 +5077,6 @@ TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_M234MatchesSeri
      */
     const int K = 192;
     const int N = 80;
-    const std::array<int, 3> verifier_rows = {2, 3, 4};
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -5117,10 +5121,14 @@ TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_M234MatchesSeri
         ASSERT_FALSE(cuda_alpha->supports_fused_projection())
             << "Generic fused FP16/BF16 projection should stay disabled until the large fused path exists";
 
-        ASSERT_TRUE(setupSharedWorkspace({cuda_alpha, cuda_beta}, 4, {N, N}, K))
+        ASSERT_TRUE(setupSharedWorkspace(
+            {cuda_alpha, cuda_beta},
+            kGroupedVerifierRuntimeRows.back(),
+            {N, N},
+            K))
             << "CUDA " << dtype_tag << " grouped verifier workspace";
 
-        for (int M : verifier_rows)
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE(std::string("CUDA ") + dtype_tag + " M=" + std::to_string(M));
             auto A_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
@@ -5225,30 +5233,30 @@ TEST_F(Test__CUDAGemmParity, MTP_FP16BF16FloatingFusedProjection_M234MatchesSeri
             continue;
         }
         const std::string &m_tag = record.tags.at("m");
-        if (!(m_tag == "2" || m_tag == "3" || m_tag == "4"))
+        if (std::stoi(m_tag) < 2 ||
+            std::stoi(m_tag) > kGroupedVerifierRuntimeRows.back())
             continue;
         if (record.tags.at("dtype") == "fp16")
             fp16_grouped_calls += record.count;
         else if (record.tags.at("dtype") == "bf16")
             bf16_grouped_calls += record.count;
     }
-    EXPECT_EQ(fp16_grouped_calls, verifier_rows.size());
-    EXPECT_EQ(bf16_grouped_calls, verifier_rows.size());
+    EXPECT_EQ(fp16_grouped_calls, kGroupedVerifierRuntimeRows.size());
+    EXPECT_EQ(bf16_grouped_calls, kGroupedVerifierRuntimeRows.size());
 
     PerfStatsCollector::reset();
 }
 
-TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_M234MatchesSerialDecodeRows)
+TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_RuntimeMMatchesSerialDecodeRows)
 {
     /**
      * Floating shared-expert down projections used to have no grouped verifier
      * implementation on CUDA.  This regression sweeps FP32, FP16, and BF16
-     * down weights and proves that grouped M=2..4 rows match the one-row
+     * down weights and proves that grouped runtime-M rows match the one-row
      * decode-sized fused SwiGLU/down entry point bit-for-bit.
      */
     const int K = 192;
     const int N = 80;
-    const std::array<int, 3> verifier_rows = {2, 3, 4};
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -5282,10 +5290,14 @@ TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_M234MatchesSerialDecodeRows)
             model_id);
         auto *cuda_down = prepared_down.kernel;
         ASSERT_NE(cuda_down, nullptr);
-        ASSERT_TRUE(setupSharedWorkspace({cuda_down}, 4, {N}, K))
+        ASSERT_TRUE(setupSharedWorkspace(
+            {cuda_down},
+            kGroupedVerifierRuntimeRows.back(),
+            {N},
+            K))
             << "CUDA " << dtype_tag << " floating SwiGLU/down workspace";
 
-        for (int M : verifier_rows)
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE(std::string("CUDA ") + dtype_tag + " SwiGLU/down M=" + std::to_string(M));
             auto gate_data = randomFP32(static_cast<size_t>(M) * static_cast<size_t>(K));
@@ -5385,7 +5397,8 @@ TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_M234MatchesSerialDecodeRows)
             continue;
         }
         const std::string &m_tag = record.tags.at("m");
-        if (!(m_tag == "2" || m_tag == "3" || m_tag == "4"))
+        if (std::stoi(m_tag) < 2 ||
+            std::stoi(m_tag) > kGroupedVerifierRuntimeRows.back())
             continue;
         if (record.tags.at("dtype") == "fp32")
             fp32_grouped_calls += record.count;
@@ -5394,9 +5407,9 @@ TEST_F(Test__CUDAGemmParity, MTP_FloatingSwiGLUDown_M234MatchesSerialDecodeRows)
         else if (record.tags.at("dtype") == "bf16")
             bf16_grouped_calls += record.count;
     }
-    EXPECT_EQ(fp32_grouped_calls, verifier_rows.size());
-    EXPECT_EQ(fp16_grouped_calls, verifier_rows.size());
-    EXPECT_EQ(bf16_grouped_calls, verifier_rows.size());
+    EXPECT_EQ(fp32_grouped_calls, kGroupedVerifierRuntimeRows.size());
+    EXPECT_EQ(fp16_grouped_calls, kGroupedVerifierRuntimeRows.size());
+    EXPECT_EQ(bf16_grouped_calls, kGroupedVerifierRuntimeRows.size());
 
     PerfStatsCollector::reset();
 }
@@ -5979,11 +5992,10 @@ TEST_F(Test__CUDAGemmParity, MTP_BlockwiseActivationQuantizeM1RepeatIsBitwiseSta
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
-TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs)
+TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatchSerialGEMVs)
 {
     const int K = 512;
     const int N = 384;
-    const std::array<int, 3> verifier_rows = {2, 3, 4};
     ScopedCudaNativeVNNIDecodeEquivalentM1Policy verifier_policy_scope;
 
     ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
@@ -5996,7 +6008,11 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
 
         auto *base_kernel = getPreparedKernel(weights.get(), gpu_device_);
         ASSERT_NE(base_kernel, nullptr) << fmt.name << " CUDA kernel";
-        ASSERT_TRUE(setupWorkspaceIfNeeded(base_kernel, 4, N, K))
+        ASSERT_TRUE(setupWorkspaceIfNeeded(
+            base_kernel,
+            kGroupedVerifierRuntimeRows.back(),
+            N,
+            K))
             << fmt.name << " workspace";
 
         cudaStream_t stream = nullptr;
@@ -6018,7 +6034,7 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
 
         CUDARowMajorWeights *rowmajor = nullptr;
 
-        for (int M : verifier_rows)
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
             auto A_data = randomFP32(static_cast<size_t>(M) * K);
             auto A_tensor = std::make_unique<FP32Tensor>(
@@ -6027,24 +6043,28 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
 
             auto C_specialized = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+            auto C_captured = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
             auto C_serial = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
             ASSERT_TRUE(with_gpu_coherence(
                 gpu_device_,
                 {A_tensor.get()},
-                {C_specialized.get(), C_serial.get()},
+                {C_specialized.get(), C_captured.get(), C_serial.get()},
                 [&]
                 {
                     const float *d_A = static_cast<const float *>(A_tensor->gpu_data_ptr());
                     float *d_C_specialized = static_cast<float *>(C_specialized->gpu_data_ptr());
+                    float *d_C_captured = static_cast<float *>(C_captured->gpu_data_ptr());
                     float *d_C_serial = static_cast<float *>(C_serial->gpu_data_ptr());
                     auto *d_A_int8 = static_cast<int8_t *>(
                         workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
                     auto *d_scales_A = static_cast<float *>(
                         workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
 
-                    if (!d_A || !d_C_specialized || !d_C_serial || !d_A_int8 || !d_scales_A)
+                    if (!d_A || !d_C_specialized || !d_C_captured || !d_C_serial ||
+                        !d_A_int8 || !d_scales_A)
                         return false;
 
                     if (!cudaQuantGemm_quantizeActivationsBlockwise(
@@ -6082,6 +6102,63 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
                     {
                         return false;
                     }
+
+                    /*
+                     * Capture the same warmed production kernel entry point.
+                     * The eager launch above has already prepared any lazy
+                     * row-major weight view, so capture contains only grouped
+                     * device work and its ordered reduction. Replaying this
+                     * graph proves that runtime row tiling does not rely on a
+                     * host-side per-row loop or capture-disabled behavior.
+                     */
+                    if (cudaStreamSynchronize(stream) != cudaSuccess)
+                        return false;
+                    cudaGraph_t graph = nullptr;
+                    cudaGraphExec_t graph_exec = nullptr;
+                    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) != cudaSuccess)
+                        return false;
+                    const bool captured_launch = cudaNativeVNNIGemvTuned_small_m_fp32(
+                        d_A_int8,
+                        static_cast<const uint8_t *>(desc.payload),
+                        static_cast<const uint16_t *>(desc.scales),
+                        static_cast<const uint16_t *>(desc.mins),
+                        static_cast<const uint32_t *>(desc.emins),
+                        d_C_captured,
+                        d_scales_A,
+                        M,
+                        N,
+                        K,
+                        1.0f,
+                        0.0f,
+                        nullptr,
+                        nullptr,
+                        desc.codebook_id,
+                        gpu_device_.ordinal,
+                        stream,
+                        gemv_ctx,
+                        &rowmajor);
+                    const cudaError_t capture_end = cudaStreamEndCapture(stream, &graph);
+                    if (!captured_launch || capture_end != cudaSuccess || !graph)
+                    {
+                        if (graph)
+                            cudaGraphDestroy(graph);
+                        return false;
+                    }
+                    if (cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
+                        !graph_exec)
+                    {
+                        cudaGraphDestroy(graph);
+                        return false;
+                    }
+                    const cudaError_t graph_launch = cudaGraphLaunch(graph_exec, stream);
+                    const cudaError_t graph_sync =
+                        graph_launch == cudaSuccess
+                            ? cudaStreamSynchronize(stream)
+                            : graph_launch;
+                    cudaGraphExecDestroy(graph_exec);
+                    cudaGraphDestroy(graph);
+                    if (graph_launch != cudaSuccess || graph_sync != cudaSuccess)
+                        return false;
 
                     for (int row = 0; row < M; ++row)
                     {
@@ -6131,6 +6208,13 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
                     C_serial->data() +
                         static_cast<size_t>(row) * static_cast<size_t>(N),
                     static_cast<size_t>(N));
+                expectBitwiseEqualFloatRow(
+                    (label + " captured").c_str(),
+                    C_captured->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    C_serial->data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(N),
+                    static_cast<size_t>(N));
             }
         }
 
@@ -6163,9 +6247,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
  * grouped implementation remains a single native small-M launch and never
  * replays rows through the serial API.
  */
-TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode)
+TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats_LargeKKPARMatchesSerialDecode)
 {
-    constexpr int M = 2;
     constexpr int N = 1024;
     constexpr int K = 5120;
 
@@ -6177,47 +6260,132 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats_LargeKK
 
         auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
         ASSERT_NE(kernel, nullptr) << format.name << " CUDA kernel";
-        ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K))
+        ASSERT_TRUE(setupWorkspaceIfNeeded(
+            kernel,
+            kGroupedVerifierRuntimeRows.back(),
+            N,
+            K))
             << format.name << " large-K verifier workspace";
 
-        const auto input = randomFP32(static_cast<size_t>(M) * K);
-        std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
-        ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
-            kernel,
-            input.data(),
-            grouped.data(),
-            M,
-            N,
-            K,
-            gpu_device_,
-            workspace_.get()))
-            << format.name << " grouped large-K verifier projection";
-
-        for (int row = 0; row < M; ++row)
+        for (const int M : kGroupedVerifierRuntimeRows)
         {
-            std::vector<float> serial(static_cast<size_t>(N), 0.0f);
-            ASSERT_TRUE(cudaMultiplyViaTensor(
+            const auto input = randomFP32(static_cast<size_t>(M) * K);
+            std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+            ASSERT_TRUE(cudaGroupedVerifierProjectionViaTensor(
                 kernel,
-                input.data() + static_cast<size_t>(row) * K,
-                serial.data(),
-                /*M=*/1,
+                input.data(),
+                grouped.data(),
+                M,
                 N,
                 K,
-                gpu_device_))
-                << format.name << " serial large-K decode row " << row;
+                gpu_device_,
+                workspace_.get()))
+                << format.name << " grouped large-K verifier projection M=" << M;
 
-            expectBitwiseEqualFloatRow(
-                (std::string(format.name) + " large-K KPAR M=2 row=" +
-                 std::to_string(row))
-                    .c_str(),
-                grouped.data() + static_cast<size_t>(row) * N,
-                serial.data(),
-                serial.size());
+            for (int row = 0; row < M; ++row)
+            {
+                std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+                ASSERT_TRUE(cudaMultiplyViaTensor(
+                    kernel,
+                    input.data() + static_cast<size_t>(row) * K,
+                    serial.data(),
+                    /*M=*/1,
+                    N,
+                    K,
+                    gpu_device_))
+                    << format.name << " serial large-K decode M=" << M
+                    << " row=" << row;
+
+                expectBitwiseEqualFloatRow(
+                    (std::string(format.name) + " large-K KPAR M=" +
+                     std::to_string(M) + " row=" + std::to_string(row))
+                        .c_str(),
+                    grouped.data() + static_cast<size_t>(row) * N,
+                    serial.data(),
+                    serial.size());
+            }
         }
 
         cleanupWorkspaceIfNeeded(kernel);
         EXPECT_FALSE(kernel->hasDynamicStateActive())
             << format.name << " large-K sweep leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+}
+
+/**
+ * @brief Prove runtime-M fused SwiGLU/down publication for every native format.
+ *
+ * MTP does not feed every verifier projection directly from hidden state. FFN
+ * down projections first materialize `silu(gate) * up`, quantize that derived
+ * activation, and then enter NativeVNNI. This sweep covers the complete fused
+ * production entry point for every certified row count so a row-independent
+ * GEMV cannot hide a batch-dependent activation or quantization implementation.
+ */
+TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedSwiGLUDown_AllNativeFormatsMatchSerialDecode)
+{
+    constexpr int N = 384;
+    constexpr int K = 512;
+
+    for (const auto &format : cudaSmallMNativeFormats())
+    {
+        auto weights = format.create(N, K);
+        ASSERT_NE(weights, nullptr)
+            << "Failed to create " << format.name << " fused-SwiGLU weights";
+
+        auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(kernel, nullptr) << format.name << " CUDA kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(
+            kernel,
+            kGroupedVerifierRuntimeRows.back(),
+            N,
+            K))
+            << format.name << " fused-SwiGLU verifier workspace";
+
+        for (const int M : kGroupedVerifierRuntimeRows)
+        {
+            const auto gate = randomFP32(static_cast<size_t>(M) * K);
+            const auto up = randomFP32(static_cast<size_t>(M) * K);
+            std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+            ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+                kernel,
+                gate.data(),
+                up.data(),
+                grouped.data(),
+                M,
+                N,
+                K,
+                gpu_device_))
+                << format.name << " grouped fused-SwiGLU M=" << M;
+
+            for (int row = 0; row < M; ++row)
+            {
+                std::vector<float> serial(static_cast<size_t>(N), 0.0f);
+                ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+                    kernel,
+                    gate.data() + static_cast<size_t>(row) * K,
+                    up.data() + static_cast<size_t>(row) * K,
+                    serial.data(),
+                    1,
+                    N,
+                    K,
+                    gpu_device_))
+                    << format.name << " serial fused-SwiGLU M=" << M
+                    << " row=" << row;
+
+                expectBitwiseEqualFloatRow(
+                    (std::string(format.name) + " fused-SwiGLU M=" +
+                     std::to_string(M) + " row=" + std::to_string(row))
+                        .c_str(),
+                    grouped.data() + static_cast<size_t>(row) * N,
+                    serial.data(),
+                    serial.size());
+            }
+        }
+
+        cleanupWorkspaceIfNeeded(kernel);
+        EXPECT_FALSE(kernel->hasDynamicStateActive())
+            << format.name << " fused-SwiGLU runtime-M sweep leaked dynamic state";
         llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
     }
 }
@@ -7451,10 +7619,8 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNati
     }
 
     const auto route_records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls",
-                                      "kernel.cuda_native_vnni_m2_calls"});
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
     uint64_t specialized_records = 0;
-    uint64_t m2_kernel_records = 0;
     for (const auto &record : route_records)
     {
         if (record.domain != "kernel" ||
@@ -7478,17 +7644,9 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNati
         {
             specialized_records += record.count;
         }
-        if (record.name == "cuda_native_vnni_m2_calls" &&
-            record.tags.at("codebook") == "5" &&
-            record.tags.at("route") == "specialized")
-        {
-            m2_kernel_records += record.count;
-        }
     }
     EXPECT_EQ(specialized_records, 1u)
         << "Qwen3.6 fused-SwiGLU down M=2 must use specialized native-VNNI small-M GEMV";
-    EXPECT_EQ(m2_kernel_records, 1u)
-        << "Qwen3.6 fused-SwiGLU down M=2 must emit the M2 tuning counter";
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())

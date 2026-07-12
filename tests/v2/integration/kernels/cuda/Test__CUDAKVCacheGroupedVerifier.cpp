@@ -150,7 +150,7 @@ namespace
         {
             GraphCaptureGuard guard;
             read_ok = cache.get_kv_batched_converted_device_view(
-                0, 0, request_count, max_kv_len,
+                0, 0, request_count,
                 ActivationPrecision::FP16, out_k, out_v, read);
         }
         const cudaError_t end_status = cudaStreamEndCapture(stream, &graph);
@@ -186,7 +186,7 @@ namespace
 } // namespace
 
 TEST(Test__CUDAKVCacheGroupedVerifier,
-     AllFormatsM234GraphCapturedReplicatedAndLocalTPMatchSerialDecodeBytes)
+     AllFormatsRuntimeMGraphCapturedReplicatedAndLocalTPMatchSerialDecodeBytes)
 {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1)

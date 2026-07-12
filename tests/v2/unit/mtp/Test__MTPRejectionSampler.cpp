@@ -536,6 +536,7 @@ namespace llaminar2::test
             /*stop_tokens=*/nullptr,
             /*stop_token_count=*/0,
             output_tokens,
+            kSpeculativeBatchMaxOutputTokens,
             meta);
 
         ASSERT_EQ(meta[kSpecBatchMetaOk], 1);

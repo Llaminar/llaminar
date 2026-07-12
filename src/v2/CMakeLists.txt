@@ -1098,8 +1098,14 @@ if(USE_ONEDNN)
         message(STATUS "V2: OneDNN source is not a git checkout and has no ref marker; using ${ONEDNN_COMMIT} for cache validation")
     endif()
 
-    # Now check if OneDNN is built for the requested commit and CPU ISA.
-    set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build")
+    # Keep one installed oneDNN tree per compiled ISA. AVX512 binaries are
+    # intentionally also exercised with AVX2 runtime dispatch by the CPU
+    # NativeVNNI trainer, while AVX2-only release artifacts remain separately
+    # runnable. A shared `build/` directory made configuring either tree erase
+    # and relink the other, invalidating both evidence provenance and Docker's
+    # dual-runtime image build.
+    string(TOLOWER "${LLAMINAR_CPU_ISA_UPPER}" ONEDNN_ISA_SUFFIX)
+    set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build-${ONEDNN_ISA_SUFFIX}")
     set(ONEDNN_VERSION_FILE "${ONEDNN_BUILD_DIR}/.llaminar-onednn-commit")
     set(ONEDNN_CACHE_KEY "${ONEDNN_COMMIT};isa=${LLAMINAR_CPU_ISA_UPPER}")
 
@@ -1167,6 +1173,11 @@ if(USE_ONEDNN)
     )
     
     set(ONEDNN_FOUND FALSE)
+    # find_library() stores results in the CMake cache. Clear the previous ISA
+    # tree before searching so an existing build directory cannot retain a
+    # link to the mutable legacy external/onednn/build installation.
+    unset(ONEDNN_LIB CACHE)
+    unset(ONEDNN_LIB)
     foreach(SEARCH_PATH ${ONEDNN_SEARCH_PATHS})
         if(EXISTS "${SEARCH_PATH}/include/oneapi/dnnl/dnnl.hpp")
             set(ONEDNN_ROOT "${SEARCH_PATH}")

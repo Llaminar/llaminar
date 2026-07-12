@@ -83,8 +83,7 @@ namespace llaminar2
     struct MTPDeviceRejectionBatchOutcome
     {
         bool ok = false;
-        std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens>
-            output_tokens;
+        std::vector<int32_t> output_tokens;
         int output_token_count = 0;
         int accepted_speculative_prefix = 0;
         int target_verifier_state_commit_count = 0;
@@ -95,9 +94,11 @@ namespace llaminar2
         int consumed_verifier_rows = 0;
         bool sampled_terminal = false;
 
-        MTPDeviceRejectionBatchOutcome()
+        explicit MTPDeviceRejectionBatchOutcome(
+            size_t output_capacity =
+                sampling_math::kSpeculativeBatchMaxOutputTokens)
+            : output_tokens(output_capacity, -1)
         {
-            output_tokens.fill(-1);
         }
     };
 

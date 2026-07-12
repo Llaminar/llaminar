@@ -629,8 +629,7 @@ namespace llaminar2
 
         const int timeout_ms =
             collective_timeout_policy::effectiveCollectTimeoutMs(
-                debugEnv().tp_collect_timeout_ms,
-                /*cold_start_completed=*/true);
+                debugEnv().tp_collect_timeout_ms);
 
         MPI_Request request = MPI_REQUEST_NULL;
         int result = MPI_Ibarrier(domain_comm_, &request);

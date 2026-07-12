@@ -380,7 +380,7 @@ namespace llaminar2
             bool uses_device_token_ids,
             const char *weight_route)
         {
-            if (num_tokens < 2 || num_tokens > 4)
+            if (num_tokens < 2)
                 return;
 
             PerfStatsCollector::addCounter(

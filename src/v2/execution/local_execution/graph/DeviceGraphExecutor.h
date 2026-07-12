@@ -352,11 +352,11 @@ namespace llaminar2
          *
          * GPU graph capture/replay intentionally disables per-stage callbacks
          * while kernels are being recorded or launched. Parity diagnostics still
-         * need the resulting stage tensors. This post-execution drain rebuilds
-         * each stage's dump metadata, publishes outputs to host using the
-         * caller-supplied graph stream when present, and invokes the configured
-         * snapshot callback without re-executing stages or falling back to eager
-         * graph traversal.
+         * need the resulting stage tensors. GPU stages are published exclusively
+         * from the immutable graph-snapshot manifest whose D2D copy nodes ran at
+         * each stage boundary; the executor never re-queries mutable stage dump
+         * metadata after launch. CPU stages retain their ordinary synchronous
+         * dump callback because they do not participate in GPU graph capture.
          *
          * @param graph Graph whose stages have just executed.
          * @param producer_stream_override Explicit producer stream for the graph
@@ -762,6 +762,14 @@ namespace llaminar2
             size_t byte_size = 0;
             size_t storage_bytes = 0;
             DeviceId device = DeviceId::invalid();
+            const void *source_ptr = nullptr;
+            /**
+             * True after a real stage execution recorded this descriptor and
+             * its point-in-time D2D copy. Allocation-only pre-capture passes
+             * may inspect stage metadata, but must not replace a warmed source
+             * with a pre-execution fallback view.
+             */
+            bool descriptor_finalized = false;
             std::unique_ptr<FP32Tensor> storage;
         };
 
@@ -770,6 +778,13 @@ namespace llaminar2
             std::vector<GraphSnapshotOutputCopy> outputs;
         };
 
+        /**
+         * GPU stages observed after real execution with no tensor-backed
+         * snapshot outputs. This is a finalized manifest state, distinct from
+         * an unknown stage that skipped warmup and must hard-fail preparation.
+         */
+        std::unordered_set<std::string> graph_snapshot_outputless_stages_;
+
         bool prepareOrRecordGraphSnapshotCopies(ComputeNode &node,
                                                 DeviceId target_device,
                                                 void *producer_stream,
@@ -777,13 +792,14 @@ namespace llaminar2
         bool shouldCaptureSnapshotStage(const std::string &node_name) const;
 
         /**
-         * @brief Allocate graph-stable snapshot copy storage without copying payload bytes.
+         * @brief Validate graph-stable snapshot storage finalized by warmup.
          *
-         * GPU graph capture cannot discover or allocate new snapshot outputs
-         * while capture is active. Call this before beginCapture() to lock the
-         * per-stage descriptor/storage shape. The actual point-in-time bytes
-         * must still be recorded by captureGraphSnapshotCopies() immediately
-         * after the producing stage executes.
+         * GPU graph capture cannot discover or allocate snapshot outputs while
+         * capture is active. Warmup must therefore execute every selected
+         * producer and finalize its exact descriptor/storage first. This method
+         * hard-fails when that manifest is absent; it never substitutes a
+         * pre-execution stage tensor. The captured point-in-time copy is still
+         * recorded after each producer executes.
          */
         bool prepareGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,
@@ -805,16 +821,16 @@ namespace llaminar2
                                         void *producer_stream);
 
         /**
-         * @brief Replace dump outputs with stable graph-captured copies.
+         * @brief Publish one GPU stage from its immutable graph snapshot slots.
          *
-         * Called by publishSnapshotsAfterGraphExecution() before publishing to
-         * host. It also re-marks copied buffers device-authoritative for replay:
-         * the graph updates their device memory, but the tensor coherence object
-         * is otherwise unaware that replay overwrote the previous host snapshot.
+         * Graph replay updates slot device memory without executing stage C++.
+         * This method records a real post-launch completion event, builds a
+         * callback descriptor solely from the frozen slot manifest, transfers
+         * those bytes to host, and invokes the configured snapshot callback.
+         * It deliberately never calls getDumpInfo() on the live stage.
          */
-        bool materializeGraphSnapshotCopies(const std::string &stage_name,
-                                            StageDumpInfo &dump_info,
-                                            void *producer_stream);
+        bool publishGraphSnapshotCopies(const std::string &stage_name,
+                                        void *producer_stream);
 
         // =====================================================================
         // Legacy internal helpers (now delegate to runStages/runStage)

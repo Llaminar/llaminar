@@ -1656,12 +1656,16 @@ namespace llaminar2
         /**
          * @brief Execute the full grouped MoE prefill pipeline (graph-capturable).
          *
-         * Runs all 5 kernels (gather+quant, gate+up GEMM, SwiGLU+quant,
-         * down GEMM, weighted scatter) in a single function with zero
-         * host-device synchronization.
+         * Runs a fixed device-side pipeline with grouped gather/quantization,
+         * grouped gate/up, grouped SwiGLU quantization, and direct ordered down
+         * publication.  The final dispatch owns one token/output lane and walks
+         * only that token's tiny top-k route list in serial-decode order.  It
+         * therefore remains economical and graph-capturable without per-route
+         * down materialization, atomic accumulation, or host-device
+         * synchronization.
          *
          * @param hidden         Input hidden states [seq_len, d_model]
-         * @param output         Output buffer [seq_len, d_model] (pre-zeroed)
+         * @param output         Output buffer [seq_len, d_model] (overwritten)
          * @param gate_desc_table_id  Descriptor table ID for gate weights
          * @param up_desc_table_id    Descriptor table ID for up weights (same table)
          * @param down_desc_table_id  Descriptor table ID for down weights

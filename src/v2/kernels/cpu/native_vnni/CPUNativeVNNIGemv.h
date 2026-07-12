@@ -47,6 +47,8 @@
 #include <cstring>
 #include <memory>
 #include <omp.h>
+#include <stdexcept>
+#include <string>
 
 #include "CPUNativeVNNIDecode.h"
 #include "CPUNativeVNNIWeightPacker.h"
@@ -56,6 +58,7 @@
 #include "tensors/SIMDHelpers.h"
 #include "utils/CPUFeatures.h"
 #include "utils/OpenMPUtils.h"
+#include "utils/PerfStatsCollector.h"
 
 // AVX2 GEMV/GEMM kernels (same packed weight format, uses emulated VNNI)
 #include "CPUNativeAVX2Gemv.h"
@@ -82,16 +85,36 @@ namespace llaminar2::cpu::native_vnni
     };
 
     /**
+     * @brief Return the maximum CPU ISA compiled into this binary.
+     *
+     * An AVX512 build and an AVX2-only build may make different verifier-row
+     * policy choices even when both execute their AVX2 runtime path. In
+     * particular, an AVX512 translation unit can have different code
+     * generation, register allocation, and inlining decisions from the
+     * AVX2-only artifact. Keep the build envelope visible to telemetry and
+     * generated dispatch instead of treating the active runtime ISA as a
+     * complete binary identity.
+     */
+    inline constexpr const char *compiledNativeVNNIBuildISAName()
+    {
+#if LLAMINAR_COMPILED_WITH_AVX512
+        return "AVX512";
+#else
+        return "AVX2";
+#endif
+    }
+
+    /**
      * @brief Runtime policy for grouped verifier-row CPU NativeVNNI kernels.
      *
-     * Pairwise uses the two-row chunk kernels as the active floor for M=2..4,
-     * with an odd tail row when M=3. WideRows uses the verifier-specialized
-     * three-row or four-row AVX512 kernels that share each decoded B chunk
-     * across more rows.  The generated table is trained from strict
-     * decode-equivalent microbench CSVs.  Shapes that have not been trained use
-     * Pairwise, the conservative economy floor, because the wide-row kernels
-     * are only safe to promote once a shape/codebook row proves faster than
-     * serial decode in the trainer.
+     * Pairwise tiles an arbitrary verifier batch into two-row chunk kernels,
+     * with one ordinary decode-equivalent tail row when M is odd. WideRows is
+     * the verifier-specialized three-row or four-row AVX512 policy that shares
+     * each decoded B chunk across more rows. The generated table is trained from strict
+     * decode-equivalent microbench CSVs independently for the compiled ISA,
+     * effective runtime ISA, and OpenMP thread count. An untrained runtime key
+     * is an unsupported production configuration and fails explicitly; it is
+     * never converted into an unmeasured Pairwise policy.
      */
     enum class VerifierRowsPolicy
     {
@@ -111,13 +134,57 @@ namespace llaminar2::cpu::native_vnni
         int N,
         int K)
     {
+        if (M < 2)
+            throw std::invalid_argument(
+                "CPU NativeVNNI grouped verifier policy requires M >= 2");
+
+        /*
+         * The kernel inventory is physical-row-tile based, not speculative
+         * depth specialized. Generated evidence may still choose between the
+         * Pairwise and WideRows schedules for an exact runtime M because task
+         * count and tail composition affect economy. If that exact key has not
+         * yet been trained, the certified four-row policy governs every full
+         * tile and its 1-3 row tail. This is a dispatch hierarchy over the same
+         * grouped kernels, never a serial compute fallback.
+         */
+        const int policy_tile_rows = std::min(M, 4);
+
         generated::CPUNativeVNNIVerifierRowsPolicy generated_policy{};
-        if (generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+#if LLAMINAR_COMPILED_WITH_AVX512
+        constexpr auto build_isa =
+            generated::CPUNativeVNNIBuildISA::AVX512;
+#else
+        constexpr auto build_isa =
+            generated::CPUNativeVNNIBuildISA::AVX2;
+#endif
+        generated::CPUNativeVNNIRuntimeISA runtime_isa{};
+        switch (activeISALevel())
+        {
+        case ISALevel::AVX512:
+            runtime_isa = generated::CPUNativeVNNIRuntimeISA::AVX512;
+            break;
+        case ISALevel::AVX2:
+            runtime_isa = generated::CPUNativeVNNIRuntimeISA::AVX2;
+            break;
+        case ISALevel::Scalar:
+        default:
+            throw std::runtime_error(
+                "CPU NativeVNNI verifier rows require AVX2 or AVX512");
+        }
+        auto resolve_generated_policy = [&](int policy_rows)
+        {
+            return generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                build_isa,
+                runtime_isa,
+                omp_get_max_threads(),
                 packed.codebook_id,
-                M,
+                policy_rows,
                 N,
                 K,
-                generated_policy))
+                generated_policy);
+        };
+        if (resolve_generated_policy(M) ||
+            (M > 4 && resolve_generated_policy(policy_tile_rows)))
         {
             return generated_policy ==
                        generated::CPUNativeVNNIVerifierRowsPolicy::WideRows
@@ -125,7 +192,17 @@ namespace llaminar2::cpu::native_vnni
                        : VerifierRowsPolicy::Pairwise;
         }
 
-        return VerifierRowsPolicy::Pairwise;
+        throw std::runtime_error(
+            std::string("No certified CPU NativeVNNI verifier-row policy for build=") +
+            compiledNativeVNNIBuildISAName() +
+            " runtime=" +
+            (activeISALevel() == ISALevel::AVX512 ? "AVX512" : "AVX2") +
+            " threads=" + std::to_string(omp_get_max_threads()) +
+            " codebook=" + std::to_string(packed.codebook_id) +
+            " M=" + std::to_string(M) +
+            " policy_tile_rows=" + std::to_string(policy_tile_rows) +
+            " N=" + std::to_string(N) +
+            " K=" + std::to_string(K));
     }
 
     // =========================================================================
@@ -700,6 +777,165 @@ namespace llaminar2::cpu::native_vnni
 
 #endif // __AVX512F__ && __AVX512VNNI__ && __AVX512BW__
 
+    /**
+     * @brief Reduce one 64-column K-tile partial stream in decode order.
+     *
+     * @param base          Address of tile zero. Consecutive tiles are 64
+     *                      floats apart.
+     * @param destination   Final output address for this N chunk.
+     * @param valid_columns Number of valid columns in the chunk, in [1, 64].
+     * @param k_tiles       Number of K partials to combine, at least two.
+     * @param use_avx512    True only when runtime dispatch selected AVX512.
+     *
+     * Serial decode and grouped verifier kernels both partition long K in the
+     * same way. Batch invariance therefore depends on adding tile 0, tile 1,
+     * and so on in exactly this order for every FP32 lane. Keeping the reduction
+     * here gives all callers one implementation of that contract.
+     *
+     * The runtime ISA branch is intentional. An AVX512 build can be launched
+     * with AVX2 runtime dispatch for training or deployment, and that regime
+     * must execute AVX2 instructions throughout the kernel rather than quietly
+     * using an AVX512 reduction compiled into the binary.
+     */
+    inline void reduceNativeVNNIKTilePartialsExact(
+        const float *base,
+        float *destination,
+        int valid_columns,
+        int k_tiles,
+        bool use_avx512)
+    {
+#if defined(__AVX512F__)
+        if (use_avx512)
+        {
+            __m512 sum0 = _mm512_loadu_ps(base);
+            __m512 sum1 = _mm512_loadu_ps(base + 16);
+            __m512 sum2 = _mm512_loadu_ps(base + 32);
+            __m512 sum3 = _mm512_loadu_ps(base + 48);
+            for (int kt = 1; kt < k_tiles; ++kt)
+            {
+                const float *src = base + static_cast<size_t>(kt) * 64;
+                sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(src));
+                sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(src + 16));
+                sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32));
+                sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48));
+            }
+
+            if (valid_columns < 64)
+            {
+                alignas(64) float temporary[64];
+                _mm512_store_ps(temporary, sum0);
+                _mm512_store_ps(temporary + 16, sum1);
+                _mm512_store_ps(temporary + 32, sum2);
+                _mm512_store_ps(temporary + 48, sum3);
+                std::memcpy(
+                    destination,
+                    temporary,
+                    static_cast<size_t>(valid_columns) * sizeof(float));
+            }
+            else
+            {
+                _mm512_storeu_ps(destination, sum0);
+                _mm512_storeu_ps(destination + 16, sum1);
+                _mm512_storeu_ps(destination + 32, sum2);
+                _mm512_storeu_ps(destination + 48, sum3);
+            }
+            return;
+        }
+#else
+        (void)use_avx512;
+#endif
+
+        __m256 sum0 = _mm256_loadu_ps(base);
+        __m256 sum1 = _mm256_loadu_ps(base + 8);
+        __m256 sum2 = _mm256_loadu_ps(base + 16);
+        __m256 sum3 = _mm256_loadu_ps(base + 24);
+        __m256 sum4 = _mm256_loadu_ps(base + 32);
+        __m256 sum5 = _mm256_loadu_ps(base + 40);
+        __m256 sum6 = _mm256_loadu_ps(base + 48);
+        __m256 sum7 = _mm256_loadu_ps(base + 56);
+        for (int kt = 1; kt < k_tiles; ++kt)
+        {
+            const float *src = base + static_cast<size_t>(kt) * 64;
+            sum0 = _mm256_add_ps(sum0, _mm256_loadu_ps(src));
+            sum1 = _mm256_add_ps(sum1, _mm256_loadu_ps(src + 8));
+            sum2 = _mm256_add_ps(sum2, _mm256_loadu_ps(src + 16));
+            sum3 = _mm256_add_ps(sum3, _mm256_loadu_ps(src + 24));
+            sum4 = _mm256_add_ps(sum4, _mm256_loadu_ps(src + 32));
+            sum5 = _mm256_add_ps(sum5, _mm256_loadu_ps(src + 40));
+            sum6 = _mm256_add_ps(sum6, _mm256_loadu_ps(src + 48));
+            sum7 = _mm256_add_ps(sum7, _mm256_loadu_ps(src + 56));
+        }
+
+        if (valid_columns < 64)
+        {
+            alignas(64) float temporary[64];
+            _mm256_store_ps(temporary, sum0);
+            _mm256_store_ps(temporary + 8, sum1);
+            _mm256_store_ps(temporary + 16, sum2);
+            _mm256_store_ps(temporary + 24, sum3);
+            _mm256_store_ps(temporary + 32, sum4);
+            _mm256_store_ps(temporary + 40, sum5);
+            _mm256_store_ps(temporary + 48, sum6);
+            _mm256_store_ps(temporary + 56, sum7);
+            std::memcpy(
+                destination,
+                temporary,
+                static_cast<size_t>(valid_columns) * sizeof(float));
+        }
+        else
+        {
+            _mm256_storeu_ps(destination, sum0);
+            _mm256_storeu_ps(destination + 8, sum1);
+            _mm256_storeu_ps(destination + 16, sum2);
+            _mm256_storeu_ps(destination + 24, sum3);
+            _mm256_storeu_ps(destination + 32, sum4);
+            _mm256_storeu_ps(destination + 40, sum5);
+            _mm256_storeu_ps(destination + 48, sum6);
+            _mm256_storeu_ps(destination + 56, sum7);
+        }
+    }
+
+    /**
+     * @brief Add one projection bias row using the selected runtime ISA.
+     *
+     * Fused verifier projection bundles apply bias after every grouped GEMV
+     * row is complete. The operation is elementwise and therefore has no
+     * cross-lane reduction order, but it still belongs to the runtime dispatch
+     * contract: forcing AVX2 in an AVX512 build must not execute AVX512
+     * instructions in this epilogue.
+     */
+    inline void addNativeVNNIBiasRow(
+        float *row,
+        const float *bias,
+        int columns,
+        bool use_avx512)
+    {
+        int column = 0;
+#if defined(__AVX512F__)
+        if (use_avx512)
+        {
+            for (; column + 15 < columns; column += 16)
+            {
+                const __m512 value = _mm512_add_ps(
+                    _mm512_loadu_ps(row + column),
+                    _mm512_loadu_ps(bias + column));
+                _mm512_storeu_ps(row + column, value);
+            }
+        }
+#else
+        (void)use_avx512;
+#endif
+        for (; column + 7 < columns; column += 8)
+        {
+            const __m256 value = _mm256_add_ps(
+                _mm256_loadu_ps(row + column),
+                _mm256_loadu_ps(bias + column));
+            _mm256_storeu_ps(row + column, value);
+        }
+        for (; column < columns; ++column)
+            row[column] += bias[column];
+    }
+
     // =========================================================================
     // Pre-quantized GEMV (M=1) — compute only, skips quantization
     // =========================================================================
@@ -808,82 +1044,8 @@ namespace llaminar2::cpu::native_vnni
                     int n_cols = std::min(64, N - n_start);
                     const float *base = partial_sums.get() +
                                         static_cast<size_t>(chunk_idx) * k_tiles * 64;
-#if defined(__AVX512F__)
-                    __m512 sum0 = _mm512_loadu_ps(base);
-                    __m512 sum1 = _mm512_loadu_ps(base + 16);
-                    __m512 sum2 = _mm512_loadu_ps(base + 32);
-                    __m512 sum3 = _mm512_loadu_ps(base + 48);
-                    for (int kt = 1; kt < k_tiles; ++kt)
-                    {
-                        const float *src = base + kt * 64;
-                        sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(src));
-                        sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(src + 16));
-                        sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32));
-                        sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48));
-                    }
-                    if (n_cols < 64)
-                    {
-                        alignas(64) float tmp[64];
-                        _mm512_store_ps(tmp, sum0);
-                        _mm512_store_ps(tmp + 16, sum1);
-                        _mm512_store_ps(tmp + 32, sum2);
-                        _mm512_store_ps(tmp + 48, sum3);
-                        std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
-                    }
-                    else
-                    {
-                        _mm512_storeu_ps(C + n_start, sum0);
-                        _mm512_storeu_ps(C + n_start + 16, sum1);
-                        _mm512_storeu_ps(C + n_start + 32, sum2);
-                        _mm512_storeu_ps(C + n_start + 48, sum3);
-                    }
-#else
-                    // AVX2 FP32 partial sum reduction
-                    __m256 s0 = _mm256_loadu_ps(base);
-                    __m256 s1 = _mm256_loadu_ps(base + 8);
-                    __m256 s2 = _mm256_loadu_ps(base + 16);
-                    __m256 s3 = _mm256_loadu_ps(base + 24);
-                    __m256 s4 = _mm256_loadu_ps(base + 32);
-                    __m256 s5 = _mm256_loadu_ps(base + 40);
-                    __m256 s6 = _mm256_loadu_ps(base + 48);
-                    __m256 s7 = _mm256_loadu_ps(base + 56);
-                    for (int kt = 1; kt < k_tiles; ++kt)
-                    {
-                        const float *src = base + kt * 64;
-                        s0 = _mm256_add_ps(s0, _mm256_loadu_ps(src));
-                        s1 = _mm256_add_ps(s1, _mm256_loadu_ps(src + 8));
-                        s2 = _mm256_add_ps(s2, _mm256_loadu_ps(src + 16));
-                        s3 = _mm256_add_ps(s3, _mm256_loadu_ps(src + 24));
-                        s4 = _mm256_add_ps(s4, _mm256_loadu_ps(src + 32));
-                        s5 = _mm256_add_ps(s5, _mm256_loadu_ps(src + 40));
-                        s6 = _mm256_add_ps(s6, _mm256_loadu_ps(src + 48));
-                        s7 = _mm256_add_ps(s7, _mm256_loadu_ps(src + 56));
-                    }
-                    if (n_cols < 64)
-                    {
-                        alignas(64) float tmp[64];
-                        _mm256_store_ps(tmp, s0);
-                        _mm256_store_ps(tmp + 8, s1);
-                        _mm256_store_ps(tmp + 16, s2);
-                        _mm256_store_ps(tmp + 24, s3);
-                        _mm256_store_ps(tmp + 32, s4);
-                        _mm256_store_ps(tmp + 40, s5);
-                        _mm256_store_ps(tmp + 48, s6);
-                        _mm256_store_ps(tmp + 56, s7);
-                        std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
-                    }
-                    else
-                    {
-                        _mm256_storeu_ps(C + n_start, s0);
-                        _mm256_storeu_ps(C + n_start + 8, s1);
-                        _mm256_storeu_ps(C + n_start + 16, s2);
-                        _mm256_storeu_ps(C + n_start + 24, s3);
-                        _mm256_storeu_ps(C + n_start + 32, s4);
-                        _mm256_storeu_ps(C + n_start + 40, s5);
-                        _mm256_storeu_ps(C + n_start + 48, s6);
-                        _mm256_storeu_ps(C + n_start + 56, s7);
-                    }
-#endif
+                    reduceNativeVNNIKTilePartialsExact(
+                        base, C + n_start, n_cols, k_tiles, use_avx512);
                 }
             };
 
@@ -2285,7 +2447,7 @@ namespace llaminar2::cpu::native_vnni
     }
 
     /**
-     * @brief Grouped M=2..4 verifier GEMM with M=1 decode-equivalent row math.
+     * @brief Grouped runtime-M verifier GEMM with M=1 decode-equivalent row math.
      *
      * The regular M>1 GEMM path is free to use 2-row microkernels and K tiling
      * that change FP32 accumulation order.  That is fine for ordinary prefill,
@@ -2328,6 +2490,48 @@ namespace llaminar2::cpu::native_vnni
 
         const int num_threads = omp_get_max_threads();
         NativeVNNITileConfig cfg = computeTileConfig(N, K, 1, packed.payload_bytes, num_threads);
+
+        /*
+         * Route identity is part of the grouped verifier contract.  WideRows
+         * has a distinct implementation only for AVX512 M=3/4; M=2 and all
+         * AVX2/scalar requests intentionally normalize to Pairwise.  Publishing
+         * both requested and effective policy prevents trainers and production
+         * diagnostics from mistaking a normalized launch for a measured wide
+         * candidate.
+         */
+        if (PerfStatsCollector::isEnabled())
+        {
+            const bool effective_wide_rows =
+                use_wide_rows && use_avx512 && M >= 3;
+            const char *requested_policy =
+                verifier_policy_override == VerifierRowsPolicy::Auto
+                    ? "Auto"
+                    : (verifier_policy_override == VerifierRowsPolicy::WideRows
+                           ? "WideRows"
+                           : "Pairwise");
+            const char *effective_policy =
+                effective_wide_rows ? "WideRows" : "Pairwise";
+            const char *effective_isa =
+                use_avx512 ? "AVX512" : (use_avx2 ? "AVX2" : "Scalar");
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_native_vnni_verifier_rows_launch",
+                1.0,
+                "gemm",
+                {},
+                PerfStatsCollector::Tags{
+                    {"m", std::to_string(M)},
+                    {"n", std::to_string(N)},
+                    {"k", std::to_string(K)},
+                    {"codebook", std::to_string(packed.codebook_id)},
+                    {"build_isa", compiledNativeVNNIBuildISAName()},
+                    {"requested_policy", requested_policy},
+                    {"effective_policy", effective_policy},
+                    {"isa", effective_isa},
+                    {"k_tiles", std::to_string(cfg.k_tiles)},
+                    {"n_block_chunks", std::to_string(cfg.n_block_chunks)},
+                    {"threads", std::to_string(num_threads)}});
+        }
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
         __m512i decode_lut_512 = _mm512_setzero_si512();
@@ -2382,99 +2586,58 @@ namespace llaminar2::cpu::native_vnni
                 /*
                  * Preserve the exact serial decode K-parallel contract:
                  *
-                 *   1. compute independent [chunk, K-tile] partial sums
+                 *   1. compute one independent partial for every
+                 *      [row, N-chunk, K-tile]
                  *   2. reduce tile0 + tile1 + ... in increasing tile order
                  *
-                 * This intentionally uses the same single-row tile kernels as
-                 * gemv_native_vnni_preq().  The workspace is modest for the
-                 * long-K verifier shapes that need it, and it buys back
-                 * K-tile parallelism without taking the non-equivalent
-                 * multi-row microkernels.
+                 * A task shares the decoded B tile across two AVX2 rows or up
+                 * to four AVX512 rows. The shared microkernels still write one
+                 * independent partial per row, so increasing runtime M changes
+                 * scheduling and weight reuse but never FP32 parenthesization.
                  */
-                /*
-                 * AVX512 can share each B tile across M=2..4 rows as long as
-                 * the shared kernel writes an independent tile partial.  The
-                 * reduction below is still the M=1 reduction, so the only
-                 * arithmetic that must match is one tile's partial output.
-                 */
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                if (use_avx512 && M >= 2 && M <= 4 &&
-                    (M == 2 || use_wide_rows))
-                {
-                    const int total_shared_tile_tasks = N_chunks * k_tiles;
+                const int row_tile_width =
+                    use_avx512 && use_wide_rows ? 4 : 2;
+                const int row_tile_count =
+                    (M + row_tile_width - 1) / row_tile_width;
+                const int total_shared_tile_tasks =
+                    row_tile_count * N_chunks * k_tiles;
 #pragma omp for schedule(static)
-                    for (int task = 0; task < total_shared_tile_tasks; ++task)
+                for (int task = 0; task < total_shared_tile_tasks; ++task)
+                {
+                    const int kt = task % k_tiles;
+                    const int chunk_and_row_tile = task / k_tiles;
+                    const int chunk = chunk_and_row_tile % N_chunks;
+                    const int row_tile = chunk_and_row_tile / N_chunks;
+                    const int row0 = row_tile * row_tile_width;
+                    const int tile_rows = std::min(row_tile_width, M - row0);
+                    const int kb_start = kt * k_blocks_per_tile;
+                    const int kb_end =
+                        std::min(kb_start + k_blocks_per_tile, K_blocks);
+                    auto partial_for_row = [&](int row)
                     {
-                        const int kt = task % k_tiles;
-                        const int chunk = task / k_tiles;
-                        const int kb_start = kt * k_blocks_per_tile;
-                        const int kb_end =
-                            std::min(kb_start + k_blocks_per_tile, K_blocks);
-                        float *dst0 =
-                            partial_sums +
-                            ((static_cast<size_t>(chunk) * k_tiles) + kt) * 64;
-                        float *dst1 =
-                            partial_sums +
-                            (((static_cast<size_t>(N_chunks) + chunk) *
-                              k_tiles) +
-                             kt) *
-                                64;
-                        float *dst2 = nullptr;
-                        float *dst3 = nullptr;
-                        if (M >= 3)
-                        {
-                            dst2 =
-                                partial_sums +
-                                (((static_cast<size_t>(2) * N_chunks + chunk) *
-                                  k_tiles) +
-                                 kt) *
-                                    64;
-                        }
-                        if (M >= 4)
-                        {
-                            dst3 =
-                                partial_sums +
-                                (((static_cast<size_t>(3) * N_chunks + chunk) *
-                                  k_tiles) +
-                                 kt) *
-                                    64;
-                        }
+                        return partial_sums +
+                               (((static_cast<size_t>(row) * N_chunks + chunk) *
+                                 k_tiles) +
+                                kt) *
+                                   64;
+                    };
 
-                        const Q8_1Block *row0_q8 = A_q8_all;
-                        const Q8_1Block *row1_q8 = A_q8_all + K_blocks;
-                        const Q8_1Block *row2_q8 =
-                            A_q8_all + static_cast<size_t>(2) * K_blocks;
-                        const Q8_1Block *row3_q8 =
-                            A_q8_all + static_cast<size_t>(3) * K_blocks;
+                    const Q8_1Block *row0_q8 =
+                        A_q8_all + static_cast<size_t>(row0) * K_blocks;
+                    float *dst0 = partial_for_row(row0);
 
-                        if (M == 2)
+                    if (tile_rows >= 2)
+                    {
+                        const Q8_1Block *row1_q8 = row0_q8 + K_blocks;
+                        float *dst1 = partial_for_row(row0 + 1);
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        if (use_avx512 && tile_rows == 4)
                         {
-                            if (packed.is_nibble_lut)
-                                gemm_2row_native_chunk(
-                                    packed, row0_q8, row1_q8, dst0, dst1,
-                                    chunk, kb_start, kb_end, decode_lut_512,
-                                    /*accumulate=*/false);
-                            else
-                                gemm_2row_int8_chunk(
-                                    packed, row0_q8, row1_q8, dst0, dst1,
-                                    chunk, kb_start, kb_end,
-                                    /*accumulate=*/false);
-                        }
-                        else if (M == 3)
-                        {
-                            if (packed.is_nibble_lut)
-                                gemm_3row_native_2z_chunk(
-                                    packed, row0_q8, row1_q8, row2_q8, dst0,
-                                    dst1, dst2, chunk, kb_start, kb_end,
-                                    decode_lut_512, /*accumulate=*/false);
-                            else
-                                gemm_3row_int8_2z_chunk(
-                                    packed, row0_q8, row1_q8, row2_q8, dst0,
-                                    dst1, dst2, chunk, kb_start, kb_end,
-                                    /*accumulate=*/false);
-                        }
-                        else
-                        {
+                            const Q8_1Block *row2_q8 = row1_q8 + K_blocks;
+                            const Q8_1Block *row3_q8 = row2_q8 + K_blocks;
+                            float *dst2 = partial_for_row(row0 + 2);
+                            float *dst3 = partial_for_row(row0 + 3);
                             if (packed.is_nibble_lut)
                                 gemm_4row_native_2z_chunk(
                                     packed, row0_q8, row1_q8, row2_q8,
@@ -2486,54 +2649,75 @@ namespace llaminar2::cpu::native_vnni
                                     packed, row0_q8, row1_q8, row2_q8,
                                     row3_q8, dst0, dst1, dst2, dst3, chunk,
                                     kb_start, kb_end, /*accumulate=*/false);
+                            continue;
                         }
-                    }
-                }
-                else
+                        if (use_avx512 && tile_rows == 3)
+                        {
+                            const Q8_1Block *row2_q8 = row1_q8 + K_blocks;
+                            float *dst2 = partial_for_row(row0 + 2);
+                            if (packed.is_nibble_lut)
+                                gemm_3row_native_2z_chunk(
+                                    packed, row0_q8, row1_q8, row2_q8, dst0,
+                                    dst1, dst2, chunk, kb_start, kb_end,
+                                    decode_lut_512, /*accumulate=*/false);
+                            else
+                                gemm_3row_int8_2z_chunk(
+                                    packed, row0_q8, row1_q8, row2_q8, dst0,
+                                    dst1, dst2, chunk, kb_start, kb_end,
+                                    /*accumulate=*/false);
+                            continue;
+                        }
+                        if (use_avx512)
+                        {
+                            if (packed.is_nibble_lut)
+                                gemm_2row_native_chunk(
+                                    packed, row0_q8, row1_q8, dst0, dst1,
+                                    chunk, kb_start, kb_end, decode_lut_512,
+                                    /*accumulate=*/false);
+                            else
+                                gemm_2row_int8_chunk(
+                                    packed, row0_q8, row1_q8, dst0, dst1,
+                                    chunk, kb_start, kb_end,
+                                    /*accumulate=*/false);
+                            continue;
+                        }
 #endif
-                {
-                const int total_tile_tasks = M * N_chunks * k_tiles;
-#pragma omp for schedule(static)
-                for (int task = 0; task < total_tile_tasks; ++task)
-                {
-                    const int kt = task % k_tiles;
-                    const int chunk = (task / k_tiles) % N_chunks;
-                    const int row = task / (N_chunks * k_tiles);
-                    const Q8_1Block *row_q8 =
-                        A_q8_all + static_cast<size_t>(row) * K_blocks;
-                    const int kb_start = kt * k_blocks_per_tile;
-                    const int kb_end =
-                        std::min(kb_start + k_blocks_per_tile, K_blocks);
-                    float *dest =
-                        partial_sums +
-                        (((static_cast<size_t>(row) * N_chunks + chunk) *
-                          k_tiles) +
-                         kt) *
-                            64;
+                        if (packed.is_nibble_lut)
+                            gemm_2row_native_chunk_avx2(
+                                packed, row0_q8, row1_q8, dst0, dst1,
+                                chunk, kb_start, kb_end, decode_lut_256,
+                                /*accumulate=*/false);
+                        else
+                            gemm_2row_int8_chunk_avx2(
+                                packed, row0_q8, row1_q8, dst0, dst1,
+                                chunk, kb_start, kb_end,
+                                /*accumulate=*/false);
+                        continue;
+                    }
 
                     if (use_avx512)
                     {
 #if defined(__AVX512F__)
                         if (packed.is_nibble_lut)
                             gemv_native_vnni_avx512_chunk_native(
-                                packed, row_q8, dest, chunk, kb_start, kb_end,
+                                packed, row0_q8, dst0, chunk, kb_start, kb_end,
                                 decode_lut_512);
                         else
                             gemv_native_vnni_avx512_chunk_int8(
-                                packed, row_q8, dest, chunk, kb_start, kb_end);
+                                packed, row0_q8, dst0, chunk, kb_start, kb_end);
 #endif
+                    }
+                    else if (packed.is_nibble_lut)
+                    {
+                        gemv_avx2_chunk_native(
+                            packed, row0_q8, dst0, chunk, kb_start, kb_end,
+                            decode_lut_256);
                     }
                     else
                     {
-                        if (packed.is_nibble_lut)
-                            gemv_avx2_chunk_native(
-                                packed, row_q8, dest, chunk, kb_start, kb_end,
-                                decode_lut_256);
-                        else
-                            gemv_avx2_chunk_int8(
-                                packed, row_q8, dest, chunk, kb_start, kb_end);
+                        gemv_avx2_chunk_int8(
+                            packed, row0_q8, dst0, chunk, kb_start, kb_end);
                     }
-                }
                 }
 
 #pragma omp for schedule(static)
@@ -2548,81 +2732,8 @@ namespace llaminar2::cpu::native_vnni
                         (static_cast<size_t>(row) * N_chunks + chunk) *
                             k_tiles * 64;
                     float *dst = C + static_cast<size_t>(row) * ldc + n_start;
-#if defined(__AVX512F__)
-                    __m512 sum0 = _mm512_loadu_ps(base);
-                    __m512 sum1 = _mm512_loadu_ps(base + 16);
-                    __m512 sum2 = _mm512_loadu_ps(base + 32);
-                    __m512 sum3 = _mm512_loadu_ps(base + 48);
-                    for (int kt = 1; kt < k_tiles; ++kt)
-                    {
-                        const float *src = base + static_cast<size_t>(kt) * 64;
-                        sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(src));
-                        sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(src + 16));
-                        sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32));
-                        sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48));
-                    }
-                    if (n_cols < 64)
-                    {
-                        alignas(64) float tmp[64];
-                        _mm512_store_ps(tmp, sum0);
-                        _mm512_store_ps(tmp + 16, sum1);
-                        _mm512_store_ps(tmp + 32, sum2);
-                        _mm512_store_ps(tmp + 48, sum3);
-                        std::memcpy(dst, tmp, static_cast<size_t>(n_cols) * sizeof(float));
-                    }
-                    else
-                    {
-                        _mm512_storeu_ps(dst, sum0);
-                        _mm512_storeu_ps(dst + 16, sum1);
-                        _mm512_storeu_ps(dst + 32, sum2);
-                        _mm512_storeu_ps(dst + 48, sum3);
-                    }
-#else
-                    __m256 s0 = _mm256_loadu_ps(base);
-                    __m256 s1 = _mm256_loadu_ps(base + 8);
-                    __m256 s2 = _mm256_loadu_ps(base + 16);
-                    __m256 s3 = _mm256_loadu_ps(base + 24);
-                    __m256 s4 = _mm256_loadu_ps(base + 32);
-                    __m256 s5 = _mm256_loadu_ps(base + 40);
-                    __m256 s6 = _mm256_loadu_ps(base + 48);
-                    __m256 s7 = _mm256_loadu_ps(base + 56);
-                    for (int kt = 1; kt < k_tiles; ++kt)
-                    {
-                        const float *src = base + static_cast<size_t>(kt) * 64;
-                        s0 = _mm256_add_ps(s0, _mm256_loadu_ps(src));
-                        s1 = _mm256_add_ps(s1, _mm256_loadu_ps(src + 8));
-                        s2 = _mm256_add_ps(s2, _mm256_loadu_ps(src + 16));
-                        s3 = _mm256_add_ps(s3, _mm256_loadu_ps(src + 24));
-                        s4 = _mm256_add_ps(s4, _mm256_loadu_ps(src + 32));
-                        s5 = _mm256_add_ps(s5, _mm256_loadu_ps(src + 40));
-                        s6 = _mm256_add_ps(s6, _mm256_loadu_ps(src + 48));
-                        s7 = _mm256_add_ps(s7, _mm256_loadu_ps(src + 56));
-                    }
-                    if (n_cols < 64)
-                    {
-                        alignas(64) float tmp[64];
-                        _mm256_store_ps(tmp, s0);
-                        _mm256_store_ps(tmp + 8, s1);
-                        _mm256_store_ps(tmp + 16, s2);
-                        _mm256_store_ps(tmp + 24, s3);
-                        _mm256_store_ps(tmp + 32, s4);
-                        _mm256_store_ps(tmp + 40, s5);
-                        _mm256_store_ps(tmp + 48, s6);
-                        _mm256_store_ps(tmp + 56, s7);
-                        std::memcpy(dst, tmp, static_cast<size_t>(n_cols) * sizeof(float));
-                    }
-                    else
-                    {
-                        _mm256_storeu_ps(dst, s0);
-                        _mm256_storeu_ps(dst + 8, s1);
-                        _mm256_storeu_ps(dst + 16, s2);
-                        _mm256_storeu_ps(dst + 24, s3);
-                        _mm256_storeu_ps(dst + 32, s4);
-                        _mm256_storeu_ps(dst + 40, s5);
-                        _mm256_storeu_ps(dst + 48, s6);
-                        _mm256_storeu_ps(dst + 56, s7);
-                    }
-#endif
+                    reduceNativeVNNIKTilePartialsExact(
+                        base, dst, n_cols, k_tiles, use_avx512);
                 }
             };
             OMP_WORKSHARE_REGION(do_kpar_partial_rows);
@@ -2633,204 +2744,127 @@ namespace llaminar2::cpu::native_vnni
         const int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-        if (use_avx512 && M == 3 && use_wide_rows)
+        if (use_avx512 && M >= 3 && use_wide_rows)
         {
-            auto do_three_rows = [&]()
+            /*
+             * Compose arbitrary runtime M from bounded four-row physical
+             * tiles. A final 1/2/3-row tile uses the matching serial-shaped
+             * chunk kernel, so M changes neither K order nor output layout.
+             */
+            const int row_tile_count = (M + 3) / 4;
+            const int total_wide_tasks = row_tile_count * total_blocks;
+            auto do_wide_rows = [&]()
             {
 #pragma omp for schedule(static)
-                for (int block_idx = 0; block_idx < total_blocks; ++block_idx)
+                for (int task = 0; task < total_wide_tasks; ++task)
                 {
+                    const int block_idx = task / row_tile_count;
+                    const int row_tile = task % row_tile_count;
+                    const int first_row = row_tile * 4;
+                    const int tile_rows = std::min(4, M - first_row);
                     const int chunk_start = block_idx * n_block_chunks;
-                    const int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
-                    const Q8_1Block *row0_q8 = A_q8_all;
-                    const Q8_1Block *row1_q8 = A_q8_all + K_blocks;
-                    const Q8_1Block *row2_q8 = A_q8_all + static_cast<size_t>(2) * K_blocks;
-                    float *row0_out = C;
-                    float *row1_out = C + static_cast<size_t>(ldc);
-                    float *row2_out = C + static_cast<size_t>(2) * ldc;
+                    const int chunk_count =
+                        std::min(n_block_chunks, N_chunks - chunk_start);
+
+                    const Q8_1Block *row_q8[4] = {};
+                    float *row_output[4] = {};
+                    for (int row = 0; row < tile_rows; ++row)
+                    {
+                        row_q8[row] =
+                            A_q8_all +
+                            static_cast<size_t>(first_row + row) * K_blocks;
+                        row_output[row] =
+                            C + static_cast<size_t>(first_row + row) * ldc;
+                    }
 
                     for (int ci = 0; ci < chunk_count; ++ci)
                     {
                         const int chunk = chunk_start + ci;
                         const int n_start = chunk * 64;
                         const int n_cols = std::min(64, N - n_start);
-                        float *c0 = row0_out + n_start;
-                        float *c1 = row1_out + n_start;
-                        float *c2 = row2_out + n_start;
-                        float *dst0 = c0;
-                        float *dst1 = c1;
-                        float *dst2 = c2;
-                        alignas(64) float tmp0[64];
-                        alignas(64) float tmp1[64];
-                        alignas(64) float tmp2[64];
-                        if (n_cols < 64)
+                        float *compact_output[4] = {};
+                        float *kernel_output[4] = {};
+                        alignas(64) float tail_output[4][64];
+                        for (int row = 0; row < tile_rows; ++row)
                         {
-                            dst0 = tmp0;
-                            dst1 = tmp1;
-                            dst2 = tmp2;
+                            compact_output[row] = row_output[row] + n_start;
+                            kernel_output[row] =
+                                n_cols == 64 ? compact_output[row]
+                                             : tail_output[row];
                         }
 
-                        if (packed.is_nibble_lut)
+                        if (tile_rows == 4)
                         {
-                            gemm_3row_native_2z_chunk(
-                                packed,
-                                row0_q8,
-                                row1_q8,
-                                row2_q8,
-                                dst0,
-                                dst1,
-                                dst2,
-                                chunk,
-                                0,
-                                K_blocks,
-                                decode_lut_512,
-                                /*accumulate=*/false);
+                            if (packed.is_nibble_lut)
+                                gemm_4row_native_2z_chunk(
+                                    packed, row_q8[0], row_q8[1], row_q8[2],
+                                    row_q8[3], kernel_output[0], kernel_output[1],
+                                    kernel_output[2], kernel_output[3], chunk, 0,
+                                    K_blocks, decode_lut_512,
+                                    /*accumulate=*/false);
+                            else
+                                gemm_4row_int8_2z_chunk(
+                                    packed, row_q8[0], row_q8[1], row_q8[2],
+                                    row_q8[3], kernel_output[0], kernel_output[1],
+                                    kernel_output[2], kernel_output[3], chunk, 0,
+                                    K_blocks, /*accumulate=*/false);
+                        }
+                        else if (tile_rows == 3)
+                        {
+                            if (packed.is_nibble_lut)
+                                gemm_3row_native_2z_chunk(
+                                    packed, row_q8[0], row_q8[1], row_q8[2],
+                                    kernel_output[0], kernel_output[1],
+                                    kernel_output[2], chunk, 0, K_blocks,
+                                    decode_lut_512, /*accumulate=*/false);
+                            else
+                                gemm_3row_int8_2z_chunk(
+                                    packed, row_q8[0], row_q8[1], row_q8[2],
+                                    kernel_output[0], kernel_output[1],
+                                    kernel_output[2], chunk, 0, K_blocks,
+                                    /*accumulate=*/false);
+                        }
+                        else if (tile_rows == 2)
+                        {
+                            if (packed.is_nibble_lut)
+                                gemm_2row_native_chunk(
+                                    packed, row_q8[0], row_q8[1],
+                                    kernel_output[0], kernel_output[1], chunk,
+                                    0, K_blocks, decode_lut_512,
+                                    /*accumulate=*/false);
+                            else
+                                gemm_2row_int8_chunk(
+                                    packed, row_q8[0], row_q8[1],
+                                    kernel_output[0], kernel_output[1], chunk,
+                                    0, K_blocks, /*accumulate=*/false);
+                        }
+                        else if (packed.is_nibble_lut)
+                        {
+                            gemv_native_vnni_avx512_chunk_native(
+                                packed, row_q8[0], kernel_output[0], chunk, 0,
+                                K_blocks, decode_lut_512);
                         }
                         else
                         {
-                            gemm_3row_int8_2z_chunk(
-                                packed,
-                                row0_q8,
-                                row1_q8,
-                                row2_q8,
-                                dst0,
-                                dst1,
-                                dst2,
-                                chunk,
-                                0,
-                                K_blocks,
-                                /*accumulate=*/false);
+                            gemv_native_vnni_avx512_chunk_int8(
+                                packed, row_q8[0], kernel_output[0], chunk, 0,
+                                K_blocks);
                         }
 
                         if (n_cols < 64)
                         {
-                            std::memcpy(c0, tmp0, static_cast<size_t>(n_cols) * sizeof(float));
-                            std::memcpy(c1, tmp1, static_cast<size_t>(n_cols) * sizeof(float));
-                            std::memcpy(c2, tmp2, static_cast<size_t>(n_cols) * sizeof(float));
+                            for (int row = 0; row < tile_rows; ++row)
+                            {
+                                std::memcpy(
+                                    compact_output[row],
+                                    tail_output[row],
+                                    static_cast<size_t>(n_cols) * sizeof(float));
+                            }
                         }
                     }
                 }
             };
-            OMP_WORKSHARE_REGION(do_three_rows);
-            return;
-        }
-
-        if (use_avx512 && M == 4 && use_wide_rows)
-        {
-            auto do_four_rows = [&]()
-            {
-#pragma omp for schedule(static)
-                for (int block_idx = 0; block_idx < total_blocks; ++block_idx)
-                {
-                    const int chunk_start = block_idx * n_block_chunks;
-                    const int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
-                    const Q8_1Block *row0_q8 = A_q8_all;
-                    const Q8_1Block *row1_q8 = A_q8_all + K_blocks;
-                    const Q8_1Block *row2_q8 = A_q8_all + static_cast<size_t>(2) * K_blocks;
-                    const Q8_1Block *row3_q8 = A_q8_all + static_cast<size_t>(3) * K_blocks;
-                    float *row0_out = C;
-                    float *row1_out = C + static_cast<size_t>(ldc);
-                    float *row2_out = C + static_cast<size_t>(2) * ldc;
-                    float *row3_out = C + static_cast<size_t>(3) * ldc;
-
-                    for (int ci = 0; ci < chunk_count; ++ci)
-                    {
-                        const int chunk = chunk_start + ci;
-                        const int n_start = chunk * 64;
-                        const int n_cols = std::min(64, N - n_start);
-                        float *c0 = row0_out + n_start;
-                        float *c1 = row1_out + n_start;
-                        float *c2 = row2_out + n_start;
-                        float *c3 = row3_out + n_start;
-                        float *dst0 = c0;
-                        float *dst1 = c1;
-                        float *dst2 = c2;
-                        float *dst3 = c3;
-                        alignas(64) float tmp0[64];
-                        alignas(64) float tmp1[64];
-                        alignas(64) float tmp2[64];
-                        alignas(64) float tmp3[64];
-                        if (n_cols < 64)
-                        {
-                            dst0 = tmp0;
-                            dst1 = tmp1;
-                            dst2 = tmp2;
-                            dst3 = tmp3;
-                        }
-
-                        const bool use_four_row_native = packed.is_nibble_lut;
-                        if (use_four_row_native)
-                        {
-                            gemm_4row_native_2z_chunk(
-                                packed,
-                                row0_q8,
-                                row1_q8,
-                                row2_q8,
-                                row3_q8,
-                                dst0,
-                                dst1,
-                                dst2,
-                                dst3,
-                                chunk,
-                                0,
-                                K_blocks,
-                                decode_lut_512,
-                                /*accumulate=*/false);
-                        }
-                        else if (!packed.is_nibble_lut)
-                        {
-                            gemm_4row_int8_2z_chunk(
-                                packed,
-                                row0_q8,
-                                row1_q8,
-                                row2_q8,
-                                row3_q8,
-                                dst0,
-                                dst1,
-                                dst2,
-                                dst3,
-                                chunk,
-                                0,
-                                K_blocks,
-                                /*accumulate=*/false);
-                        }
-                        else
-                        {
-                            gemm_2row_native_chunk(
-                                packed,
-                                row0_q8,
-                                row1_q8,
-                                dst0,
-                                dst1,
-                                chunk,
-                                0,
-                                K_blocks,
-                                decode_lut_512,
-                                /*accumulate=*/false);
-                            gemm_2row_native_chunk(
-                                packed,
-                                row2_q8,
-                                row3_q8,
-                                dst2,
-                                dst3,
-                                chunk,
-                                0,
-                                K_blocks,
-                                decode_lut_512,
-                                /*accumulate=*/false);
-                        }
-
-                        if (n_cols < 64)
-                        {
-                            std::memcpy(c0, tmp0, static_cast<size_t>(n_cols) * sizeof(float));
-                            std::memcpy(c1, tmp1, static_cast<size_t>(n_cols) * sizeof(float));
-                            std::memcpy(c2, tmp2, static_cast<size_t>(n_cols) * sizeof(float));
-                            std::memcpy(c3, tmp3, static_cast<size_t>(n_cols) * sizeof(float));
-                        }
-                    }
-                }
-            };
-            OMP_WORKSHARE_REGION(do_four_rows);
+            OMP_WORKSHARE_REGION(do_wide_rows);
             return;
         }
 #endif
@@ -2983,9 +3017,9 @@ namespace llaminar2::cpu::native_vnni
      *
      * All descriptors share the same pre-quantized activation rows.  Each
      * projection keeps its own packed weight matrix, output stride, and optional
-     * bias.  The helper below schedules M=2..4 verifier rows for several
-     * projections in one OpenMP region while preserving the exact M=1 GEMV
-     * chunk kernels used by serial decode.
+     * bias. The helper below schedules arbitrary runtime-M verifier rows for
+     * several projections in one OpenMP region while preserving the exact M=1
+     * GEMV chunk kernels used by serial decode.
      */
     struct FusedVerifierRowsDesc
     {
@@ -2997,19 +3031,20 @@ namespace llaminar2::cpu::native_vnni
     };
 
     /**
-     * @brief Fused multi-projection M=2..4 verifier rows.
+     * @brief Fused multi-projection runtime-M verifier rows.
      *
      * This is the projection-bundle analogue of
-     * gemm_native_vnni_preq_decode_equivalent_rows().  It does not use the
-     * regular M>1 GEMM microkernels; every output row is still computed by the
-     * same per-row GEMV block function as serial decode.  The economy win comes
-     * from grouping projections and rows under one OpenMP team and using
-     * nowait scheduling between projections.
+     * gemm_native_vnni_preq_decode_equivalent_rows(). Full-K projections use
+     * two-row physical tiles, while long-K projections use two-row AVX2 or
+     * four-row AVX512 tiles. Each tile shares packed-weight decode work across
+     * independent row accumulators without changing any row's K traversal.
+     * K-parallel partials are reduced through
+     * reduceNativeVNNIKTilePartialsExact(), so grouped and serial decode add
+     * tile partials in identical order.
      *
-     * K-parallel GEMV shapes are intentionally not handled here yet because the
-     * partial-sum reduction order must remain identical to serial decode.  The
-     * caller should use gemm_native_vnni_preq_decode_equivalent_rows() for those
-     * single-projection or K-parallel cases.
+     * All descriptors execute under one OpenMP team. This avoids per-projection
+     * fork/join overhead while preserving each projection's own codebook,
+     * output stride, bias, and tail-column handling.
      */
     inline bool gemm_native_vnni_fused_verifier_rows_preq(
         const Q8_1Block *A_q8_all,
@@ -3019,7 +3054,7 @@ namespace llaminar2::cpu::native_vnni
         int K_blocks,
         ISAPath isa_path = ISAPath::AUTO)
     {
-        if (!A_q8_all || !descs || num_descs <= 0 || M <= 1 || M > 4 || K_blocks <= 0)
+        if (!A_q8_all || !descs || num_descs <= 0 || M <= 1 || K_blocks <= 0)
             return false;
 
         const int num_threads = omp_get_max_threads();
@@ -3091,6 +3126,41 @@ namespace llaminar2::cpu::native_vnni
                 fused_partial_sum_floats += plan.partial_sums_size;
             }
         }
+
+        if (PerfStatsCollector::isEnabled())
+        {
+            const char *effective_isa =
+                use_avx512 ? "AVX512" : (use_avx2 ? "AVX2" : "Scalar");
+            for (int p = 0; p < num_descs; ++p)
+            {
+                const auto &plan = plans[static_cast<size_t>(p)];
+                const bool grouped_k_parallel =
+                    plan.k_tiles > 1 && (use_avx512 || use_avx2);
+                const int physical_row_tile =
+                    grouped_k_parallel ? (use_avx512 ? 4 : 2)
+                                       : ((use_avx512 || use_avx2) ? 2 : 1);
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_fused_verifier_rows_projection_launch",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(M)},
+                        {"n", std::to_string(descs[p].N)},
+                        {"k", std::to_string(descs[p].packed->K)},
+                        {"codebook", std::to_string(descs[p].packed->codebook_id)},
+                        {"projection", std::to_string(p)},
+                        {"isa", effective_isa},
+                        {"k_tiles", std::to_string(plan.k_tiles)},
+                        {"physical_row_tile", std::to_string(physical_row_tile)},
+                        {"route", grouped_k_parallel
+                                      ? "grouped_k_parallel_row_tiles"
+                                      : ((use_avx512 || use_avx2)
+                                             ? "grouped_full_k_pair_tiles"
+                                             : "scalar_diagnostic")}});
+            }
+        }
         /*
          * Every K-tile partial is overwritten before reduction.  A single
          * thread-local arena avoids repeated per-projection allocations while
@@ -3130,7 +3200,7 @@ namespace llaminar2::cpu::native_vnni
                         ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
                         : _mm256_setzero_si256();
 
-                if (plan.k_tiles > 1)
+                if (plan.k_tiles > 1 && (use_avx512 || use_avx2))
                 {
                     /*
                      * Long-K fused verifier projections need K-parallel work
@@ -3144,84 +3214,56 @@ namespace llaminar2::cpu::native_vnni
                     float *partial_sums =
                         fused_partial_sums_base + plan.partial_sums_offset;
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                    if (use_avx512 && M >= 2 && M <= 4)
-                    {
-                        const int total_shared_tile_tasks = N_chunks * k_tiles;
+                    /*
+                     * Compose a fixed physical row tile across the complete
+                     * runtime M. AVX2 shares each decoded B chunk across two
+                     * rows; AVX512 shares it across up to four. The final tile
+                     * uses the matching 1/2/3-row kernel, so M=5..31 and larger
+                     * configured capacities never degrade into independent
+                     * one-row K-part tasks.
+                     */
+                    const int row_tile_width = use_avx512 ? 4 : 2;
+                    const int row_tile_count =
+                        (M + row_tile_width - 1) / row_tile_width;
+                    const int total_shared_tile_tasks =
+                        row_tile_count * N_chunks * k_tiles;
 #pragma omp for schedule(static)
-                        for (int task = 0; task < total_shared_tile_tasks; ++task)
+                    for (int task = 0; task < total_shared_tile_tasks; ++task)
+                    {
+                        const int kt = task % k_tiles;
+                        const int chunk_and_row_tile = task / k_tiles;
+                        const int chunk = chunk_and_row_tile % N_chunks;
+                        const int row_tile = chunk_and_row_tile / N_chunks;
+                        const int row0 = row_tile * row_tile_width;
+                        const int tile_rows =
+                            std::min(row_tile_width, M - row0);
+                        const int kb_start = kt * k_blocks_per_tile;
+                        const int kb_end =
+                            std::min(kb_start + k_blocks_per_tile, K_blocks);
+                        auto partial_for_row = [&](int row)
                         {
-                            const int kt = task % k_tiles;
-                            const int chunk = task / k_tiles;
-                            const int kb_start = kt * k_blocks_per_tile;
-                            const int kb_end =
-                                std::min(kb_start + k_blocks_per_tile, K_blocks);
-                            float *dst0 =
-                                partial_sums +
-                                ((static_cast<size_t>(chunk) * k_tiles) + kt) * 64;
-                            float *dst1 =
-                                partial_sums +
-                                (((static_cast<size_t>(N_chunks) + chunk) *
-                                  k_tiles) +
-                                 kt) *
-                                    64;
-                            float *dst2 = nullptr;
-                            float *dst3 = nullptr;
-                            if (M >= 3)
-                            {
-                                dst2 =
-                                    partial_sums +
-                                    (((static_cast<size_t>(2) * N_chunks + chunk) *
-                                      k_tiles) +
-                                     kt) *
-                                        64;
-                            }
-                            if (M >= 4)
-                            {
-                                dst3 =
-                                    partial_sums +
-                                    (((static_cast<size_t>(3) * N_chunks + chunk) *
-                                      k_tiles) +
-                                     kt) *
-                                        64;
-                            }
+                            return partial_sums +
+                                   (((static_cast<size_t>(row) * N_chunks + chunk) *
+                                     k_tiles) +
+                                    kt) *
+                                       64;
+                        };
 
-                            const Q8_1Block *row0_q8 = A_q8_all;
-                            const Q8_1Block *row1_q8 = A_q8_all + K_blocks;
-                            const Q8_1Block *row2_q8 =
-                                A_q8_all + static_cast<size_t>(2) * K_blocks;
-                            const Q8_1Block *row3_q8 =
-                                A_q8_all + static_cast<size_t>(3) * K_blocks;
+                        const Q8_1Block *row0_q8 =
+                            A_q8_all + static_cast<size_t>(row0) * K_blocks;
+                        float *dst0 = partial_for_row(row0);
+                        if (tile_rows >= 2)
+                        {
+                            const Q8_1Block *row1_q8 = row0_q8 + K_blocks;
+                            float *dst1 = partial_for_row(row0 + 1);
 
-                            if (M == 2)
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            if (use_avx512 && tile_rows == 4)
                             {
-                                if (packed.is_nibble_lut)
-                                    gemm_2row_native_chunk(
-                                        packed, row0_q8, row1_q8, dst0, dst1,
-                                        chunk, kb_start, kb_end,
-                                        decode_lut_512, /*accumulate=*/false);
-                                else
-                                    gemm_2row_int8_chunk(
-                                        packed, row0_q8, row1_q8, dst0, dst1,
-                                        chunk, kb_start, kb_end,
-                                        /*accumulate=*/false);
-                            }
-                            else if (M == 3)
-                            {
-                                if (packed.is_nibble_lut)
-                                    gemm_3row_native_2z_chunk(
-                                        packed, row0_q8, row1_q8, row2_q8,
-                                        dst0, dst1, dst2, chunk, kb_start,
-                                        kb_end, decode_lut_512,
-                                        /*accumulate=*/false);
-                                else
-                                    gemm_3row_int8_2z_chunk(
-                                        packed, row0_q8, row1_q8, row2_q8,
-                                        dst0, dst1, dst2, chunk, kb_start,
-                                        kb_end, /*accumulate=*/false);
-                            }
-                            else
-                            {
+                                const Q8_1Block *row2_q8 = row1_q8 + K_blocks;
+                                const Q8_1Block *row3_q8 = row2_q8 + K_blocks;
+                                float *dst2 = partial_for_row(row0 + 2);
+                                float *dst3 = partial_for_row(row0 + 3);
                                 if (packed.is_nibble_lut)
                                     gemm_4row_native_2z_chunk(
                                         packed, row0_q8, row1_q8, row2_q8,
@@ -3234,55 +3276,77 @@ namespace llaminar2::cpu::native_vnni
                                         row3_q8, dst0, dst1, dst2, dst3,
                                         chunk, kb_start, kb_end,
                                         /*accumulate=*/false);
+                                continue;
                             }
-                        }
-                    }
-                    else
-#endif
-                    {
-                        const int total_tile_tasks = M * N_chunks * k_tiles;
-#pragma omp for schedule(static)
-                        for (int task = 0; task < total_tile_tasks; ++task)
-                        {
-                            const int kt = task % k_tiles;
-                            const int chunk = (task / k_tiles) % N_chunks;
-                            const int row = task / (N_chunks * k_tiles);
-                            const Q8_1Block *row_q8 =
-                                A_q8_all + static_cast<size_t>(row) * K_blocks;
-                            const int kb_start = kt * k_blocks_per_tile;
-                            const int kb_end =
-                                std::min(kb_start + k_blocks_per_tile, K_blocks);
-                            float *dest =
-                                partial_sums +
-                                (((static_cast<size_t>(row) * N_chunks + chunk) *
-                                  k_tiles) +
-                                 kt) *
-                                    64;
-
+                            if (use_avx512 && tile_rows == 3)
+                            {
+                                const Q8_1Block *row2_q8 = row1_q8 + K_blocks;
+                                float *dst2 = partial_for_row(row0 + 2);
+                                if (packed.is_nibble_lut)
+                                    gemm_3row_native_2z_chunk(
+                                        packed, row0_q8, row1_q8, row2_q8,
+                                        dst0, dst1, dst2, chunk, kb_start,
+                                        kb_end, decode_lut_512,
+                                        /*accumulate=*/false);
+                                else
+                                    gemm_3row_int8_2z_chunk(
+                                        packed, row0_q8, row1_q8, row2_q8,
+                                        dst0, dst1, dst2, chunk, kb_start,
+                                        kb_end, /*accumulate=*/false);
+                                continue;
+                            }
                             if (use_avx512)
                             {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
                                 if (packed.is_nibble_lut)
-                                    gemv_native_vnni_avx512_chunk_native(
-                                        packed, row_q8, dest, chunk, kb_start,
-                                        kb_end, decode_lut_512);
+                                    gemm_2row_native_chunk(
+                                        packed, row0_q8, row1_q8, dst0, dst1,
+                                        chunk, kb_start, kb_end,
+                                        decode_lut_512, /*accumulate=*/false);
                                 else
-                                    gemv_native_vnni_avx512_chunk_int8(
-                                        packed, row_q8, dest, chunk, kb_start,
-                                        kb_end);
+                                    gemm_2row_int8_chunk(
+                                        packed, row0_q8, row1_q8, dst0, dst1,
+                                        chunk, kb_start, kb_end,
+                                        /*accumulate=*/false);
+                                continue;
+                            }
 #endif
-                            }
+                            if (packed.is_nibble_lut)
+                                gemm_2row_native_chunk_avx2(
+                                    packed, row0_q8, row1_q8, dst0, dst1,
+                                    chunk, kb_start, kb_end, decode_lut_256,
+                                    /*accumulate=*/false);
                             else
-                            {
-                                if (packed.is_nibble_lut)
-                                    gemv_avx2_chunk_native(
-                                        packed, row_q8, dest, chunk, kb_start,
-                                        kb_end, decode_lut_256);
-                                else
-                                    gemv_avx2_chunk_int8(
-                                        packed, row_q8, dest, chunk, kb_start,
-                                        kb_end);
-                            }
+                                gemm_2row_int8_chunk_avx2(
+                                    packed, row0_q8, row1_q8, dst0, dst1,
+                                    chunk, kb_start, kb_end,
+                                    /*accumulate=*/false);
+                            continue;
+                        }
+
+                        if (use_avx512)
+                        {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            if (packed.is_nibble_lut)
+                                gemv_native_vnni_avx512_chunk_native(
+                                    packed, row0_q8, dst0, chunk, kb_start,
+                                    kb_end, decode_lut_512);
+                            else
+                                gemv_native_vnni_avx512_chunk_int8(
+                                    packed, row0_q8, dst0, chunk, kb_start,
+                                    kb_end);
+#endif
+                        }
+                        else if (packed.is_nibble_lut)
+                        {
+                            gemv_avx2_chunk_native(
+                                packed, row0_q8, dst0, chunk, kb_start,
+                                kb_end, decode_lut_256);
+                        }
+                        else
+                        {
+                            gemv_avx2_chunk_int8(
+                                packed, row0_q8, dst0, chunk, kb_start,
+                                kb_end);
                         }
                     }
 
@@ -3299,85 +3363,8 @@ namespace llaminar2::cpu::native_vnni
                                 k_tiles * 64;
                         float *dst =
                             d.output + static_cast<size_t>(row) * d.ldc + n_start;
-#if defined(__AVX512F__)
-                        __m512 sum0 = _mm512_loadu_ps(base);
-                        __m512 sum1 = _mm512_loadu_ps(base + 16);
-                        __m512 sum2 = _mm512_loadu_ps(base + 32);
-                        __m512 sum3 = _mm512_loadu_ps(base + 48);
-                        for (int kt = 1; kt < k_tiles; ++kt)
-                        {
-                            const float *src = base + static_cast<size_t>(kt) * 64;
-                            sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(src));
-                            sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(src + 16));
-                            sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(src + 32));
-                            sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(src + 48));
-                        }
-                        if (n_cols < 64)
-                        {
-                            alignas(64) float tmp[64];
-                            _mm512_store_ps(tmp, sum0);
-                            _mm512_store_ps(tmp + 16, sum1);
-                            _mm512_store_ps(tmp + 32, sum2);
-                            _mm512_store_ps(tmp + 48, sum3);
-                            std::memcpy(
-                                dst, tmp,
-                                static_cast<size_t>(n_cols) * sizeof(float));
-                        }
-                        else
-                        {
-                            _mm512_storeu_ps(dst, sum0);
-                            _mm512_storeu_ps(dst + 16, sum1);
-                            _mm512_storeu_ps(dst + 32, sum2);
-                            _mm512_storeu_ps(dst + 48, sum3);
-                        }
-#else
-                        __m256 s0 = _mm256_loadu_ps(base);
-                        __m256 s1 = _mm256_loadu_ps(base + 8);
-                        __m256 s2 = _mm256_loadu_ps(base + 16);
-                        __m256 s3 = _mm256_loadu_ps(base + 24);
-                        __m256 s4 = _mm256_loadu_ps(base + 32);
-                        __m256 s5 = _mm256_loadu_ps(base + 40);
-                        __m256 s6 = _mm256_loadu_ps(base + 48);
-                        __m256 s7 = _mm256_loadu_ps(base + 56);
-                        for (int kt = 1; kt < k_tiles; ++kt)
-                        {
-                            const float *src = base + static_cast<size_t>(kt) * 64;
-                            s0 = _mm256_add_ps(s0, _mm256_loadu_ps(src));
-                            s1 = _mm256_add_ps(s1, _mm256_loadu_ps(src + 8));
-                            s2 = _mm256_add_ps(s2, _mm256_loadu_ps(src + 16));
-                            s3 = _mm256_add_ps(s3, _mm256_loadu_ps(src + 24));
-                            s4 = _mm256_add_ps(s4, _mm256_loadu_ps(src + 32));
-                            s5 = _mm256_add_ps(s5, _mm256_loadu_ps(src + 40));
-                            s6 = _mm256_add_ps(s6, _mm256_loadu_ps(src + 48));
-                            s7 = _mm256_add_ps(s7, _mm256_loadu_ps(src + 56));
-                        }
-                        if (n_cols < 64)
-                        {
-                            alignas(64) float tmp[64];
-                            _mm256_store_ps(tmp, s0);
-                            _mm256_store_ps(tmp + 8, s1);
-                            _mm256_store_ps(tmp + 16, s2);
-                            _mm256_store_ps(tmp + 24, s3);
-                            _mm256_store_ps(tmp + 32, s4);
-                            _mm256_store_ps(tmp + 40, s5);
-                            _mm256_store_ps(tmp + 48, s6);
-                            _mm256_store_ps(tmp + 56, s7);
-                            std::memcpy(
-                                dst, tmp,
-                                static_cast<size_t>(n_cols) * sizeof(float));
-                        }
-                        else
-                        {
-                            _mm256_storeu_ps(dst, s0);
-                            _mm256_storeu_ps(dst + 8, s1);
-                            _mm256_storeu_ps(dst + 16, s2);
-                            _mm256_storeu_ps(dst + 24, s3);
-                            _mm256_storeu_ps(dst + 32, s4);
-                            _mm256_storeu_ps(dst + 40, s5);
-                            _mm256_storeu_ps(dst + 48, s6);
-                            _mm256_storeu_ps(dst + 56, s7);
-                        }
-#endif
+                        reduceNativeVNNIKTilePartialsExact(
+                            base, dst, n_cols, k_tiles, use_avx512);
                     }
 
                     if (d.bias)
@@ -3387,18 +3374,8 @@ namespace llaminar2::cpu::native_vnni
                         {
                             float *row_out =
                                 d.output + static_cast<size_t>(row) * d.ldc;
-                            int j = 0;
-#if defined(__AVX512F__)
-                            for (; j + 15 < d.N; j += 16)
-                            {
-                                __m512 v = _mm512_add_ps(
-                                    _mm512_loadu_ps(row_out + j),
-                                    _mm512_loadu_ps(d.bias + j));
-                                _mm512_storeu_ps(row_out + j, v);
-                            }
-#endif
-                            for (; j < d.N; ++j)
-                                row_out[j] += d.bias[j];
+                            addNativeVNNIBiasRow(
+                                row_out, d.bias, d.N, use_avx512);
                         }
                     }
                     continue;
@@ -3530,18 +3507,8 @@ namespace llaminar2::cpu::native_vnni
                     for (int row = 0; row < M; ++row)
                     {
                         float *row_out = d.output + static_cast<size_t>(row) * d.ldc;
-                        int j = 0;
-#if defined(__AVX512F__)
-                        for (; j + 15 < d.N; j += 16)
-                        {
-                            __m512 v = _mm512_add_ps(
-                                _mm512_loadu_ps(row_out + j),
-                                _mm512_loadu_ps(d.bias + j));
-                            _mm512_storeu_ps(row_out + j, v);
-                        }
-#endif
-                        for (; j < d.N; ++j)
-                            row_out[j] += d.bias[j];
+                        addNativeVNNIBiasRow(
+                            row_out, d.bias, d.N, use_avx512);
                     }
                 }
             }

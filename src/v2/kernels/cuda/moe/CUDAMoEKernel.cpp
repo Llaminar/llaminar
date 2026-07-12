@@ -328,10 +328,9 @@ namespace
             break;
         }
 
-        // MTP verifier prefill runs with M=1..4 rows and must be cheap enough
-        // to be the production grouped path.  The compact TM=2 template wins on
-        // CUDA for these tiny active groups because it avoids over-wide blocks
-        // while still covering the full row set through grid.y.
+        // Runtime-M verifier prefill uses fixed-size grouped tiles. The compact
+        // TM=2 template wins for very small active groups; larger groups widen
+        // the tile without changing the row-wise arithmetic contract.
         if (max_tokens_per_expert <= 4)
             return 2;
         if (max_tokens_per_expert <= 8)
@@ -369,9 +368,16 @@ namespace
         bool use_gateup_kpart,
         bool fuse_swiglu_requested,
         bool use_ordered_down_kpart,
-        bool ordered_scatter)
+        bool ordered_scatter,
+        int splitk_tile_rows)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
+        if (use_gateup_kpart || use_ordered_down_kpart)
+        {
+            tags["splitk_tile_rows"] = std::to_string(splitk_tile_rows);
+            tags["splitk_tile_count"] =
+                std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
+        }
         if (active_expert_slots > 0)
         {
             llaminar2::PerfStatsCollector::addCounter(
@@ -1061,23 +1067,6 @@ extern "C"
         int expert_id, int max_tokens, int d_model,
         int device_idx, void *stream);
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_table(
-        const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        int num_active,
-        int intermediate,
-        int d_model,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream);
-
     bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
         const float *d_hidden,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -1096,23 +1085,6 @@ extern "C"
         int num_experts,
         uint8_t codebook_id,
         int k_partitions,
-        int device_idx,
-        void *stream);
-
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
-        const float *d_hidden,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        bool hidden_prequantized,
-        int num_active,
-        int intermediate,
-        int d_model,
-        int num_experts,
-        uint8_t codebook_id,
         int device_idx,
         void *stream);
 
@@ -1136,22 +1108,6 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        float *d_output,
-        int num_active,
-        int d_model,
-        int intermediate,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream);
-
     bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
@@ -1168,23 +1124,6 @@ extern "C"
         int num_experts,
         uint8_t codebook_id,
         int k_partitions,
-        int device_idx,
-        void *stream);
-
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const void *d_runtime_layer,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        float *d_output,
-        int num_active,
-        int d_model,
-        int intermediate,
-        int num_experts,
-        uint8_t codebook_id,
         int device_idx,
         void *stream);
 
@@ -1246,6 +1185,7 @@ extern "C"
         uint32_t down_codebook_mask,
         int gateup_k_partitions,
         int down_k_partitions,
+        int splitk_tile_rows,
         int device_idx,
         void *stream);
 
@@ -1449,6 +1389,7 @@ namespace llaminar2
         invalidateRouterQ8HiddenPublication();
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
+        decode_hidden_rows_cap_ = 0;
         d_grouped_gateup_gate_partials_ = nullptr;
         d_grouped_gateup_up_partials_ = nullptr;
         grouped_gateup_kpart_active_cap_ = 0;
@@ -1648,6 +1589,7 @@ namespace llaminar2
         runtime_prefill_desc_cap_ = 0;
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
+        decode_hidden_rows_cap_ = 0;
         invalidateRouterQ8HiddenPublication();
         router_q8_gate_cache_.clear();
         next_router_q8_gate_workspace_slot_ = 0;
@@ -1911,14 +1853,18 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedGateUpDecodeCapacity(int top_k, int d_model)
+    bool CUDAMoEKernel::ensureGroupedGateUpDecodeCapacity(
+        int top_k,
+        int d_model,
+        int hidden_rows)
     {
         if (top_k <= 0 || top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            d_model <= 0 || (d_model % 32) != 0)
+            d_model <= 0 || (d_model % 32) != 0 || hidden_rows <= 0)
             return false;
 
         const bool need_growth = top_k > decode_gateup_topk_cap_ ||
                                  d_model > decode_gateup_d_model_cap_ ||
+                                 hidden_rows > decode_hidden_rows_cap_ ||
                                  !d_decode_hidden_int8_ || !d_decode_hidden_scales_;
         if (!need_growth)
             return true;
@@ -1928,11 +1874,11 @@ namespace llaminar2
         void *decode_hidden_scales = nullptr;
         const bool ok =
             bindWorkspaceBuffer(&decode_hidden_int8, MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,
-                                static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                static_cast<size_t>(hidden_rows) *
                                     static_cast<size_t>(d_model) * sizeof(int8_t),
                                 "decode hidden int8") &&
             bindWorkspaceBuffer(&decode_hidden_scales, MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
-                                static_cast<size_t>(MoEWorkspaceBuffers::kMaxVerifierRows) *
+                                static_cast<size_t>(hidden_rows) *
                                     static_cast<size_t>(blocks_per_row) * sizeof(float),
                                 "decode hidden scales");
         if (!ok)
@@ -1941,6 +1887,7 @@ namespace llaminar2
             d_decode_hidden_scales_ = nullptr;
             decode_gateup_topk_cap_ = 0;
             decode_gateup_d_model_cap_ = 0;
+            decode_hidden_rows_cap_ = 0;
             return false;
         }
 
@@ -1948,6 +1895,7 @@ namespace llaminar2
         d_decode_hidden_scales_ = static_cast<float *>(decode_hidden_scales);
         decode_gateup_topk_cap_ = top_k;
         decode_gateup_d_model_cap_ = d_model;
+        decode_hidden_rows_cap_ = hidden_rows;
         return true;
     }
 
@@ -1964,8 +1912,7 @@ namespace llaminar2
         int rows,
         bool recorded_during_capture) noexcept
     {
-        if (!source || rows <= 0 ||
-            rows > static_cast<int>(MoEWorkspaceBuffers::kMaxVerifierRows) ||
+        if (!source || rows <= 0 || rows > decode_hidden_rows_cap_ ||
             !d_decode_hidden_int8_ || !d_decode_hidden_scales_)
         {
             invalidateRouterQ8HiddenPublication();
@@ -2220,22 +2167,25 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate)
+    bool CUDAMoEKernel::ensureGroupedGateUpKPartScratchCapacity(
+        int active_slots,
+        int k_partitions,
+        int intermediate)
     {
         // Only the discrete partition counts the kpart launcher accepts are valid.
-        if (top_k <= 0 || intermediate <= 0 ||
+        if (active_slots <= 0 || intermediate <= 0 ||
             !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
               k_partitions == 16 || k_partitions == 32))
             return false;
 
         // Fast path: existing buffers already cover the requested shape.
         if (d_grouped_gateup_gate_partials_ && d_grouped_gateup_up_partials_ &&
-            grouped_gateup_kpart_active_cap_ >= top_k &&
+            grouped_gateup_kpart_active_cap_ >= active_slots &&
             grouped_gateup_kpart_partitions_cap_ >= k_partitions &&
             grouped_gateup_kpart_intermediate_cap_ >= intermediate)
             return true;
 
-        const size_t partial_count = static_cast<size_t>(top_k) *
+        const size_t partial_count = static_cast<size_t>(active_slots) *
                                      static_cast<size_t>(k_partitions) *
                                      static_cast<size_t>(intermediate);
         void *gate_partials = nullptr;
@@ -2257,7 +2207,7 @@ namespace llaminar2
 
         d_grouped_gateup_gate_partials_ = static_cast<float *>(gate_partials);
         d_grouped_gateup_up_partials_ = static_cast<float *>(up_partials);
-        grouped_gateup_kpart_active_cap_ = top_k;
+        grouped_gateup_kpart_active_cap_ = active_slots;
         grouped_gateup_kpart_partitions_cap_ = k_partitions;
         grouped_gateup_kpart_intermediate_cap_ = intermediate;
         return true;
@@ -3073,7 +3023,7 @@ namespace llaminar2
             return false;
         }
 
-        if (seq_len < 1 || seq_len > 4 || d_model <= 0 ||
+        if (seq_len < 1 || d_model <= 0 ||
             num_experts <= 0 || top_k <= 0 || top_k > num_experts)
         {
             LOG_ERROR("[" << kContext << "] invalid verifier routing shape seq_len="
@@ -3156,7 +3106,7 @@ namespace llaminar2
          */
         if (q8_router_requested)
         {
-            if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
+            if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model, seq_len))
             {
                 LOG_ERROR("[" << kContext << "] Q8 router hidden scratch unavailable");
                 return false;
@@ -3263,7 +3213,7 @@ namespace llaminar2
         markDeviceWritten(output_weights, device, stream);
         PerfStatsCollector::addCounter(
             "kernel",
-            "cuda_moe_router_decode_equivalent_small_m_calls",
+            "cuda_moe_router_decode_equivalent_runtime_m_calls",
             1.0,
             {},
             {},
@@ -5426,6 +5376,19 @@ namespace llaminar2
 
         group_active_expert_slots_ = std::min(total_slots, num_experts);
         prepared_num_experts_ = num_experts;
+        /*
+         * Runtime-M verifier batches above the compact planner's fixed work
+         * envelope use the scalable count/scan/scatter pipeline.  Publish a
+         * distinct counter so correctness tests can prove an extended-depth
+         * row batch did not accidentally reuse the M<=4 planner or skip
+         * grouping altogether.
+         */
+        PerfStatsCollector::addCounter(
+            "kernel", "cuda_moe_general_prefill_grouping_calls", 1.0, {}, {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"num_experts", std::to_string(num_experts)},
+             {"total_slots", std::to_string(total_slots)}});
         return true;
     }
 
@@ -5658,16 +5621,16 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int splitk_tile_rows =
+            std::min(seq_len, MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const int splitk_route_slots = splitk_tile_rows * top_k;
         const int active_expert_slots = group_active_expert_slots_;
         const int *d_active_expert_ids =
             (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
-        const bool use_gateup_kpart =
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        const bool use_gateup_kpart = active_expert_slots > 0;
         if (use_gateup_kpart &&
             !ensureGroupedGateUpKPartScratchCapacity(
-                total_slots,
+                splitk_route_slots,
                 debugEnv().gemm.cuda_moe_gateup_kparts,
                 intermediate))
         {
@@ -5675,17 +5638,19 @@ namespace llaminar2
                       "verifier grouped gate/up split-K scratch allocation failed");
             return false;
         }
-        const bool use_down_ordered_kpart =
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
-            d_group_original_to_grouped_ != nullptr &&
-            d_group_original_expert_ids_ != nullptr &&
-            debugEnv().gemm.cuda_moe_down_kpart_decode;
+        if (active_expert_slots > 0 &&
+            (!d_group_original_to_grouped_ || !d_group_original_expert_ids_))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "decode-equivalent grouped prefill requires ordered route maps");
+            return false;
+        }
+        const bool use_down_ordered_kpart = active_expert_slots > 0;
         if (use_down_ordered_kpart &&
             !ensureGroupedDownKPartScratchCapacity(
                 debugEnv().gemm.cuda_moe_down_kparts,
                 d_model,
-                seq_len))
+                splitk_tile_rows))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
                       "verifier grouped down split-K scratch allocation failed");
@@ -5704,7 +5669,6 @@ namespace llaminar2
             routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
         const bool reuse_router_q8_hidden =
             active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
             router_q8_reuse_block_reason == nullptr;
         if (!reuse_router_q8_hidden)
         {
@@ -5719,26 +5683,29 @@ namespace llaminar2
                  {"descriptor_source", "static_table"},
                  {"reason", active_expert_slots <= 0
                                 ? "no_active_experts"
-                                : (max_tokens_per_expert > 4
-                                       ? "not_verifier_small_m"
-                                       : router_q8_reuse_block_reason)}});
+                                : (router_q8_reuse_block_reason
+                                       ? router_q8_reuse_block_reason
+                                       : "unpublished")}});
         }
 
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         /*
-         * Ordered scatter overwrites every output element, including the shared
-         * expert identity-map case.  Only the atomic scatter fallback needs a
-         * zeroed destination before accumulation.  CUDA currently uses ordered
-         * scatter for this graph-native prefill path whenever the grouping map
-         * is present, so the explicit alias keeps the pre-zero contract aligned
-         * with ROCm and protects future atomic variants from silently skipping
-         * the clear.
+         * Ordered scatter is the only active-route publication path. Every
+         * token/column has one owner, so no floating-point atomic accumulation
+         * or destination pre-zero is involved. A participant with no local
+         * routes still publishes an all-zero contribution for the following
+         * collective; that no-work case is the sole reason to clear output.
          */
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
-        const bool scatter_overwrites_output = ordered_scatter_overwrites_output;
-        if (!scatter_overwrites_output)
+        if (active_expert_slots > 0 && !ordered_scatter_overwrites_output)
         {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "active grouped prefill routes require ordered scatter ownership");
+            return false;
+        }
+        if (active_expert_slots == 0)
+        {
+            cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
             cudaError_t err = cudaMemsetAsync(d_output, 0,
                                               static_cast<size_t>(seq_len) * d_model * sizeof(float),
                                               cuda_stream);
@@ -5761,7 +5728,9 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
-            use_down_ordered_kpart ? d_group_original_expert_ids_ : nullptr,
+            use_gateup_kpart || use_down_ordered_kpart
+                ? d_group_original_expert_ids_
+                : nullptr,
             d_active_expert_ids,
             d_group_weights_,
             d_prefill_A_int8_,
@@ -5789,6 +5758,7 @@ namespace llaminar2
             down_table.codebook_mask,
             use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
             use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
+            splitk_tile_rows,
             device_ordinal_,
             stream);
         if (!ok)
@@ -5814,7 +5784,7 @@ namespace llaminar2
         const int selected_tile_m = selectGroupedPrefillTileM(
             debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert);
         const int selected_tile_n =
-            (active_expert_slots > 0 && max_tokens_per_expert <= 4) ? 64 : 128;
+            use_gateup_kpart ? 64 : 128;
         recordGroupedPrefillCounters(
             seq_len,
             top_k,
@@ -5825,7 +5795,8 @@ namespace llaminar2
             use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
-            ordered_scatter_overwrites_output);
+            ordered_scatter_overwrites_output,
+            splitk_tile_rows);
         return true;
     }
 
@@ -5889,22 +5860,23 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int splitk_tile_rows =
+            std::min(seq_len, MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const int splitk_route_slots = splitk_tile_rows * top_k;
         const int active_expert_slots = std::min(total_slots, num_experts);
-        const bool use_gateup_kpart =
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4;
+        const bool use_gateup_kpart = active_expert_slots > 0;
         /*
          * Runtime grouped verifier prefill must mirror the public M=1 runtime
          * decode route.  CUDA serial decode uses split-K gate/up for tiny MoE
-         * rows by default, so M=2..4 publication has to use the same split-K
-         * partial ordering before it evaluates SwiGLU and quantizes the down
-         * input.  Keeping this as a grouped kernel sequence preserves the target
-         * architecture without reintroducing row replay.
+         * rows by default, so every runtime-M publication has to use the same
+         * split-K partial ordering before it evaluates SwiGLU and quantizes the
+         * down input. Fixed-size row tiles bound scratch independently of M;
+         * this remains one grouped, graph-capturable device sequence rather
+         * than serial row replay.
          */
         if (use_gateup_kpart &&
             !ensureGroupedGateUpKPartScratchCapacity(
-                total_slots,
+                splitk_route_slots,
                 debugEnv().gemm.cuda_moe_gateup_kparts,
                 intermediate))
         {
@@ -5912,12 +5884,8 @@ namespace llaminar2
                       "verifier grouped gate/up split-K scratch allocation failed");
             return false;
         }
-        const bool use_down_ordered_kpart =
-            debugEnv().gemm.cuda_moe_down_kpart_decode &&
-            max_tokens_per_expert <= 4 &&
-            num_experts > 1 &&
-            top_k > 1;
-        if (use_down_ordered_kpart &&
+        const bool use_down_ordered_kpart = active_expert_slots > 0;
+        if ((use_gateup_kpart || use_down_ordered_kpart) &&
             !runtime_host_layer.route_expert_ids)
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
@@ -5928,7 +5896,7 @@ namespace llaminar2
             !ensureGroupedDownKPartScratchCapacity(
                 debugEnv().gemm.cuda_moe_down_kparts,
                 d_model,
-                seq_len))
+                splitk_tile_rows))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromRuntime] "
                       "verifier grouped down split-K scratch allocation failed");
@@ -5964,7 +5932,6 @@ namespace llaminar2
             routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
         const bool reuse_router_q8_hidden =
             active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
             router_q8_reuse_block_reason == nullptr;
         if (!reuse_router_q8_hidden)
         {
@@ -5979,9 +5946,9 @@ namespace llaminar2
                  {"descriptor_source", "runtime_table"},
                  {"reason", active_expert_slots <= 0
                                 ? "no_active_experts"
-                                : (max_tokens_per_expert > 4
-                                       ? "not_verifier_small_m"
-                                       : router_q8_reuse_block_reason)}});
+                                : (router_q8_reuse_block_reason
+                                       ? router_q8_reuse_block_reason
+                                       : "unpublished")}});
         }
 
         if (!cudaMoE_build_active_expert_list_runtime(
@@ -6030,7 +5997,9 @@ namespace llaminar2
             runtime_host_layer.expert_offsets,
             runtime_host_layer.grouped_token_ids,
             d_group_original_to_grouped_,
-            use_down_ordered_kpart ? runtime_host_layer.route_expert_ids : nullptr,
+            use_gateup_kpart || use_down_ordered_kpart
+                ? runtime_host_layer.route_expert_ids
+                : nullptr,
             d_group_active_expert_ids_,
             runtime_host_layer.grouped_route_weights,
             d_prefill_A_int8_,
@@ -6058,6 +6027,7 @@ namespace llaminar2
             down_table.codebook_mask,
             use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
             use_down_ordered_kpart ? debugEnv().gemm.cuda_moe_down_kparts : 0,
+            splitk_tile_rows,
             device_ordinal_,
             stream);
         if (!ok)
@@ -6086,11 +6056,12 @@ namespace llaminar2
             num_experts,
             active_expert_slots,
             selectGroupedPrefillTileM(debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert),
-            (active_expert_slots > 0 && max_tokens_per_expert <= 4) ? 64 : 128,
+            use_gateup_kpart ? 64 : 128,
             use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
             use_down_ordered_kpart,
-            true);
+            true,
+            splitk_tile_rows);
         return true;
     }
 
@@ -6139,11 +6110,10 @@ namespace llaminar2
             return false;
 
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
-        if (use_kpart && !ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate))
+        if (!ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
+                      "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
         if (!ensureGroupedGateUpDecodeCapacity(num_active, d_model))
@@ -6169,9 +6139,8 @@ namespace llaminar2
             !requireCudaDevicePointer(d_decode_hidden_int8_, device_ordinal_, "decode hidden int8", "groupedExpertGateUpDecodeFromTable", stream) ||
             !requireCudaDevicePointer(d_decode_hidden_scales_, device_ordinal_, "decode hidden scales", "groupedExpertGateUpDecodeFromTable", stream))
             return false;
-        if (use_kpart &&
-            (!requireCudaDevicePointer(d_grouped_gateup_gate_partials_, device_ordinal_, "gate partials", "groupedExpertGateUpDecodeFromTable", stream) ||
-             !requireCudaDevicePointer(d_grouped_gateup_up_partials_, device_ordinal_, "up partials", "groupedExpertGateUpDecodeFromTable", stream)))
+        if (!requireCudaDevicePointer(d_grouped_gateup_gate_partials_, device_ordinal_, "gate partials", "groupedExpertGateUpDecodeFromTable", stream) ||
+            !requireCudaDevicePointer(d_grouped_gateup_up_partials_, device_ordinal_, "up partials", "groupedExpertGateUpDecodeFromTable", stream))
             return false;
         if (!requireTensorElements(input, static_cast<size_t>(blocks_per_row) * 32u, "input", "groupedExpertGateUpDecodeFromTable"))
             return false;
@@ -6216,43 +6185,26 @@ namespace llaminar2
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
 
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  false,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  num_active,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  false,
-                                  num_active,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_grouped_decode_expert_ids_,
+            d_gate_ptrs,
+            d_up_ptrs,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            false,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            num_active,
+            intermediate,
+            d_model,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
         if (ok)
         {
             for (int slot = 0; slot < num_active; ++slot)
@@ -6262,7 +6214,7 @@ namespace llaminar2
             }
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_gateup_calls", "table", num_active,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -6339,54 +6291,37 @@ namespace llaminar2
 
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
-        if (use_kpart && !ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, num_active))
+        if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, num_active))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] "
-                      "K-part down decode was requested but scratch allocation failed");
+                      "mandatory K-part down scratch allocation failed");
             return false;
         }
 
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_grouped_decode_expert_ids_,
-                  d_grouped_decode_weights_,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_grouped_down_partials_,
-                  d_output,
-                  num_active,
-                  d_model,
-                  intermediate,
-                  table.num_experts,
-                  table.codebook_id,
-                  k_partitions,
-                  device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_grouped_decode_expert_ids_,
-                  d_grouped_decode_weights_,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  num_active,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  device_ordinal_,
-                  stream);
+        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            d_gate_ptrs,
+            d_up_ptrs,
+            table.device_descs,
+            d_grouped_decode_expert_ids_,
+            d_grouped_decode_weights_,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            num_active,
+            d_model,
+            intermediate,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_down_calls", "table", num_active,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -6435,11 +6370,10 @@ namespace llaminar2
         }
 
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
-        if (use_kpart && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        if (!ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
+                      "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
 
@@ -6544,43 +6478,26 @@ namespace llaminar2
             return false;
         }
 
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_routing_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  false,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_routing_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  false,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_routing_decode_expert_ids_,
+            d_gate_ptrs,
+            d_up_ptrs,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            false,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            top_k,
+            intermediate,
+            d_model,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
         if (ok)
         {
             for (int slot = 0; slot < top_k; ++slot)
@@ -6590,7 +6507,7 @@ namespace llaminar2
             }
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_gateup_calls", "routing", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -6731,54 +6648,37 @@ namespace llaminar2
             return false;
 
         const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
-        if (use_kpart && !ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
+        if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRouting] "
-                      "K-part down decode was requested but scratch allocation failed");
+                      "mandatory K-part down scratch allocation failed");
             return false;
         }
 
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_routing_decode_expert_ids_,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_grouped_down_partials_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.num_experts,
-                  table.codebook_id,
-                  k_partitions,
-                  device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_routing_decode_expert_ids_,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  device_ordinal_,
-                  stream);
+        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            d_gate_ptrs,
+            d_up_ptrs,
+            table.device_descs,
+            d_routing_decode_expert_ids_,
+            d_weights,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_down_calls", "routing", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -6823,21 +6723,19 @@ namespace llaminar2
             return false;
 
         const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_gateup_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
-        if (use_gateup_kpart &&
-            !ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate))
+        if (!ensureGroupedGateUpKPartScratchCapacity(
+                top_k, gateup_k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
+                      "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
         const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_down_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
-        if (use_down_kpart &&
-            !ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model, top_k))
+        if (!ensureGroupedDownKPartScratchCapacity(
+                down_k_partitions, d_model, top_k))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
-                      "K-part down decode was requested but scratch allocation failed");
+                      "mandatory K-part down scratch allocation failed");
             return false;
         }
 
@@ -6917,152 +6815,85 @@ namespace llaminar2
                  {"d_model", std::to_string(d_model)}});
         }
         const bool gateup_ok = use_runtime_descriptors
-                                   ? (use_gateup_kpart
-                                          ? cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
-                                                d_hidden,
-                                                runtime_layer,
-                                                d_expert_ids,
-                                                d_gate_ptrs,
-                                                d_up_ptrs,
-                                                d_decode_hidden_int8_,
-                                                d_decode_hidden_scales_,
-                                                reuse_router_q8_hidden,
-                                                d_grouped_gateup_gate_partials_,
-                                                d_grouped_gateup_up_partials_,
-                                                top_k,
-                                                intermediate,
-                                                d_model,
-                                                gateup_table.num_experts,
-                                                gateup_table.codebook_id,
-                                                gateup_k_partitions,
-                                                device_ordinal_,
-                                                stream)
-                                          : cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
-                                                d_hidden,
-                                                runtime_layer,
-                                                d_expert_ids,
-                                                d_gate_ptrs,
-                                                d_up_ptrs,
-                                                d_decode_hidden_int8_,
-                                                d_decode_hidden_scales_,
-                                                reuse_router_q8_hidden,
-                                                top_k,
-                                                intermediate,
-                                                d_model,
-                                                gateup_table.num_experts,
-                                                gateup_table.codebook_id,
-                                                device_ordinal_,
-                                                stream))
-                                   : (use_gateup_kpart
-                                          ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                                d_hidden,
-                                                gateup_table.device_gate_descs,
-                                                gateup_table.device_up_descs,
-                                                d_expert_ids,
-                                                d_gate_ptrs,
-                                                d_up_ptrs,
-                                                d_decode_hidden_int8_,
-                                                d_decode_hidden_scales_,
-                                                reuse_router_q8_hidden,
-                                                d_grouped_gateup_gate_partials_,
-                                                d_grouped_gateup_up_partials_,
-                                                top_k,
-                                                intermediate,
-                                                d_model,
-                                                gateup_table.num_experts,
-                                                gateup_table.codebook_id,
-                                                gateup_k_partitions,
-                                                device_ordinal_,
-                                                stream)
-                                          : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                                d_hidden,
-                                                gateup_table.device_gate_descs,
-                                                gateup_table.device_up_descs,
-                                                d_expert_ids,
-                                                d_gate_ptrs,
-                                                d_up_ptrs,
-                                                d_decode_hidden_int8_,
-                                                d_decode_hidden_scales_,
-                                                reuse_router_q8_hidden,
-                                                top_k,
-                                                intermediate,
-                                                d_model,
-                                                gateup_table.codebook_id,
-                                                device_ordinal_,
-                                                stream));
+                                   ? cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+                                         d_hidden,
+                                         runtime_layer,
+                                         d_expert_ids,
+                                         d_gate_ptrs,
+                                         d_up_ptrs,
+                                         d_decode_hidden_int8_,
+                                         d_decode_hidden_scales_,
+                                         reuse_router_q8_hidden,
+                                         d_grouped_gateup_gate_partials_,
+                                         d_grouped_gateup_up_partials_,
+                                         top_k,
+                                         intermediate,
+                                         d_model,
+                                         gateup_table.num_experts,
+                                         gateup_table.codebook_id,
+                                         gateup_k_partitions,
+                                         device_ordinal_,
+                                         stream)
+                                   : cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                                         d_hidden,
+                                         gateup_table.device_gate_descs,
+                                         gateup_table.device_up_descs,
+                                         d_expert_ids,
+                                         d_gate_ptrs,
+                                         d_up_ptrs,
+                                         d_decode_hidden_int8_,
+                                         d_decode_hidden_scales_,
+                                         reuse_router_q8_hidden,
+                                         d_grouped_gateup_gate_partials_,
+                                         d_grouped_gateup_up_partials_,
+                                         top_k,
+                                         intermediate,
+                                         d_model,
+                                         gateup_table.num_experts,
+                                         gateup_table.codebook_id,
+                                         gateup_k_partitions,
+                                         device_ordinal_,
+                                         stream);
         if (!gateup_ok)
             return false;
 
         const bool down_ok = use_runtime_descriptors
-                                 ? (use_down_kpart
-                                        ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              runtime_layer,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_decode_swiglu_int8_,
-                                              d_decode_swiglu_scales_,
-                                              d_grouped_down_partials_,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.num_experts,
-                                              down_table.codebook_id,
-                                              down_k_partitions,
-                                              device_ordinal_,
-                                              stream)
-                                        : cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              runtime_layer,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_decode_swiglu_int8_,
-                                              d_decode_swiglu_scales_,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.num_experts,
-                                              down_table.codebook_id,
-                                              device_ordinal_,
-                                              stream))
-                                 : (use_down_kpart
-                                        ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              down_table.device_descs,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_decode_swiglu_int8_,
-                                              d_decode_swiglu_scales_,
-                                              d_grouped_down_partials_,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.num_experts,
-                                              down_table.codebook_id,
-                                              down_k_partitions,
-                                              device_ordinal_,
-                                              stream)
-                                        : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                                              d_down_gate_ptrs,
-                                              d_down_up_ptrs,
-                                              down_table.device_descs,
-                                              d_expert_ids,
-                                              d_weights,
-                                              d_decode_swiglu_int8_,
-                                              d_decode_swiglu_scales_,
-                                              d_output,
-                                              top_k,
-                                              d_model,
-                                              intermediate,
-                                              down_table.codebook_id,
-                                              device_ordinal_,
-                                              stream));
+                                 ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+                                       d_down_gate_ptrs,
+                                       d_down_up_ptrs,
+                                       runtime_layer,
+                                       d_expert_ids,
+                                       d_weights,
+                                       d_decode_swiglu_int8_,
+                                       d_decode_swiglu_scales_,
+                                       d_grouped_down_partials_,
+                                       d_output,
+                                       top_k,
+                                       d_model,
+                                       intermediate,
+                                       down_table.num_experts,
+                                       down_table.codebook_id,
+                                       down_k_partitions,
+                                       device_ordinal_,
+                                       stream)
+                                 : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+                                       d_down_gate_ptrs,
+                                       d_down_up_ptrs,
+                                       down_table.device_descs,
+                                       d_expert_ids,
+                                       d_weights,
+                                       d_decode_swiglu_int8_,
+                                       d_decode_swiglu_scales_,
+                                       d_grouped_down_partials_,
+                                       d_output,
+                                       top_k,
+                                       d_model,
+                                       intermediate,
+                                       down_table.num_experts,
+                                       down_table.codebook_id,
+                                       down_k_partitions,
+                                       device_ordinal_,
+                                       stream);
         if (!down_ok)
             return false;
 
@@ -7116,14 +6947,13 @@ namespace llaminar2
         if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
             return false;
 
-        // K-part decode is an explicit contract. If it is enabled and the
-        // partial scratch cannot be sized, fail instead of changing routes.
+        // Ordered K-part decode is the production contract. If its partial
+        // scratch cannot be sized, fail instead of changing arithmetic.
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
-        if (use_kpart && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        if (!ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
-                      "K-part gate/up decode was requested but scratch allocation failed");
+                      "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
 
@@ -7197,42 +7027,25 @@ namespace llaminar2
                  {"d_model", std::to_string(d_model)}});
         }
 
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
-                                  d_hidden,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  reuse_router_q8_hidden,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
-                                  d_hidden,
-                                  runtime_layer,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  reuse_router_q8_hidden,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+            d_hidden,
+            runtime_layer,
+            d_expert_ids,
+            d_gate_ptrs,
+            d_up_ptrs,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            reuse_router_q8_hidden,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            top_k,
+            intermediate,
+            d_model,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
 
         if (ok)
         {
@@ -7243,7 +7056,7 @@ namespace llaminar2
             }
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_gateup_calls", "runtime", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -7328,60 +7141,41 @@ namespace llaminar2
             return false;
         }
 
-        // Split-K (K-partition) path raises occupancy by multiplying the block
-        // count by k_partitions. Serial is only used when the K-part toggle is
-        // explicitly off.
+        // Split-K raises occupancy while its ordered reduction preserves the
+        // serial-decode arithmetic tree used by grouped verifier batches.
         const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
-        if (use_kpart && !ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
+        if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRuntime] "
-                      "K-part down decode was requested but scratch allocation failed");
+                      "mandatory K-part down scratch allocation failed");
             return false;
         }
 
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  runtime_layer,
-                  d_expert_ids,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_grouped_down_partials_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.num_experts,
-                  table.codebook_id,
-                  k_partitions,
-                  device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  runtime_layer,
-                  d_expert_ids,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.num_experts,
-                  table.codebook_id,
-                  device_ordinal_,
-                  stream);
+        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+            d_gate_ptrs,
+            d_up_ptrs,
+            runtime_layer,
+            d_expert_ids,
+            d_weights,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
 
         if (ok)
         {
             markDeviceWritten(output, device, stream);
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_down_calls", "runtime", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }

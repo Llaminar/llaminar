@@ -2,7 +2,7 @@
  * @file CUDATinyFP32ProjectionKernels.cu
  * @brief Graph-capturable fixed-order small-N floating-point verifier projections.
  *
- * These kernels serve MTP verifier publication paths where grouped M=1..4 rows
+ * These kernels serve MTP verifier publication paths where grouped runtime-M rows
  * must match the backend's serial decode row contract.  They avoid cuBLAS
  * shape-dependent reduction choices for tiny output projections such as GDN
  * alpha/beta publication, while still grouping rows and projection batches in
@@ -43,7 +43,7 @@ namespace
      * @brief Convert IEEE FP16 bits to FP32 using device-side scalar logic.
      *
      * The verifier kernels use explicit bit conversion instead of relying on a
-     * library GEMM path so M=1 and M=2..4 rows walk the same K loop and convert
+     * library GEMM path so serial and grouped rows walk the same K loop and convert
      * each weight at the same point in that loop.
      */
     __device__ __forceinline__ float fp16_bits_to_float(uint16_t h)
@@ -194,7 +194,7 @@ namespace
      * or BF16.  This kernel implements the grouped verifier contract for those
      * weight formats without routing through cuBLAS.  Every output element owns
      * one block, each thread accumulates a fixed strided K subsequence, and the
-     * block reduction order is identical for serial M=1 and grouped M=2..4.
+     * block reduction order is identical for serial M=1 and grouped runtime-M.
      */
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
         void fp32x16_tiny_batched_projection_kernel(
@@ -252,7 +252,7 @@ namespace
      * This is the floating-weight counterpart to the quantized grouped verifier
      * down path.  It intentionally does not materialize the intermediate
      * `silu(gate) * up` row: every output element walks K in the same strided
-     * order for serial M=1 and grouped M=2..4, computes the SwiGLU product at
+     * order for serial M=1 and grouped runtime-M, computes the SwiGLU product at
      * the same point in that loop, then reduces through the same block tree.
      */
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
@@ -512,7 +512,7 @@ extern "C" bool cudaFloating_swiglu_down_projection(
     void *stream)
 {
     if (!d_gate || !d_up || !d_weights || !d_output ||
-        M <= 0 || M > 4 ||
+        M <= 0 ||
         N <= 0 ||
         K <= 0 ||
         (weight_dtype != TINY_SWIGLU_DOWN_WEIGHT_FP32 &&

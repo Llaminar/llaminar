@@ -202,8 +202,7 @@ namespace llaminar2
         int result = MPI_SUCCESS;
         const int timeout_ms =
             collective_timeout_policy::effectiveCollectTimeoutMs(
-                debugEnv().tp_collect_timeout_ms,
-                /*cold_start_completed=*/true);
+                debugEnv().tp_collect_timeout_ms);
         MPI_Request request = MPI_REQUEST_NULL;
         result = MPI_Iallreduce(
             MPI_IN_PLACE,
@@ -383,8 +382,7 @@ namespace llaminar2
         int result = MPI_SUCCESS;
         const int timeout_ms =
             collective_timeout_policy::effectiveCollectTimeoutMs(
-                debugEnv().tp_collect_timeout_ms,
-                /*cold_start_completed=*/true);
+                debugEnv().tp_collect_timeout_ms);
         MPI_Request request = MPI_REQUEST_NULL;
         result = MPI_Ibcast(
             buffer,
@@ -432,8 +430,7 @@ namespace llaminar2
         int result = MPI_SUCCESS;
         const int timeout_ms =
             collective_timeout_policy::effectiveCollectTimeoutMs(
-                debugEnv().tp_collect_timeout_ms,
-                /*cold_start_completed=*/true);
+                debugEnv().tp_collect_timeout_ms);
         MPI_Request request = MPI_REQUEST_NULL;
         result = MPI_Ibarrier(domain_comm_, &request);
         if (result == MPI_SUCCESS &&

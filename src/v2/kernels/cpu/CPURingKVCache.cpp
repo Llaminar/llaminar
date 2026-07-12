@@ -1093,7 +1093,7 @@ namespace llaminar2
         (void)gpu_stream;
         if (layer < 0 || layer >= n_layers_ ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
-            verifier_rows < 2 || verifier_rows > 4 ||
+            verifier_rows < 2 ||
             !K || !V)
         {
             return false;
@@ -1203,7 +1203,13 @@ namespace llaminar2
         // metadata is committed only after every row copy has succeeded.
         int next_head = entry.head;
         int next_size = entry.size;
-        std::array<int, 4> dst_positions{};
+        /*
+         * Destination planning is runtime-sized because speculative depth is a
+         * graph capacity, not a four-row cache ABI. Planning every position
+         * before copying preserves transactional metadata publication: entry
+         * head/size are committed only after all native K/V rows succeed.
+         */
+        std::vector<int> dst_positions(static_cast<size_t>(verifier_rows));
         for (int row = 0; row < verifier_rows; ++row)
         {
             if (next_size < max_seq_len_)

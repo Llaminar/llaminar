@@ -6618,7 +6618,6 @@ namespace llaminar2
                 * silently taking the ordinary decode shortcut.
                 */
                params_.seq_len >= 1 &&
-               params_.seq_len <= 4 &&
                supportsGroupedPrefillExecutionBackend(params_.device_id);
     }
 
@@ -6633,8 +6632,7 @@ namespace llaminar2
                 params_.device_id.is_cuda() ||
                 params_.device_id.is_rocm()) &&
                params_.force_decode_equivalent_verifier_prefill &&
-               params_.seq_len >= 1 &&
-               params_.seq_len <= 4;
+               params_.seq_len >= 1;
     }
 
     bool SharedExpertFFNStage::usesDecodeEquivalentVerifierPrefillForTesting() const

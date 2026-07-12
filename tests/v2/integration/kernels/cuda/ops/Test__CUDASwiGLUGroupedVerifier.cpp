@@ -4,7 +4,7 @@
  *
  * The explicit suite enters CUDASwiGLUKernelT through its production tensor API
  * on a non-default stream. Every native activation format must match CUDA M=1
- * decode bytes at M=2..4 while issuing one flat activation launch.
+ * decode bytes across the runtime-M inventory in one flat activation launch.
  */
 
 #include <gtest/gtest.h>

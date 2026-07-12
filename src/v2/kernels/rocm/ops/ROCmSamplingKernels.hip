@@ -1375,18 +1375,7 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_kernel(
     const float *__restrict__ draft_probs,
     int k,
     int distribution_stride,
-    int draft_token0,
-    int draft_token1,
-    int draft_token2,
-    int draft_token3,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchHostParameters parameters,
     int row_count,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
@@ -1397,28 +1386,6 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_kernel(
     if (row >= row_count)
         return;
 
-    int draft_token = draft_token0;
-    float accept_threshold = accept_threshold0;
-    float residual_threshold = residual_threshold0;
-    if (row == 1)
-    {
-        draft_token = draft_token1;
-        accept_threshold = accept_threshold1;
-        residual_threshold = residual_threshold1;
-    }
-    else if (row == 2)
-    {
-        draft_token = draft_token2;
-        accept_threshold = accept_threshold2;
-        residual_threshold = residual_threshold2;
-    }
-    else if (row == 3)
-    {
-        draft_token = draft_token3;
-        accept_threshold = accept_threshold3;
-        residual_threshold = residual_threshold3;
-    }
-
     const int offset = row * distribution_stride;
     llaminar2::sampling_math::speculative_verify_with_thresholds(
         target_token_ids + offset,
@@ -1426,9 +1393,9 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_kernel(
         draft_token_ids + offset,
         draft_probs + offset,
         k,
-        draft_token,
-        accept_threshold,
-        residual_threshold,
+        parameters.draft_tokens[row],
+        parameters.thresholds.accept[row],
+        parameters.thresholds.residual[row],
         out_token + row,
         out_accepted + row,
         out_accept_probability ? out_accept_probability + row : nullptr,
@@ -1453,14 +1420,7 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
     int distribution_stride,
     const int *__restrict__ sampled_draft_tokens,
     const float *__restrict__ sampled_draft_probabilities,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     int row_count,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
@@ -1479,23 +1439,8 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
     if (row >= row_count)
         return;
 
-    float accept_threshold = accept_threshold0;
-    float residual_threshold = residual_threshold0;
-    if (row == 1)
-    {
-        accept_threshold = accept_threshold1;
-        residual_threshold = residual_threshold1;
-    }
-    else if (row == 2)
-    {
-        accept_threshold = accept_threshold2;
-        residual_threshold = residual_threshold2;
-    }
-    else if (row == 3)
-    {
-        accept_threshold = accept_threshold3;
-        residual_threshold = residual_threshold3;
-    }
+    float accept_threshold = 0.0f;
+    float residual_threshold = 0.0f;
 
     const int threshold_logical_position =
         threshold_base_position
@@ -1518,6 +1463,16 @@ __global__ void rocm_speculative_verify_distribution_thresholds_batch_device_tok
                 threshold_seed,
                 threshold_logical_position,
                 2 /* MTPSpecStochasticDrawPurpose::Residual */);
+    }
+    else
+    {
+        /*
+         * Explicit host thresholds are packed into bounded value-owned kernel
+         * parameters by the diagnostic wrapper. Seeded production rows never
+         * index this bounded payload, so their runtime depth is unrestricted.
+         */
+        accept_threshold = thresholds.accept[row];
+        residual_threshold = thresholds.residual[row];
     }
 
     const int offset = row * distribution_stride;
@@ -2559,14 +2514,7 @@ __global__ void rocm_speculative_verify_processed_logits_thresholds_batch_device
     int target_row_stride,
     int draft_row_stride,
     const int *__restrict__ sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -2615,23 +2563,8 @@ __global__ void rocm_speculative_verify_processed_logits_thresholds_batch_device
             &draft_argmax);
     }
 
-    float accept_threshold = accept_threshold0;
-    float residual_threshold = residual_threshold0;
-    if (row == 1)
-    {
-        accept_threshold = accept_threshold1;
-        residual_threshold = residual_threshold1;
-    }
-    else if (row == 2)
-    {
-        accept_threshold = accept_threshold2;
-        residual_threshold = residual_threshold2;
-    }
-    else if (row == 3)
-    {
-        accept_threshold = accept_threshold3;
-        residual_threshold = residual_threshold3;
-    }
+    const float accept_threshold = thresholds.accept[row];
+    const float residual_threshold = thresholds.residual[row];
 
     if (tid == 0)
     {
@@ -2863,10 +2796,7 @@ __global__ void rocm_speculative_verify_processed_target_draft_probabilities_thr
     int target_row_stride,
     int draft_row_stride,
     const int *__restrict__ sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
     int thresholds_from_seed,
@@ -2907,13 +2837,7 @@ __global__ void rocm_speculative_verify_processed_target_draft_probabilities_thr
         &target_sum,
         &target_argmax);
 
-    float accept_threshold = accept_threshold0;
-    if (row == 1)
-        accept_threshold = accept_threshold1;
-    else if (row == 2)
-        accept_threshold = accept_threshold2;
-    else if (row == 3)
-        accept_threshold = accept_threshold3;
+    float accept_threshold = 0.0f;
 
     const int logical_position =
         threshold_base_position
@@ -2926,6 +2850,10 @@ __global__ void rocm_speculative_verify_processed_target_draft_probabilities_thr
                 inverse_sample_seed,
                 logical_position,
                 1 /* MTPSpecStochasticDrawPurpose::Accept */);
+    }
+    else
+    {
+        accept_threshold = thresholds.accept[row];
     }
 
     if (tid == 0)
@@ -2999,10 +2927,7 @@ __global__ void rocm_speculative_verify_processed_target_draft_logits_thresholds
     int draft_row_stride,
     const int *__restrict__ sampled_draft_tokens,
     const float *__restrict__ sampled_draft_probabilities,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
     int *__restrict__ out_token,
@@ -3054,13 +2979,7 @@ __global__ void rocm_speculative_verify_processed_target_draft_logits_thresholds
             &draft_argmax);
     }
 
-    float accept_threshold = accept_threshold0;
-    if (row == 1)
-        accept_threshold = accept_threshold1;
-    else if (row == 2)
-        accept_threshold = accept_threshold2;
-    else if (row == 3)
-        accept_threshold = accept_threshold3;
+    const float accept_threshold = thresholds.accept[row];
 
     if (tid == 0)
     {
@@ -3154,10 +3073,7 @@ __global__ void rocm_speculative_verify_probabilities_thresholds_batch_device_to
     int draft_row_stride,
     int inverse_sample_row_stride,
     const int *__restrict__ sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     int no_draft_probabilities,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
@@ -3184,13 +3100,7 @@ __global__ void rocm_speculative_verify_probabilities_thresholds_batch_device_to
         inverse_rejection_samples +
         static_cast<size_t>(row) * inverse_sample_row_stride;
 
-    float accept_threshold = accept_threshold0;
-    if (row == 1)
-        accept_threshold = accept_threshold1;
-    else if (row == 2)
-        accept_threshold = accept_threshold2;
-    else if (row == 3)
-        accept_threshold = accept_threshold3;
+    const float accept_threshold = thresholds.accept[row];
 
     if (tid == 0)
     {
@@ -3276,6 +3186,7 @@ __global__ void rocm_summarize_speculative_verify_batch_kernel(
     const int *__restrict__ bonus_token,
     int has_bonus_token,
     int *__restrict__ out_tokens,
+    int out_token_capacity,
     int *__restrict__ out_meta)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
@@ -3302,6 +3213,7 @@ __global__ void rocm_summarize_speculative_verify_batch_kernel(
         ready_token,
         has_bonus_token,
         out_tokens,
+        out_token_capacity,
         out_meta);
 }
 
@@ -3330,6 +3242,7 @@ __global__ void rocm_summarize_speculative_verify_batch_device_first_token_kerne
     const int *__restrict__ bonus_token,
     int has_bonus_token,
     int *__restrict__ out_tokens,
+    int out_token_capacity,
     int *__restrict__ out_meta)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
@@ -3357,6 +3270,7 @@ __global__ void rocm_summarize_speculative_verify_batch_device_first_token_kerne
         ready_token,
         has_bonus_token,
         out_tokens,
+        out_token_capacity,
         out_meta);
 }
 
@@ -3382,6 +3296,7 @@ __global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(
     int stop_token7,
     int stop_token_count,
     int *__restrict__ out_tokens,
+    int out_token_capacity,
     int *__restrict__ out_meta)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
@@ -3405,6 +3320,7 @@ __global__ void rocm_summarize_greedy_speculative_verify_batch_kernel(
         stop_tokens,
         stop_token_count,
         out_tokens,
+        out_token_capacity,
         out_meta);
 }
 
@@ -3601,6 +3517,30 @@ __global__ void rocm_initialize_mtp_device_logical_state_kernel(
 // ============================================================================
 // Extern "C" Wrapper
 // ============================================================================
+
+/**
+ * @brief Copy optional explicit threshold rows into a graph-owned launch value.
+ *
+ * Seeded production verification derives thresholds from device-resident
+ * logical positions. Explicit integration probes are copied into this bounded
+ * value so no host pointer survives HIP graph capture.
+ */
+static llaminar2::sampling_math::SpeculativeBatchThresholdParameters
+packROCmSpeculativeBatchThresholds(
+    const float *accept_thresholds,
+    const float *residual_thresholds,
+    int row_count)
+{
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters packed{};
+    for (int row = 0; row < row_count; ++row)
+    {
+        if (accept_thresholds)
+            packed.accept[row] = accept_thresholds[row];
+        if (residual_thresholds)
+            packed.residual[row] = residual_thresholds[row];
+    }
+    return packed;
+}
 
 extern "C"
 {
@@ -4231,7 +4171,6 @@ bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
     if (!logits || !verify_tokens || !verify_accepted || !out_token ||
         !stream || vocab_size <= 0 || row_stride < vocab_size ||
         row_count < 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         (first_token < 0 && !first_token_device) ||
         stop_token_count < 0 ||
         stop_token_count >
@@ -4428,7 +4367,7 @@ bool rocmOps_fill_inverse_exponential_samples_f32(
     void *stream)
 {
     if (!out_samples || !stream ||
-        row_count <= 0 || row_count > 4 ||
+        row_count <= 0 ||
         vocab_size <= 0 || row_stride < vocab_size)
     {
         return false;
@@ -4515,18 +4454,9 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_f32(
     const float *draft_probs,
     int k,
     int distribution_stride,
-    int draft_token0,
-    int draft_token1,
-    int draft_token2,
-    int draft_token3,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    const int *draft_tokens_host,
+    const float *accept_thresholds_host,
+    const float *residual_thresholds_host,
     int row_count,
     int *out_token,
     int *out_accepted,
@@ -4537,9 +4467,11 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_f32(
 {
     if (k <= 0 || k > TOPK_MAX_K ||
         distribution_stride < k ||
-        row_count <= 0 || row_count > 4 ||
+        row_count <= 0 ||
         !target_token_ids || !target_probs ||
         !draft_token_ids || !draft_probs ||
+        !draft_tokens_host || !accept_thresholds_host ||
+        !residual_thresholds_host ||
         !out_token || !out_accepted || !stream)
     {
         return false;
@@ -4547,39 +4479,57 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_f32(
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    hipLaunchKernelGGL(
-        rocm_speculative_verify_distribution_thresholds_batch_kernel,
-        dim3(1), dim3(4), 0, static_cast<hipStream_t>(stream),
-        target_token_ids,
-        target_probs,
-        draft_token_ids,
-        draft_probs,
-        k,
-        distribution_stride,
-        draft_token0,
-        draft_token1,
-        draft_token2,
-        draft_token3,
-        accept_threshold0,
-        accept_threshold1,
-        accept_threshold2,
-        accept_threshold3,
-        residual_threshold0,
-        residual_threshold1,
-        residual_threshold2,
-        residual_threshold3,
-        row_count,
-        out_token,
-        out_accepted,
-        out_accept_probability,
-        out_accept_threshold);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    constexpr int kRowsPerLaunch =
+        llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+    for (int row_base = 0; row_base < row_count;
+         row_base += kRowsPerLaunch)
     {
-        fprintf(stderr, "ROCm Speculative Verify Batch FP32 kernel launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        const int launch_rows =
+            std::min(kRowsPerLaunch, row_count - row_base);
+        llaminar2::sampling_math::SpeculativeBatchHostParameters parameters{};
+        for (int row = 0; row < launch_rows; ++row)
+        {
+            parameters.draft_tokens[row] =
+                draft_tokens_host[row_base + row];
+            parameters.thresholds.accept[row] =
+                accept_thresholds_host[row_base + row];
+            parameters.thresholds.residual[row] =
+                residual_thresholds_host[row_base + row];
+        }
+
+        const size_t row_offset =
+            static_cast<size_t>(row_base) *
+            static_cast<size_t>(distribution_stride);
+        hipLaunchKernelGGL(
+            rocm_speculative_verify_distribution_thresholds_batch_kernel,
+            dim3(1),
+            dim3(kRowsPerLaunch),
+            0,
+            static_cast<hipStream_t>(stream),
+            target_token_ids + row_offset,
+            target_probs + row_offset,
+            draft_token_ids + row_offset,
+            draft_probs + row_offset,
+            k,
+            distribution_stride,
+            parameters,
+            launch_rows,
+            out_token + row_base,
+            out_accepted + row_base,
+            out_accept_probability
+                ? out_accept_probability + row_base
+                : nullptr,
+            out_accept_threshold
+                ? out_accept_threshold + row_base
+                : nullptr);
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "ROCm Speculative Verify Batch FP32 kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -4593,14 +4543,8 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
     int distribution_stride,
     const int *sampled_draft_tokens,
     const float *sampled_draft_probabilities,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    const float *accept_thresholds_host,
+    const float *residual_thresholds_host,
     int row_count,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
@@ -4623,7 +4567,7 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
         draft_token_ids == nullptr && draft_probs == nullptr;
     if (k <= 0 || k > TOPK_MAX_K ||
         distribution_stride < k ||
-        row_count <= 0 || row_count > 4 ||
+        row_count <= 0 ||
         !target_token_ids || !target_probs ||
         (!has_draft_distribution && !has_one_hot_draft_distribution) ||
         !sampled_draft_tokens ||
@@ -4634,46 +4578,91 @@ bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-
-    hipLaunchKernelGGL(
-        rocm_speculative_verify_distribution_thresholds_batch_device_tokens_kernel,
-        dim3(1), dim3(4), 0, static_cast<hipStream_t>(stream),
-        target_token_ids,
-        target_probs,
-        draft_token_ids,
-        draft_probs,
-        k,
-        distribution_stride,
-        sampled_draft_tokens,
-        sampled_draft_probabilities,
-        accept_threshold0,
-        accept_threshold1,
-        accept_threshold2,
-        accept_threshold3,
-        residual_threshold0,
-        residual_threshold1,
-        residual_threshold2,
-        residual_threshold3,
-        row_count,
-        inverse_sample_seed,
-        inverse_sample_first_logical_position,
-        inverse_sample_vocab_size,
-        threshold_seed,
-        threshold_first_logical_position,
-        thresholds_from_seed,
-        threshold_base_position,
-        threshold_position_offset,
-        out_token,
-        out_accepted,
-        out_accept_probability,
-        out_accept_threshold);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    constexpr int kRuntimeVerifierThreads = 128;
+    constexpr int kExplicitThresholdRows =
+        llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+    const bool use_seeded_thresholds = thresholds_from_seed != 0;
+    if (!use_seeded_thresholds &&
+        (!accept_thresholds_host || !residual_thresholds_host))
     {
-        fprintf(stderr, "ROCm Speculative Verify Batch Device Tokens FP32 kernel launch failed: %s\n",
-                hipGetErrorString(err));
         return false;
+    }
+
+    const int launch_count = use_seeded_thresholds
+                                 ? 1
+                                 : (row_count + kExplicitThresholdRows - 1) /
+                                       kExplicitThresholdRows;
+    for (int launch = 0; launch < launch_count; ++launch)
+    {
+        const int row_base = use_seeded_thresholds
+                                 ? 0
+                                 : launch * kExplicitThresholdRows;
+        const int launch_rows = use_seeded_thresholds
+                                    ? row_count
+                                    : std::min(kExplicitThresholdRows,
+                                               row_count - row_base);
+        llaminar2::sampling_math::SpeculativeBatchThresholdParameters
+            thresholds{};
+        if (!use_seeded_thresholds)
+        {
+            for (int row = 0; row < launch_rows; ++row)
+            {
+                thresholds.accept[row] =
+                    accept_thresholds_host[row_base + row];
+                thresholds.residual[row] =
+                    residual_thresholds_host[row_base + row];
+            }
+        }
+
+        const int threads = use_seeded_thresholds
+                                ? kRuntimeVerifierThreads
+                                : kExplicitThresholdRows;
+        const int blocks = (launch_rows + threads - 1) / threads;
+        const size_t row_offset =
+            static_cast<size_t>(row_base) *
+            static_cast<size_t>(distribution_stride);
+        hipLaunchKernelGGL(
+            rocm_speculative_verify_distribution_thresholds_batch_device_tokens_kernel,
+            dim3(blocks),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            target_token_ids + row_offset,
+            target_probs + row_offset,
+            draft_token_ids ? draft_token_ids + row_offset : nullptr,
+            draft_probs ? draft_probs + row_offset : nullptr,
+            k,
+            distribution_stride,
+            sampled_draft_tokens + row_base,
+            sampled_draft_probabilities
+                ? sampled_draft_probabilities + row_base
+                : nullptr,
+            thresholds,
+            launch_rows,
+            inverse_sample_seed,
+            inverse_sample_first_logical_position + row_base,
+            inverse_sample_vocab_size,
+            threshold_seed,
+            threshold_first_logical_position + row_base,
+            thresholds_from_seed,
+            threshold_base_position,
+            threshold_position_offset + row_base,
+            out_token + row_base,
+            out_accepted + row_base,
+            out_accept_probability
+                ? out_accept_probability + row_base
+                : nullptr,
+            out_accept_threshold
+                ? out_accept_threshold + row_base
+                : nullptr);
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "ROCm Speculative Verify Batch Device Tokens FP32 kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -4686,14 +4675,8 @@ bool rocmOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_
     int target_row_stride,
     int draft_row_stride,
     const int *sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    const float *accept_thresholds_host,
+    const float *residual_thresholds_host,
     int *out_token,
     int *out_accepted,
     float *out_accept_probability,
@@ -4705,48 +4688,61 @@ bool rocmOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_
     if (!target_logits || !draft_logits || !sampled_draft_tokens ||
         !out_token || !out_accepted || !stream ||
         row_count <= 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         vocab_size <= 0 ||
         target_row_stride < vocab_size ||
-        draft_row_stride < vocab_size)
+        draft_row_stride < vocab_size ||
+        !accept_thresholds_host || !residual_thresholds_host)
     {
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipLaunchKernelGGL(
-        rocm_speculative_verify_processed_logits_thresholds_batch_device_tokens_kernel,
-        dim3(row_count),
-        dim3(PROCESSED_LOGIT_VERIFY_THREADS),
-        0,
-        static_cast<hipStream_t>(stream),
-        target_logits,
-        draft_logits,
-        row_count,
-        vocab_size,
-        target_row_stride,
-        draft_row_stride,
-        sampled_draft_tokens,
-        accept_threshold0,
-        accept_threshold1,
-        accept_threshold2,
-        accept_threshold3,
-        residual_threshold0,
-        residual_threshold1,
-        residual_threshold2,
-        residual_threshold3,
-        out_token,
-        out_accepted,
-        out_accept_probability,
-        out_accept_threshold,
-        draft_token_probabilities);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    constexpr int kRowsPerLaunch =
+        llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+    for (int row_base = 0; row_base < row_count;
+         row_base += kRowsPerLaunch)
     {
-        fprintf(stderr, "ROCm Processed-Logit Stochastic Speculative Verify kernel launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        const int launch_rows =
+            std::min(kRowsPerLaunch, row_count - row_base);
+        const auto thresholds = packROCmSpeculativeBatchThresholds(
+            accept_thresholds_host + row_base,
+            residual_thresholds_host + row_base,
+            launch_rows);
+        hipLaunchKernelGGL(
+            rocm_speculative_verify_processed_logits_thresholds_batch_device_tokens_kernel,
+            dim3(launch_rows),
+            dim3(PROCESSED_LOGIT_VERIFY_THREADS),
+            0,
+            static_cast<hipStream_t>(stream),
+            target_logits +
+                static_cast<size_t>(row_base) * target_row_stride,
+            draft_logits +
+                static_cast<size_t>(row_base) * draft_row_stride,
+            launch_rows,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            sampled_draft_tokens + row_base,
+            thresholds,
+            out_token + row_base,
+            out_accepted + row_base,
+            out_accept_probability
+                ? out_accept_probability + row_base
+                : nullptr,
+            out_accept_threshold
+                ? out_accept_threshold + row_base
+                : nullptr,
+            draft_token_probabilities
+                ? draft_token_probabilities + row_base
+                : nullptr);
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "ROCm Processed-Logit Stochastic Speculative Verify kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -4759,10 +4755,7 @@ bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_
     int target_row_stride,
     int draft_row_stride,
     const int *sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    const float *accept_thresholds_host,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
     int thresholds_from_seed,
@@ -4781,7 +4774,6 @@ bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_
         !sampled_draft_tokens ||
         !out_token || !out_accepted || !stream ||
         row_count <= 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         vocab_size <= 0 ||
         target_row_stride < vocab_size ||
         (!no_draft_probabilities && draft_row_stride < vocab_size) ||
@@ -4791,40 +4783,71 @@ bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipLaunchKernelGGL(
-        rocm_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_kernel,
-        dim3(row_count),
-        dim3(PROCESSED_LOGIT_VERIFY_THREADS),
-        0,
-        static_cast<hipStream_t>(stream),
-        target_logits,
-        draft_probabilities,
-        row_count,
-        vocab_size,
-        target_row_stride,
-        draft_row_stride,
-        sampled_draft_tokens,
-        accept_threshold0,
-        accept_threshold1,
-        accept_threshold2,
-        accept_threshold3,
-        inverse_sample_seed,
-        inverse_sample_first_logical_position,
-        thresholds_from_seed,
-        threshold_base_position,
-        threshold_position_offset,
-        out_token,
-        out_accepted,
-        out_accept_probability,
-        out_accept_threshold,
-        no_draft_probabilities);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "ROCm Processed-Target/Draft-Probability Stochastic Verify kernel launch failed: %s\n",
-                hipGetErrorString(err));
+    constexpr int kRowsPerLaunch =
+        llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+    const bool use_seeded_thresholds = thresholds_from_seed != 0;
+    if (!use_seeded_thresholds && !accept_thresholds_host)
         return false;
+
+    const int launch_count = use_seeded_thresholds
+                                 ? 1
+                                 : (row_count + kRowsPerLaunch - 1) /
+                                       kRowsPerLaunch;
+    for (int launch = 0; launch < launch_count; ++launch)
+    {
+        const int row_base = use_seeded_thresholds
+                                 ? 0
+                                 : launch * kRowsPerLaunch;
+        const int launch_rows = use_seeded_thresholds
+                                    ? row_count
+                                    : std::min(kRowsPerLaunch,
+                                               row_count - row_base);
+        const auto thresholds = packROCmSpeculativeBatchThresholds(
+            use_seeded_thresholds
+                ? nullptr
+                : accept_thresholds_host + row_base,
+            /*residual_thresholds=*/nullptr,
+            use_seeded_thresholds ? 0 : launch_rows);
+        hipLaunchKernelGGL(
+            rocm_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_kernel,
+            dim3(launch_rows),
+            dim3(PROCESSED_LOGIT_VERIFY_THREADS),
+            0,
+            static_cast<hipStream_t>(stream),
+            target_logits +
+                static_cast<size_t>(row_base) * target_row_stride,
+            no_draft_probabilities
+                ? nullptr
+                : draft_probabilities +
+                      static_cast<size_t>(row_base) * draft_row_stride,
+            launch_rows,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            sampled_draft_tokens + row_base,
+            thresholds,
+            inverse_sample_seed,
+            inverse_sample_first_logical_position + row_base,
+            thresholds_from_seed,
+            threshold_base_position,
+            threshold_position_offset + row_base,
+            out_token + row_base,
+            out_accepted + row_base,
+            out_accept_probability
+                ? out_accept_probability + row_base
+                : nullptr,
+            out_accept_threshold
+                ? out_accept_threshold + row_base
+                : nullptr,
+            no_draft_probabilities);
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "ROCm Processed-Target/Draft-Probability Stochastic Verify kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -4838,10 +4861,7 @@ bool rocmOps_speculative_verify_processed_target_draft_logits_thresholds_batch_d
     int draft_row_stride,
     const int *sampled_draft_tokens,
     const float *sampled_draft_probabilities,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    const float *accept_thresholds_host,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
     int *out_token,
@@ -4854,46 +4874,63 @@ bool rocmOps_speculative_verify_processed_target_draft_logits_thresholds_batch_d
     if (!target_logits || !draft_logits || !sampled_draft_tokens ||
         !out_token || !out_accepted || !stream ||
         row_count <= 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         vocab_size <= 0 ||
         target_row_stride < vocab_size ||
-        draft_row_stride < vocab_size)
+        draft_row_stride < vocab_size ||
+        !accept_thresholds_host)
     {
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipLaunchKernelGGL(
-        rocm_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_kernel,
-        dim3(row_count),
-        dim3(PROCESSED_LOGIT_VERIFY_THREADS),
-        0,
-        static_cast<hipStream_t>(stream),
-        target_logits,
-        draft_logits,
-        row_count,
-        vocab_size,
-        target_row_stride,
-        draft_row_stride,
-        sampled_draft_tokens,
-        sampled_draft_probabilities,
-        accept_threshold0,
-        accept_threshold1,
-        accept_threshold2,
-        accept_threshold3,
-        inverse_sample_seed,
-        inverse_sample_first_logical_position,
-        out_token,
-        out_accepted,
-        out_accept_probability,
-        out_accept_threshold);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    constexpr int kRowsPerLaunch =
+        llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+    for (int row_base = 0; row_base < row_count;
+         row_base += kRowsPerLaunch)
     {
-        fprintf(stderr, "ROCm Processed-Target/Draft-Logit Stochastic Verify kernel launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        const int launch_rows =
+            std::min(kRowsPerLaunch, row_count - row_base);
+        const auto thresholds = packROCmSpeculativeBatchThresholds(
+            accept_thresholds_host + row_base,
+            /*residual_thresholds=*/nullptr,
+            launch_rows);
+        hipLaunchKernelGGL(
+            rocm_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_kernel,
+            dim3(launch_rows),
+            dim3(PROCESSED_LOGIT_VERIFY_THREADS),
+            0,
+            static_cast<hipStream_t>(stream),
+            target_logits +
+                static_cast<size_t>(row_base) * target_row_stride,
+            draft_logits +
+                static_cast<size_t>(row_base) * draft_row_stride,
+            launch_rows,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            sampled_draft_tokens + row_base,
+            sampled_draft_probabilities
+                ? sampled_draft_probabilities + row_base
+                : nullptr,
+            thresholds,
+            inverse_sample_seed,
+            inverse_sample_first_logical_position + row_base,
+            out_token + row_base,
+            out_accepted + row_base,
+            out_accept_probability
+                ? out_accept_probability + row_base
+                : nullptr,
+            out_accept_threshold
+                ? out_accept_threshold + row_base
+                : nullptr);
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "ROCm Processed-Target/Draft-Logit Stochastic Verify kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -4908,10 +4945,7 @@ bool rocmOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32
     int draft_row_stride,
     int inverse_sample_row_stride,
     const int *sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    const float *accept_thresholds_host,
     int no_draft_probabilities,
     int *out_token,
     int *out_accepted,
@@ -4924,47 +4958,65 @@ bool rocmOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32
         (!no_draft_probabilities && !draft_probabilities) ||
         !sampled_draft_tokens || !out_token || !out_accepted || !stream ||
         row_count <= 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         vocab_size <= 0 ||
         target_row_stride < vocab_size ||
         (!no_draft_probabilities && draft_row_stride < vocab_size) ||
-        inverse_sample_row_stride < vocab_size)
+        inverse_sample_row_stride < vocab_size ||
+        !accept_thresholds_host)
     {
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipLaunchKernelGGL(
-        rocm_speculative_verify_probabilities_thresholds_batch_device_tokens_kernel,
-        dim3(row_count),
-        dim3(PROCESSED_LOGIT_VERIFY_THREADS),
-        0,
-        static_cast<hipStream_t>(stream),
-        target_probabilities,
-        draft_probabilities,
-        inverse_rejection_samples,
-        row_count,
-        vocab_size,
-        target_row_stride,
-        draft_row_stride,
-        inverse_sample_row_stride,
-        sampled_draft_tokens,
-        accept_threshold0,
-        accept_threshold1,
-        accept_threshold2,
-        accept_threshold3,
-        no_draft_probabilities,
-        out_token,
-        out_accepted,
-        out_accept_probability,
-        out_accept_threshold);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    constexpr int kRowsPerLaunch =
+        llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+    for (int row_base = 0; row_base < row_count;
+         row_base += kRowsPerLaunch)
     {
-        fprintf(stderr, "ROCm Full-Probability Stochastic Speculative Verify kernel launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        const int launch_rows =
+            std::min(kRowsPerLaunch, row_count - row_base);
+        const auto thresholds = packROCmSpeculativeBatchThresholds(
+            accept_thresholds_host + row_base,
+            /*residual_thresholds=*/nullptr,
+            launch_rows);
+        hipLaunchKernelGGL(
+            rocm_speculative_verify_probabilities_thresholds_batch_device_tokens_kernel,
+            dim3(launch_rows),
+            dim3(PROCESSED_LOGIT_VERIFY_THREADS),
+            0,
+            static_cast<hipStream_t>(stream),
+            target_probabilities +
+                static_cast<size_t>(row_base) * target_row_stride,
+            no_draft_probabilities
+                ? nullptr
+                : draft_probabilities +
+                      static_cast<size_t>(row_base) * draft_row_stride,
+            inverse_rejection_samples +
+                static_cast<size_t>(row_base) * inverse_sample_row_stride,
+            launch_rows,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            inverse_sample_row_stride,
+            sampled_draft_tokens + row_base,
+            thresholds,
+            no_draft_probabilities,
+            out_token + row_base,
+            out_accepted + row_base,
+            out_accept_probability
+                ? out_accept_probability + row_base
+                : nullptr,
+            out_accept_threshold
+                ? out_accept_threshold + row_base
+                : nullptr);
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "ROCm Full-Probability Stochastic Speculative Verify kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -4986,12 +5038,13 @@ bool rocmOps_summarize_speculative_verify_batch(
     const int *bonus_token,
     int has_bonus_token,
     int *out_tokens,
+    int out_token_capacity,
     int *out_meta,
     int device_idx,
     void *stream)
 {
     if (row_count < 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+        out_token_capacity < row_count + 1 ||
         stop_token_count < 0 ||
         stop_token_count >
             llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
@@ -5023,6 +5076,7 @@ bool rocmOps_summarize_speculative_verify_batch(
         bonus_token,
         has_bonus_token,
         out_tokens,
+        out_token_capacity,
         out_meta);
 
     hipError_t err = hipGetLastError();
@@ -5052,12 +5106,13 @@ bool rocmOps_summarize_speculative_verify_batch_device_first_token(
     const int *bonus_token,
     int has_bonus_token,
     int *out_tokens,
+    int out_token_capacity,
     int *out_meta,
     int device_idx,
     void *stream)
 {
     if (row_count < 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+        out_token_capacity < row_count + 1 ||
         stop_token_count < 0 ||
         stop_token_count >
             llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
@@ -5089,6 +5144,7 @@ bool rocmOps_summarize_speculative_verify_batch_device_first_token(
         bonus_token,
         has_bonus_token,
         out_tokens,
+        out_token_capacity,
         out_meta);
 
     hipError_t err = hipGetLastError();
@@ -5116,12 +5172,13 @@ bool rocmOps_summarize_greedy_speculative_verify_batch(
     int stop_token7,
     int stop_token_count,
     int *out_tokens,
+    int out_token_capacity,
     int *out_meta,
     int device_idx,
     void *stream)
 {
     if (compare_row_count < 0 ||
-        compare_row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+        out_token_capacity < compare_row_count + 1 ||
         stop_token_count < 0 ||
         stop_token_count >
             llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
@@ -5150,6 +5207,7 @@ bool rocmOps_summarize_greedy_speculative_verify_batch(
         stop_token7,
         stop_token_count,
         out_tokens,
+        out_token_capacity,
         out_meta);
 
     hipError_t err = hipGetLastError();
@@ -5310,12 +5368,10 @@ bool rocmOps_prepare_speculative_shifted_kv_tokens(
         !out_position_ids ||
         !stream ||
         meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
-        output_token_stride <
-            llaminar2::sampling_math::kSpeculativeBatchMaxOutputTokens ||
+        output_token_stride <= first_output_token_index ||
         request_index < 0 ||
         first_output_token_index < 0 ||
-        row_count <= 0 ||
-        row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows)
+        row_count <= 0)
     {
         return false;
     }
@@ -5366,7 +5422,6 @@ bool rocmOps_prepare_mtp_batched_sidecar_inputs(
         condition_token_stride <= 0 ||
         !base_positions ||
         request_count <= 0 ||
-        request_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         !out_condition_tokens ||
         !out_position_ids ||
         !stream)
@@ -5419,7 +5474,6 @@ bool rocmOps_initialize_mtp_device_logical_state(
     if (!sampled_tokens ||
         !target_positions ||
         request_count <= 0 ||
-        request_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
         !out_base_cached_tokens ||
         !out_target_positions ||
         !out_accepted_state_counts ||

@@ -18,6 +18,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -213,7 +214,7 @@ namespace llaminar2::test::gpu_residual_add_verifier
     }
 
     /**
-     * @brief Sweep one native format across M=2..4 and two production widths.
+     * @brief Sweep one native format across runtime M and production widths.
      *
      * Serial witnesses consume byte copies of the already-converted grouped
      * operands, ensuring host conversion cannot hide a native-format mismatch.
@@ -232,17 +233,18 @@ namespace llaminar2::test::gpu_residual_add_verifier
         // standalone residual publication proof covers the exact geometry
         // consumed by the fused residual-plus-RMSNorm production stage.
         constexpr std::array<int, 3> column_counts = {128, 4096, 5120};
+        constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
 
         for (int cols : column_counts)
         {
             const auto input_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x1A2B3000u ^ static_cast<uint32_t>(cols));
             const auto residual_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x4C5D6000u ^ static_cast<uint32_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string(backend_label) + " format=" + format_label +

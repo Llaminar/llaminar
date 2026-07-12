@@ -5,9 +5,9 @@
  * MTP verifier rows may use either contiguous positions represented by a
  * device-resident scalar offset or explicit device position rows for batched
  * requests. Both GPU backends implement FP32, BF16, and FP16 fused Q/K kernels
- * for those routes. This harness compares one M=2..4 production launch against
- * the same native rows processed by the backend's production M=1 contiguous
- * path and requires byte equality plus an exact route-counter observation.
+ * for those routes. This harness compares one runtime-M production launch
+ * against the same native rows processed by the backend's production M=1
+ * contiguous path and requires byte equality plus an exact route counter.
  */
 
 #pragma once
@@ -19,6 +19,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -167,16 +168,28 @@ namespace llaminar2::test::gpu_rope_verifier
         constexpr int head_dim = 128;
         constexpr int partial_rotary_dim = 64;
         constexpr float rope_theta = 1000000.0f;
-        constexpr std::array<int, 4> explicit_positions = {101, 101, 107, 109};
+        constexpr int max_rows = kGroupedVerifierRuntimeRows.back();
         constexpr std::array<PositionRoute, 2> position_routes = {
             PositionRoute::ContiguousDeviceScalar,
             PositionRoute::ExplicitDeviceRows,
         };
 
+        std::array<int, max_rows> explicit_positions{};
+        for (int row = 0; row < max_rows; ++row)
+        {
+            // Repeated positions and irregular gaps prevent the explicit-row
+            // route from passing by accidentally treating the group as one
+            // contiguous position run.
+            explicit_positions[static_cast<size_t>(row)] =
+                101 + (row / 3) * 5 + (row % 3 == 2 ? 2 : 0);
+        }
+
         const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
         const size_t k_cols = static_cast<size_t>(n_kv_heads) * head_dim;
-        const auto q_values = makeValues(4 * q_cols, 0xC001D00Du);
-        const auto k_values = makeValues(4 * k_cols, 0x51A7E123u);
+        const auto q_values = makeValues(
+            static_cast<size_t>(max_rows) * q_cols, 0xC001D00Du);
+        const auto k_values = makeValues(
+            static_cast<size_t>(max_rows) * k_cols, 0x51A7E123u);
         const std::array<int, 2> rotary_dims = {
             head_dim,
             include_partial_rope ? partial_rotary_dim : head_dim,
@@ -189,7 +202,7 @@ namespace llaminar2::test::gpu_rope_verifier
             const int rotary_argument = effective_rotary_dim == head_dim
                                             ? 0
                                             : effective_rotary_dim;
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : kGroupedVerifierRuntimeRows)
             {
                 for (PositionRoute position_route : position_routes)
                 {
@@ -205,7 +218,7 @@ namespace llaminar2::test::gpu_rope_verifier
 
                     Kernel kernel(0);
                     kernel.setGPUStream(stream);
-                    const auto requirements = kernel.getWorkspaceRequirements(4);
+                    const auto requirements = kernel.getWorkspaceRequirements(max_rows);
                     DeviceWorkspaceManager workspace(
                         device, requirements.total_bytes_with_alignment() + 4096);
                     ASSERT_TRUE(workspace.allocate(requirements));

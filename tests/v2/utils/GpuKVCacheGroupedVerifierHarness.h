@@ -29,6 +29,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <array>
 #include <cstdint>
@@ -359,10 +360,9 @@ namespace llaminar2::test::gpu_kv_verifier
         GroupedAppender &&grouped_append,
         DeviceStateObserver &&observe_state)
     {
-        constexpr int prefix_rows = 3;
-        constexpr int max_seq_len = 5;
+        constexpr int max_seq_len = kGroupedVerifierRuntimeRows.back();
+        constexpr int prefix_rows = max_seq_len - 2;
         constexpr std::array<int, 2> head_dims = {64, 128};
-        constexpr std::array<int, 3> verifier_depths = {2, 3, 4};
         constexpr std::array<bool, 2> source_layouts = {false, true};
         ScopedPerfStats perfstats;
         ASSERT_TRUE(PerfStatsCollector::isEnabled());
@@ -380,7 +380,7 @@ namespace llaminar2::test::gpu_kv_verifier
                     const int kv_dim = local_heads * head_dim;
                     for (const bool source_head_major : source_layouts)
                     {
-                        for (const int verifier_rows : verifier_depths)
+                        for (const int verifier_rows : kGroupedVerifierRuntimeRows)
                         {
                             const char *layout_label = source_head_major
                                                            ? "head_major"
@@ -402,8 +402,10 @@ namespace llaminar2::test::gpu_kv_verifier
                                 device, format.cache_precision, topology,
                                 max_seq_len, head_dim, &tq_context);
 
-                            // Prefix rows force M=3/4 through ring wrap while
-                            // M=2 remains the exact-capacity non-wrapped case.
+                            // The prefix leaves exactly two free positions.
+                            // M=2 fills the ring, while every larger certified
+                            // depth wraps without assigning two source rows to
+                            // the same destination slot in one grouped launch.
                             const TensorType history_type =
                                 format.cache_precision == ActivationPrecision::TQ8
                                     ? TensorType::FP32

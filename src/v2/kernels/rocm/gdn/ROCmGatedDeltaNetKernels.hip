@@ -74,11 +74,12 @@ namespace { // anonymous namespace to avoid symbol conflicts with CUDA kernels
 /**
  * @brief Advance a tiny grouped recurrence with the exact scalar HIP arithmetic.
  *
- * Scalar decode and grouped MTP verification both enter this kernel.  M=1 uses
- * one loop iteration; M=2..4 keeps the same block resident and advances rows in
- * causal order.  In particular, the four-way `d_k` split, wavefront reduction,
- * gate math, and state-update expressions are shared rather than reimplemented
- * by a prefill kernel with a subtly different floating-point schedule.
+ * Scalar decode and grouped MTP verification both enter this kernel. M=1 uses
+ * one loop iteration; a runtime-sized verifier matrix keeps the same block
+ * resident and advances rows in causal order. In particular, the four-way
+ * `d_k` split, wavefront reduction, gate math, and state-update expressions are
+ * shared rather than reimplemented by a prefill kernel with a subtly different
+ * floating-point schedule.
  *
  * Grid X flattens request and head identity. Grid Y owns independent value
  * columns. Post-row snapshots use the flattened request-row namespace, so one
@@ -805,12 +806,12 @@ __global__ void rocm_short_conv1d_prefill_kernel(
 /**
  * @brief Decode-equivalent grouped short-conv kernel for MTP verifier rows.
  *
- * The verifier only uses very small row counts (currently M=2..4).  The
- * ordinary prefill route needs two launches so the final live state cannot race
- * with threads that still read the old state.  This kernel avoids that launch
- * tax by assigning one lane to each channel, walking the tiny row group in
- * causal order, publishing each post-row state snapshot, then updating the live
- * state once all reads from the old state for that channel are complete.
+ * The ordinary prefill route needs two launches so the final live state cannot
+ * race with threads that still read the old state. A verifier already needs
+ * every post-row history, so this kernel assigns one lane to each channel,
+ * walks the runtime-sized matrix in causal order, publishes each snapshot, and
+ * commits speculative state once all reads from the old channel history finish.
+ * There is one launch for the complete matrix and no row replay.
  */
 __global__ void rocm_short_conv1d_small_m_kernel(
     const float *__restrict__ input,
@@ -2077,14 +2078,20 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         print_pointer_attrs("state", state);
     }
 
+    const int required_snapshot_stride = n_heads * d_k * d_v;
+    const bool complete_verifier_capture =
+        state_snapshots != nullptr &&
+        snapshot_stride_floats >= required_snapshot_stride &&
+        max_snapshot_rows >= seq_len;
+
     /*
-     * Tiny verifier groups, small padded request matrices, and one-row
-     * continuation share the scalar recurrence kernel through width eight.
-     * Grid X flattens `(request, head)` and each block advances M rows in order.
-     * This preserves the exact wavefront reduction and state-update schedule
-     * while retaining one economical launch for the request matrix.
+     * Widths through eight use the exact scalar recurrence for launch economy.
+     * A complete verifier capture matrix selects it at every runtime M because
+     * any post-row state may be published and must therefore preserve scalar
+     * decode's wavefront reduction schedule. Long ordinary prefill supplies no
+     * complete capture matrix and continues through the optimized path below.
      */
-    if (request_seq_len <= 8)
+    if (request_seq_len <= 8 || complete_verifier_capture)
     {
         if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
         {
@@ -2345,7 +2352,29 @@ bool rocmGDN_short_conv1d(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    if (seq_len == 1) {
+    const int required_snapshot_stride = channels * (kernel_size - 1);
+    const bool complete_verifier_capture =
+        state_snapshots != nullptr &&
+        snapshot_stride_floats >= required_snapshot_stride &&
+        max_snapshot_rows >= seq_len;
+
+    /*
+     * Verifier execution supplies one complete post-row state matrix. Use the
+     * one-channel-owner kernel at every runtime M, including M=1, so every row
+     * can be selected by device-side publication without changing arithmetic.
+     */
+    if (complete_verifier_capture) {
+        int threads = 256;
+        int blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            nullptr,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            seq_len, channels, kernel_size, apply_silu);
+    } else if (seq_len == 1) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_decode_kernel,
@@ -2403,7 +2432,24 @@ bool rocmGDN_short_conv1d_effective(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    if (seq_len == 1) {
+    const int required_snapshot_stride = channels * (kernel_size - 1);
+    const bool complete_verifier_capture =
+        state_snapshots != nullptr &&
+        snapshot_stride_floats >= required_snapshot_stride &&
+        max_snapshot_rows >= seq_len;
+
+    if (complete_verifier_capture) {
+        int threads = 256;
+        int blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            seq_len, channels, kernel_size, apply_silu);
+    } else if (seq_len == 1) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_decode_kernel,
@@ -2477,7 +2523,12 @@ bool rocmGDN_short_conv1d_batched(
     }
 
     constexpr int threads = 256;
-    if (request_seq_len <= 4)
+    const int required_snapshot_stride = channels * (kernel_size - 1);
+    const bool complete_verifier_capture =
+        state_snapshots != nullptr &&
+        snapshot_stride_floats >= required_snapshot_stride &&
+        max_snapshot_rows >= request_count * request_seq_len;
+    if (request_seq_len <= 4 || complete_verifier_capture)
     {
         const int channel_blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(

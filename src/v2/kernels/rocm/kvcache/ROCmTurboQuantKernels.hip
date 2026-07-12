@@ -13,6 +13,7 @@
 #include "../../../utils/Logger.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <atomic>
@@ -1103,7 +1104,6 @@ namespace llaminar2
         int rope_dim)
     {
         const int head = static_cast<int>(blockIdx.x);
-        const int tile_start = static_cast<int>(blockIdx.y) * TILE;
         const int request = static_cast<int>(blockIdx.z);
         const int tid = static_cast<int>(threadIdx.x);
         if (request >= request_count || head >= n_kv_heads || tid >= D)
@@ -1131,11 +1131,15 @@ namespace llaminar2
         const int kv_dim = n_kv_heads * D;
         __shared__ float centroid[D];
 
+        for (int tile_start = static_cast<int>(blockIdx.y) * TILE;
+             tile_start < max_kv_len;
+             tile_start += static_cast<int>(gridDim.y) * TILE)
+        {
         for (int tile = 0; tile < TILE; ++tile)
         {
             const int output_token = tile_start + tile;
             if (output_token >= max_kv_len)
-                return;
+                break;
             const size_t output_index =
                 (static_cast<size_t>(request) * max_kv_len + output_token) *
                     static_cast<size_t>(kv_dim) +
@@ -1146,7 +1150,6 @@ namespace llaminar2
                 __syncthreads();
                 continue;
             }
-
             const int source_token =
                 (tail + skipped_rows + output_token) % max_seq_len;
             const uint8_t *block = cache +
@@ -1197,6 +1200,7 @@ namespace llaminar2
             output[output_index] = static_cast<_Float16>(value);
             __syncthreads();
         }
+        }
     }
 
     /**
@@ -1216,7 +1220,6 @@ namespace llaminar2
         int n_kv_heads)
     {
         const int head = static_cast<int>(blockIdx.x);
-        const int tile_start = static_cast<int>(blockIdx.y) * TILE;
         const int request = static_cast<int>(blockIdx.z);
         const int tid = static_cast<int>(threadIdx.x);
         if (request >= request_count || head >= n_kv_heads || tid >= D)
@@ -1248,11 +1251,15 @@ namespace llaminar2
         const int byte_index = group8 * 3;
         __shared__ float centroid[D];
 
+        for (int tile_start = static_cast<int>(blockIdx.y) * TILE;
+             tile_start < max_kv_len;
+             tile_start += static_cast<int>(gridDim.y) * TILE)
+        {
         for (int tile = 0; tile < TILE; ++tile)
         {
             const int output_token = tile_start + tile;
             if (output_token >= max_kv_len)
-                return;
+                break;
             const size_t output_index =
                 (static_cast<size_t>(request) * max_kv_len + output_token) *
                     static_cast<size_t>(kv_dim) +
@@ -1263,7 +1270,6 @@ namespace llaminar2
                 __syncthreads();
                 continue;
             }
-
             const int source_token =
                 (tail + skipped_rows + output_token) % max_seq_len;
             const uint8_t *block = cache +
@@ -1297,6 +1303,7 @@ namespace llaminar2
                 static_cast<_Float16>(hip_tq_inverse_rotate_canonical<D>(
                     rotation, centroid, norm, tid));
             __syncthreads();
+        }
         }
     }
 
@@ -1536,41 +1543,43 @@ namespace llaminar2
     {
         const int effective_rope_dim = rope_dim > 0 ? rope_dim : head_dim;
         const int half_dim = effective_rope_dim / 2;
-        const int pairs_per_request = max_kv_len * n_kv_heads * half_dim;
-        const int global_pair = blockIdx.x * blockDim.x + threadIdx.x;
-        if (global_pair >= request_count * pairs_per_request)
+        const int request = static_cast<int>(blockIdx.y);
+        if (request >= request_count)
             return;
 
-        const int request = global_pair / pairs_per_request;
-        const int request_pair = global_pair % pairs_per_request;
         const int pairs_per_token = n_kv_heads * half_dim;
-        const int token = request_pair / pairs_per_token;
-        const int token_pair = request_pair % pairs_per_token;
-        const int head = token_pair / half_dim;
-        const int pair = token_pair % half_dim;
         int ring_count = counts[entry_offset + request];
         ring_count = ring_count < 0
                          ? 0
                          : (ring_count > max_seq_len ? max_seq_len : ring_count);
         const int visible_count =
             ring_count < max_kv_len ? ring_count : max_kv_len;
-        if (token >= visible_count)
-            return;
-
+        const int live_pairs = visible_count * pairs_per_token;
         const int kv_dim = n_kv_heads * head_dim;
-        const size_t base =
-            (static_cast<size_t>(request) * max_kv_len + token) * kv_dim +
-            static_cast<size_t>(head) * head_dim;
-        const size_t first = base + pair;
-        const size_t second = base + pair + half_dim;
-        float rotated_x = 0.0f;
-        float rotated_y = 0.0f;
-        canonical_hip_rope_pair(
-            static_cast<float>(d_K[first]), static_cast<float>(d_K[second]),
-            rope_theta, pair, effective_rope_dim, position_start + token,
-            &rotated_x, &rotated_y);
-        d_K[first] = static_cast<_Float16>(rotated_x);
-        d_K[second] = static_cast<_Float16>(rotated_y);
+        for (int request_pair =
+                 static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+             request_pair < live_pairs;
+             request_pair += static_cast<int>(gridDim.x * blockDim.x))
+        {
+            const int token = request_pair / pairs_per_token;
+            const int token_pair = request_pair % pairs_per_token;
+            const int head = token_pair / half_dim;
+            const int pair = token_pair % half_dim;
+            const size_t base =
+                (static_cast<size_t>(request) * max_kv_len + token) * kv_dim +
+                static_cast<size_t>(head) * head_dim;
+            const size_t first = base + pair;
+            const size_t second = base + pair + half_dim;
+            float rotated_x = 0.0f;
+            float rotated_y = 0.0f;
+            canonical_hip_rope_pair(
+                static_cast<float>(d_K[first]),
+                static_cast<float>(d_K[second]),
+                rope_theta, pair, effective_rope_dim,
+                position_start + token, &rotated_x, &rotated_y);
+            d_K[first] = static_cast<_Float16>(rotated_x);
+            d_K[second] = static_cast<_Float16>(rotated_y);
+        }
     }
 
     __global__ void hip_rope_apply_batched_fp32_ring_to_fp16_device_state_kernel(
@@ -1590,18 +1599,11 @@ namespace llaminar2
     {
         const int effective_rope_dim = rope_dim > 0 ? rope_dim : head_dim;
         const int half_dim = effective_rope_dim / 2;
-        const int pairs_per_request = max_kv_len * n_kv_heads * half_dim;
-        const int global_pair = blockIdx.x * blockDim.x + threadIdx.x;
-        if (global_pair >= request_count * pairs_per_request)
+        const int request = static_cast<int>(blockIdx.y);
+        if (request >= request_count)
             return;
 
-        const int request = global_pair / pairs_per_request;
-        const int request_pair = global_pair % pairs_per_request;
         const int pairs_per_token = n_kv_heads * half_dim;
-        const int output_token = request_pair / pairs_per_token;
-        const int token_pair = request_pair % pairs_per_token;
-        const int head = token_pair / half_dim;
-        const int pair = token_pair % half_dim;
         const int entry = entry_offset + request;
         int ring_count = counts[entry];
         ring_count = ring_count < 0
@@ -1609,30 +1611,40 @@ namespace llaminar2
                          : (ring_count > max_seq_len ? max_seq_len : ring_count);
         const int visible_count =
             ring_count < max_kv_len ? ring_count : max_kv_len;
-        if (output_token >= visible_count)
-            return;
-
         const int skipped_rows = ring_count - visible_count;
         int tail = (heads[entry] - ring_count) % max_seq_len;
         if (tail < 0)
             tail += max_seq_len;
-        const int source_token =
-            (tail + skipped_rows + output_token) % max_seq_len;
         const int kv_dim = n_kv_heads * head_dim;
-        const size_t source_base =
-            static_cast<size_t>(source_token) * kv_dim +
-            static_cast<size_t>(head) * head_dim;
-        const HipFP32RoPEPair rotated = canonical_hip_fp32_rope_pair(
-            entry_table[entry][source_base + pair],
-            entry_table[entry][source_base + pair + half_dim],
-            rope_theta, pair, effective_rope_dim,
-            position_start + output_token);
-        const size_t output_base =
-            (static_cast<size_t>(request) * max_kv_len + output_token) * kv_dim +
-            static_cast<size_t>(head) * head_dim;
         auto *half_output = reinterpret_cast<half *>(d_K_out);
-        half_output[output_base + pair] = __float2half(rotated.first);
-        half_output[output_base + pair + half_dim] = __float2half(rotated.second);
+        const int live_pairs = visible_count * pairs_per_token;
+        for (int request_pair =
+                 static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+             request_pair < live_pairs;
+             request_pair += static_cast<int>(gridDim.x * blockDim.x))
+        {
+            const int output_token = request_pair / pairs_per_token;
+            const int token_pair = request_pair % pairs_per_token;
+            const int head = token_pair / half_dim;
+            const int pair = token_pair % half_dim;
+            const int source_token =
+                (tail + skipped_rows + output_token) % max_seq_len;
+            const size_t source_base =
+                static_cast<size_t>(source_token) * kv_dim +
+                static_cast<size_t>(head) * head_dim;
+            const HipFP32RoPEPair rotated = canonical_hip_fp32_rope_pair(
+                entry_table[entry][source_base + pair],
+                entry_table[entry][source_base + pair + half_dim],
+                rope_theta, pair, effective_rope_dim,
+                position_start + output_token);
+            const size_t output_base =
+                (static_cast<size_t>(request) * max_kv_len + output_token) *
+                    kv_dim +
+                static_cast<size_t>(head) * head_dim;
+            half_output[output_base + pair] = __float2half(rotated.first);
+            half_output[output_base + pair + half_dim] =
+                __float2half(rotated.second);
+        }
     }
 
     // =========================================================================
@@ -2014,11 +2026,16 @@ namespace llaminar2
         {
             return false;
         }
-        const int pairs = request_count * max_kv_len * n_kv_heads *
-                          (effective_rope_dim / 2);
+        const int pairs_per_request =
+            max_kv_len * n_kv_heads * (effective_rope_dim / 2);
+        constexpr unsigned int resident_rope_blocks = 64;
+        const unsigned int blocks = std::min(
+            static_cast<unsigned int>((pairs_per_request + 255) / 256),
+            resident_rope_blocks);
         hipLaunchKernelGGL(
             hip_rope_apply_batched_fp16_device_state_kernel,
-            dim3((pairs + 255) / 256), dim3(256), 0, stream,
+            dim3(blocks, static_cast<unsigned int>(request_count)),
+            dim3(256), 0, stream,
             d_K, d_counts, entry_offset, request_count, max_kv_len,
             max_seq_len, n_kv_heads, head_dim, rope_theta,
             position_start, effective_rope_dim);
@@ -2050,11 +2067,16 @@ namespace llaminar2
         {
             return false;
         }
-        const int pairs = request_count * max_kv_len * n_kv_heads *
-                          (effective_rope_dim / 2);
+        const int pairs_per_request =
+            max_kv_len * n_kv_heads * (effective_rope_dim / 2);
+        constexpr unsigned int resident_rope_blocks = 64;
+        const unsigned int blocks = std::min(
+            static_cast<unsigned int>((pairs_per_request + 255) / 256),
+            resident_rope_blocks);
         hipLaunchKernelGGL(
             hip_rope_apply_batched_fp32_ring_to_fp16_device_state_kernel,
-            dim3((pairs + 255) / 256), dim3(256), 0, stream,
+            dim3(blocks, static_cast<unsigned int>(request_count)),
+            dim3(256), 0, stream,
             d_K_out, d_K_entry_table, d_heads, d_counts, entry_offset,
             request_count, max_kv_len, max_seq_len, n_kv_heads, head_dim,
             rope_theta, position_start, effective_rope_dim);
@@ -2137,9 +2159,12 @@ namespace llaminar2
         }
 
         constexpr int tile = 16;
+        constexpr unsigned int resident_tile_blocks = 8;
         const dim3 grid(
             static_cast<unsigned int>(n_kv_heads),
-            static_cast<unsigned int>((max_kv_len + tile - 1) / tile),
+            std::min(
+                static_cast<unsigned int>((max_kv_len + tile - 1) / tile),
+                resident_tile_blocks),
             static_cast<unsigned int>(request_count));
         if (head_dim == 64)
         {

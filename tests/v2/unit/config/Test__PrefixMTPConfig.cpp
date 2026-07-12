@@ -254,6 +254,35 @@ TEST(Test__PrefixMTPConfig, MTPRequestBatchCapacityResolvesRunnerBatchSize)
         << "Disabled MTP must not quietly inflate normal runner capacity.";
 }
 
+TEST(Test__PrefixMTPConfig, MTPGraphCapacityUsesMaximumPolicyDepthAndRequestCount)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 15);
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 16)
+        << "A fixed fifteen-draft transaction owns fifteen comparison rows and one bonus row.";
+
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.initial_depth = 3;
+    mtp.depth_policy.max_depth = 15;
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 15)
+        << "Graph planning must reserve the promotion ceiling, not only the warm-start depth.";
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 16);
+
+    mtp.max_request_batch = 2;
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 32)
+        << "Request batching flattens one complete target row group per request.";
+
+    mtp.depth_policy.max_depth = 31;
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 31);
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 64)
+        << "Sixteen verifier rows are a certification default, not an architectural maximum.";
+}
+
 TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
 {
     {

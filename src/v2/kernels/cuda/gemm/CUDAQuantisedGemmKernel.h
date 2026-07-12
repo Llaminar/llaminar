@@ -471,10 +471,11 @@ namespace llaminar2
             /**
              * @brief Small-M FP32 activations -> specialized native-VNNI GEMV.
              *
-             * Greedy MTP verifier forwards commonly use M=2..4. The generic
-             * native VNNI prefill path is tuned for larger prefill buckets and
-             * has separate dispatch regimes, so verifier rows stay on the small-M
-             * decode-class GEMV path after one shared activation quantization.
+             * MTP verifier forwards use a runtime row count determined by the
+             * speculative depth. The generic native VNNI prefill path is tuned
+             * for larger prompt buckets and has separate dispatch regimes, so
+             * verifier rows stay on the decode-class GEMV path after one shared
+             * activation quantization.
              */
             bool multiply_fp32_to_fp32_small_m_gemv(
                 const float *d_A, float *d_C, const float *d_bias,

@@ -381,10 +381,8 @@ namespace llaminar2
         int cuda_stream_k_mode = 0;               ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
         int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
         int cuda_force_prefill_split_k = 0;       ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
-        bool cuda_moe_gateup_kpart_decode = true; ///< Enable K-partitioned grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        int cuda_moe_gateup_kparts = 16;          ///< K partitions for grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
-        bool cuda_moe_down_kpart_decode = true;   ///< Enable K-partitioned grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        int cuda_moe_down_kparts = 16;            ///< K partitions for grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
+        int cuda_moe_gateup_kparts = 16;          ///< K partitions for the mandatory decode-equivalent grouped MoE gate/up CUDA path (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
+        int cuda_moe_down_kparts = 16;            ///< K partitions for the mandatory decode-equivalent grouped MoE SwiGLU down CUDA path (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
         bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
         bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
@@ -527,12 +525,10 @@ namespace llaminar2
             const char *force_split_k_env = std::getenv("LLAMINAR_FORCE_PREFILL_SPLIT_K");
             cuda_force_prefill_split_k = force_split_k_env ? std::atoi(force_split_k_env) : 0;
 
-            // CUDA grouped MoE gate/up split-K (kpart) decode toggle + partition count.
-            cuda_moe_gateup_kpart_decode = true;
+            // CUDA grouped MoE gate/up split-K partition count. The ordered
+            // K-part path is mandatory because verifier batches must execute
+            // the same reduction tree as serial decode.
             cuda_moe_gateup_kparts = 16;
-            const char *moe_gateup_kpart_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE");
-            if (moe_gateup_kpart_env)
-                cuda_moe_gateup_kpart_decode = (std::atoi(moe_gateup_kpart_env) != 0);
             const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPARTS");
             if (moe_gateup_kparts_env)
             {
@@ -543,16 +539,10 @@ namespace llaminar2
                     requested == 16 || requested == 32)
                     cuda_moe_gateup_kparts = requested;
             }
-            // Split-K reduction reorders the accumulation; disable for determinism.
-            if (deterministic)
-                cuda_moe_gateup_kpart_decode = false;
-
-            // CUDA grouped MoE SwiGLU down split-K (kpart) decode toggle + partition count.
-            cuda_moe_down_kpart_decode = true;
+            // CUDA grouped MoE SwiGLU down split-K partition count. The
+            // ordered reduction is deterministic and remains enabled in
+            // LLAMINAR_DETERMINISTIC mode.
             cuda_moe_down_kparts = 16;
-            const char *moe_down_kpart_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE");
-            if (moe_down_kpart_env)
-                cuda_moe_down_kpart_decode = (std::atoi(moe_down_kpart_env) != 0);
             const char *moe_down_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPARTS");
             if (moe_down_kparts_env)
             {
@@ -562,10 +552,6 @@ namespace llaminar2
                     requested == 16)
                     cuda_moe_down_kparts = requested;
             }
-            // Split-K reduction reorders the accumulation; disable for determinism.
-            if (deterministic)
-                cuda_moe_down_kpart_decode = false;
-
             // CUDA MoE decode router Q8 path mirrors ROCm's cached Q8 router.
             // It reduces router GEMV traffic and lets the grouped gate/up decode
             // reuse the same hidden quantization in production runtime-table flow.
@@ -2693,20 +2679,22 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
      * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
-     * - `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` - Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (default: off)
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
      * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
      * - `LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE=0` - Disable K-partitioned grouped MoE gate/up decode projection
      * - `LLAMINAR_ROCM_MOE_GATEUP_KPARTS=<2|4|8|16>` - K partitions for grouped MoE gate/up decode projection (default: 4)
      * - `LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED=0` - Disable grouped gate/up K-part reduction fused directly into SwiGLU Q8 quantization (default: on)
-     * - `LLAMINAR_ROCM_MOE_PREFILL_TILE_M=<0|2|4|8>` - Force grouped MoE prefill verifier row tile size (`0` = auto)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_FP16=1` - Enable cached FP16 router gate weights for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
      * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
      * - `LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN=0` - Disable router Q8 hidden/scales reuse for grouped gate/up decode when the hidden row pointer matches (default: on)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M=<4|8|12|16>` - Force expert-row tile for grouped gate/up prefill training (`-1` = generated policy)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N=<64|128|256>` - Force output-column tile for grouped gate/up prefill training (`-1` = generated policy)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_M=<4|8|12|16>` - Force expert-row tile for grouped down prefill training (`-1` = generated policy)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_N=<64|128|256>` - Force output-column tile for grouped down prefill training (`-1` = generated policy)
      * - `LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS=<0|16|32|64|128>` - Override batched Qwen-style top-k partial block cap (`0` = auto)
      *
      * @code
@@ -2772,7 +2760,6 @@ namespace llaminar2
         int ratio_prefill_iq4_kb = 0;              ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
         bool concurrent_prefill = true;            ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
         bool concurrent_decode = false;            ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
-        bool concurrent_m2_rows = false;           ///< Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (LLAMINAR_ROCM_CONCURRENT_M2_ROWS)
         bool gdn_concurrent_decode = true;         ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
         bool moe_grouped_decode_router = true;     ///< Enable grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER, disabled by LLAMINAR_DETERMINISTIC)
@@ -2782,12 +2769,15 @@ namespace llaminar2
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
         bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
         bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
+        int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row tile override (-1=generated policy; 4/8/12/16 valid)
+        int moe_prefill_gateup_tile_n = -1;        ///< Grouped prefill gate/up output-column tile override (-1=generated policy; 64/128/256 valid)
+        int moe_prefill_down_tile_m = -1;          ///< Grouped prefill down expert-row tile override (-1=generated policy; 4/8/12/16 valid)
+        int moe_prefill_down_tile_n = -1;          ///< Grouped prefill down output-column tile override (-1=generated policy; 64/128/256 valid)
         bool moe_parallel_down_decode = true;      ///< Enable parallel-expert grouped MoE decode down projection (LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_gateup_kpart_decode = true;       ///< Enable K-partitioned grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int moe_gateup_kparts = 4;                 ///< K partitions for grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPARTS)
         bool moe_gateup_swiglu_quant_fused = true; ///< Fuse K-part gate/up reduce into grouped SwiGLU Q8 quantization (LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_device_routed_decode = true;      ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
-        int moe_prefill_tile_m = 0;                ///< Tokens-per-block override for grouped MoE prefill on ROCm (LLAMINAR_ROCM_MOE_PREFILL_TILE_M, valid 0|2|4|8, default 0=auto)
         int topk_smallk_partial_blocks = 0;        ///< Override small-k top-k partial block cap (LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS, valid 0|16|32|64|128; 0=auto)
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
@@ -2858,7 +2848,6 @@ namespace llaminar2
             ratio_prefill_iq4_kb = 0;
             concurrent_prefill = true;
             concurrent_decode = false;
-            concurrent_m2_rows = false;
             gdn_concurrent_decode = true;
             moe_grouped_decode = true;
             moe_grouped_decode_router = true;
@@ -2868,12 +2857,15 @@ namespace llaminar2
             moe_router_kparts = 8;
             moe_router_wave_topk = true;
             moe_reuse_router_q8_hidden = true;
+            moe_prefill_gateup_tile_m = -1;
+            moe_prefill_gateup_tile_n = -1;
+            moe_prefill_down_tile_m = -1;
+            moe_prefill_down_tile_n = -1;
             moe_parallel_down_decode = true;
             moe_gateup_kpart_decode = true;
             moe_gateup_kparts = 4;
             moe_gateup_swiglu_quant_fused = true;
             moe_device_routed_decode = true;
-            moe_prefill_tile_m = 0;
             topk_smallk_partial_blocks = 0;
             repack_slots = 3;
             repack_budget_mb = 0;
@@ -3210,12 +3202,6 @@ namespace llaminar2
                 concurrent_decode = (std::atoi(concurrent_decode_env) != 0);
             }
 
-            const char *concurrent_m2_rows_env = std::getenv("LLAMINAR_ROCM_CONCURRENT_M2_ROWS");
-            if (concurrent_m2_rows_env)
-            {
-                concurrent_m2_rows = (std::atoi(concurrent_m2_rows_env) != 0);
-            }
-
             const char *gdn_concurrent_decode_env = std::getenv("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
             if (gdn_concurrent_decode_env)
             {
@@ -3274,6 +3260,20 @@ namespace llaminar2
                 moe_reuse_router_q8_hidden = (std::atoi(moe_reuse_router_q8_hidden_env) != 0);
             }
 
+            const auto read_moe_prefill_tile = [](const char *name, int default_value)
+            {
+                const char *value = std::getenv(name);
+                return value ? std::atoi(value) : default_value;
+            };
+            moe_prefill_gateup_tile_m = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M", -1);
+            moe_prefill_gateup_tile_n = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N", -1);
+            moe_prefill_down_tile_m = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_M", -1);
+            moe_prefill_down_tile_n = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_N", -1);
+
             const char *moe_parallel_down_decode_env = std::getenv("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE");
             if (moe_parallel_down_decode_env)
             {
@@ -3305,7 +3305,6 @@ namespace llaminar2
                 nvnni_atomic_reduce = false;
                 concurrent_prefill = false;
                 concurrent_decode = false;
-                concurrent_m2_rows = false;
                 gdn_concurrent_decode = false;
                 moe_router_q8 = false;
                 moe_router_fp16 = false;
@@ -3324,15 +3323,6 @@ namespace llaminar2
                 moe_device_routed_decode = (std::atoi(moe_device_routed_decode_env) != 0);
             }
 
-            const char *moe_prefill_tile_m_env = std::getenv("LLAMINAR_ROCM_MOE_PREFILL_TILE_M");
-            if (moe_prefill_tile_m_env)
-            {
-                const int requested = std::atoi(moe_prefill_tile_m_env);
-                if (requested == 0 || requested == 2 || requested == 4 || requested == 8)
-                {
-                    moe_prefill_tile_m = requested;
-                }
-            }
             const char *topk_partial_blocks_env = std::getenv("LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS");
             if (topk_partial_blocks_env)
             {

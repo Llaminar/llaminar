@@ -493,7 +493,7 @@ namespace llaminar2
              * serial decode.  ROCm in particular can choose hipBLAS for tiny
              * verifier-prefill routing, which is mathematically valid prefill but
              * not bitwise-equivalent to the M=1 decode router.  Delegate to the
-             * backend verifier contract so every M=1..4 row uses serial-row
+             * backend verifier contract so every runtime-M row uses serial-row
              * math while the backend still performs one grouped publication.
              */
             if (!kernel->routeVerifierRowsDecodeEquivalent(
@@ -1095,7 +1095,6 @@ namespace llaminar2
                params_.device_id.is_gpu() &&
                supportsGroupedPrefillExecutionBackend(params_.device_id) &&
                params_.seq_len >= 1 &&
-               params_.seq_len <= 4 &&
                params_.d_model > 0 &&
                params_.num_experts > 0 &&
                params_.top_k > 0 &&

@@ -1470,7 +1470,9 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierUsesMirroredGDNStateWhenHandoff
     EXPECT_EQ(short_conv->getParams().channels, 12)
         << "The verifier short-conv must own full Q/K/V channels: "
            "2*full_key_heads*d_state + full_value_heads*d_state.";
-    EXPECT_EQ(short_conv->getParams().verifier_state_capture_rows, 4)
+    EXPECT_EQ(
+        short_conv->getParams().verifier_state_capture_rows,
+        resolveMTPMaxTargetQueryRows(config.mtp))
         << "Full mirrored short-conv post-row state is the publication source.";
 
     const auto *recurrence_node = verifier_graph.getNode("layer0_gdn_recurrence");
@@ -1480,7 +1482,9 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierUsesMirroredGDNStateWhenHandoff
     ASSERT_NE(recurrence, nullptr);
     EXPECT_EQ(recurrence->getParams().n_heads, 2);
     EXPECT_EQ(recurrence->getParams().n_k_heads, 2);
-    EXPECT_EQ(recurrence->getParams().verifier_state_capture_rows, 4)
+    EXPECT_EQ(
+        recurrence->getParams().verifier_state_capture_rows,
+        resolveMTPMaxTargetQueryRows(config.mtp))
         << "Full mirrored recurrence post-row state is restored directly by "
            "accepted-state publication.";
 }
@@ -1959,15 +1963,17 @@ TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresPostCollectiveMoEKeys)
  * The main MoE graph and the MTP sidecar intentionally share the same
  * `BufferId`s for routed/shared MoE scratch so snapshot names, stage contracts,
  * and publication hooks stay stable.  During normal decode the resolver sees
- * `seq_len == 1`, but a depth-0 sidecar can still replay up to the fixed
- * verifier-row capacity.  Resolving these buffers to one row lets
- * `MTP0_shared_expert_ffn` write four verifier rows into a one-row tensor.
+ * `seq_len == 1`, but a depth-0 sidecar can still execute up to the configured
+ * verifier-row capacity. Resolving these buffers to one row would let the
+ * sidecar write the full runtime-M verifier batch into a one-row tensor.
  */
 TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
 {
     GraphConfig config = makeMoEConfig();
     config.mtp.enabled = true;
-    config.mtp.draft_tokens = 1;
+    config.mtp.draft_tokens = 15;
+    const size_t expected_rows =
+        static_cast<size_t>(resolveMTPMaxTargetQueryRows(config.mtp));
 
     TestableQwen35MoEGraph graph_builder(config, nullptr);
     const GraphResolverConfig resolver_config =
@@ -1975,7 +1981,7 @@ TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
     const auto rows_it =
         resolver_config.custom_formulas.find("moe_activation_rows");
     ASSERT_NE(rows_it, resolver_config.custom_formulas.end());
-    EXPECT_EQ(rows_it->second, 4u);
+    EXPECT_EQ(rows_it->second, expected_rows);
 
     Qwen35MoESchemaFactory factory;
     const GraphSchema schema = factory.createSchema();
@@ -1994,7 +2000,7 @@ TEST(Test__Qwen35MoEGraph, MTPDecodeMoEBuffersReserveVerifierRows)
         const BufferDescriptor *buffer = findBuffer(requirements, name);
         ASSERT_NE(buffer, nullptr) << name;
         ASSERT_FALSE(buffer->shape.empty()) << name;
-        EXPECT_EQ(buffer->shape[0], 4u)
+        EXPECT_EQ(buffer->shape[0], expected_rows)
             << name << " must reserve every depth-0 verifier row";
     }
 }
@@ -2035,6 +2041,65 @@ TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
     EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_k_norm"));
     EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"))
         << "rope_on_read stores pre-RoPE K, but it must still wait for K norm";
+}
+
+/**
+ * @brief Lock the Qwen graph's device-derived causal-mask ownership policy.
+ *
+ * `workspace_mask` historically aliased the shared GEMM scratch allocation.
+ * No graph stage materialized additive-mask values into that buffer, so a
+ * captured suffix could reinterpret unrelated GEMM output as an attention
+ * mask after its live KV length changed.  The attention kernels already own
+ * causal and continuation bounds through device-resident parameters.  This
+ * construction-only unit test supplies an unmistakably non-null legacy mask
+ * pointer and proves the declarative Qwen builder deliberately does not bind
+ * it to the production attention stage.
+ */
+TEST(Test__Qwen35MoEGraph, AttentionDoesNotBindRecycledGemmScratchAsExternalMask)
+{
+    GraphConfig config = makeMoEConfig();
+    config.layer_types = {"full_attention", "gdn"};
+
+    Qwen35MoEGraph graph_builder(config, nullptr);
+    TensorArena arena;
+    auto layer = makeFALayerWeights(arena, config);
+    auto buffers = makeFAActivationBuffers(arena, /*tokens=*/2, config);
+    buffers.workspace_mask = arena.fp32({2, 2});
+    ASSERT_NE(buffers.workspace_mask, nullptr);
+
+    MockMPIContext mpi_ctx;
+    llaminar::v2::kernels::KVCacheConfig kv_config;
+    kv_config.precision = ActivationPrecision::FP16;
+    kv_config.device = DeviceId::cpu();
+    kv_config.num_layers = 1;
+    kv_config.batch_size = 1;
+    kv_config.max_seq_len = 8;
+    kv_config.n_kv_heads = config.n_kv_heads;
+    kv_config.head_dim = config.head_dim;
+    kv_config.mpi_ctx = &mpi_ctx;
+    auto kv_cache =
+        llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+    ASSERT_NE(kv_cache, nullptr);
+
+    ComputeGraph graph = graph_builder.buildAttentionGraph(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        kv_cache.get(),
+        /*position_ids=*/nullptr,
+        DeviceId::cpu());
+
+    const auto *attention_node = graph.getNode("layer0_attention");
+    ASSERT_NE(attention_node, nullptr);
+    const auto *attention =
+        dynamic_cast<const AttentionComputeStage *>(
+            attention_node->stage.get());
+    ASSERT_NE(attention, nullptr);
+    EXPECT_EQ(attention->getParams().workspace_mask, nullptr)
+        << "Qwen graph attention must derive causal geometry internally, not "
+           "consume the legacy GEMM scratch alias as an additive mask";
 }
 
 TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFullKVRows)
@@ -2140,8 +2205,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
         << "Fused QKV writes packed local V rows even when phase-split storage is full-width";
     EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_q_norm"));
     EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_k_norm"));
-    EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_tp_kv_state_allgather"))
-        << "Phase-split KV handoff stores pre-RoPE K, so RoPE must wait before mutating K in place.";
+    EXPECT_FALSE(hasDependency(graph, "layer0_rope", "layer0_tp_kv_state_allgather"))
+        << "RoPE-on-read leaves K untouched, so Q RoPE and the pre-RoPE KV handoff should run concurrently.";
 
     const auto *kv_append_node = graph.getNode("layer0_kv_append");
     ASSERT_NE(kv_append_node, nullptr);
@@ -2156,8 +2221,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
     ASSERT_NE(rope_node, nullptr);
     const auto *rope = dynamic_cast<const RoPEStage *>(rope_node->stage.get());
     ASSERT_NE(rope, nullptr);
-    EXPECT_FALSE(rope->getParams().skip_k)
-        << "Local prefill attention still needs RoPE-applied K even though the decode cache stores pre-RoPE full K";
+    EXPECT_TRUE(rope->getParams().skip_k)
+        << "Phase-split prefill and decode share the pre-RoPE cache and apply K RoPE only while reading it.";
 
     const auto *attention_node = graph.getNode("layer0_attention");
     ASSERT_NE(attention_node, nullptr);
@@ -2166,8 +2231,12 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
     ASSERT_NE(attention, nullptr);
     EXPECT_EQ(attention->getParams().K, buffers.K);
     EXPECT_EQ(attention->getParams().V, buffers.V);
-    EXPECT_FALSE(attention->getParams().read_kv_from_cache);
-    EXPECT_FALSE(attention->getParams().apply_rope_to_k);
+    EXPECT_EQ(attention->getParams().n_heads, config.local_n_heads);
+    EXPECT_EQ(attention->getParams().n_kv_heads, config.n_kv_heads);
+    EXPECT_EQ(attention->getParams().gqa_n_rep,
+              config.n_heads / config.n_kv_heads);
+    EXPECT_TRUE(attention->getParams().read_kv_from_cache);
+    EXPECT_TRUE(attention->getParams().apply_rope_to_k);
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_kv_append"));
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_rope"))
         << "Local prefill attention must consume RoPE-applied Q/K after the cache handoff captured pre-RoPE K.";

@@ -18,6 +18,7 @@
 #include "v2/tensors/Tensors.h" // For Q16_1Tensor
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/PerfStatsCollector.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
 #include <array>
 #include <vector>
@@ -356,7 +357,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Prove one native CPU RoPE format across the M=2..4 buckets.
+         * @brief Prove one native CPU RoPE format across the runtime-M inventory.
          *
          * The serial witness slices native storage into one-row tensors and
          * calls the public production M=1 API. The grouped witness calls the
@@ -368,7 +369,7 @@ namespace llaminar2
             const char *format_label,
             Q16BlockSize q16_block_size = Q16BlockSize::BLOCK_32)
         {
-            constexpr int max_rows = 4;
+            constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
             constexpr int n_heads = 4;
             constexpr int n_kv_heads = 2;
             constexpr int head_dim = 128;
@@ -378,7 +379,9 @@ namespace llaminar2
             auto q_values = generate_random_fp32(max_rows * q_cols, -1.5f, 1.5f);
             auto k_values = generate_random_fp32(max_rows * k_cols, -1.25f, 1.25f);
 
-            for (int rows : {2, 3, 4})
+            std::array<int, max_rows> positions{};
+            std::iota(positions.begin(), positions.end(), 101);
+            for (int rows : test::kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(std::string(format_label) + " rows=" + std::to_string(rows) +
                              " q16_block=" +
@@ -406,7 +409,6 @@ namespace llaminar2
 
                 const size_t q_row_bytes = q_serial->size_bytes() / rows;
                 const size_t k_row_bytes = k_serial->size_bytes() / rows;
-                const std::array<int, max_rows> positions = {101, 102, 103, 104};
                 CPURoPEKernelT<Precision> kernel;
                 for (int row = 0; row < rows; ++row)
                 {
@@ -672,7 +674,7 @@ namespace llaminar2
         const int k_cols = local_n_kv_heads * local_head_dim;
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
 
-        for (int rows : {2, 3, 4})
+        for (int rows : test::kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE("rows=" + std::to_string(rows));
             const size_t q_size = static_cast<size_t>(rows) * q_cols;
@@ -836,7 +838,7 @@ namespace llaminar2
     }
 
     /**
-     * @brief Sweep every native CPU RoPE storage contract at M=2..4.
+     * @brief Sweep every native CPU RoPE storage contract across runtime M.
      *
      * Q16 block size is a physical code layout, not merely a performance hint,
      * so all supported 32-, 64-, and 128-value layouts are independent cells.

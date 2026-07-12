@@ -201,6 +201,20 @@ namespace llaminar2
             dynamic_pre_append_cached_tokens_ = -1;
             dynamic_logical_seq_len_ = 0;
             dynamic_post_append_kv_len_ = 0;
+            /*
+             * Effective K/V descriptors describe the source selected by one
+             * execution, not durable graph state. A prior decode can select an
+             * FP16 cache view while the next phase-split prefill intentionally
+             * consumes its FP32 projection buffer. Retaining the old descriptor
+             * makes pre-capture snapshot preparation allocate an FP16 slot for
+             * a capture that records an FP32 source.
+             *
+             * Captured snapshot lifetime belongs exclusively to
+             * DeviceGraphExecutor's immutable D2D slot manifest. Clearing this
+             * stage-local diagnostic mirror cannot invalidate a captured graph;
+             * it only prevents stale request/phase metadata from contaminating
+             * the next warmup or capture preparation pass.
+             */
             debug_effective_k_tensor_ = nullptr;
             debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;

@@ -390,7 +390,7 @@ namespace
         bool uses_device_token_ids,
         const char *weight_route)
     {
-        if (num_tokens < 2 || num_tokens > 4)
+        if (num_tokens < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(
@@ -424,7 +424,7 @@ namespace
         int device,
         const char *position_route)
     {
-        if (verifier_rows < 2 || verifier_rows > 4)
+        if (verifier_rows < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(
@@ -464,7 +464,7 @@ namespace
         int cols,
         int device)
     {
-        if (verifier_rows < 2 || verifier_rows > 4)
+        if (verifier_rows < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(
@@ -494,7 +494,7 @@ namespace
         int cols,
         int device)
     {
-        if (verifier_rows < 2 || verifier_rows > 4)
+        if (verifier_rows < 2)
             return;
 
         llaminar2::PerfStatsCollector::addCounter(
@@ -656,8 +656,8 @@ namespace llaminar2
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
-            // DeviceGraphExecutor owns synchronization; successful M=2..4
-            // launches publish their native grouped route for regression gates.
+            // DeviceGraphExecutor owns synchronization; every successful
+            // runtime-M launch publishes its grouped route for regression gates.
             const bool ok = cudaOps_rmsnorm_bf16(
                 d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
             if (ok)
@@ -730,8 +730,8 @@ namespace llaminar2
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
-            // DeviceGraphExecutor owns synchronization; successful M=2..4
-            // launches publish their native grouped route for regression gates.
+            // DeviceGraphExecutor owns synchronization; every successful
+            // runtime-M launch publishes its grouped route for regression gates.
             const bool ok = cudaOps_rmsnorm_fp16(
                 d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
             if (ok)

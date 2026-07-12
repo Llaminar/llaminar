@@ -34,6 +34,7 @@
 #include "v2/utils/CPUFeatures.h"
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/PerfStatsCollector.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 
@@ -767,7 +768,7 @@ TEST_F(Test__Q16DecodeHeadMajor, SingleKVPosition_HD128)
     runHeadMajorDecodeTest(1, 4, 2, 128, "SingleKV_HD128");
 }
 
-TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
+TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_RuntimeM)
 {
     ScopedPerfStats perfstats;
 
@@ -777,7 +778,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
      * decode at BASE_KV + r + 1 visible KV positions.
      */
     constexpr int BASE_KV = 19;
-    constexpr int MAX_M = 4;
+    constexpr int MAX_M = test::kGroupedVerifierRuntimeRows.back();
     constexpr int FULL_KV = BASE_KV + MAX_M;
     constexpr int N_HEADS = 8;
     constexpr int N_KV_HEADS = 4;
@@ -798,7 +799,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
     ASSERT_NE(K_q16, nullptr);
     ASSERT_NE(V_q16, nullptr);
 
-    for (int m = 2; m <= MAX_M; ++m)
+    for (int m : test::kGroupedVerifierRuntimeRows)
     {
         const int kv_len = BASE_KV + m;
         std::vector<float> grouped(static_cast<size_t>(m) * Q_DIM, 0.0f);
@@ -841,7 +842,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_M2ToM4)
     }
 }
 
-TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_M2ToM4)
+TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shape_RuntimeBoundaries)
 {
     ScopedPerfStats perfstats;
 
@@ -851,7 +852,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shap
      * the model shape that exposed the first real parity drift.
      */
     constexpr int BASE_KV = 37;
-    constexpr int MAX_M = 4;
+    constexpr int MAX_M = test::kGroupedVerifierBoundaryRows.back();
     constexpr int FULL_KV = BASE_KV + MAX_M;
     constexpr int N_HEADS = 28;
     constexpr int N_KV_HEADS = 4;
@@ -872,7 +873,7 @@ TEST_F(Test__Q16DecodeHeadMajor, GroupedVerifierRowsMatchSerialDecode_Qwen36Shap
     ASSERT_NE(K_q16, nullptr);
     ASSERT_NE(V_q16, nullptr);
 
-    for (int m = 2; m <= MAX_M; ++m)
+    for (int m : test::kGroupedVerifierBoundaryRows)
     {
         const int kv_len = BASE_KV + m;
         std::vector<float> grouped(static_cast<size_t>(m) * Q_DIM, 0.0f);

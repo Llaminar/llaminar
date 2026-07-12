@@ -426,7 +426,7 @@ namespace llaminar2
         void *gpu_stream)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_ ||
-            verifier_rows < 1 || verifier_rows > 4 || !K || !V || !gpu_stream)
+            verifier_rows < 1 || !K || !V || !gpu_stream)
         {
             LOG_ERROR("[CUDARingKVCacheTQ] Invalid grouped verifier append request");
             return false;
@@ -1024,7 +1024,6 @@ namespace llaminar2
         int layer,
         int first_seq_idx,
         int request_count,
-        int max_kv_len,
         ITensor **out_k,
         ITensor **out_v,
         void *gpu_stream)
@@ -1036,7 +1035,7 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
             request_count <= 0 ||
             first_seq_idx > batch_size_ - request_count ||
-            max_kv_len <= 0 || max_kv_len > max_seq_len_ || !gpu_stream ||
+            !gpu_stream ||
             !d_head_params_ || !d_count_params_ ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
             !rotations_.d_rotations)
@@ -1045,7 +1044,6 @@ namespace llaminar2
                       << " layer=" << layer
                       << " first_seq=" << first_seq_idx
                       << " requests=" << request_count
-                      << " max_kv_len=" << max_kv_len
                       << " stream=" << gpu_stream);
             return false;
         }
@@ -1066,7 +1064,7 @@ namespace llaminar2
                 rotations_.d_rotations + rotation_offset,
                 entry_offset,
                 request_count,
-                max_kv_len,
+                max_seq_len_,
                 max_seq_len_,
                 local_n_kv_heads_,
                 head_dim_,
@@ -1084,7 +1082,7 @@ namespace llaminar2
         scratch.invalidate();
         cached_stream_ = stream;
         const size_t rows =
-            static_cast<size_t>(request_count) * max_kv_len;
+            static_cast<size_t>(request_count) * max_seq_len_;
         if (!batched_k_view_ ||
             batched_k_view_->gpu_data_ptr() != scratch.d_K ||
             batched_k_view_->shape().empty() ||
@@ -1114,7 +1112,6 @@ namespace llaminar2
         int layer,
         int first_seq_idx,
         int request_count,
-        int max_kv_len,
         ActivationPrecision target,
         ITensor **out_k,
         ITensor **out_v,
@@ -1133,7 +1130,6 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
             request_count <= 0 ||
             first_seq_idx > batch_size_ - request_count ||
-            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
             target != ActivationPrecision::FP16 || !read.gpu_stream ||
             requested_heads != local_n_kv_heads_ ||
             requested_head_dim != head_dim_ ||
@@ -1147,7 +1143,6 @@ namespace llaminar2
                       << " layer=" << layer
                       << " first_seq=" << first_seq_idx
                       << " requests=" << request_count
-                      << " max_kv_len=" << max_kv_len
                       << " target=" << activationPrecisionToString(target)
                       << " heads=" << requested_heads
                       << " head_dim=" << requested_head_dim
@@ -1172,7 +1167,7 @@ namespace llaminar2
                 rotations_.d_rotations + rotation_offset,
                 entry_offset,
                 request_count,
-                max_kv_len,
+                max_seq_len_,
                 max_seq_len_,
                 local_n_kv_heads_,
                 head_dim_,
@@ -1188,7 +1183,7 @@ namespace llaminar2
         scratch.invalidate();
         cached_stream_ = stream;
         const size_t rows =
-            static_cast<size_t>(request_count) * max_kv_len;
+            static_cast<size_t>(request_count) * max_seq_len_;
         if (!batched_k_view_ ||
             batched_k_view_->gpu_data_ptr() != scratch.d_K ||
             batched_k_view_->shape().empty() ||

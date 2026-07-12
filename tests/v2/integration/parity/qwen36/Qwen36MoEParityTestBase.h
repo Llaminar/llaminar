@@ -316,15 +316,10 @@ namespace llaminar2::test::parity::qwen36
     {
     public:
         ScopedCudaMoEFusedVerifierPrefillRoutes()
-            : old_gateup_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_gateup_kpart_decode),
-              old_down_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
-              old_prefill_fuse_swiglu_(mutableDebugEnv().gemm.cuda_moe_prefill_fuse_swiglu),
+            : old_prefill_fuse_swiglu_(mutableDebugEnv().gemm.cuda_moe_prefill_fuse_swiglu),
               old_prefill_tile_m_(mutableDebugEnv().gemm.cuda_moe_prefill_tile_m)
         {
             auto &gemm = mutableDebugEnv().gemm;
-            const bool allow_split_k_decode = !gemm.deterministic;
-            gemm.cuda_moe_gateup_kpart_decode = allow_split_k_decode;
-            gemm.cuda_moe_down_kpart_decode = allow_split_k_decode;
             gemm.cuda_moe_prefill_fuse_swiglu = true;
             gemm.cuda_moe_prefill_tile_m = 0;
             llaminar::v2::kernels::KernelFactory::clearCache();
@@ -333,8 +328,6 @@ namespace llaminar2::test::parity::qwen36
         ~ScopedCudaMoEFusedVerifierPrefillRoutes()
         {
             auto &gemm = mutableDebugEnv().gemm;
-            gemm.cuda_moe_gateup_kpart_decode = old_gateup_kpart_decode_;
-            gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
             gemm.cuda_moe_prefill_fuse_swiglu = old_prefill_fuse_swiglu_;
             gemm.cuda_moe_prefill_tile_m = old_prefill_tile_m_;
             llaminar::v2::kernels::KernelFactory::clearCache();
@@ -344,8 +337,6 @@ namespace llaminar2::test::parity::qwen36
         ScopedCudaMoEFusedVerifierPrefillRoutes &operator=(const ScopedCudaMoEFusedVerifierPrefillRoutes &) = delete;
 
     private:
-        bool old_gateup_kpart_decode_ = false;
-        bool old_down_kpart_decode_ = false;
         bool old_prefill_fuse_swiglu_ = false;
         int old_prefill_tile_m_ = 0;
     };
@@ -2908,7 +2899,6 @@ namespace llaminar2::test::parity::qwen36
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
 
@@ -3000,7 +2990,6 @@ namespace llaminar2::test::parity::qwen36
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
 
@@ -5992,7 +5981,7 @@ namespace llaminar2::test::parity::qwen36
         if (expect_grouped_moe_verifier_prefill)
         {
             const char *routed_counter = device.is_rocm()
-                                             ? "rocm_moe_grouped_prefill_active_expert_grid_calls"
+                                             ? "rocm_moe_grouped_prefill_batch_invariant_calls"
                                              : "cuda_moe_grouped_prefill_swiglu_path_calls";
             const auto records = PerfStatsCollector::snapshot({"kernel", "mtp"});
             EXPECT_TRUE(hasPerfCounter(records, "kernel", routed_counter))

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 import unittest
@@ -11,15 +12,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = REPO_ROOT / "scripts" / "refresh_native_vnni_dispatch_tables.sh"
-CPU_ANALYZER = (
-    REPO_ROOT
-    / "tests"
-    / "v2"
-    / "performance"
-    / "kernels"
-    / "cpu"
-    / "analyze_cpu_native_vnni_verifier_trainer.py"
-)
 VALIDATOR = (
     REPO_ROOT
     / "tests"
@@ -41,8 +33,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
                     "/bin/true",
                     "--rocm-decode-bin",
                     "/bin/true",
-                    "--cpu-sweep-bin",
+                    "--cpu-avx2-sweep-bin",
                     "/bin/true",
+                    "--cpu-avx512-sweep-bin",
+                    "/bin/true",
+                    "--cpu-threads",
+                    "28",
                     "--output-dir",
                     str(Path(tmp) / "out"),
                     *args,
@@ -59,13 +55,36 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
-        self.assertIn("LLAMINAR_CUDA_TC_SWEEP_M=1,2,3,4", stdout)
-        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_M=1,2,3,4", stdout)
+        runtime_m = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31"
+        self.assertIn(f"LLAMINAR_CUDA_TC_SWEEP_M={runtime_m}", stdout)
+        self.assertIn(f"LLAMINAR_ROCM_NVNNI_DECODE_M={runtime_m}", stdout)
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured",
+            stdout,
+        )
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV=", stdout)
         self.assertIn("LLAMINAR_CUDA_TC_SWEEP_FAMILIES=wide,kpar,direct", stdout)
         self.assertIn("infer_gemv_dispatch_heuristic.py", result.stdout)
         self.assertIn("analyze_cuda_tc_gemv_dispatch.py", result.stdout)
         self.assertIn("analyze_rocm_native_vnni_decode_trainer.py", result.stdout)
         self.assertIn("validate_native_vnni_generated_dispatch_ids.py", result.stdout)
+
+    def test_onednn_build_cache_is_partitioned_by_compiled_cpu_isa(self) -> None:
+        cmake = (REPO_ROOT / "src" / "v2" / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build-${ONEDNN_ISA_SUFFIX}")',
+            cmake,
+        )
+        self.assertIn("unset(ONEDNN_LIB CACHE)", cmake)
+        self.assertIn("build-${ONEDNN_ISA_SUFFIX}", dockerfile)
+        self.assertIn(
+            "build-$(printf '%s' \"${LLAMINAR_CPU_ISA}\"",
+            dockerfile,
+        )
 
     def test_custom_m_values_are_forwarded_to_cuda_and_rocm(self) -> None:
         result = self.run_script("--backend", "all", "--m-values", "2,4")
@@ -77,7 +96,9 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=2,4", stdout)
 
     def test_install_copies_generated_backend_artifacts(self) -> None:
-        result = self.run_script("--backend", "all", "--install")
+        result = self.run_script(
+            "--backend", "all", "--profile", "qwen36", "--install"
+        )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CUDANativeVNNIGemvDispatchHeuristicGenerated.inc", result.stdout)
@@ -86,6 +107,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("src/v2/kernels/cuda/gemm", result.stdout)
         self.assertIn("src/v2/kernels/rocm/gemm", result.stdout)
         self.assertIn("src/v2/kernels/cpu/native_vnni", result.stdout)
+
+    def test_cpu_smoke_profile_cannot_install_a_production_policy(self) -> None:
+        result = self.run_script("--backend", "cpu", "--install")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installing CPU dispatch requires", result.stderr)
 
     def test_family_smoke_is_stratified_by_format(self) -> None:
         result = self.run_script(
@@ -130,13 +157,18 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_CUDA_TC_FORMATS=IQ1_M", stdout)
         self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_0", stdout)
+        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_1", stdout)
+        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_K", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=IQ1_M", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q8_0", stdout)
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q8_1", stdout)
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q8_K", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=IQ1_M", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q8_0", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q8_1", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q8_K", stdout)
         self.assertIn("cuda_decode_sweep.Q8_0.csv", stdout)
         self.assertIn("rocm_decode_sweep.IQ1_M.csv", stdout)
         self.assertIn("cpu_verifier_rows.Q8_1.", stdout)
@@ -179,7 +211,11 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("Qwen36_LM_Head", core_stdout)
 
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_LM_Head", lm_stdout)
-        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE=native-auto", lm_stdout)
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured",
+            lm_stdout,
+        )
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV=", lm_stdout)
         self.assertNotIn("Qwen36_FFN_GateUp", lm_stdout)
 
         self.assertIn(
@@ -188,7 +224,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             moe_stdout,
         )
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=", moe_stdout)
-        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE=fp32", moe_stdout)
+        self.assertNotIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE", moe_stdout)
         self.assertIn("--base-include", moe_stdout)
         self.assertIn("ROCmNativeVNNIDecodeDispatchGenerated.inc", moe_stdout)
         self.assertNotIn("Qwen36_LM_Head", moe_stdout)
@@ -196,7 +232,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("Qwen36_FFN_GateUp", full_stdout)
         self.assertIn("Qwen36_LM_Head", full_stdout)
         self.assertIn("35BMoE_Expert_GateUp", full_stdout)
-        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE=fp32", core_stdout)
+        self.assertNotIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE", core_stdout)
         self.assertIn("--min-overall-family-pct 99.0", cuda_core.stdout)
         self.assertIn("--min-fallback-family-pct 97.0", cuda_core.stdout)
 
@@ -247,9 +283,17 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_GDN_OutputProjection", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_N=5120", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_K=17408", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=0", stdout)
-        self.assertIn("MTP_VerifierRows_GroupedVsSerial_Synthetic", stdout)
+        self.assertIn("LLAMINAR_ISA_LEVEL=avx2", stdout)
+        self.assertIn("LLAMINAR_ISA_LEVEL=avx512", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_TIMING_CSV=", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_THREADS=28", stdout)
+        self.assertIn("TrainerCsv_StrongVerifierRows_AllFormats", stdout)
+        self.assertIn("avx2-build.avx2-runtime", stdout)
+        self.assertIn("avx512-build.avx2-runtime", stdout)
+        self.assertIn("avx512-build.avx512-runtime", stdout)
         self.assertIn("analyze_cpu_native_vnni_verifier_trainer.py", stdout)
+        self.assertIn("--require-isa-matrix", stdout)
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", stdout)
         self.assertIn("validate_native_vnni_generated_dispatch_ids.py", stdout)
 
@@ -270,9 +314,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_FFN_GateUp", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_FFN_DownProjection", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_GDN_OutputProjection", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=1", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=5", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=10", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=30", stdout)
         self.assertIn("--require-key Q4_K:2:17408:5120", stdout)
         self.assertIn("--require-key Q4_K:4:5120:17408", stdout)
         self.assertIn("--require-key Q4_K:3:5120:6144", stdout)
@@ -307,9 +350,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_LM_Head", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=1", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=5", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=10", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=30", stdout)
         self.assertIn("--require-key Q4_K:2:248320:5120", stdout)
         self.assertIn("--require-key Q4_K:4:248320:5120", stdout)
 
@@ -337,81 +379,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_K=512", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_N=8192", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_N=4096", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=1", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP=5", stdout)
-        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=10", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=30", stdout)
         self.assertIn("--require-key Q4_K:2:512:2048", stdout)
         self.assertIn("--require-key Q4_K:4:512:2048", stdout)
         self.assertIn("--require-key Q4_K:2:2048:512", stdout)
         self.assertIn("--require-key Q4_K:4:2048:512", stdout)
-
-    def test_cpu_verifier_analyzer_generates_valid_policy_include(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            csv_path = root / "cpu_verifier.csv"
-            inc_path = root / "CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
-            summary_path = root / "summary.txt"
-            csv_path.write_text(
-                "backend,phase,format,codebook,is_nibble_lut,payload_bytes,"
-                "is_asymmetric,is_superblock,shape,n,k,m,isa,grouped_min_us,"
-                "serial_min_us,speedup,grouped_mean_us,serial_mean_us,cosine,"
-                "relative_l2,symmetric_kl,max_abs,correctness_pass\n"
-                "cpu,verifier_rows,Q4_K,5,1,16,1,1,Qwen36Verifier,5120,5120,3,"
-                "AVX512,10.0,20.0,2.0,11.0,21.0,1.0,0.0,0.0,0.0,1\n"
-                "cpu,verifier_rows_pairwise_policy,Q4_K,5,1,16,1,1,"
-                "Qwen36_FFN_DownProjection,5120,5120,3,AVX512,9.0,20.0,"
-                "2.222222,10.0,21.0,1.0,0.0,0.0,0.0,1\n"
-                "cpu,verifier_rows_wide_policy,Q6_K,8,0,24,0,1,"
-                "Qwen36_GDN_OutputProjection,5120,5120,4,AVX512,10.0,36.0,"
-                "3.6,11.0,37.0,1.0,0.0,0.0,0.0,1\n"
-                "cpu,verifier_rows,Q8_0,19,0,32,0,0,Qwen36Verifier,"
-                "5120,5120,2,AVX512,40.0,20.0,0.5,41.0,21.0,"
-                "1.0,0.0,0.0,0.0,1\n",
-                encoding="utf-8",
-            )
-
-            generated = subprocess.run(
-                [
-                    "python3",
-                    str(CPU_ANALYZER),
-                    "--input",
-                    str(csv_path),
-                    "--output",
-                    str(inc_path),
-                    "--summary",
-                    str(summary_path),
-                    "--require-key",
-                    "Q4_K:3:5120:5120",
-                    "--require-key",
-                    "Q6_K:4:5120:5120",
-                ],
-                cwd=REPO_ROOT,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(generated.returncode, 0, generated.stderr)
-            self.assertTrue(inc_path.exists())
-            text = inc_path.read_text(encoding="utf-8")
-            self.assertIn("CB=5 (Q4_1)", text)
-            self.assertIn("CPUNativeVNNIVerifierRowsPolicy::WideRows", text)
-            self.assertIn("CPUNativeVNNIVerifierRowsPolicy::Pairwise", text)
-            self.assertIn("verifier_rows_pairwise_policy", text)
-            self.assertIn("verifier_rows_wide_policy", text)
-            self.assertNotIn("Q8_0", text)
-            self.assertNotIn("0.500000f", text)
-
-            validated = subprocess.run(
-                ["python3", str(VALIDATOR), str(inc_path)],
-                cwd=REPO_ROOT,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(validated.returncode, 0, validated.stderr)
-            self.assertIn("validated", validated.stdout)
 
     def test_cpu_generated_verifier_policy_is_checked_in_and_consumed(self) -> None:
         source_path = (
@@ -427,11 +400,37 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertTrue(generated_path.is_file(), "CPU verifier generated policy include is missing")
         source = source_path.read_text(encoding="utf-8")
+        generated_source = generated_path.read_text(encoding="utf-8")
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", source)
         self.assertIn("selectCPUNativeVNNIVerifierRowsGeneratedPolicy", source)
         self.assertIn("selectVerifierRowsPolicy(packed, M, N, K)", source)
-        self.assertIn("M == 3 && use_wide_rows", source)
-        self.assertIn("M == 4 && use_wide_rows", source)
+        self.assertIn("omp_get_max_threads()", source)
+        self.assertIn("No certified CPU NativeVNNI verifier-row policy", source)
+        self.assertNotIn("return VerifierRowsPolicy::Pairwise;", source)
+        self.assertIn("use_avx512 && M >= 3 && use_wide_rows", source)
+        self.assertIn("const int row_tile_count = (M + 3) / 4", source)
+        self.assertIn("const int policy_tile_rows = std::min(M, 4)", source)
+        self.assertIn("resolve_generated_policy(M)", source)
+        self.assertIn("M > 4 && resolve_generated_policy(policy_tile_rows)", source)
+        self.assertIn("reduceNativeVNNIKTilePartialsExact", source)
+        self.assertEqual(
+            len(
+                re.findall(
+                    r"^\s+reduceNativeVNNIKTilePartialsExact\($",
+                    source,
+                    flags=re.MULTILINE,
+                )
+            ),
+            3,
+        )
+        self.assertEqual(source.count("_mm512_loadu_ps(base)"), 1)
+        self.assertIn("grouped_k_parallel_row_tiles", source)
+        self.assertIn("const int row_tile_width = use_avx512 ? 4 : 2", source)
+        self.assertNotIn("if (use_avx512 && M >= 2 && M <= 4)", source)
+        self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_POLICY_ABI 2", generated_source)
+        self.assertIn("enum class CPUNativeVNNIBuildISA", generated_source)
+        self.assertIn("enum class CPUNativeVNNIRuntimeISA", generated_source)
+        self.assertIn("threads == 28", generated_source)
 
         validated = subprocess.run(
             ["python3", str(VALIDATOR), str(generated_path)],

@@ -612,8 +612,34 @@ namespace llaminar2
         bool ensureGroupingBufferCapacity(int total_slots, int num_experts);
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
         bool ensureRuntimePrefillDescriptorCapacity(int num_experts);
-        bool ensureGroupedGateUpDecodeCapacity(int top_k, int d_model);
-        bool ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate);
+        /**
+         * @brief Bind decode/Q8-publication scratch for the declared row count.
+         *
+         * `hidden_rows` is independent of `top_k`: grouped verifier routing
+         * publishes one quantized hidden row per verifier row, while ordinary
+         * expert decode still needs at most `top_k` expert slots.
+         */
+        bool ensureGroupedGateUpDecodeCapacity(
+            int top_k,
+            int d_model,
+            int hidden_rows = 1);
+        /**
+         * @brief Bind reusable split-K gate/up partial storage for active routes.
+         *
+         * Grouped verifier prefill passes at most one fixed row tile's route
+         * slots here. Decode passes its ordinary top-k width. The distinction
+         * keeps workspace bounded independently of runtime verifier depth.
+         */
+        bool ensureGroupedGateUpKPartScratchCapacity(
+            int active_slots,
+            int k_partitions,
+            int intermediate);
+        /**
+         * @brief Bind reusable split-K down partial storage for output rows.
+         *
+         * `slots` is the number of rows in the current reusable verifier tile,
+         * or one for ordinary serial decode.
+         */
         bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots = 1);
         bool ensureGroupedDownDecodeCapacity(int top_k, int intermediate);
         /**
@@ -865,6 +891,7 @@ namespace llaminar2
         bool router_q8_hidden_capture_recorded_ = false; ///< Producer exists only in the current capture
         int decode_gateup_topk_cap_ = 0;
         int decode_gateup_d_model_cap_ = 0;
+        int decode_hidden_rows_cap_ = 0;
         std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;
 
         // Split-K partials scratch for the grouped gate/up decode projection.

@@ -213,6 +213,7 @@ namespace
     {
         GraphConfig config;
         std::shared_ptr<MockMPIContext> mpi = std::make_shared<MockMPIContext>(0, 1);
+        size_t row_capacity = 4;
 
         std::unique_ptr<FP32Tensor> embedding_table;
         std::unique_ptr<FP32Tensor> lm_head;
@@ -269,7 +270,16 @@ namespace
         int draft_token = 17;
         int position_id = 5;
 
-        DenseMTPGraphFixture()
+        /**
+         * @brief Build a complete sidecar fixture with an explicit row capacity.
+         *
+         * Most graph-shape tests use four rows simply to keep their allocations
+         * small. Tests that cross the historical M=4 boundary pass a larger
+         * capacity so every bound tensor, including KV state, represents a
+         * valid executable graph rather than relying on construction alone.
+         */
+        explicit DenseMTPGraphFixture(size_t rows = 4)
+            : row_capacity(std::max<size_t>(1, rows))
         {
             config.n_layers = 2;
             config.d_model = 64;
@@ -327,39 +337,39 @@ namespace
             fill_moe(*moe_up_exps, 0.0009f);
             fill_moe(*moe_down_exps, 0.0005f);
 
-            terminal_hidden = TestTensorFactory::createFP32Random({4, d});
-            embedding = TestTensorFactory::createFP32({4, d});
-            norm_hidden = TestTensorFactory::createFP32({4, d});
-            norm_embedding = TestTensorFactory::createFP32({4, d});
-            concat = TestTensorFactory::createFP32({4, d * 2});
-            projected = TestTensorFactory::createFP32({4, d});
-            hidden = TestTensorFactory::createFP32({4, d});
-            q = TestTensorFactory::createFP32({4, q_dim});
-            k = TestTensorFactory::createFP32({4, kv_dim});
-            v = TestTensorFactory::createFP32({4, kv_dim});
-            k_full_prefill = TestTensorFactory::createFP32({4, kv_dim});
-            v_full_prefill = TestTensorFactory::createFP32({4, kv_dim});
-            q_raw = TestTensorFactory::createFP32({4, q_dim * 2});
-            q_gate = TestTensorFactory::createFP32({4, q_dim});
-            attn_output = TestTensorFactory::createFP32({4, q_dim});
-            attn_proj = TestTensorFactory::createFP32({4, d});
-            gate = TestTensorFactory::createFP32({4, ff});
-            up = TestTensorFactory::createFP32({4, ff});
-            ffn_output = TestTensorFactory::createFP32({4, d});
-            moe_expert_indices = TestTensorFactory::createFP32({4, moe_top_k});
-            moe_expert_weights = TestTensorFactory::createFP32({4, moe_top_k});
-            moe_combined_output = TestTensorFactory::createFP32({4, d});
-            moe_shared_expert_output = TestTensorFactory::createFP32({4, d});
-            moe_gate_scratch = TestTensorFactory::createFP32({4, moe_experts});
-            moe_up_scratch = TestTensorFactory::createFP32({4, moe_experts});
-            logits = TestTensorFactory::createFP32({4, vocab});
-            gathered_logits = TestTensorFactory::createFP32({4, vocab});
+            terminal_hidden = TestTensorFactory::createFP32Random({row_capacity, d});
+            embedding = TestTensorFactory::createFP32({row_capacity, d});
+            norm_hidden = TestTensorFactory::createFP32({row_capacity, d});
+            norm_embedding = TestTensorFactory::createFP32({row_capacity, d});
+            concat = TestTensorFactory::createFP32({row_capacity, d * 2});
+            projected = TestTensorFactory::createFP32({row_capacity, d});
+            hidden = TestTensorFactory::createFP32({row_capacity, d});
+            q = TestTensorFactory::createFP32({row_capacity, q_dim});
+            k = TestTensorFactory::createFP32({row_capacity, kv_dim});
+            v = TestTensorFactory::createFP32({row_capacity, kv_dim});
+            k_full_prefill = TestTensorFactory::createFP32({row_capacity, kv_dim});
+            v_full_prefill = TestTensorFactory::createFP32({row_capacity, kv_dim});
+            q_raw = TestTensorFactory::createFP32({row_capacity, q_dim * 2});
+            q_gate = TestTensorFactory::createFP32({row_capacity, q_dim});
+            attn_output = TestTensorFactory::createFP32({row_capacity, q_dim});
+            attn_proj = TestTensorFactory::createFP32({row_capacity, d});
+            gate = TestTensorFactory::createFP32({row_capacity, ff});
+            up = TestTensorFactory::createFP32({row_capacity, ff});
+            ffn_output = TestTensorFactory::createFP32({row_capacity, d});
+            moe_expert_indices = TestTensorFactory::createFP32({row_capacity, moe_top_k});
+            moe_expert_weights = TestTensorFactory::createFP32({row_capacity, moe_top_k});
+            moe_combined_output = TestTensorFactory::createFP32({row_capacity, d});
+            moe_shared_expert_output = TestTensorFactory::createFP32({row_capacity, d});
+            moe_gate_scratch = TestTensorFactory::createFP32({row_capacity, moe_experts});
+            moe_up_scratch = TestTensorFactory::createFP32({row_capacity, moe_experts});
+            logits = TestTensorFactory::createFP32({row_capacity, vocab});
+            gathered_logits = TestTensorFactory::createFP32({row_capacity, vocab});
 
             kv_cache = createCPURingKVCache(
                 ActivationPrecision::FP32,
                 *mpi,
                 /*n_layers=*/1,
-                /*batch_size=*/1,
+                /*batch_size=*/static_cast<int>(row_capacity),
                 /*max_seq_len=*/8,
                 config.n_kv_heads,
                 config.head_dim,
@@ -1789,7 +1799,7 @@ TEST(Test__MTPGraphConstruction, PhaseSplitKVOnlySidecarUsesMTPFullPrefillBuffer
     EXPECT_TRUE(contractReads(kv_append_contract, BufferId::MTP_V_FULL_PREFILL));
     EXPECT_FALSE(contractReads(kv_append_contract, BufferId::K_FULL_PREFILL));
     EXPECT_FALSE(contractReads(kv_append_contract, BufferId::V_FULL_PREFILL));
-    EXPECT_TRUE(hasDependency(graph, "MTP0_rope", "MTP0_tp_kv_state_allgather"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_tp_kv_state_allgather", "MTP0_rope"));
     EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_tp_kv_state_allgather"));
 }
 
@@ -1839,6 +1849,7 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesOneRowPerRequ
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
     DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
 
@@ -1894,6 +1905,7 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesVariableLengt
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
     DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
 
@@ -1961,6 +1973,7 @@ TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarRunsOneRowPerRequ
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
     DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
 
@@ -2070,6 +2083,7 @@ TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarPreservesPerReque
     PerfStatsCollector::reset();
 
     TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 2;
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
     DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
 
@@ -2182,14 +2196,17 @@ TEST(Test__MTPGraphConstruction, RejectsMultiRowFullQwen35SidecarGraph)
     EXPECT_EQ(graph.size(), 0u);
 }
 
-TEST(Test__MTPGraphConstruction, RejectsOversizedRequestBatchQwen35SidecarGraph)
+TEST(Test__MTPGraphConstruction, BuildsRequestBatchAboveLegacyFourRowLimit)
 {
-    DenseMTPGraphFixture fixture;
+    constexpr int request_count = 5;
+    DenseMTPGraphFixture fixture(request_count);
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.max_request_batch = request_count;
     Qwen35Graph graph_builder(fixture.config, fixture.mpi);
     graph_builder.setWeights(fixture.modelWeights());
 
-    const std::array<int, 5> draft_tokens = {17, 18, 19, 20, 21};
-    const std::array<int, 5> positions = {5, 5, 5, 5, 5};
+    const std::array<int, request_count> draft_tokens = {17, 18, 19, 20, 21};
+    const std::array<int, request_count> positions = {5, 5, 5, 5, 5};
 
     auto weights = fixture.mtpWeights();
     auto input = fixture.input();
@@ -2201,7 +2218,13 @@ TEST(Test__MTPGraphConstruction, RejectsOversizedRequestBatchQwen35SidecarGraph)
 
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
 
-    EXPECT_EQ(graph.size(), 0u);
+    ASSERT_GT(graph.size(), 0u)
+        << "A grouped sidecar graph must not encode the historical M<=4 limit.";
+    const auto *lm_head_node = graph.getNode("mtp0_lm_head");
+    ASSERT_NE(lm_head_node, nullptr);
+    EXPECT_EQ(
+        dumpScalarInt(lm_head_node->stage->getDumpInfoSnapshot(), "seq_len"),
+        request_count);
 }
 
 TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWeights)
@@ -3831,7 +3854,7 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, CPUShiftedPrefillBatchesRowsIntoSingleKVOnlySidecar)
+TEST(Test__MTPGraphConstruction, CPUShiftedPrefillChunksAtConfiguredRuntimeCapacity)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -3868,23 +3891,23 @@ TEST(Test__MTPGraphConstruction, CPUShiftedPrefillBatchesRowsIntoSingleKVOnlySid
         {"device_positions", "false"},
         {"kv_cache_only", "true"},
         {"batch", "1"},
-        {"seq_len", "4"}};
+        {"seq_len", "2"}};
     const PerfStatRecord *sidecar_record = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_depth0_calls",
         sidecar_tags);
     ASSERT_NE(sidecar_record, nullptr);
-    EXPECT_DOUBLE_EQ(sidecar_record->value, 1.0);
+    EXPECT_DOUBLE_EQ(sidecar_record->value, 2.0);
 
-    const auto batch_tags = PerfStatsCollector::Tags{{"rows", "4"}};
+    const auto batch_tags = PerfStatsCollector::Tags{{"rows", "2"}};
     const PerfStatRecord *batch_record = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "shifted_prefill_sidecar_batches",
         batch_tags);
     ASSERT_NE(batch_record, nullptr);
-    EXPECT_DOUBLE_EQ(batch_record->value, 1.0);
+    EXPECT_DOUBLE_EQ(batch_record->value, 2.0);
 
     const auto after_prefill = orchestrator.prefixStateProbe();
     EXPECT_EQ(maxCachedTokens(after_prefill.mtp_kv_caches),

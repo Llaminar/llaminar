@@ -49,6 +49,17 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep);
 
+    /** @brief Device-resident prefill with native BF16 K/V cache storage. */
+    int hipFlashAttn_prefill_fa2_bf16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
     // Flash Attention 2 prefill with native Q8_1 KV cache (inline dequant)
     int hipFlashAttn_prefill_fa2_q8_1(
         const float *Q, const void *K, const void *V, float *O,
@@ -73,6 +84,17 @@ extern "C"
 
     // Flash Decoding with native FP16 KV cache (avoids FP32 conversion)
     int hipFlashAttn_decode_fp16(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
+    /** @brief Split-K decode with native BF16 K/V cache storage. */
+    int hipFlashAttn_decode_bf16(
         const float *Q, const void *K_cache, const void *V_cache, float *O,
         float *O_partial, float *m_partial, float *l_partial,
         int batch_size, int kv_len,
@@ -113,6 +135,17 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep);
 
+    /** @brief Grouped shared-cache verifier decode over native BF16 K/V. */
+    int hipFlashAttn_decode_bf16_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
     int hipFlashAttn_decode_q8_1_grouped_verifier_rows(
         const float *Q, const void *K_cache, const void *V_cache, float *O,
         float *O_partial, float *m_partial, float *l_partial,
@@ -143,6 +176,17 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep);
 
+    /** @brief Grouped independent-request decode over native BF16 K/V. */
+    int hipFlashAttn_decode_bf16_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep);
+
     int hipFlashAttn_decode_q8_1_grouped_request_rows(
         const float *Q, const void *K_cache, const void *V_cache, float *O,
         float *O_partial, float *m_partial, float *l_partial,
@@ -158,11 +202,13 @@ extern "C"
         const int *post_append_cached_tokens,
         int seq_len,
         int query_rows,
+        int kv_stride,
         void *stream);
 
     int hipFlashAttn_prepare_device_params_from_geometry(
         void *device_params,
         int kv_len,
+        int kv_stride,
         int position_offset,
         int query_rows,
         void *stream);
@@ -172,6 +218,7 @@ extern "C"
         const int *post_append_cached_tokens,
         int request_count,
         int query_rows,
+        int kv_stride,
         void *stream);
 
     int hipFlashAttn_allocWorkspace(
@@ -289,6 +336,7 @@ namespace llaminar2
               device_ctx_(other.device_ctx_),
               small_decode_rows_(other.small_decode_rows_),
               dynamic_attn_kv_len_(other.dynamic_attn_kv_len_),
+              dynamic_attn_kv_stride_(other.dynamic_attn_kv_stride_),
               dynamic_attn_position_offset_(other.dynamic_attn_position_offset_),
               dynamic_attn_query_rows_(other.dynamic_attn_query_rows_),
               dynamic_attn_param_rows_(other.dynamic_attn_param_rows_),
@@ -326,6 +374,7 @@ namespace llaminar2
                 device_ctx_ = other.device_ctx_;
                 small_decode_rows_ = other.small_decode_rows_;
                 dynamic_attn_kv_len_ = other.dynamic_attn_kv_len_;
+                dynamic_attn_kv_stride_ = other.dynamic_attn_kv_stride_;
                 dynamic_attn_position_offset_ = other.dynamic_attn_position_offset_;
                 dynamic_attn_query_rows_ = other.dynamic_attn_query_rows_;
                 dynamic_attn_param_rows_ = other.dynamic_attn_param_rows_;
@@ -348,7 +397,11 @@ namespace llaminar2
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::writeDynamicAttnParams(
-            int kv_len, int position_offset, int query_rows, void *stream)
+            int kv_len,
+            int kv_stride,
+            int position_offset,
+            int query_rows,
+            void *stream)
         {
             if (!stream)
             {
@@ -381,12 +434,14 @@ namespace llaminar2
             if (hipFlashAttn_prepare_device_params_from_geometry(
                     d_buf,
                     kv_len,
+                    kv_stride,
                     position_offset,
                     query_rows,
                     stream) != 0)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device attention-param writer failed"
                           << " kv_len=" << kv_len
+                          << " kv_stride=" << kv_stride
                           << " position_offset=" << position_offset
                           << " query_rows=" << query_rows);
                 dynamic_attn_device_valid_ = false;
@@ -682,6 +737,7 @@ namespace llaminar2
                 !dynamic_attn_device_derived_ &&
                 dynamic_attn_device_valid_ &&
                 dynamic_attn_kv_len_ == kv_len &&
+                dynamic_attn_kv_stride_ == kv_len &&
                 dynamic_attn_position_offset_ == position_offset &&
                 dynamic_attn_query_rows_ == sanitized_query_rows &&
                 dynamic_attn_param_rows_ == param_rows;
@@ -690,6 +746,7 @@ namespace llaminar2
                 return;
 
             dynamic_attn_kv_len_ = kv_len;
+            dynamic_attn_kv_stride_ = kv_len;
             dynamic_attn_position_offset_ = position_offset;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = param_rows;
@@ -700,11 +757,15 @@ namespace llaminar2
                 return;
 
             (void)writeDynamicAttnParams(
-                kv_len, position_offset, sanitized_query_rows, stream_);
+                kv_len, kv_len, position_offset, sanitized_query_rows, stream_);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
-            int kv_len, int position_offset, int query_rows, void *stream)
+            int kv_len,
+            int position_offset,
+            int query_rows,
+            void *stream,
+            int kv_stride)
         {
             if (!stream)
             {
@@ -713,17 +774,54 @@ namespace llaminar2
                 return false;
             }
             setGPUStream(stream);
-            setDynamicAttnParams(kv_len, position_offset, query_rows);
-            const bool ready = dynamicAttnParamsReady(kv_len, position_offset, query_rows);
+            const int resolved_kv_stride =
+                std::max(kv_len, kv_stride > 0 ? kv_stride : kv_len);
+            const int sanitized_query_rows =
+                (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS)
+                    ? query_rows
+                    : 1;
+            const int param_rows = std::max(1, sanitized_query_rows);
+            const bool same_params =
+                !dynamic_attn_device_derived_ &&
+                dynamic_attn_device_valid_ &&
+                dynamic_attn_kv_len_ == kv_len &&
+                dynamic_attn_kv_stride_ == resolved_kv_stride &&
+                dynamic_attn_position_offset_ == position_offset &&
+                dynamic_attn_query_rows_ == sanitized_query_rows &&
+                dynamic_attn_param_rows_ == param_rows;
+            if (!same_params)
+            {
+                small_decode_rows_ =
+                    sanitized_query_rows > 1 ? sanitized_query_rows : 0;
+                dynamic_attn_kv_len_ = kv_len;
+                dynamic_attn_kv_stride_ = resolved_kv_stride;
+                dynamic_attn_position_offset_ = position_offset;
+                dynamic_attn_query_rows_ = sanitized_query_rows;
+                dynamic_attn_param_rows_ = param_rows;
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                if (!writeDynamicAttnParams(
+                        kv_len,
+                        resolved_kv_stride,
+                        position_offset,
+                        sanitized_query_rows,
+                        stream))
+                {
+                    return false;
+                }
+            }
+            const bool ready =
+                dynamicAttnParamsReady(kv_len, position_offset, query_rows) &&
+                dynamic_attn_kv_stride_ == resolved_kv_stride;
             if (!ready)
             {
-                const int sanitized_query_rows =
-                    (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Dynamic attention params not ready after prepare"
                           << " requested(kv_len=" << kv_len
+                          << ", kv_stride=" << resolved_kv_stride
                           << ", pos=" << position_offset
                           << ", rows=" << sanitized_query_rows << ")"
                           << " actual(kv_len=" << dynamic_attn_kv_len_
+                          << ", kv_stride=" << dynamic_attn_kv_stride_
                           << ", pos=" << dynamic_attn_position_offset_
                           << ", rows=" << dynamic_attn_query_rows_
                           << ", param_rows=" << dynamic_attn_param_rows_
@@ -738,11 +836,15 @@ namespace llaminar2
             const int *post_append_cached_tokens_device,
             int seq_len,
             int query_rows,
-            void *stream)
+            void *stream,
+            int kv_stride)
         {
             const int sanitized_query_rows =
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
-            if (!post_append_cached_tokens_device || seq_len <= 0 || !stream)
+            const int resolved_kv_stride =
+                kv_stride > 0 ? kv_stride : seq_len;
+            if (!post_append_cached_tokens_device || seq_len <= 0 ||
+                resolved_kv_stride <= 0 || !stream)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len, and explicit stream");
                 dynamic_attn_device_valid_ = false;
@@ -774,6 +876,7 @@ namespace llaminar2
                 post_append_cached_tokens_device,
                 seq_len,
                 sanitized_query_rows,
+                resolved_kv_stride,
                 stream);
             if (rc != 0)
             {
@@ -785,6 +888,7 @@ namespace llaminar2
 
             small_decode_rows_ = (sanitized_query_rows > 1) ? sanitized_query_rows : 0;
             dynamic_attn_kv_len_ = 0;
+            dynamic_attn_kv_stride_ = resolved_kv_stride;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = sanitized_query_rows;
             dynamic_attn_param_rows_ = sanitized_query_rows;
@@ -797,6 +901,7 @@ namespace llaminar2
         {
             small_decode_rows_ = 0;
             dynamic_attn_kv_len_ = 0;
+            dynamic_attn_kv_stride_ = 0;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = 1;
             dynamic_attn_param_rows_ = 1;
@@ -878,6 +983,7 @@ namespace llaminar2
                 if (!disable_native_kv &&
                     head_dim >= 64 &&
                     (kv_native_type == TensorType::FP16 ||
+                     kv_native_type == TensorType::BF16 ||
                      (kv_native_type == TensorType::Q8_1 && head_dim % 32 == 0)))
                 {
                     use_native_kv = true;
@@ -1045,9 +1151,8 @@ namespace llaminar2
             // Native KV dispatch: call typed kernel directly, skip FP32 conversion
             if (use_native_kv)
             {
-                // Set HIP device context for multi-device TP — required before
-                // any hipMalloc, stream creation, or hipBLAS calls in downstream
-                // helpers (get_stream_pool, get_dequant_buffer, ensure_scores_buffer).
+                // Set the HIP device context before launching native cache
+                // kernels in a multi-device TP worker.
                 if (hipFlashAttn_setDevice(dev) != 0)
                 {
                     LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
@@ -1110,6 +1215,18 @@ namespace llaminar2
                                 num_splits, d_attn_params, stream_,
                                 head_start, gqa_n_rep);
                         }
+                        else if (kv_native_type == TensorType::BF16)
+                        {
+                            result = hipFlashAttn_decode_bf16(
+                                Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
+                                static_cast<float *>(partial_output_buf_),
+                                static_cast<float *>(partial_m_buf_),
+                                static_cast<float *>(partial_l_buf_),
+                                batch_size, kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                num_splits, d_attn_params, stream_,
+                                head_start, gqa_n_rep);
+                        }
                         else
                         {
                             result = hipFlashAttn_decode_q8_1(
@@ -1135,6 +1252,16 @@ namespace llaminar2
                     if (kv_native_type == TensorType::FP16)
                     {
                         result = hipFlashAttn_prefill_fa2_fp16(
+                            Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
+                            batch_size, seq_len, kv_len,
+                            n_heads, n_kv_heads, head_dim,
+                            causal, window_size, 0,
+                            d_attn_params, mask_ptr, stream_,
+                            head_start, gqa_n_rep);
+                    }
+                    else if (kv_native_type == TensorType::BF16)
+                    {
+                        result = hipFlashAttn_prefill_fa2_bf16(
                             Q_ptr, K->gpu_data_ptr(), V->gpu_data_ptr(), O_ptr,
                             batch_size, seq_len, kv_len,
                             n_heads, n_kv_heads, head_dim,
@@ -1327,9 +1454,8 @@ namespace llaminar2
 
             TensorType execution_kv_type = K->native_type();
             const bool convert_to_fp32 =
-                execution_kv_type == TensorType::BF16 ||
-                (debugEnv().rocm.fa_disable_native_kv &&
-                 execution_kv_type != TensorType::FP32);
+                debugEnv().rocm.fa_disable_native_kv &&
+                execution_kv_type != TensorType::FP32;
             if (convert_to_fp32)
             {
                 float *k_tmp = static_cast<float *>(
@@ -1379,6 +1505,18 @@ namespace llaminar2
                 if (execution_kv_type == TensorType::FP16)
                 {
                     result = hipFlashAttn_decode_fp16_grouped_verifier_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        verifier_rows, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+                else if (execution_kv_type == TensorType::BF16)
+                {
+                    result = hipFlashAttn_decode_bf16_grouped_verifier_rows(
                         q_ptr, k_ptr, v_ptr, output_ptr,
                         static_cast<float *>(partial_output_buf_),
                         static_cast<float *>(partial_m_buf_),
@@ -1573,6 +1711,7 @@ namespace llaminar2
                     post_append_cached_tokens_device,
                     request_count,
                     query_rows,
+                    max_kv_len,
                     stream_) != 0)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] Failed to derive request-row params");
@@ -1583,6 +1722,7 @@ namespace llaminar2
                     device_params_buffer);
 
             dynamic_attn_kv_len_ = 0;
+            dynamic_attn_kv_stride_ = max_kv_len;
             dynamic_attn_position_offset_ = 0;
             dynamic_attn_query_rows_ = total_rows;
             dynamic_attn_param_rows_ = total_rows;
@@ -1591,9 +1731,8 @@ namespace llaminar2
 
             TensorType execution_kv_type = K->native_type();
             const bool convert_to_fp32 =
-                execution_kv_type == TensorType::BF16 ||
-                (debugEnv().rocm.fa_disable_native_kv &&
-                 execution_kv_type != TensorType::FP32);
+                debugEnv().rocm.fa_disable_native_kv &&
+                execution_kv_type != TensorType::FP32;
             if (convert_to_fp32)
             {
                 float *k_tmp = static_cast<float *>(
@@ -1643,6 +1782,18 @@ namespace llaminar2
                 if (execution_kv_type == TensorType::FP16)
                 {
                     result = hipFlashAttn_decode_fp16_grouped_request_rows(
+                        q_ptr, k_ptr, v_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        request_count, query_rows, max_kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        max_num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
+                }
+                else if (execution_kv_type == TensorType::BF16)
+                {
+                    result = hipFlashAttn_decode_bf16_grouped_request_rows(
                         q_ptr, k_ptr, v_ptr, output_ptr,
                         static_cast<float *>(partial_output_buf_),
                         static_cast<float *>(partial_m_buf_),

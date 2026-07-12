@@ -63,7 +63,7 @@ namespace llaminar2
                 int device)
             {
                 const int rows = activeRows(input, num_elements);
-                if (rows < 2 || rows > 4)
+                if (rows < 2)
                     return;
 
                 PerfStatsCollector::addCounter(

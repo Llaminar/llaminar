@@ -59,20 +59,19 @@ namespace
     };
 }
 
-TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicCudaAndRocmRoutes)
+TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutesAndPreservesOrderedCudaKPart)
 {
     ScopedEnv env({
         {"LLAMINAR_DETERMINISTIC", "1"},
         {"LLAMINAR_CUDA_CONCURRENT_PREFILL", "1"},
         {"LLAMINAR_CUDA_CONCURRENT_DECODE", "1"},
-        {"LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE", "1"},
-        {"LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE", "1"},
+        {"LLAMINAR_CUDA_MOE_GATEUP_KPARTS", "8"},
+        {"LLAMINAR_CUDA_MOE_DOWN_KPARTS", "4"},
         {"LLAMINAR_CUDA_MOE_ROUTER_Q8", "1"},
         {"LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN", "1"},
         {"LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_PREFILL", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "1"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "1"},
         {"LLAMINAR_ROCM_GDN_CONCURRENT_DECODE", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_Q8", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_FP16", "1"},
@@ -87,15 +86,14 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicCudaAndRocmRoutes)
 
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_prefill);
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_decode);
-    EXPECT_FALSE(env_snapshot.gemm.cuda_moe_gateup_kpart_decode);
-    EXPECT_FALSE(env_snapshot.gemm.cuda_moe_down_kpart_decode);
+    EXPECT_EQ(env_snapshot.gemm.cuda_moe_gateup_kparts, 8);
+    EXPECT_EQ(env_snapshot.gemm.cuda_moe_down_kparts, 4);
     EXPECT_FALSE(env_snapshot.gemm.cuda_moe_router_q8);
     EXPECT_FALSE(env_snapshot.gemm.cuda_moe_reuse_router_q8_hidden);
 
     EXPECT_FALSE(env_snapshot.rocm.nvnni_atomic_reduce);
     EXPECT_FALSE(env_snapshot.rocm.concurrent_prefill);
     EXPECT_FALSE(env_snapshot.rocm.concurrent_decode);
-    EXPECT_FALSE(env_snapshot.rocm.concurrent_m2_rows);
     EXPECT_FALSE(env_snapshot.rocm.gdn_concurrent_decode);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_q8);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_fp16);

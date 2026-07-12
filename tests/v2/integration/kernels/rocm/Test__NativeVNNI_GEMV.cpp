@@ -44,7 +44,9 @@
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -526,7 +528,7 @@ namespace
         };
 
         /**
-         * @brief Forces the M=2..4 verifier launch to reuse the generated M=1 policy.
+         * @brief Forces every grouped verifier launch to reuse the generated M=1 policy.
          *
          * This is the production dense verifier contract: grouped rows may
          * amortize work, but every row must remain numerically equivalent to a
@@ -1244,7 +1246,7 @@ namespace
 #endif
     }
 
-    TEST_F(NativeVNNIGEMVTest, SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs)
+    TEST_F(NativeVNNIGEMVTest, RuntimeM_AllNativeFormatsDirectAndSplitKMatchSerialGEMVsAndCapture)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
@@ -1254,16 +1256,18 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
-        NativeVNNITuningOverrideGuard force_direct(/*kb=*/1);
         NativeVNNIDecodeEquivalentM1PolicyGuard force_decode_equivalent_policy;
         constexpr int N = 384;
         constexpr int K = 512;
-        const std::array<int, 3> verifier_rows = {2, 3, 4};
         const auto device = DeviceId::rocm(0);
 
-        for (const auto &fmt : ALL_GEMV_FORMATS)
+        for (int forced_kb : {1, 4})
         {
+            NativeVNNITuningOverrideGuard force_matching_serial_kb(forced_kb);
+            for (const auto &fmt : ALL_GEMV_FORMATS)
+            {
+                SCOPED_TRACE(
+                    fmt.name + " forced_kb=" + std::to_string(forced_kb));
             auto weights = fmt.create(N, K);
             ASSERT_NE(weights, nullptr) << fmt.name << " weights";
 
@@ -1271,7 +1275,11 @@ namespace
             ASSERT_TRUE(packForNativeVNNIGemv(fmt, weights.get(), packed))
                 << fmt.name << " native-VNNI pack";
             ROCmQuantisedGemmKernel kernel(&packed, 0);
-            ASSERT_TRUE(setupWorkspace(kernel, 4, N, K))
+            ASSERT_TRUE(setupWorkspace(
+                kernel,
+                kGroupedVerifierRuntimeRows.back(),
+                N,
+                K))
                 << fmt.name << " workspace";
 
             DeviceNativeVNNIMatrixDesc desc;
@@ -1308,7 +1316,7 @@ namespace
             ASSERT_NE(d_sums_A, nullptr) << fmt.name << " blockwise sum workspace";
             ASSERT_NE(d_partial, nullptr) << fmt.name << " scatter partial workspace";
 
-            for (int M : verifier_rows)
+            for (const int M : kGroupedVerifierRuntimeRows)
             {
                 auto input = TestTensorFactory::createFP32Random(
                     {static_cast<size_t>(M), static_cast<size_t>(K)},
@@ -1346,6 +1354,12 @@ namespace
                     32))
                     << fmt.name << " blockwise activation quantization M=" << M;
 
+                hipGraph_t graph = nullptr;
+                hipGraphExec_t executable = nullptr;
+                ASSERT_EQ(
+                    hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+                    hipSuccess)
+                    << fmt.name << " capture begin M=" << M;
                 ASSERT_TRUE(rocmGemv_native_vnni_small_m_fp32_with_sums(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
@@ -1362,7 +1376,16 @@ namespace
                     desc.codebook_id,
                     0,
                     stream))
-                    << fmt.name << " specialized small-M GEMV M=" << M;
+                    << fmt.name << " captured runtime-M GEMV M=" << M;
+                ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess)
+                    << fmt.name << " capture end M=" << M;
+                ASSERT_NE(graph, nullptr) << fmt.name << " captured graph M=" << M;
+                ASSERT_EQ(
+                    hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                    hipSuccess)
+                    << fmt.name << " graph instantiate M=" << M;
+                ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess)
+                    << fmt.name << " graph replay M=" << M;
 
                 for (int row = 0; row < M; ++row)
                 {
@@ -1406,12 +1429,18 @@ namespace
                     serial,
                     count,
                     static_cast<size_t>(N));
+
+                ASSERT_EQ(hipGraphExecDestroy(executable), hipSuccess)
+                    << fmt.name << " graph executable destroy M=" << M;
+                ASSERT_EQ(hipGraphDestroy(graph), hipSuccess)
+                    << fmt.name << " graph destroy M=" << M;
             }
 
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             kernel.setGPUStream(nullptr);
             ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
             cleanupWorkspace(kernel);
+            }
         }
 #endif
     }

@@ -1598,15 +1598,28 @@ namespace llaminar2
         bool grouped_decode_equivalent_spec_publication_scope_ = false;
 
         /**
+         * @brief Allocate rank-owned MTP scratch from the configured depth.
+         *
+         * The rank reducer is used by CPU LocalTP and by response diagnostics.
+         * Its storage must therefore follow the same configured graph capacity
+         * as the child runners instead of imposing a second compile-time depth
+         * limit. This helper is called once by every constructor after
+         * `config_` has been copied.
+         */
+        void initializeRankMTPScratch();
+
+        /**
          * @brief Rank-local compact verifier scratch for diagnostics.
          *
          * GPU LocalTP production MTP uses child-owned mirrored verifier outcomes.
-         * These arrays remain available for response materialization in rank-level
+         * These buffers remain available for response materialization in rank-level
          * diagnostic reducers and CPU-local coordination paths; they must not be
          * uploaded into GPU child runners for live-state publication.
          */
-        std::array<int32_t, sampling_math::kSpeculativeBatchMaxOutputTokens>
-            rank_compact_output_tokens_{};
+        int rank_max_draft_depth_ = 1;
+        int rank_max_verifier_rows_ = 2;
+        int rank_compact_output_token_stride_ = 2;
+        std::vector<int32_t> rank_compact_output_tokens_;
         std::array<int, sampling_math::kSpeculativeBatchMetaCount>
             rank_compact_output_meta_{};
         enum class RankCompactOutcomeKind : uint8_t
@@ -1628,12 +1641,11 @@ namespace llaminar2
          * @brief LocalTP stochastic distribution slot capacity.
          *
          * The grouped MTP verifier needs one slot per speculative comparison
-         * row plus one bonus/first-token slot.  Keep the rank scratch shape
-         * identical to the backend compact-summary ABI so the rank-level
-         * reducer and single-device GPU reducers share the same bounds.
+         * row plus one bonus/first-token slot for each configured request. The
+         * capacity is computed from `MTPRuntimeConfig`; it is deliberately not
+         * a semantic maximum for speculative depth.
          */
-        static constexpr int kRankStochasticMaxSlots =
-            sampling_math::kSpeculativeBatchMaxOutputTokens;
+        int rank_stochastic_slot_capacity_ = 2;
 
         /**
          * @brief Rank-owned compact stochastic target tables for LocalTP.
@@ -1642,21 +1654,15 @@ namespace llaminar2
          * stochastic distribution because every child owns only one LM-head
          * shard.  RankOrchestrator therefore gathers only each shard's top-k
          * candidates, merges those small candidate lists, and stores the final
-         * compact tables here for the later verifier reducer.  These arrays are
-         * small: at most `(max verifier rows + bonus) * 256` entries.
+         * compact tables here for the later verifier reducer. These vectors are
+         * small: at most `(configured verifier rows * request capacity) * 256`
+         * entries.
          */
-        std::array<int,
-                   kRankStochasticMaxSlots * sampling_math::kMaxTopK>
-            rank_stochastic_target_token_ids_{};
-        std::array<float,
-                   kRankStochasticMaxSlots * sampling_math::kMaxTopK>
-            rank_stochastic_target_probs_{};
-        std::array<int, kRankStochasticMaxSlots>
-            rank_stochastic_target_top_k_{};
-        std::array<int32_t, kRankStochasticMaxSlots>
-            rank_stochastic_target_sample_tokens_{};
-        std::array<int32_t, kRankStochasticMaxSlots>
-            rank_stochastic_draft_sample_tokens_{};
+        std::vector<int> rank_stochastic_target_token_ids_;
+        std::vector<float> rank_stochastic_target_probs_;
+        std::vector<int> rank_stochastic_target_top_k_;
+        std::vector<int32_t> rank_stochastic_target_sample_tokens_;
+        std::vector<int32_t> rank_stochastic_draft_sample_tokens_;
         /**
          * @brief Slots whose target distribution lives on mirrored child zero.
          *
@@ -1666,8 +1672,7 @@ namespace llaminar2
          * LocalTP collective. This bitset joins those two API calls without
          * introducing a host logits or token shadow.
          */
-        std::array<bool, kRankStochasticMaxSlots>
-            rank_mirrored_target_distribution_ready_{};
+        std::vector<bool> rank_mirrored_target_distribution_ready_;
         std::vector<int32_t> rank_stochastic_staged_draft_tokens_;
 
         /**

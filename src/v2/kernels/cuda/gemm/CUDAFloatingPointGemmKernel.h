@@ -172,7 +172,7 @@ namespace llaminar2
              *
              * Floating shared-expert decode uses FP32 gate/up activations even
              * when the down weights are FP16 or BF16.  This entry point handles
-             * M=1..4 rows with a graph-capturable CUDA kernel whose reduction
+             * runtime-M rows with a graph-capturable CUDA kernel whose reduction
              * order is shared with the verifier grouped hook below.
              */
             bool multiply_tensor_with_fused_swiglu(
@@ -187,7 +187,7 @@ namespace llaminar2
              * @brief Grouped verifier SwiGLU/down with serial-decode math order.
              *
              * The implementation is a real grouped CUDA path: rows are launched
-             * together for M=1..4, but each output dot product walks K and
+             * together for runtime M, but each output dot product walks K and
              * reduces in the same order as the M=1 decode call.
              */
             bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(

@@ -316,7 +316,7 @@ namespace llaminar2
      * after cache construction and are uploaded as one all-layer table when the
      * cache workspace is bound.
      */
-    template <typename T>
+    template <typename T, bool ZeroInactiveRows>
     __global__ void ring_gather_batched_device_state_kernel(
         T *__restrict__ d_K_out,
         T *__restrict__ d_V_out,
@@ -326,12 +326,11 @@ namespace llaminar2
         const int *__restrict__ d_counts,
         int entry_offset,
         int request_count,
-        int max_kv_len,
+        int output_stride,
         int max_seq_len,
         int kv_dim)
     {
         const int request = static_cast<int>(blockIdx.z);
-        const int output_token = static_cast<int>(blockIdx.x);
         const int element =
             static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
         if (request >= request_count || element >= kv_dim)
@@ -339,29 +338,38 @@ namespace llaminar2
 
         const int entry = entry_offset + request;
         const int ring_count = min(max(d_counts[entry], 0), max_seq_len);
-        const int visible_count = min(ring_count, max_kv_len);
-        const int output_offset =
-            (request * max_kv_len + output_token) * kv_dim + element;
-        if (output_token >= visible_count)
-        {
-            d_K_out[output_offset] = T{};
-            d_V_out[output_offset] = T{};
-            return;
-        }
-
-        /*
-         * When a caller deliberately requests a shorter window than the live
-         * ring, retain the newest rows.  Normal full-context prefill requests
-         * max_kv_len >= ring_count, making `skipped_rows` zero.
-         */
+        const int visible_count = min(ring_count, output_stride);
         const int skipped_rows = ring_count - visible_count;
         const int tail =
             (d_heads[entry] - ring_count + max_seq_len) % max_seq_len;
-        const int source_token =
-            (tail + skipped_rows + output_token) % max_seq_len;
-        const int source_offset = source_token * kv_dim + element;
-        d_K_out[output_offset] = d_K_entry_table[entry][source_offset];
-        d_V_out[output_offset] = d_V_entry_table[entry][source_offset];
+        const int token_limit =
+            ZeroInactiveRows ? output_stride : visible_count;
+
+        /*
+         * A small fixed token grid is graph-stable and avoids launching one
+         * block per configured context row. Each block walks a disjoint token
+         * stripe up to the live device count, so replay work grows with useful
+         * history rather than with the maximum context allocation.
+         */
+        for (int output_token = static_cast<int>(blockIdx.x);
+             output_token < token_limit;
+             output_token += static_cast<int>(gridDim.x))
+        {
+            const int output_offset =
+                (request * output_stride + output_token) * kv_dim + element;
+            if (output_token >= visible_count)
+            {
+                d_K_out[output_offset] = T{};
+                d_V_out[output_offset] = T{};
+                continue;
+            }
+
+            const int source_token =
+                (tail + skipped_rows + output_token) % max_seq_len;
+            const int source_offset = source_token * kv_dim + element;
+            d_K_out[output_offset] = d_K_entry_table[entry][source_offset];
+            d_V_out[output_offset] = d_V_entry_table[entry][source_offset];
+        }
     }
 
     template <typename T>
@@ -429,7 +437,7 @@ namespace llaminar2
      * zero-fills rows outside the live count. No host-sized view or validity bit
      * participates in the operation.
      */
-    template <typename StorageT>
+    template <typename StorageT, bool ZeroInactiveRows>
     __global__ void ring_gather_batched_device_state_fp16_kernel(
         __half *__restrict__ k_output,
         __half *__restrict__ v_output,
@@ -439,12 +447,11 @@ namespace llaminar2
         const int *__restrict__ counts,
         int entry_offset,
         int request_count,
-        int max_kv_len,
+        int output_stride,
         int max_seq_len,
         int logical_kv_dim)
     {
         const int request = static_cast<int>(blockIdx.z);
-        const int output_token = static_cast<int>(blockIdx.x);
         const int element =
             static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
         if (request >= request_count || element >= logical_kv_dim)
@@ -452,29 +459,38 @@ namespace llaminar2
 
         const int entry = entry_offset + request;
         const int ring_count = min(max(counts[entry], 0), max_seq_len);
-        const int visible_count = min(ring_count, max_kv_len);
-        const size_t output_index =
-            (static_cast<size_t>(request) * max_kv_len + output_token) *
-                logical_kv_dim +
-            element;
-        if (output_token >= visible_count)
-        {
-            k_output[output_index] = __float2half_rn(0.0f);
-            v_output[output_index] = __float2half_rn(0.0f);
-            return;
-        }
-
+        const int visible_count = min(ring_count, output_stride);
         const int skipped_rows = ring_count - visible_count;
         const int tail =
             (heads[entry] - ring_count + max_seq_len) % max_seq_len;
-        const int source_token =
-            (tail + skipped_rows + output_token) % max_seq_len;
-        k_output[output_index] = __float2half_rn(
-            load_ring_logical_value(
-                k_entry_table[entry], source_token, element, logical_kv_dim));
-        v_output[output_index] = __float2half_rn(
-            load_ring_logical_value(
-                v_entry_table[entry], source_token, element, logical_kv_dim));
+        const int token_limit =
+            ZeroInactiveRows ? output_stride : visible_count;
+        for (int output_token = static_cast<int>(blockIdx.x);
+             output_token < token_limit;
+             output_token += static_cast<int>(gridDim.x))
+        {
+            const size_t output_index =
+                (static_cast<size_t>(request) * output_stride + output_token) *
+                    logical_kv_dim +
+                element;
+            if (output_token >= visible_count)
+            {
+                k_output[output_index] = __float2half_rn(0.0f);
+                v_output[output_index] = __float2half_rn(0.0f);
+                continue;
+            }
+
+            const int source_token =
+                (tail + skipped_rows + output_token) % max_seq_len;
+            k_output[output_index] = __float2half_rn(
+                load_ring_logical_value(
+                    k_entry_table[entry], source_token, element,
+                    logical_kv_dim));
+            v_output[output_index] = __float2half_rn(
+                load_ring_logical_value(
+                    v_entry_table[entry], source_token, element,
+                    logical_kv_dim));
+        }
     }
 
     template <typename SrcT>
@@ -1619,7 +1635,7 @@ namespace llaminar2
     {
         if (layer < 0 || layer >= n_layers_ ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
-            verifier_rows < 1 || verifier_rows > 4 ||
+            verifier_rows < 1 ||
             !K || !V || !gpu_stream)
         {
             LOG_ERROR("[CUDARingKVCache] Invalid verifier append request: layer="
@@ -2417,7 +2433,7 @@ namespace llaminar2
             static_cast<unsigned int>(out_max_kv_len),
             static_cast<unsigned int>((kv_storage_dim_ + 255) / 256),
             static_cast<unsigned int>(num_seqs));
-        ring_gather_batched_device_state_kernel<DataT><<<grid, block, 0, stream>>>(
+        ring_gather_batched_device_state_kernel<DataT, true><<<grid, block, 0, stream>>>(
             static_cast<DataT *>(d_k_out),
             static_cast<DataT *>(d_v_out),
             d_batched_k_entry_table_,
@@ -2440,7 +2456,6 @@ namespace llaminar2
         int layer,
         int first_seq_idx,
         int request_count,
-        int max_kv_len,
         ITensor **out_k,
         ITensor **out_v,
         void *gpu_stream)
@@ -2453,7 +2468,6 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ ||
             first_seq_idx < 0 || request_count <= 0 ||
             first_seq_idx + request_count > batch_size_ ||
-            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
             !gpu_stream || !workspace_ || !workspace_->isAllocated() ||
             !d_head_params_ || !d_count_params_ ||
             !batched_pointer_tables_ready_)
@@ -2462,7 +2476,6 @@ namespace llaminar2
                       << " layer=" << layer
                       << " first_seq=" << first_seq_idx
                       << " requests=" << request_count
-                      << " max_kv_len=" << max_kv_len
                       << " batch_capacity=" << batch_size_
                       << " max_seq_len=" << max_seq_len_
                       << " stream=" << gpu_stream
@@ -2473,7 +2486,8 @@ namespace llaminar2
         }
 
         const size_t rows =
-            static_cast<size_t>(request_count) * static_cast<size_t>(max_kv_len);
+            static_cast<size_t>(request_count) *
+            static_cast<size_t>(max_seq_len_);
         const size_t required_bytes =
             rows * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         if (!ensureConvScratch(required_bytes) ||
@@ -2492,12 +2506,15 @@ namespace llaminar2
 
         const int entry_offset = layer * batch_size_ + first_seq_idx;
         const dim3 block(256);
+        constexpr unsigned int resident_token_blocks = 32;
         const dim3 grid(
-            static_cast<unsigned int>(max_kv_len),
+            std::min(
+                static_cast<unsigned int>(max_seq_len_),
+                resident_token_blocks),
             static_cast<unsigned int>((kv_storage_dim_ + 255) / 256),
             static_cast<unsigned int>(request_count));
         auto stream = static_cast<cudaStream_t>(gpu_stream);
-        ring_gather_batched_device_state_kernel<DataT><<<grid, block, 0, stream>>>(
+        ring_gather_batched_device_state_kernel<DataT, false><<<grid, block, 0, stream>>>(
             static_cast<DataT *>(conv_scratch_k_),
             static_cast<DataT *>(conv_scratch_v_),
             d_batched_k_entry_table_,
@@ -2506,7 +2523,7 @@ namespace llaminar2
             d_count_params_,
             entry_offset,
             request_count,
-            max_kv_len,
+            max_seq_len_,
             max_seq_len_,
             kv_storage_dim_);
         const cudaError_t launch_error = cudaGetLastError();
@@ -2559,7 +2576,6 @@ namespace llaminar2
         int layer,
         int first_seq_idx,
         int request_count,
-        int max_kv_len,
         ActivationPrecision target,
         ITensor **out_k,
         ITensor **out_v,
@@ -2579,7 +2595,6 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
             request_count <= 0 ||
             first_seq_idx > batch_size_ - request_count ||
-            max_kv_len <= 0 || max_kv_len > max_seq_len_ ||
             target != ActivationPrecision::FP16 || !read.gpu_stream ||
             requested_heads != local_n_kv_heads_ ||
             requested_head_dim != head_dim_ ||
@@ -2593,7 +2608,6 @@ namespace llaminar2
                       << " layer=" << layer
                       << " first_seq=" << first_seq_idx
                       << " requests=" << request_count
-                      << " max_kv_len=" << max_kv_len
                       << " target=" << activationPrecisionToString(target)
                       << " heads=" << requested_heads
                       << " head_dim=" << requested_head_dim
@@ -2603,7 +2617,7 @@ namespace llaminar2
         }
 
         const size_t rows =
-            static_cast<size_t>(request_count) * max_kv_len;
+            static_cast<size_t>(request_count) * max_seq_len_;
         const size_t required_bytes =
             rows * static_cast<size_t>(kv_dim_) * sizeof(__half);
         if (!ensureConvScratch(required_bytes) ||
@@ -2619,11 +2633,14 @@ namespace llaminar2
         auto stream = static_cast<cudaStream_t>(read.gpu_stream);
         const int entry_offset = layer * batch_size_ + first_seq_idx;
         const dim3 gather_block(256);
+        constexpr unsigned int resident_token_blocks = 32;
         const dim3 gather_grid(
-            static_cast<unsigned int>(max_kv_len),
+            std::min(
+                static_cast<unsigned int>(max_seq_len_),
+                resident_token_blocks),
             static_cast<unsigned int>((kv_dim_ + 255) / 256),
             static_cast<unsigned int>(request_count));
-        ring_gather_batched_device_state_fp16_kernel<DataT>
+        ring_gather_batched_device_state_fp16_kernel<DataT, true>
             <<<gather_grid, gather_block, 0, stream>>>(
                 k_output,
                 v_output,
@@ -2633,7 +2650,7 @@ namespace llaminar2
                 d_count_params_,
                 entry_offset,
                 request_count,
-                max_kv_len,
+                max_seq_len_,
                 max_seq_len_,
                 kv_dim_);
         cudaError_t launch_error = cudaGetLastError();
@@ -2652,9 +2669,9 @@ namespace llaminar2
                 rope_ok = cuda_rope_apply_batched_fp32_ring_to_fp16_device_state(
                     k_output,
                     reinterpret_cast<const float *const *>(
-                        d_batched_k_entry_table_),
+                    d_batched_k_entry_table_),
                     d_head_params_, d_count_params_, entry_offset,
-                    request_count, max_kv_len, max_seq_len_,
+                    request_count, max_seq_len_, max_seq_len_,
                     local_n_kv_heads_, head_dim_, read.rope_theta,
                     read.position_start, effective_rope_dim, stream);
             }
@@ -2662,7 +2679,7 @@ namespace llaminar2
             {
                 rope_ok = cuda_rope_apply_batched_fp16_device_state(
                     k_output, d_count_params_, entry_offset, request_count,
-                    max_kv_len, max_seq_len_, local_n_kv_heads_, head_dim_,
+                    max_seq_len_, max_seq_len_, local_n_kv_heads_, head_dim_,
                     read.rope_theta, read.position_start, effective_rope_dim,
                     stream);
             }
@@ -2713,15 +2730,26 @@ namespace llaminar2
     WorkspaceRequirements CUDARingKVCache<Precision>::getWorkspaceRequirements(
         int m, int n, int k) const
     {
-        // New callers pass m=max graph tokens and n=batch size so conversion
-        // scratch can follow bucket/chunk size. Legacy one-arg callers used
-        // m=batch size; keep that behavior and size scratch to max_seq_len_.
+        /*
+         * New callers pass m as the active graph bucket and n as the request
+         * batch. That bucket is not a valid upper bound for resident KV reads:
+         * a later prefill chunk can contain 256 new rows while attention gathers
+         * 768 or more cached rows. Conversion scratch therefore follows the
+         * cache's configured sequence horizon, never merely the current chunk.
+         *
+         * Legacy one-argument callers use m as a batch hint. Preserve that API,
+         * while also reserving the cache's complete configured batch capacity so
+         * a smaller first graph cannot under-size a later request batch.
+         */
         (void)k;
 
         const bool has_token_hint = n > 0;
         const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
-        const int scratch_tokens = has_token_hint ? m : max_seq_len_;
-        const int bounded_batch_size = std::max(1, actual_batch_size);
+        const int scratch_tokens = has_token_hint
+                                       ? std::max(m, max_seq_len_)
+                                       : max_seq_len_;
+        const int bounded_batch_size =
+            std::max(std::max(1, actual_batch_size), batch_size_);
         const int bounded_scratch_tokens = std::max(1, scratch_tokens);
         const size_t batched_scratch_tokens =
             static_cast<size_t>(bounded_scratch_tokens) *

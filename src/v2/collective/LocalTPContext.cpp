@@ -1633,8 +1633,7 @@ namespace llaminar2
             // Wait for the last arrival to complete the reduction
             const int barrier_timeout_ms =
                 collective_timeout_policy::effectiveCollectTimeoutMs(
-                    debugEnv().tp_collect_timeout_ms,
-                    first_barrier_completed_.load());
+                    debugEnv().tp_collect_timeout_ms);
 
             bool completed = barrier_cv_.wait_for(
                 lock,
@@ -1784,7 +1783,6 @@ namespace llaminar2
 
         // Cleanup and release waiters
         barrier_result_ = true;
-        first_barrier_completed_.store(true);
         barrier_tensors_.clear();
         barrier_stage_name_.clear();
         barrier_element_count_ = 0;
@@ -1838,8 +1836,7 @@ namespace llaminar2
         {
             const int barrier_timeout_ms =
                 collective_timeout_policy::effectiveCollectTimeoutMs(
-                    debugEnv().tp_collect_timeout_ms,
-                    first_barrier_completed_.load());
+                    debugEnv().tp_collect_timeout_ms);
 
             bool completed = barrier_cv_.wait_for(
                 lock,
@@ -1886,7 +1883,6 @@ namespace llaminar2
         }
 
         barrier_result_ = true;
-        first_barrier_completed_.store(true);
         barrier_tensors_.clear();
         barrier_stage_name_.clear();
         barrier_element_count_ = 0;
@@ -2145,8 +2141,7 @@ namespace llaminar2
             // Not the last arrival: wait for completion with timeout
             const int barrier_timeout_ms =
                 collective_timeout_policy::effectiveCollectTimeoutMs(
-                    debugEnv().tp_collect_timeout_ms,
-                    first_barrier_completed_.load());
+                    debugEnv().tp_collect_timeout_ms);
 
             bool completed = barrier_cv_.wait_for(
                 lock,
@@ -2615,8 +2610,6 @@ namespace llaminar2
         barrier_generation_.fetch_add(1);
 
         bool final_result = barrier_result_;
-        if (final_result)
-            first_barrier_completed_.store(true);
 
         LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Multi-GPU allreduce completed with result="
                   << final_result << ", releasing waiters (generation=" << barrier_generation_.load() << ")");
@@ -4525,8 +4518,7 @@ namespace llaminar2
             };
 
             const int timeout_ms = collective_timeout_policy::effectiveCollectTimeoutMs(
-                debugEnv().tp_collect_timeout_ms,
-                first_onstream_collective_completed_.load(std::memory_order_acquire));
+                debugEnv().tp_collect_timeout_ms);
             bool completed = true;
             if (timeout_ms > 0)
             {
@@ -4689,10 +4681,6 @@ namespace llaminar2
                               << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
                               << " error=" << grouped_onstream_allreduce_error_);
                 }
-                else
-                {
-                    first_onstream_collective_completed_.store(true, std::memory_order_release);
-                }
                 grouped_onstream_allreduce_cv_.notify_all();
                 return depart_generation(enqueue_ok);
             }
@@ -4843,11 +4831,6 @@ namespace llaminar2
                       << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
                       << " error=" << grouped_onstream_allreduce_error_);
         }
-        else
-        {
-            first_onstream_collective_completed_.store(true, std::memory_order_release);
-        }
-
         if (success && debugEnv().tp_collective_contract_trace)
         {
             LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_grouped_onstream_enqueued"
@@ -4957,8 +4940,7 @@ namespace llaminar2
             if (!ready())
             {
                 const int timeout_ms = collective_timeout_policy::effectiveCollectTimeoutMs(
-                    debugEnv().tp_collect_timeout_ms,
-                    first_onstream_collective_completed_.load(std::memory_order_acquire));
+                    debugEnv().tp_collect_timeout_ms);
                 if (timeout_ms > 0)
                 {
                     const bool completed = contract_trace_cv_.wait_for(
@@ -4985,10 +4967,6 @@ namespace llaminar2
 
             ok = entry.ok && !abort_requested_.load(std::memory_order_acquire);
             error = entry.error;
-            if (ok)
-            {
-                first_onstream_collective_completed_.store(true, std::memory_order_release);
-            }
             ++entry.departures;
             if (entry.departures >= entry.arrivals)
             {

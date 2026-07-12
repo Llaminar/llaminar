@@ -19,6 +19,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/PerfStatsCollector.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
 #include <vector>
 #include <cmath>
@@ -177,6 +178,15 @@ namespace llaminar2
                                             int verifier_rows,
                                             int hidden_dim)
         {
+            // The production policy keeps tiny groups cache-serial and opens one
+            // row-parallel workshare once there are enough independent rows to
+            // amortize OpenMP coordination. Keep this assertion explicit so a
+            // future dispatch regression cannot masquerade as mere byte parity.
+            const char *expected_row_schedule =
+                verifier_rows >= 8 ||
+                        static_cast<size_t>(verifier_rows) * hidden_dim >= 65536u
+                    ? "openmp_rows"
+                    : "cache_serial_rows";
             bool found = false;
             for (const auto &record : PerfStatsCollector::snapshot(
                      {"kernel.cpu_rmsnorm_grouped_verifier_rows_calls"}))
@@ -191,7 +201,7 @@ namespace llaminar2
                          tag_equals("output_format", output_format) &&
                          tag_equals("verifier_rows", std::to_string(verifier_rows)) &&
                          tag_equals("hidden_dim", std::to_string(hidden_dim)) &&
-                         tag_equals("row_schedule", "cache_serial_rows") &&
+                         tag_equals("row_schedule", expected_row_schedule) &&
                          tag_equals("invocation_policy", "single_grouped_call"));
             }
             EXPECT_TRUE(found)
@@ -559,7 +569,7 @@ namespace llaminar2
     }
 
     /**
-     * @brief Prove all CPU RMSNorm activation formats are batch invariant for M=2..4.
+     * @brief Prove all CPU RMSNorm activation formats are batch invariant for runtime M.
      *
      * The grouped side calls each production typed kernel once over all verifier
      * rows. The serial witness calls the same typed kernel on one row at a time.
@@ -572,7 +582,7 @@ namespace llaminar2
     {
         ScopedPerfStats perfstats;
 
-        constexpr int max_rows = 4;
+        constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
         constexpr int cols = 4096;
         constexpr size_t elements_per_row = static_cast<size_t>(cols);
         constexpr size_t blocks_per_row = elements_per_row / Q8_1Block::BLOCK_SIZE;
@@ -597,7 +607,7 @@ namespace llaminar2
                 q16_input[block]);
         }
 
-        for (int rows : {2, 3, 4})
+        for (int rows : test::kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE("rows=" + std::to_string(rows));
 

@@ -3,7 +3,7 @@
  * @brief CUDA production-stage grouped fused-residual RMSNorm integration gate.
  *
  * The shared matrix drives FusedResidualNormStage on one non-default CUDA stream
- * for FP32, BF16, and FP16 at M=2..4. Both device-published outputs must equal
+ * for FP32, BF16, and FP16 across runtime M. Both device-published outputs must equal
  * independent CUDA M=1 stage executions byte for byte, and stage telemetry must
  * prove one native fused launch covered the complete verifier row group.
  */

@@ -3,7 +3,7 @@
  * @brief CPU all-format grouped standalone SwiGLU byte-equivalence gate.
  *
  * The production CPU activation path supports FP32, BF16, FP16, and Q8_1.
- * This suite proves M=2..4 output is byte-identical to production M=1 decode at
+ * This suite proves runtime-M output is byte-identical to production M=1 decode at
  * both an odd 17-block row width and a real dense Qwen FFN width. Route counters
  * additionally require one grouped primitive call rather than row replay.
  */
@@ -15,6 +15,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <array>
@@ -175,19 +176,20 @@ namespace
         const char *schedule_label)
     {
         constexpr std::array<int, 2> column_counts = {544, 4864};
+        constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
         constexpr const char *counter_name =
             "cpu_swiglu_grouped_verifier_rows_calls";
 
         for (int cols : column_counts)
         {
             const auto gate_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0x91A10000u ^ static_cast<uint32_t>(cols));
             const auto up_values = makeValues(
-                static_cast<size_t>(4) * cols,
+                static_cast<size_t>(max_rows) * cols,
                 0xA2B20000u ^ static_cast<uint32_t>(cols));
 
-            for (int verifier_rows : {2, 3, 4})
+            for (int verifier_rows : test::kGroupedVerifierRuntimeRows)
             {
                 SCOPED_TRACE(
                     std::string("CPU format=") + format_label +

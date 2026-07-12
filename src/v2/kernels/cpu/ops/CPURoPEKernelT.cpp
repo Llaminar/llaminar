@@ -57,7 +57,7 @@ namespace llaminar2
                                              << format_label);
                 return false;
             }
-            if (verifier_rows < 2 || verifier_rows > 4 ||
+            if (verifier_rows < 2 ||
                 n_heads <= 0 || n_kv_heads < 0 ||
                 head_dim <= 0 || (head_dim % 2) != 0)
             {

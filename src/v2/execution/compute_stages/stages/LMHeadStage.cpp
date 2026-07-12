@@ -144,7 +144,7 @@ namespace llaminar2
         }
 
         // Bias is passed directly to GEMM kernel for fused application.
-        // CPU NativeVNNI uses its batched M=2..4 path here for verifier rows;
+        // CPU NativeVNNI uses its runtime-row grouped path here for verifier rows;
         // parity tests compare these rows against serial one-token decode.
         bool success = false;
         if (params_.force_decode_equivalent_verifier_prefill &&
@@ -198,13 +198,6 @@ namespace llaminar2
     {
         if (!hidden_states || !logits || !lm_gemm)
             return false;
-        if (lm_m > 4)
-        {
-            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier prefill is only supported "
-                      << "for tiny MTP verifier batches, got m=" << lm_m);
-            return false;
-        }
-
         const bool is_gpu = params_.device_id.is_gpu();
         void *stream = gpuStream();
         if (is_gpu && !stream)

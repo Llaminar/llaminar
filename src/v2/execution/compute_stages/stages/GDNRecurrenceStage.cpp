@@ -1342,11 +1342,11 @@ namespace llaminar2
             }
 
             /*
-             * All-position verifier rows are tiny (M=2..4), and the hot path
-             * needs post-row state snapshots rather than a generic prefill
-             * layout.  Let CPU kernels that understand the merged layout read
-             * Q/K/V slices directly so we do not spend more time copying QKV
-             * than advancing the recurrence.
+             * All-position verifier rows are bounded by the graph's declared
+             * runtime capacity and need post-row state snapshots rather than a
+             * generic prefill layout. Let CPU kernels that understand the merged
+             * layout read Q/K/V slices directly so we do not spend more time
+             * copying QKV than advancing the recurrence.
              */
             const bool direct_merged_verifier =
                 params_.seq_len > 1 &&

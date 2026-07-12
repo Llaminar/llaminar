@@ -749,17 +749,22 @@ namespace llaminar2
          * materialize the selected slots into persistent device workspace while
          * reading ring heads and counts from device-owned metadata.
          *
-         * The returned tensors use the cache's native K and V formats and remain
-         * owned by the cache.  Their pointers are stable for the lifetime of the
-         * bound workspace, making the gather kernel and its consumers safe to
-         * capture in one CUDA/HIP graph.  Implementations must fail when they do
+         * The returned tensors use the cache's native K and V formats and a
+         * fixed request stride of @ref max_seq_len. Their pointers and shapes
+         * are stable for the lifetime of the bound workspace, making the gather
+         * and its consumers safe to capture in one CUDA/HIP graph while the
+         * canonical device count grows. Implementations must fail when they do
          * not provide a native batched path; production callers must not replay
          * rows or silently substitute sequence zero.
+         *
+         * Only rows below each request's canonical device count are initialized
+         * by an invocation. Consumers must use that same device count as their
+         * logical bound. Inactive capacity is deliberately unspecified so a
+         * short decode does not clear an entire maximum-context allocation.
          *
          * @param layer Model/cache layer whose entries will be gathered.
          * @param first_seq_idx First logical cache sequence to gather.
          * @param request_count Number of consecutive request slots.
-         * @param max_kv_len Fixed output row stride per request.
          * @param out_k Receives cache-owned device K view.
          * @param out_v Receives cache-owned device V view.
          * @param gpu_stream Explicit backend stream ordering append, gather, and attention.
@@ -769,7 +774,6 @@ namespace llaminar2
             int layer,
             int first_seq_idx,
             int request_count,
-            int max_kv_len,
             ITensor **out_k,
             ITensor **out_v,
             void *gpu_stream)
@@ -777,7 +781,6 @@ namespace llaminar2
             (void)layer;
             (void)first_seq_idx;
             (void)request_count;
-            (void)max_kv_len;
             (void)gpu_stream;
             if (out_k)
                 *out_k = nullptr;
@@ -861,14 +864,15 @@ namespace llaminar2
          * head/count, optionally applies RoPE to K, and writes stable cache-owned
          * output storage on the supplied stream.
          *
-         * Rows beyond a request's device count are zero-filled. Implementations
-         * must be graph-capturable, must not perform D2H observation, and must not
-         * replay requests or rows through a scalar production path.
+         * The converted view has a fixed request stride of @ref max_seq_len.
+         * Rows beyond a request's device count are unspecified and must not be
+         * consumed. Implementations must be graph-capturable, must not perform
+         * D2H observation, and must not replay requests or rows through a scalar
+         * production path.
          *
          * @param layer Model/cache layer whose entries will be materialized.
          * @param first_seq_idx First request slot in the contiguous batch.
          * @param request_count Number of request-local rings to process.
-         * @param max_kv_len Fixed output stride and graph launch horizon.
          * @param target Requested output precision.
          * @param out_k Receives the stable converted K view.
          * @param out_v Receives the stable converted V view.
@@ -879,7 +883,6 @@ namespace llaminar2
             int layer,
             int first_seq_idx,
             int request_count,
-            int max_kv_len,
             ActivationPrecision target,
             ITensor **out_k,
             ITensor **out_v,
@@ -888,7 +891,6 @@ namespace llaminar2
             (void)layer;
             (void)first_seq_idx;
             (void)request_count;
-            (void)max_kv_len;
             (void)target;
             (void)read;
             if (out_k)

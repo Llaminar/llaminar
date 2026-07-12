@@ -1148,10 +1148,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNISmallMDispatchSweepUsesRe
     const auto small_m_body = sliceBetween(
         tuned_source,
         "bool dispatchCodebookSmallMRowPar(",
-        "template <int M>");
+        "bool dispatchSmallMByCodebook(");
 
     EXPECT_NE(small_m_body.find("if (g_sweep.active)"), std::string::npos)
-        << "CUDA M=2..4 NativeVNNI trainer rows must time the requested candidate, not the generated runtime route.";
+        << "CUDA runtime-M NativeVNNI trainer rows must time the requested candidate, not the generated runtime route.";
     EXPECT_NE(small_m_body.find("tuning = GeneratedDispatchTuning{"), std::string::npos)
         << "The small-M sweep override must forward tile/family parameters into the real launch.";
 
@@ -1162,7 +1162,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNISmallMDispatchSweepUsesRe
         << "The CUDA NativeVNNI trainer must filter candidate families unsupported by the GPU-prepared harness.";
     EXPECT_NE(sweep_source.find("if (m > 1)\n            return candidate.family == SweepFamily::KPar;"),
               std::string::npos)
-        << "M=2..4 trainer cases must not label WIDE/DIRECT/ROWPAR rows as specialized small-M timings.";
+        << "Grouped trainer cases must not label WIDE/DIRECT/ROWPAR rows as specialized KPAR timings.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCapturedStream)
@@ -1276,6 +1276,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsStageConditionTokensInAre
         "bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(");
     const auto executable_sidecar_body =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(sidecar_body));
+    const auto compact_source = removeAsciiWhitespace(source);
 
     /*
      * GPU graph capture records the embedding kernel's token pointer.  Host
@@ -1290,15 +1291,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPGpuSidecarsStageConditionTokensInAre
         << "The condition-token buffer must expose its row capacity to runtime validation.";
     EXPECT_NE(source.find("kMTPSidecarConditionTokenSlotCount"), std::string::npos)
         << "Graph-captured sidecar roles must have distinct condition-token slots.";
-    EXPECT_NE(source.find("BufferId::MTP_CONDITION_TOKEN,\n"
-                          "                                        1,\n"
-                          "                                        sampling_math::kSpeculativeBatchMaxRows *\n"
-                          "                                            kMTPSidecarConditionTokenSlotCount"),
+    EXPECT_NE(compact_source.find(
+                  "BufferId::MTP_CONDITION_TOKEN,1,"
+                  "static_cast<size_t>(mtp_sidecar_condition_token_slot_width_)*"
+                  "kMTPSidecarConditionTokenSlotCount"),
               std::string::npos)
-        << "MTP_CONDITION_TOKEN must hold all catch-up rows for every sidecar slot.";
+        << "MTP_CONDITION_TOKEN must hold the configured runtime row capacity for every sidecar slot.";
     EXPECT_NE(sidecar_body.find("sidecar_condition_token_slot"), std::string::npos)
         << "MTP sidecar caches must map to role-owned condition-token slots.";
-    EXPECT_NE(sidecar_body.find("condition_token_slot * kConditionTokenSlotWidth"), std::string::npos)
+    EXPECT_NE(executable_sidecar_body.find(
+                  "condition_token_slot*mtp_sidecar_condition_token_slot_width_"),
+              std::string::npos)
         << "Device-token staging must use the cache-owned slot offset, not the buffer base.";
     EXPECT_NE(sidecar_body.find("condition_token_device"), std::string::npos)
         << "Graph construction and token staging must share the same slot pointer.";
@@ -6372,6 +6375,33 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAEmbeddingDoesNotUploadDynamicTokens
     EXPECT_NE(apply_tensor.find("Token ID upload requires an explicit non-null stream"), std::string::npos);
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVConversionScratchCoversResidentHistoryBeyondGraphBucket)
+{
+    const auto cuda_source =
+        readFile(repoRoot() / "src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu");
+    const auto rocm_source =
+        readFile(repoRoot() / "src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp");
+
+    const auto cuda_requirements = sliceBetween(
+        cuda_source,
+        "WorkspaceRequirements CUDARingKVCache<Precision>::getWorkspaceRequirements(",
+        "    template <ActivationPrecision Precision>\n    void CUDARingKVCache<Precision>::bindWorkspace");
+    const auto rocm_requirements = sliceBetween(
+        rocm_source,
+        "WorkspaceRequirements ROCmRingKVCache<Precision>::getWorkspaceRequirements(",
+        "    template <ActivationPrecision Precision>\n    void ROCmRingKVCache<Precision>::bindWorkspace");
+
+    for (const auto *requirements : {&cuda_requirements, &rocm_requirements})
+    {
+        EXPECT_NE(requirements->find("std::max(m, max_seq_len_)"), std::string::npos)
+            << "A prefill graph bucket bounds new rows, not the resident KV horizon";
+        EXPECT_NE(requirements->find("batch_size_"), std::string::npos)
+            << "Scratch must retain the cache's full configured request capacity";
+        EXPECT_NE(requirements->find("KVCacheWorkspaceBuffers::CONV_SCRATCH_K"), std::string::npos);
+        EXPECT_NE(requirements->find("KVCacheWorkspaceBuffers::CONV_SCRATCH_V"), std::string::npos);
+    }
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, RoPECanConsumeDeviceResidentPositionIdsWithoutH2D)
 {
     const auto graph_input =
@@ -6663,10 +6693,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         << "The decode-equivalent verifier lane is CPU-only now. GPU verifier "
            "rows must stay on the economical grouped publication routes instead "
            "of drifting back toward row replay.";
-    EXPECT_NE(compact.find("total_tokens>=1&&total_tokens<=4"),
+    EXPECT_NE(compact.find("total_tokens>=1&&"),
               std::string::npos)
-        << "M=1 verifier publication uses the explicit decode-equivalent path, "
-           "while M=2..4 can use the grouped verifier route.";
+        << "CPU verifier publication must accept every positive runtime row count.";
+    EXPECT_EQ(compact.find("total_tokens<=4"), std::string::npos)
+        << "Verifier admission must not encode the retired four-row MTP limit.";
 
     const auto combined_shared_section = sliceBetween(
         graph_source,

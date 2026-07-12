@@ -241,7 +241,7 @@ namespace llaminar2
             return output_tokens_device != nullptr &&
                    meta_device != nullptr &&
                    request_count > 0 &&
-                   output_token_stride >= sampling_math::kSpeculativeBatchMaxOutputTokens &&
+                   output_token_stride > 0 &&
                    meta_stride >= sampling_math::kSpeculativeBatchMetaCount &&
                    stream != nullptr &&
                    response_ready_event != nullptr;
@@ -540,20 +540,65 @@ namespace llaminar2
             DeviceStochasticDrawPositionSource::ExplicitThresholds;
         bool serial_sample_equivalent = false;
         bool use_device_draft_tokens = true; ///< Null host draft pointer when true.
-        std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows> draft_tokens;
-        std::array<float, sampling_math::kSpeculativeBatchMaxRows> accept_thresholds;
-        std::array<float, sampling_math::kSpeculativeBatchMaxRows> residual_thresholds;
-        std::array<float, sampling_math::kSpeculativeBatchMaxRows> sample_thresholds;
+        std::vector<int32_t> draft_tokens;
+        std::vector<float> accept_thresholds;
+        std::vector<float> residual_thresholds;
+        std::vector<float> sample_thresholds;
         std::array<int32_t, sampling_math::kSpeculativeBatchMaxStopTokens> stop_tokens;
         int stop_token_count = 0;
 
         DeviceStochasticBatchOutcomeRequest()
+            : draft_tokens(
+                  static_cast<size_t>(sampling_math::kSpeculativeBatchMaxRows),
+                  -1),
+              accept_thresholds(
+                  static_cast<size_t>(sampling_math::kSpeculativeBatchMaxRows),
+                  0.0f),
+              residual_thresholds(
+                  static_cast<size_t>(sampling_math::kSpeculativeBatchMaxRows),
+                  0.0f),
+              sample_thresholds(
+                  static_cast<size_t>(sampling_math::kSpeculativeBatchMaxRows),
+                  0.0f)
         {
-            draft_tokens.fill(-1);
-            accept_thresholds.fill(0.0f);
-            residual_thresholds.fill(0.0f);
-            sample_thresholds.fill(0.0f);
             stop_tokens.fill(-1);
+        }
+
+        /**
+         * @brief Ensure optional host diagnostic rows can describe `count` rows.
+         *
+         * Seed-derived GPU production requests ordinarily leave these vectors
+         * untouched because tokens and thresholds stay device-owned. Explicit
+         * CPU/diagnostic callers use this helper before writing row values so
+         * a configured speculative depth is not constrained by the default
+         * certification depth.
+         */
+        bool ensureHostRowCapacity(int count)
+        {
+            if (count < 0)
+                return false;
+            const size_t required = static_cast<size_t>(count);
+            if (draft_tokens.size() < required)
+                draft_tokens.resize(required, -1);
+            if (accept_thresholds.size() < required)
+                accept_thresholds.resize(required, 0.0f);
+            if (residual_thresholds.size() < required)
+                residual_thresholds.resize(required, 0.0f);
+            if (sample_thresholds.size() < required)
+                sample_thresholds.resize(required, 0.0f);
+            return true;
+        }
+
+        /** @brief Return whether every optional host row vector covers `count`. */
+        bool hasHostRowCapacity(int count) const
+        {
+            if (count < 0)
+                return false;
+            const size_t required = static_cast<size_t>(count);
+            return draft_tokens.size() >= required &&
+                   accept_thresholds.size() >= required &&
+                   residual_thresholds.size() >= required &&
+                   sample_thresholds.size() >= required;
         }
 
         const int32_t *hostDraftTokensOrNull() const
@@ -3143,7 +3188,6 @@ namespace llaminar2
                 accept_thresholds != nullptr && residual_thresholds != nullptr;
             if ((!has_host_thresholds && !derive_thresholds_from_seed) ||
                 row_count <= 0 ||
-                row_count > kSpeculativeBatchMaxRows ||
                 stop_token_count < 0 ||
                 stop_token_count > kSpeculativeBatchMaxStopTokens ||
                 (stop_token_count > 0 && !stop_tokens) ||
@@ -3172,6 +3216,8 @@ namespace llaminar2
                     ? DeviceStochasticDrawPositionSource::HostLogicalPosition
                     : DeviceStochasticDrawPositionSource::ExplicitThresholds;
             request.use_device_draft_tokens = draft_tokens == nullptr;
+            if (!request.ensureHostRowCapacity(row_count))
+                return false;
 
             for (int row = 0; row < row_count; ++row)
             {
@@ -3235,7 +3281,6 @@ namespace llaminar2
                 accept_thresholds != nullptr && residual_thresholds != nullptr;
             if ((!has_host_thresholds && !derive_thresholds_from_seed) ||
                 row_count <= 0 ||
-                row_count > kSpeculativeBatchMaxRows ||
                 first_target_sample_slot < 0 ||
                 stop_token_count < 0 ||
                 stop_token_count > kSpeculativeBatchMaxStopTokens ||
@@ -3266,6 +3311,8 @@ namespace llaminar2
                     ? DeviceStochasticDrawPositionSource::HostLogicalPosition
                     : DeviceStochasticDrawPositionSource::ExplicitThresholds;
             request.use_device_draft_tokens = draft_tokens == nullptr;
+            if (!request.ensureHostRowCapacity(row_count))
+                return false;
 
             for (int row = 0; row < row_count; ++row)
             {
@@ -3319,7 +3366,6 @@ namespace llaminar2
             {
                 const DeviceStochasticBatchOutcomeRequest &request = requests[i];
                 if (request.row_count <= 0 ||
-                    request.row_count > kSpeculativeBatchMaxRows ||
                     request.stop_token_count < 0 ||
                     request.stop_token_count > kSpeculativeBatchMaxStopTokens)
                 {
@@ -3332,6 +3378,16 @@ namespace llaminar2
                         : nullptr;
                 const int32_t *draft_tokens =
                     request.hostDraftTokensOrNull();
+                const size_t required_rows =
+                    static_cast<size_t>(request.row_count);
+                if ((!request.use_device_draft_tokens &&
+                     request.draft_tokens.size() < required_rows) ||
+                    (!request.derive_thresholds_from_seed &&
+                     (request.accept_thresholds.size() < required_rows ||
+                      request.residual_thresholds.size() < required_rows)))
+                {
+                    return false;
+                }
                 if (request.serial_sample_equivalent)
                 {
                     /*
@@ -3355,10 +3411,12 @@ namespace llaminar2
                      */
                     return false;
                 }
-                std::array<float, kSpeculativeBatchMaxRows>
-                    derived_accept_thresholds = {};
-                std::array<float, kSpeculativeBatchMaxRows>
-                    derived_residual_thresholds = {};
+                std::vector<float> derived_accept_thresholds(
+                    static_cast<size_t>(request.row_count),
+                    0.0f);
+                std::vector<float> derived_residual_thresholds(
+                    static_cast<size_t>(request.row_count),
+                    0.0f);
                 const float *accept_thresholds =
                     request.accept_thresholds.data();
                 const float *residual_thresholds =

@@ -81,7 +81,6 @@ namespace llaminar2
             int layer,
             int first_seq_idx,
             int request_count,
-            int max_kv_len,
             ITensor **out_k,
             ITensor **out_v,
             void *gpu_stream) override;
@@ -90,7 +89,6 @@ namespace llaminar2
             int layer,
             int first_seq_idx,
             int request_count,
-            int max_kv_len,
             ActivationPrecision target,
             ITensor **out_k,
             ITensor **out_v,

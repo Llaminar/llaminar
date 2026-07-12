@@ -367,12 +367,6 @@ namespace llaminar2
         std::vector<size_t> barrier_watch_sample_offsets_;
         std::vector<bool> barrier_watch_checksum_valid_;
 
-        /// True after the first barrier has completed successfully.
-        /// Used for adaptive timeout: first barrier uses a longer timeout to
-        /// accommodate GPU workspace allocation (hipMalloc) which can take 30-60s
-        /// and is serialized across devices in the same process.
-        std::atomic<bool> first_barrier_completed_{false};
-
         // =====================================================================
         // NCCL Telemetry
         // =====================================================================
@@ -393,7 +387,6 @@ namespace llaminar2
         std::condition_variable contract_trace_cv_;
         std::vector<uint64_t> onstream_sequence_by_slot_;
         std::unordered_map<uint64_t, OnStreamCollectiveContract> onstream_contracts_;
-        std::atomic<bool> first_onstream_collective_completed_{false};
 
         // Eager homogeneous GPU allreduce rendezvous. Unlike the graph-capture
         // path, eager execution launches one grouped NCCL/RCCL collective over

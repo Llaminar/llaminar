@@ -1244,6 +1244,7 @@ public:
             ready_token,
             1,
             output_tokens.data(),
+            static_cast<int>(output_tokens.size()),
             meta.data());
         if (meta[kSpecBatchMetaOk] == 0)
             return false;
@@ -1767,6 +1768,7 @@ public:
                 bonus_token,
                 has_bonus,
                 output_tokens.data(),
+                static_cast<int>(output_tokens.size()),
                 meta.data());
             if (meta[kSpecBatchMetaOk] == 0)
                 return false;
@@ -7212,11 +7214,14 @@ TEST_F(Test__RankOrchestrator,
 
     auto tp_ctx = makeTPContextForRunnerCount(2);
     auto *tp_ctx_ptr = tp_ctx.get();
+    auto rank_config = makeRankConfigForRunnerCount(2);
+    rank_config.mtp.enabled = true;
+    rank_config.mtp.draft_tokens = 2;
     auto orchestrator = RankOrchestrator::createForTest(
         llaminar2::test::MockModelContext::createMinimal(),
         std::move(runners),
         std::move(tp_ctx),
-        makeRankConfigForRunnerCount(2));
+        std::move(rank_config));
 
     int32_t host_shadow = -1;
     ASSERT_TRUE(orchestrator->sampleGreedyFromMainLogitsToDeviceTargetSlot(
@@ -7259,11 +7264,14 @@ TEST_F(Test__RankOrchestrator, MultiChildGreedyMainTargetSlotStagesCrossShardWin
     runners.push_back(std::move(runner0));
     runners.push_back(std::move(runner1));
 
+    auto rank_config = makeRankConfigForRunnerCount(2);
+    rank_config.mtp.enabled = true;
+    rank_config.mtp.draft_tokens = 2;
     auto orchestrator = RankOrchestrator::createForTest(
         llaminar2::test::MockModelContext::createMinimal(),
         std::move(runners),
         makeTPContextForRunnerCount(2),
-        makeRankConfigForRunnerCount(2));
+        std::move(rank_config));
 
     int32_t host_token = -1;
     EXPECT_TRUE(orchestrator->sampleGreedyFromMainLogitsToDeviceTargetSlot(
