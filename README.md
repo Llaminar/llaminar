@@ -56,11 +56,19 @@ Open vscode in the devcontainer, and run the Build Integration / Build Release v
 
 ### Running Llaminar
 
-**Important**: Ensure your installed AMD DKMS and Nvidia drivers are compatible with Llaminar's CUDA and ROCm versions.
+#### OS, Driver, Framework versions
 
-Serve an OpenAI-compatible HTTP API endpoint from a supported GGUF model.
+Llaminar is built and tested with the following configuration:
 
-Set these once before running the one-liners below:
+* Ubuntu 24.04.1, kernel `6.14.0-37-generic`
+* CUDA 13.0, driver 580.126.09, package `linux-modules-nvidia-580-open-6.14.0-37-generic`
+* ROCm 7.1.1, driver 6.16.6, `amdgpu-dkms` package version `6.16.6.30200100-2255209.24.04`
+
+#### Commands
+
+The following commands will serve an OpenAI-compatible HTTP API endpoint from a supported GGUF model.
+
+Set this boilerplate once before running the one-liners below:
 
 ```bash
 # Choose a model folder and download some GGUFs:
