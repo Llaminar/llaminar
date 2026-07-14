@@ -22,7 +22,7 @@ Llaminar supports:
 
 ## Supported Models
 
-Llaminar supports the following model architectures initially:
+Llaminar inferences the standard GGUF files you'll find on Huggingface, and supports the following model architectures initially:
 
 * Qwen 2.5 (dense)
 * Qwen 3 (dense)
