@@ -198,7 +198,8 @@ namespace llaminar2
                                          << " bytes=" << raw_bytes);
     }
 
-    bool WeightVRAMPool::allocate(IBackend *backend, int device_id, int staging_slot_count)
+    bool WeightVRAMPool::allocate(IBackend *backend, int device_id, int staging_slot_count,
+                                  size_t staging_slot_bytes)
     {
         if (allocated_)
         {
@@ -221,6 +222,10 @@ namespace llaminar2
             for (const auto &[name, plan] : plans_)
             {
                 max_staging = std::max(max_staging, plan.staging_bytes);
+            }
+            if (staging_slot_bytes > 0)
+            {
+                max_staging = std::min(max_staging, staging_slot_bytes);
             }
             staging_region_bytes_ = max_staging * staging_slot_count;
         }

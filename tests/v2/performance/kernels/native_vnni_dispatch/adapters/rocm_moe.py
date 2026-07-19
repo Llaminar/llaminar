@@ -14,11 +14,13 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping
 
 from .evidence import (
     native_double_digest as timing_sample_digest,
+    raw_corpus_id,
     verify_aggregate_timing,
 )
 from ..candidate_registry import rocm_moe_grouped_prefill_registry
@@ -111,7 +113,7 @@ def read_rocm_moe_timing_sidecars(
 ) -> dict[RawTimingKey, tuple[float, ...]]:
     """Read, order, and validate every raw HIP event timing sample."""
 
-    indexed: dict[RawTimingKey, dict[int, float]] = {}
+    indexed: dict[RawTimingKey, list[float]] = {}
     replays: dict[RawTimingKey, int] = {}
     for path in (Path(item) for item in paths):
         with path.open(newline="", encoding="utf-8") as handle:
@@ -128,9 +130,11 @@ def read_rocm_moe_timing_sidecars(
                     raise ValueError(f"{path}:{row_number}: wrong timing sidecar surface")
                 key = _timing_key(raw)
                 sample_index = int(raw["sample_index"])
-                if sample_index < 0 or sample_index in indexed.setdefault(key, {}):
+                samples = indexed.setdefault(key, [])
+                if sample_index != len(samples):
                     raise ValueError(
-                        f"{path}:{row_number}: duplicate/negative sample index {sample_index}"
+                        f"{path}:{row_number}: timing sample index {sample_index} "
+                        f"is not the next contiguous index {len(samples)}"
                     )
                 replay_count = int(raw["timed_replays"])
                 if replay_count <= 0:
@@ -149,14 +153,11 @@ def read_rocm_moe_timing_sidecars(
                     raise ValueError(
                         f"{path}:{row_number}: readable and exact latency fields disagree"
                     )
-                indexed[key][sample_index] = latency_ms
+                samples.append(latency_ms)
 
     result = {}
     for key, samples in indexed.items():
-        expected = list(range(len(samples)))
-        if sorted(samples) != expected:
-            raise ValueError(f"timing sidecar has non-contiguous samples for {key}")
-        values = tuple(samples[index] for index in expected)
+        values = tuple(samples)
         if tuple(sorted(values)) != values:
             raise ValueError(f"timing sidecar samples are not in trainer-sorted order for {key}")
         result[key] = values
@@ -230,18 +231,6 @@ class ROCmMoEAdapterContext:
                 )
 
 
-def raw_corpus_id(paths: Iterable[Path]) -> str:
-    """Hash ordered raw CSV shard bytes for adapter-level corpus provenance."""
-
-    digest = hashlib.sha256()
-    for path in sorted(Path(item) for item in paths):
-        digest.update(str(path).encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return "sha256:" + digest.hexdigest()
-
-
 def _projection_vector(role: str, n: int) -> tuple[int, ...]:
     """Model gate/up as its actual homogeneous two-projection bundle."""
 
@@ -264,19 +253,38 @@ def _shape_group(row: Mapping[str, str], role: str) -> str:
     )
 
 
-def _trial_set_hash(row: Mapping[str, str], projection_vector: tuple[int, ...]) -> str:
-    """Identify the deterministic hidden/routing/weight fixture used by C++."""
+@lru_cache(maxsize=None)
+def _trial_set_hash_values(
+    source_format: str,
+    shape: str,
+    m: int,
+    projection_vector: tuple[int, ...],
+    k: int,
+) -> str:
+    """Hash one reused grouped-MoE trial identity exactly once."""
 
     return _sha256({
         "version": ROCM_MOE_TRIAL_SET_VERSION,
-        "source_format": row["source_format"].strip().upper(),
-        "shape": row["shape"],
-        "m": int(row["m"]),
+        "source_format": source_format,
+        "shape": shape,
+        "m": m,
         "projection_n_vector": projection_vector,
-        "k": int(row["k"]),
+        "k": k,
         "top_k": 8,
         "num_experts": 8,
     })
+
+
+def _trial_set_hash(row: Mapping[str, str], projection_vector: tuple[int, ...]) -> str:
+    """Identify the deterministic hidden/routing/weight fixture used by C++."""
+
+    return _trial_set_hash_values(
+        row["source_format"].strip().upper(),
+        row["shape"],
+        int(row["m"]),
+        projection_vector,
+        int(row["k"]),
+    )
 
 
 def adapt_rocm_moe_row(

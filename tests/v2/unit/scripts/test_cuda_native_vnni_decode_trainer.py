@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Regression tests for the common-backed CUDA decode policy analyzer."""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+KERNEL_PERF_ROOT = REPO_ROOT / "tests" / "v2" / "performance" / "kernels"
+if str(KERNEL_PERF_ROOT) not in sys.path:
+    sys.path.insert(0, str(KERNEL_PERF_ROOT))
+
+from native_vnni_dispatch.corpus import GenericDomain  # noqa: E402
+from native_vnni_dispatch.measurement_plan import (  # noqa: E402
+    load_gpu_measurement_plan,
+)
+from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.schema import (  # noqa: E402
+    AspectBucket,
+    Backend,
+    ExecutionMode,
+    SemanticContract,
+)
+from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    FeatureAxis,
+    FeaturePredicate,
+    FeatureThreshold,
+    GenericDispatchRule,
+)
+from native_vnni_dispatch.shape_manifest import load_shape_manifest  # noqa: E402
+ANALYZER = (
+    REPO_ROOT
+    / "tests"
+    / "v2"
+    / "performance"
+    / "kernels"
+    / "cuda"
+    / "gemm"
+    / "analyze_cuda_native_vnni_decode_trainer.py"
+)
+TRAINER_SOURCE = (
+    REPO_ROOT
+    / "tests"
+    / "v2"
+    / "performance"
+    / "kernels"
+    / "cuda"
+    / "gemm"
+    / "Perf__CUDANativeVNNIDecodeTrainer.cpp"
+)
+RUNTIME_SOURCE = (
+    REPO_ROOT
+    / "src"
+    / "v2"
+    / "kernels"
+    / "cuda"
+    / "gemm"
+    / "CUDANativeVNNIGemvTuned.cu"
+)
+DEBUG_ENV_SOURCE = REPO_ROOT / "src" / "v2" / "utils" / "DebugEnv.h"
+
+
+class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
+    """Exercise exact-KB emission and serial-M1 verifier inheritance."""
+
+    @staticmethod
+    def row(
+        candidate: str,
+        execution_mode: str,
+        median_us: float,
+        *,
+        m: int = 1,
+        serial_candidate: str | None = None,
+    ) -> dict[str, object]:
+        """Construct one complete Q8_K production-route observation."""
+
+        verifier = m > 1
+        serial = serial_candidate or candidate
+        serial_kb = int(serial.rsplit("kb", 1)[1])
+        serial_tile = int(serial.split(".tn", 1)[1].split(".", 1)[0])
+        serial_cpt = int(serial.split(".cpt", 1)[1].split(".", 1)[0])
+        if verifier:
+            requested = "cuda.nvnni.decode.verifier.inherit_serial_m1"
+            family = "inherit_serial_m1"
+            tile_n = 0
+            cpt = 0
+            exact_kb = 0
+            force_two_phase = 0
+            observed = requested
+        else:
+            requested = candidate
+            family = "kpar"
+            tile_n = int(candidate.split(".tn", 1)[1].split(".", 1)[0])
+            cpt = int(candidate.split(".cpt", 1)[1].split(".", 1)[0])
+            exact_kb = int(candidate.rsplit("kb", 1)[1])
+            force_two_phase = 1
+            observed = candidate
+        return {
+            "backend": "cuda",
+            "phase": "decode",
+            "source_format": "Q8_K",
+            "source_codebook": 21,
+            "execution_codebook": 19,
+            "shape": "35BMoE_Expert_GateUp",
+            "execution_mode": execution_mode,
+            "m": m,
+            "n": 512,
+            "k": 2048,
+            "candidate_id": requested,
+            "measurement_protocol": "sample_interleaved_v1",
+            "family": family,
+            "tile_n": tile_n,
+            "cpt": cpt,
+            "target_waves": 0,
+            "mkg": 0,
+            "max_kb": 0,
+            "exact_kb": exact_kb,
+            "force_two_phase": force_two_phase,
+            "weight_bytes": 1114112,
+            "warmup_count": 2,
+            "sample_count": 3,
+            "min_us": median_us,
+            "median_us": median_us,
+            "p95_us": median_us,
+            "mad_us": 0,
+            "cv": 0.01,
+            "effective_bandwidth_gbs": 30,
+            "bit_mismatches": 0,
+            "first_bit_mismatch": 0,
+            "repeat_byte_mismatches": 0,
+            "max_abs": 0,
+            "relative_l2": 0,
+            "cosine": 1,
+            "symmetric_kld": 0,
+            "grouped_output_digest": "sha256:equal",
+            "serial_output_digest": "sha256:equal",
+            "timing_sample_digest": "sha256:timing",
+            "supported": 1,
+            "graph_capture_ok": 1,
+            "workspace_ok": 1,
+            "explicit_stream_ok": 1,
+            "route_counter_ok": 1,
+            "observed_candidate_id": observed,
+            "observed_path": "kpar",
+            "observed_tile_n": serial_tile if verifier else tile_n,
+            "observed_cpt": serial_cpt if verifier else cpt,
+            "observed_effective_kb": serial_kb if verifier else exact_kb,
+            "serial_m1_candidate_id": serial,
+            "serial_route_counter_ok": 1,
+            "numerical_correctness": 1,
+            "correctness_pass": 1,
+            "is_winner": 0,
+        }
+
+    def run_analyzer(
+        self,
+        rows: list[dict[str, object]],
+        *extra: str,
+    ) -> tuple[subprocess.CompletedProcess[str], str, list[dict[str, str]]]:
+        """Run the analyzer against a temporary strong-evidence corpus."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_csv = root / "trainer.csv"
+            output = root / "generated.inc"
+            summary = root / "summary.csv"
+            common = root / "common.csv"
+            prepared_rows = [dict(row) for row in rows]
+            grouped: dict[tuple[object, ...], list[dict[str, object]]] = {}
+            for row in prepared_rows:
+                key = tuple(row[field] for field in (
+                    "source_format",
+                    "source_codebook",
+                    "execution_codebook",
+                    "shape",
+                    "execution_mode",
+                    "m",
+                    "n",
+                    "k",
+                ))
+                grouped.setdefault(key, []).append(row)
+            for group_index, group_rows in enumerate(grouped.values(), start=1):
+                for measurement_order, row in enumerate(group_rows):
+                    row.setdefault("measurement_order", measurement_order)
+                    row.setdefault("measurement_order_seed", 100000 + group_index)
+            with input_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=tuple(prepared_rows[0])
+                )
+                writer.writeheader()
+                writer.writerows(prepared_rows)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ANALYZER),
+                    str(input_csv),
+                    "--output",
+                    str(output),
+                    "--summary",
+                    str(summary),
+                    "--common-observations",
+                    str(common),
+                    *extra,
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            generated = output.read_text(encoding="utf-8") if output.exists() else ""
+            summary_rows = []
+            if summary.exists():
+                with summary.open(newline="", encoding="utf-8") as handle:
+                    summary_rows = list(csv.DictReader(handle))
+            if result.returncode == 0:
+                self.assertTrue(common.exists())
+                with common.open(newline="", encoding="utf-8") as handle:
+                    self.assertEqual(len(list(csv.DictReader(handle))), len(rows))
+            return result, generated, summary_rows
+
+    def test_opposing_modes_emit_independent_exact_kpart_winners(self) -> None:
+        """The generated ABI must preserve each mode's economical exact KB."""
+
+        kb8 = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb8"
+        kb32 = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        rows = [
+            self.row(kb8, "eager", 10.0),
+            self.row(kb8, "graph_captured", 100.0),
+            self.row(kb32, "eager", 20.0),
+            self.row(kb32, "graph_captured", 20.0),
+            self.row(kb32, "eager", 30.0, m=2, serial_candidate=kb32),
+            self.row(
+                kb32,
+                "graph_captured",
+                31.0,
+                m=2,
+                serial_candidate=kb32,
+            ),
+        ]
+
+        result, generated, summary = self.run_analyzer(rows)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("common alias-robust, mode-specific exact oracle", generated)
+        self.assertIn("{256, 4, 0, 0, 0, 1, 8}", generated)
+        self.assertIn("{256, 4, 0, 0, 0, 1, 32}", generated)
+        self.assertNotIn("M=2 512x2048", generated)
+        self.assertEqual(len(summary), 2)
+        by_mode = {row["execution_mode"]: row for row in summary}
+        self.assertEqual(by_mode["eager"]["candidate_id"], kb8)
+        self.assertEqual(by_mode["eager"]["exact_kb"], "8")
+        self.assertEqual(by_mode["graph_captured"]["candidate_id"], kb32)
+        self.assertEqual(by_mode["graph_captured"]["exact_kb"], "32")
+        self.assertEqual(
+            by_mode["eager"]["certified_verifier_key_count"], "2"
+        )
+
+    def test_explicit_fast_candidate_is_rejected_for_verifier_depth(self) -> None:
+        """Verifier rows may certify inheritance but cannot publish a Fast route."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        row = self.row(candidate, "eager", 30.0, m=2)
+        row.update({
+            "candidate_id": candidate,
+            "family": "kpar",
+            "tile_n": 256,
+            "cpt": 4,
+            "exact_kb": 32,
+            "force_two_phase": 1,
+            "observed_candidate_id": candidate,
+        })
+
+        result, _, _ = self.run_analyzer([row])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not support Verifier", result.stderr)
+
+    def test_require_complete_rejects_partial_matrix(self) -> None:
+        """Promotion cannot silently omit aliases, modes, candidates, or depths."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        result, _, _ = self.run_analyzer(
+            [self.row(candidate, "eager", 20.0)],
+            "--require-complete",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("canonical alias/mode coverage is incomplete", result.stderr)
+
+    def test_exact_m1_stage_has_no_uncertified_or_default_route(self) -> None:
+        """Staging emits exact evidence only and leaves misses as hard misses."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        rows = [
+            self.row(candidate, "eager", 20.0),
+            self.row(candidate, "graph_captured", 21.0),
+        ]
+        result, generated, _ = self.run_analyzer(rows, "--exact-only")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("generic policy intentionally absent", generated)
+        self.assertIn("Uncovered runtime keys return false", generated)
+        self.assertNotIn("const float aspect_ratio", generated)
+        self.assertNotIn("classifyShapeGenerated", generated)
+        self.assertNotIn("selectGeneratedTuning", generated)
+
+    def test_fast_m1_completeness_gate_rejects_partial_surface(self) -> None:
+        """The stage gate is strict without requiring causally later M>1 rows."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        result, _, _ = self.run_analyzer(
+            [self.row(candidate, "eager", 20.0)],
+            "--exact-only",
+            "--require-fast-m1-complete",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("canonical alias/mode coverage is incomplete", result.stderr)
+
+    def test_legacy_weak_csv_is_rejected(self) -> None:
+        """A missing exact-KB or repeat-stability proof invalidates the corpus."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        row = self.row(candidate, "eager", 20.0)
+        del row["repeat_byte_mismatches"]
+
+        result, _, _ = self.run_analyzer([row])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing strong CUDA decode columns", result.stderr)
+
+    def test_duplicate_measurement_order_is_rejected(self) -> None:
+        """Every cell must expose one auditable randomized permutation."""
+
+        kb8 = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb8"
+        kb32 = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        first = self.row(kb8, "eager", 10.0)
+        second = self.row(kb32, "eager", 11.0)
+        for row in (first, second):
+            row["measurement_order"] = 0
+            row["measurement_order_seed"] = 123456789
+
+        result, _, _ = self.run_analyzer([first, second])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not one contiguous permutation", result.stderr)
+
+    def test_cpp_trainer_randomizes_and_publishes_candidate_order(self) -> None:
+        """Every broad timing round must independently permute candidates."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("measurementOrderSeed", source)
+        self.assertIn("std::mt19937_64 order_engine(order_seed)", source)
+        self.assertIn("std::shuffle(", source)
+        self.assertIn("measurement_order_seed", source)
+        self.assertIn("runCandidatesInterleaved", source)
+        self.assertIn("sample_interleaved_v1", source)
+        self.assertIn("sample_measurement_orders", source)
+        self.assertIn("sample_order_seeds", source)
+        self.assertIn("interleaved_timed_launch", source)
+
+    def test_cpp_trainer_has_a_distinct_interleaved_confirmation_mode(self) -> None:
+        """Frozen timing must retain identity and balance the first-launch role."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_CSV", source)
+        self.assertIn(
+            "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST",
+            source,
+        )
+        self.assertIn("runPairedConfirmation", source)
+        self.assertIn("pairedOrderSeed", source)
+        self.assertIn("pairedRequestSeed", source)
+        self.assertIn("first_candidate_offset", source)
+        self.assertIn(
+            "(static_cast<size_t>(sample) + first_candidate_offset) % 2",
+            source,
+        )
+        self.assertIn("within_pair_order", source)
+        self.assertIn("cuda-paired-interleaved-v2", source)
+        self.assertIn("request_id", source)
+        self.assertIn("static_cast<size_t>(config.samples)", source)
+        self.assertNotIn("CandidateEvidence runCandidate(", source)
+        self.assertNotIn("PAIRED_SELECTED", source)
+        self.assertNotIn("PAIRED_EXACT", source)
+
+    def test_analyzer_threads_paired_development_evidence_into_common_compiler(self) -> None:
+        """Final CUDA emission must use the same tournament as development CV."""
+
+        source = ANALYZER.read_text(encoding="utf-8")
+        self.assertIn("--paired-development-csv", source)
+        self.assertIn("read_paired_confirmation_csv", source)
+        self.assertIn("paired_timing_comparisons", source)
+        self.assertIn(
+            "paired_development_comparisons=paired_development_comparisons",
+            source,
+        )
+
+    def test_cpp_oracle_compares_every_grouped_verifier_row(self) -> None:
+        """Prevent regression to certifying only the first row of runtime M."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            "static_cast<size_t>(m) * static_cast<size_t>(n)",
+            source,
+        )
+        self.assertNotIn(
+            "repeated_output, serial.output, static_cast<size_t>(n)",
+            source,
+        )
+
+    def test_explicit_exact_kb_can_exercise_trailing_empty_partitions(self) -> None:
+        """Pinned diagnostics retain dominated KB schedules omitted by training."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("exactKBlocksForSweep(config, k_groups)", source)
+        self.assertIn("if (config.candidate_ids.empty())", source)
+        self.assertIn("return economicalExactKBlocks(k_groups);", source)
+        self.assertIn("for (int kb = 1; kb <= maximum; ++kb)", source)
+
+    def test_unseen_m1_shapes_use_only_an_explicit_trainer_oracle(self) -> None:
+        """Policy expansion must not require or weaken production miss behavior."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("diagnosticM1OracleCandidate", source)
+        self.assertIn(
+            "cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb1",
+            source,
+        )
+        self.assertIn(
+            "m == 1 ? &diagnosticM1OracleCandidate() : nullptr",
+            source,
+        )
+        self.assertIn("queryGraphCapturedExecution", runtime)
+        self.assertIn(
+            "graph_captured, 1, N, K, shape, tuning",
+            runtime,
+        )
+        self.assertNotIn("diagnosticM1OracleCandidate", runtime)
+
+    def test_captured_verifier_uses_a_captured_serial_m1_oracle(self) -> None:
+        """Captured grouped evidence may not borrow an eager serial-M1 route."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("ExecutionMode mode", source)
+        self.assertIn("serial_graph_primer", source)
+        self.assertIn("serial_graph_launch", source)
+        self.assertIn(
+            'tag("execution_mode") != executionModeName(mode)',
+            source,
+        )
+        self.assertIn('{"execution_mode", graph_captured', runtime)
+
+    def test_production_runtime_has_no_default_or_rowpar_override(self) -> None:
+        """The learned boolean resolver is authoritative for M1 and verifier."""
+
+        runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
+        debug_env = DEBUG_ENV_SOURCE.read_text(encoding="utf-8")
+        self.assertGreaterEqual(runtime.count("selectGeneratedDispatch<CB>("), 2)
+        self.assertNotIn("classifyShapeGenerated<CB>", runtime)
+        self.assertNotIn("selectGeneratedTuning<CB>", runtime)
+        self.assertNotIn("isRowParEnabled", runtime)
+        self.assertNotIn("LLAMINAR_CUDA_GEMV_ROWPAR", debug_env)
+        self.assertNotIn("cuda_gemv_rowpar", debug_env)
+
+    def test_final_compile_accepts_distinct_m1_and_verifier_phases(self) -> None:
+        """The causal transaction keeps independently collected phases explicit."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        m1_rows = [
+            self.row(candidate, "eager", 20.0),
+            self.row(candidate, "graph_captured", 21.0),
+        ]
+        verifier_rows = [
+            self.row(candidate, "eager", 30.0, m=2),
+            self.row(candidate, "graph_captured", 31.0, m=2),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            m1_csv = root / "m1.csv"
+            verifier_csv = root / "verifier.csv"
+            certified_include = root / "certified-m1.inc"
+            certified_policy = root / "certified-m1.json"
+            output = root / "generated.inc"
+            summary = root / "summary.csv"
+            for path, rows in ((m1_csv, m1_rows), (verifier_csv, verifier_rows)):
+                for seed_offset, row in enumerate(rows, start=1):
+                    row["measurement_order"] = 0
+                    row["measurement_order_seed"] = 200000 + seed_offset
+                with path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+            def digest(mapping: dict[str, object]) -> str:
+                encoded = json.dumps(
+                    mapping,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+            manifest = load_shape_manifest()
+            manifest_digest = manifest.digest()
+            measurement_plan_digest = load_gpu_measurement_plan(
+                manifest=manifest,
+            ).digest(manifest)
+            generic_mapping = {
+                "policy_abi": 3,
+                "learner_version": "test-learner",
+                "feature_schema_version": "test-features",
+                "generic_rules": [],
+                "unpromoted_domains": [],
+                "cross_validation": [],
+            }
+            generic_digest = digest(generic_mapping)
+            policy = {
+                **generic_mapping,
+                "exact_entries": [],
+                "metadata": {
+                    "shape_manifest_digest": manifest_digest,
+                    "measurement_plan_digest": measurement_plan_digest,
+                    "frozen_generic_policy_digest": generic_digest,
+                    "development_corpus_digest": "sha256:development",
+                    "sealed_corpus_digest": "sha256:sealed",
+                },
+            }
+            certified_policy.write_text(
+                json.dumps({
+                    "state": "sealed_certified",
+                    "policy": policy,
+                    "policy_digest": digest(policy),
+                    "frozen_generic_policy_digest": generic_digest,
+                    "certification": {
+                        "sealed_cell_count": 1,
+                        "out_of_scope_cell_count": 0,
+                        "required_cell_count": 1,
+                        "covered_cell_count": 1,
+                        "coverage": 1.0,
+                        "verifier_bitwise_failures": 0,
+                        "unexercised_rule_count": 0,
+                        "unpromoted_domain_count": 0,
+                        "required_domain_count": 1,
+                        "passing_domain_count": 1,
+                        "passing_domain_fraction": 1.0,
+                        "domain_promotion_quota_satisfied": True,
+                        "max_observed_regret": 0.01,
+                        "p95_observed_regret": 0.01,
+                        "p95_simultaneous_95pct_upper_regret": 0.02,
+                        "domain_results": [{
+                            "domain": {"test_domain": "cuda-fast-m1"},
+                            "sealed_cell_count": 1,
+                            "p95_observed_regret": 0.01,
+                            "p95_simultaneous_95pct_upper_regret": 0.02,
+                            "passes_p95_budget": True,
+                        }],
+                        "cells": [{}],
+                    },
+                }, sort_keys=True),
+                encoding="utf-8",
+            )
+            certified_include.write_text(
+                "\n".join((
+                    f"// Common policy digest: {digest(policy)}",
+                    f"// Shape manifest digest: {manifest_digest}",
+                    f"// Measurement plan digest: {measurement_plan_digest}",
+                    f"// Frozen generic policy digest: {generic_digest}",
+                    "// Sealed generic certificate: coverage=1/1",
+                    "// immutable staged M1 test include",
+                    "",
+                )),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ANALYZER),
+                    "--m1-input",
+                    str(m1_csv),
+                    "--verifier-input",
+                    str(verifier_csv),
+                    "--m1-build-id",
+                    "sha256:m1-build",
+                    "--build-id",
+                    "sha256:verifier-build",
+                    "--m1-baseline-policy-hash",
+                    "sha256:old-m1",
+                    "--serial-m1-policy-hash",
+                    "sha256:staged-m1",
+                    "--output",
+                    str(output),
+                    "--summary",
+                    str(summary),
+                    "--certified-m1-include",
+                    str(certified_include),
+                    "--certified-m1-policy-json",
+                    str(certified_policy),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_bytes(), certified_include.read_bytes())
+            with summary.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["certified_verifier_key_count"], "2")
+
+    def test_sealed_generic_promotion_is_explicit_and_production_only(self) -> None:
+        """Development-only rules cannot masquerade as an installable table."""
+
+        candidate = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        result, _, _ = self.run_analyzer(
+            [self.row(candidate, "eager", 20.0)],
+            "--certify-generic",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires --profile production", result.stderr)
+
+        source = ANALYZER.read_text(encoding="utf-8")
+        self.assertIn("def freeze_fast_policy(", source)
+        self.assertIn("def certify_fast_policy(", source)
+        self.assertIn("validate_frozen_policy_file", source)
+        self.assertIn("validate_certified_m1_artifacts", source)
+        self.assertNotIn("def compile_fast_policy(", source)
+        self.assertNotIn("compile_policy(", source)
+        self.assertNotIn("split.partition(fast)", source)
+        self.assertIn("shape.exact_overlay", source)
+        self.assertIn("filtering exact overlays changed", source)
+        self.assertIn('conditions.append(f"k / 32 >=', source)
+        self.assertIn("resolveGeneratedTargetBlocksKBlocks", source)
+        self.assertIn("resolveGeneratedCanonicalTargetBlocksKBlocks", source)
+        self.assertIn("resolveGeneratedBlocksPerPartitionKBlocks", source)
+        self.assertIn("project_cuda_shape_resolved_candidates", source)
+        self.assertIn("--freeze-generic", source)
+        self.assertIn("--frozen-policy-json", source)
+        self.assertIn("--certified-m1-policy-json", source)
+        self.assertIn("--policy-json", source)
+
+    def test_formula_tree_emitter_produces_compilable_mode_aware_cpp(self) -> None:
+        """A rational tree leaf must resolve a concrete exact KB in C++."""
+
+        spec = importlib.util.spec_from_file_location(
+            "cuda_native_vnni_analyzer_test_module",
+            ANALYZER,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        domain = GenericDomain(
+            backend=Backend.CUDA,
+            architecture_class="sm86-test",
+            semantic_contract=SemanticContract.FAST,
+            operation_kind="NativeVNNIDecodeProjection",
+            bundle_signature="single",
+            prepared_family_id="NativeVNNI_cuda_CB0",
+            packing_abi="native-vnni-cuda-cb0-v1",
+            runtime_codebook_id=0,
+            execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            m=1,
+            aspect_bucket=AspectBucket.BALANCED,
+        )
+        rule = GenericDispatchRule(
+            domain=domain,
+            predicates=(
+                FeaturePredicate(
+                    FeatureThreshold(FeatureAxis.ASPECT_RATIO, 5, 4),
+                    True,
+                ),
+                FeaturePredicate(
+                    FeatureThreshold(FeatureAxis.N_TILES_64, 15, 1),
+                    True,
+                ),
+                FeaturePredicate(
+                    FeatureThreshold(
+                        FeatureAxis.K_GROUPS_PER_N_TILE_64,
+                        3,
+                        2,
+                    ),
+                    False,
+                ),
+            ),
+            candidate_id=(
+                "cuda.nvnni.decode.fast_m1.kpar_formula."
+                "tn128.cpt1.tb328.mkg1"
+            ),
+            arithmetic_fingerprint="sha256:test-formula",
+            development_shape_groups=("shape-a", "shape-b"),
+            development_max_regret=0.01,
+            development_p95_regret=0.01,
+            development_mean_regret=0.01,
+        )
+        generated = module.generate_include(
+            [],
+            [rule],
+            corpus_digest="sha256:test-corpus",
+            registry_digest="sha256:test-registry",
+            profile=MeasurementProfile.QUICK,
+        )
+        source = "\n".join((
+            "enum class NativeGemvShape { WIDE, KPAR, DIRECT, ROWPAR };",
+            generated,
+            "int main() {",
+            "  NativeGemvShape shape{};",
+            "  GeneratedDispatchTuning tuning{};",
+            "  return selectGeneratedDispatch<0>(true, 1, 900, 1024, shape, tuning) ? 0 : 1;",
+            "}",
+        ))
+        result = subprocess.run(
+            ["g++", "-std=c++20", "-x", "c++", "-fsyntax-only", "-"],
+            input=source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

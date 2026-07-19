@@ -121,6 +121,11 @@ namespace
         // Qwen3.5/Qwen3.6 MoE expert FFN shapes.
         {"35BMoE_Expert_GateUp", "MoE", 512, 2048},
         {"35BMoE_Expert_Down", "MoE", 2048, 512},
+        // Qwen3.6 35B-A3B hybrid GDN projections. These are model-width
+        // prefill GEMMs and must receive direct ROCm measurements alongside
+        // the routed expert matrices and their CUDA/CPU counterparts.
+        {"Qwen36MoE_GDN_QKVProjection", "MoE_GDN", 8192, 2048},
+        {"Qwen36MoE_GDN_ZProjection", "MoE_GDN", 4096, 2048},
         // Qwen2.5-0.5B (hidden=896, intermediate=4864)
         {"0.5B_AttnQKV", "Attention", 2688, 896},
         {"0.5B_AttnOut", "Attention", 896, 896},

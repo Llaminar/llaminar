@@ -54,6 +54,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -262,8 +263,17 @@ namespace
     /// Sequence lengths to benchmark (typical prefill sizes)
     static const std::vector<int> M_VALUES = {32, 64, 128, 256};
 
-    /// MTP verifier batch sizes exercised by the Phase 13.5 small-M route.
-    static const std::vector<int> MTP_SMALL_M_VALUES = {2, 3, 4};
+    /**
+     * @brief Canonical runtime-M verifier rows exercised by this ROCm suite.
+     *
+     * Keep this inventory sourced from the production graph defaults. A local
+     * `{2, 3, 4}` list previously let deeper speculative groups escape the
+     * all-format ROCm performance and correctness surface even though the
+     * learned dispatch trainer already certified every row through sixteen.
+     */
+    static const std::vector<int> MTP_SMALL_M_VALUES(
+        kDefaultNativeVNNISmallMRows.begin(),
+        kDefaultNativeVNNISmallMRows.end());
 
     // Qwen2.5-0.5B:  hidden=896,  intermediate=4864
     // Qwen2.5-3B:    hidden=2048, intermediate=11008
@@ -287,7 +297,8 @@ namespace
     };
 
     static const std::vector<GEMMShape> MTP_SMALL_M_SHAPES = {
-        {"Qwen36_MTP_HiddenProjection", 5120, 5120},
+        {"Qwen36Dense_MTP_HiddenProjection", 5120, 10240},
+        {"Qwen36MoE_MTP_HiddenProjection", 2048, 4096},
         {"Qwen36_FFN_DownProjection", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", 10240, 5120},
         {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},

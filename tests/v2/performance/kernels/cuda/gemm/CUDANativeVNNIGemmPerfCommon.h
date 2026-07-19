@@ -100,7 +100,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
     };
 
     inline const std::vector<Shape> kQwenShapes = {
-        // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
+        // Qwen3.6-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
         // These are the production hot-path GEMMs for the grouped MoE prefill/decode
         // kernels (gate/up: N=512,K=2048; down: N=2048,K=512). The dense NativeVNNI
         // kernel exercised here shares the same per-codebook decode_groups helpers as
@@ -591,6 +591,32 @@ namespace llaminar2::test::native_vnni_gemm_perf
         if (!C_tensor->ensureOnDevice(gpu_device))
             throw std::runtime_error("ensureOnDevice C failed");
 
+        // Production CUDA GEMM stages always receive a worker-owned stream.
+        // The perf harness mirrors that contract with one nonblocking stream
+        // retained across warmup, canonical event timing, and output download.
+        // Keeping a stable stream is also required for Nsight to attribute the
+        // separately profiled launch to the same production execution path.
+        cudaStream_t execution_stream = nullptr;
+        if (cudaStreamCreateWithFlags(
+                &execution_stream, cudaStreamNonBlocking) != cudaSuccess)
+        {
+            throw std::runtime_error("cudaStreamCreateWithFlags failed");
+        }
+        kernel->setGPUStream(static_cast<void *>(execution_stream));
+        struct ExecutionStreamGuard
+        {
+            ITensorGemm *kernel = nullptr;
+            cudaStream_t stream = nullptr;
+
+            ~ExecutionStreamGuard()
+            {
+                if (kernel)
+                    kernel->setGPUStream(nullptr);
+                if (stream)
+                    (void)cudaStreamDestroy(stream);
+            }
+        } execution_stream_guard{kernel, execution_stream};
+
         std::vector<double> times_us;
         times_us.reserve(static_cast<size_t>(bench_runs));
 
@@ -604,7 +630,8 @@ namespace llaminar2::test::native_vnni_gemm_perf
 
         // Surface any sticky CUDA error from warmup before timing so that an
         // illegal access cannot silently serialize as a 0.000 us row.
-        if (cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess)
+        if (cudaError_t err = cudaStreamSynchronize(execution_stream);
+            err != cudaSuccess)
         {
             throw std::runtime_error(std::string("CUDA error after warmup: ") + cudaGetErrorString(err));
         }
@@ -618,9 +645,9 @@ namespace llaminar2::test::native_vnni_gemm_perf
                 throw std::runtime_error("cudaEventCreate failed");
             }
 
-            cudaEventRecord(start);
+            cudaEventRecord(start, execution_stream);
             const bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k);
-            cudaEventRecord(stop);
+            cudaEventRecord(stop, execution_stream);
             cudaEventSynchronize(stop);
 
             float elapsed_ms = 0.0f;

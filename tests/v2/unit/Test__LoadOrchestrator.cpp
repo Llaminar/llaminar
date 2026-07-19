@@ -156,6 +156,66 @@ namespace llaminar2
         EXPECT_TRUE(pool->isAllocated());
     }
 
+    TEST(Test__LoadOrchestrator, OversizedWeightIsSplitIntoBoundedRowChunks)
+    {
+        BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                                  /*free_bytes=*/2ULL * 1024ULL * kMiB);
+        LoadOrchestrator orch(&backend);
+        orch.addDevice(0);
+
+        constexpr int rows = 8;
+        constexpr int cols = 64;
+        constexpr size_t bytes_per_row = cols * sizeof(float);
+        constexpr size_t raw_bytes = rows * bytes_per_row;
+        std::vector<float> raw(rows * cols, 1.0f);
+
+        orch.planRawWeight(0, "chunked", rows, cols, raw_bytes);
+        ASSERT_NO_THROW(orch.allocate(/*pinned_slot_size=*/2 * bytes_per_row,
+                                      /*num_h2d_streams=*/2));
+
+        WeightJob job;
+        job.name = "chunked";
+        job.host_raw_data = raw.data();
+        job.raw_bytes = raw_bytes;
+        job.format = RepackFormat::RAW_FP;
+        job.N = rows;
+        job.K = cols;
+        job.is_asymmetric = false;
+        ASSERT_NO_THROW(orch.addWeightJob(0, job));
+
+        EXPECT_EQ(orch.pendingJobCount(0), 4u);
+        EXPECT_EQ(orch.totalPendingBytes(0), raw_bytes);
+        ASSERT_NE(orch.getPool(0), nullptr);
+        EXPECT_EQ(orch.getPool(0)->maxStagingSlotBytes(), 2 * bytes_per_row);
+    }
+
+    TEST(Test__LoadOrchestrator, RejectsBudgetSmallerThanOneRawRow)
+    {
+        BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                                  /*free_bytes=*/2ULL * 1024ULL * kMiB);
+        LoadOrchestrator orch(&backend);
+        orch.addDevice(0);
+
+        constexpr int rows = 2;
+        constexpr int cols = 256;
+        const size_t raw_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
+        std::vector<float> raw(static_cast<size_t>(rows) * cols, 1.0f);
+        orch.planRawWeight(0, "too_wide", rows, cols, raw_bytes);
+        ASSERT_NO_THROW(orch.allocate(/*pinned_slot_size=*/512,
+                                      /*num_h2d_streams=*/1));
+
+        WeightJob job;
+        job.name = "too_wide";
+        job.host_raw_data = raw.data();
+        job.raw_bytes = raw_bytes;
+        job.format = RepackFormat::RAW_FP;
+        job.N = rows;
+        job.K = cols;
+        job.is_asymmetric = false;
+
+        EXPECT_THROW(orch.addWeightJob(0, job), std::runtime_error);
+    }
+
     TEST(Test__LoadOrchestrator, AllocateRejectsPinnedStagingWithoutStreams)
     {
         LoadOrchestrator orch;

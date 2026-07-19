@@ -22,6 +22,10 @@ back to these files so the skill content stays in one place.
 - `.agents/mtp-tuning/SKILL.md`: use for vLLM-style MTP/speculative decode,
   prefix-cache interaction, strict verifier-row parity, grouped MTP kernel
   economics, depth-controller tuning, and the MTP plan/dashboard workflow.
+- `.agents/nativevnni-gemm-tuning/SKILL.md`: use for cross-backend NativeVNNI
+  GEMV/GEMM candidate tuning, all-format evidence collection, isolated
+  profiling, Git LFS corpus publication or refitting, generic-policy
+  certification, exact overlays, and generated dispatch installation.
 
 Do not copy these skill bodies into framework-specific folders. Add or update
 symlinks instead so Codex, Claude, and GitHub Copilot all read the same content.

@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -21,9 +22,11 @@
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/common/EmbedQ8Repack.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar::v2::kernels;
@@ -183,6 +186,35 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, HandleMetadataCorrect)
 
     const size_t expected_byte_size = kVocabSize * expected_blocks_per_row * 36;
     EXPECT_EQ(handle->weights->byte_size, expected_byte_size);
+}
+
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, EmbeddingUploadIsCorrectWhenStagingBudgetForcesChunks)
+{
+    struct ConfigRestore
+    {
+        int &value;
+        int original;
+        ~ConfigRestore() { value = original; }
+    } restore{mutableDebugEnv().rocm.repack_budget_mb,
+              mutableDebugEnv().rocm.repack_budget_mb};
+
+    mutableDebugEnv().rocm.repack_budget_mb = 1;
+    constexpr size_t large_vocab = 16384;
+    auto tensor = TestTensorFactory::createQ4_0Random({large_vocab, kDModel});
+    auto expected = repackEmbeddingToQ8(tensor.get(), kDModelInt);
+
+    PreparedWeightStore store(kModelId);
+    auto ref = prepareEmbedding(store, 1, tensor.get());
+    auto *handle = store.embeddingHandle(ref);
+
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(handle->weights, nullptr);
+    ASSERT_NE(handle->weights->device_data, nullptr);
+    ASSERT_GT(expected.byte_size, 1024u * 1024u);
+    ASSERT_EQ(handle->weights->byte_size, expected.byte_size);
+    EXPECT_EQ(std::memcmp(handle->weights->device_data,
+                          expected.data.data(), expected.byte_size),
+              0);
 }
 
 // ============================================================================

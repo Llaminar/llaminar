@@ -39,6 +39,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/OpenMPUtils.h"
 #include "utils/PerfStatsCollector.h"
 #include "fort.hpp"
 
@@ -131,6 +132,73 @@ namespace
         bool had_old_;
         std::string old_value_;
     };
+
+    /**
+     * @brief Physical CPU prefill route observed for one production launch.
+     *
+     * Correct values alone cannot prove that a regression exercised the
+     * economical grouped kernel under review. This record mirrors the route
+     * dimensions emitted by `gemm_native_vnni_preq()` so tests can assert the
+     * exact candidate, K partition, ISA regime, and thread topology that ran.
+     */
+    struct ObservedCPUPrefillRoute
+    {
+        bool found = false;          ///< Whether a matching launch was emitted.
+        std::string route;           ///< Physical grouped implementation name.
+        int k_tiles = 0;             ///< Number of serial-equivalent K tiles.
+        int k_tile_blocks = 0;       ///< Quantized K blocks in each tile.
+        int n_block_chunks = 0;      ///< Consecutive 64-column chunks per task.
+        uint64_t count = 0;          ///< Number of matching physical launches.
+    };
+
+    /**
+     * @brief Find the production prefill route for one exact tensor geometry.
+     *
+     * @param M Runtime input-row count.
+     * @param N Logical output-column count.
+     * @param K Logical reduction dimension.
+     * @param codebook Normalized NativeVNNI execution codebook.
+     * @return Aggregated route evidence for the matching physical launch.
+     */
+    ObservedCPUPrefillRoute findObservedCPUPrefillRoute(
+        int M,
+        int N,
+        int K,
+        uint8_t codebook)
+    {
+        ObservedCPUPrefillRoute result;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_prefill_gemm_launch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_prefill_gemm_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const auto tag = [&](const char *name) -> std::string
+            {
+                const auto iterator = record.tags.find(name);
+                return iterator == record.tags.end()
+                           ? std::string{}
+                           : iterator->second;
+            };
+            if (tag("m") != std::to_string(M) ||
+                tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) ||
+                tag("codebook") != std::to_string(codebook))
+            {
+                continue;
+            }
+            result.found = true;
+            result.route = tag("route");
+            result.k_tiles = std::stoi(tag("k_tiles"));
+            result.k_tile_blocks = std::stoi(tag("k_tile_blocks"));
+            result.n_block_chunks = std::stoi(tag("n_block_chunks"));
+            result.count += record.count;
+        }
+        return result;
+    }
 
     // =========================================================================
     // FP32 CPU reference GEMV (double-precision accumulation)
@@ -1234,6 +1302,626 @@ namespace
         EXPECT_EQ(per_projection_grouped_calls, 0u)
             << "Mixed-format CPU verifier bundles must not quietly drop to the "
                "per-projection grouped route";
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+
+    /**
+     * @test Prove production full-K prefill candidates are batch invariant.
+     *
+     * The ordinary M>1 NativeVNNI GEMM is a separate launcher from the
+     * dedicated verifier-row kernel. A learned large-M policy may vary N task
+     * granularity, but it may not introduce a K-tile accumulation boundary
+     * that changes FP32 parenthesization. This sweep therefore forces every
+     * reviewed N-block candidate while fixing one full-K tile, executes the
+     * real `multiply_tensor` path, and compares all result bytes with
+     * independent production M1 decode rows for every codebook and certified
+     * runtime M.
+     */
+    TEST_F(CPUNativeVNNIGemvTest,
+           NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode)
+    {
+        constexpr int N = 1024;
+        constexpr int K = 256;
+        constexpr std::array<int, 5> n_block_candidates = {1, 2, 4, 8, 16};
+        const auto &runtime_rows = kGroupedVerifierRuntimeRows;
+        const std::string full_k_blocks = std::to_string(K / 32);
+
+        setenv(
+            "LLAMINAR_PERF_STATS_JSON",
+            "/tmp/llaminar_cpu_native_vnni_prefill_full_k.json",
+            1);
+        PerfStatsCollector::reset();
+
+        for (size_t format_index = 0;
+             format_index < ALL_FORMATS.size();
+             ++format_index)
+        {
+            const auto &format = ALL_FORMATS[format_index];
+            SCOPED_TRACE(format.name);
+            auto weights = createWeightsForFormat(format.name, N, K);
+            ASSERT_NE(weights, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << format.name;
+            const auto &packed = kernel.packedWeights();
+
+            for (int M : runtime_rows)
+            {
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    static_cast<uint32_t>(
+                        0x6A00u + format_index * 977u + M * 131u));
+                ASSERT_NE(input, nullptr);
+
+                std::vector<float> serial(
+                    static_cast<size_t>(M) * N,
+                    0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    ASSERT_TRUE(multiplyViaTensor(
+                        kernel,
+                        input->data() + static_cast<size_t>(row) * K,
+                        serial.data() + static_cast<size_t>(row) * N,
+                        1,
+                        N,
+                        K))
+                        << format.name << " serial M1 row " << row;
+                }
+
+                const int k_blocks = packed.blocks_per_row;
+                std::vector<Q8_1Block> quantized_rows(
+                    static_cast<size_t>(M) * k_blocks);
+                quantize_activations_to_q8_1(
+                    input->data(),
+                    quantized_rows.data(),
+                    M,
+                    K,
+                    k_blocks);
+
+                /*
+                 * Exercise the actual inference entry once before forcing any
+                 * diagnostic candidate. This call must resolve through the
+                 * installed generated policy; the explicit calls below prove
+                 * the rest of the byte-exact candidate surface without making
+                 * production Auto honor debug-environment overrides.
+                 */
+                std::vector<float> auto_grouped(
+                    static_cast<size_t>(M) * N,
+                    0.0f);
+#if LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED
+                ASSERT_TRUE(multiplyViaTensor(
+                    kernel,
+                    input->data(),
+                    auto_grouped.data(),
+                    M,
+                    N,
+                    K));
+                expectBitwiseEqualFloatRows(
+                    format.name + " generated production full-K prefill M=" +
+                        std::to_string(M),
+                    auto_grouped.data(),
+                    serial.data(),
+                    auto_grouped.size(),
+                    static_cast<size_t>(N));
+#else
+                EXPECT_THROW(
+                    multiplyViaTensor(
+                        kernel,
+                        input->data(),
+                        auto_grouped.data(),
+                        M,
+                        N,
+                        K),
+                    std::runtime_error)
+                    << "A development-only generated table must fail closed";
+#endif
+
+                const auto run_candidate = [&](
+                                               int n_block_chunks,
+                                               PrefillSchedulePolicy schedule,
+                                               const char *schedule_name)
+                {
+                    SCOPED_TRACE(
+                        std::string("n_block_chunks=") +
+                        std::to_string(n_block_chunks));
+                    SCOPED_TRACE(std::string("schedule=") + schedule_name);
+                    const std::string n_block_text =
+                        std::to_string(n_block_chunks);
+                    ScopedCPUVNNIEnv force_n_blocks(
+                        "LLAMINAR_CPU_VNNI_N_BLOCK_CHUNKS",
+                        n_block_text.c_str());
+                    ScopedCPUVNNIEnv force_full_k(
+                        "LLAMINAR_CPU_VNNI_K_TILE_BLOCKS",
+                        full_k_blocks.c_str());
+
+                    std::vector<float> grouped(
+                        static_cast<size_t>(M) * N,
+                        0.0f);
+                    gemm_native_vnni_preq(
+                        packed,
+                        quantized_rows.data(),
+                        grouped.data(),
+                        M,
+                        N,
+                        ISAPath::AUTO,
+                        VerifierRowsPolicy::Pairwise,
+                        schedule);
+                    expectBitwiseEqualFloatRows(
+                        format.name + " production full-K prefill M=" +
+                            std::to_string(M) + " nbc=" +
+                            std::to_string(n_block_chunks) + " schedule=" +
+                            schedule_name,
+                        grouped.data(),
+                        serial.data(),
+                        grouped.size(),
+                        static_cast<size_t>(N));
+                };
+                run_candidate(
+                    1,
+                    PrefillSchedulePolicy::RowChunkGrid,
+                    "row_chunk_grid");
+                for (PrefillSchedulePolicy schedule : {
+                         PrefillSchedulePolicy::TwoRowNMajor,
+                         PrefillSchedulePolicy::TwoRowPairGrid})
+                {
+                    const char *schedule_name =
+                        schedule == PrefillSchedulePolicy::TwoRowPairGrid
+                            ? "two_row_pair_grid"
+                            : "two_row_n_major";
+                    for (int n_block_chunks : n_block_candidates)
+                        run_candidate(
+                            n_block_chunks, schedule, schedule_name);
+                }
+            }
+        }
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.cpu_native_vnni_prefill_gemm_launch"});
+        uint64_t launch_count = 0;
+        std::set<int> observed_n_block_chunks;
+        std::set<std::string> observed_routes;
+        for (const auto &record : records)
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_prefill_gemm_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_EQ(record.tags.at("k_tile_blocks"), full_k_blocks);
+            EXPECT_EQ(record.tags.at("k_tiles"), "1");
+            EXPECT_TRUE(
+                record.tags.at("route") == "row_chunk_grid" ||
+                record.tags.at("route") == "two_row_n_major" ||
+                record.tags.at("route") == "two_row_pair_grid");
+            EXPECT_GT(std::stoi(record.tags.at("parallel_tasks")), 0);
+            if (record.tags.at("route") == "two_row_pair_grid")
+                EXPECT_EQ(record.tags.at("row_tile"), "2");
+            observed_routes.insert(record.tags.at("route"));
+            observed_n_block_chunks.insert(
+                std::stoi(record.tags.at("n_block_chunks")));
+            launch_count += record.count;
+        }
+        EXPECT_TRUE(std::ranges::includes(
+            observed_n_block_chunks,
+            std::set<int>(n_block_candidates.begin(), n_block_candidates.end())))
+            << "The diagnostic override must still exercise every reviewed "
+               "full-K N-block candidate";
+        EXPECT_TRUE(std::ranges::includes(
+            observed_routes,
+            std::set<std::string>{
+                "row_chunk_grid", "two_row_n_major", "two_row_pair_grid"}))
+            << "The all-format sweep must execute every full-K task topology";
+        EXPECT_EQ(
+            launch_count,
+            ALL_FORMATS.size() * runtime_rows.size() *
+                (2u * n_block_candidates.size() + 1u +
+                 LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED))
+            << "Every full-K candidate and generated Auto decision must publish "
+               "one production M>1 route";
+
+        const auto pair_grid_records = PerfStatsCollector::snapshot(
+            {"kernel.cpu_native_vnni_pair_grid_execution"});
+        uint64_t pair_grid_execution_count = 0;
+        std::set<int> physically_executed_n_block_chunks;
+        for (const auto &record : pair_grid_records)
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_pair_grid_execution" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const int m = std::stoi(record.tags.at("m"));
+            const int n = std::stoi(record.tags.at("n"));
+            const int nbc = std::stoi(record.tags.at("n_block_chunks"));
+            const int expected_tasks =
+                ((m + 1) / 2) * (((n + 63) / 64 + nbc - 1) / nbc);
+            EXPECT_EQ(
+                std::stoi(record.tags.at("parallel_tasks")),
+                expected_tasks);
+            physically_executed_n_block_chunks.insert(nbc);
+            pair_grid_execution_count += record.count;
+        }
+        EXPECT_TRUE(std::ranges::includes(
+            physically_executed_n_block_chunks,
+            std::set<int>(n_block_candidates.begin(), n_block_candidates.end())))
+            << "The all-format sweep must prove the physical pair-grid task "
+               "granularity, not only the outer requested-route label";
+        EXPECT_GE(
+            pair_grid_execution_count,
+            ALL_FORMATS.size() * runtime_rows.size() *
+                n_block_candidates.size())
+            << "Every forced pair-grid candidate must publish its physical "
+               "execution geometry";
+
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+
+    /**
+     * @test Prove partial 64-column chunks remain inside each logical output row.
+     *
+     * The economical full-K prefill kernel shares one packed-weight chunk
+     * across two M rows. Its physical AVX2/AVX512 microkernels always publish
+     * 64 floats, while a model projection may end at any logical N. A direct
+     * store for the final partial chunk corrupts the next row and eventually
+     * writes past the output allocation. The fresh CPU prefill sealed-v2
+     * geometry `N=608, K=704, M=64` exposed that defect first at flat output
+     * index 608.
+     *
+     * This regression deliberately exercises:
+     *
+     * - every source format and normalized execution codebook;
+     * - even M, odd M, and the exact long-M sealed failure;
+     * - logical tail widths immediately below, at, and above 32 columns; and
+     * - all five learned N-block schedules on a wide shape where none of them
+     *   normalizes to the separate row-chunk-grid route.
+     *
+     * Serial M1 runs consume the exact same prequantized activation rows. Guard
+     * regions around the logical output make both prefix underflow and suffix
+     * overflow observable independently of allocator behavior.
+     */
+    TEST_F(CPUNativeVNNIGemvTest,
+           NativeVNNIPrefillFullKAllFormatsPartialNChunksStayWithinRows)
+    {
+        constexpr int K = 704;
+        constexpr float guard_value = -123456.75f;
+        constexpr size_t guard_values = 64;
+        const std::array<int, 5> narrow_tail_ns = {577, 607, 608, 609, 639};
+        const std::array<int, 2> short_runtime_rows = {2, 3};
+        const std::array<int, 1> narrow_candidates = {1};
+        const std::array<int, 5> wide_candidates = {1, 2, 4, 8, 16};
+
+        /*
+         * The original sealed collector ran one 28-core socket per MPI rank.
+         * Route normalization depends on thread count, so retain that topology
+         * here; a whole-machine default could silently choose row_chunk_grid
+         * for N=608 and fail to cover the repaired two-row implementation.
+         */
+        llaminar::v2::ThreadCountGuard socket_thread_regime(28);
+
+        setenv(
+            "LLAMINAR_PERF_STATS_JSON",
+            "/tmp/llaminar_cpu_native_vnni_prefill_partial_n.json",
+            1);
+
+        const auto run_shape = [&](
+                                   int N,
+                                   const auto &runtime_rows,
+                                   const auto &n_block_candidates)
+        {
+            for (size_t format_index = 0;
+                 format_index < ALL_FORMATS.size();
+                 ++format_index)
+            {
+                const auto &format = ALL_FORMATS[format_index];
+                SCOPED_TRACE(format.name);
+                SCOPED_TRACE(std::string("N=") + std::to_string(N));
+                auto weights = createWeightsForFormat(format.name, N, K);
+                ASSERT_NE(weights, nullptr) << format.name;
+                CPUNativeVNNIGemmKernel kernel(weights.get());
+                ASSERT_TRUE(kernel.isValid()) << format.name;
+                const auto &packed = kernel.packedWeights();
+                const int k_blocks = packed.blocks_per_row;
+                const std::string full_k_blocks = std::to_string(k_blocks);
+
+                for (int M : runtime_rows)
+                {
+                    SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                    std::mt19937 rng(static_cast<uint32_t>(
+                        0xD17Au + format_index * 977u + M * 131u + N));
+                    std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+                    std::vector<float> input(static_cast<size_t>(M) * K);
+                    for (float &value : input)
+                        value = distribution(rng);
+
+                    std::vector<Q8_1Block> quantized_rows(
+                        static_cast<size_t>(M) * k_blocks);
+                    quantize_activations_to_q8_1(
+                        input.data(),
+                        quantized_rows.data(),
+                        M,
+                        K,
+                        k_blocks);
+
+                    std::vector<float> serial(
+                        static_cast<size_t>(M) * N,
+                        0.0f);
+                    for (int row = 0; row < M; ++row)
+                    {
+                        gemv_native_vnni_preq(
+                            packed,
+                            quantized_rows.data() +
+                                static_cast<size_t>(row) * k_blocks,
+                            serial.data() + static_cast<size_t>(row) * N,
+                            ISAPath::AUTO);
+                    }
+
+                    for (PrefillSchedulePolicy schedule : {
+                             PrefillSchedulePolicy::TwoRowNMajor,
+                             PrefillSchedulePolicy::TwoRowPairGrid})
+                    {
+                        const char *expected_route =
+                            schedule == PrefillSchedulePolicy::TwoRowPairGrid
+                                ? "two_row_pair_grid"
+                                : "two_row_n_major";
+                        SCOPED_TRACE(
+                            std::string("schedule=") + expected_route);
+                        for (int n_block_chunks : n_block_candidates)
+                        {
+                            SCOPED_TRACE(
+                                std::string("n_block_chunks=") +
+                                std::to_string(n_block_chunks));
+                            const std::string n_block_text =
+                                std::to_string(n_block_chunks);
+                            ScopedCPUVNNIEnv force_n_blocks(
+                                "LLAMINAR_CPU_VNNI_N_BLOCK_CHUNKS",
+                                n_block_text.c_str());
+                            ScopedCPUVNNIEnv force_full_k(
+                                "LLAMINAR_CPU_VNNI_K_TILE_BLOCKS",
+                                full_k_blocks.c_str());
+
+                            const size_t logical_values =
+                                static_cast<size_t>(M) * N;
+                            std::vector<float> guarded_output(
+                                guard_values + logical_values + guard_values,
+                                guard_value);
+                            float *grouped =
+                                guarded_output.data() + guard_values;
+
+                            PerfStatsCollector::reset();
+                            gemm_native_vnni_preq(
+                                packed,
+                                quantized_rows.data(),
+                                grouped,
+                                M,
+                                N,
+                                ISAPath::AUTO,
+                                VerifierRowsPolicy::Pairwise,
+                                schedule);
+
+                            const ObservedCPUPrefillRoute route =
+                                findObservedCPUPrefillRoute(
+                                    M, N, K, packed.codebook_id);
+                            ASSERT_TRUE(route.found);
+                            EXPECT_EQ(route.route, expected_route);
+                            EXPECT_EQ(route.n_block_chunks, n_block_chunks);
+                            EXPECT_EQ(route.k_tiles, 1);
+                            EXPECT_EQ(route.k_tile_blocks, k_blocks);
+                            EXPECT_EQ(route.count, 1u);
+
+                            expectBitwiseEqualFloatRows(
+                                format.name + " partial-N full-K prefill M=" +
+                                    std::to_string(M) + " N=" +
+                                    std::to_string(N) + " nbc=" +
+                                    std::to_string(n_block_chunks) +
+                                    " schedule=" + expected_route,
+                                grouped,
+                                serial.data(),
+                                logical_values,
+                                static_cast<size_t>(N));
+
+                            EXPECT_TRUE(std::all_of(
+                                guarded_output.begin(),
+                                guarded_output.begin() + guard_values,
+                                [guard_value](float value)
+                                { return value == guard_value; }))
+                                << "Grouped prefill wrote before the logical output";
+                            EXPECT_TRUE(std::all_of(
+                                guarded_output.begin() + guard_values +
+                                    logical_values,
+                                guarded_output.end(),
+                                [guard_value](float value)
+                                { return value == guard_value; }))
+                                << "Grouped prefill wrote past the logical output";
+                        }
+                    }
+                }
+            }
+        };
+
+        for (int N : narrow_tail_ns)
+            run_shape(N, short_runtime_rows, narrow_candidates);
+
+        /* Reproduce the exact fresh sealed-v2 failure for every format. */
+        const std::array<int, 1> sealed_runtime_rows = {64};
+        run_shape(608, sealed_runtime_rows, narrow_candidates);
+
+        /*
+         * N=7200 has 113 physical chunks. Even nbc=16 retains eight output
+         * tasks on the 28-core blessed host, keeping every learned N-block
+         * schedule on the two-row production route while ending at 32 columns.
+         */
+        run_shape(7200, short_runtime_rows, wide_candidates);
+
+        PerfStatsCollector::reset();
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
+
+    /**
+     * @test Prove grouped prefill inherits production serial K partitioning.
+     *
+     * Small-N, long-K projections such as Qwen2.5 3B FFN-down use K-parallel
+     * serial decode. A grouped full-K accumulation is deterministic but cannot
+     * be byte-identical because it changes FP32 parenthesization. This focused
+     * all-format regression uses the real Qwen 1.5B FFN-down geometry, which is
+     * one of the finite serial-K-part production shapes exhaustively owned by
+     * the generated prefill table. The selected Pairwise or WideRows kernel
+     * must compute independent tile partials and reduce them in exactly the
+     * same order as M individual decode rows.
+     */
+    TEST_F(CPUNativeVNNIGemvTest,
+           NativeVNNIPrefillKPartAllFormatsRuntimeMMatchesSerialDecode)
+    {
+        constexpr int N = 1536;
+        constexpr int K = 8960;
+        constexpr std::array<int, 4> runtime_rows = {2, 5, 15, 64};
+
+        setenv(
+            "LLAMINAR_PERF_STATS_JSON",
+            "/tmp/llaminar_cpu_native_vnni_prefill_kpart.json",
+            1);
+        PerfStatsCollector::reset();
+
+        for (size_t format_index = 0;
+             format_index < ALL_FORMATS.size();
+             ++format_index)
+        {
+            const auto &format = ALL_FORMATS[format_index];
+            SCOPED_TRACE(format.name);
+            auto weights = createWeightsForFormat(format.name, N, K);
+            ASSERT_NE(weights, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << format.name;
+            const auto &packed = kernel.packedWeights();
+            const NativeVNNITileConfig serial_config = computeTileConfig(
+                N,
+                K,
+                1,
+                packed.payload_bytes,
+                omp_get_max_threads());
+            ASSERT_GT(serial_config.k_tiles, 1)
+                << "regression geometry must exercise serial K partitioning";
+
+            for (int M : runtime_rows)
+            {
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    static_cast<uint32_t>(
+                        0x7B00u + format_index * 977u + M * 131u));
+                ASSERT_NE(input, nullptr);
+
+                const int k_blocks = packed.blocks_per_row;
+                std::vector<Q8_1Block> quantized_rows(
+                    static_cast<size_t>(M) * k_blocks);
+                quantize_activations_to_q8_1(
+                    input->data(),
+                    quantized_rows.data(),
+                    M,
+                    K,
+                    k_blocks);
+                std::vector<float> serial(static_cast<size_t>(M) * N, 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    gemv_native_vnni_preq(
+                        packed,
+                        quantized_rows.data() +
+                            static_cast<size_t>(row) * k_blocks,
+                        serial.data() + static_cast<size_t>(row) * N);
+                }
+
+                std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+                ASSERT_TRUE(multiplyViaTensor(
+                    kernel,
+                    input->data(),
+                    grouped.data(),
+                    M,
+                    N,
+                    K));
+                expectBitwiseEqualFloatRows(
+                    format.name + " production Auto serial-K-part prefill M=" +
+                        std::to_string(M),
+                    grouped.data(),
+                    serial.data(),
+                    grouped.size(),
+                    static_cast<size_t>(N));
+
+                std::fill(grouped.begin(), grouped.end(), 0.0f);
+                gemm_native_vnni_preq(
+                    packed,
+                    quantized_rows.data(),
+                    grouped.data(),
+                    M,
+                    N,
+                    ISAPath::AUTO,
+                    VerifierRowsPolicy::Pairwise);
+                expectBitwiseEqualFloatRows(
+                    format.name + " production serial-K-part prefill M=" +
+                        std::to_string(M),
+                    grouped.data(),
+                    serial.data(),
+                    grouped.size(),
+                    static_cast<size_t>(N));
+            }
+        }
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.cpu_native_vnni_prefill_gemm_launch"});
+        uint64_t kpart_launches = 0;
+        uint64_t pairwise_launches = 0;
+        uint64_t wide_rows_launches = 0;
+        for (const auto &record : records)
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_prefill_gemm_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            EXPECT_EQ(
+                record.tags.at("route"),
+                "decode_equivalent_kpart_rows");
+            EXPECT_GT(std::stoi(record.tags.at("k_tiles")), 1);
+            EXPECT_TRUE(
+                record.tags.at("effective_policy") == "Pairwise" ||
+                record.tags.at("effective_policy") == "WideRows");
+            if (record.tags.at("effective_policy") == "WideRows")
+                wide_rows_launches += record.count;
+            else
+                pairwise_launches += record.count;
+            kpart_launches += record.count;
+        }
+        const uint64_t cells = ALL_FORMATS.size() * runtime_rows.size();
+#if LLAMINAR_COMPILED_WITH_AVX512
+        if (activeISALevel() >= ISALevel::AVX512)
+        {
+            const uint64_t m2_cells = ALL_FORMATS.size();
+            EXPECT_EQ(wide_rows_launches, cells - m2_cells)
+                << "Every forceable native-AVX512 Auto cell is exhaustively "
+                   "trained to the WideRows winner";
+            EXPECT_EQ(pairwise_launches, cells + m2_cells)
+                << "The diagnostic call exercises Pairwise for every cell, and "
+                   "M2 explicitly selects its unique forceable Pairwise route";
+        }
+        else
+#endif
+        {
+            EXPECT_EQ(wide_rows_launches, 0u);
+            EXPECT_EQ(pairwise_launches, cells * 2u)
+                << "Pairwise is the unique forceable AVX2 K-part schedule";
+        }
+        EXPECT_EQ(
+            kpart_launches,
+            cells * 2u);
+
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }

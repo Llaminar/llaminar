@@ -2020,7 +2020,16 @@ namespace llaminar2
 
         // Phase 2: Allocate VRAM pool + pinned ring buffer
         const auto &rocm_cfg = debugEnv().rocm;
-        orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+        const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
+        const size_t staging_budget_bytes = rocm_cfg.repack_budget_mb > 0
+                                                ? static_cast<size_t>(rocm_cfg.repack_budget_mb) * 1024ULL * 1024ULL
+                                                : 0;
+        const size_t staging_slot_bytes = staging_budget_bytes > 0
+                                              ? std::min(max_raw_bytes,
+                                                         std::max<size_t>(1, staging_budget_bytes /
+                                                                                 static_cast<size_t>(repack_streams)))
+                                              : max_raw_bytes;
+        orchestrator->allocate(staging_slot_bytes, repack_streams);
 
         // Phase 3: Create weight jobs from raw GGUF data
         size_t transfer_source_idx = 0;
@@ -2367,7 +2376,16 @@ namespace llaminar2
 
         // Phase 2: Allocate VRAM pool + pinned ring buffer
         const auto &rocm_cfg = debugEnv().rocm;
-        orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+        const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
+        const size_t staging_budget_bytes = rocm_cfg.repack_budget_mb > 0
+                                                ? static_cast<size_t>(rocm_cfg.repack_budget_mb) * 1024ULL * 1024ULL
+                                                : 0;
+        const size_t staging_slot_bytes = staging_budget_bytes > 0
+                                              ? std::min(max_raw_bytes,
+                                                         std::max<size_t>(1, staging_budget_bytes /
+                                                                                 static_cast<size_t>(repack_streams)))
+                                              : max_raw_bytes;
+        orchestrator->allocate(staging_slot_bytes, repack_streams);
 
         // Phase 3: Create weight jobs
         for (auto &grp : groups)
@@ -2407,6 +2425,7 @@ namespace llaminar2
                 job.N = static_cast<int>(view->rows());
                 job.K = static_cast<int>(view->cols());
                 job.is_asymmetric = vnni->is_asymmetric;
+                job.advise_mmap_dontneed_after_staging = view->is_mmap_data();
 
                 orchestrator->addWeightJob(gpu_ordinal, job);
             }

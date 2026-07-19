@@ -11,6 +11,7 @@
 
 #include "../../../mocks/MockComputeStage.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
 
 #ifdef HAVE_CUDA
@@ -287,6 +288,40 @@ namespace
             }
         }
         return values;
+    }
+
+    /**
+     * @brief Publish the separately numbered shared expert in the final route.
+     *
+     * A combined Qwen 3.6 verifier table has routed expert ids 0..255 and the
+     * shared expert at id 256. Merely allocating 257 descriptors does not test
+     * that last entry: this helper makes every row select it explicitly while
+     * leaving the first @p top_k - 1 routes on their routed-expert pattern.
+     *
+     * @param values Mutable row-major route-id matrix.
+     * @param rows Number of verifier rows in the matrix.
+     * @param top_k Number of routes per verifier row.
+     * @param num_experts Width of the descriptor table, including shared.
+     */
+    void publishTerminalExpertRoute(
+        std::vector<float> &values,
+        int rows,
+        int top_k,
+        int num_experts)
+    {
+        if (rows <= 0 || top_k <= 0 || num_experts <= 1 ||
+            values.size() != static_cast<size_t>(rows * top_k))
+        {
+            throw std::invalid_argument(
+                "terminal expert route requires a non-empty row-major route matrix");
+        }
+
+        const float terminal_expert = static_cast<float>(num_experts - 1);
+        for (int row = 0; row < rows; ++row)
+        {
+            values[static_cast<size_t>(row * top_k + top_k - 1)] =
+                terminal_expert;
+        }
     }
 
     std::vector<float> makeRoutingWeights(int rows, int top_k)
@@ -658,7 +693,9 @@ namespace
         int intermediate,
         const std::string &backend_name,
         uint64_t model_context_base,
-        std::vector<int> materialized_experts)
+        std::vector<int> materialized_experts,
+        const llaminar2::test::QuantizedVerifierFormatCase &gateup_format,
+        const llaminar2::test::QuantizedVerifierFormatCase &down_format)
     {
         PreparedExpertTables tables;
         materialized_experts =
@@ -670,21 +707,16 @@ namespace
         tables.down_descs.resize(num_experts);
         std::vector<bool> has_desc(static_cast<size_t>(num_experts), false);
 
-        auto add_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
+        auto add_desc = [&](
+            int rows,
+            int cols,
+            int seed,
+            const char *role,
+            const llaminar2::test::QuantizedVerifierFormatCase &format)
         {
-            std::unique_ptr<llaminar2::TensorBase> weight;
-            if (expected_codebook == 13)
-            {
-                weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
-                    {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                    static_cast<unsigned>(seed));
-            }
-            else
-            {
-                weight = llaminar2::test::TestTensorFactory::createIQ4_XSRandom(
-                    {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                    static_cast<unsigned>(seed));
-            }
+            std::unique_ptr<llaminar2::TensorBase> weight = format.create(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
 
             auto *weight_ptr = weight.get();
             tables.weights.push_back(std::move(weight));
@@ -699,18 +731,18 @@ namespace
                 << "failed to export native descriptor role=" << role;
             EXPECT_EQ(desc.n, rows);
             EXPECT_EQ(desc.k, cols);
-            EXPECT_EQ(desc.codebook_id, expected_codebook);
+            EXPECT_EQ(desc.codebook_id, format.device_execution_codebook_id);
             return desc;
         };
 
         for (int expert : materialized_experts)
         {
             tables.gate_descs[static_cast<size_t>(expert)] =
-                add_desc(intermediate, d_model, 4100 + expert, "gate", 13);
+                add_desc(intermediate, d_model, 4100 + expert, "gate", gateup_format);
             tables.up_descs[static_cast<size_t>(expert)] =
-                add_desc(intermediate, d_model, 4200 + expert, "up", 13);
+                add_desc(intermediate, d_model, 4200 + expert, "up", gateup_format);
             tables.down_descs[static_cast<size_t>(expert)] =
-                add_desc(d_model, intermediate, 4300 + expert, "down", 4);
+                add_desc(d_model, intermediate, 4300 + expert, "down", down_format);
             has_desc[static_cast<size_t>(expert)] = true;
         }
 
@@ -823,6 +855,24 @@ namespace
         cudaGraphExec_t exec_ = nullptr;
     };
 
+    /**
+     * @brief Stop a timing cell immediately when its launch body is rejected.
+     *
+     * A non-fatal EXPECT inside an iteration loop turns one unsupported route
+     * into hundreds of failures and then reports meaningless near-zero timing.
+     * Throwing here lets GoogleTest report the first broken phase and prevents
+     * failed work from being mistaken for an economical kernel.
+     */
+    void requireCudaBenchBody(bool ok, const char *phase)
+    {
+        if (!ok)
+        {
+            throw std::runtime_error(
+                std::string("CUDA MoE verifier benchmark body failed during ") +
+                (phase ? phase : "unknown phase"));
+        }
+    }
+
     double timeCudaEvents(cudaStream_t stream, int iterations, const std::function<bool()> &body)
     {
         cudaEvent_t start = nullptr;
@@ -831,7 +881,7 @@ namespace
         EXPECT_EQ(cudaEventCreate(&stop), cudaSuccess);
         EXPECT_EQ(cudaEventRecord(start, stream), cudaSuccess);
         for (int i = 0; i < iterations; ++i)
-            EXPECT_TRUE(body());
+            requireCudaBenchBody(body(), "timed replay");
         EXPECT_EQ(cudaEventRecord(stop, stream), cudaSuccess);
         EXPECT_EQ(cudaEventSynchronize(stop), cudaSuccess);
         float ms = 0.0f;
@@ -945,7 +995,10 @@ namespace
         int routed_top_k = 8,
         int routed_num_experts = 256,
         const char *case_name_override = nullptr,
-        bool unique_routes = false)
+        bool unique_routes = false,
+        bool include_terminal_expert = false,
+        const llaminar2::test::QuantizedVerifierFormatCase *gateup_format = nullptr,
+        const llaminar2::test::QuantizedVerifierFormatCase *down_format = nullptr)
     {
         /*
          * Match the Qwen3.6 MoE production shape used by the benchmark matrix:
@@ -960,6 +1013,12 @@ namespace
         constexpr int intermediate = 512;
         const int top_k = shared ? shared_top_k : routed_top_k;
         const int num_experts = shared ? shared_num_experts : routed_num_experts;
+        const auto &selected_gateup_format = gateup_format
+                                                 ? *gateup_format
+                                                 : llaminar2::test::quantizedVerifierFormat("IQ2_S");
+        const auto &selected_down_format = down_format
+                                               ? *down_format
+                                               : llaminar2::test::quantizedVerifierFormat("IQ4_XS");
         const int iterations = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", 30);
         const int warmups = envInt("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", 5);
         const auto device = llaminar2::DeviceId::cuda(0);
@@ -976,7 +1035,7 @@ namespace
         const int workspace_num_experts = std::max(num_experts, routed_num_experts);
         const int workspace_top_k = std::max(top_k, routed_top_k);
         auto reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
-            /*max_seq_len=*/4,
+            /*max_seq_len=*/rows,
             d_model,
             intermediate,
             workspace_num_experts,
@@ -1019,13 +1078,17 @@ namespace
         gemm_config.set(gateup_kparts, down_kparts);
 
         const auto hidden_values = makeHiddenValues(rows, d_model);
-        const auto routing_indices = unique_routes
-                                         ? makeUniqueRoutingIndices(rows, top_k, num_experts)
-                                         : makeRoutingIndices(rows, top_k, num_experts);
+        auto routing_indices = unique_routes
+                                   ? makeUniqueRoutingIndices(rows, top_k, num_experts)
+                                   : makeRoutingIndices(rows, top_k, num_experts);
+        if (include_terminal_expert)
+            publishTerminalExpertRoute(routing_indices, rows, top_k, num_experts);
         const auto routing_weights = makeRoutingWeights(rows, top_k);
         auto tables = prepareExpertTables(
             moe, device, num_experts, d_model, intermediate, "cuda", 270000,
-            uniqueExpertIdsFromRoutes(routing_indices, num_experts));
+            uniqueExpertIdsFromRoutes(routing_indices, num_experts),
+            selected_gateup_format,
+            selected_down_format);
         auto hidden = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(d_model)}, hidden_values);
         auto route_indices_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_indices);
         auto route_weights_tensor = makeTensor({static_cast<size_t>(rows), static_cast<size_t>(top_k)}, routing_weights);
@@ -1066,26 +1129,44 @@ namespace
         };
 
         for (int i = 0; i < warmups; ++i)
-            EXPECT_TRUE(run_grouped());
+            requireCudaBenchBody(run_grouped(), "warmup");
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
         const double eager_ms = timeCudaEvents(stream, iterations, run_grouped);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         const double prepare_ms = timeCudaEvents(stream, iterations, run_prepare);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-        EXPECT_TRUE(run_prepare());
+        requireCudaBenchBody(run_prepare(), "pipeline preparation");
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         const double pipeline_ms = timeCudaEvents(stream, iterations, run_pipeline);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
         CudaGraphOwner graph;
-        EXPECT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+        const cudaError_t begin_status =
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (begin_status != cudaSuccess)
+        {
+            throw std::runtime_error(
+                std::string("CUDA MoE verifier graph capture begin failed: ") +
+                cudaGetErrorString(begin_status));
+        }
         const bool captured = run_grouped();
         const cudaError_t end_status = cudaStreamEndCapture(stream, graph.graphPtr());
-        EXPECT_TRUE(captured);
-        EXPECT_EQ(end_status, cudaSuccess) << cudaGetErrorString(end_status);
-        EXPECT_NE(*graph.graphPtr(), nullptr);
-        EXPECT_EQ(cudaGraphInstantiate(graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0), cudaSuccess);
+        if (!captured || end_status != cudaSuccess || *graph.graphPtr() == nullptr)
+        {
+            throw std::runtime_error(
+                std::string("CUDA MoE verifier graph capture body failed: ") +
+                cudaGetErrorString(end_status));
+        }
+        const cudaError_t instantiate_status =
+            cudaGraphInstantiate(
+                graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0);
+        if (instantiate_status != cudaSuccess)
+        {
+            throw std::runtime_error(
+                std::string("CUDA MoE verifier graph instantiate failed: ") +
+                cudaGetErrorString(instantiate_status));
+        }
         for (int i = 0; i < warmups; ++i)
             EXPECT_EQ(cudaGraphLaunch(graph.execHandle(), stream), cudaSuccess);
         EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
@@ -1469,9 +1550,53 @@ TEST(Perf__MoEVerifierPrefill, CUDA_M4_CombinedRoutedSharedUpperBound)
         /*routed_top_k=*/9,
         /*routed_num_experts=*/257,
         /*case_name_override=*/"combined_top9_upper_bound",
-        /*unique_routes=*/true);
+        /*unique_routes=*/true,
+        /*include_terminal_expert=*/true);
     expectClose(combined.metrics);
     expectGraphReplayFasterThanReference(combined);
     printResult(combined);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, CUDA_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    /*
+     * This is a capacity and arithmetic regression, not a timing campaign.
+     * One replay per cell keeps the canonical integration gate compact while
+     * still entering the production graph-captured pipeline. M=4 covers the
+     * direct verifier policy; M=9 and M=31 prove that runtime depth remains
+     * independent of the historical M=2..4 assumption.
+     */
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvOverride iters_env("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", "1");
+    ScopedEnvOverride warmups_env("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", "0");
+    ScopedEnvOverride rowwise_env(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        for (const int rows : {4, 9, 31})
+        {
+            SCOPED_TRACE(rows);
+            auto combined = runCudaCase(
+                /*shared=*/false,
+                rows,
+                /*routed_top_k=*/9,
+                /*routed_num_experts=*/257,
+                /*case_name_override=*/"combined_top9_all_formats",
+                /*unique_routes=*/false,
+                /*include_terminal_expert=*/true,
+                &format,
+                &format);
+            expectClose(combined.metrics);
+            expectGraphReplayFasterThanReference(combined);
+        }
+    }
 #endif
 }

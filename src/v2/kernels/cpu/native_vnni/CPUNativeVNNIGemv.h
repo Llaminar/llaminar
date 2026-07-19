@@ -62,7 +62,16 @@
 
 // AVX2 GEMV/GEMM kernels (same packed weight format, uses emulated VNNI)
 #include "CPUNativeAVX2Gemv.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIDecodePolicyGenerated.inc"
+#include "kernels/cpu/native_vnni/CPUNativeVNNIPrefillPolicyGenerated.inc"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIVerifierRowsPolicyGenerated.inc"
+
+// Development-only artifacts intentionally omit this marker. Absence must
+// fail closed so a stale local include cannot gain production authority merely
+// by having the generated selector's expected filename.
+#ifndef LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED
+#define LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED 0
+#endif
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -128,6 +137,216 @@ namespace llaminar2::cpu::native_vnni
         WideRows,
     };
 
+    /**
+     * @brief Forceable CPU M=1 N-chunk ownership policy.
+     *
+     * Every value preserves the frozen serial-M1 K partition and ascending
+     * FP32 reduction tree.  The policy changes only how many adjacent
+     * 64-column chunks one OpenMP task owns.  `FrozenSerialOracle` exists for
+     * correctness diagnostics and trainer references; production callers use
+     * `Auto`, which requires a sealed generated table.
+     */
+    enum class DecodeSchedulePolicy
+    {
+        Auto,
+        FrozenSerialOracle,
+        Nbc1,
+        Nbc2,
+        Nbc4,
+        Nbc8,
+        Nbc16,
+    };
+
+    /** Return the requested N-chunk count for one explicit decode policy. */
+    inline int decodeScheduleNBlockChunks(DecodeSchedulePolicy policy)
+    {
+        switch (policy)
+        {
+        case DecodeSchedulePolicy::Nbc1:
+            return 1;
+        case DecodeSchedulePolicy::Nbc2:
+            return 2;
+        case DecodeSchedulePolicy::Nbc4:
+            return 4;
+        case DecodeSchedulePolicy::Nbc8:
+            return 8;
+        case DecodeSchedulePolicy::Nbc16:
+            return 16;
+        case DecodeSchedulePolicy::Auto:
+        case DecodeSchedulePolicy::FrozenSerialOracle:
+            break;
+        }
+        throw std::invalid_argument(
+            "CPU NativeVNNI decode policy has no explicit N-block width");
+    }
+
+    /** Return the stable route name published by production telemetry. */
+    inline const char *decodeSchedulePolicyName(DecodeSchedulePolicy policy)
+    {
+        switch (policy)
+        {
+        case DecodeSchedulePolicy::Auto:
+            return "Auto";
+        case DecodeSchedulePolicy::FrozenSerialOracle:
+            return "FrozenSerialOracle";
+        case DecodeSchedulePolicy::Nbc1:
+            return "Nbc1";
+        case DecodeSchedulePolicy::Nbc2:
+            return "Nbc2";
+        case DecodeSchedulePolicy::Nbc4:
+            return "Nbc4";
+        case DecodeSchedulePolicy::Nbc8:
+            return "Nbc8";
+        case DecodeSchedulePolicy::Nbc16:
+            return "Nbc16";
+        }
+        return "Invalid";
+    }
+
+    /**
+     * @brief Collapse nominal widths that own the same physical N task.
+     *
+     * A request wider than the complete N-chunk inventory cannot create a new
+     * launch.  Normalize it to the smallest forceable width that covers every
+     * chunk so timing and profiler evidence never relabel duplicate work as a
+     * distinct candidate.
+     */
+    inline DecodeSchedulePolicy normalizeDecodeSchedulePolicy(
+        DecodeSchedulePolicy policy,
+        int n_chunks)
+    {
+        if (policy == DecodeSchedulePolicy::Auto ||
+            policy == DecodeSchedulePolicy::FrozenSerialOracle)
+        {
+            return policy;
+        }
+        if (n_chunks <= 1)
+            return DecodeSchedulePolicy::Nbc1;
+        if (decodeScheduleNBlockChunks(policy) < n_chunks)
+            return policy;
+        if (n_chunks <= 2)
+            return DecodeSchedulePolicy::Nbc2;
+        if (n_chunks <= 4)
+            return DecodeSchedulePolicy::Nbc4;
+        if (n_chunks <= 8)
+            return DecodeSchedulePolicy::Nbc8;
+        return DecodeSchedulePolicy::Nbc16;
+    }
+
+    /** Map one generated policy value to the forceable runtime enum. */
+    inline DecodeSchedulePolicy decodeSchedulePolicyFromGenerated(
+        generated::CPUNativeVNNIDecodePolicy policy)
+    {
+        switch (policy)
+        {
+        case generated::CPUNativeVNNIDecodePolicy::Nbc1:
+            return DecodeSchedulePolicy::Nbc1;
+        case generated::CPUNativeVNNIDecodePolicy::Nbc2:
+            return DecodeSchedulePolicy::Nbc2;
+        case generated::CPUNativeVNNIDecodePolicy::Nbc4:
+            return DecodeSchedulePolicy::Nbc4;
+        case generated::CPUNativeVNNIDecodePolicy::Nbc8:
+            return DecodeSchedulePolicy::Nbc8;
+        case generated::CPUNativeVNNIDecodePolicy::Nbc16:
+            return DecodeSchedulePolicy::Nbc16;
+        }
+        throw std::runtime_error(
+            "Generated CPU NativeVNNI decode policy is outside the runtime ABI");
+    }
+
+    /**
+     * @brief Resolve the sealed CPU M=1 schedule for a physical launch.
+     *
+     * @param packed Prepared weights whose execution codebook owns the domain.
+     * @param N Output width.
+     * @param K Input width.
+     * @param use_avx512 Whether this invocation selected AVX512 kernels.
+     * @param use_avx2 Whether this invocation selected AVX2 kernels.
+     * @param serial_kpart Whether frozen serial arithmetic has multiple K tiles.
+     * @return A forceable N-chunk schedule backed by certified evidence.
+     * @throws std::runtime_error when no certified total policy is installed.
+     */
+    inline DecodeSchedulePolicy selectDecodeSchedulePolicy(
+        const CPUNativeVNNIPackedWeights &packed,
+        int N,
+        int K,
+        bool use_avx512,
+        bool use_avx2,
+        bool serial_kpart)
+    {
+        if constexpr (!LLAMINAR_CPU_NVNNI_DECODE_POLICY_CERTIFIED)
+        {
+            throw std::runtime_error(
+                "CPU NativeVNNI M=1 Auto dispatch requires a sealed-certified "
+                "generated decode policy");
+        }
+
+#if LLAMINAR_COMPILED_WITH_AVX512
+        constexpr auto build_isa =
+            generated::CPUNativeVNNIDecodeBuildISA::AVX512;
+#else
+        constexpr auto build_isa =
+            generated::CPUNativeVNNIDecodeBuildISA::AVX2;
+#endif
+        generated::CPUNativeVNNIDecodeRuntimeISA runtime_isa{};
+        if (use_avx512)
+            runtime_isa = generated::CPUNativeVNNIDecodeRuntimeISA::AVX512;
+        else if (use_avx2)
+            runtime_isa = generated::CPUNativeVNNIDecodeRuntimeISA::AVX2;
+        else
+            throw std::runtime_error(
+                "CPU NativeVNNI M=1 decode requires AVX2 or AVX512");
+
+        generated::CPUNativeVNNIDecodePolicy generated_policy{};
+        if (generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
+                build_isa,
+                runtime_isa,
+                omp_get_max_threads(),
+                packed.codebook_id,
+                N,
+                K,
+                serial_kpart,
+                generated_policy))
+        {
+            return decodeSchedulePolicyFromGenerated(generated_policy);
+        }
+        throw std::runtime_error(
+            std::string("No certified CPU NativeVNNI M=1 decode policy for build=") +
+            compiledNativeVNNIBuildISAName() +
+            " runtime=" + (use_avx512 ? "AVX512" : "AVX2") +
+            " threads=" + std::to_string(omp_get_max_threads()) +
+            " codebook=" + std::to_string(packed.codebook_id) +
+            " N=" + std::to_string(N) +
+            " K=" + std::to_string(K) +
+            " serial_kpart=" + (serial_kpart ? "true" : "false"));
+    }
+
+    /**
+     * @brief Forceable ordinary-prefill work-sharing schedule.
+     *
+     * Production callers use Auto and receive the sealed generated policy.
+     * The explicit values exist for integration tests and the strong perf
+     * trainer, where every physical candidate must be requested independently
+     * and authenticated through launch telemetry. They select only task
+     * ownership: every schedule invokes the same serial-M1-equivalent chunk
+     * microkernels and leaves each output row's increasing-K arithmetic tree
+     * unchanged.
+     */
+    enum class PrefillSchedulePolicy
+    {
+        /** Resolve the sealed generated production policy. */
+        Auto,
+
+        /** Schedule one independent `(row, 64-column chunk)` task. */
+        RowChunkGrid,
+
+        /** Schedule N blocks and visit every two-row tile inside each task. */
+        TwoRowNMajor,
+
+        /** Schedule the Cartesian product of two-row tiles and N blocks. */
+        TwoRowPairGrid,
+    };
+
     inline VerifierRowsPolicy selectVerifierRowsPolicy(
         const CPUNativeVNNIPackedWeights &packed,
         int M,
@@ -142,13 +361,11 @@ namespace llaminar2::cpu::native_vnni
          * The kernel inventory is physical-row-tile based, not speculative
          * depth specialized. Generated evidence may still choose between the
          * Pairwise and WideRows schedules for an exact runtime M because task
-         * count and tail composition affect economy. If that exact key has not
-         * yet been trained, the certified four-row policy governs every full
-         * tile and its 1-3 row tail. This is a dispatch hierarchy over the same
-         * grouped kernels, never a serial compute fallback.
+         * count and tail composition affect economy. Every production M must
+         * therefore have its own generated decision. Reusing an M4 decision
+         * for an untrained wider batch would preserve correctness but make an
+         * unsupported economy claim, so missing exact coverage fails closed.
          */
-        const int policy_tile_rows = std::min(M, 4);
-
         generated::CPUNativeVNNIVerifierRowsPolicy generated_policy{};
 #if LLAMINAR_COMPILED_WITH_AVX512
         constexpr auto build_isa =
@@ -171,20 +388,15 @@ namespace llaminar2::cpu::native_vnni
             throw std::runtime_error(
                 "CPU NativeVNNI verifier rows require AVX2 or AVX512");
         }
-        auto resolve_generated_policy = [&](int policy_rows)
-        {
-            return generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+        if (generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
                 build_isa,
                 runtime_isa,
                 omp_get_max_threads(),
                 packed.codebook_id,
-                policy_rows,
+                M,
                 N,
                 K,
-                generated_policy);
-        };
-        if (resolve_generated_policy(M) ||
-            (M > 4 && resolve_generated_policy(policy_tile_rows)))
+                generated_policy))
         {
             return generated_policy ==
                        generated::CPUNativeVNNIVerifierRowsPolicy::WideRows
@@ -200,9 +412,97 @@ namespace llaminar2::cpu::native_vnni
             " threads=" + std::to_string(omp_get_max_threads()) +
             " codebook=" + std::to_string(packed.codebook_id) +
             " M=" + std::to_string(M) +
-            " policy_tile_rows=" + std::to_string(policy_tile_rows) +
             " N=" + std::to_string(N) +
             " K=" + std::to_string(K));
+    }
+
+    /**
+     * @brief Resolve the certified ordinary-prefill physical schedule.
+     *
+     * Ordinary M>1 projection and grouped verifier rows have different launch
+     * economics even though both must preserve the serial-M1 accumulation
+     * tree. The generated prefill selector therefore owns row-chunk versus
+     * two-row N sharing as well as Pairwise versus WideRows publication for a
+     * serial K-part geometry. The caller supplies the *effective* ISA selected
+     * for this invocation so an AVX512 build forced to AVX2 uses its separately
+     * trained policy surface.
+     *
+     * @param packed Prepared production weights and execution codebook.
+     * @param M Runtime row count before model-tier bucketing.
+     * @param N Output width.
+     * @param K Input width.
+     * @param use_avx512 True when this invocation executes AVX512 kernels.
+     * @param use_avx2 True when this invocation executes AVX2 kernels.
+     * @param serial_kpart True when production serial M1 owns multiple ordered
+     * K partitions for this geometry.
+     * @return A measured, byte-exact ordinary-prefill schedule.
+     * @throws std::runtime_error when the active build/ISA/thread/codebook/shape
+     * surface has no generated policy. Production never substitutes the old
+     * tile heuristic for an untrained policy cell.
+     */
+    inline generated::CPUNativeVNNIPrefillPolicy selectPrefillPolicy(
+        const CPUNativeVNNIPackedWeights &packed,
+        int M,
+        int N,
+        int K,
+        bool use_avx512,
+        bool use_avx2,
+        bool serial_kpart)
+    {
+        if constexpr (!LLAMINAR_CPU_NVNNI_PREFILL_POLICY_CERTIFIED)
+        {
+            throw std::runtime_error(
+                "CPU NativeVNNI prefill Auto dispatch requires a sealed-certified "
+                "generated policy; the compiled table is development-only");
+        }
+
+#if LLAMINAR_COMPILED_WITH_AVX512
+        constexpr auto build_isa =
+            generated::CPUNativeVNNIPrefillBuildISA::AVX512;
+#else
+        constexpr auto build_isa =
+            generated::CPUNativeVNNIPrefillBuildISA::AVX2;
+#endif
+        generated::CPUNativeVNNIPrefillRuntimeISA runtime_isa{};
+        if (use_avx512)
+        {
+            runtime_isa = generated::CPUNativeVNNIPrefillRuntimeISA::AVX512;
+        }
+        else if (use_avx2)
+        {
+            runtime_isa = generated::CPUNativeVNNIPrefillRuntimeISA::AVX2;
+        }
+        else
+        {
+            throw std::runtime_error(
+                "CPU NativeVNNI prefill requires AVX2 or AVX512");
+        }
+
+        generated::CPUNativeVNNIPrefillPolicy policy{};
+        if (generated::selectCPUNativeVNNIPrefillGeneratedPolicy(
+                build_isa,
+                runtime_isa,
+                omp_get_max_threads(),
+                packed.codebook_id,
+                M,
+                N,
+                K,
+                serial_kpart,
+                policy))
+        {
+            return policy;
+        }
+
+        throw std::runtime_error(
+            std::string("No certified CPU NativeVNNI prefill policy for build=") +
+            compiledNativeVNNIBuildISAName() +
+            " runtime=" + (use_avx512 ? "AVX512" : "AVX2") +
+            " threads=" + std::to_string(omp_get_max_threads()) +
+            " codebook=" + std::to_string(packed.codebook_id) +
+            " M=" + std::to_string(M) +
+            " N=" + std::to_string(N) +
+            " K=" + std::to_string(K) +
+            " serial_kpart=" + (serial_kpart ? "true" : "false"));
     }
 
     // =========================================================================
@@ -949,7 +1249,8 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8,
         float *C,
-        ISAPath isa_path = ISAPath::AUTO)
+        ISAPath isa_path = ISAPath::AUTO,
+        DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
         const int N = packed.N;
         const int K = packed.K;
@@ -984,8 +1285,70 @@ namespace llaminar2::cpu::native_vnni
 
         if (!use_avx512 && !use_avx2)
         {
+            if (isa_path != ISAPath::SCALAR ||
+                schedule_override != DecodeSchedulePolicy::FrozenSerialOracle)
+            {
+                throw std::runtime_error(
+                    "CPU NativeVNNI production decode requires an AVX2 or "
+                    "AVX512 grouped implementation; scalar execution is an "
+                    "explicit frozen diagnostic oracle only");
+            }
             gemv_native_vnni_scalar(packed, A_q8, C, N, K_blocks);
             return;
+        }
+
+        /*
+         * K partition boundaries remain the frozen serial arithmetic contract.
+         * The learned policy owns task granularity only, so changing a table
+         * can improve OpenMP economy without changing any FP32 parenthesization
+         * inherited by grouped verifier execution.
+         */
+        const bool serial_kpart = cfg.k_tiles > 1;
+        const DecodeSchedulePolicy requested_schedule = schedule_override;
+        DecodeSchedulePolicy selected_schedule = schedule_override;
+        int n_block_chunks = cfg.n_block_chunks;
+        if (selected_schedule == DecodeSchedulePolicy::Auto)
+        {
+            selected_schedule = selectDecodeSchedulePolicy(
+                packed, N, K, use_avx512, use_avx2, serial_kpart);
+        }
+        if (selected_schedule != DecodeSchedulePolicy::FrozenSerialOracle)
+        {
+            const DecodeSchedulePolicy normalized_schedule =
+                normalizeDecodeSchedulePolicy(selected_schedule, N_chunks);
+            if (requested_schedule == DecodeSchedulePolicy::Auto &&
+                normalized_schedule != selected_schedule)
+            {
+                throw std::runtime_error(
+                    "Generated CPU NativeVNNI M=1 policy selected a nominal "
+                    "N-block width that is not a physical candidate");
+            }
+            selected_schedule = normalized_schedule;
+            n_block_chunks = decodeScheduleNBlockChunks(selected_schedule);
+        }
+
+        if (PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_native_vnni_decode_launch",
+                1.0,
+                "gemv",
+                {},
+                PerfStatsCollector::Tags{
+                    {"n", std::to_string(N)},
+                    {"k", std::to_string(K)},
+                    {"codebook", std::to_string(packed.codebook_id)},
+                    {"build_isa", compiledNativeVNNIBuildISAName()},
+                    {"isa", use_avx512 ? "AVX512" : "AVX2"},
+                    {"requested_policy",
+                     decodeSchedulePolicyName(requested_schedule)},
+                    {"effective_policy",
+                     decodeSchedulePolicyName(selected_schedule)},
+                    {"n_block_chunks", std::to_string(n_block_chunks)},
+                    {"k_tiles", std::to_string(cfg.k_tiles)},
+                    {"serial_kpart", serial_kpart ? "1" : "0"},
+                    {"threads", std::to_string(num_threads)}});
         }
 
         // K-parallel GEMV when N-parallelism is insufficient
@@ -998,41 +1361,58 @@ namespace llaminar2::cpu::native_vnni
              * reduction pass.  Use default-initialized storage so long-K decode
              * verifier rows do not pay a redundant memset on every GEMV call.
              */
-            std::unique_ptr<float[]> partial_sums(
-                new float[static_cast<size_t>(N_chunks) * k_tiles * 64]);
+            const size_t partial_sum_floats =
+                static_cast<size_t>(N_chunks) * k_tiles * 64;
+            thread_local AlignedVector<float> partial_sums_tls;
+            if (partial_sums_tls.size() < partial_sum_floats)
+                partial_sums_tls.resize_uninitialized(partial_sum_floats);
+            float *partial_sums = partial_sums_tls.data();
 
             auto do_gemv_kpar = [&]()
             {
-                int total_2d = N_chunks * k_tiles;
+                const int n_blocks =
+                    (N_chunks + n_block_chunks - 1) / n_block_chunks;
+                const int total_2d = n_blocks * k_tiles;
 #pragma omp for schedule(static)
                 for (int task = 0; task < total_2d; ++task)
                 {
-                    int chunk_idx = task / k_tiles;
-                    int kt = task % k_tiles;
-                    int kb_start = kt * k_blocks_per_tile;
-                    int kb_end = std::min(kb_start + k_blocks_per_tile, K_blocks);
-                    float *dest = partial_sums.get() +
-                                  (static_cast<size_t>(chunk_idx) * k_tiles + kt) * 64;
-
-                    if (use_avx512)
+                    const int block_idx = task / k_tiles;
+                    const int kt = task % k_tiles;
+                    const int chunk_start = block_idx * n_block_chunks;
+                    const int chunk_count =
+                        std::min(n_block_chunks, N_chunks - chunk_start);
+                    const int kb_start = kt * k_blocks_per_tile;
+                    const int kb_end =
+                        std::min(kb_start + k_blocks_per_tile, K_blocks);
+                    for (int offset = 0; offset < chunk_count; ++offset)
                     {
+                        const int chunk_idx = chunk_start + offset;
+                        float *dest = partial_sums +
+                                      (static_cast<size_t>(chunk_idx) * k_tiles + kt) * 64;
+                        if (use_avx512)
+                        {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                        if (packed.is_nibble_lut)
-                            gemv_native_vnni_avx512_chunk_native(packed, A_q8, dest,
-                                                                 chunk_idx, kb_start, kb_end, decode_lut_512);
-                        else
-                            gemv_native_vnni_avx512_chunk_int8(packed, A_q8, dest,
-                                                               chunk_idx, kb_start, kb_end);
+                            if (packed.is_nibble_lut)
+                                gemv_native_vnni_avx512_chunk_native(
+                                    packed, A_q8, dest, chunk_idx, kb_start,
+                                    kb_end, decode_lut_512);
+                            else
+                                gemv_native_vnni_avx512_chunk_int8(
+                                    packed, A_q8, dest, chunk_idx, kb_start,
+                                    kb_end);
 #endif
-                    }
-                    else
-                    {
-                        if (packed.is_nibble_lut)
-                            gemv_avx2_chunk_native(packed, A_q8, dest,
-                                                   chunk_idx, kb_start, kb_end, decode_lut_256);
+                        }
+                        else if (packed.is_nibble_lut)
+                        {
+                            gemv_avx2_chunk_native(
+                                packed, A_q8, dest, chunk_idx, kb_start, kb_end,
+                                decode_lut_256);
+                        }
                         else
-                            gemv_avx2_chunk_int8(packed, A_q8, dest,
-                                                 chunk_idx, kb_start, kb_end);
+                        {
+                            gemv_avx2_chunk_int8(
+                                packed, A_q8, dest, chunk_idx, kb_start, kb_end);
+                        }
                     }
                 }
 
@@ -1042,7 +1422,7 @@ namespace llaminar2::cpu::native_vnni
                 {
                     int n_start = chunk_idx * 64;
                     int n_cols = std::min(64, N - n_start);
-                    const float *base = partial_sums.get() +
+                    const float *base = partial_sums +
                                         static_cast<size_t>(chunk_idx) * k_tiles * 64;
                     reduceNativeVNNIKTilePartialsExact(
                         base, C + n_start, n_cols, k_tiles, use_avx512);
@@ -1054,7 +1434,6 @@ namespace llaminar2::cpu::native_vnni
         }
 
         // Standard N-parallel GEMV
-        int n_block_chunks = cfg.n_block_chunks;
         int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
 
         // Serial fast path: when there are fewer tasks than threads and we're
@@ -1116,21 +1495,7 @@ namespace llaminar2::cpu::native_vnni
     }
 
     // =========================================================================
-    // Forward declaration: Q8_0 native GEMV (defined later in this file)
-    // =========================================================================
-    inline void q8_0_native_gemv(
-        const Q8_0Block *__restrict blocks,
-        const float *__restrict A,
-        float *__restrict C,
-        int N, int K, int bpr);
-
-    // =========================================================================
-    // Full GEMV dispatcher (M=1) — unified entrypoint
-    //
-    // When q8_0_blocks is non-null, uses the Q8_0 native path (direct block
-    // access + FP32 dequant + FMA). Otherwise uses the packed VNNI path
-    // (FP32→Q8_1 quantize + vpdpbusd). The caller does not need to know
-    // which format is active.
+    // Full GEMV dispatcher (M=1) — unified eager-interleaved entrypoint
     // =========================================================================
 
     inline void gemv_native_vnni(
@@ -1138,15 +1503,6 @@ namespace llaminar2::cpu::native_vnni
         const float *A_fp32,
         float *C)
     {
-        // Q8_0 fast path: workspace contains raw Q8_0 blocks (no interleave).
-        // Use dedicated raw-block GEMV for both AVX512 and AVX2 builds.
-        if (packed.codebook_id == 19 && packed.workspace_data_)
-        {
-            auto *blocks = reinterpret_cast<const Q8_0Block *>(packed.workspace_data_);
-            q8_0_native_gemv(blocks, A_fp32, C, packed.N, packed.K, packed.blocks_per_row);
-            return;
-        }
-
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
@@ -2203,6 +2559,17 @@ namespace llaminar2::cpu::native_vnni
     //           Row m starts at A_q8_all + m * K_blocks.
     // =========================================================================
 
+    inline void gemm_native_vnni_preq_decode_equivalent_rows(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8_all,
+        float *C,
+        int M,
+        int ldc,
+        ISAPath isa_path,
+        VerifierRowsPolicy verifier_policy_override,
+        bool publish_verifier_route,
+        int full_k_n_block_chunks_override = 0);
+
     inline void gemm_native_vnni_preq(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_all,
@@ -2210,7 +2577,8 @@ namespace llaminar2::cpu::native_vnni
         int M,
         int ldc,
         ISAPath isa_path = ISAPath::AUTO,
-        VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto)
+        VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto,
+        PrefillSchedulePolicy schedule_override = PrefillSchedulePolicy::Auto)
     {
         const int N = packed.N;
         const int K_blocks = packed.blocks_per_row;
@@ -2230,11 +2598,238 @@ namespace llaminar2::cpu::native_vnni
 
         int num_threads = omp_get_max_threads();
         NativeVNNITileConfig cfg = computeTileConfig(N, packed.K, M, packed.payload_bytes, num_threads);
-        int n_block_chunks = cfg.n_block_chunks;
-        int total_n_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
-
         int k_tile_blocks = cfg.k_tile_blocks > 0 ? cfg.k_tile_blocks : K_blocks;
         int num_k_tiles = (K_blocks + k_tile_blocks - 1) / k_tile_blocks;
+        const NativeVNNITileConfig serial_cfg = computeTileConfig(
+            N, packed.K, 1, packed.payload_bytes, num_threads);
+        const bool use_decode_equivalent_kpart = serial_cfg.k_tiles > 1;
+
+        generated::CPUNativeVNNIPrefillPolicy generated_policy{};
+        const bool use_generated_policy =
+            verifier_policy_override == VerifierRowsPolicy::Auto &&
+            schedule_override == PrefillSchedulePolicy::Auto;
+        if (use_generated_policy)
+        {
+            if (ldc < 64)
+            {
+                throw std::runtime_error(
+                    "Generated CPU NativeVNNI prefill policy does not admit "
+                    "an output stride narrower than one 64-value chunk");
+            }
+            generated_policy = selectPrefillPolicy(
+                packed,
+                M,
+                N,
+                packed.K,
+                use_avx512,
+                use_avx2,
+                use_decode_equivalent_kpart);
+        }
+
+        int n_block_chunks = cfg.n_block_chunks;
+        bool use_row_chunk_grid =
+            (N_chunks + n_block_chunks - 1) / n_block_chunks <=
+                    num_threads / 4 &&
+                M >= 2;
+        bool use_two_row_pair_grid = false;
+        if (!use_generated_policy)
+        {
+            switch (schedule_override)
+            {
+            case PrefillSchedulePolicy::Auto:
+                use_row_chunk_grid = use_row_chunk_grid || ldc < 64;
+                break;
+            case PrefillSchedulePolicy::RowChunkGrid:
+                use_row_chunk_grid = true;
+                break;
+            case PrefillSchedulePolicy::TwoRowNMajor:
+                use_row_chunk_grid = false;
+                break;
+            case PrefillSchedulePolicy::TwoRowPairGrid:
+                use_row_chunk_grid = false;
+                use_two_row_pair_grid = true;
+                break;
+            }
+        }
+        else
+        {
+            switch (generated_policy)
+            {
+            case generated::CPUNativeVNNIPrefillPolicy::RowChunkGrid:
+                use_row_chunk_grid = true;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc1:
+                n_block_chunks = 1;
+                use_row_chunk_grid = false;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc2:
+                n_block_chunks = 2;
+                use_row_chunk_grid = false;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc4:
+                n_block_chunks = 4;
+                use_row_chunk_grid = false;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc8:
+                n_block_chunks = 8;
+                use_row_chunk_grid = false;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowNbc16:
+                n_block_chunks = 16;
+                use_row_chunk_grid = false;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc1:
+                n_block_chunks = 1;
+                use_row_chunk_grid = false;
+                use_two_row_pair_grid = true;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc2:
+                n_block_chunks = 2;
+                use_row_chunk_grid = false;
+                use_two_row_pair_grid = true;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc4:
+                n_block_chunks = 4;
+                use_row_chunk_grid = false;
+                use_two_row_pair_grid = true;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc8:
+                n_block_chunks = 8;
+                use_row_chunk_grid = false;
+                use_two_row_pair_grid = true;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::TwoRowPairGridNbc16:
+                n_block_chunks = 16;
+                use_row_chunk_grid = false;
+                use_two_row_pair_grid = true;
+                break;
+            case generated::CPUNativeVNNIPrefillPolicy::KPartPairwise:
+            case generated::CPUNativeVNNIPrefillPolicy::KPartWideRows:
+                if (!use_decode_equivalent_kpart)
+                {
+                    throw std::runtime_error(
+                        "Generated CPU prefill K-part policy disagrees with "
+                        "the production serial-M1 route");
+                }
+                use_row_chunk_grid = false;
+                break;
+            }
+        }
+        const int total_n_blocks =
+            (N_chunks + n_block_chunks - 1) / n_block_chunks;
+        const VerifierRowsPolicy requested_kpart_policy =
+            use_decode_equivalent_kpart
+                ? (use_generated_policy
+                       ? (generated_policy ==
+                                  generated::CPUNativeVNNIPrefillPolicy::
+                                      KPartWideRows
+                              ? VerifierRowsPolicy::WideRows
+                              : VerifierRowsPolicy::Pairwise)
+                       : verifier_policy_override)
+                : VerifierRowsPolicy::Pairwise;
+        const bool effective_wide_kpart =
+            use_decode_equivalent_kpart && use_avx512 && M >= 3 &&
+            requested_kpart_policy == VerifierRowsPolicy::WideRows;
+        const int effective_k_tiles = use_decode_equivalent_kpart
+                                          ? serial_cfg.k_tiles
+                                          : num_k_tiles;
+        const int effective_k_tile_blocks = use_decode_equivalent_kpart
+                                                ? (K_blocks + serial_cfg.k_tiles - 1) /
+                                                      serial_cfg.k_tiles
+                                                : k_tile_blocks;
+        const int parallel_tasks = use_decode_equivalent_kpart
+                                       ? M * N_chunks * effective_k_tiles
+                                   : use_row_chunk_grid
+                                       ? M * N_chunks
+                                   : use_two_row_pair_grid
+                                       ? ((M + 1) / 2) * total_n_blocks
+                                       : total_n_blocks;
+
+        /*
+         * Ordinary prefill and the dedicated verifier-row kernel are distinct
+         * policy surfaces. Publish the exact production M>1 route here so an
+         * all-format trainer can prove that a requested N-task granularity and
+         * full-K arithmetic schedule really reached the launcher. Without this
+         * record, an override normalized by the small-N branch could be
+         * mislabeled as an independently measured candidate.
+         */
+        if (PerfStatsCollector::isEnabled())
+        {
+            const char *effective_isa =
+                use_avx512 ? "AVX512" : (use_avx2 ? "AVX2" : "Scalar");
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_native_vnni_prefill_gemm_launch",
+                1.0,
+                "gemm",
+                {},
+                PerfStatsCollector::Tags{
+                    {"m", std::to_string(M)},
+                    {"n", std::to_string(N)},
+                    {"k", std::to_string(packed.K)},
+                    {"codebook", std::to_string(packed.codebook_id)},
+                    {"build_isa", compiledNativeVNNIBuildISAName()},
+                    {"isa", effective_isa},
+                    {"route", use_decode_equivalent_kpart
+                                  ? "decode_equivalent_kpart_rows"
+                                  : (use_row_chunk_grid
+                                         ? "row_chunk_grid"
+                                     : use_two_row_pair_grid
+                                         ? "two_row_pair_grid"
+                                         : "two_row_n_major")},
+                    {"requested_policy",
+                     requested_kpart_policy == VerifierRowsPolicy::WideRows
+                         ? "WideRows"
+                         : "Pairwise"},
+                    {"effective_policy",
+                     effective_wide_kpart ? "WideRows" : "Pairwise"},
+                    {"n_block_chunks",
+                     std::to_string(use_decode_equivalent_kpart
+                                        ? serial_cfg.n_block_chunks
+                                        : n_block_chunks)},
+                    {"k_tile_blocks", std::to_string(effective_k_tile_blocks)},
+                    {"k_tiles", std::to_string(effective_k_tiles)},
+                    {"parallel_tasks", std::to_string(parallel_tasks)},
+                    {"row_tile", use_two_row_pair_grid ? "2" : "1"},
+                    {"threads", std::to_string(num_threads)}});
+        }
+
+        if (use_decode_equivalent_kpart)
+        {
+            gemm_native_vnni_preq_decode_equivalent_rows(
+                packed,
+                A_q8_all,
+                C,
+                M,
+                ldc,
+                isa_path,
+                requested_kpart_policy,
+                /*publish_verifier_route=*/false);
+            return;
+        }
+
+        /*
+         * The grouped verifier helper already owns the economical full-K
+         * two-row Cartesian task grid. Calling it with an explicit Pairwise
+         * policy bypasses verifier-policy lookup while reusing the exact same
+         * AVX2/AVX512 chunk microkernels as the N-major prefill schedule. Each
+         * task writes a disjoint pair of output rows and N block, so changing
+         * task order cannot alter any row's floating-point accumulation order.
+         */
+        if (use_two_row_pair_grid)
+        {
+            gemm_native_vnni_preq_decode_equivalent_rows(
+                packed,
+                A_q8_all,
+                C,
+                M,
+                ldc,
+                isa_path,
+                VerifierRowsPolicy::Pairwise,
+                /*publish_verifier_route=*/false,
+                n_block_chunks);
+            return;
+        }
 
         // Initialize decode LUTs for selected ISA
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -2250,7 +2845,7 @@ namespace llaminar2::cpu::native_vnni
         // Also forced when ldc < 64: the 2-row tiled microkernel always stores
         // 64 floats per row via _mm512_storeu_ps, which overflows into adjacent
         // rows when the output stride is narrower than one VNNI chunk.
-        if ((total_n_blocks <= num_threads / 4 && M >= 2) || ldc < 64)
+        if (use_row_chunk_grid)
         {
             auto do_compute = [&]()
             {
@@ -2310,7 +2905,7 @@ namespace llaminar2::cpu::native_vnni
             return;
         }
 
-        // Tiled GEMM path: N-parallel with 2-row microkernels and K-tiling
+        // N-major GEMM path: each N block owns all two-row tiles.
         auto do_compute = [&]()
         {
 #pragma omp for schedule(static)
@@ -2338,27 +2933,77 @@ namespace llaminar2::cpu::native_vnni
                             float *c0 = C + m * ldc + n_start;
                             float *c1 = C + (m + 1) * ldc + n_start;
 
-                            if (use_avx512)
+                            /*
+                             * The physical microkernel always publishes one
+                             * complete 64-column chunk. A logical tensor row,
+                             * however, is allowed to end partway through that
+                             * chunk. Publishing the last chunk directly would
+                             * overwrite the beginning of the following row and
+                             * would run past the allocation for the final row.
+                             *
+                             * Keep the weight-sharing two-row microkernel for
+                             * the tail, but point it at stack-owned full chunks
+                             * and copy only the logical columns back. For a
+                             * K-tiled call, seed the valid prefix with the
+                             * previously accumulated output; zero padding is
+                             * private scratch and never becomes tensor state.
+                             */
+                            const int n_cols_actual =
+                                std::min(64, N - n_start);
+                            const auto compute_two_rows =
+                                [&](float *output0, float *output1)
                             {
+                                if (use_avx512)
+                                {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                                if (packed.is_nibble_lut)
-                                    gemm_2row_native_chunk(packed, aq0, aq1, c0, c1,
-                                                           chunk, kb_start, kb_end,
-                                                           decode_lut_512, accum);
-                                else
-                                    gemm_2row_int8_chunk(packed, aq0, aq1, c0, c1,
-                                                         chunk, kb_start, kb_end, accum);
+                                    if (packed.is_nibble_lut)
+                                        gemm_2row_native_chunk(
+                                            packed, aq0, aq1, output0, output1,
+                                            chunk, kb_start, kb_end,
+                                            decode_lut_512, accum);
+                                    else
+                                        gemm_2row_int8_chunk(
+                                            packed, aq0, aq1, output0, output1,
+                                            chunk, kb_start, kb_end, accum);
 #endif
+                                }
+                                else
+                                {
+                                    if (packed.is_nibble_lut)
+                                        gemm_2row_native_chunk_avx2(
+                                            packed, aq0, aq1, output0, output1,
+                                            chunk, kb_start, kb_end,
+                                            decode_lut_256, accum);
+                                    else
+                                        gemm_2row_int8_chunk_avx2(
+                                            packed, aq0, aq1, output0, output1,
+                                            chunk, kb_start, kb_end,
+                                            accum);
+                                }
+                            };
+
+                            if (n_cols_actual == 64)
+                            {
+                                compute_two_rows(c0, c1);
                             }
                             else
                             {
-                                if (packed.is_nibble_lut)
-                                    gemm_2row_native_chunk_avx2(packed, aq0, aq1, c0, c1,
-                                                                chunk, kb_start, kb_end,
-                                                                decode_lut_256, accum);
-                                else
-                                    gemm_2row_int8_chunk_avx2(packed, aq0, aq1, c0, c1,
-                                                              chunk, kb_start, kb_end, accum);
+                                /*
+                                 * Keep scratch construction out of the common
+                                 * full-chunk path. This route is selected for
+                                 * throughput, so complete chunks must not pay
+                                 * for 128 unnecessary stores per K tile.
+                                 */
+                                alignas(64) float tail0[64] = {};
+                                alignas(64) float tail1[64] = {};
+                                if (accum)
+                                {
+                                    std::copy_n(c0, n_cols_actual, tail0);
+                                    std::copy_n(c1, n_cols_actual, tail1);
+                                }
+                                compute_two_rows(tail0, tail1);
+                                std::copy_n(tail0, n_cols_actual, c0);
+                                std::copy_n(tail1, n_cols_actual, c1);
                             }
                         }
                     }
@@ -2373,71 +3018,84 @@ namespace llaminar2::cpu::native_vnni
                             int n_start = chunk * 64;
                             float *c_row = C + m * ldc + n_start;
 
-                            if (use_avx512)
+                            /*
+                             * An odd final M row uses the serial-shaped chunk
+                             * kernel, which also writes 64 columns. Give a
+                             * partial N tail the same bounded publication
+                             * contract as the paired-row path above.
+                             */
+                            const int n_cols_actual =
+                                std::min(64, N - n_start);
+                            const auto compute_one_row = [&](float *output)
                             {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                                if (accum)
+                                if (use_avx512)
                                 {
-                                    alignas(64) float tmp[64] = {};
-                                    if (packed.is_nibble_lut)
-                                        gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut_512);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                    if (accum)
+                                    {
+                                        alignas(64) float tmp[64] = {};
+                                        if (packed.is_nibble_lut)
+                                            gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut_512);
+                                        else
+                                            gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
+                                        __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(output), _mm512_load_ps(tmp));
+                                        __m512 s1 = _mm512_add_ps(_mm512_loadu_ps(output + 16), _mm512_load_ps(tmp + 16));
+                                        __m512 s2 = _mm512_add_ps(_mm512_loadu_ps(output + 32), _mm512_load_ps(tmp + 32));
+                                        __m512 s3 = _mm512_add_ps(_mm512_loadu_ps(output + 48), _mm512_load_ps(tmp + 48));
+                                        _mm512_storeu_ps(output, s0);
+                                        _mm512_storeu_ps(output + 16, s1);
+                                        _mm512_storeu_ps(output + 32, s2);
+                                        _mm512_storeu_ps(output + 48, s3);
+                                    }
                                     else
-                                        gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
-                                    __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(c_row), _mm512_load_ps(tmp));
-                                    __m512 s1 = _mm512_add_ps(_mm512_loadu_ps(c_row + 16), _mm512_load_ps(tmp + 16));
-                                    __m512 s2 = _mm512_add_ps(_mm512_loadu_ps(c_row + 32), _mm512_load_ps(tmp + 32));
-                                    __m512 s3 = _mm512_add_ps(_mm512_loadu_ps(c_row + 48), _mm512_load_ps(tmp + 48));
-                                    _mm512_storeu_ps(c_row, s0);
-                                    _mm512_storeu_ps(c_row + 16, s1);
-                                    _mm512_storeu_ps(c_row + 32, s2);
-                                    _mm512_storeu_ps(c_row + 48, s3);
+                                    {
+                                        if (packed.is_nibble_lut)
+                                            gemv_native_vnni_avx512_chunk_native(packed, aq, output, chunk, kb_start, kb_end, decode_lut_512);
+                                        else
+                                            gemv_native_vnni_avx512_chunk_int8(packed, aq, output, chunk, kb_start, kb_end);
+                                    }
+#endif
                                 }
                                 else
                                 {
-                                    if (packed.is_nibble_lut)
-                                        gemv_native_vnni_avx512_chunk_native(packed, aq, c_row, chunk, kb_start, kb_end, decode_lut_512);
+                                    if (accum)
+                                    {
+                                        alignas(64) float tmp[64] = {};
+                                        if (packed.is_nibble_lut)
+                                            gemv_avx2_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut_256);
+                                        else
+                                            gemv_avx2_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
+                                        for (int i = 0; i < 64; i += 8)
+                                        {
+                                            __m256 s = _mm256_add_ps(
+                                                _mm256_loadu_ps(output + i),
+                                                _mm256_load_ps(tmp + i));
+                                            _mm256_storeu_ps(output + i, s);
+                                        }
+                                    }
                                     else
-                                        gemv_native_vnni_avx512_chunk_int8(packed, aq, c_row, chunk, kb_start, kb_end);
+                                    {
+                                        if (packed.is_nibble_lut)
+                                            gemv_avx2_chunk_native(packed, aq, output, chunk, kb_start, kb_end, decode_lut_256);
+                                        else
+                                            gemv_avx2_chunk_int8(packed, aq, output, chunk, kb_start, kb_end);
+                                    }
                                 }
-#endif
+                            };
+
+                            if (n_cols_actual == 64)
+                            {
+                                compute_one_row(c_row);
                             }
                             else
                             {
+                                alignas(64) float tail[64] = {};
                                 if (accum)
-                                {
-                                    alignas(64) float tmp[64] = {};
-                                    if (packed.is_nibble_lut)
-                                        gemv_avx2_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut_256);
-                                    else
-                                        gemv_avx2_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
-                                    for (int i = 0; i < 64; i += 8)
-                                    {
-                                        __m256 s = _mm256_add_ps(
-                                            _mm256_loadu_ps(c_row + i),
-                                            _mm256_load_ps(tmp + i));
-                                        _mm256_storeu_ps(c_row + i, s);
-                                    }
-                                }
-                                else
-                                {
-                                    if (packed.is_nibble_lut)
-                                        gemv_avx2_chunk_native(packed, aq, c_row, chunk, kb_start, kb_end, decode_lut_256);
-                                    else
-                                        gemv_avx2_chunk_int8(packed, aq, c_row, chunk, kb_start, kb_end);
-                                }
+                                    std::copy_n(c_row, n_cols_actual, tail);
+                                compute_one_row(tail);
+                                std::copy_n(tail, n_cols_actual, c_row);
                             }
                         }
-                    }
-                }
-
-                int last_chunk_start = (chunk_start + chunk_count - 1) * 64;
-                int last_n_cols = std::min(64, N - last_chunk_start);
-                if (last_n_cols < 64)
-                {
-                    for (int m_row = 0; m_row < M; ++m_row)
-                    {
-                        for (int i = last_n_cols; i < 64; ++i)
-                            C[m_row * ldc + last_chunk_start + i] = 0.0f;
                     }
                 }
             }
@@ -2449,13 +3107,18 @@ namespace llaminar2::cpu::native_vnni
     /**
      * @brief Grouped runtime-M verifier GEMM with M=1 decode-equivalent row math.
      *
-     * The regular M>1 GEMM path is free to use 2-row microkernels and K tiling
-     * that change FP32 accumulation order.  That is fine for ordinary prefill,
-     * but not for MTP verifier rows that later publish recurrent/KV state:
-     * those rows must match running M individual decode GEMVs.  This helper
-     * keeps the work grouped by parallelizing across `(row, N-block[, K-tile])`
-     * tasks while preserving the exact per-row GEMV chunk and reduction order
-     * used by gemv_native_vnni_preq().
+     * Grouped rows must preserve the production M1 reduction tree whenever
+     * their results can feed speculative or recurrent state. Ordinary full-K
+     * prefill uses its economical two-row kernel directly; when serial M1
+     * selects K partitioning, the ordinary dispatcher enters this same helper.
+     * Work remains grouped across `(row, N-block[, K-tile])` tasks while every
+     * row preserves the exact GEMV chunk and reduction order used by
+     * gemv_native_vnni_preq().
+     *
+     * @param full_k_n_block_chunks_override Exact N-chunk granularity for an
+     *        explicitly selected full-K pair-grid prefill candidate. Zero
+     *        retains the serial-decode-derived verifier geometry. A nonzero
+     *        value is invalid for K-partitioned decode-equivalent execution.
      */
     inline void gemm_native_vnni_preq_decode_equivalent_rows(
         const CPUNativeVNNIPackedWeights &packed,
@@ -2464,7 +3127,9 @@ namespace llaminar2::cpu::native_vnni
         int M,
         int ldc,
         ISAPath isa_path = ISAPath::AUTO,
-        VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto)
+        VerifierRowsPolicy verifier_policy_override = VerifierRowsPolicy::Auto,
+        bool publish_verifier_route = true,
+        int full_k_n_block_chunks_override)
     {
         const int N = packed.N;
         const int K = packed.K;
@@ -2490,6 +3155,21 @@ namespace llaminar2::cpu::native_vnni
 
         const int num_threads = omp_get_max_threads();
         NativeVNNITileConfig cfg = computeTileConfig(N, K, 1, packed.payload_bytes, num_threads);
+        if (full_k_n_block_chunks_override < 0)
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI full-K N-block override must be non-negative");
+        }
+        if (full_k_n_block_chunks_override > 0 && cfg.k_tiles > 1)
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI pair-grid N-block override cannot replace "
+                "the serial decode K-partition geometry");
+        }
+        const int effective_n_block_chunks =
+            full_k_n_block_chunks_override > 0
+                ? full_k_n_block_chunks_override
+                : cfg.n_block_chunks;
 
         /*
          * Route identity is part of the grouped verifier contract.  WideRows
@@ -2499,7 +3179,7 @@ namespace llaminar2::cpu::native_vnni
          * diagnostics from mistaking a normalized launch for a measured wide
          * candidate.
          */
-        if (PerfStatsCollector::isEnabled())
+        if (publish_verifier_route && PerfStatsCollector::isEnabled())
         {
             const bool effective_wide_rows =
                 use_wide_rows && use_avx512 && M >= 3;
@@ -2529,7 +3209,31 @@ namespace llaminar2::cpu::native_vnni
                     {"effective_policy", effective_policy},
                     {"isa", effective_isa},
                     {"k_tiles", std::to_string(cfg.k_tiles)},
-                    {"n_block_chunks", std::to_string(cfg.n_block_chunks)},
+                    {"n_block_chunks", std::to_string(effective_n_block_chunks)},
+                    {"threads", std::to_string(num_threads)}});
+        }
+
+        if (full_k_n_block_chunks_override > 0 &&
+            PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_native_vnni_pair_grid_execution",
+                1.0,
+                "gemm",
+                {},
+                PerfStatsCollector::Tags{
+                    {"m", std::to_string(M)},
+                    {"n", std::to_string(N)},
+                    {"k", std::to_string(K)},
+                    {"codebook", std::to_string(packed.codebook_id)},
+                    {"n_block_chunks",
+                     std::to_string(effective_n_block_chunks)},
+                    {"parallel_tasks",
+                     std::to_string(
+                         ((M + 1) / 2) *
+                         ((N_chunks + effective_n_block_chunks - 1) /
+                          effective_n_block_chunks))},
                     {"threads", std::to_string(num_threads)}});
         }
 
@@ -2740,7 +3444,7 @@ namespace llaminar2::cpu::native_vnni
             return;
         }
 
-        const int n_block_chunks = cfg.n_block_chunks;
+        const int n_block_chunks = effective_n_block_chunks;
         const int total_blocks = (N_chunks + n_block_chunks - 1) / n_block_chunks;
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -3028,6 +3732,19 @@ namespace llaminar2::cpu::native_vnni
         const float *bias = nullptr;
         int N = 0;
         int ldc = 0;
+        /**
+         * Optional projection-local activation base. A null value means that
+         * every projection shares the function-level activation base. This
+         * keeps gate/up bundles and multi-expert down bundles on one audited
+         * scheduler without copying or repacking Q8_1 activations.
+         */
+        const Q8_1Block *input = nullptr;
+        /**
+         * Forceable M=1 schedule used by the decode trainer. Grouped M>1
+         * verifier launches must leave this as Auto because their row policy
+         * is selected independently by the verifier policy table.
+         */
+        DecodeSchedulePolicy decode_schedule = DecodeSchedulePolicy::Auto;
     };
 
     /**
@@ -3054,19 +3771,26 @@ namespace llaminar2::cpu::native_vnni
         int K_blocks,
         ISAPath isa_path = ISAPath::AUTO)
     {
-        if (!A_q8_all || !descs || num_descs <= 0 || M <= 1 || K_blocks <= 0)
+        if (!descs || num_descs <= 0 || M <= 0 || K_blocks <= 0)
             return false;
 
         const int num_threads = omp_get_max_threads();
         for (int p = 0; p < num_descs; ++p)
         {
             const auto &d = descs[p];
-            if (!d.packed || !d.output || d.N <= 0 || d.ldc < d.N ||
+            if (!d.packed || !d.output || (!A_q8_all && !d.input) ||
+                d.N <= 0 || d.ldc < d.N ||
                 d.packed->blocks_per_row != K_blocks)
             {
                 return false;
             }
-
+            if (M > 1 &&
+                d.decode_schedule != DecodeSchedulePolicy::Auto)
+            {
+                throw std::invalid_argument(
+                    "CPU NativeVNNI grouped verifier bundles cannot override "
+                    "the M=1 decode schedule");
+            }
         }
 
         const ISALevel active_isa = activeISALevel();
@@ -3079,6 +3803,12 @@ namespace llaminar2::cpu::native_vnni
             !use_avx512 &&
             ((isa_path == ISAPath::AUTO && active_isa >= ISALevel::AVX2) ||
              isa_path == ISAPath::AVX2);
+        if (!use_avx512 && !use_avx2)
+        {
+            throw std::runtime_error(
+                "CPU NativeVNNI fused decode/verifier execution requires an "
+                "AVX2 or AVX512 grouped implementation");
+        }
 
         struct FusedVerifierRowsPlan
         {
@@ -3089,6 +3819,10 @@ namespace llaminar2::cpu::native_vnni
             int k_blocks_per_tile = 0;
             size_t partial_sums_offset = 0;
             size_t partial_sums_size = 0;
+            DecodeSchedulePolicy requested_decode_schedule =
+                DecodeSchedulePolicy::Auto;
+            DecodeSchedulePolicy effective_decode_schedule =
+                DecodeSchedulePolicy::Auto;
         };
 
         std::vector<FusedVerifierRowsPlan> plans(static_cast<size_t>(num_descs));
@@ -3102,10 +3836,44 @@ namespace llaminar2::cpu::native_vnni
             auto &plan = plans[static_cast<size_t>(p)];
             plan.n_chunks = (d.packed->N + 63) / 64;
             plan.n_block_chunks = std::max(1, cfg.n_block_chunks);
+            plan.k_tiles = cfg.k_tiles;
+            if (M == 1)
+            {
+                plan.requested_decode_schedule = d.decode_schedule;
+                plan.effective_decode_schedule = d.decode_schedule;
+                if (plan.effective_decode_schedule ==
+                    DecodeSchedulePolicy::Auto)
+                {
+                    plan.effective_decode_schedule = selectDecodeSchedulePolicy(
+                        *d.packed,
+                        d.N,
+                        d.packed->K,
+                        use_avx512,
+                        use_avx2,
+                        plan.k_tiles > 1);
+                }
+                if (plan.effective_decode_schedule !=
+                    DecodeSchedulePolicy::FrozenSerialOracle)
+                {
+                    const DecodeSchedulePolicy normalized =
+                        normalizeDecodeSchedulePolicy(
+                            plan.effective_decode_schedule,
+                            plan.n_chunks);
+                    if (plan.requested_decode_schedule ==
+                            DecodeSchedulePolicy::Auto &&
+                        normalized != plan.effective_decode_schedule)
+                    {
+                        throw std::runtime_error(
+                            "Generated CPU NativeVNNI fused M=1 policy selected "
+                            "a nominal N-block width that is not physical");
+                    }
+                    plan.effective_decode_schedule = normalized;
+                    plan.n_block_chunks = decodeScheduleNBlockChunks(normalized);
+                }
+            }
             plan.total_blocks =
                 (plan.n_chunks + plan.n_block_chunks - 1) /
                 plan.n_block_chunks;
-            plan.k_tiles = cfg.k_tiles;
             plan.k_blocks_per_tile =
                 (plan.k_tiles > 1)
                     ? (K_blocks + plan.k_tiles - 1) / plan.k_tiles
@@ -3135,10 +3903,12 @@ namespace llaminar2::cpu::native_vnni
             {
                 const auto &plan = plans[static_cast<size_t>(p)];
                 const bool grouped_k_parallel =
-                    plan.k_tiles > 1 && (use_avx512 || use_avx2);
-                const int physical_row_tile =
-                    grouped_k_parallel ? (use_avx512 ? 4 : 2)
-                                       : ((use_avx512 || use_avx2) ? 2 : 1);
+                    plan.k_tiles > 1;
+                const int physical_row_tile = M == 1
+                                                  ? 1
+                                                  : (grouped_k_parallel
+                                                         ? (use_avx512 ? 4 : 2)
+                                                         : 2);
                 PerfStatsCollector::addCounter(
                     "kernel",
                     "cpu_native_vnni_fused_verifier_rows_projection_launch",
@@ -3153,12 +3923,23 @@ namespace llaminar2::cpu::native_vnni
                         {"projection", std::to_string(p)},
                         {"isa", effective_isa},
                         {"k_tiles", std::to_string(plan.k_tiles)},
+                        {"n_block_chunks",
+                         std::to_string(plan.n_block_chunks)},
+                        {"requested_decode_policy",
+                         decodeSchedulePolicyName(
+                             plan.requested_decode_schedule)},
+                        {"effective_decode_policy",
+                         decodeSchedulePolicyName(
+                             plan.effective_decode_schedule)},
                         {"physical_row_tile", std::to_string(physical_row_tile)},
-                        {"route", grouped_k_parallel
-                                      ? "grouped_k_parallel_row_tiles"
-                                      : ((use_avx512 || use_avx2)
-                                             ? "grouped_full_k_pair_tiles"
-                                             : "scalar_diagnostic")}});
+                        {"route",
+                         M == 1
+                             ? (grouped_k_parallel
+                                    ? "decode_k_parallel_row"
+                                    : "decode_full_k_row")
+                             : (grouped_k_parallel
+                                    ? "grouped_k_parallel_row_tiles"
+                                    : "grouped_full_k_pair_tiles")}});
             }
         }
         /*
@@ -3183,6 +3964,8 @@ namespace llaminar2::cpu::native_vnni
             {
                 const auto &d = descs[p];
                 const auto &packed = *d.packed;
+                const Q8_1Block *projection_input =
+                    d.input ? d.input : A_q8_all;
                 const int N = packed.N;
                 auto &plan = plans[static_cast<size_t>(p)];
                 const int N_chunks = plan.n_chunks;
@@ -3199,6 +3982,111 @@ namespace llaminar2::cpu::native_vnni
                     (use_avx2 && packed.is_nibble_lut)
                         ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
                         : _mm256_setzero_si256();
+
+                if (M == 1 && plan.k_tiles > 1)
+                {
+                    /*
+                     * The fused M=1 path must expose the same forceable
+                     * N-block candidates as ordinary decode even when the
+                     * frozen arithmetic contract uses K-partials. Each task
+                     * owns one `(N block, K tile)` rectangle and writes the
+                     * ordinary `[N chunk][K tile][64]` layout. The following
+                     * reduction therefore has byte-for-byte the same inputs
+                     * and increasing tile order as gemv_native_vnni_preq().
+                     */
+                    const int k_tiles = plan.k_tiles;
+                    const int k_blocks_per_tile = plan.k_blocks_per_tile;
+                    float *partial_sums =
+                        fused_partial_sums_base + plan.partial_sums_offset;
+                    const int total_tasks = total_blocks * k_tiles;
+#pragma omp for schedule(static)
+                    for (int task = 0; task < total_tasks; ++task)
+                    {
+                        const int block_idx = task / k_tiles;
+                        const int kt = task % k_tiles;
+                        const int chunk_start = block_idx * n_block_chunks;
+                        const int chunk_count = std::min(
+                            n_block_chunks, N_chunks - chunk_start);
+                        const int kb_start = kt * k_blocks_per_tile;
+                        const int kb_end = std::min(
+                            kb_start + k_blocks_per_tile, K_blocks);
+                        for (int offset = 0; offset < chunk_count; ++offset)
+                        {
+                            const int chunk = chunk_start + offset;
+                            float *destination =
+                                partial_sums +
+                                (static_cast<size_t>(chunk) * k_tiles + kt) *
+                                    64;
+                            if (use_avx512)
+                            {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                                if (packed.is_nibble_lut)
+                                    gemv_native_vnni_avx512_chunk_native(
+                                        packed,
+                                        projection_input,
+                                        destination,
+                                        chunk,
+                                        kb_start,
+                                        kb_end,
+                                        decode_lut_512);
+                                else
+                                    gemv_native_vnni_avx512_chunk_int8(
+                                        packed,
+                                        projection_input,
+                                        destination,
+                                        chunk,
+                                        kb_start,
+                                        kb_end);
+#endif
+                            }
+                            else if (packed.is_nibble_lut)
+                            {
+                                gemv_avx2_chunk_native(
+                                    packed,
+                                    projection_input,
+                                    destination,
+                                    chunk,
+                                    kb_start,
+                                    kb_end,
+                                    decode_lut_256);
+                            }
+                            else
+                            {
+                                gemv_avx2_chunk_int8(
+                                    packed,
+                                    projection_input,
+                                    destination,
+                                    chunk,
+                                    kb_start,
+                                    kb_end);
+                            }
+                        }
+                    }
+
+#pragma omp for schedule(static)
+                    for (int chunk = 0; chunk < N_chunks; ++chunk)
+                    {
+                        const int n_start = chunk * 64;
+                        const int n_columns = std::min(64, N - n_start);
+                        const float *base =
+                            partial_sums +
+                            static_cast<size_t>(chunk) * k_tiles * 64;
+                        reduceNativeVNNIKTilePartialsExact(
+                            base,
+                            d.output + n_start,
+                            n_columns,
+                            k_tiles,
+                            use_avx512);
+                    }
+
+                    if (d.bias)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int column = 0; column < d.N; ++column)
+                            d.output[column] += d.bias[column];
+                    }
+                    continue;
+                }
 
                 if (plan.k_tiles > 1 && (use_avx512 || use_avx2))
                 {
@@ -3250,7 +4138,8 @@ namespace llaminar2::cpu::native_vnni
                         };
 
                         const Q8_1Block *row0_q8 =
-                            A_q8_all + static_cast<size_t>(row0) * K_blocks;
+                            projection_input +
+                            static_cast<size_t>(row0) * K_blocks;
                         float *dst0 = partial_for_row(row0);
                         if (tile_rows >= 2)
                         {
@@ -3381,20 +4270,6 @@ namespace llaminar2::cpu::native_vnni
                     continue;
                 }
 
-                if (!use_avx512 && !use_avx2)
-                {
-#pragma omp for schedule(static) nowait
-                    for (int row = 0; row < M; ++row)
-                    {
-                        gemv_native_vnni_scalar(
-                            packed,
-                            A_q8_all + static_cast<size_t>(row) * K_blocks,
-                            d.output + static_cast<size_t>(row) * d.ldc,
-                            N,
-                            K_blocks);
-                    }
-                }
-                else
                 {
                     const int row_pairs = (M + 1) / 2;
                     const int total_tasks = row_pairs * total_blocks;
@@ -3417,9 +4292,11 @@ namespace llaminar2::cpu::native_vnni
                     if (row1 < M)
                     {
                         const Q8_1Block *row0_q8 =
-                            A_q8_all + static_cast<size_t>(row0) * K_blocks;
+                            projection_input +
+                            static_cast<size_t>(row0) * K_blocks;
                         const Q8_1Block *row1_q8 =
-                            A_q8_all + static_cast<size_t>(row1) * K_blocks;
+                            projection_input +
+                            static_cast<size_t>(row1) * K_blocks;
                         float *row0_out = d.output + static_cast<size_t>(row0) * d.ldc;
                         float *row1_out = d.output + static_cast<size_t>(row1) * d.ldc;
 
@@ -3479,7 +4356,8 @@ namespace llaminar2::cpu::native_vnni
                     }
 
                     const Q8_1Block *row_q8 =
-                        A_q8_all + static_cast<size_t>(row0) * K_blocks;
+                        projection_input +
+                        static_cast<size_t>(row0) * K_blocks;
                     float *row_out = d.output + static_cast<size_t>(row0) * d.ldc;
                     if (use_avx512)
                     {
@@ -3565,200 +4443,23 @@ namespace llaminar2::cpu::native_vnni
     }
 
     // =========================================================================
-    // Native Q8_0 GEMV — internal implementation
-    // =========================================================================
-    //
-    // These are implementation details called by gemv_native_vnni() when
-    // Q8_0 blocks are provided. For Q8_0 weights (8-bit symmetric, 34
-    // bytes/block), the packed VNNI format's 3-array layout creates too
-    // many memory streams for the hardware prefetcher. Reading native
-    // blocks directly is faster: one contiguous stream per row.
-    //
-    // VNNI path (AVX512_VNNI + AVX512VL): Pre-quantize FP32 activation
-    // to Q8_1 once, then use 256-bit vpdpbusd via abs()+sign() trick for
-    // signed×signed dot product. ~2× fewer instructions than FP32 FMA.
-    //
-    // FMA fallback (AVX512F only): F16C hardware scale conversion,
-    // 4-block unrolled FMA with FP32 activation.
-
-#if defined(__AVX512F__)
-
-    /**
-     * @brief Hardware FP16→FP32 conversion using F16C (vcvtph2ps).
-     * Single instruction vs the software path which has branches and bit ops.
-     */
-    static inline float hw_fp16_to_fp32(uint16_t h)
-    {
-        return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
-    }
-
-    /**
-     * @brief VNNI-accelerated Q8_0 row dot product with pre-quantized INT8 activation.
-     *
-     * Uses 256-bit AVX512_VNNI vpdpbusd via the abs()+sign() trick for true
-     * signed×signed dot product without bias correction. ~2× fewer instructions
-     * than an FP32 FMA approach: 8 instr/block vs ~15.
-     *
-     * Q8_0 weight values are in [-127,127] (never -128), so abs() is exact.
-     *
-     * @param row     Q8_0 weight blocks for one output row (bpr blocks)
-     * @param a_q8    Q8_1 activation blocks (pre-quantized from FP32)
-     * @param bpr     Blocks per row (K / 32)
-     * @return        Scalar dot product with scale weighting
-     */
-    static inline float gemv_dot_row_q8_0_vnni(
-        const Q8_0Block *__restrict row,
-        const Q8_1Block *__restrict a_q8,
-        int bpr)
-    {
-        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-
-        int kb = 0;
-
-        // Main loop: 4-block unroll for ILP across independent FMA chains
-        for (; kb + 3 < bpr; kb += 4)
-        {
-            // Block 0: abs(w)*sign(a,w) → vpdpbusd → scale → FMA accumulate
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb].qs));
-                const __m256i sumi = _mm256_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = hw_fp16_to_fp32(row[kb].d) * hw_fp16_to_fp32(a_q8[kb].d);
-                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc0);
-            }
-            // Block 1
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 1].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 1].qs));
-                const __m256i sumi = _mm256_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = hw_fp16_to_fp32(row[kb + 1].d) * hw_fp16_to_fp32(a_q8[kb + 1].d);
-                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc1);
-            }
-            // Block 2
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 2].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 2].qs));
-                const __m256i sumi = _mm256_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = hw_fp16_to_fp32(row[kb + 2].d) * hw_fp16_to_fp32(a_q8[kb + 2].d);
-                acc2 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc2);
-            }
-            // Block 3
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 3].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 3].qs));
-                const __m256i sumi = _mm256_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = hw_fp16_to_fp32(row[kb + 3].d) * hw_fp16_to_fp32(a_q8[kb + 3].d);
-                acc3 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc3);
-            }
-        }
-
-        // Tail: remaining 1-3 blocks
-        for (; kb < bpr; ++kb)
-        {
-            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb].qs));
-            const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb].qs));
-            const __m256i sumi = _mm256_dpbusd_epi32(
-                _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-            const float sp = hw_fp16_to_fp32(row[kb].d) * hw_fp16_to_fp32(a_q8[kb].d);
-            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc0);
-        }
-
-        // Horizontal reduce: 4 × YMM (8 FP32 each) → 1 scalar
-        const __m256 sum01 = _mm256_add_ps(acc0, acc1);
-        const __m256 sum23 = _mm256_add_ps(acc2, acc3);
-        const __m256 total = _mm256_add_ps(sum01, sum23);
-        const __m128 hi = _mm256_extractf128_ps(total, 1);
-        const __m128 lo = _mm256_castps256_ps128(total);
-        __m128 sum128 = _mm_add_ps(lo, hi);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        return _mm_cvtss_f32(sum128);
-    }
-
-    /**
-     * @brief Row-parallel Q8_0 GEMV from native blocks.
-     *
-     * C[n] = Σ_kb  scale[n][kb] * dot(qs[n][kb], A[kb*32..(kb+1)*32-1])
-     *
-     * @param blocks  Native Q8_0 blocks [N × bpr], contiguous in memory
-     * @param A       FP32 activation vector [K]
-     * @param C       FP32 output vector [N]
-     * @param N       Number of output rows
-     * @param K       Input dimension
-     * @param bpr     Blocks per row (= K / 32)
-     */
-    inline void q8_0_native_gemv(
-        const Q8_0Block *__restrict blocks,
-        const float *__restrict A,
-        float *__restrict C,
-        int N,
-        int K,
-        int bpr)
-    {
-        (void)K;
-
-        // VNNI path: pre-quantize activation to Q8_1, then use vpdpbusd
-        static thread_local std::vector<Q8_1Block> a_q8_tls;
-        if (static_cast<int>(a_q8_tls.size()) < bpr)
-            a_q8_tls.resize(bpr);
-        Q8_1Block *A_q8 = a_q8_tls.data();
-
-        // Quantize FP32 activation → Q8_1 (single-threaded, amortized over all rows)
-        {
-            int kb = 0;
-            for (; kb + 1 < bpr; kb += 2)
-                simd::quantize_two_blocks_avx512(A + kb * 32, A_q8[kb], A_q8[kb + 1]);
-            for (; kb < bpr; ++kb)
-                simd::quantize_single_block(A + kb * 32, A_q8[kb], 32);
-        }
-
-        // Serial fast path for small N (same rationale as gemv_native_vnni_preq)
-        int num_threads = omp_get_max_threads();
-        if (!omp_in_parallel() && N < num_threads)
-        {
-            for (int n = 0; n < N; ++n)
-            {
-                const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * bpr;
-                C[n] = gemv_dot_row_q8_0_vnni(row, A_q8, bpr);
-            }
-            return;
-        }
-
-        auto do_gemv = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * bpr;
-                C[n] = gemv_dot_row_q8_0_vnni(row, A_q8, bpr);
-            }
-        };
-        OMP_WORKSHARE_REGION(do_gemv);
-    }
-
-    // =========================================================================
     // Fused multi-projection GEMV (single OMP region, all formats)
     // =========================================================================
 
     /**
      * @brief Descriptor for one projection in a fused GEMV call.
      *
-     * Supports both Q8_0-raw (row-parallel on native blocks) and interleaved
-     * (chunk-parallel on VNNI-packed data) weight layouts.
+     * Every projection owns the eager interleaved representation used by the
+     * ordinary GEMV entry point. Keeping one prepared representation prevents
+     * fused inference from silently selecting a different Q8_0 arithmetic and
+     * scheduling path than the path certified by the all-format trainer.
      */
     struct FusedGemvDesc
     {
-        const CPUNativeVNNIPackedWeights *packed; // interleaved packed weights (always set)
-        const Q8_0Block *q8_0_raw;                // non-null for Q8_0 zero-copy (row-parallel)
+        const CPUNativeVNNIPackedWeights *packed; // eager interleaved weights
         float *output;                            // output vector [N]
         const float *bias;                        // optional bias [N], nullptr if none
         int N;                                    // number of output rows
-        int bpr;                                  // blocks per row (for Q8_0 raw path)
     };
 
     /**
@@ -3769,262 +4470,69 @@ namespace llaminar2::cpu::native_vnni
      * can immediately start the next — critical for work balancing when
      * projection sizes differ (e.g., Q=3584, K=512, V=512 with 56 threads).
      *
-     * Supports mixed formats: Q8_0 deferred (row-parallel on raw blocks) and
-     * any interleaved format (chunk-parallel on VNNI-packed data).
-     *
      * @param A_q8              Pre-quantized Q8_1 activations [K_blocks]
      * @param descs             Array of projection descriptors
      * @param num_descs         Number of projections
+     * @param isa_path          Runtime ISA selection used by every projection
+     * @param schedule_override Forceable M=1 ownership policy for training
+     *
+     * @throws std::invalid_argument if descriptors do not share one K width.
+     * @throws std::runtime_error if the shared grouped engine rejects the
+     *         production bundle or no vector implementation is available.
      */
     inline void gemv_native_vnni_fused_preq(
         const Q8_1Block *__restrict A_q8,
         const FusedGemvDesc *descs,
-        int num_descs)
+        int num_descs,
+        ISAPath isa_path = ISAPath::AUTO,
+        DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
-        auto do_fused = [&]()
+        if (!A_q8 || !descs || num_descs <= 0)
+            throw std::invalid_argument(
+                "CPU NativeVNNI fused decode requires input and descriptors");
+
+        const int K_blocks = descs[0].packed
+                                 ? descs[0].packed->blocks_per_row
+                                 : 0;
+        if (K_blocks <= 0)
+            throw std::invalid_argument(
+                "CPU NativeVNNI fused decode has an invalid first projection");
+
+        std::vector<FusedVerifierRowsDesc> fused_rows;
+        fused_rows.reserve(static_cast<size_t>(num_descs));
+        for (int projection = 0; projection < num_descs; ++projection)
         {
-            for (int p = 0; p < num_descs; ++p)
+            const FusedGemvDesc &d = descs[projection];
+            if (!d.packed || !d.output || d.N <= 0 ||
+                d.packed->blocks_per_row != K_blocks)
             {
-                const auto &d = descs[p];
-
-                if (d.q8_0_raw)
-                {
-                    // Q8_0 raw blocks: row-parallel (one row per thread)
-                    const int proj_N = d.N;
-                    const int proj_bpr = d.bpr;
-                    const Q8_0Block *__restrict blocks = d.q8_0_raw;
-
-#pragma omp for schedule(static) nowait
-                    for (int n = 0; n < proj_N; ++n)
-                    {
-                        const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * proj_bpr;
-                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
-                        if (d.bias)
-                            val += d.bias[n];
-                        d.output[n] = val;
-                    }
-                }
-                else
-                {
-                    // Interleaved: chunk-parallel (64 columns per chunk)
-                    const auto &packed = *d.packed;
-                    const int N = packed.N;
-                    const int N_chunks = (N + 63) / 64;
-                    const int K_blocks = packed.blocks_per_row;
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                    const __m512i decode_lut = packed.is_nibble_lut
-                                                   ? build_decode_lut(packed.codebook_id)
-                                                   : _mm512_setzero_si512();
-
-#pragma omp for schedule(static) nowait
-                    for (int chunk = 0; chunk < N_chunks; ++chunk)
-                    {
-                        gemv_native_vnni_avx512_block(packed, A_q8, d.output,
-                                                      chunk, 1, K_blocks, N, decode_lut);
-                    }
-#else
-                    const __m256i decode_lut = packed.is_nibble_lut
-                                                   ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
-                                                   : _mm256_setzero_si256();
-#pragma omp for schedule(static) nowait
-                    for (int chunk = 0; chunk < N_chunks; ++chunk)
-                    {
-                        gemv_avx2_block(packed, A_q8, d.output, chunk, 1, K_blocks, N, decode_lut);
-                    }
-#endif
-                    // Barrier: all GEMV chunks must complete before bias pass
-                    // reads d.output. Without this, threads with 0 GEMV chunks
-                    // (when N_chunks < num_threads) race into the bias loop
-                    // and read output locations still being written by GEMV threads.
-                    if (d.bias)
-                    {
-#pragma omp barrier
-#pragma omp for schedule(static) nowait
-                        for (int i = 0; i < d.N; ++i)
-                            d.output[i] += d.bias[i];
-                    }
-                }
+                throw std::invalid_argument(
+                    "CPU NativeVNNI fused decode descriptors must have valid "
+                    "outputs and one shared K width");
             }
-
-            // Final barrier: ensure all projections are complete before
-            // the caller reads outputs.
-#pragma omp barrier
-        };
-        OMP_WORKSHARE_REGION(do_fused);
-    }
-
-#else // !defined(__AVX512F__)
-
-    /*
-     * AVX2-only builds still need the same decode economics as AVX512:
-     * MoE single-token gate/up fusion depends on one quantization pass and one
-     * OpenMP region spanning all active expert projections. Keep the row dot
-     * vectorized here too so Q8_0 raw expert weights do not fall back to scalar.
-     */
-    static inline float gemv_dot_row_q8_0_vnni(
-        const Q8_0Block *__restrict row,
-        const Q8_1Block *__restrict a_q8,
-        int bpr)
-    {
-        __m256 acc0 = _mm256_setzero_ps();
-        __m256 acc1 = _mm256_setzero_ps();
-        __m256 acc2 = _mm256_setzero_ps();
-        __m256 acc3 = _mm256_setzero_ps();
-
-        int kb = 0;
-        for (; kb + 3 < bpr; kb += 4)
-        {
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb].qs));
-                const __m256i sumi = isa::avx2_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = simd::fp16_to_fp32(row[kb].d) * simd::fp16_to_fp32(a_q8[kb].d);
-                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc0);
-            }
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 1].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 1].qs));
-                const __m256i sumi = isa::avx2_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = simd::fp16_to_fp32(row[kb + 1].d) * simd::fp16_to_fp32(a_q8[kb + 1].d);
-                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc1);
-            }
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 2].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 2].qs));
-                const __m256i sumi = isa::avx2_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = simd::fp16_to_fp32(row[kb + 2].d) * simd::fp16_to_fp32(a_q8[kb + 2].d);
-                acc2 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc2);
-            }
-            {
-                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 3].qs));
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 3].qs));
-                const __m256i sumi = isa::avx2_dpbusd_epi32(
-                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-                const float sp = simd::fp16_to_fp32(row[kb + 3].d) * simd::fp16_to_fp32(a_q8[kb + 3].d);
-                acc3 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc3);
-            }
+            fused_rows.push_back(FusedVerifierRowsDesc{
+                .packed = d.packed,
+                .output = d.output,
+                .bias = d.bias,
+                .N = d.N,
+                .ldc = d.N,
+                .input = nullptr,
+                .decode_schedule = schedule_override,
+            });
         }
 
-        for (; kb < bpr; ++kb)
+        if (!gemm_native_vnni_fused_verifier_rows_preq(
+                A_q8,
+                fused_rows.data(),
+                static_cast<int>(fused_rows.size()),
+                1,
+                K_blocks,
+                isa_path))
         {
-            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb].qs));
-            const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb].qs));
-            const __m256i sumi = isa::avx2_dpbusd_epi32(
-                _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
-            const float sp = simd::fp16_to_fp32(row[kb].d) * simd::fp16_to_fp32(a_q8[kb].d);
-            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc0);
+            throw std::runtime_error(
+                "CPU NativeVNNI fused decode bundle was rejected");
         }
-
-        const __m256 sum01 = _mm256_add_ps(acc0, acc1);
-        const __m256 sum23 = _mm256_add_ps(acc2, acc3);
-        return isa::hsum_ps_avx2(_mm256_add_ps(sum01, sum23));
     }
-
-    inline void q8_0_native_gemv(
-        const Q8_0Block *__restrict blocks,
-        const float *__restrict A,
-        float *__restrict C,
-        int N,
-        int K,
-        int bpr)
-    {
-        static thread_local std::vector<Q8_1Block> a_q8_tls;
-        if (static_cast<int>(a_q8_tls.size()) < bpr)
-            a_q8_tls.resize(bpr);
-        Q8_1Block *A_q8 = a_q8_tls.data();
-
-        for (int kb = 0; kb < bpr; ++kb)
-        {
-            const int block_start = kb * 32;
-            const int block_len = std::min(32, K - block_start);
-            simd::quantize_single_block(A + block_start, A_q8[kb], block_len);
-        }
-
-        auto do_gemv = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * bpr;
-                C[n] = gemv_dot_row_q8_0_vnni(row, A_q8, bpr);
-            }
-        };
-        OMP_WORKSHARE_REGION(do_gemv);
-    }
-
-    struct FusedGemvDesc
-    {
-        const CPUNativeVNNIPackedWeights *packed;
-        const Q8_0Block *q8_0_raw;
-        float *output;
-        const float *bias;
-        int N;
-        int bpr;
-    };
-
-    inline void gemv_native_vnni_fused_preq(
-        const Q8_1Block *__restrict A_q8,
-        const FusedGemvDesc *descs,
-        int num_descs)
-    {
-        auto do_fused = [&]()
-        {
-            for (int p = 0; p < num_descs; ++p)
-            {
-                const auto &d = descs[p];
-
-                if (d.q8_0_raw)
-                {
-                    const int proj_N = d.N;
-                    const int proj_bpr = d.bpr;
-                    const Q8_0Block *__restrict blocks = d.q8_0_raw;
-
-#pragma omp for schedule(static) nowait
-                    for (int n = 0; n < proj_N; ++n)
-                    {
-                        const Q8_0Block *__restrict row =
-                            blocks + static_cast<size_t>(n) * proj_bpr;
-                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
-                        if (d.bias)
-                            val += d.bias[n];
-                        d.output[n] = val;
-                    }
-                }
-                else
-                {
-                    const auto &packed = *d.packed;
-                    const int N = packed.N;
-                    const int N_chunks = (N + 63) / 64;
-                    const int K_blocks = packed.blocks_per_row;
-                    const __m256i decode_lut = packed.is_nibble_lut
-                                                   ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
-                                                   : _mm256_setzero_si256();
-
-#pragma omp for schedule(static) nowait
-                    for (int chunk = 0; chunk < N_chunks; ++chunk)
-                    {
-                        gemv_avx2_block(packed, A_q8, d.output, chunk, 1, K_blocks, N, decode_lut);
-                    }
-
-                    if (d.bias)
-                    {
-#pragma omp barrier
-#pragma omp for schedule(static) nowait
-                        for (int n = 0; n < d.N; ++n)
-                            d.output[n] += d.bias[n];
-                    }
-                }
-            }
-
-#pragma omp barrier
-        };
-        OMP_WORKSHARE_REGION(do_fused);
-    }
-
-#endif // __AVX512F__
 
     // =========================================================================
     // Fused multi-input GEMV (single OMP region, different Q8_1 input per desc)
@@ -4042,10 +4550,8 @@ namespace llaminar2::cpu::native_vnni
     {
         const Q8_1Block *A_q8;                    // per-projection Q8_1 input
         const CPUNativeVNNIPackedWeights *packed;  // packed weights
-        const Q8_0Block *q8_0_raw;                // non-null for Q8_0 zero-copy path
         float *output;                            // output vector [N]
         int N;                                    // number of output rows
-        int bpr;                                  // blocks per row
     };
 
     /**
@@ -4057,63 +4563,56 @@ namespace llaminar2::cpu::native_vnni
      */
     inline void gemv_fused_multi_input_preq(
         const FusedGemvMultiInputDesc *descs,
-        int num_descs)
+        int num_descs,
+        ISAPath isa_path = ISAPath::AUTO,
+        DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
-        auto do_fused = [&]()
+        if (!descs || num_descs <= 0)
+            throw std::invalid_argument(
+                "CPU NativeVNNI fused multi-input decode requires descriptors");
+
+        const int K_blocks = descs[0].packed
+                                 ? descs[0].packed->blocks_per_row
+                                 : 0;
+        if (K_blocks <= 0)
+            throw std::invalid_argument(
+                "CPU NativeVNNI fused multi-input decode has an invalid first "
+                "projection");
+
+        std::vector<FusedVerifierRowsDesc> fused_rows;
+        fused_rows.reserve(static_cast<size_t>(num_descs));
+        for (int projection = 0; projection < num_descs; ++projection)
         {
-            for (int p = 0; p < num_descs; ++p)
+            const FusedGemvMultiInputDesc &d = descs[projection];
+            if (!d.A_q8 || !d.packed || !d.output || d.N <= 0 ||
+                d.packed->blocks_per_row != K_blocks)
             {
-                const auto &d = descs[p];
-
-                if (d.q8_0_raw)
-                {
-                    const int proj_N = d.N;
-                    const int proj_bpr = d.bpr;
-                    const Q8_0Block *__restrict blocks = d.q8_0_raw;
-                    const Q8_1Block *__restrict A_q8 = d.A_q8;
-
-#pragma omp for schedule(static) nowait
-                    for (int n = 0; n < proj_N; ++n)
-                    {
-                        const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * proj_bpr;
-                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
-                        d.output[n] = val;
-                    }
-                }
-                else
-                {
-                    const auto &packed = *d.packed;
-                    const int N = packed.N;
-                    const int N_chunks = (N + 63) / 64;
-                    const int K_blocks = packed.blocks_per_row;
-                    const Q8_1Block *__restrict A_q8 = d.A_q8;
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                    const __m512i decode_lut = packed.is_nibble_lut
-                                                   ? build_decode_lut(packed.codebook_id)
-                                                   : _mm512_setzero_si512();
-
-#pragma omp for schedule(static) nowait
-                    for (int chunk = 0; chunk < N_chunks; ++chunk)
-                    {
-                        gemv_native_vnni_avx512_block(packed, A_q8, d.output,
-                                                      chunk, 1, K_blocks, N, decode_lut);
-                    }
-#else
-                    const __m256i decode_lut = packed.is_nibble_lut
-                                                   ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
-                                                   : _mm256_setzero_si256();
-#pragma omp for schedule(static) nowait
-                    for (int chunk = 0; chunk < N_chunks; ++chunk)
-                    {
-                        gemv_avx2_block(packed, A_q8, d.output, chunk, 1, K_blocks, N, decode_lut);
-                    }
-#endif
-                }
+                throw std::invalid_argument(
+                    "CPU NativeVNNI fused multi-input descriptors must have "
+                    "valid buffers and one shared K width");
             }
+            fused_rows.push_back(FusedVerifierRowsDesc{
+                .packed = d.packed,
+                .output = d.output,
+                .bias = nullptr,
+                .N = d.N,
+                .ldc = d.N,
+                .input = d.A_q8,
+                .decode_schedule = schedule_override,
+            });
+        }
 
-#pragma omp barrier
-        };
-        OMP_WORKSHARE_REGION(do_fused);
+        if (!gemm_native_vnni_fused_verifier_rows_preq(
+                nullptr,
+                fused_rows.data(),
+                static_cast<int>(fused_rows.size()),
+                1,
+                K_blocks,
+                isa_path))
+        {
+            throw std::runtime_error(
+                "CPU NativeVNNI fused multi-input decode bundle was rejected");
+        }
     }
 
 } // namespace llaminar2::cpu::native_vnni

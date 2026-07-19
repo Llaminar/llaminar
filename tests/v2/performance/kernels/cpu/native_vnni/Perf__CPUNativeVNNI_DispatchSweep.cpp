@@ -28,6 +28,7 @@
 #include <csignal>
 #include <cstring>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -116,6 +117,7 @@ namespace
     struct ModelDims
     {
         std::string label;  // e.g. "0.5B", "7B"
+        int parameter_scale_tenths_of_billions;
         int d_model;
         int n_heads;
         int n_kv_heads;
@@ -124,11 +126,11 @@ namespace
     };
 
     static const std::vector<ModelDims> ALL_MODEL_DIMS = {
-        {"0.5B",  896, 14, 2,  64,  4864},
-        {"3B",   2048, 16, 2, 128, 11008},
-        {"7B",   3584, 28, 4, 128, 18944},
-        {"14B",  5120, 40, 8, 128, 13824},
-        {"32B",  5120, 40, 8, 128, 27648},
+        {"0.5B",   5,  896, 14, 2,  64,  4864},
+        {"3B",    30, 2048, 16, 2, 128, 11008},
+        {"7B",    70, 3584, 28, 4, 128, 18944},
+        {"14B",  140, 5120, 40, 8, 128, 13824},
+        {"32B",  320, 5120, 40, 8, 128, 27648},
     };
 
     static std::vector<GEMMShape> shapesForModel(const ModelDims &m)
@@ -279,8 +281,40 @@ namespace
     static const std::vector<int> K_TILE_BLOCKS_VALUES = {0, 16, 32, 64, 128, 256};
     // m_unroll: M-loop unroll factor
     static const std::vector<int> M_UNROLL_VALUES = {0, 1, 2, 4};
-    // Batch sizes for prefill
-    static const std::vector<int> PREFILL_M_VALUES = {64, 256, 1024, 1788};
+    // Sparse logarithmic buckets expose dispatch transitions without timing
+    // every intervening row count. The per-model ceiling below prevents the
+    // largest CPU projections from dominating a canonical collection.
+    static const std::vector<int> PREFILL_M_VALUES = {
+        64, 256, 1024, 2048, 4096, 8192, 16384};
+
+    /**
+     * @brief Return the largest economical prefill depth for one model tier.
+     *
+     * Qwen2.5 32B projections stop at 1024 rows. The 14B tier extends through
+     * 4096 rows, while 9B-and-smaller models exercise the complete 16384-row
+     * range. Keeping model scale explicit makes future 9B entries inherit the
+     * intended tier without parsing a human-readable label.
+     */
+    static int maximumPrefillM(const ModelDims &model)
+    {
+        if (model.parameter_scale_tenths_of_billions <= 90)
+            return 16384;
+        if (model.parameter_scale_tenths_of_billions <= 140)
+            return 4096;
+        return 1024;
+    }
+
+    /** @brief Select canonical prefill buckets up to a model's economy cap. */
+    static std::vector<int> prefillMValues(const ModelDims &model)
+    {
+        std::vector<int> result;
+        const int maximum_m = maximumPrefillM(model);
+        std::copy_if(PREFILL_M_VALUES.begin(),
+                     PREFILL_M_VALUES.end(),
+                     std::back_inserter(result),
+                     [maximum_m](int m) { return m <= maximum_m; });
+        return result;
+    }
 
     // =========================================================================
     // Core sweep function
@@ -527,6 +561,30 @@ namespace
         void TearDown() override { clearOverrides(); }
     };
 
+    /**
+     * @brief Lock the economical model-tiered prefill measurement matrix.
+     *
+     * This test performs no tensor allocation or kernel work. It prevents a
+     * future trainer edit from restoring giant 32B prefills or accidentally
+     * dropping the deep-M coverage intended for 9B-and-smaller models.
+     */
+    TEST(CPUNativeVNNIPrefillMatrix, ModelScaleSelectsExpectedMDepths)
+    {
+        const std::vector<int> through_1024 = {64, 256, 1024};
+        const std::vector<int> through_4096 = {
+            64, 256, 1024, 2048, 4096};
+        const std::vector<int> through_16384 = {
+            64, 256, 1024, 2048, 4096, 8192, 16384};
+
+        EXPECT_EQ(prefillMValues(ALL_MODEL_DIMS.at(4)), through_1024);
+        EXPECT_EQ(prefillMValues(ALL_MODEL_DIMS.at(3)), through_4096);
+        EXPECT_EQ(prefillMValues(ALL_MODEL_DIMS.at(2)), through_16384);
+
+        const ModelDims future_qwen_9b = {
+            "9B", 90, 4096, 32, 8, 128, 14336};
+        EXPECT_EQ(prefillMValues(future_qwen_9b), through_16384);
+    }
+
     // -----------------------------------------------------------------------
     // DECODE (M=1): Full sweep for Q8_0 across all Qwen 7B shapes
     // -----------------------------------------------------------------------
@@ -566,7 +624,7 @@ namespace
     }
 
     // -----------------------------------------------------------------------
-    // PREFILL: Q8_0 sweep at M=64, 256, 1024, 1788 for key FFN shapes
+    // PREFILL: Q8_0 sweep through M=16384 for key Qwen 7B FFN shapes
     // -----------------------------------------------------------------------
     TEST_F(CPUNativeVNNIDispatchSweepTest, Q8_0_Prefill_7B)
     {
@@ -606,7 +664,7 @@ namespace
         std::vector<SweepResult> all;
         bool header = false;
 
-        for (int M : {256, 1788})
+        for (int M : PREFILL_M_VALUES)
         {
             for (const auto &shape : prefill_shapes)
             {
@@ -644,7 +702,7 @@ namespace
     }
 
     // -----------------------------------------------------------------------
-    // PREFILL: Multi-model sweep — Q8_0 at M=256,1024 across all sizes
+    // PREFILL: Multi-model sweep with model-tiered M ceilings
     //
     // Uses representative M values; FFN shapes dominate prefill time.
     // -----------------------------------------------------------------------
@@ -663,7 +721,7 @@ namespace
                 {model.label + "_Wo_proj",  "Attn", model.d_model, q_n},
             };
 
-            for (int M : {256, 1024})
+            for (int M : prefillMValues(model))
             {
                 for (const auto &shape : pfill_shapes)
                 {

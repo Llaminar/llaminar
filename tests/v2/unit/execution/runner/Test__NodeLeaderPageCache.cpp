@@ -39,10 +39,9 @@ struct PageCacheDecision
 PageCacheDecision decide_page_cache_strategy(const IMPIContext *mpi_ctx, bool use_mmap, bool target_is_gpu)
 {
     PageCacheDecision decision;
-    (void)target_is_gpu;
 
     const bool is_multi_rank = mpi_ctx && mpi_ctx->world_size() > 1;
-    if (!use_mmap)
+    if (!use_mmap || target_is_gpu)
         return decision;
 
     if (!is_multi_rank)
@@ -192,16 +191,15 @@ TEST(Test__NodeLeaderPageCache, NoTopology_NonRootDoesNotPrepopulate)
 // Tests: Edge cases
 // =========================================================================
 
-TEST(Test__NodeLeaderPageCache, SingleRankGpu_PrepopulatesAndSkipsEviction)
+TEST(Test__NodeLeaderPageCache, SingleRankGpu_RemainsDemandPaged)
 {
     auto ctx = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
     auto d = decide_page_cache_strategy(ctx.get(), /*use_mmap=*/true, /*target_is_gpu=*/true);
 
-    EXPECT_TRUE(d.should_prepopulate)
-        << "single-rank GPU mmap must warm the page cache before tensor-sized upload faults";
-    EXPECT_TRUE(d.should_skip_cache_eviction)
-        << "MmapRegion must not evict the just-warmed cache before GPU staging copies";
+    EXPECT_FALSE(d.should_prepopulate)
+        << "GPU-only mmap must not read the whole GGUF into host page cache";
+    EXPECT_FALSE(d.should_skip_cache_eviction);
     EXPECT_FALSE(d.used_intra_node_barrier);
     EXPECT_FALSE(d.used_world_barrier);
     EXPECT_FALSE(d.used_fallback);
@@ -241,9 +239,23 @@ TEST(Test__NodeLeaderPageCache, NullContext_TreatedAsSingleProcess)
 {
     auto d = decide_page_cache_strategy(nullptr, /*use_mmap=*/true, /*target_is_gpu=*/true);
 
-    EXPECT_TRUE(d.should_prepopulate)
-        << "a missing MPI context is still a single-process mmap load";
-    EXPECT_TRUE(d.should_skip_cache_eviction);
+    EXPECT_FALSE(d.should_prepopulate);
+    EXPECT_FALSE(d.should_skip_cache_eviction);
+}
+
+TEST(Test__NodeLeaderPageCache, MultiRankGpu_DoesNotElectPageCacheLeader)
+{
+    auto topo = MockMPITopology::createSimple(/*rank=*/0, /*world_size=*/4,
+                                               /*ranks_per_node=*/2);
+    auto ctx = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/4);
+    ctx->set_topology(topo, MPI_COMM_WORLD);
+
+    auto d = decide_page_cache_strategy(ctx.get(), /*use_mmap=*/true, /*target_is_gpu=*/true);
+
+    EXPECT_FALSE(d.should_prepopulate);
+    EXPECT_FALSE(d.should_skip_cache_eviction);
+    EXPECT_FALSE(d.used_intra_node_barrier);
+    EXPECT_FALSE(d.used_world_barrier);
 }
 
 // =========================================================================

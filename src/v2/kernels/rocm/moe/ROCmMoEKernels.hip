@@ -11385,7 +11385,9 @@ __global__ void rocm_moe_count_per_expert_kernel(
 // Kernel 11: Exclusive Scan
 //
 // Computes exclusive prefix sum on expert_counts → expert_offsets.
-// Single block, single thread (num_experts ≤ 256; serial cost negligible).
+// Single block, single thread. The loop is runtime-sized and supports the
+// 512-entry ROCm grouped-prefill descriptor contract; serial cost remains tiny
+// relative to the expert projections and avoids host-visible scan state.
 // Also preserves expert_counts (the original counts are needed by caller).
 // =========================================================================
 

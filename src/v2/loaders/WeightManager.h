@@ -257,7 +257,8 @@ namespace llaminar2
             std::function<bool(const std::string &)> layer_filter = nullptr,
             const FrozenModelWeightSet *frozen_weights = nullptr,
             bool include_expert_jobs = true,
-            const MoEExpertOverlayPreparationPlan *overlay_preparation_plan = nullptr);
+            const MoEExpertOverlayPreparationPlan *overlay_preparation_plan = nullptr,
+            std::optional<size_t> staging_budget_bytes_override = std::nullopt);
 
         /**
          * @brief Upload all non-GEMM weights to GPU

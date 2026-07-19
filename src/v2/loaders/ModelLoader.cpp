@@ -1133,9 +1133,30 @@ namespace llaminar2
         // Calculate slice byte range
         size_t slice_offset = row_start * bytes_per_row;
         size_t slice_bytes = slice_rows * bytes_per_row;
+        std::vector<size_t> slice_shape = {slice_rows, cols};
 
         LOG_TRACE("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
                                              << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
+
+        // Quantized row slices are contiguous in GGUF. Keep them as a view into
+        // the demand-paged mapping instead of allocating and copying the entire
+        // TP shard into anonymous RAM before GPU preparation begins.
+        if (mmap_region_ && info->isQuantized() &&
+            weight_precision == WeightPrecision::NATIVE && factory_)
+        {
+            auto mmap_owner = getMmapRegion(info);
+            const uint64_t end_offset = getDataOffset(info) + info->offset +
+                                        slice_offset + slice_bytes;
+            if (!mmap_owner || end_offset > mmap_owner->size())
+            {
+                LOG_ERROR("[ModelLoader] Row slice extends past end of mapped file: " << tensor_name);
+                return nullptr;
+            }
+            return factory_->createQuantizedZeroCopy(
+                ggufToTensorType(info->type), slice_shape,
+                getMmapPtr(info) + slice_offset, slice_bytes,
+                std::move(mmap_owner));
+        }
 
         // Ensure NUMA binding before allocating the temporary read buffer
         if (factory_)
@@ -1197,9 +1218,6 @@ namespace llaminar2
                 return nullptr;
             }
         } // Release file_mutex_ - tensor creation can proceed in parallel
-
-        // Create shape for sliced tensor
-        std::vector<size_t> slice_shape = {slice_rows, cols};
 
         // Handle weight precision conversion (same as loadTensor)
         bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
@@ -1563,9 +1581,30 @@ namespace llaminar2
         size_t bytes_per_expert = ne1 * bytes_per_row;
         size_t slice_offset = expert_start * bytes_per_expert;
         size_t slice_bytes = local_count * bytes_per_expert;
+        std::vector<size_t> slice_shape = {ne0, ne1, local_count};
 
         LOG_TRACE("[ModelLoader] Expert slice " << tensor_name << ": experts [" << expert_start << ", " << expert_end
                                                 << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
+
+        // The expert dimension is the slowest-varying GGUF dimension, so a
+        // consecutive expert range is one contiguous byte range. Preserve that
+        // mapping as a zero-copy view for GPU-bound native quantized loads.
+        if (mmap_region_ && info->isQuantized() &&
+            weight_precision == WeightPrecision::NATIVE && factory_)
+        {
+            auto mmap_owner = getMmapRegion(info);
+            const uint64_t end_offset = getDataOffset(info) + info->offset +
+                                        slice_offset + slice_bytes;
+            if (!mmap_owner || end_offset > mmap_owner->size())
+            {
+                LOG_ERROR("[ModelLoader] Expert slice extends past end of mapped file: " << tensor_name);
+                return nullptr;
+            }
+            return factory_->createQuantizedZeroCopy(
+                ggufToTensorType(info->type), slice_shape,
+                getMmapPtr(info) + slice_offset, slice_bytes,
+                std::move(mmap_owner));
+        }
 
         // Ensure NUMA binding before allocating the read buffer
         if (factory_)
@@ -1622,9 +1661,6 @@ namespace llaminar2
                 return nullptr;
             }
         }
-
-        // Create 3D shape for the sliced tensor
-        std::vector<size_t> slice_shape = {ne0, ne1, local_count};
 
         // Handle weight precision conversion
         bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();

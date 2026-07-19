@@ -22,8 +22,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -588,73 +586,6 @@ namespace
         return std::max(kMinimumBudget, requirements.total_bytes_with_alignment());
     }
 
-    std::string shellQuote(const std::string &value)
-    {
-        std::string quoted = "'";
-        for (const char ch : value)
-        {
-            if (ch == '\'')
-                quoted += "'\\''";
-            else
-                quoted += ch;
-        }
-        quoted += "'";
-        return quoted;
-    }
-
-    std::string existingPathOrDefault(std::initializer_list<std::string> candidates)
-    {
-        for (const auto &candidate : candidates)
-        {
-            if (!candidate.empty() && std::filesystem::exists(candidate))
-                return candidate;
-        }
-        for (const auto &candidate : candidates)
-        {
-            if (!candidate.empty())
-                return candidate;
-        }
-        return {};
-    }
-
-    std::string loadHeuristicInputCsvPath()
-    {
-        const std::string heuristic_csv = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_INPUT_CSV");
-        const std::string sweep_csv = getEnvString("LLAMINAR_CUDA_TC_SWEEP_CSV");
-        return existingPathOrDefault({
-            heuristic_csv,
-            sweep_csv,
-            "/tmp/llaminar_cuda_tc_gemv_sweep_expanded_20260312.csv",
-            "/tmp/llaminar_cuda_tc_gemv_sweep.csv",
-        });
-    }
-
-    std::string loadHeuristicOutputPath()
-    {
-        const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_OUTPUT");
-        return path.empty() ? "/tmp/llaminar_cuda_tc_gemv_dispatch_heuristic_generated.inc" : path;
-    }
-
-    std::string loadHeuristicSummaryPath()
-    {
-        const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_SUMMARY");
-        return path.empty() ? "/tmp/llaminar_cuda_tc_gemv_dispatch_heuristic_summary.txt" : path;
-    }
-
-    std::string loadHeuristicScriptPath()
-    {
-        const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_SCRIPT");
-        return path.empty()
-                   ? "/workspaces/llaminar/tests/v2/performance/kernels/cuda/gemm/infer_gemv_dispatch_heuristic.py"
-                   : path;
-    }
-
-    bool fileHasContent(const std::string &path)
-    {
-        std::ifstream input(path);
-        return input.good() && input.peek() != std::ifstream::traits_type::eof();
-    }
-
     struct RunResult
     {
         double min_us = 0.0;
@@ -952,62 +883,6 @@ namespace
                      executed_rows, executed_cases, cfg.csv_path.c_str());
     }
 
-    TEST(CUDABlockwiseTensorCoreGemmSweepOffline, GenerateDispatchHeuristicFromExistingCsv)
-    {
-        const std::string input_csv = loadHeuristicInputCsvPath();
-        if (input_csv.empty() || !std::filesystem::exists(input_csv))
-        {
-            GTEST_SKIP() << "No existing sweep CSV found. Set LLAMINAR_CUDA_TC_HEURISTIC_INPUT_CSV.";
-        }
-
-        const std::string script_path = loadHeuristicScriptPath();
-        ASSERT_TRUE(std::filesystem::exists(script_path)) << "Heuristic generator script missing: " << script_path;
-
-        const std::string output_path = loadHeuristicOutputPath();
-        const std::string summary_path = loadHeuristicSummaryPath();
-
-        std::filesystem::create_directories(std::filesystem::path(output_path).parent_path());
-        std::filesystem::create_directories(std::filesystem::path(summary_path).parent_path());
-
-        std::string command =
-            "python3 " + shellQuote(script_path) +
-            " --input " + shellQuote(input_csv) +
-            " --output " + shellQuote(output_path) +
-            " --summary " + shellQuote(summary_path);
-
-        if (script_path.find("analyze_cuda_tc_gemv_dispatch.py") != std::string::npos)
-        {
-            command +=
-                " --min-overall-family-pct 99.0"
-                " --min-overall-exact-pct 99.0"
-                " --min-fallback-family-pct 97.0"
-                " --min-fallback-exact-pct 30.0";
-        }
-        command += " 2>&1";
-
-        FILE *pipe = popen(command.c_str(), "r");
-        ASSERT_NE(pipe, nullptr) << "Failed to spawn heuristic generator";
-
-        char buffer[256];
-        std::string output;
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
-            output += buffer;
-
-        const int status = pclose(pipe);
-        ASSERT_TRUE(WIFEXITED(status)) << "Heuristic generator terminated abnormally:\n"
-                                       << output;
-        ASSERT_EQ(WEXITSTATUS(status), 0) << "Heuristic generator failed:\n"
-                                          << output;
-
-        ASSERT_TRUE(std::filesystem::exists(output_path)) << "Heuristic output was not created: " << output_path;
-        ASSERT_TRUE(std::filesystem::exists(summary_path)) << "Heuristic summary was not created: " << summary_path;
-        ASSERT_TRUE(fileHasContent(output_path)) << "Heuristic output is empty: " << output_path;
-        ASSERT_TRUE(fileHasContent(summary_path)) << "Heuristic summary is empty: " << summary_path;
-
-        std::fprintf(stderr,
-                     "[CUDABlockwiseTC][HEURISTIC] input=%s output=%s summary=%s\n%s",
-                     input_csv.c_str(), output_path.c_str(), summary_path.c_str(), output.c_str());
-    }
 }
 
 #endif

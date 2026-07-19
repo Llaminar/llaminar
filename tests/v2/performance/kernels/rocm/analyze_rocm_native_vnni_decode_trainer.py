@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -32,26 +34,64 @@ from native_vnni_dispatch.adapters.rocm_decode import (  # noqa: E402
     raw_corpus_id,
 )
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
+    read_observation_csv,
     write_observation_csv,
 )
 from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     candidate_registry_digest,
     rocm_native_vnni_decode_registry,
 )
+from native_vnni_dispatch.certification import CertificationReport  # noqa: E402
+from native_vnni_dispatch.compiler import (  # noqa: E402
+    CompiledPolicy,
+    FrozenPolicy,
+    certify_frozen_policy,
+    freeze_policy,
+)
 from native_vnni_dispatch.corpus import ObservationCorpus, RuntimeKey  # noqa: E402
+from native_vnni_dispatch.cpp_predicates import (  # noqa: E402
+    aspect_condition,
+    generic_rule_sort_key,
+    predicate_condition,
+    render_if_header,
+)
 from native_vnni_dispatch.exact_oracle import (  # noqa: E402
     ExactWinner,
     build_exact_winners,
 )
+from native_vnni_dispatch.format_registry import FORMAT_SPECS  # noqa: E402
+from native_vnni_dispatch.measurement_plan import (  # noqa: E402
+    MEASUREMENT_PLAN_PATH,
+    NativeVNNIGPUMeasurementPlan,
+    load_gpu_measurement_plan,
+)
 from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.profiler_model import (  # noqa: E402
+    ProfilerFeatureCatalog,
+    load_profiler_feature_catalog,
+)
+from native_vnni_dispatch.policy_artifact import (  # noqa: E402
+    validate_installable_policy_artifact,
+    validate_frozen_policy_file,
+    write_compiled_policy,
+    write_frozen_policy,
+)
+from native_vnni_dispatch.policy_ir import PolicyIR  # noqa: E402
 from native_vnni_dispatch.schema import (  # noqa: E402
-    AspectBucket,
+    Backend,
     ExecutionMode,
     SemanticContract,
 )
 from native_vnni_dispatch.segmented_policy import (  # noqa: E402
     GenericDispatchRule,
     fit_generic_policy,
+)
+from native_vnni_dispatch.shape_manifest import (  # noqa: E402
+    MANIFEST_PATH,
+    NativeVNNIShapeManifest,
+    ShapePartition,
+    load_shape_manifest,
+    partition_assignments,
 )
 from native_vnni_dispatch.validation import (  # noqa: E402
     CANONICAL_VERIFIER_M,
@@ -87,6 +127,17 @@ def pack_shape_key(m: int, n: int, k: int) -> int:
     return ((m & 0xFF) << 56) | ((k & 0xFFFFFF) << 28) | (n & 0x0FFFFFFF)
 
 
+def _mode_robust_policy_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
+    """Preserve mode timing surfaces while collapsing the ROCm runtime key."""
+
+    if not corpus.distinguishes_execution_mode:
+        return corpus
+    return ObservationCorpus(
+        corpus.observations,
+        distinguish_execution_mode=False,
+    )
+
+
 def _candidate_kb(candidate_id: str) -> int:
     """Resolve one common Fast candidate and return its effective KB."""
 
@@ -115,9 +166,10 @@ def select_fast_entries(
 ) -> tuple[list[FastEntry], dict[RuntimeKey, ExactWinner]]:
     """Run the common exact oracle and encode only Fast M=1 KB decisions."""
 
+    policy_corpus = _mode_robust_policy_corpus(corpus)
     exact = build_exact_winners(
-        corpus,
-        serial_m1_hashes=_serial_hashes(corpus, serial_m1_policy_hash),
+        policy_corpus,
+        serial_m1_hashes=_serial_hashes(policy_corpus, serial_m1_policy_hash),
     )
     entries = []
     for key, winner in sorted(exact.items()):
@@ -133,7 +185,7 @@ def select_fast_entries(
             raise ValueError(f"unsupported ROCm decode exact policy key {key}")
         if len(key.projection_n_vector) != 1:
             raise ValueError("ROCm decode exact entry is not a single projection")
-        rows = corpus.rows_for_runtime_key(key)
+        rows = policy_corpus.rows_for_runtime_key(key)
         shape_names = sorted({row.shape_name for row in rows})
         if len(shape_names) != 1:
             raise ValueError(
@@ -158,9 +210,10 @@ def select_fast_generic_rules(
 ) -> list[GenericDispatchRule]:
     """Fit the shared bounded regret learner and retain Fast M=1 domains."""
 
+    policy_corpus = _mode_robust_policy_corpus(corpus)
     generic = fit_generic_policy(
-        corpus,
-        serial_m1_hashes=_serial_hashes(corpus, serial_m1_policy_hash),
+        policy_corpus,
+        serial_m1_hashes=_serial_hashes(policy_corpus, serial_m1_policy_hash),
     )
     return [
         rule
@@ -170,8 +223,229 @@ def select_fast_generic_rules(
     ]
 
 
-def validate_complete(corpus: ObservationCorpus) -> None:
-    """Require all aliases, modes, M depths, and registry candidates."""
+def _fast_m1_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
+    """Project one physical transaction onto ROCm public Fast M=1 rows."""
+
+    rows = tuple(
+        row
+        for row in corpus
+        if row.semantic_contract == SemanticContract.FAST and row.m == 1
+    )
+    if not rows:
+        raise ValueError("ROCm policy transaction contains no Fast M=1 evidence")
+    return ObservationCorpus(rows)
+
+
+def _fast_partition_surfaces(
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    partition: ShapePartition,
+) -> frozenset[tuple[str, str, ExecutionMode]]:
+    """Return the reviewed ROCm shape/format/mode partition surface."""
+
+    shape_names = (
+        measurement_plan.common_development_shapes
+        if partition == ShapePartition.DEVELOPMENT
+        else manifest.partition_names(
+            verifier=False,
+            partition=ShapePartition.SEALED,
+        )
+    )
+    surfaces = {
+        (shape_name, spec.label, mode)
+        for shape_name in shape_names
+        for spec in FORMAT_SPECS
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED)
+    }
+    if partition == ShapePartition.DEVELOPMENT:
+        for extension in measurement_plan.fast_development_extensions:
+            if extension.backend != Backend.ROCM:
+                continue
+            surfaces.update(
+                (shape_name, source_format, mode)
+                for shape_name in extension.shape_names
+                for source_format in extension.source_formats
+                for mode in (
+                    ExecutionMode.EAGER,
+                    ExecutionMode.GRAPH_CAPTURED,
+                )
+            )
+    return frozenset(surfaces)
+
+
+def _require_fast_partition(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    partition: ShapePartition,
+) -> ObservationCorpus:
+    """Reject mixed, incomplete, or dimension-stale ROCm Fast evidence."""
+
+    direct = _fast_m1_corpus(corpus)
+    require_canonical_alias_coverage(
+        direct,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_candidate_matrix_complete(direct)
+    require_registry_candidate_coverage(
+        direct,
+        rocm_native_vnni_decode_registry(),
+    )
+    required = _fast_partition_surfaces(manifest, measurement_plan, partition)
+    actual = {
+        (row.shape_name, row.source_format, row.execution_mode)
+        for row in direct
+    }
+    if actual != required:
+        order = lambda item: (item[0], item[1], item[2].value)
+        missing = sorted(required - actual, key=order)
+        unexpected = sorted(actual - required, key=order)
+        raise ValueError(
+            "ROCm Fast partition surface is incomplete: "
+            f"missing_count={len(missing)} first_missing={missing[:1]} "
+            f"unexpected_count={len(unexpected)} "
+            f"first_unexpected={unexpected[:1]}"
+        )
+    for row in direct:
+        shape = manifest.by_name(row.shape_name)
+        if (row.aggregate_n, row.k) != (shape.n, shape.k):
+            raise ValueError(
+                f"{row.shape_name}: ROCm evidence dimensions disagree with "
+                "the reviewed shape manifest"
+            )
+    assignments = partition_assignments(
+        ((row.shape_group_id, row.shape_name) for row in direct),
+        verifier=False,
+        manifest=manifest,
+    )
+    if set(assignments.values()) != {partition}:
+        raise ValueError(
+            f"ROCm Fast {partition.value} input crosses a manifest partition"
+        )
+    return direct
+
+
+def _fast_sealed_commitment(
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+) -> str:
+    """Commit to the untouched ROCm Fast sealed inventory before fitting."""
+
+    payload = {
+        "protocol": "rocm-native-vnni-fast-m1-sealed-v1",
+        "manifest_digest": manifest.digest(),
+        "measurement_plan_digest": measurement_plan.digest(manifest),
+        "shape_names": list(manifest.partition_names(
+            verifier=False,
+            partition=ShapePartition.SEALED,
+        )),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def freeze_fast_policy(
+    development_corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    profiler_feature_catalog: ProfilerFeatureCatalog,
+) -> FrozenPolicy:
+    """Fit mode-robust ROCm Fast rules without receiving sealed rows."""
+
+    direct = _require_fast_partition(
+        development_corpus,
+        manifest,
+        measurement_plan,
+        ShapePartition.DEVELOPMENT,
+    )
+    development = _mode_robust_policy_corpus(direct)
+    return freeze_policy(
+        development,
+        sealed_commitment=_fast_sealed_commitment(manifest, measurement_plan),
+        split_manifest_digest=measurement_plan.digest(manifest),
+        profiler_feature_catalog=profiler_feature_catalog,
+        metadata={
+            "backend": "rocm",
+            "semantic_contract": SemanticContract.FAST.value,
+            "shape_manifest_schema": manifest.schema_version,
+            "shape_manifest_digest": manifest.digest(),
+            "measurement_plan_schema": measurement_plan.schema_version,
+            "measurement_plan_digest": measurement_plan.digest(manifest),
+            "execution_mode_policy": "alias_robust_collapsed",
+        },
+    )
+
+
+def certify_fast_policy(
+    frozen: FrozenPolicy,
+    development_corpus: ObservationCorpus,
+    sealed_corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+) -> CompiledPolicy:
+    """Open ROCm sealed rows and certify the already-frozen generic IR."""
+
+    development = _mode_robust_policy_corpus(_require_fast_partition(
+        development_corpus,
+        manifest,
+        measurement_plan,
+        ShapePartition.DEVELOPMENT,
+    ))
+    sealed = _mode_robust_policy_corpus(_require_fast_partition(
+        sealed_corpus,
+        manifest,
+        measurement_plan,
+        ShapePartition.SEALED,
+    ))
+    return certify_frozen_policy(frozen, development, sealed)
+
+
+def validate_emitter_inputs(
+    policy_ir: PolicyIR,
+    entries: list[FastEntry],
+    generic_rules: list[GenericDispatchRule],
+) -> None:
+    """Prove ROCm emission consumes the exact certified common policy IR."""
+
+    ir_exact = {
+        (
+            entry.key.runtime_codebook_id,
+            entry.key.aggregate_n,
+            entry.key.k,
+        ): entry.candidate_id
+        for entry in policy_ir.exact_entries
+    }
+    emitted_exact = {
+        (entry.codebook, entry.n, entry.k): entry.candidate_id
+        for entry in entries
+    }
+    if emitted_exact != ir_exact:
+        raise ValueError("ROCm exact emitter inputs disagree with common IR")
+    if tuple(generic_rules) != policy_ir.generic_rules:
+        raise ValueError("ROCm generic emitter inputs disagree with common IR")
+
+
+def validate_complete(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    *,
+    require_full_inventory: bool,
+) -> None:
+    """Require every applicable surface, depth, mode, and candidate.
+
+    The bounded measurement plan, rather than the broad supported-shape
+    manifest, owns physical surface applicability. Treating every geometry as
+    both contracts would turn a local M1 refinement into unrelated all-format
+    verifier sweeps.
+    """
 
     require_canonical_alias_coverage(
         corpus,
@@ -188,6 +462,7 @@ def validate_complete(corpus: ObservationCorpus) -> None:
     )
 
     by_shape: dict[tuple, set[tuple[SemanticContract, int]]] = {}
+    names_by_shape: dict[tuple, str] = {}
     for row in corpus:
         identity = (
             row.runtime_codebook_id,
@@ -195,20 +470,134 @@ def validate_complete(corpus: ObservationCorpus) -> None:
             row.execution_mode,
             row.shape_group_id,
         )
+        previous_name = names_by_shape.setdefault(identity, row.shape_name)
+        if previous_name != row.shape_name:
+            raise ValueError(
+                f"ROCm shape group maps to multiple manifest names: {identity}"
+            )
         by_shape.setdefault(identity, set()).add((row.semantic_contract, row.m))
-    required = {(SemanticContract.FAST, 1)} | {
-        (SemanticContract.VERIFIER_SERIAL_M1_BITWISE, m)
-        for m in CANONICAL_VERIFIER_M
-    }
-    missing = [
-        (identity, sorted(required - represented, key=lambda item: (item[0].value, item[1])))
-        for identity, represented in by_shape.items()
-        if not required.issubset(represented)
-    ]
-    if missing:
+
+    failures = []
+    for identity, represented in by_shape.items():
+        shape_name = names_by_shape[identity]
+        manifest.by_name(shape_name)
+        source_format = identity[1]
+        required: set[tuple[SemanticContract, int]] = set()
+        if measurement_plan.fast_shape_applies(
+            manifest,
+            backend=Backend.ROCM,
+            source_format=source_format,
+            shape_name=shape_name,
+        ):
+            required.add((SemanticContract.FAST, 1))
+        if measurement_plan.verifier_shape_applies(
+            manifest,
+            shape_name=shape_name,
+        ):
+            required.update(
+                (SemanticContract.VERIFIER_SERIAL_M1_BITWISE, m)
+                for m in CANONICAL_VERIFIER_M
+            )
+        missing = required - represented
+        unexpected = represented - required
+        if missing or unexpected:
+            order_key = lambda item: (item[0].value, item[1])
+            failures.append((
+                identity,
+                sorted(missing, key=order_key),
+                sorted(unexpected, key=order_key),
+            ))
+    if failures:
         raise ValueError(
-            f"ROCm decode Fast/verifier depth matrix is incomplete for "
-            f"{len(missing)} surface(s); first={missing[0]}"
+            "ROCm decode shape applicability/depth matrix is invalid for "
+            f"{len(failures)} surface(s); first={failures[0]}"
+        )
+
+    if require_full_inventory:
+        expected = measurement_plan.expected_decode_surfaces(
+            manifest,
+            backend=Backend.ROCM,
+            source_formats=tuple(spec.label for spec in FORMAT_SPECS),
+            execution_modes=(
+                ExecutionMode.EAGER,
+                ExecutionMode.GRAPH_CAPTURED,
+            ),
+            verifier_m_values=CANONICAL_VERIFIER_M,
+        )
+        actual = {
+            (
+                row.semantic_contract,
+                row.m,
+                row.shape_name,
+                row.source_format,
+                row.execution_mode,
+            )
+            for row in corpus
+        }
+        if actual != expected:
+            order_key = lambda item: (
+                item[2], item[3], item[4].value, item[0].value, item[1]
+            )
+            missing = sorted(expected - actual, key=order_key)
+            unexpected = sorted(actual - expected, key=order_key)
+            raise ValueError(
+                "ROCm production physical surface inventory is incomplete: "
+                f"missing_count={len(missing)} first_missing={missing[:1]} "
+                f"unexpected_count={len(unexpected)} "
+                f"first_unexpected={unexpected[:1]}"
+            )
+
+
+def validate_verifier_complete(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+) -> None:
+    """Validate the staged-policy grouped verifier transaction by itself."""
+
+    if any(
+        row.semantic_contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        for row in corpus
+    ):
+        raise ValueError("ROCm verifier transaction contains Fast observations")
+    require_canonical_alias_coverage(
+        corpus,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_verifier_m_matrix(corpus)
+    require_candidate_matrix_complete(corpus)
+    expected = {
+        surface
+        for surface in measurement_plan.expected_decode_surfaces(
+            manifest,
+            backend=Backend.ROCM,
+            source_formats=tuple(spec.label for spec in FORMAT_SPECS),
+            execution_modes=(
+                ExecutionMode.EAGER,
+                ExecutionMode.GRAPH_CAPTURED,
+            ),
+            verifier_m_values=CANONICAL_VERIFIER_M,
+        )
+        if surface[0] == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    }
+    actual = {
+        (
+            row.semantic_contract,
+            row.m,
+            row.shape_name,
+            row.source_format,
+            row.execution_mode,
+        )
+        for row in corpus
+    }
+    if actual != expected:
+        raise ValueError(
+            "ROCm verifier physical surface inventory is incomplete: "
+            f"missing_count={len(expected - actual)} "
+            f"unexpected_count={len(actual - expected)}"
         )
 
 
@@ -224,15 +613,6 @@ def _entry_line(entry: FastEntry, *, indent: str) -> str:
     )
 
 
-def _aspect_condition(bucket: AspectBucket) -> str:
-    return {
-        AspectBucket.VERY_WIDE: "aspect_ratio >= 16.0f",
-        AspectBucket.WIDE: "aspect_ratio >= 2.0f",
-        AspectBucket.BALANCED: "aspect_ratio >= 0.75f",
-        AspectBucket.TALL: "true",
-    }[bucket]
-
-
 def generate_include(
     entries: list[FastEntry],
     generic_rules: list[GenericDispatchRule],
@@ -240,6 +620,8 @@ def generate_include(
     corpus_digest: str,
     registry_digest: str,
     profile: MeasurementProfile,
+    policy_digest: str = "",
+    certification: CertificationReport | None = None,
 ) -> str:
     """Render exact and common-regret generic decisions into the current ABI."""
 
@@ -253,9 +635,17 @@ def generate_include(
     for rule in generic_rules:
         rules_by_codebook.setdefault(rule.domain.runtime_codebook_id, []).append(rule)
 
+    decision_comment = (
+        "// Decisions: common alias/mode-robust exact oracle plus frozen "
+        "development policy with generic-only sealed certification."
+        if certification is not None
+        else "// Decisions: development-only common alias/mode-robust exact "
+        "oracle and profiler-informed generic policy; this artifact is not "
+        "installable."
+    )
     lines = [
         "// Auto-generated by analyze_rocm_native_vnni_decode_trainer.py. DO NOT EDIT.",
-        "// Decisions: common alias/mode-robust exact oracle + segmented-regret learner.",
+        decision_comment,
         "// Runtime-M verifier rows inherit this serial M=1 policy; no independent verifier KB is emitted.",
         f"// Measurement profile: {profile.value}",
         f"// Common corpus digest: {corpus_digest}",
@@ -316,6 +706,22 @@ def generate_include(
         "{",
         "    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);",
     ]
+    if certification is not None:
+        lines[6:6] = [
+            f"// Common policy digest: {policy_digest}",
+            (
+                "// Frozen generic policy digest: "
+                f"{certification.frozen_generic_policy_digest}"
+            ),
+            (
+                "// Sealed generic certificate: coverage="
+                f"{certification.covered_cell_count}/"
+                f"{certification.required_cell_count} max-regret="
+                f"{certification.max_observed_regret:.6%} "
+                "max-simultaneous-ucb="
+                f"{certification.max_simultaneous_95pct_upper_regret:.6%}"
+            ),
+        ]
 
     for codebook in sorted(entries_by_codebook):
         lines.extend([
@@ -338,8 +744,6 @@ def generate_include(
     ])
     if rules_by_codebook:
         lines.extend([
-            "    const float aspect_ratio =",
-            "        k > 0 ? static_cast<float>(n) / static_cast<float>(k) : 0.0f;",
             "    const long long work_items =",
             "        static_cast<long long>(n) * static_cast<long long>(k);",
         ])
@@ -348,16 +752,15 @@ def generate_include(
         lines.append("    {")
         for rule in sorted(
             rules_by_codebook[codebook],
-            key=lambda item: (
-                list(AspectBucket).index(item.domain.aspect_bucket),
-                item.min_work_items,
-            ),
+            key=generic_rule_sort_key,
         ):
             kb = _candidate_kb(rule.candidate_id)
+            conditions = [
+                aspect_condition(rule.domain.aspect_bucket),
+                *(predicate_condition(predicate) for predicate in rule.predicates),
+            ]
+            lines.extend(render_if_header(conditions, indent="        "))
             lines.extend([
-                f"        if ({_aspect_condition(rule.domain.aspect_bucket)} &&",
-                f"            work_items >= {rule.min_work_items}LL &&",
-                f"            work_items <= {rule.max_work_items}LL)",
                 "        {",
                 f"            out = ROCmNativeVNNIDecodeDispatchConfig{{{kb}, {CANONICAL_TARGET_WAVES}}};",
                 "            return true;",
@@ -456,16 +859,19 @@ def write_summary(
 def _context_from_args(
     args: argparse.Namespace,
     inputs: tuple[Path, ...],
+    timing_sidecars: tuple[Path, ...],
+    *,
+    run_id: str | None = None,
 ) -> ROCmDecodeAdapterContext:
     """Build conspicuous smoke provenance or strict installable provenance."""
 
-    corpus_id = raw_corpus_id((*inputs, *args.timing_sidecar))
+    corpus_id = raw_corpus_id((*inputs, *timing_sidecars))
     profile = MeasurementProfile(args.profile)
     if not profile.installable:
         return ROCmDecodeAdapterContext.workflow_smoke(corpus_id=corpus_id)
     return ROCmDecodeAdapterContext(
         profile=profile,
-        run_id=args.run_id,
+        run_id=run_id or args.run_id,
         corpus_id=corpus_id,
         git_revision=args.git_revision,
         build_id=args.build_id,
@@ -474,7 +880,7 @@ def _context_from_args(
         device_name=args.device_name,
         driver_runtime=args.driver_runtime,
         serial_m1_policy_hash=args.serial_m1_policy_hash,
-        raw_timing_sidecar_retained=bool(args.timing_sidecar),
+        raw_timing_sidecar_retained=bool(timing_sidecars),
     )
 
 
@@ -491,6 +897,30 @@ def main() -> int:
         "--timing-sidecar", action="append", type=Path, default=[],
         help="Raw timing CSV shard; repeat for every aggregate shard",
     )
+    parser.add_argument(
+        "--development-input", action="append", type=Path, default=[]
+    )
+    parser.add_argument(
+        "--development-timing-sidecar", action="append", type=Path, default=[]
+    )
+    parser.add_argument("--sealed-input", action="append", type=Path, default=[])
+    parser.add_argument(
+        "--sealed-timing-sidecar", action="append", type=Path, default=[]
+    )
+    parser.add_argument("--freeze-generic", action="store_true")
+    parser.add_argument("--certify-generic", action="store_true")
+    parser.add_argument("--adapt-only", action="store_true")
+    parser.add_argument("--frozen-policy-json", type=Path)
+    parser.add_argument("--policy-json", type=Path)
+    parser.add_argument("--development-profiler-requests", type=Path)
+    parser.add_argument("--development-profiler-evidence", type=Path)
+    parser.add_argument(
+        "--development-profiler-observations",
+        type=Path,
+        help="Original common CSV bound to reusable profiler sidecars",
+    )
+    parser.add_argument("--certified-policy-include", type=Path)
+    parser.add_argument("--certified-policy-json", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--summary", "--summary-csv", dest="summary", type=Path)
     parser.add_argument("--common-observations", type=Path)
@@ -512,6 +942,18 @@ def main() -> int:
     parser.add_argument("--device-name", default="")
     parser.add_argument("--driver-runtime", default="")
     parser.add_argument("--serial-m1-policy-hash", default="")
+    parser.add_argument(
+        "--shape-manifest",
+        type=Path,
+        default=MANIFEST_PATH,
+        help="Reviewed shape partitions and semantic-surface applicability",
+    )
+    parser.add_argument(
+        "--measurement-plan",
+        type=Path,
+        default=MEASUREMENT_PLAN_PATH,
+        help="Reviewed bounded and backend-scoped GPU timing plan",
+    )
     args = parser.parse_args()
 
     positional = tuple(args.inputs)
@@ -519,30 +961,323 @@ def main() -> int:
     if positional and optional:
         parser.error("use positional inputs or --input, not both")
     inputs = positional or optional
-    if not inputs:
-        parser.error("at least one strong trainer CSV is required")
     if args.max_generated_kb != 64:
         parser.error(
             "--max-generated-kb must remain 64; silently dropping forceable "
             "candidates makes the common matrix incomplete"
         )
+    if args.freeze_generic and args.certify_generic:
+        parser.error("--freeze-generic and --certify-generic are mutually exclusive")
+    if args.adapt_only and (args.freeze_generic or args.certify_generic):
+        parser.error("--adapt-only cannot freeze or certify a policy")
+    certified_replay = bool(
+        args.certified_policy_include or args.certified_policy_json
+    )
+    if bool(args.certified_policy_include) != bool(args.certified_policy_json):
+        parser.error(
+            "certified policy include and JSON are required together"
+        )
+    if certified_replay and (
+        args.adapt_only or args.freeze_generic or args.certify_generic
+    ):
+        parser.error("certified verifier replay is a separate transaction")
+    if bool(args.development_profiler_requests) != bool(
+        args.development_profiler_evidence
+    ):
+        parser.error(
+            "development profiler requests and evidence are required together"
+        )
+    if args.development_profiler_observations and not (
+        args.development_profiler_requests
+        and args.development_profiler_evidence
+    ):
+        parser.error(
+            "development profiler observations require requests and evidence"
+        )
+    if (args.freeze_generic or args.certify_generic) and not (
+        args.development_profiler_requests
+        and args.development_profiler_evidence
+    ):
+        parser.error(
+            "production ROCm freeze/certification requires complete "
+            "development profiler evidence"
+        )
+    separate_certification = bool(
+        args.development_input
+        or args.development_timing_sidecar
+        or args.sealed_input
+        or args.sealed_timing_sidecar
+        or args.frozen_policy_json
+    )
+    if args.freeze_generic:
+        if not inputs or separate_certification:
+            parser.error("--freeze-generic accepts development --input only")
+        if not args.policy_json:
+            parser.error("--freeze-generic requires --policy-json")
+    elif args.certify_generic:
+        if inputs or args.timing_sidecar:
+            parser.error("--certify-generic accepts separate partition inputs only")
+        if not args.development_input or not args.sealed_input:
+            parser.error("certification requires development and sealed inputs")
+        if not args.frozen_policy_json or not args.policy_json:
+            parser.error("certification requires frozen and compiled policy JSON")
+    elif separate_certification:
+        parser.error("separate partition inputs require --certify-generic")
+    elif not inputs:
+        parser.error("at least one strong trainer CSV is required")
+    if (
+        MeasurementProfile(args.profile) == MeasurementProfile.PRODUCTION
+        and not args.freeze_generic
+        and not args.certify_generic
+        and not args.adapt_only
+        and not certified_replay
+    ):
+        parser.error(
+            "production ROCm policy emission requires development freeze and "
+            "separate sealed certification"
+        )
 
-    context = _context_from_args(args, inputs)
+    manifest = load_shape_manifest(args.shape_manifest)
+    measurement_plan = load_gpu_measurement_plan(
+        args.measurement_plan,
+        manifest=manifest,
+    )
+
+    if args.adapt_only:
+        if not inputs or separate_certification:
+            parser.error("--adapt-only accepts development --input only")
+        timing = tuple(args.timing_sidecar)
+        context = _context_from_args(args, inputs, timing)
+        corpus = adapt_rocm_decode_csv(inputs, context, timing_sidecars=timing)
+        direct = _require_fast_partition(
+            corpus,
+            manifest,
+            measurement_plan,
+            ShapePartition.DEVELOPMENT,
+        )
+        policy_corpus = _mode_robust_policy_corpus(direct)
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(generate_include(
+            entries,
+            [],
+            corpus_digest=policy_corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=context.profile,
+        ), encoding="utf-8")
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        print(
+            f"adapted {len(corpus)} ROCm Fast development observations "
+            f"without fitting -> {args.output}"
+        )
+        return 0
+
+    if args.freeze_generic:
+        timing = tuple(args.timing_sidecar)
+        context = _context_from_args(args, inputs, timing)
+        corpus = adapt_rocm_decode_csv(inputs, context, timing_sidecars=timing)
+        profiler_catalog = load_profiler_feature_catalog(
+            corpus,
+            args.development_profiler_requests,
+            args.development_profiler_evidence,
+            source_corpus=(
+                read_observation_csv((args.development_profiler_observations,))
+                if args.development_profiler_observations
+                else None
+            ),
+        )
+        frozen = freeze_fast_policy(
+            corpus,
+            manifest,
+            measurement_plan,
+            profiler_catalog,
+        )
+        policy_corpus = _mode_robust_policy_corpus(_fast_m1_corpus(corpus))
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+        generic_rules = list(frozen.policy_ir.generic_rules)
+        validate_emitter_inputs(frozen.policy_ir, entries, generic_rules)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(generate_include(
+            entries,
+            generic_rules,
+            corpus_digest=policy_corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=context.profile,
+            policy_digest=frozen.policy_ir.digest(),
+        ), encoding="utf-8")
+        write_frozen_policy(args.policy_json, frozen)
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        print(
+            f"froze {len(corpus)} ROCm development observations as "
+            f"{frozen.generic_digest} -> {args.output}"
+        )
+        return 0
+
+    if args.certify_generic:
+        development_inputs = tuple(args.development_input)
+        development_timing = tuple(args.development_timing_sidecar)
+        development_context = _context_from_args(
+            args,
+            development_inputs,
+            development_timing,
+        )
+        development = adapt_rocm_decode_csv(
+            development_inputs,
+            development_context,
+            timing_sidecars=development_timing,
+        )
+        profiler_catalog = load_profiler_feature_catalog(
+            development,
+            args.development_profiler_requests,
+            args.development_profiler_evidence,
+            source_corpus=(
+                read_observation_csv((args.development_profiler_observations,))
+                if args.development_profiler_observations
+                else None
+            ),
+        )
+        frozen = freeze_fast_policy(
+            development,
+            manifest,
+            measurement_plan,
+            profiler_catalog,
+        )
+        # This complete byte comparison precedes the first sealed file read.
+        validate_frozen_policy_file(args.frozen_policy_json, frozen)
+
+        sealed_inputs = tuple(args.sealed_input)
+        sealed_timing = tuple(args.sealed_timing_sidecar)
+        sealed_context = _context_from_args(
+            args,
+            sealed_inputs,
+            sealed_timing,
+            run_id=f"{args.run_id}-sealed",
+        )
+        sealed = adapt_rocm_decode_csv(
+            sealed_inputs,
+            sealed_context,
+            timing_sidecars=sealed_timing,
+        )
+        compiled = certify_fast_policy(
+            frozen,
+            development,
+            sealed,
+            manifest,
+            measurement_plan,
+        )
+        development_fast = _fast_m1_corpus(development)
+        sealed_fast = _fast_m1_corpus(sealed)
+        policy_corpus = _mode_robust_policy_corpus(ObservationCorpus((
+            *development_fast.observations,
+            *sealed_fast.observations,
+        )))
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            development_context.serial_m1_policy_hash,
+        )
+        generic_rules = list(compiled.policy_ir.generic_rules)
+        validate_emitter_inputs(compiled.policy_ir, entries, generic_rules)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(generate_include(
+            entries,
+            generic_rules,
+            corpus_digest=policy_corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=development_context.profile,
+            policy_digest=compiled.policy_ir.digest(),
+            certification=compiled.certification,
+        ), encoding="utf-8")
+        write_compiled_policy(args.policy_json, compiled)
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            combined = ObservationCorpus((
+                *development.observations,
+                *sealed.observations,
+            ))
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, combined)
+        print(
+            f"certified frozen ROCm policy {frozen.generic_digest} against "
+            f"{len(sealed)} sealed observations -> {args.output}"
+        )
+        return 0
+
+    timing = tuple(args.timing_sidecar)
+    context = _context_from_args(args, inputs, timing)
     corpus = adapt_rocm_decode_csv(
         inputs,
         context,
-        timing_sidecars=args.timing_sidecar,
+        timing_sidecars=timing,
     )
+    if certified_replay:
+        validate_verifier_complete(corpus, manifest, measurement_plan)
+        policy_corpus = _mode_robust_policy_corpus(corpus)
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+        if entries:
+            raise ValueError("ROCm verifier replay unexpectedly emitted Fast entries")
+        validate_installable_policy_artifact(
+            args.certified_policy_json,
+            include_path=args.certified_policy_include,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            args.certified_policy_include.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        print(
+            f"validated {len(corpus)} ROCm grouped verifier observations "
+            f"against certified M1 policy -> {args.output}"
+        )
+        return 0
+    policy_corpus = _mode_robust_policy_corpus(corpus)
     entries, exact = select_fast_entries(
-        corpus,
+        policy_corpus,
         context.serial_m1_policy_hash,
     )
     generic_rules = select_fast_generic_rules(
-        corpus,
+        policy_corpus,
         context.serial_m1_policy_hash,
     )
     if args.require_complete:
-        validate_complete(corpus)
+        manifest = load_shape_manifest(args.shape_manifest)
+        validate_complete(
+            corpus,
+            manifest,
+            load_gpu_measurement_plan(
+                args.measurement_plan,
+                manifest=manifest,
+            ),
+            require_full_inventory=(
+                args.profile == MeasurementProfile.PRODUCTION.value
+            ),
+        )
 
     if args.base_include:
         emit_overlay(entries, args.output, args.base_include)
@@ -552,7 +1287,7 @@ def main() -> int:
             generate_include(
                 entries,
                 generic_rules,
-                corpus_digest=corpus.digest(),
+                corpus_digest=policy_corpus.digest(),
                 registry_digest=candidate_registry_digest(),
                 profile=context.profile,
             ),

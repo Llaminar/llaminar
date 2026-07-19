@@ -82,12 +82,12 @@ static float *getKparPartials(CUDAGemvContext_ *ctx, size_t num_floats)
 //
 // Column-major layout (current) is coalesced for column-parallel KPAR,
 // but row-parallel (grid=N, one block per output row) needs row-major
-// for coalesced K-dimension reads.  The data is created lazily on first
-// ROWPAR dispatch and stored on CUDAPackedWeights — freed automatically
-// when the weight tensor is destroyed.
+// for coalesced K-dimension reads. This representation is created only by an
+// explicitly forced diagnostic ROWPAR candidate and stored on CUDAPackedWeights
+// until the weight tensor is destroyed. Production dispatch must not allocate
+// it or override a generated policy decision implicitly.
 //
 // Memory cost: ~1× the weight data (about 1.4 GB for 7B Q4_0).
-// Controlled by LLAMINAR_CUDA_GEMV_ROWPAR env variable.
 // =====================================================================
 struct CUDARowMajorWeights_
 {
@@ -313,7 +313,7 @@ namespace
         T *d_row = nullptr;
         if (cudaMalloc(&d_row, total_bytes) != cudaSuccess)
         {
-            cudaGetLastError(); // Clear sticky error so KPAR fallback works
+            cudaGetLastError(); // Clear sticky state before reporting preparation failure.
             return nullptr;
         }
 
@@ -330,18 +330,6 @@ namespace
             return nullptr;
         }
         return d_row;
-    }
-
-    // Row-parallel GEMV is enabled by default (fewer kernel launches = faster graph replay).
-    // Set LLAMINAR_CUDA_GEMV_ROWPAR=0 to disable (e.g., if VRAM is tight).
-    static bool isRowParEnabled()
-    {
-        static int enabled = -1;
-        if (enabled < 0)
-        {
-            enabled = llaminar2::debugEnv().gemm.cuda_gemv_rowpar ? 1 : 0;
-        }
-        return enabled == 1;
     }
 
     static const char *shapeName(NativeGemvShape shape)
@@ -366,7 +354,31 @@ namespace
         int num_sms,
         int target_waves,
         int min_kgroups_per_cta,
-        int max_kb);
+        int max_kb,
+        int exact_kb);
+
+    /**
+     * @brief Resolve the execution surface represented by the active stream.
+     * @param stream CUDA stream on which the NativeVNNI launch will be issued.
+     * @param graph_captured Receives true while the stream is being captured.
+     * @return true when CUDA reported a trustworthy capture state.
+     *
+     * Policy ABI v2 treats eager launch gaps and graph-captured replay as
+     * distinct economical surfaces. A failed runtime query therefore cannot be
+     * interpreted as eager execution: doing so could select a different exact
+     * K partition and break the verifier's serial-M1 arithmetic identity.
+     */
+    static bool queryGraphCapturedExecution(
+        cudaStream_t stream,
+        bool &graph_captured)
+    {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t error = cudaStreamIsCapturing(stream, &status);
+        if (error != cudaSuccess)
+            return false;
+        graph_captured = status != cudaStreamCaptureStatusNone;
+        return true;
+    }
 
     /**
      * @brief Build the stable common-trainer identity for an observed launch.
@@ -415,6 +427,7 @@ namespace
         int K,
         bool rowmajor_available,
         int cuda_device_id,
+        bool graph_captured,
         bool verifier_serial_m1,
         CUDAGemvContext_ *gemv_ctx)
     {
@@ -430,7 +443,8 @@ namespace
                 querySmCount(gemv_ctx),
                 tuning.target_waves,
                 tuning.mkg,
-                tuning.max_kb);
+                tuning.max_kb,
+                tuning.exact_kb);
         }
 
         llaminar2::PerfStatsCollector::addCounter(
@@ -444,6 +458,9 @@ namespace
                 {"m", std::to_string(M)},
                 {"n", std::to_string(N)},
                 {"k", std::to_string(K)},
+                {"execution_mode", graph_captured
+                                       ? "graph_captured"
+                                       : "eager"},
                 {"semantic_contract", verifier_serial_m1
                                              ? "verifier_serial_m1_bitwise"
                                              : "fast"},
@@ -457,6 +474,7 @@ namespace
                 {"target_waves", std::to_string(tuning.target_waves)},
                 {"mkg", std::to_string(tuning.mkg)},
                 {"max_kb", std::to_string(tuning.max_kb)},
+                {"exact_kb", std::to_string(tuning.exact_kb)},
                 {"force_two_phase", std::to_string(tuning.force_two_phase)},
                 {"rowmajor_available", rowmajor_available ? "true" : "false"}});
     }
@@ -510,10 +528,11 @@ namespace
     /**
      * @brief Resolve the effective K-partition count for one launch.
      *
-     * Generated production policies express an occupancy target and optional
-     * cap. Trainer and regression sweeps additionally provide an exact KB so
-     * each measured candidate has one unambiguous reduction tree. Exact sweep
-     * values larger than the number of 32-element K groups are rejected rather
+     * Generated production policies carry the exact KB selected by the common
+     * trainer so every installed candidate has one unambiguous reduction tree.
+     * Legacy generated rows may leave exact KB at zero, in which case the old
+     * occupancy target and cap remain sufficient to read the transition table.
+     * Values larger than the number of 32-element K groups are rejected rather
      * than silently clamped and mislabeled.
      */
     static int resolveKparKBlocks(
@@ -522,17 +541,18 @@ namespace
         int num_sms,
         int target_waves,
         int min_kgroups_per_cta,
-        int max_kb)
+        int max_kb,
+        int exact_kb)
     {
         if (grid_n <= 0 || k_groups <= 0 || num_sms <= 0)
             return 0;
 
         int kb = 0;
-        if (g_sweep.active && g_sweep.exact_kb > 0)
+        if (exact_kb > 0)
         {
-            if (g_sweep.exact_kb > k_groups)
+            if (exact_kb > k_groups)
                 return 0;
-            kb = g_sweep.exact_kb;
+            kb = exact_kb;
         }
         else
         {
@@ -770,13 +790,18 @@ namespace
         const int blocks_per_split = (blocks_per_row + kb - 1) / kb;
         const int blk_begin = split_idx * blocks_per_split;
         const int blk_end = min(blocks_per_row, blk_begin + blocks_per_split);
-        if (blk_begin >= blocks_per_row)
-            return;
 
         float acc[CPT];
 #pragma unroll
         for (int c = 0; c < CPT; ++c)
             acc[c] = 0.0f;
+
+        /*
+         * Some exact KB values do not divide the K-block count and therefore
+         * create trailing empty partitions. Those partitions must still write
+         * explicit zero partials: returning here would leave reusable graph
+         * workspace stale and make the ordered reducer nondeterministic.
+         */
 
         for (int blk = blk_begin; blk < blk_end; ++blk)
         {
@@ -1296,8 +1321,6 @@ namespace
         const int blocks_per_split = (blocks_per_row + kb - 1) / kb;
         const int blk_begin = split_idx * blocks_per_split;
         const int blk_end = min(blocks_per_row, blk_begin + blocks_per_split);
-        if (blk_begin >= blocks_per_row)
-            return;
 
         float acc[ROWS_PER_TILE][CPT];
 #pragma unroll
@@ -1307,6 +1330,13 @@ namespace
             for (int c = 0; c < CPT; ++c)
                 acc[tile_row][c] = 0.0f;
         }
+
+        /*
+         * Keep trailing empty K partitions in the publication tree by writing
+         * zero for every owned verifier row/column. This is required because
+         * the partials arena survives graph replay and may contain an older
+         * launch's bytes when the current exact KB has empty tail partitions.
+         */
 
         for (int blk = blk_begin; blk < blk_end; ++blk)
         {
@@ -1473,6 +1503,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int exact_kb,
         int force_two_phase,
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
@@ -1601,6 +1632,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int exact_kb,
         int force_two_phase,
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
@@ -1614,7 +1646,7 @@ namespace
         const bool verifier_decode_equivalent = decodeEquivalentM1ConfigActive();
         const int kb_capped = resolveKparKBlocks(
             grid_n, k_groups, num_sms,
-            target_waves, min_kgroups_per_cta, max_kb);
+            target_waves, min_kgroups_per_cta, max_kb, exact_kb);
         if (kb_capped <= 0)
             return false;
         /*
@@ -1692,6 +1724,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int exact_kb,
         int force_two_phase,
         int device_id, cudaStream_t stream,
         CUDAGemvContext_ *gemv_ctx)
@@ -1704,7 +1737,7 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb_capped = resolveKparKBlocks(
             grid_n, k_groups, num_sms,
-            target_waves, min_kgroups_per_cta, max_kb);
+            target_waves, min_kgroups_per_cta, max_kb, exact_kb);
         if (kb_capped <= 0)
             return false;
         g_last_effective_kb = kb_capped;
@@ -1801,32 +1834,38 @@ namespace
             return launchKparSmallMImpl<32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C1:
             return launchKparSmallMImpl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C2:
             return launchKparSmallMImpl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C1:
             return launchKparSmallMImpl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C2:
             return launchKparSmallMImpl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T256_C2:
             return launchKparSmallMImpl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, 0, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         }
         return false;
     }
@@ -1853,32 +1892,38 @@ namespace
             return launchKparImpl<32, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C1:
             return launchKparImpl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T64_C2:
             return launchKparImpl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C1:
             return launchKparImpl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T128_C2:
             return launchKparImpl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         case KparTile::T256_C2:
             return launchKparImpl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, N, K, alpha, beta,
-                d_C_existing, d_bias, tw, mkg, mkb, cuda_device_id, stream, gemv_ctx);
+                d_C_existing, d_bias, tw, mkg, mkb, 0, 0,
+                cuda_device_id, stream, gemv_ctx);
         }
         return false;
     }
@@ -2124,42 +2169,49 @@ namespace
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 64 * 100 + 1:
                 return sweepLaunchKpar<64, 1, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 64 * 100 + 2:
                 return sweepLaunchKpar<64, 2, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 128 * 100 + 1:
                 return sweepLaunchKpar<128, 1, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 128 * 100 + 2:
                 return sweepLaunchKpar<128, 2, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 256 * 100 + 2:
                 return sweepLaunchKpar<256, 2, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 256 * 100 + 4:
                 return sweepLaunchKpar<256, 4, CB>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
+                    tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             default:
                 return false;
@@ -2191,6 +2243,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int exact_kb,
         int force_two_phase,
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream);
@@ -2297,36 +2350,42 @@ namespace
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 64 * 100 + 1:
             return launchKparSmallMImpl<64, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 64 * 100 + 2:
             return launchKparSmallMImpl<64, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 128 * 100 + 1:
             return launchKparSmallMImpl<128, 1, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 128 * 100 + 2:
             return launchKparSmallMImpl<128, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 256 * 100 + 2:
             return launchKparSmallMImpl<256, 2, CB>(
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         case 256 * 100 + 4:
             /*
@@ -2340,6 +2399,7 @@ namespace
                 d_A_int8, d_payload, d_scales, d_mins, d_emins,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
+                tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx);
         default:
             return false;
@@ -2362,6 +2422,10 @@ namespace
         CUDARowMajorWeights_ **rm_slot,
         int cuda_device_id, cudaStream_t stream)
     {
+        bool graph_captured = false;
+        if (!queryGraphCapturedExecution(stream, graph_captured))
+            return false;
+
         // Sweep override — bypass heuristics, use explicit params
         if (g_sweep.active)
         {
@@ -2391,6 +2455,7 @@ namespace
                 g_sweep.mkg,
                 g_sweep.max_kb,
                 g_sweep.force_two_phase,
+                g_sweep.exact_kb,
             };
 
             // For ROWPAR sweep: ensure row-major exists (skip for Q8_0
@@ -2419,6 +2484,7 @@ namespace
                 K,
                 rm_slot && *rm_slot && (*rm_slot)->d_payload,
                 cuda_device_id,
+                graph_captured,
                 false,
                 gemv_ctx);
 
@@ -2430,37 +2496,16 @@ namespace
                 cuda_device_id, stream);
         }
 
-        // Normal dispatch path
-        NativeGemvShape shape = classifyShapeGenerated<CB>(N, K);
-        GeneratedDispatchTuning tuning = selectGeneratedTuning<CB>(N, K);
-
-        // Row-parallel override: for KPAR shapes, use ROWPAR if available.
-        // Q8_0 (CB==19): SKIP — 32-byte payloads cause stride of N*32
-        // between adjacent threads in column-major ROWPAR (uncoalesced).
-        // KPAR has naturally coalesced column-major access and is faster.
-        if (shape == NativeGemvShape::KPAR && isRowParEnabled())
-        {
-            if constexpr (CB != 19)
-            {
-                // Lazy-create row-major transpose on first ROWPAR dispatch
-                if (rm_slot && !*rm_slot)
-                {
-                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                    *rm_slot = cudaRowMajorWeights_create(
-                        d_payload, d_scales, d_mins, d_emins,
-                        N, K, PB, cuda_device_id, stream);
-                }
-                if (rm_slot && *rm_slot && (*rm_slot)->d_payload)
-                {
-                    shape = NativeGemvShape::ROWPAR;
-                    // NWARPS: 2 for most shapes (well-tested), 4 for large-K shapes
-                    // where more warps/block helps hide K-loop memory latency
-                    const int k_blocks = K / BLOCK_K;
-                    tuning.tile_n = (k_blocks >= 256) ? 4 : 2;
-                    tuning.cpt = 0;
-                }
-            }
-        }
+        /*
+         * The generated policy is the complete production authority. A miss is
+         * an unsupported shape, not permission to manufacture a default KPAR
+         * route or lazily promote to an unmeasured ROWPAR representation.
+         */
+        NativeGemvShape shape = NativeGemvShape::KPAR;
+        GeneratedDispatchTuning tuning{};
+        if (!selectGeneratedDispatch<CB>(
+                graph_captured, 1, N, K, shape, tuning))
+            return false;
 
         recordGemvDispatch<CB>(
             shape,
@@ -2470,6 +2515,7 @@ namespace
             K,
             rm_slot && *rm_slot && (*rm_slot)->d_payload,
             cuda_device_id,
+            graph_captured,
             false,
             gemv_ctx);
 
@@ -2493,6 +2539,10 @@ namespace
         CUDARowMajorWeights_ **rm_slot,
         int cuda_device_id, cudaStream_t stream)
     {
+        bool graph_captured = false;
+        if (!queryGraphCapturedExecution(stream, graph_captured))
+            return false;
+
         g_last_effective_kb = 1;
         NativeGemvShape shape = NativeGemvShape::KPAR;
         GeneratedDispatchTuning tuning{};
@@ -2503,7 +2553,7 @@ namespace
              * The generated-dispatch trainer drives this path for verifier
              * runtime-M buckets. Keep the sweep override local to backend
              * tuning: production dispatch still comes from the generated
-             * classifier below, while the perf harness can time real KPAR
+             * policy below, while the perf harness can time real KPAR
              * small-M candidates instead of accidentally timing the current
              * generated route and labelling it as every candidate.
              */
@@ -2532,6 +2582,7 @@ namespace
                 g_sweep.mkg,
                 g_sweep.max_kb,
                 g_sweep.force_two_phase,
+                g_sweep.exact_kb,
             };
         }
         else
@@ -2547,8 +2598,11 @@ namespace
             const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
             const int dispatch_m =
                 decode_equivalent_m1 ? 1 : (llaminar2::debugEnv().gemm.deterministic ? 2 : M);
-            shape = classifyShapeGenerated<CB>(dispatch_m, N, K);
-            tuning = selectGeneratedTuning<CB>(dispatch_m, N, K);
+            if (!selectGeneratedDispatch<CB>(
+                    graph_captured, dispatch_m, N, K, shape, tuning))
+            {
+                return false;
+            }
         }
 
         const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
@@ -2560,6 +2614,7 @@ namespace
             K,
             rm_slot && *rm_slot && (*rm_slot)->d_payload,
             cuda_device_id,
+            graph_captured,
             decode_equivalent_m1,
             gemv_ctx);
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
@@ -2574,39 +2629,8 @@ namespace
 
         if constexpr (CB != 19)
         {
-            /**
-             * Serial M=1 decode promotes generated KPAR shapes to ROWPAR when
-             * row-major weights are available.  Verifier publication has to
-             * match that true public decode route, not just the raw generated
-             * classifier result, so the grouped runtime-M path applies the same
-             * promotion while still executing all verifier rows in one launch.
-             */
-            if (decode_equivalent_m1 && shape == NativeGemvShape::KPAR &&
-                isRowParEnabled() && rm_slot)
-            {
-                if (!*rm_slot)
-                {
-                    constexpr int PB = llaminar2::cuda_native_vnni::CodebookTraits<CB>::payload_bytes;
-                    *rm_slot = cudaRowMajorWeights_create(
-                        d_payload, d_scales, d_mins, d_emins,
-                        N, K, PB, cuda_device_id, stream);
-                }
-                if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
-                {
-                    const int k_blocks = K / BLOCK_K;
-                    const int nwarps = (k_blocks >= 256) ? 4 : 2;
-                    return launchRowParSmallM<CB>(
-                        d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
-                        (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
-                        d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
-                        nwarps, stream);
-                }
-
-                cudaGetLastError();
-                return false;
-            }
-
-            if (shape == NativeGemvShape::ROWPAR && isRowParEnabled() && rm_slot)
+            /* Explicit diagnostic ROWPAR candidates own their preparation. */
+            if (shape == NativeGemvShape::ROWPAR && rm_slot)
             {
                 if (!*rm_slot)
                 {
@@ -2624,7 +2648,8 @@ namespace
                         tuning.tile_n, stream);
                 }
 
-                cudaGetLastError(); // Clear row-major allocation/launch errors before KPAR fallback.
+                cudaGetLastError();
+                return false;
             }
         }
 
@@ -2708,6 +2733,7 @@ namespace
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
         int target_waves, int min_kgroups_per_cta, int max_kb,
+        int exact_kb,
         int force_two_phase,
         CUDAGemvContext_ *gemv_ctx,
         int device_id, cudaStream_t stream)
@@ -2721,7 +2747,7 @@ namespace
         const bool verifier_decode_equivalent = decodeEquivalentM1ConfigActive();
         const int kb_capped = resolveKparKBlocks(
             grid_n, k_groups, num_sms,
-            target_waves, min_kgroups_per_cta, max_kb);
+            target_waves, min_kgroups_per_cta, max_kb, exact_kb);
         if (kb_capped <= 0)
             return false;
         g_last_effective_kb = kb_capped;

@@ -148,6 +148,31 @@ sudo /usr/local/cuda/bin/ncu -i /tmp/k_ncu.ncu-rep --page details
 | `L1/TEX` + spilling | spilled regs reloaded from local mem | reduce live registers / relax `__launch_bounds__` MIN_BLOCKS |
 | `Long Scoreboard` (memory) | global-load latency | improve coalescing / prefetch / more warps |
 
+### Prove NativeVNNI IMMA and vectorized memory execution
+
+Do not infer tensor-core use from a source-level `mma.sync` spelling or a
+candidate-family name. Profile the actual production-selected candidate and
+record the GA102 IMMA and memory-width counters on one isolated extra launch:
+
+```bash
+sudo -E /usr/local/cuda/bin/ncu \
+  --kernel-name "nativeVnniTC" --launch-skip 1 --launch-count 1 \
+  --metrics \
+sm__inst_executed_pipe_tensor_op_imma.sum,\
+smsp__average_inst_executed_pipe_tensor_op_imma_per_warp,\
+smsp__sass_inst_executed_op_memory_128b.sum,\
+smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.ratio \
+  --target-processes all -o /tmp/native_vnni_instruction_proof -f \
+  ./build_v2_release/tests/v2/v2_perf_cuda_native_vnni_gemm \
+  --gtest_filter="CUDANativeVNNIGemmPerf.Performance_AllFormats_AllShapes"
+```
+
+The command MUST use the harness's normal shape/format/M filters so Nsight sees
+the candidate selected by production dispatch. A nonzero IMMA count proves the
+compiled integer tensor-core path. The 128-bit instruction count and bytes per
+sector diagnose vectorization and coalescing independently. Nsight replay time
+is never canonical latency and must not enter dispatch labels.
+
 ---
 
 ## Step 4: Isolate & A/B with the GEMM perf-test harness
@@ -176,20 +201,51 @@ covers the exact GEMMs a model actually runs.
 
 ### Generated GEMM/GEMV dispatch training pipeline
 
+Read `.agents/nativevnni-gemm-tuning/SKILL.md` for the shared corpus, learner,
+certification, Git LFS, and installation workflow. This section owns only
+CUDA-specific kernel/profiler constraints.
+
 Do not land source-level "one shape gets this tile" overrides for CUDA NativeVNNI
 unless the user explicitly asks for a temporary experiment. The durable path is:
 
 1. Add or confirm the production shapes in
    `tests/v2/performance/kernels/cuda/gemm/CUDANativeVNNIGemmPerfCommon.h`.
-2. For decode/GEMV dispatch tables, prefer the turnkey refresh wrapper:
-   `scripts/refresh_native_vnni_dispatch_tables.sh --backend cuda --profile qwen36`.
-   It sweeps canonical `M={1,2,3,4}` verifier buckets, trains the tree model,
-   overlays exact known-shape winners, validates the generated include, and can
-   install it with `--install`.
+2. For decode/GEMV dispatch tables, use the Git-LFS-aware turnkey transaction:
+   `scripts/train_native_vnni_dispatch.sh --backend cuda --install`.
+   The lower-level `refresh_native_vnni_dispatch_tables.sh` remains the phase
+   executor used by the driver and for focused diagnostic collection.
+   It first sweeps and freezes `Fast M=1`, then certifies grouped verifier
+   `M=2..16,31` against that exact staged serial policy. Fifteen drafts require
+   verifier M16 because the target pass includes one bonus row; M31 is a deeper
+   sentinel, not a runtime maximum. Installation requires this complete matrix.
+   The M1 broad sweep runs complete sample-interleaved candidate rounds. Failed
+   development-CV cells are converted by
+   `tests/v2/performance/kernels/native_vnni_dispatch/paired_requests.py` into
+   typed, concrete candidate-pair
+   manifests; the CUDA trainer batches those requests, the compiler absorbs the
+   dimensionless tournament ratios, and CV repeats before sealed evaluation.
    The CUDA decode sweep trainer uses deterministic structurally-valid packed
    payloads, not per-element random quantization, so giant LM-head refreshes do
    not stall in host fixture generation. It still constructs the real tensor
    classes and production VRAM-pool preparation path.
+   Policy fitting itself may use every CUDA and ROCm device through the exact
+   leaf-primary scorer DSOs. The wrapper auto-discovers them; use
+   `--policy-accelerators` and `--policy-lanes` to make ownership explicit.
+   These launches score authenticated regret matrices, not candidate kernels,
+   and cannot enter canonical timing or Nsight evidence. CUDA/HIP workers are
+   process-isolated, and an explicitly requested accelerator failure is fatal.
+   A production refresh also emits a provenance-bound profiler request for
+   every physical candidate observation. Nsight Compute starts with collection
+   disabled; packing, graph capture, route proof, correctness, and warmup remain
+   outside profiling, and `cuProfilerStart` brackets one extra production
+   launch per pass. Never run `ncu` around canonical timing or import
+   replay-inflated profiler duration as the dispatch latency. Multi-kernel
+   candidates retain one ordered evidence record per physical dispatch.
+   Missing `ncu`, a required metric, or one supported candidate record blocks
+   a production install. The final `cuda_profiler_features.csv` is generated
+   only by authenticating the original canonical observation corpus against
+   the request and evidence manifests; it contains untouched pipeline timing
+   plus separate per-dispatch Nsight metrics.
    The default CUDA decode family set is `wide,kpar,direct`.  The perf harness
    uses the production VRAM-pool preparation path, which does not own ROWPAR's
    optional row-major auxiliary weight view; do not add `rowpar` back to the
@@ -226,13 +282,15 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    off-policy `M` rows by default, can merge an existing generated include via
    `--base-include`, and emits
    `src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc`.
-5. When debugging the decode trainer itself, the lower-level flow is:
-   `v2_perf_cuda_blockwise_tensorcore_gemm_sweep` emits the sweep CSV,
-   `infer_gemv_dispatch_heuristic.py` trains the M-aware fallback tree, and
-   `analyze_cuda_tc_gemv_dispatch.py --base-include <tree.inc>` overlays exact
-   `(M,N,K)` known-shape winners. Both the fallback tree and overlay fallback
-   must stay M-aware; Qwen3.6 LM-head can legitimately prefer WIDE/DIRECT at
-   M=1 and KPAR at M=2..4 for the same `(N,K)`.
+5. When debugging the decode trainer itself, the lower-level flow is
+   `Perf__CUDANativeVNNIDecodeTrainer.cpp` ->
+   `analyze_cuda_native_vnni_decode_trainer.py` -> the common compiler under
+   `native_vnni_dispatch/`. The retired `infer_gemv_dispatch_heuristic.py` and
+   `analyze_cuda_tc_gemv_dispatch.py` pipeline is not an authority and must not
+   be resurrected. Public M1 may legitimately prefer WIDE, DIRECT, or an exact
+   ordered KPAR schedule for the same `(N,K)` in eager versus captured mode.
+   Grouped M2+ never chooses an independent schedule; it inherits the complete
+   frozen M1 arithmetic identity and proves byte equality at every required M.
    The trained fallback is the real policy: it must generalize by aspect ratio
    and work-size/log-shape features. Exact `(M,N,K)` rows are overlays only.
    Do not replace the broad fallback with a table that only recognizes today’s
@@ -278,8 +336,8 @@ regression for the affected shape and the relevant Qwen3.6 CUDA parity cells.
 ### MTP verifier dispatch mode
 
 Grouped MTP verifier rows are stricter than ordinary fast decode: rows may be
-published to live state, so they must be reproducible against rowwise serial
-decode under strict L2/cos/KLD/max-abs gates. CUDA exposes this through
+published to live state, so every native FP32 output byte must equal rowwise
+serial M1 decode. L2/cos/KLD/max-abs are diagnostics only. CUDA exposes this through
 `ITensorGemm::beginVerifierDecodeEquivalentScope()`, which selects the canonical
 small-M NativeVNNI dispatch/reduction policy and disables prefill/concurrent
 decode reordering without enabling global `LLAMINAR_DETERMINISTIC`. Stage code

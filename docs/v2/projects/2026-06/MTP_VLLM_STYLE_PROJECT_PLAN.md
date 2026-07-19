@@ -13,6 +13,13 @@ accepted-count state machine: draft state lives in speculative slots, target
 verification produces accepted counts and output tokens, and only accepted
 state slots are published to live model state.
 
+Related proposer work: the
+[`QWEN36_DFLASH_ACCELERATION_PROJECT_PLAN.md`](../2026-07/QWEN36_DFLASH_ACCELERATION_PROJECT_PLAN.md)
+uses this accepted-count verifier/publication transaction for a parallel
+block-diffusion drafter. DFlash is not a second verifier path; the shared MTP
+transaction is generalized behind proposer-neutral interfaces before DFlash is
+connected.
+
 2026-07-06 update: CUDA2 ExpertOverlay Dynamic + prefix-cache + MTP long-context
 parity now passes after prefix restore without a model-runtime snapshot destroys
 depth-0 MTP sidecar graph caches instead of preserving graph objects whose MoE

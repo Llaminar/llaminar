@@ -372,7 +372,7 @@ namespace llaminar2
             /**
              * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
              *
-             * This is the graph-stage proof boundary for M=2..4 verifier rows.
+             * This is the graph-stage proof boundary for M=2..16 verifier rows.
              * It prepares row-local attention parameters for the whole verifier
              * span, then invokes one grouped flash-decode phase grid and one
              * grouped reduction grid. Each row shares the same K/V allocation

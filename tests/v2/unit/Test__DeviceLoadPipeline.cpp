@@ -478,6 +478,139 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_SingleWeight)
 #endif
 }
 
+TEST_F(Test__DeviceLoadPipeline, Q4_0_KChunkedWeightMatchesUnchunkedLayout)
+{
+#ifdef HAVE_ROCM
+    const int N = 64;
+    const int K = 128;
+    const int blocks_per_row = K / 32;
+    const int total_blocks = N * blocks_per_row;
+    const size_t raw_bytes = total_blocks * sizeof(Q4_0Block);
+    const size_t raw_bytes_per_row = blocks_per_row * sizeof(Q4_0Block);
+
+    std::vector<Q4_0Block> host_blocks(total_blocks);
+    fill_q4_0_blocks(host_blocks.data(), total_blocks);
+
+    LoadOrchestrator orch(backend_);
+    orch.addDevice(0);
+    orch.planWeight(0, "chunked_q4_0", N, K, 16, false, false, raw_bytes);
+    orch.allocate(/*pinned_slot_size=*/16 * raw_bytes_per_row,
+                  /*num_h2d_streams=*/2);
+
+    WeightJob job;
+    job.name = "chunked_q4_0";
+    job.host_raw_data = host_blocks.data();
+    job.raw_bytes = raw_bytes;
+    job.format = RepackFormat::Q4_0;
+    job.N = N;
+    job.K = K;
+    job.is_asymmetric = false;
+    orch.addWeightJob(0, job);
+
+    EXPECT_EQ(orch.pendingJobCount(0), 4u);
+    ASSERT_NO_THROW(orch.load());
+
+    auto *pool = orch.getPool(0);
+    ASSERT_NE(pool, nullptr);
+    auto slot = pool->getSlot("chunked_q4_0");
+    ASSERT_TRUE(slot.has_value());
+    verifyQ4_0Slot(*slot, host_blocks.data(), N, K);
+
+    orch.release();
+#endif
+}
+
+TEST_F(Test__DeviceLoadPipeline, Q4_K_KChunkedWeightMatchesUnchunkedLayout)
+{
+#ifdef HAVE_ROCM
+    const int N = 32;
+    const int K = 1024;
+    const int superblocks_per_row = K / 256;
+    const size_t raw_bytes = static_cast<size_t>(N) * superblocks_per_row * sizeof(Q4_KBlock);
+    const size_t raw_bytes_per_superblock_column = static_cast<size_t>(N) * sizeof(Q4_KBlock);
+
+    std::vector<Q4_KBlock> host_blocks(static_cast<size_t>(N) * superblocks_per_row);
+    fill_q4k_blocks(host_blocks.data(), static_cast<int>(host_blocks.size()));
+
+    LoadOrchestrator orch(backend_);
+    orch.addDevice(0);
+    orch.planWeight(0, "chunked_q4_k", N, K, 16, true, false, raw_bytes);
+    orch.allocate(/*pinned_slot_size=*/raw_bytes_per_superblock_column,
+                  /*num_h2d_streams=*/2);
+
+    WeightJob job;
+    job.name = "chunked_q4_k";
+    job.host_raw_data = host_blocks.data();
+    job.raw_bytes = raw_bytes;
+    job.format = RepackFormat::Q4_K;
+    job.N = N;
+    job.K = K;
+    job.is_asymmetric = true;
+    orch.addWeightJob(0, job);
+
+    EXPECT_EQ(orch.pendingJobCount(0), 4u);
+    ASSERT_NO_THROW(orch.load());
+
+    auto *pool = orch.getPool(0);
+    ASSERT_NE(pool, nullptr);
+    auto slot = pool->getSlot("chunked_q4_k");
+    ASSERT_TRUE(slot.has_value());
+    verifyQ4_KSlot(*slot, host_blocks.data(), N, K);
+
+    orch.release();
+#endif
+}
+
+TEST(Test__DeviceLoadPipelineCUDA, Q4_0_KChunkedWeightMatchesUnchunkedLayout)
+{
+#ifdef HAVE_CUDA
+    auto *backend = getCUDABackend();
+    if (!backend)
+        GTEST_SKIP() << "CUDA backend unavailable";
+    backend->setDevice(0);
+
+    const int N = 64;
+    const int K = 128;
+    const int blocks_per_row = K / 32;
+    const int total_blocks = N * blocks_per_row;
+    const size_t raw_bytes = static_cast<size_t>(total_blocks) * sizeof(Q4_0Block);
+    const size_t raw_bytes_per_block_column = static_cast<size_t>(N) * sizeof(Q4_0Block);
+    std::vector<Q4_0Block> host_blocks(total_blocks);
+    fill_q4_0_blocks(host_blocks.data(), total_blocks);
+
+    LoadOrchestrator orch(backend);
+    orch.addDevice(0);
+    orch.planWeight(0, "cuda_chunked_q4_0", N, K, 16, false, false, raw_bytes);
+    orch.allocate(raw_bytes_per_block_column, 2);
+
+    WeightJob job;
+    job.name = "cuda_chunked_q4_0";
+    job.host_raw_data = host_blocks.data();
+    job.raw_bytes = raw_bytes;
+    job.format = RepackFormat::Q4_0;
+    job.N = N;
+    job.K = K;
+    job.is_asymmetric = false;
+    orch.addWeightJob(0, job);
+    ASSERT_NO_THROW(orch.load());
+
+    auto slot = orch.getPool(0)->getSlot(job.name);
+    ASSERT_TRUE(slot.has_value());
+    std::vector<uint8_t> expected_payload;
+    std::vector<uint16_t> expected_scales;
+    cpu_pack_q4_0(host_blocks.data(), N, K, expected_payload, expected_scales);
+    std::vector<uint8_t> actual_payload(expected_payload.size());
+    std::vector<uint16_t> actual_scales(expected_scales.size());
+    ASSERT_TRUE(backend->deviceToHost(actual_payload.data(), slot->d_native_vnni_payload,
+                                      actual_payload.size(), 0));
+    ASSERT_TRUE(backend->deviceToHost(actual_scales.data(), slot->d_native_vnni_scales,
+                                      actual_scales.size() * sizeof(uint16_t), 0));
+    EXPECT_EQ(actual_payload, expected_payload);
+    EXPECT_EQ(actual_scales, expected_scales);
+    orch.release();
+#endif
+}
+
 // ============================================================================
 // Test 2: Q4_K single weight through pipeline
 // ============================================================================

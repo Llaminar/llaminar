@@ -83,7 +83,7 @@ extern "C"
      * Unlike an ordinary decode batch, every verifier row reads the same cache
      * allocation but has its own device-resident logical KV length. The kernel
      * preserves the exact split sizing and reduction order of independent M=1
-     * decode while amortizing launch overhead across M=2..4.
+     * decode while amortizing launch overhead across runtime M=2..16.
      */
     int cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
         const float *Q, const void *K_cache_fp16, const void *V_cache_fp16, float *O,

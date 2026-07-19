@@ -1746,6 +1746,152 @@ add_v2_test(V2_Unit_NativeVnniFormatInfo
     MPI_PROCS 1
 )
 
+# The learned-dispatch fitter evaluates millions of exact leaf objectives and
+# legal feature splits. ABI v7 keeps the full top-64 tree beam on CUDA or ROCm,
+# including canonical p95 gates, complete objective ordering, exact structural
+# deduplication, compact index-only selection, graph replay, and every leaf
+# budget. Keep one DSO per vendor: a policy worker
+# loads exactly one runtime and binds to one physical accelerator, avoiding
+# CUDA/HIP startup interaction in-process.
+if(HAVE_CUDA)
+    add_library(v2_native_vnni_leaf_primary_scorer_cuda SHARED
+        performance/kernels/native_vnni_dispatch/CUDANativeVNNILeafPrimaryScorer.cu
+    )
+    target_include_directories(v2_native_vnni_leaf_primary_scorer_cuda PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch
+    )
+    target_link_libraries(v2_native_vnni_leaf_primary_scorer_cuda PRIVATE
+        CUDA::cudart
+    )
+    target_compile_options(v2_native_vnni_leaf_primary_scorer_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true>
+    )
+    set_target_properties(v2_native_vnni_leaf_primary_scorer_cuda PROPERTIES
+        OUTPUT_NAME llaminar_native_vnni_leaf_primary_scorer_cuda
+        CXX_VISIBILITY_PRESET hidden
+        CUDA_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
+    )
+endif()
+
+if(HAVE_ROCM)
+    set_source_files_properties(
+        performance/kernels/native_vnni_dispatch/ROCmNativeVNNILeafPrimaryScorer.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    add_library(v2_native_vnni_leaf_primary_scorer_rocm SHARED
+        performance/kernels/native_vnni_dispatch/ROCmNativeVNNILeafPrimaryScorer.hip
+    )
+    target_include_directories(v2_native_vnni_leaf_primary_scorer_rocm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch
+    )
+    target_link_libraries(v2_native_vnni_leaf_primary_scorer_rocm PRIVATE
+        hip::host
+        hip::device
+    )
+    target_compile_options(v2_native_vnni_leaf_primary_scorer_rocm PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:-O3;-fno-fast-math;-ffp-contract=off>
+    )
+    set_target_properties(v2_native_vnni_leaf_primary_scorer_rocm PROPERTIES
+        OUTPUT_NAME llaminar_native_vnni_leaf_primary_scorer_rocm
+        CXX_VISIBILITY_PRESET hidden
+        HIP_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
+    )
+endif()
+
+# GPU execution belongs in Integration, never Unit. Each CTest process loads
+# only one vendor DSO and compares the diagnostic leaf primitive and complete
+# fitted tree sequence with an independent serial Python oracle over adversarial
+# matrices, feature families, missing candidates, and profiler-adjusted costs.
+# The same integration also requires persistent matrix/scratch reuse, captured
+# graph replay, one terminal stream synchronization, and zero intermediate syncs.
+if(NOT V2_PERF_TESTS_ONLY AND HAVE_CUDA)
+    add_test(NAME V2_Integration_NativeVNNILeafPrimaryScorer_CUDA
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/Test__NativeVNNILeafPrimaryScorer.py
+            --backend cuda
+            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_cuda>
+            --device 0
+    )
+    set_tests_properties(V2_Integration_NativeVNNILeafPrimaryScorer_CUDA PROPERTIES
+        LABELS "V2;Integration;CUDA;NativeVNNI;MTP;Dispatch;Trainer;GPUAccelerated;Exact;Regression"
+        RESOURCE_LOCK cuda_gpu_0
+        TIMEOUT 30
+    )
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY AND HAVE_ROCM)
+    add_test(NAME V2_Integration_NativeVNNILeafPrimaryScorer_ROCm
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/Test__NativeVNNILeafPrimaryScorer.py
+            --backend rocm
+            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_rocm>
+            --device 0
+    )
+    set_tests_properties(V2_Integration_NativeVNNILeafPrimaryScorer_ROCm PROPERTIES
+        LABELS "V2;Integration;ROCm;NativeVNNI;MTP;Dispatch;Trainer;GPUAccelerated;Exact;Regression"
+        RESOURCE_LOCK rocm_gpu_0
+        TIMEOUT 30
+    )
+endif()
+
+# Production-shaped scorer benchmark. Keep this in the performance tier: it
+# launches the complete 32-leaf GPU search and intentionally carries no serial
+# Python oracle. The integration suite above owns exactness; this target makes
+# capture/replay economics visible before an hours-long corpus fit is started.
+if(HAVE_CUDA)
+    add_test(NAME V2_Perf_NativeVNNIPolicyScorer_CUDA
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIPolicyScorer.py
+            --backend cuda
+            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_cuda>
+            --device 0
+    )
+    set_tests_properties(V2_Perf_NativeVNNIPolicyScorer_CUDA PROPERTIES
+        LABELS "V2;Performance;CUDA;NativeVNNI;Dispatch;Trainer;GPUAccelerated"
+        RESOURCE_LOCK cuda_gpu_0
+        TIMEOUT 300
+    )
+endif()
+
+if(HAVE_ROCM)
+    add_test(NAME V2_Perf_NativeVNNIPolicyScorer_ROCm
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIPolicyScorer.py
+            --backend rocm
+            --library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_rocm>
+            --device 0
+    )
+    set_tests_properties(V2_Perf_NativeVNNIPolicyScorer_ROCm PROPERTIES
+        LABELS "V2;Performance;ROCm;NativeVNNI;Dispatch;Trainer;GPUAccelerated"
+        RESOURCE_LOCK rocm_gpu_0
+        TIMEOUT 300
+    )
+endif()
+
+# End-to-end grouped-CV economics. Unlike the per-fold scorer tests above, this
+# runs production fold construction, all profiler-influence variants, dynamic
+# scheduling across every local accelerator, and deterministic CV reduction.
+# It reports a 108-domain projection so tuning can target a complete fit in
+# minutes rather than optimizing an isolated graph while orchestration remains
+# expensive. The projection is diagnostic until the target is achieved; the
+# harness itself still hard-fails runtime, coverage, and worker-lifecycle bugs.
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_test(NAME V2_Perf_NativeVNNIPolicyCrossValidation_MixedGPU
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/Perf__NativeVNNIPolicyCrossValidation.py
+            --cuda-library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_cuda>
+            --rocm-library $<TARGET_FILE:v2_native_vnni_leaf_primary_scorer_rocm>
+    )
+    set_tests_properties(
+        V2_Perf_NativeVNNIPolicyCrossValidation_MixedGPU PROPERTIES
+        LABELS "V2;Performance;CUDA;ROCm;NativeVNNI;Dispatch;Trainer;CrossValidation;GPUAccelerated"
+        RESOURCE_LOCK "cuda_gpu_0;cuda_gpu_1;rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3"
+        TIMEOUT 600
+    )
+endif()
+
 add_test(NAME V2_Unit_NativeVNNICodebookCsvValidator
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_codebook_csv.py
@@ -1789,6 +1935,143 @@ add_test(NAME V2_Unit_NativeVNNIDispatchRefreshScript
 )
 set_tests_properties(V2_Unit_NativeVNNIDispatchRefreshScript PROPERTIES
     LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Regression"
+    TIMEOUT 1800
+)
+
+add_test(NAME V2_Unit_NativeVNNICorpusBundle
+    COMMAND ${Python3_EXECUTABLE} -m pytest -q
+            tests/v2/unit/scripts/test_native_vnni_corpus_bundle.py
+)
+set_tests_properties(V2_Unit_NativeVNNICorpusBundle PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Corpus;GitLFS;Regression"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIDispatchPipeline
+    COMMAND ${Python3_EXECUTABLE} -m pytest -q
+            tests/v2/unit/scripts/test_native_vnni_dispatch_pipeline.py
+)
+set_tests_properties(V2_Unit_NativeVNNIDispatchPipeline PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Regression"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillReplayRecipe
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_replay_recipe.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillReplayRecipe PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Corpus;Regression"
+    TIMEOUT 120
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillBurnedSeal
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_burned_seal.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillBurnedSeal PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Corpus;Certification;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillCandidateExpansion
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_candidate_expansion.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillCandidateExpansion PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;CandidateExpansion;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillCandidateExpansionRebase
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_candidate_expansion_rebase.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillCandidateExpansionRebase PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;CandidateExpansion;Checkpoint;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillCheckpointMigration
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_checkpoint_migration.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillCheckpointMigration PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Checkpoint;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillDevelopmentLineage
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_development_lineage.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillDevelopmentLineage PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Lineage;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillGenericRefinement
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_generic_refinement.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillGenericRefinement PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;Refinement;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillRouteManifest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_route_manifest.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillRouteManifest PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;RouteManifest;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillTrainingPlan
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_training_plan.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillTrainingPlan PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;Prefill;Dispatch;Trainer;MeasurementPlan;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CUDANativeVNNIDecodeAdapter
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_vnni_decode_adapter.py
+)
+set_tests_properties(V2_Unit_CUDANativeVNNIDecodeAdapter PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;Decode;Dispatch;Trainer;Evidence;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNICompatibleCSVs
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_compatible_csvs.py
+)
+set_tests_properties(V2_Unit_NativeVNNICompatibleCSVs PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Corpus;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIGPUMeasurementPlan
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_gpu_measurement_plan.py
+)
+set_tests_properties(V2_Unit_NativeVNNIGPUMeasurementPlan PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;ROCm;Dispatch;Trainer;MeasurementPlan;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIQwenReleaseGeometry
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_qwen_release_geometry.py
+)
+set_tests_properties(V2_Unit_NativeVNNIQwenReleaseGeometry PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;Dispatch;Trainer;Qwen;Geometry;Regression"
     TIMEOUT 30
 )
 
@@ -1819,12 +2102,60 @@ set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeTrainer PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_CUDANativeVNNIDecodeTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cuda_native_vnni_decode_trainer.py
+)
+
+add_test(NAME V2_Unit_NativeVNNIPairedRequests
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_paired_requests.py
+)
+set_tests_properties(V2_Unit_NativeVNNIPairedRequests PROPERTIES
+    LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Dispatch;Trainer;PairedTiming;Regression"
+    TIMEOUT 30
+)
+
+add_executable(v2_test_native_vnni_paired_request_manifest
+    unit/native_vnni_dispatch/Test__NativeVNNIPairedRequestManifest.cpp)
+target_include_directories(v2_test_native_vnni_paired_request_manifest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_native_vnni_paired_request_manifest
+    GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_NativeVNNIPairedRequestManifest
+    COMMAND $<TARGET_FILE:v2_test_native_vnni_paired_request_manifest>
+    LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Dispatch;Trainer;JSON;Regression"
+    MPI_PROCS 1
+)
+set_tests_properties(V2_Unit_CUDANativeVNNIDecodeTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CUDA;NativeVNNI;Decode;Dispatch;Trainer;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_CPUNativeVNNIVerifierAdapter
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_verifier_adapter.py
 )
 set_tests_properties(V2_Unit_CPUNativeVNNIVerifierAdapter PROPERTIES
     LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Evidence;ISA;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIDecodeAdapter
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_decode_adapter.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIDecodeAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Evidence;ISA;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIDecodeTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_decode_trainer.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIDecodeTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Decode;Dispatch;ISA;Trainer;Regression"
     TIMEOUT 30
 )
 
@@ -1837,12 +2168,93 @@ set_tests_properties(V2_Unit_CPUNativeVNNIVerifierTrainer PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillAdapter
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_adapter.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillAdapter PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Evidence;ISA;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CPUNativeVNNIPrefillTrainer
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_native_vnni_prefill_trainer.py
+)
+set_tests_properties(V2_Unit_CPUNativeVNNIPrefillTrainer PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Dispatch;ISA;Trainer;Regression"
+    TIMEOUT 120
+)
+
+add_test(NAME V2_Unit_NativeVNNIGroupedOracleExtent
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_grouped_oracle_extent.py
+)
+set_tests_properties(V2_Unit_NativeVNNIGroupedOracleExtent PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;CUDA;ROCm;MoE;NativeVNNI;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIShapeManifest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_shape_manifest.py
+)
+set_tests_properties(V2_Unit_NativeVNNIShapeManifest PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;CUDA;ROCm;NativeVNNI;Dispatch;Trainer;Certification;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIPrefillMatrix
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_prefill_matrix.py
+)
+set_tests_properties(V2_Unit_NativeVNNIPrefillMatrix PROPERTIES
+    LABELS "V2;Unit;MTP;CPU;NativeVNNI;Prefill;Dispatch;Trainer;Matrix;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_NativeVNNICommonDispatchPolicy
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_dispatch_policy.py
 )
 set_tests_properties(V2_Unit_NativeVNNICommonDispatchPolicy PROPERTIES
     LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;Certification;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIPolicyAccelerator
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_policy_accelerator.py
+)
+set_tests_properties(V2_Unit_NativeVNNIPolicyAccelerator PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Dispatch;Trainer;GPUAccelerated;ProcessIsolation;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIProfilerEvidence
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_evidence.py
+)
+set_tests_properties(V2_Unit_NativeVNNIProfilerEvidence PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Performance;Profiler;Evidence;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIProfilerDiagnostics
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_diagnostics.py
+)
+set_tests_properties(V2_Unit_NativeVNNIProfilerDiagnostics PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CPU;CUDA;ROCm;MTP;Performance;Profiler;Diagnostics;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIPairedConfirmation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_paired_confirmation.py
+)
+set_tests_properties(V2_Unit_NativeVNNIPairedConfirmation PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;CUDA;MTP;Performance;Trainer;Certification;Regression"
     TIMEOUT 30
 )
 
@@ -1911,30 +2323,6 @@ add_test(NAME V2_Unit_MoELLEPTraceCorpusEvaluatorScript
 )
 set_tests_properties(V2_Unit_MoELLEPTraceCorpusEvaluatorScript PROPERTIES
     LABELS "V2;Unit;MoE;Benchmark;Policy;LLEP;Regression"
-    TIMEOUT 30
-)
-
-add_test(NAME V2_Unit_CUDAGemvDispatchGeneratorAliases
-    COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_generator.py
-            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/infer_gemv_dispatch_heuristic.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/fixtures/cuda_gemv_dispatch_alias_smoke.csv
-)
-set_tests_properties(V2_Unit_CUDAGemvDispatchGeneratorAliases PROPERTIES
-    LABELS "V2;Unit;CUDA;GEMV;NativeVNNI;Codebook;Dispatch;Regression"
-    TIMEOUT 30
-)
-
-add_test(NAME V2_Unit_CUDAGemvDispatchBaseMerge
-    COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_base_merge.py
-            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/analyze_cuda_tc_gemv_dispatch.py
-            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/fixtures/cuda_gemv_dispatch_alias_smoke.csv
-            --base-include ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
-            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
-)
-set_tests_properties(V2_Unit_CUDAGemvDispatchBaseMerge PROPERTIES
-    LABELS "V2;Unit;CUDA;GEMV;NativeVNNI;Codebook;Dispatch;Regression"
     TIMEOUT 30
 )
 
@@ -4913,6 +5301,33 @@ add_v2_test(V2_Perf_MoEVerifierPrefill
     RESOURCE_LOCK RealModel_Perf
 )
 
+# The Qwen 3.6 routed-plus-shared verifier table has 257 descriptors. Keep its
+# capacity proof in the canonical grouped-verifier namespace so CUDA/ROCm table
+# indexing and ROCm's device-owned long-M work directory cannot regress behind
+# the broader performance target. Each backend test selects expert id 256 and
+# sweeps every quantized source format at direct M=4 and runtime M=9/M=31.
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoE257DescriptorTable
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+                --gtest_filter=Perf__MoEVerifierPrefill.CUDA_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;RuntimeM;SharedExpert;DeviceResident;GraphCapture;Regression"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+    )
+endif()
+
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoE257DescriptorTable
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+                --gtest_filter=Perf__MoEVerifierPrefill.ROCm_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;RuntimeM;SharedExpert;DeviceResident;GraphCapture;Regression;gfx906"
+        MPI_PROCS 1
+        RESOURCE_LOCK RealModel_Perf
+    )
+endif()
+
 # Focused LLEP/rebalance deterministic-kernel speedometer.
 # Covers grouped route/scatter prep, current-batch span assignment, Dynamic
 # maintenance planning, transfer-command materialization, and compact payload
@@ -5321,15 +5736,47 @@ add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
 # NativeVNNI decode/verifier trainer. This executable sweeps exact CUDA launch
 # schedules for serial M=1 and grouped runtime-M rows, emits replayable evidence
 # CSVs, and is intentionally run through the Performance gate rather than Unit.
+# Every NativeVNNI trainer backend consumes this one resolved exact-overlay
+# inventory. Keep the paths centralized here; backend-specific target blocks
+# must never grow private model/shape lists.
+set(LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json")
+set(LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG
+    "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/qwen35_qwen36_release_models_v1.json")
+
 add_executable(v2_perf_cuda_native_vnni_decode_trainer
     performance/kernels/cuda/gemm/Perf__CUDANativeVNNIDecodeTrainer.cpp)
 target_link_libraries(v2_perf_cuda_native_vnni_decode_trainer
     llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_perf_cuda_native_vnni_decode_trainer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_compile_definitions(v2_perf_cuda_native_vnni_decode_trainer PRIVATE
+    LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
+    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
 add_v2_test(V2_Perf_CUDANativeVNNIDecodeTrainer
     COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_decode_trainer>
     LABELS "V2;Performance;CUDA;GEMV;Decode;MTP;GroupedVerifierRows;NativeVNNI;AllFormats;BatchInvariant;Trainer"
     MPI_PROCS 1
 )
+if(HAVE_CUDA)
+    # Regression for exact K-partitions that leave trailing empty splits. The
+    # trainer poisons partial workspace first, so every split must explicitly
+    # publish before the ordered reducer runs in eager and captured execution.
+    add_v2_test(V2_Integration_CUDANativeVNNIExactKPartTailPublication
+        COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_decode_trainer>
+                --gtest_filter=*TrainerCsv_StrongDecode_AllFormats
+        LABELS "V2;Integration;CUDA;MTP;NativeVNNI;KPart;GraphCapture;Regression"
+        MPI_PROCS 1
+    )
+    if(TEST V2_Integration_CUDANativeVNNIExactKPartTailPublication)
+        set_tests_properties(V2_Integration_CUDANativeVNNIExactKPartTailPublication PROPERTIES
+            ENVIRONMENT
+                "LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q8_0;LLAMINAR_CUDA_NVNNI_DECODE_SHAPES=35BMoE_Expert_Down;LLAMINAR_CUDA_NVNNI_DECODE_M=1;LLAMINAR_CUDA_NVNNI_DECODE_CANDIDATES=cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb15;LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured;LLAMINAR_CUDA_NVNNI_DECODE_WARMUPS=2;LLAMINAR_CUDA_NVNNI_DECODE_SAMPLES=5;LLAMINAR_CUDA_NVNNI_DECODE_CSV=/tmp/llaminar_cuda_exact_kpart_tail.csv;LLAMINAR_CUDA_NVNNI_DECODE_TIMING_CSV=/tmp/llaminar_cuda_exact_kpart_tail.timing.csv"
+            RESOURCE_LOCK cuda_gpu_0
+            TIMEOUT 30
+        )
+    endif()
+endif()
 
 add_executable(v2_perf_cuda_native_vnni_gemm performance/kernels/cuda/gemm/Perf__CUDANativeVNNIGemm.cpp)
 target_link_libraries(v2_perf_cuda_native_vnni_gemm llaminar2_core GTest::gtest GTest::gtest_main)
@@ -9415,7 +9862,7 @@ add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters
+            --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_SmallM_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_ForcedWideRows_AllFormatsRuntimeMMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows:CPUNativeVNNIGemvTest.MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.MTP_FP16BF16FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters:CPUNativeVNNIGemvTest.NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode
             --gtest_brief=1
     LABELS "V2;Integration;CPU;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeVNNI;oneDNN;Regression"
     MPI_PROCS 1
@@ -9485,6 +9932,11 @@ target_link_libraries(v2_perf_cpu_native_vnni_gemv
 )
 target_include_directories(v2_perf_cpu_native_vnni_gemv PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
+)
+target_compile_definitions(v2_perf_cpu_native_vnni_gemv PRIVATE
+    LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
+    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"
 )
 add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
@@ -10521,7 +10973,13 @@ if(HAVE_ROCM)
         GTest::gtest_main
         OpenMP::OpenMP_CXX
         roc::hipblas
+        ${ROCM_PATH}/lib/librocprofiler-sdk-roctx.so
     )
+    target_include_directories(v2_perf_native_vnni_throughput PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+    target_compile_definitions(v2_perf_native_vnni_throughput PRIVATE
+        LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
+        LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
     target_compile_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
     target_link_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
     add_v2_test(V2_Perf_NativeVNNI_Throughput

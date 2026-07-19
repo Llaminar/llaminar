@@ -25,6 +25,25 @@ namespace llaminar2
         int N;                     ///< Number of output features (rows in weight matrix)
         int K;                     ///< Number of input features (columns)
         bool is_asymmetric;        ///< True if format has mins (Q4_K etc.)
+
+        /** Chunk coordinates for bounded staging. */
+        int row_offset = 0;
+        int full_N = 0;
+        int full_K = 0;
+
+        /**
+         * Quantized weights are chunked along K because the final VNNI layout is
+         * block-major (`block * N + row`). The host GGUF layout is row-major, so
+         * a K chunk is gathered from `N` source rows into the pinned slot.
+         */
+        size_t host_row_stride_bytes = 0;
+        size_t host_row_copy_bytes = 0;
+        int output_block_offset = 0;
+
+        /// Drop mmap PTEs for this source range once it has reached pinned memory.
+        bool advise_mmap_dontneed_after_staging = false;
+        const void *mmap_discard_data = nullptr;
+        size_t mmap_discard_bytes = 0;
     };
 
     /// Per-device pipelined H2D transfer + GPU repack engine.

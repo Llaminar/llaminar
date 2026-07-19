@@ -2,7 +2,10 @@
  * @file Perf__NativeVNNI_Throughput.cpp
  * @brief Per-format bandwidth benchmark for native-VNNI GEMV kernels
  *
- * Measures decode throughput for M=1 GEMV and M=2..4 verifier-row GEMV
+ * Measures decode throughput for serial M=1 GEMV and runtime-M grouped
+ * verifier GEMV. The canonical verifier inventory is M=2..16 plus M=31:
+ * fifteen draft tokens require sixteen target rows, while M=31 guards against
+ * accidentally turning that current graph capacity into a kernel limit.
  * shapes across all native-VNNI formats.
  * at model-realistic dimensions (Qwen2.5-0.5B, 3B, and 7B layer shapes).
  *
@@ -63,10 +66,13 @@
 #include "../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../native_vnni_dispatch/NativeVNNIProfilerControl.h"
+#include "../native_vnni_dispatch/NativeVNNIShapeManifest.h"
 #include "fort.hpp"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
 #include "GpuVerification.h"
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
@@ -205,51 +211,17 @@ namespace
          { return TestTensorFactory::createQ8_KRandom({N, K}); }},
     };
 
-    // Model-realistic GEMV shapes (N×K)
-    struct GEMVShape
-    {
-        std::string name;
-        int N;
-        int K;
-    };
+    using GEMVShape = native_vnni_dispatch::NativeVNNIShapeSpec;
 
-    // Qwen2.5-0.5B:  hidden=896,  intermediate=4864
-    // Qwen2.5-3B:    hidden=2048, intermediate=11008
-    // Qwen2.5-7B:    hidden=3584, intermediate=18944
-    // All K values are multiples of 32 (minimum block size).
-    // Super-block formats (256-element) handle non-256-aligned K via sub-block iteration.
-    static const std::vector<GEMVShape> SHAPES = {
-        // Qwen3.5/Qwen3.6 MoE expert FFN decode shapes.
-        {"35BMoE_Expert_GateUp", 512, 2048},
-        {"35BMoE_Expert_Down", 2048, 512},
-        // Qwen3.6 MoE hybrid GDN verifier decode shapes.
-        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
-        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
-        // Qwen2.5-0.5B
-        {"0.5B_AttnOut", 896, 896},    // Qwen2.5-0.5B attention output projection
-        {"0.5B_QKV", 896 * 3, 896},    // Qwen2.5-0.5B attention QKV projection
-        {"0.5B_FFN_Up", 4864, 896},    // Qwen2.5-0.5B FFN gate/up
-        {"0.5B_FFN_Dn", 896, 4864},    // Qwen2.5-0.5B FFN down
-        {"0.5B_LM_Head", 151936, 896}, // Qwen2.5-0.5B LM head (vocab projection)
-        // Qwen2.5-3B
-        {"3B_AttnOut", 2048, 2048},   // Qwen2.5-3B attention output projection
-        {"3B_FFN_Up", 11008, 2048},   // Qwen2.5-3B FFN gate/up
-        {"3B_FFN_Dn", 2048, 11008},   // Qwen2.5-3B FFN down
-        {"3B_LM_Head", 151936, 2048}, // Qwen2.5-3B LM head (vocab projection)
-        // Qwen2.5-7B
-        {"7B_QKV", 3584 * 3, 3584}, // Qwen2.5-7B attention projection
-        {"7B_FFN_Up", 18944, 3584}, // Qwen2.5-7B FFN gate/up
-        {"7B_FFN_Dn", 3584, 18944}, // Qwen2.5-7B FFN down
-        // Qwen3.6 27B dense / hybrid GDN production shapes.
-        {"Qwen36_Attn_QKVProjection", 12288, 5120},
-        {"Qwen36_FFN_GateUp", 17408, 5120},
-        {"Qwen36_FFN_DownProjection", 5120, 17408},
-        {"Qwen36_GDN_InnerProjection", 10240, 5120},
-        {"Qwen36_GDN_ZProjection", 6144, 5120},
-        {"Qwen36_GDN_TimeProjection", 1024, 5120},
-        {"Qwen36_GDN_OutputProjection", 5120, 6144},
-        {"Qwen36_LM_Head", 248320, 5120},
-    };
+    /**
+     * @brief Shared model and held-out shape inventory for ROCm measurements.
+     *
+     * The legacy ROCm-only list was broader than CUDA but still had no frozen
+     * development/sealed ownership. Loading the common manifest ensures every
+     * backend trains and certifies identical aspect, work, and small-K cells.
+     */
+    static const std::vector<GEMVShape> &SHAPES =
+        native_vnni_dispatch::nativeVnniShapeManifest();
 
     static std::string toLower(std::string value)
     {
@@ -344,7 +316,7 @@ namespace
         [[nodiscard]] bool appliesToM(int M) const
         {
             return (M == 1 && kind == DecodeCandidateKind::FastExplicitKB) ||
-                   (M >= 2 && M <= 4 &&
+                   (M >= 2 &&
                     kind == DecodeCandidateKind::VerifierInheritSerialM1);
         }
     };
@@ -572,7 +544,10 @@ namespace
     static std::vector<int> getDecodeMValues()
     {
         const char *raw = std::getenv("LLAMINAR_ROCM_NVNNI_DECODE_M");
-        const std::string spec = (raw && *raw) ? raw : "1";
+        const std::string spec =
+            (raw && *raw)
+                ? raw
+                : "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31";
 
         std::vector<int> values;
         std::stringstream stream(spec);
@@ -583,12 +558,12 @@ namespace
             if (token.empty())
                 continue;
             const int m = std::atoi(token.c_str());
-            if (m <= 0 || m > 4)
+            if (m <= 0)
                 throw std::runtime_error("Invalid ROCm NativeVNNI decode M value: " + token);
             values.push_back(m);
         }
         if (values.empty())
-            values.push_back(1);
+            throw std::runtime_error("ROCm decode trainer selected no M values");
         std::sort(values.begin(), values.end());
         values.erase(std::unique(values.begin(), values.end()), values.end());
         return values;
@@ -1153,6 +1128,7 @@ namespace
         std::string observed_candidate_id = "missing";
         std::string observed_path = "missing";
         double effective_bandwidth_gbs = 0.0;
+        int isolated_profile_launches = 0;
     };
 
     /**
@@ -1365,6 +1341,7 @@ namespace
         double weight_bytes,
         int warmups,
         int timing_samples,
+        const std::string &profiler_request_id,
         int device_id)
     {
         DecodeCandidateTrainerEvidence result;
@@ -1411,7 +1388,7 @@ namespace
 
         const auto run_once = [&]() -> bool
         {
-            if (M >= 2 && M <= 4)
+            if (M >= 2)
             {
                 auto verifier_scope = kernel.beginVerifierDecodeEquivalentScope();
                 return kernel.multiply_tensor(input, output.get(), M, N, K);
@@ -1473,7 +1450,7 @@ namespace
         result.route_counter_ok = observed && observed_count > 0 &&
                                   result.observed_kb == expected_kb &&
                                   inherited_waves_match &&
-                                  !(M >= 2 && M <= 4 &&
+                                  !(M >= 2 &&
                                     result.observed_path == "atomic_reduce");
 
         std::vector<float> first_output;
@@ -1502,10 +1479,15 @@ namespace
         result.repeat_byte_mismatches =
             llaminar2::test::trainer::nativeByteMismatchCount(
                 first_output, repeated_output);
+        /*
+         * Certify every grouped row. Restricting this comparison to N values
+         * would validate row zero only and let later-row indexing, workspace,
+         * or publication failures enter the learned verifier policy.
+         */
         result.comparison = llaminar2::test::trainer::compareFP32(
             repeated_output,
             serial.output,
-            static_cast<size_t>(N));
+            static_cast<size_t>(M) * static_cast<size_t>(N));
         result.numerical_correctness =
             result.comparison.nonfinite_count == 0 &&
             result.comparison.cosine >=
@@ -1523,6 +1505,55 @@ namespace
         {
             cleanup();
             return fail("warmup_sync");
+        }
+
+        if (!profiler_request_id.empty())
+        {
+            /*
+             * rocprofiler-sdk selected-region collection remains paused during
+             * preparation, graph capture, serial-oracle work, correctness, and
+             * warmup. Resume only for this extra production launch and pause
+             * again after its explicit-stream completion. The launch is not
+             * inserted into the canonical timing sample vector below.
+             */
+            const std::string profiler_range =
+                "NativeVNNIProfile::" + profiler_request_id;
+            if (roctxRangePushA(profiler_range.c_str()) < 0)
+            {
+                cleanup();
+                return fail("profiler_range_push");
+            }
+            if (roctxProfilerResume(0) != 0)
+            {
+                (void)roctxRangePop();
+                cleanup();
+                return fail("profiler_resume");
+            }
+            const bool launch_ok = execute_once();
+            const hipError_t synchronize_status = hipStreamSynchronize(stream);
+            const int pause_status = roctxProfilerPause(0);
+            const int range_level = roctxRangePop();
+            if (!launch_ok || synchronize_status != hipSuccess || pause_status != 0)
+            {
+                cleanup();
+                return fail("profiler_target_launch");
+            }
+            if (range_level < 0)
+            {
+                cleanup();
+                return fail("profiler_range_pop");
+            }
+            result.isolated_profile_launches = 1;
+            std::fprintf(
+                stderr,
+                "[NativeVNNIProfiler][ROCm] request=%s candidate=%s "
+                "mode=%s M=%d N=%d K=%d launches=1\n",
+                profiler_request_id.c_str(),
+                variant.name.c_str(),
+                decodeExecutionModeName(execution_mode),
+                M,
+                N,
+                K);
         }
 
         hipEvent_t start = nullptr;
@@ -1677,6 +1708,23 @@ namespace
         const std::vector<DecodeExecutionMode> execution_modes =
             getDecodeExecutionModes();
         const std::vector<int> m_values = getDecodeMValues();
+        const std::string profiler_request_id =
+            native_vnni_dispatch::profilerRequestId();
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(format_filters.size(), 1u)
+                << "isolated ROCm profiling requires exactly one source format";
+            ASSERT_EQ(shape_filters.size(), 1u)
+                << "isolated ROCm profiling requires exactly one shape";
+            ASSERT_EQ(variants.size(), 1u)
+                << "isolated ROCm profiling requires exactly one candidate";
+            ASSERT_EQ(execution_modes.size(), 1u)
+                << "isolated ROCm profiling requires exactly one execution mode";
+            ASSERT_EQ(m_values.size(), 1u)
+                << "isolated ROCm profiling requires exactly one runtime M";
+            ASSERT_EQ(max_cases, 1)
+                << "isolated ROCm profiling requires exactly one shape case";
+        }
         ScopedTrainerEnvironment stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
 
         std::FILE *csv = nullptr;
@@ -1712,6 +1760,7 @@ namespace
 
         int executed_cases = 0;
         int executed_rows = 0;
+        int isolated_profile_launches = 0;
         uint64_t preparation_id = 1;
         for (const auto &fmt : ALL_PERF_FORMATS)
         {
@@ -1815,6 +1864,7 @@ namespace
                                     weight_bytes,
                                     trainer_warmups,
                                     trainer_samples,
+                                    profiler_request_id,
                                     0);
                             ASSERT_TRUE(result.valid)
                                 << fmt.name << '/' << shape.name << " M=" << M
@@ -1834,6 +1884,8 @@ namespace
                                 mode_index,
                                 std::move(result),
                                 eligible});
+                            isolated_profile_launches +=
+                                rows.back().result.isolated_profile_launches;
                         }
                     }
 
@@ -2009,6 +2061,11 @@ namespace
         if (timing_csv)
             ASSERT_EQ(std::fclose(timing_csv), 0);
         ASSERT_GT(executed_cases, 0) << "No ROCm NativeVNNI decode trainer cases selected.";
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(isolated_profile_launches, 1)
+                << "each ROCm profiler request must execute one target launch";
+        }
 #endif
     }
 

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import csv
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from tests.v2.performance.kernels.native_vnni_dispatch.adapters.cuda_decode import (  # noqa: E402
     CUDADecodeAdapterContext,
     adapt_cuda_decode_row,
+    read_cuda_decode_timing_sidecars,
 )
 from tests.v2.performance.kernels.native_vnni_dispatch.exact_oracle import (  # noqa: E402
     candidate_is_eligible,
@@ -45,6 +48,9 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
             "n": "128",
             "k": "256",
             "candidate_id": candidate,
+            "measurement_order": "0",
+            "measurement_order_seed": "123456789",
+            "measurement_protocol": "sample_interleaved_v1",
             "family": "kpar",
             "tile_n": "256",
             "cpt": "4",
@@ -181,6 +187,123 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unknown forceable candidate"):
             adapt_cuda_decode_row(row, self.context())
+
+    def test_batched_cuda_event_samples_preserve_per_launch_evidence(self) -> None:
+        """Accept stable replay batches and reject a changed replay divisor."""
+
+        fieldnames = (
+            "backend", "phase", "source_format", "source_codebook",
+            "execution_codebook", "shape", "execution_mode", "m", "n",
+            "k", "candidate_id", "measurement_order",
+            "measurement_order_seed", "measurement_protocol",
+            "sample_measurement_order", "sample_order_seed", "sample_index",
+            "timed_replays", "latency_us", "latency_us_hex",
+        )
+        base = {
+            "backend": "cuda",
+            "phase": "decode",
+            "source_format": "Q8_K",
+            "source_codebook": "21",
+            "execution_codebook": "19",
+            "shape": "StrongSmoke",
+            "execution_mode": "eager",
+            "m": "1",
+            "n": "128",
+            "k": "256",
+            "candidate_id": (
+                "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb8"
+            ),
+            "measurement_order": "0",
+            "measurement_order_seed": "123456789",
+            "measurement_protocol": "sample_interleaved_v1",
+            "sample_measurement_order": "0",
+            "timed_replays": "16",
+        }
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "timing.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for index, latency in enumerate((1.25, 1.5)):
+                    writer.writerow({
+                        **base,
+                        "sample_order_seed": str(9000 + index),
+                        "sample_index": str(index),
+                        "latency_us": f"{latency:.9f}",
+                        "latency_us_hex": latency.hex(),
+                    })
+            evidence = read_cuda_decode_timing_sidecars((path,))
+            self.assertEqual(next(iter(evidence.values())), (1.25, 1.5))
+
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[1]["timed_replays"] = "8"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "timed_replays changed"):
+                read_cuda_decode_timing_sidecars((path,))
+
+    def test_every_timing_sample_is_a_complete_candidate_permutation(self) -> None:
+        """Missing or repeated candidates cannot masquerade as interleaving."""
+
+        fieldnames = (
+            "backend", "phase", "source_format", "source_codebook",
+            "execution_codebook", "shape", "execution_mode", "m", "n",
+            "k", "candidate_id", "measurement_order",
+            "measurement_order_seed", "measurement_protocol",
+            "sample_measurement_order", "sample_order_seed", "sample_index",
+            "timed_replays", "latency_us", "latency_us_hex",
+        )
+        candidates = (
+            "cuda.nvnni.decode.fast_m1.kpar.tn64.cpt2.kb8",
+            "cuda.nvnni.decode.fast_m1.kpar.tn32.cpt1.kb4",
+        )
+        rows = []
+        for sample_index in range(3):
+            order = candidates if sample_index % 2 == 0 else candidates[::-1]
+            for sample_order, candidate in enumerate(order):
+                latency = 10.0 + sample_index + sample_order * 0.1
+                rows.append({
+                    "backend": "cuda",
+                    "phase": "decode",
+                    "source_format": "Q8_K",
+                    "source_codebook": "21",
+                    "execution_codebook": "19",
+                    "shape": "StrongSmoke",
+                    "execution_mode": "eager",
+                    "m": "1",
+                    "n": "128",
+                    "k": "256",
+                    "candidate_id": candidate,
+                    "measurement_order": str(candidates.index(candidate)),
+                    "measurement_order_seed": "123456789",
+                    "measurement_protocol": "sample_interleaved_v1",
+                    "sample_measurement_order": str(sample_order),
+                    "sample_order_seed": str(7000 + sample_index),
+                    "sample_index": str(sample_index),
+                    "timed_replays": "16",
+                    "latency_us": f"{latency:.9f}",
+                    "latency_us_hex": latency.hex(),
+                })
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "interleaved.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            evidence = read_cuda_decode_timing_sidecars((path,))
+            self.assertEqual(len(evidence), 2)
+
+            rows[1]["sample_measurement_order"] = "0"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "not one contiguous"):
+                read_cuda_decode_timing_sidecars((path,))
 
 
 if __name__ == "__main__":

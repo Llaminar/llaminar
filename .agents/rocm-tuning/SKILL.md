@@ -209,6 +209,10 @@ select per shape; don't assume one kernel wins everywhere.
 
 ## Step 6: Train generated NativeVNNI dispatch tables
 
+Read `.agents/nativevnni-gemm-tuning/SKILL.md` for the shared corpus, learner,
+certification, Git LFS, and installation workflow. This section owns only
+ROCm-specific kernel/profiler constraints.
+
 ROCm NativeVNNI dispatch should follow the same automatic sweep/generate/validate
 pipeline as CUDA. Avoid hand-coded per-shape overrides except as throwaway
 experiments.
@@ -217,14 +221,18 @@ experiments.
    `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp` for prefill
    and `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp` for
    decode/GEMV.
-2. For decode/GEMV dispatch tables, prefer the turnkey refresh wrapper:
-   `scripts/refresh_native_vnni_dispatch_tables.sh --backend rocm --profile qwen36`.
+2. For decode/GEMV dispatch tables, use the Git-LFS-aware turnkey transaction:
+   `scripts/train_native_vnni_dispatch.sh --backend rocm --install`.
+   The lower-level `refresh_native_vnni_dispatch_tables.sh` remains the phase
+   executor used by the driver and for focused diagnostic collection.
    It runs with `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`, sweeps canonical
-   `M={1,2,3,4}` verifier buckets, generates the M-aware include, validates it,
-   and can install it with `--install`.
-   Keep the generated decision surface keyed by M as well as N/K.  Qwen3.6
-   verifier buckets can prefer different families at M=1 versus M=2..4 for the
-   same projection shape, and CUDA/ROCm refresh evidence must stay comparable.
+   serial `M=1` first and grouped verifier `M=2..16,31` against that exact frozen
+   dependency, generates the include, validates it, and can install it with
+   `--install`. M31 is a deeper sentinel rather than a production maximum.
+   Keep public M1 decisions keyed by every runtime-visible discriminator.
+   Grouped verifier buckets must inherit the frozen M1 K partition and ordered
+   reduction tree; selecting a different M2+ family is incompatible with the
+   byte-exact serial-row contract.
    The durable decode selector must generalize by aspect ratio plus work-size
    segments. Exact `(M,N,K)` winners are allowed only as overlays above that
    broad fallback; do not land an exact-shape-only table that would require
@@ -240,6 +248,25 @@ experiments.
    compares candidates with a reset-AUTO native output instead of building a
    multi-GB FP32 hipBLAS mirror. Treat that as a dispatch-equivalence trainer
    proxy; model parity and benchmarks still gate any `--install`.
+   Production collection derives immutable profiler requests only after the
+   canonical timing CSV and raw timing sidecar are sealed. Each request starts
+   a fresh process. `roctxProfilerResume(0)`/`roctxProfilerPause(0)` bracket one
+   extra production launch, while a request-specific ROCTx range identifies the
+   exact pipeline in PMC passes. The trace pass keeps physical kernel names;
+   renamed PMC rows join back by contiguous dispatch order. On gfx906, collect
+   `FetchSize`, `WriteSize`, `Wavefronts`, `VALUUtilization`, and
+   `LDSBankConflict` as reviewed singleton passes. Combining the TCC traffic
+   metrics exceeds hardware profile capabilities and can hang rocprofiler's
+   abort path. Never let profiler replay or overhead enter canonical timing.
+   The final `rocm_profiler_features.csv` must be the authenticated export of
+   the canonical observation, request, and evidence manifests, with one row per
+   physical dispatch rather than an ad hoc join of rocprof CSVs.
+   The common policy fit may separately use every ROCm and CUDA device through
+   exact leaf-primary scorer DSOs. The refresh wrapper auto-discovers devices;
+   `--policy-accelerators` fixes the inventory and `--policy-lanes` controls
+   independent CPU orchestration lanes per device. Those scorer launches do not
+   time candidate kernels and never enter rocprof evidence. Keep CUDA and HIP
+   in separate worker processes and hard-fail any requested accelerator error.
 3. Use `--profile family-smoke` for a bounded representative training pass before
    a full acceptance refresh. This profile is stratified by format: it runs one
    small sweep per codebook/family, writes per-format partial CSVs, combines them,

@@ -370,7 +370,7 @@ namespace llaminar2
          * an FP16 shadow.  The latter is the production Q8/BF16 cache path:
          * cache precision describes storage, while verifier attention sees the
          * converted post-append span.  Preparing only one AttentionDeviceParams
-         * row in that case sends the M=2..4 verifier through multi-row prefill
+         * row in that case sends the M=2..16 verifier through multi-row prefill
          * semantics instead of row-local serial-decode semantics.
          */
         const bool cuda_effective_fp16_kv =
@@ -526,8 +526,8 @@ namespace llaminar2
         }
 
         /*
-         * Multirow MTP verifier graphs append M=2..4 rows and then run the
-         * native-KV M=2..4 verifier path.  The row count is a first-class
+         * Multirow MTP verifier graphs append M=2..16 rows and then run the
+         * native-KV M=2..16 verifier path. The row count is a first-class
          * replay signature input, but exact token positions are not: dynamic
          * attention params and device sequence state carry row-local KV lengths
          * into the captured kernel arguments before every replay.  The graph
@@ -1121,7 +1121,7 @@ namespace llaminar2
          * device counts.  They must never enter the ordinary batch path, whose
          * single AttentionDeviceParams row describes only equal-length batches.
          * The explicit request contract below supports compact per-request rows
-         * up to the same four-row bound used by grouped MTP verification.
+         * up to the same sixteen-row bound used by grouped MTP verification.
          */
         const bool gpu_grouped_request_decode =
             gpu_stage &&
@@ -1165,7 +1165,7 @@ namespace llaminar2
                 /*
                  * KernelFactory may reuse one attention kernel object across
                  * graph signatures and request lifetimes. An earlier grouped
-                 * verifier can therefore leave device-derived M=2..4 params on
+                 * verifier can therefore leave device-derived M=2..16 params on
                  * the object. Ordinary prefill must explicitly replace that
                  * ownership with its one-row static launch metadata; otherwise
                  * compute_tensor() can consume the stale verifier mode even

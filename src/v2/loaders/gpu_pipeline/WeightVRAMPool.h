@@ -66,7 +66,11 @@ namespace llaminar2
         /// @param backend  GPU backend (CUDA or ROCm) — if null, falls back to no-op (unit tests)
         /// @param device_id  Device ordinal
         /// @param staging_slot_count  How many staging slots (ring-buffer overlap). 0 = no staging.
-        bool allocate(IBackend *backend, int device_id, int staging_slot_count = 0);
+        /// @param staging_slot_bytes  Optional bounded bytes per staging slot. 0 uses the
+        ///        largest planned raw weight (legacy behavior). Oversized weights can be
+        ///        submitted to DeviceLoadPipeline as row chunks.
+        bool allocate(IBackend *backend, int device_id, int staging_slot_count = 0,
+                      size_t staging_slot_bytes = 0);
 
         /// Phase 3: Get slot — zero-cost offset lookup by weight name.
         std::optional<WeightSlot> getSlot(const std::string &name) const;

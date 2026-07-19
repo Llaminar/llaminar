@@ -2,18 +2,12 @@
  * @file Perf__CPUNativeVNNI_GEMV.cpp
  * @brief Comprehensive GEMV decode performance sweep across all Qwen model
  *        sizes (0.5B through 32B), TP degrees (1/2/4), and both quantized
- *        GEMV paths: packed VNNI and native Q8_0.
+ *        production eager-interleaved Q8_0 GEMV path.
  *
  * For each (model, shape, TP degree):
  *   1. Report tile config (nbc, k_tiles, category)
  *   2. Benchmark packed VNNI GEMV (FP32→Q8_1 quantize + INT8 packed access)
- *   3. Benchmark native Q8_0 GEMV (direct block access, FP32 dequant + FMA)
- *   4. Report latency, effective BW, roofline %, and speedup
- *
- * NOTE: The VNNI column calls gemv_native_vnni() directly (which includes
- * activation quantization + packed INT8 VNNI compute). This gives a real
- * comparison vs native Q8_0, rather than going through multiply_tensor()
- * which short-circuits to the native Q8_0 path for codebook_id==19.
+ *   3. Report latency, effective bandwidth, and roofline utilization
  *
  * Also decomposes per-GEMV overhead:
  *   - Activation quantization (FP32→Q8_1 per call)
@@ -40,27 +34,38 @@
 #include <cstdlib>
 #include <csignal>
 #include <cstring>
+#include <fstream>
+#include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h"
+#include "kernels/cpu/native_vnni/CPUNativeVNNITraits.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 #include "fort.hpp"
 
 #include "utils/NativeVNNITrainerEvidence.h"
+#include "utils/NativeVNNIPrefillProbePlan.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/VerifierRowTestInventory.h"
+#include "../../native_vnni_dispatch/NativeVNNIPairedRequestManifest.h"
+#include "../../native_vnni_dispatch/NativeVNNIShapeManifest.h"
+#include "../../native_vnni_dispatch/NativeVNNIProfilerControl.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -103,6 +108,169 @@ namespace
 
     static auto *g_mpi_env [[maybe_unused]] =
         ::testing::AddGlobalTestEnvironment(new MPIEnvironment);
+
+    /**
+     * @brief Coordinates complete candidate rounds across CPU measurement ranks.
+     *
+     * The production prefill collector runs one process per physical socket.
+     * Process-local complete rounds are not sufficient in that topology: one
+     * rank can finish a cheap cell, advance to a larger M, and change the peer
+     * socket's power or memory-pressure regime while that peer is still timing
+     * its previous cell.  The resulting latency transition is real, but it is
+     * not evidence about either candidate's steady-state economy.
+     *
+     * When enabled, this coordinator performs one collective after every local
+     * complete round.  A rank whose candidates have all converged continues to
+     * launch unmeasured pacing rounds until every rank is ready.  Consequently
+     * no rank can advance to the next M while a peer is still collecting the
+     * current M.  A one-rank MPI world follows exactly the same code path and
+     * reduces to a local decision.
+     */
+    class MPIPrefillRoundCoordinator
+    {
+    public:
+        /**
+         * @param enabled Whether cross-rank complete-round synchronization is required.
+         */
+        explicit MPIPrefillRoundCoordinator(bool enabled)
+            : enabled_(enabled)
+        {
+            int initialized = 0;
+            MPI_Initialized(&initialized);
+            if (!initialized)
+                throw std::runtime_error(
+                    "CPU prefill MPI round coordination requires MPI_Init");
+            checkMPI(MPI_Comm_rank(MPI_COMM_WORLD, &rank_), "MPI_Comm_rank");
+            checkMPI(MPI_Comm_size(MPI_COMM_WORLD, &world_size_), "MPI_Comm_size");
+        }
+
+        /** Return the stable provenance label written into trainer evidence. */
+        const char *policyName() const
+        {
+            return enabled_
+                ? "mpi-complete-round-v1"
+                : "process-local-complete-round-v1";
+        }
+
+        /** Return this process's rank in the measurement communicator. */
+        int rank() const { return rank_; }
+
+        /** Return the number of socket-local processes in the measurement job. */
+        int worldSize() const { return world_size_; }
+
+        /**
+         * @brief Prove every rank visits the same format and M phase inventory.
+         *
+         * Complete-round collectives would deadlock if paired jobs used
+         * different format counts or M inventories. The refresh plan groups
+         * identical phase vectors, and this runtime handshake independently
+         * rejects a broken schedule before either rank enters the first
+         * per-format/per-M collective.
+         */
+        void requireMatchingPhaseInventory(
+            size_t format_phase_count,
+            const std::vector<int> &m_values) const
+        {
+            if (!enabled_ || world_size_ == 1)
+                return;
+
+            uint64_t digest = 1469598103934665603ULL;
+            digest ^= static_cast<uint64_t>(format_phase_count);
+            digest *= 1099511628211ULL;
+            for (int m : m_values)
+            {
+                digest ^= static_cast<uint64_t>(m);
+                digest *= 1099511628211ULL;
+            }
+            digest ^= static_cast<uint64_t>(m_values.size());
+            digest *= 1099511628211ULL;
+
+            uint64_t minimum_digest = 0;
+            uint64_t maximum_digest = 0;
+            checkMPI(
+                MPI_Allreduce(
+                    &digest, &minimum_digest, 1, MPI_UINT64_T,
+                    MPI_MIN, MPI_COMM_WORLD),
+                "MPI_Allreduce(min M inventory)");
+            checkMPI(
+                MPI_Allreduce(
+                    &digest, &maximum_digest, 1, MPI_UINT64_T,
+                    MPI_MAX, MPI_COMM_WORLD),
+                "MPI_Allreduce(max M inventory)");
+            if (minimum_digest != maximum_digest)
+                throw std::runtime_error(
+                    "CPU prefill MPI ranks received different format/M phase inventories");
+        }
+
+        /** Wait until every rank has reached the same measurement boundary. */
+        void barrier() const
+        {
+            if (enabled_ && world_size_ > 1)
+                checkMPI(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier");
+        }
+
+        /**
+         * @brief Return true while any rank still needs measured local rounds.
+         *
+         * All ranks call this method at the same round boundary.  Ranks that
+         * report false locally still execute pacing rounds while the collective
+         * result remains true.
+         */
+        bool anyRankActive(bool locally_active) const
+        {
+            if (!enabled_ || world_size_ == 1)
+                return locally_active;
+            const int local = locally_active ? 1 : 0;
+            int global = 0;
+            checkMPI(
+                MPI_Allreduce(
+                    &local, &global, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD),
+                "MPI_Allreduce(active rounds)");
+            return global != 0;
+        }
+
+        /**
+         * @brief Fail the complete measurement job when any rank reports failure.
+         *
+         * A normal GTest fatal assertion returns only from the local test body.
+         * Its peer can then enter the next-M barrier while the failed rank enters
+         * MPI_Finalize, producing mismatched collectives and a permanent hang.
+         * This reduction gives every rank the same decision point and aborts the
+         * communicator before either process can advance independently.
+         */
+        void failAllRanksIf(
+            bool local_failure,
+            const std::string &local_diagnostic) const
+        {
+            const bool global_failure = anyRankActive(local_failure);
+            if (!global_failure)
+                return;
+            if (local_failure && !local_diagnostic.empty())
+                std::fprintf(stderr, "%s\n", local_diagnostic.c_str());
+            if (enabled_ && world_size_ > 1)
+            {
+                std::fflush(stderr);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                std::abort();
+            }
+            throw std::runtime_error(
+                local_diagnostic.empty()
+                    ? "a peer CPU prefill rank rejected its timing evidence"
+                    : local_diagnostic);
+        }
+
+    private:
+        static void checkMPI(int error, const char *operation)
+        {
+            if (error != MPI_SUCCESS)
+                throw std::runtime_error(
+                    std::string(operation) + " failed during CPU prefill training");
+        }
+
+        bool enabled_ = false;
+        int rank_ = 0;
+        int world_size_ = 1;
+    };
 
     // =========================================================================
     // System roofline — measured via STREAM-like calibration
@@ -288,6 +456,46 @@ namespace
     }
 
     /**
+     * @brief Temporarily force one production CPU NativeVNNI tile parameter.
+     *
+     * Tile configuration is cached by `DebugEnv`; changing only the process
+     * environment would therefore leave the trainer measuring a stale route.
+     * This guard updates both owners on entry and restores both on exit so a
+     * candidate trial cannot contaminate the next candidate or test.
+     */
+    class ScopedCPUNativeVNNITileOverride
+    {
+    public:
+        ScopedCPUNativeVNNITileOverride(const char *name, std::string value)
+            : name_(name),
+              had_previous_(std::getenv(name) != nullptr),
+              previous_(had_previous_ ? std::getenv(name) : "")
+        {
+            setenv(name_.c_str(), value.c_str(), 1);
+            mutableDebugEnv().cpu_vnni.reload();
+        }
+
+        ~ScopedCPUNativeVNNITileOverride()
+        {
+            if (had_previous_)
+                setenv(name_.c_str(), previous_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().cpu_vnni.reload();
+        }
+
+        ScopedCPUNativeVNNITileOverride(
+            const ScopedCPUNativeVNNITileOverride &) = delete;
+        ScopedCPUNativeVNNITileOverride &operator=(
+            const ScopedCPUNativeVNNITileOverride &) = delete;
+
+    private:
+        std::string name_;
+        bool had_previous_;
+        std::string previous_;
+    };
+
+    /**
      * @brief Keep standalone verifier microbench runs on a representative CPU team.
      *
      * Production inference and CTest normally enter through the launcher/MPI
@@ -325,6 +533,279 @@ namespace
                 max_threads,
                 kStandaloneThreadCap);
         }
+    }
+
+    /**
+     * @brief Capture the exact persistent OpenMP team used by one CPU launch.
+     *
+     * Linux performance events attached to the process leader cannot be reset
+     * atomically across already-inherited worker events. The profiler instead
+     * opens one event group against every concrete worker TID after warmup has
+     * established libgomp's team. Indexing by OpenMP thread number keeps the
+     * main thread at element zero, which lets `LinuxPerfControl` exclude its
+     * own enable/disable syscalls from the measured main-thread interval.
+     *
+     * @return Worker TIDs ordered by stable OpenMP thread number.
+     */
+    std::vector<pid_t> captureOpenMPProfilerThreadIds()
+    {
+        std::vector<pid_t> thread_ids(
+            static_cast<size_t>(omp_get_max_threads()),
+            static_cast<pid_t>(-1));
+#pragma omp parallel shared(thread_ids)
+        {
+            const int thread_number = omp_get_thread_num();
+            thread_ids[static_cast<size_t>(thread_number)] =
+                static_cast<pid_t>(::syscall(SYS_gettid));
+        }
+        if (std::find(thread_ids.begin(), thread_ids.end(), -1) !=
+            thread_ids.end())
+        {
+            throw std::runtime_error(
+                "OpenMP profiler failed to capture every worker TID");
+        }
+        return thread_ids;
+    }
+
+    /**
+     * @brief One exact request in a process-amortized CPU profiler batch.
+     *
+     * The TSV repeats every launch discriminator that the CPU trainer can
+     * observe. It intentionally carries the request-specific output path so a
+     * reused OpenMP team can never merge two counter intervals into one file.
+     */
+    struct CPUProfilerBatchRequest
+    {
+        std::string request_id;
+        std::string operation_kind;
+        std::string source_format;
+        std::string execution_mode;
+        int m = 0;
+        std::string projection_n_vector;
+        int aggregate_n = 0;
+        int k = 0;
+        std::string effective_candidate_id;
+        std::string output_path;
+        bool consumed = false;
+    };
+
+    /**
+     * @brief Load and account for exact CPU profiler requests in this process.
+     *
+     * Batching is only a setup optimization. ``claim()`` performs a complete
+     * identity match, and ``requireComplete()`` prevents a successful process
+     * from silently omitting one planned launch. The hardware control object
+     * is rebound and reset separately for every claimed row.
+     */
+    class CPUProfilerBatch
+    {
+    public:
+        CPUProfilerBatch()
+        {
+            const std::string path = native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kProfilerBatchPathEnvironment);
+            if (path.empty())
+                return;
+
+            std::ifstream input(path);
+            if (!input)
+                throw std::runtime_error(
+                    "failed to open CPU profiler batch plan: " + path);
+            std::string line;
+            if (!std::getline(input, line) || line != kHeader)
+                throw std::runtime_error(
+                    "CPU profiler batch plan has an invalid schema header");
+            std::set<std::string> request_ids;
+            std::set<std::string> output_paths;
+            while (std::getline(input, line))
+            {
+                if (line.empty())
+                    continue;
+                std::vector<std::string> fields;
+                std::stringstream stream(line);
+                std::string field;
+                while (std::getline(stream, field, '\t'))
+                    fields.push_back(field);
+                if (fields.size() != 10)
+                    throw std::runtime_error(
+                        "CPU profiler batch row must contain ten TSV fields");
+                CPUProfilerBatchRequest request{
+                    .request_id = fields[0],
+                    .operation_kind = fields[1],
+                    .source_format = fields[2],
+                    .execution_mode = fields[3],
+                    .m = parsePositive(fields[4], "M"),
+                    .projection_n_vector = fields[5],
+                    .aggregate_n = parsePositive(fields[6], "N"),
+                    .k = parsePositive(fields[7], "K"),
+                    .effective_candidate_id = fields[8],
+                    .output_path = fields[9],
+                };
+                if (request.request_id.empty() ||
+                    request.operation_kind.empty() ||
+                    request.source_format.empty() ||
+                    request.execution_mode.empty() ||
+                    request.projection_n_vector.empty() ||
+                    request.effective_candidate_id.empty() ||
+                    request.output_path.empty())
+                {
+                    throw std::runtime_error(
+                        "CPU profiler batch row contains an empty identity field");
+                }
+                if (!request_ids.insert(request.request_id).second)
+                    throw std::runtime_error(
+                        "CPU profiler batch request IDs must be unique");
+                if (!output_paths.insert(request.output_path).second)
+                    throw std::runtime_error(
+                        "CPU profiler batch output paths must be unique");
+                requests_.push_back(std::move(request));
+            }
+            if (requests_.empty())
+                throw std::runtime_error("CPU profiler batch plan is empty");
+        }
+
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return !requests_.empty();
+        }
+
+        [[nodiscard]] size_t size() const noexcept
+        {
+            return requests_.size();
+        }
+
+        /** Return whether the batch contains any candidate for one work cell. */
+        [[nodiscard]] bool containsCell(
+            std::string_view operation_kind,
+            std::string_view source_format,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k) const
+        {
+            return std::any_of(
+                requests_.begin(), requests_.end(),
+                [&](const CPUProfilerBatchRequest &request)
+                {
+                    return matchesCell(
+                        request, operation_kind, source_format, execution_mode,
+                        m, n, k);
+                });
+        }
+
+        /** Claim exactly one request for the production candidate invocation. */
+        CPUProfilerBatchRequest *claim(
+            std::string_view operation_kind,
+            std::string_view source_format,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k,
+            std::string_view effective_candidate_id)
+        {
+            CPUProfilerBatchRequest *result = nullptr;
+            for (CPUProfilerBatchRequest &request : requests_)
+            {
+                if (!matchesCell(
+                        request, operation_kind, source_format, execution_mode,
+                        m, n, k) ||
+                    request.effective_candidate_id != effective_candidate_id)
+                {
+                    continue;
+                }
+                if (result != nullptr)
+                    throw std::runtime_error(
+                        "CPU profiler batch has duplicate exact launch identities");
+                result = &request;
+            }
+            if (result && result->consumed)
+                throw std::runtime_error(
+                    "CPU profiler batch request was claimed more than once: " +
+                    result->request_id);
+            if (result)
+                result->consumed = true;
+            return result;
+        }
+
+        /** Fail the process if any exact batch member did not launch once. */
+        void requireComplete() const
+        {
+            for (const CPUProfilerBatchRequest &request : requests_)
+            {
+                if (!request.consumed)
+                    throw std::runtime_error(
+                        "CPU profiler batch omitted request " +
+                        request.request_id);
+            }
+        }
+
+        /** Return the first request for constructing the reusable event owner. */
+        const CPUProfilerBatchRequest &first() const
+        {
+            if (requests_.empty())
+                throw std::runtime_error("CPU profiler batch is disabled");
+            return requests_.front();
+        }
+
+    private:
+        static constexpr std::string_view kHeader =
+            "request_id\toperation_kind\tsource_format\texecution_mode\tm\t"
+            "projection_n_vector\taggregate_n\tk\t"
+            "effective_candidate_id\toutput_path";
+
+        static int parsePositive(const std::string &value, const char *name)
+        {
+            size_t consumed = 0;
+            const int parsed = std::stoi(value, &consumed);
+            if (consumed != value.size() || parsed <= 0)
+                throw std::runtime_error(
+                    std::string("CPU profiler batch has invalid ") + name);
+            return parsed;
+        }
+
+        static bool matchesCell(
+            const CPUProfilerBatchRequest &request,
+            std::string_view operation_kind,
+            std::string_view source_format,
+            std::string_view execution_mode,
+            int m,
+            int n,
+            int k)
+        {
+            return request.operation_kind == operation_kind &&
+                   request.source_format == source_format &&
+                   request.execution_mode == execution_mode &&
+                   request.m == m && request.aggregate_n == n &&
+                   request.k == k &&
+                   request.projection_n_vector == std::to_string(n);
+        }
+
+        std::vector<CPUProfilerBatchRequest> requests_;
+    };
+
+    /**
+     * @brief Profile one exact CPU request using reusable per-worker events.
+     */
+    template <typename Launch>
+    void profileExactCPURequest(
+        native_vnni_dispatch::LinuxPerfControl &control,
+        const std::string &request_id,
+        const std::string &output_path,
+        Launch &&launch)
+    {
+        control.rebind(request_id, output_path);
+        if (!control.prepared())
+            control.prepare(captureOpenMPProfilerThreadIds());
+        const auto parallel_perf_control = [](auto &&action)
+        {
+#pragma omp parallel
+            {
+                action(static_cast<size_t>(omp_get_thread_num()));
+            }
+        };
+        control.begin(parallel_perf_control);
+        launch();
+        control.end(parallel_perf_control);
     }
 
     /**
@@ -497,8 +978,143 @@ namespace
     /** Exact sorted samples and common robust aggregates for policy training. */
     struct StrongTimingMeasurement
     {
+        std::vector<double> acquisition_samples_us;
         std::vector<double> samples_us;
         llaminar2::test::trainer::TimingEvidence evidence;
+        llaminar2::test::trainer::AdaptiveTimingDecision adaptive;
+        std::string stop_reason = "fixed_samples";
+    };
+
+    /**
+     * @brief Select deterministic serial-M1 oracle rows for a prefill timing cell.
+     *
+     * The dedicated all-format correctness sweep owns exhaustive byte equality.
+     * Replaying all M serial GEMVs again inside every performance cell made the
+     * Cartesian trainer spend days recomputing an already certified oracle.  A
+     * timing cell instead checks row-pair boundaries, quartile boundaries, and
+     * the final rows.  These positions expose launch-grid and row-index defects
+     * while bounding oracle work independently of long-context M.
+     */
+    std::vector<int> prefillSerialOracleRows(int M)
+    {
+        std::set<int> selected;
+        const auto include = [&](int row)
+        {
+            if (row >= 0 && row < M)
+                selected.insert(row);
+        };
+        for (int row = 0; row < std::min(M, 4); ++row)
+            include(row);
+        for (int anchor : {M / 4, M / 2, (3 * M) / 4})
+        {
+            include(anchor - 1);
+            include(anchor);
+        }
+        for (int row = std::max(0, M - 6); row < M; ++row)
+            include(row);
+        return {selected.begin(), selected.end()};
+    }
+
+    /**
+     * @brief Owns deterministic Q8_1 activation fixtures shared by formats.
+     *
+     * The ordinary-prefill trainer historically seeded an activation from
+     * ``(M, N, K, source-format-name length)``. Source formats with the same
+     * name length therefore quantized exactly the same bytes, but separate
+     * trainer processes rebuilt those bytes independently. A coalesced process
+     * retains that historical seed contract and memoizes the quantized result.
+     * Weight packing and every production kernel launch remain format-local.
+     *
+     * Fixtures are released after the final selected format in one name-length
+     * class. This bounds retained memory to the format classes that are still
+     * reachable while allowing all M values in that class to reuse quantization.
+     */
+    class PrefillActivationFixtureCache
+    {
+    public:
+        /** Construct a cache for one fixed trainer geometry. */
+        PrefillActivationFixtureCache(int n, int k)
+            : n_(n), k_(k)
+        {
+            if (n_ <= 0 || k_ <= 0)
+                throw std::invalid_argument(
+                    "CPU prefill activation fixture geometry must be positive");
+        }
+
+        /**
+         * @brief Return the byte-identical legacy fixture for one format/M.
+         *
+         * @param m Number of activation rows.
+         * @param source_format Source GGUF tensor format label.
+         * @param k_blocks Number of Q8_1 blocks expected by packed weights.
+         */
+        const std::vector<Q8_1Block> &fixtureFor(
+            int m,
+            std::string_view source_format,
+            int k_blocks)
+        {
+            if (m <= 0 || k_blocks <= 0 ||
+                static_cast<size_t>(k_blocks) * Q8_1Block::BLOCK_SIZE !=
+                    static_cast<size_t>(k_))
+            {
+                throw std::invalid_argument(
+                    "CPU prefill activation fixture block geometry is invalid");
+            }
+            const uint64_t key = fixtureKey(m, source_format.size());
+            auto [iterator, inserted] = fixtures_.try_emplace(key);
+            if (!inserted)
+                return iterator->second;
+
+            std::mt19937 rng(static_cast<uint32_t>(
+                0xB47Cu + m * 131u + n_ + k_ + source_format.size()));
+            std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+            std::vector<float> input(static_cast<size_t>(m) * k_);
+            for (float &value : input)
+                value = distribution(rng);
+
+            std::vector<Q8_1Block> &quantized_rows = iterator->second;
+            quantized_rows.resize(static_cast<size_t>(m) * k_blocks);
+            quantize_activations_to_q8_1(
+                input.data(),
+                quantized_rows.data(),
+                m,
+                k_,
+                k_blocks);
+            return quantized_rows;
+        }
+
+        /** Release fixtures that no later selected format can consume. */
+        void releaseFormatNameLength(size_t format_name_length)
+        {
+            for (auto iterator = fixtures_.begin(); iterator != fixtures_.end();)
+            {
+                if (keyFormatNameLength(iterator->first) == format_name_length)
+                    iterator = fixtures_.erase(iterator);
+                else
+                    ++iterator;
+            }
+        }
+
+        /** Return the number of resident fixtures for focused regressions. */
+        size_t fixtureCount() const { return fixtures_.size(); }
+
+    private:
+        static uint64_t fixtureKey(int m, size_t format_name_length)
+        {
+            if (format_name_length > std::numeric_limits<uint32_t>::max())
+                throw std::invalid_argument("CPU prefill format label is too long");
+            return (static_cast<uint64_t>(static_cast<uint32_t>(m)) << 32) |
+                static_cast<uint32_t>(format_name_length);
+        }
+
+        static size_t keyFormatNameLength(uint64_t key)
+        {
+            return static_cast<size_t>(static_cast<uint32_t>(key));
+        }
+
+        int n_;
+        int k_;
+        std::unordered_map<uint64_t, std::vector<Q8_1Block>> fixtures_;
     };
 
     /**
@@ -527,6 +1143,74 @@ namespace
             result.samples_us.push_back(
                 std::chrono::duration<double, std::micro>(end - begin).count());
         }
+        result.acquisition_samples_us = result.samples_us;
+        std::sort(result.samples_us.begin(), result.samples_us.end());
+        result.evidence =
+            llaminar2::test::trainer::summarizeSortedTimingSamples(
+                result.samples_us);
+        result.adaptive.measured_duration_us = std::accumulate(
+            result.samples_us.begin(), result.samples_us.end(), 0.0);
+        return result;
+    }
+
+    /**
+     * @brief Time a CPU candidate until elapsed and stability evidence is sufficient.
+     *
+     * A production prefill matrix contains both tiny attention projections and
+     * very expensive long-context FFN GEMMs. Fixed repetition counts spend most
+     * of the sweep re-confirming expensive kernels after their timing has
+     * stabilized. This protocol retains a minimum sample population, then
+     * admits an early stop only after the measured kernel duration and
+     * acquisition-order half-window stability thresholds are both satisfied.
+     * Inexpensive or drifting kernels continue to the hard sample ceiling.
+     */
+    template <typename Fn>
+    StrongTimingMeasurement timeStrongTrainerCandidateAdaptive(
+        int warmup,
+        int minimum_iterations,
+        int maximum_iterations,
+        double minimum_duration_us,
+        double maximum_median_relative_drift,
+        Fn &&fn)
+    {
+        for (int index = 0; index < warmup; ++index)
+            fn();
+
+        const int bounded_maximum = std::max(1, maximum_iterations);
+        const int bounded_minimum = std::clamp(
+            minimum_iterations, 1, bounded_maximum);
+        std::vector<double> acquisition_samples;
+        acquisition_samples.reserve(static_cast<size_t>(bounded_maximum));
+        llaminar2::test::trainer::AdaptiveTimingDecision decision;
+        for (int index = 0; index < bounded_maximum; ++index)
+        {
+            const auto begin = std::chrono::steady_clock::now();
+            fn();
+            const auto end = std::chrono::steady_clock::now();
+            acquisition_samples.push_back(
+                std::chrono::duration<double, std::micro>(end - begin).count());
+            decision = llaminar2::test::trainer::evaluateAdaptiveTiming(
+                acquisition_samples,
+                static_cast<size_t>(bounded_minimum),
+                static_cast<size_t>(bounded_maximum),
+                minimum_duration_us,
+                maximum_median_relative_drift);
+            if (decision.should_stop)
+                break;
+        }
+
+        StrongTimingMeasurement result;
+        result.acquisition_samples_us = acquisition_samples;
+        result.adaptive = decision;
+        const size_t stationary_begin = std::min(
+            decision.stationary_window_begin, acquisition_samples.size());
+        result.samples_us.assign(
+            acquisition_samples.begin() +
+                static_cast<std::ptrdiff_t>(stationary_begin),
+            acquisition_samples.end());
+        result.stop_reason = decision.promotion_evidence
+                                 ? "stationary_window"
+                                 : "max_samples";
         std::sort(result.samples_us.begin(), result.samples_us.end());
         result.evidence =
             llaminar2::test::trainer::summarizeSortedTimingSamples(
@@ -586,6 +1270,197 @@ namespace
             result.n_block_chunks = std::stoi(tag("n_block_chunks"));
             result.threads = std::stoi(tag("threads"));
             result.count += record.count;
+        }
+        return result;
+    }
+
+    /** Route identity observed from the real production M=1 entry point. */
+    struct CPUDecodeRouteEvidence
+    {
+        bool found = false;
+        std::string effective_policy;
+        std::string build_isa;
+        std::string isa;
+        int k_tiles = 0;
+        int n_block_chunks = 0;
+        bool serial_kpart = false;
+        int threads = 0;
+        uint64_t count = 0;
+    };
+
+    /**
+     * @brief Find the exact M=1 candidate route recorded for one projection.
+     *
+     * Trainers request a nominal NBC policy, but small N geometries can make
+     * several nominal widths the same physical launch.  The production route
+     * counter publishes the effective width, allowing the adapter to retain
+     * normalized requests as unsupported evidence without profiling aliases.
+     */
+    CPUDecodeRouteEvidence findCPUDecodeRoute(
+        int N,
+        int K,
+        uint8_t codebook)
+    {
+        CPUDecodeRouteEvidence result;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_decode_launch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_decode_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const auto tag = [&](const char *name) -> std::string
+            {
+                const auto iterator = record.tags.find(name);
+                return iterator == record.tags.end()
+                           ? std::string{}
+                           : iterator->second;
+            };
+            if (tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) ||
+                tag("codebook") != std::to_string(codebook))
+            {
+                continue;
+            }
+            result.found = true;
+            result.effective_policy = tag("effective_policy");
+            result.build_isa = tag("build_isa");
+            result.isa = tag("isa");
+            result.k_tiles = std::stoi(tag("k_tiles"));
+            result.n_block_chunks = std::stoi(tag("n_block_chunks"));
+            result.serial_kpart = tag("serial_kpart") == "1";
+            result.threads = std::stoi(tag("threads"));
+            result.count += record.count;
+        }
+        return result;
+    }
+
+    /** Route identity observed from ordinary production M>1 NativeVNNI GEMM. */
+    struct CPUPrefillRouteEvidence
+    {
+        bool found = false;
+        std::string route;
+        std::string requested_policy;
+        std::string effective_policy;
+        std::string build_isa;
+        std::string isa;
+        int k_tiles = 0;
+        int k_tile_blocks = 0;
+        int n_block_chunks = 0;
+        bool pair_grid_execution_found = false;
+        int pair_grid_execution_n_block_chunks = 0;
+        int pair_grid_parallel_tasks = 0;
+        uint64_t pair_grid_execution_count = 0;
+        int threads = 0;
+        uint64_t count = 0;
+
+        /** @brief Render the registry ID for the physical route that ran. */
+        std::string candidateId() const
+        {
+            if (route == "row_chunk_grid")
+                return "cpu.nvnni.prefill.row_chunk_grid.full_k";
+            if (route == "two_row_n_major")
+            {
+                return "cpu.nvnni.prefill.two_row_tiles.nbc" +
+                       std::to_string(n_block_chunks) + ".full_k";
+            }
+            if (route == "two_row_pair_grid")
+            {
+                return "cpu.nvnni.prefill.two_row_pair_grid.nbc" +
+                       std::to_string(n_block_chunks) + ".full_k";
+            }
+            if (route == "decode_equivalent_kpart_rows")
+            {
+                return effective_policy == "WideRows"
+                           ? "cpu.nvnni.prefill.decode_equivalent_kpart.wide_rows"
+                           : "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise";
+            }
+            return {};
+        }
+    };
+
+    /**
+     * @brief Read the exact physical full-K prefill route for one trial cell.
+     *
+     * Candidate requests can normalize when a coarse N block leaves too few
+     * output tasks and production chooses the row-chunk grid. The trainer must
+     * retain that row as unsupported evidence under the requested candidate,
+     * while naming the observed route separately; otherwise two nominal knobs
+     * could be promoted as independent schedules despite executing identically.
+     */
+    CPUPrefillRouteEvidence findCPUPrefillRoute(
+        int M,
+        int N,
+        int K,
+        uint8_t codebook)
+    {
+        CPUPrefillRouteEvidence result;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_prefill_gemm_launch"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_prefill_gemm_launch" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const auto tag = [&](const char *name) -> std::string
+            {
+                const auto iterator = record.tags.find(name);
+                return iterator == record.tags.end()
+                           ? std::string{}
+                           : iterator->second;
+            };
+            if (tag("m") != std::to_string(M) ||
+                tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) ||
+                tag("codebook") != std::to_string(codebook))
+            {
+                continue;
+            }
+            result.found = true;
+            result.route = tag("route");
+            result.requested_policy = tag("requested_policy");
+            result.effective_policy = tag("effective_policy");
+            result.build_isa = tag("build_isa");
+            result.isa = tag("isa");
+            result.k_tiles = std::stoi(tag("k_tiles"));
+            result.k_tile_blocks = std::stoi(tag("k_tile_blocks"));
+            result.n_block_chunks = std::stoi(tag("n_block_chunks"));
+            result.threads = std::stoi(tag("threads"));
+            result.count += record.count;
+        }
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_pair_grid_execution"}))
+        {
+            if (record.domain != "kernel" ||
+                record.name != "cpu_native_vnni_pair_grid_execution" ||
+                record.kind != PerfStatRecord::Kind::Counter)
+            {
+                continue;
+            }
+            const auto tag = [&](const char *name) -> std::string
+            {
+                const auto iterator = record.tags.find(name);
+                return iterator == record.tags.end()
+                           ? std::string{}
+                           : iterator->second;
+            };
+            if (tag("m") != std::to_string(M) ||
+                tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) ||
+                tag("codebook") != std::to_string(codebook))
+            {
+                continue;
+            }
+            result.pair_grid_execution_found = true;
+            result.pair_grid_execution_n_block_chunks =
+                std::stoi(tag("n_block_chunks"));
+            result.pair_grid_parallel_tasks =
+                std::stoi(tag("parallel_tasks"));
+            result.pair_grid_execution_count += record.count;
         }
         return result;
     }
@@ -934,17 +1809,11 @@ namespace
         // Packed VNNI GEMV (current production: quantize + packed access)
         double packed_us;
         double packed_bw_gbs;
-        // Native Q8_0 GEMV (new: direct block access, FP32 compute)
-        double native_us;
-        double native_bw_gbs;
-        // Roofline and comparison
+        // Roofline comparison
         double roofline_bw;
         double packed_roof_pct;
-        double native_roof_pct;
-        double speedup; // packed_us / native_us
         // Weight data sizes
         double packed_bytes; // VNNI packed buffer
-        double native_bytes; // Q8_0 native blocks
     };
 
     // =========================================================================
@@ -996,38 +1865,6 @@ namespace
         for (int i = 0; i < ITERS; ++i)
         {
             flush_cache_range(weight_data, weight_bytes);
-            auto t0 = std::chrono::high_resolution_clock::now();
-            gemv_native_vnni(packed, A, C);
-            auto t1 = std::chrono::high_resolution_clock::now();
-            times[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
-        }
-        std::sort(times.begin(), times.end());
-        return times[std::max(0, (int)(ITERS * 0.1) - 1)];
-    }
-
-    /**
-     * @brief Benchmark native Q8_0 GEMV via unified dispatch, return p10 latency (us).
-     *
-     * Calls gemv_native_vnni() with Q8_0 blocks pointer, which dispatches to
-     * the native Q8_0 path (direct block access + VNNI vpdpbusd).
-     *
-     * Flushes the Q8_0 weight blocks from cache before each timed iteration
-     * to measure true DRAM bandwidth efficiency without cache effects.
-     */
-    double benchNativeQ8_0(const CPUNativeVNNIPackedWeights &packed,
-                           const Q8_0Block *blocks, const float *A,
-                           float *C, int N, int bpr)
-    {
-        // Weight data: N rows × bpr blocks × 34 bytes/block
-        size_t weight_bytes = static_cast<size_t>(N) * bpr * sizeof(Q8_0Block);
-
-        for (int i = 0; i < WARMUP; ++i)
-            gemv_native_vnni(packed, A, C);
-
-        std::vector<double> times(ITERS);
-        for (int i = 0; i < ITERS; ++i)
-        {
-            flush_cache_range(blocks, weight_bytes);
             auto t0 = std::chrono::high_resolution_clock::now();
             gemv_native_vnni(packed, A, C);
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -1096,9 +1933,6 @@ namespace
         // Packed VNNI: interleaved blocks + scales + comps
         // INT8 pre-decoded: stride=2048 per chunk per K-block
         r.packed_bytes = (double)N_chunks * bpr * (2048 + 256 + 256); // interleaved + scales + comp
-        // Native Q8_0: 34 bytes per block
-        r.native_bytes = (double)shape.N * bpr * 34.0;
-
         // --- Packed VNNI GEMV (quantize FP32→Q8_1 + INT8 packed VNNI) ---
         CPUNativeVNNIGemmKernel packed_kernel(weights.get());
         if (packed_kernel.isValid())
@@ -1109,19 +1943,6 @@ namespace
             r.packed_bw_gbs = r.packed_bytes / (r.packed_us * 1e-6) / 1e9;
             r.packed_roof_pct = r.packed_bw_gbs / roofline_bw * 100.0;
         }
-
-        // --- Native Q8_0 GEMV (direct block access, FP32 dequant) ---
-        {
-            std::vector<float> C(shape.N, 0.0f);
-            r.native_us = benchNativeQ8_0(
-                packed_kernel.packedWeights(), q8_tensor->typed_data(),
-                A.data(), C.data(), shape.N, bpr);
-            r.native_bw_gbs = r.native_bytes / (r.native_us * 1e-6) / 1e9;
-            r.native_roof_pct = r.native_bw_gbs / roofline_bw * 100.0;
-        }
-
-        // Speedup of native over packed
-        r.speedup = (r.native_us > 0) ? r.packed_us / r.native_us : 0;
 
         return r;
     }
@@ -1140,20 +1961,18 @@ namespace
         table << fort::header
               << "Shape" << "Cat" << "Shard" << "N" << "K"
               << "Tile" << "nbc" << "kt"
-              << "VNNI \xc2\xb5s" << "VNNI BW" << "VNNI R%"
               << "Q8_0 \xc2\xb5s" << "Q8_0 BW" << "Q8_0 R%"
-              << "Speedup"
               << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
         table.column(1).set_cell_text_align(fort::text_align::left);
         table.column(2).set_cell_text_align(fort::text_align::left);
         table.column(5).set_cell_text_align(fort::text_align::left);
-        for (int c : {3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14})
+        for (int c : {3, 4, 6, 7, 8, 9, 10})
             table.column(c).set_cell_text_align(fort::text_align::right);
 
-        double sum_packed = 0, sum_native = 0;
-        double sum_packed_bytes = 0, sum_native_bytes = 0;
+        double sum_packed = 0;
+        double sum_packed_bytes = 0;
         std::string last_cat;
 
         for (const auto &r : results)
@@ -1162,46 +1981,31 @@ namespace
                 table << fort::separator;
             last_cat = r.category;
 
-            char pu[16], pbw[16], pr[16], nu[16], nbw[16], nr[16], sp[16];
+            char pu[16], pbw[16], pr[16];
             std::snprintf(pu, sizeof(pu), "%.0f", r.packed_us);
             std::snprintf(pbw, sizeof(pbw), "%.1f", r.packed_bw_gbs);
             std::snprintf(pr, sizeof(pr), "%.0f%%", r.packed_roof_pct);
-            std::snprintf(nu, sizeof(nu), "%.0f", r.native_us);
-            std::snprintf(nbw, sizeof(nbw), "%.1f", r.native_bw_gbs);
-            std::snprintf(nr, sizeof(nr), "%.0f%%", r.native_roof_pct);
-            std::snprintf(sp, sizeof(sp), "%.2fx", r.speedup);
 
             table << r.shape_name << r.category << r.shard
                   << r.N << r.K
                   << r.tile_cat << r.nbc << r.k_tiles
                   << pu << pbw << pr
-                  << nu << nbw << nr
-                  << sp
                   << fort::endr;
 
             sum_packed += r.packed_us;
-            sum_native += r.native_us;
             sum_packed_bytes += r.packed_bytes;
-            sum_native_bytes += r.native_bytes;
         }
 
         // Summary row
         table << fort::separator;
         double avg_packed_bw = sum_packed_bytes / (sum_packed * 1e-6) / 1e9;
-        double avg_native_bw = sum_native_bytes / (sum_native * 1e-6) / 1e9;
-        char tpu[16], tpbw[16], tpr[16], tnu[16], tnbw[16], tnr[16], tsp[16];
+        char tpu[16], tpbw[16], tpr[16];
         std::snprintf(tpu, sizeof(tpu), "%.0f", sum_packed);
         std::snprintf(tpbw, sizeof(tpbw), "%.1f", avg_packed_bw);
         std::snprintf(tpr, sizeof(tpr), "%.0f%%", avg_packed_bw / roofline * 100);
-        std::snprintf(tnu, sizeof(tnu), "%.0f", sum_native);
-        std::snprintf(tnbw, sizeof(tnbw), "%.1f", avg_native_bw);
-        std::snprintf(tnr, sizeof(tnr), "%.0f%%", avg_native_bw / roofline * 100);
-        std::snprintf(tsp, sizeof(tsp), "%.2fx", sum_packed / sum_native);
 
         table << "TOTAL" << "" << "" << "" << "" << "" << "" << ""
               << tpu << tpbw << tpr
-              << tnu << tnbw << tnr
-              << tsp
               << fort::endr;
 
         std::cout << "\n"
@@ -1209,7 +2013,7 @@ namespace
                   << "Threads: " << omp_get_max_threads()
                   << "  |  Roofline: " << std::fixed << std::setprecision(1) << roofline << " GB/s (calibrated)"
                   << "  |  Cold cache (clflushopt before each iteration)"
-                  << "  |  Q8_0 = native blocks (VNNI vpdpbusd)\n\n"
+                  << "  |  Q8_0 = eager interleaved NativeVNNI\n\n"
                   << table.to_string() << std::endl;
     }
 
@@ -1223,13 +2027,11 @@ namespace
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
               << "Model" << "Layers"
-              << "VNNI ms/tok" << "VNNI tok/s"
               << "Q8_0 ms/tok" << "Q8_0 tok/s"
-              << "Speedup"
               << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 6; ++c)
+        for (int c = 1; c <= 3; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
         // Approximate layer counts
@@ -1254,37 +2056,29 @@ namespace
         {
             int layers = layerCount(model_name);
             // Sum per-layer GEMV time (all shapes except LM_Head)
-            double layer_packed_us = 0, layer_native_us = 0;
-            double lm_packed_us = 0, lm_native_us = 0;
+            double layer_packed_us = 0;
+            double lm_packed_us = 0;
 
             for (const auto &r : results)
             {
                 if (r.category == "LM_Head")
                 {
                     lm_packed_us += r.packed_us;
-                    lm_native_us += r.native_us;
                 }
                 else
                 {
                     layer_packed_us += r.packed_us;
-                    layer_native_us += r.native_us;
                 }
             }
 
             double packed_ms = (layer_packed_us * layers + lm_packed_us) / 1000.0;
-            double native_ms = (layer_native_us * layers + lm_native_us) / 1000.0;
 
-            char pm[16], pt[16], nm[16], nt[16], sp[16];
+            char pm[16], pt[16];
             std::snprintf(pm, sizeof(pm), "%.1f", packed_ms);
             std::snprintf(pt, sizeof(pt), "%.1f", 1000.0 / packed_ms);
-            std::snprintf(nm, sizeof(nm), "%.1f", native_ms);
-            std::snprintf(nt, sizeof(nt), "%.1f", 1000.0 / native_ms);
-            std::snprintf(sp, sizeof(sp), "%.2fx", packed_ms / native_ms);
 
             table << model_name << layers
                   << pm << pt
-                  << nm << nt
-                  << sp
                   << fort::endr;
         }
 
@@ -1320,17 +2114,17 @@ namespace
         size_t n = std::min({tp1.size(), tp2.size(), tp4.size()});
         for (size_t i = 0; i < n; ++i)
         {
-            double eff2 = (tp1[i].native_us / 2.0) / tp2[i].native_us;
-            double eff4 = (tp1[i].native_us / 4.0) / tp4[i].native_us;
+            double eff2 = (tp1[i].packed_us / 2.0) / tp2[i].packed_us;
+            double eff4 = (tp1[i].packed_us / 4.0) / tp4[i].packed_us;
 
             char nk1[24], u1[16], nk2[24], u2[16], e2[16], nk4[24], u4[16], e4[16];
             std::snprintf(nk1, sizeof(nk1), "%d\xc3\x97%d", tp1[i].N, tp1[i].K);
-            std::snprintf(u1, sizeof(u1), "%.0f", tp1[i].native_us);
+            std::snprintf(u1, sizeof(u1), "%.0f", tp1[i].packed_us);
             std::snprintf(nk2, sizeof(nk2), "%d\xc3\x97%d", tp2[i].N, tp2[i].K);
-            std::snprintf(u2, sizeof(u2), "%.0f", tp2[i].native_us);
+            std::snprintf(u2, sizeof(u2), "%.0f", tp2[i].packed_us);
             std::snprintf(e2, sizeof(e2), "%.0f%%", eff2 * 100);
             std::snprintf(nk4, sizeof(nk4), "%d\xc3\x97%d", tp4[i].N, tp4[i].K);
-            std::snprintf(u4, sizeof(u4), "%.0f", tp4[i].native_us);
+            std::snprintf(u4, sizeof(u4), "%.0f", tp4[i].packed_us);
             std::snprintf(e4, sizeof(e4), "%.0f%%", eff4 * 100);
 
             // Extract short layer name from shape name (after model prefix)
@@ -1349,7 +2143,7 @@ namespace
         std::cout << "\n"
                   << title << "\n"
                   << "TP Eff = (TP1_time / TP_degree) / actual_time\n"
-                  << "Native Q8_0 GEMV only\n\n"
+                  << "Eager-interleaved Q8_0 NativeVNNI GEMV\n\n"
                   << table.to_string() << std::endl;
     }
 
@@ -1360,11 +2154,62 @@ namespace
     {
     };
 
+    /**
+     * @test Prove coalesced activation fixtures preserve legacy input bytes.
+     *
+     * This is intentionally a tiny CPU-only regression. The production
+     * trainer still performs full serial-row parity for every measured format;
+     * this test isolates the lifecycle optimization and proves that two source
+     * labels from the same historical seed class reuse one quantized fixture.
+     */
+    TEST_F(
+        CPUNativeVNNIGemvTest,
+        PrefillActivationFixtureCache_PreservesLegacyFormatSeed)
+    {
+        constexpr int N = 64;
+        constexpr int K = 64;
+        constexpr int M = 3;
+        constexpr int K_BLOCKS = K / Q8_1Block::BLOCK_SIZE;
+        const auto legacy_fixture = [](std::string_view source_format)
+        {
+            std::mt19937 rng(static_cast<uint32_t>(
+                0xB47Cu + M * 131u + N + K + source_format.size()));
+            std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+            std::vector<float> input(static_cast<size_t>(M) * K);
+            for (float &value : input)
+                value = distribution(rng);
+            std::vector<Q8_1Block> result(
+                static_cast<size_t>(M) * K_BLOCKS);
+            quantize_activations_to_q8_1(
+                input.data(), result.data(), M, K, K_BLOCKS);
+            return result;
+        };
+
+        PrefillActivationFixtureCache cache(N, K);
+        const std::vector<Q8_1Block> expected = legacy_fixture("Q4_0");
+        const auto &first = cache.fixtureFor(M, "Q4_0", K_BLOCKS);
+        ASSERT_EQ(first.size(), expected.size());
+        EXPECT_EQ(
+            std::memcmp(
+                first.data(),
+                expected.data(),
+                expected.size() * sizeof(Q8_1Block)),
+            0);
+        const auto &same_seed_class = cache.fixtureFor(M, "Q5_0", K_BLOCKS);
+        EXPECT_EQ(&first, &same_seed_class);
+        EXPECT_EQ(cache.fixtureCount(), 1u);
+
+        (void)cache.fixtureFor(M, "IQ3_S", K_BLOCKS);
+        EXPECT_EQ(cache.fixtureCount(), 2u);
+        cache.releaseFormatNameLength(std::string_view("Q4_0").size());
+        EXPECT_EQ(cache.fixtureCount(), 1u);
+    }
+
     // =========================================================================
     // TEST 1: Q8_0 All Models — Full shape sweep (TP=1)
     //
     // Comprehensive decode GEMV benchmark across all Qwen model sizes.
-    // Compares packed VNNI (production) vs native Q8_0 for each shape.
+    // Measures the single production eager-interleaved path for each shape.
     // =========================================================================
     TEST_F(CPUNativeVNNIGemvTest, Q8_0_AllModels)
     {
@@ -1556,12 +2401,11 @@ namespace
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
               << "Shape" << "K" << "K_blocks"
-              << "Quant \xc2\xb5s" << "VNNI \xc2\xb5s" << "Q8_0 \xc2\xb5s"
-              << "Quant %" << "Speedup"
+              << "Quant \xc2\xb5s" << "Q8_0 \xc2\xb5s" << "Quant %"
               << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 7; ++c)
+        for (int c = 1; c <= 5; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
         for (const auto &shape : shapes)
@@ -1614,17 +2458,15 @@ namespace
             std::sort(quant_times.begin(), quant_times.end());
             double quant_us = quant_times[std::max(0, (int)(ITERS * 0.1) - 1)];
 
-            // Full packed GEMV and native GEMV
+            // Full production eager-interleaved GEMV.
             auto r = benchShape(shape, roofline);
 
             double quant_pct = (r.packed_us > 0) ? (quant_us / r.packed_us) * 100.0 : 0;
 
-            char qu[16], pu[16], nu[16], qp[16], sp[16];
+            char qu[16], pu[16], qp[16];
             std::snprintf(qu, sizeof(qu), "%.1f", quant_us);
             std::snprintf(pu, sizeof(pu), "%.0f", r.packed_us);
-            std::snprintf(nu, sizeof(nu), "%.0f", r.native_us);
             std::snprintf(qp, sizeof(qp), "%.1f%%", quant_pct);
-            std::snprintf(sp, sizeof(sp), "%.2fx", r.speedup);
 
             std::string sname = shape.name;
             auto pos = sname.find('_');
@@ -1632,15 +2474,13 @@ namespace
                 sname = sname.substr(pos + 1);
 
             table << sname << K << K_blocks
-                  << qu << pu << nu
-                  << qp << sp
+                  << qu << pu << qp
                   << fort::endr;
         }
 
         std::cout << "\n=== Quantization Overhead Isolation: Qwen 7B ===\n"
                   << "Quant = FP32\xe2\x86\x92Q8_1 activation quantization only\n"
-                  << "VNNI = packed INT8 path (FP32\xe2\x86\x92Q8_1 quant + VNNI compute)\n"
-                  << "Q8_0 = native blocks (FP32 dequant + FMA)\n\n"
+                  << "Q8_0 = eager interleaved path (FP32\xe2\x86\x92Q8_1 quant + NativeVNNI compute)\n\n"
                   << table.to_string() << std::endl;
     }
 
@@ -2501,6 +3341,1008 @@ namespace
     }
 
     /**
+     * @brief One forceable CPU M=1 production schedule.
+     *
+     * The canonical ID is the policy/compiler identity. The shorter route name
+     * is emitted by production telemetry and independently proves that the
+     * requested schedule survived physical-width normalization.
+     */
+    struct CPUDecodeScheduleCandidate
+    {
+        const char *route_name;
+        const char *canonical_id;
+        DecodeSchedulePolicy policy;
+    };
+
+    inline constexpr std::array<CPUDecodeScheduleCandidate, 5>
+        CPU_DECODE_SCHEDULE_CANDIDATES = {{
+            {"Nbc1", "cpu.nvnni.decode.n_chunk_grid.nbc1", DecodeSchedulePolicy::Nbc1},
+            {"Nbc2", "cpu.nvnni.decode.n_chunk_grid.nbc2", DecodeSchedulePolicy::Nbc2},
+            {"Nbc4", "cpu.nvnni.decode.n_chunk_grid.nbc4", DecodeSchedulePolicy::Nbc4},
+            {"Nbc8", "cpu.nvnni.decode.n_chunk_grid.nbc8", DecodeSchedulePolicy::Nbc8},
+            {"Nbc16", "cpu.nvnni.decode.n_chunk_grid.nbc16", DecodeSchedulePolicy::Nbc16},
+        }};
+
+    /** Return one forceable schedule by its compiler-facing canonical ID. */
+    const CPUDecodeScheduleCandidate *findCPUDecodeScheduleCandidate(
+        std::string_view candidate_id)
+    {
+        const std::string normalized = toLower(std::string(candidate_id));
+        const auto iterator = std::find_if(
+            CPU_DECODE_SCHEDULE_CANDIDATES.begin(),
+            CPU_DECODE_SCHEDULE_CANDIDATES.end(),
+            [&](const CPUDecodeScheduleCandidate &candidate)
+            {
+                return normalized == toLower(candidate.canonical_id);
+            });
+        return iterator == CPU_DECODE_SCHEDULE_CANDIDATES.end()
+                   ? nullptr
+                   : &*iterator;
+    }
+
+    /** Mix one byte string into a stable nonzero FNV-1a measurement seed. */
+    uint64_t cpuPairedSeed(std::string_view identity)
+    {
+        uint64_t hash = 1469598103934665603ULL;
+        for (const unsigned char byte : identity)
+        {
+            hash ^= static_cast<uint64_t>(byte);
+            hash *= 1099511628211ULL;
+        }
+        return hash == 0 ? 1 : hash;
+    }
+
+    /** Extend a cell seed with one pair index for retained replay provenance. */
+    uint64_t cpuPairedOrderSeed(uint64_t cell_seed, size_t pair_index)
+    {
+        uint64_t hash = cell_seed;
+        for (int byte = 0; byte < 8; ++byte)
+        {
+            hash ^= (static_cast<uint64_t>(pair_index) >> (byte * 8)) & 0xffULL;
+            hash *= 1099511628211ULL;
+        }
+        return hash == 0 ? 1 : hash;
+    }
+
+    /** Correctness and physical-route proof prepared before paired timing. */
+    struct CPUPairedCandidateEvidence
+    {
+        CPUDecodeRouteEvidence route;
+        llaminar2::test::trainer::FP32Evidence comparison;
+        size_t repeat_byte_mismatches = 0;
+        bool route_ok = false;
+        bool numerical_correctness = false;
+        bool correctness_pass = false;
+    };
+
+    /**
+     * @brief Write one half of an architecture-qualified CPU timing pair.
+     *
+     * CSV formatting occurs after the timed launch. It is deliberately kept
+     * outside the measured window with route snapshots, output comparisons,
+     * fixture construction, and every dynamic allocation.
+     */
+    void writeCPUPairedSample(
+        std::ostream &output,
+        const native_vnni_dispatch::NativeVNNIPairedTimingRequest &request,
+        const CPUDecodeScheduleCandidate &candidate,
+        const CPUPairedCandidateEvidence &evidence,
+        std::string_view candidate_role,
+        size_t pair_index,
+        size_t within_pair_order,
+        size_t configured_pair_count,
+        uint64_t cell_order_seed,
+        uint64_t pair_order_seed,
+        double latency_us,
+        int warmup_count)
+    {
+        const char *observed_path = evidence.route.serial_kpart
+                                        ? "serial-kpart"
+                                        : "serial-full-k";
+        output << "native-vnni-paired-interleaved-v3,"
+               << request.request_id << ",cpu,decode_m1,"
+               << request.source_format << ','
+               << request.source_codebook << ','
+               << request.execution_codebook << ','
+               << request.architecture_class << ','
+               << request.shape << ",eager,1,"
+               << request.n << ',' << request.k << ','
+               << pair_index << ',' << configured_pair_count << ','
+               << within_pair_order << ',' << cell_order_seed << ','
+               << pair_order_seed << ',' << candidate_role << ','
+               << candidate.canonical_id << ",1,"
+               << std::setprecision(17) << latency_us << ','
+               << std::hexfloat << latency_us << std::defaultfloat << ','
+               << warmup_count << ','
+               << evidence.comparison.mismatch_count << ','
+               << evidence.comparison.first_mismatch_index << ','
+               << evidence.repeat_byte_mismatches << ','
+               << std::setprecision(17)
+               << evidence.comparison.max_abs << ','
+               << evidence.comparison.relative_l2 << ','
+               << evidence.comparison.cosine << ','
+               << evidence.comparison.symmetric_kld << ','
+               << evidence.comparison.actual_digest << ','
+               << evidence.comparison.expected_digest
+               << ",0,1,1," << (evidence.route_ok ? 1 : 0) << ','
+               << candidate.canonical_id << ',' << observed_path << ','
+               << evidence.route.n_block_chunks << ','
+               << evidence.route.k_tiles << ",0,"
+               << "cpu.nvnni.frozen-serial-m1-arithmetic-v1,"
+               << (evidence.numerical_correctness ? 1 : 0) << ','
+               << (evidence.correctness_pass ? 1 : 0) << '\n';
+    }
+
+    /**
+     * @brief Execute an authoritative CPU paired-confirmation transaction.
+     *
+     * Every request constructs and packs its fixture before timing, primes the
+     * OpenMP team and persistent K-partial high-water buffer, proves each forced
+     * route with one untimed performance-counter launch, and then disables the
+     * collector. The measured loop contains only steady-clock reads and one
+     * production `gemv_native_vnni_preq()` call. No output vector, workspace,
+     * route tag, CSV field, or sample container is allocated or freed there.
+     */
+    void runCPUM1PairedConfirmation(
+        const std::string &request_manifest_path,
+        const std::string &output_path)
+    {
+        const auto manifest =
+            native_vnni_dispatch::loadNativeVnniPairedRequestManifest(
+                request_manifest_path);
+        ASSERT_EQ(manifest.backend, "cpu");
+        ASSERT_FALSE(manifest.requests.empty());
+        ASSERT_FALSE(PerfStatsCollector::isEnabled())
+            << "CPU paired timing requires ambient perfstats/profiling to be disabled";
+        ASSERT_TRUE(native_vnni_dispatch::profilerRequestId().empty())
+            << "isolated Linux-perf profiling cannot run inside paired timing";
+
+        const int warmups = std::max(
+            5, getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_WARMUP").value_or(5));
+        const int pair_count = std::max(
+            30, getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_ITERS").value_or(30));
+        const std::string build_isa = compiledNativeVNNIBuildISAName();
+        const std::string runtime_isa = activeISANameForVerifierTrainer();
+        const int threads = omp_get_max_threads();
+        const std::string architecture_suffix =
+            "|build=" + build_isa + "|runtime=" + runtime_isa +
+            "|threads=" + std::to_string(threads);
+
+        const std::filesystem::path output_file_path(output_path);
+        if (output_file_path.has_parent_path())
+            std::filesystem::create_directories(output_file_path.parent_path());
+        std::ofstream output(output_file_path, std::ios::out | std::ios::trunc);
+        ASSERT_TRUE(output.is_open()) << output_path;
+        output
+            << "protocol_version,request_id,backend,phase,source_format,"
+               "source_codebook,execution_codebook,architecture_class,shape,"
+               "execution_mode,m,n,k,pair_index,configured_pair_count,"
+               "within_pair_order,cell_order_seed,pair_order_seed,candidate_role,"
+               "candidate_id,timed_replays,latency_us,latency_us_hex,warmup_count,"
+               "bit_mismatches,first_bit_mismatch,repeat_byte_mismatches,max_abs,"
+               "relative_l2,cosine,symmetric_kld,grouped_output_digest,"
+               "serial_output_digest,graph_capture_ok,workspace_ok,"
+               "explicit_stream_ok,route_counter_ok,observed_candidate_id,"
+               "observed_path,observed_tile_n,observed_cpt,observed_effective_kb,"
+               "serial_m1_candidate_id,numerical_correctness,correctness_pass\n";
+
+        size_t executed_requests = 0;
+        for (const auto &request : manifest.requests)
+        {
+            ASSERT_EQ(request.execution_mode, "eager") << request.request_id;
+            ASSERT_EQ(request.m, 1) << request.request_id;
+            ASSERT_GE(request.architecture_class.size(), architecture_suffix.size())
+                << request.request_id;
+            ASSERT_EQ(
+                request.architecture_class.substr(
+                    request.architecture_class.size() - architecture_suffix.size()),
+                architecture_suffix)
+                << request.request_id << " belongs to another CPU ISA/thread regime";
+
+            const auto &shape_manifest =
+                native_vnni_dispatch::nativeVnniShapeManifest();
+            const auto shape_iterator = std::find_if(
+                shape_manifest.begin(), shape_manifest.end(),
+                [&](const native_vnni_dispatch::NativeVNNIShapeSpec &shape)
+                {
+                    return shape.name == request.shape;
+                });
+            ASSERT_NE(shape_iterator, shape_manifest.end())
+                << request.request_id << " unknown shape " << request.shape;
+            ASSERT_EQ(shape_iterator->N, request.n) << request.request_id;
+            ASSERT_EQ(shape_iterator->K, request.k) << request.request_id;
+
+            const auto format_iterator = std::find_if(
+                MTP_SMALL_M_FORMATS.begin(), MTP_SMALL_M_FORMATS.end(),
+                [&](const FormatSpec &format)
+                {
+                    return toLower(format.name) ==
+                           toLower(request.source_format);
+                });
+            ASSERT_NE(format_iterator, MTP_SMALL_M_FORMATS.end())
+                << request.request_id << " unknown format "
+                << request.source_format;
+            const CPUDecodeScheduleCandidate *selected =
+                findCPUDecodeScheduleCandidate(request.selected_candidate_id);
+            const CPUDecodeScheduleCandidate *exact =
+                findCPUDecodeScheduleCandidate(request.exact_candidate_id);
+            ASSERT_NE(selected, nullptr) << request.request_id;
+            ASSERT_NE(exact, nullptr) << request.request_id;
+            ASSERT_NE(selected, exact) << request.request_id;
+
+            auto weights = createWeightsForFormat(
+                format_iterator->name,
+                static_cast<size_t>(request.n),
+                static_cast<size_t>(request.k));
+            ASSERT_NE(weights, nullptr) << request.request_id;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << request.request_id;
+            const auto &packed = kernel.packedWeights();
+            ASSERT_EQ(
+                static_cast<int>(packed.codebook_id), request.source_codebook)
+                << request.request_id;
+            ASSERT_EQ(
+                static_cast<int>(packed.codebook_id), request.execution_codebook)
+                << request.request_id;
+
+            std::mt19937 rng(static_cast<uint32_t>(
+                0xDEC0DEu + request.n + request.k +
+                format_iterator->name.size()));
+            std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+            std::vector<float> input(static_cast<size_t>(request.k));
+            for (float &value : input)
+                value = distribution(rng);
+            std::vector<Q8_1Block> quantized(
+                static_cast<size_t>(packed.blocks_per_row));
+            quantize_activations_to_q8_1(
+                input.data(), quantized.data(), 1, request.k,
+                packed.blocks_per_row);
+
+            std::vector<float> oracle(static_cast<size_t>(request.n), 0.0f);
+            std::array<std::vector<float>, 2> candidate_outputs = {
+                std::vector<float>(static_cast<size_t>(request.n), 0.0f),
+                std::vector<float>(static_cast<size_t>(request.n), 0.0f),
+            };
+            std::array<std::vector<float>, 2> first_outputs = {
+                std::vector<float>(static_cast<size_t>(request.n), 0.0f),
+                std::vector<float>(static_cast<size_t>(request.n), 0.0f),
+            };
+            std::array<std::vector<double>, 2> samples = {
+                std::vector<double>(static_cast<size_t>(pair_count), 0.0),
+                std::vector<double>(static_cast<size_t>(pair_count), 0.0),
+            };
+            constexpr ISAPath isa_path = ISAPath::AUTO;
+            gemv_native_vnni_preq(
+                packed, quantized.data(), oracle.data(), isa_path,
+                DecodeSchedulePolicy::FrozenSerialOracle);
+
+            const std::array<const CPUDecodeScheduleCandidate *, 2> candidates = {
+                selected, exact};
+            std::array<CPUPairedCandidateEvidence, 2> evidence;
+            for (size_t candidate_index = 0;
+                 candidate_index < candidates.size(); ++candidate_index)
+            {
+                const CPUDecodeScheduleCandidate &candidate =
+                    *candidates[candidate_index];
+                const auto launch = [&]
+                {
+                    gemv_native_vnni_preq(
+                        packed,
+                        quantized.data(),
+                        candidate_outputs[candidate_index].data(),
+                        isa_path,
+                        candidate.policy);
+                };
+
+                PerfStatsCollector::reset();
+                ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_JSON", "1", 1), 0);
+                launch();
+                evidence[candidate_index].route = findCPUDecodeRoute(
+                    request.n, request.k, packed.codebook_id);
+                ASSERT_EQ(unsetenv("LLAMINAR_PERF_STATS_JSON"), 0);
+                ASSERT_FALSE(PerfStatsCollector::isEnabled());
+                std::copy(
+                    candidate_outputs[candidate_index].begin(),
+                    candidate_outputs[candidate_index].end(),
+                    first_outputs[candidate_index].begin());
+                launch();
+
+                CPUPairedCandidateEvidence &candidate_evidence =
+                    evidence[candidate_index];
+                candidate_evidence.repeat_byte_mismatches =
+                    llaminar2::test::trainer::nativeByteMismatchCount(
+                        first_outputs[candidate_index],
+                        candidate_outputs[candidate_index]);
+                candidate_evidence.comparison =
+                    llaminar2::test::trainer::compareFP32(
+                        candidate_outputs[candidate_index], oracle,
+                        static_cast<size_t>(request.n));
+                candidate_evidence.route_ok =
+                    candidate_evidence.route.found &&
+                    candidate_evidence.route.count == 1 &&
+                    candidate_evidence.route.build_isa == build_isa &&
+                    candidate_evidence.route.isa == runtime_isa &&
+                    candidate_evidence.route.threads == threads &&
+                    candidate_evidence.route.effective_policy ==
+                        candidate.route_name &&
+                    candidate_evidence.route.n_block_chunks ==
+                        decodeScheduleNBlockChunks(candidate.policy);
+                candidate_evidence.numerical_correctness =
+                    candidate_evidence.comparison.nonfinite_count == 0;
+                candidate_evidence.correctness_pass =
+                    candidate_evidence.route_ok &&
+                    candidate_evidence.comparison.bitwiseEqual() &&
+                    candidate_evidence.repeat_byte_mismatches == 0 &&
+                    candidate_evidence.numerical_correctness;
+                ASSERT_TRUE(candidate_evidence.correctness_pass)
+                    << request.request_id << " candidate="
+                    << candidate.canonical_id;
+            }
+
+            /*
+             * Prime both schedules in alternating order. This starts the
+             * OpenMP worker team, raises the K-partial buffer to its required
+             * high-water mark, and removes first-use faults before timing.
+             */
+            for (int warmup = 0; warmup < warmups; ++warmup)
+            {
+                const size_t first = static_cast<size_t>(warmup & 1);
+                for (size_t offset = 0; offset < candidates.size(); ++offset)
+                {
+                    const size_t candidate_index = (first + offset) % 2;
+                    gemv_native_vnni_preq(
+                        packed,
+                        quantized.data(),
+                        candidate_outputs[candidate_index].data(),
+                        isa_path,
+                        candidates[candidate_index]->policy);
+                }
+            }
+
+            const uint64_t cell_seed = cpuPairedSeed(request.request_id);
+            for (int pair_index = 0; pair_index < pair_count; ++pair_index)
+            {
+                const uint64_t pair_seed = cpuPairedOrderSeed(
+                    cell_seed, static_cast<size_t>(pair_index));
+                const size_t first = static_cast<size_t>(
+                    (pair_index + (cell_seed & 1ULL)) & 1ULL);
+                for (size_t offset = 0; offset < candidates.size(); ++offset)
+                {
+                    const size_t candidate_index = (first + offset) % 2;
+                    const auto begin = std::chrono::steady_clock::now();
+                    gemv_native_vnni_preq(
+                        packed,
+                        quantized.data(),
+                        candidate_outputs[candidate_index].data(),
+                        isa_path,
+                        candidates[candidate_index]->policy);
+                    const auto end = std::chrono::steady_clock::now();
+                    samples[candidate_index][static_cast<size_t>(pair_index)] =
+                        std::chrono::duration<double, std::micro>(end - begin)
+                            .count();
+                }
+
+                for (size_t candidate_index = 0;
+                     candidate_index < candidates.size(); ++candidate_index)
+                {
+                    writeCPUPairedSample(
+                        output,
+                        request,
+                        *candidates[candidate_index],
+                        evidence[candidate_index],
+                        candidate_index == 0 ? "selected" : "exact",
+                        static_cast<size_t>(pair_index),
+                        candidate_index == first ? 0u : 1u,
+                        static_cast<size_t>(pair_count),
+                        cell_seed,
+                        pair_seed,
+                        samples[candidate_index][static_cast<size_t>(pair_index)],
+                        warmups);
+                }
+            }
+            output.flush();
+            ASSERT_TRUE(output.good()) << output_path;
+            ++executed_requests;
+        }
+
+        ASSERT_EQ(executed_requests, manifest.requests.size());
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @test Emit promotion-grade CPU M=1 decode schedule evidence.
+     *
+     * Every candidate enters the real pre-quantized production GEMV launcher.
+     * Candidates may change only OpenMP ownership of adjacent 64-column chunks;
+     * the frozen serial K partition and ascending reduction tree remain fixed.
+     * Each forceable route must therefore repeat byte-identically and match the
+     * explicit frozen-serial oracle for the complete FP32 output.
+     *
+     * Canonical timing and Linux-perf evidence are deliberately separate.  A
+     * profiler process warms the fixture, enables counters around exactly one
+     * target launch, and then emits only a one-sample diagnostic timing row.
+     */
+    TEST_F(CPUNativeVNNIGemvTest, TrainerCsv_StrongDecode_AllFormats)
+    {
+        applyVerifierRowsThreadCapForStandalonePerf();
+
+        const std::string paired_request_manifest_path = getEnvString(
+            "LLAMINAR_CPU_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST");
+        const std::string paired_output_path = getEnvString(
+            "LLAMINAR_CPU_NVNNI_DECODE_PAIRED_CSV");
+        ASSERT_EQ(
+            paired_request_manifest_path.empty(), paired_output_path.empty())
+            << "CPU paired confirmation requires both the request manifest and CSV";
+        if (!paired_request_manifest_path.empty())
+        {
+            ASSERT_TRUE(getEnvString("LLAMINAR_CPU_NVNNI_DECODE_FORMATS").empty());
+            ASSERT_TRUE(getEnvString("LLAMINAR_CPU_NVNNI_DECODE_CANDIDATES").empty());
+            ASSERT_TRUE(getEnvString("LLAMINAR_CPU_NVNNI_DECODE_M").empty());
+            ASSERT_TRUE(getEnvString("LLAMINAR_CPU_NVNNI_DECODE_SHAPE_NAME").empty());
+            ASSERT_TRUE(getEnvString("LLAMINAR_CPU_NVNNI_DECODE_STRONG_CSV").empty());
+            ASSERT_TRUE(getEnvString("LLAMINAR_CPU_NVNNI_DECODE_TIMING_CSV").empty());
+            runCPUM1PairedConfirmation(
+                paired_request_manifest_path, paired_output_path);
+            return;
+        }
+
+        const int N = getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_N").value_or(5120);
+        const int K = getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_K").value_or(5120);
+        ASSERT_GT(N, 0);
+        ASSERT_GT(K, 0);
+        ASSERT_EQ(K % 32, 0);
+
+        std::string shape_name =
+            getEnvString("LLAMINAR_CPU_NVNNI_DECODE_SHAPE_NAME");
+        if (shape_name.empty())
+            shape_name = "Qwen36Decode";
+        std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_DECODE_FORMATS");
+        if (format_filters.empty())
+            format_filters = {toLower("Q4_K")};
+        if (format_filters.count("all") != 0)
+            format_filters.clear();
+        const std::set<std::string> candidate_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_DECODE_CANDIDATES");
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_DECODE_M");
+        for (const std::string &raw_m : m_filters)
+            ASSERT_EQ(raw_m, "1") << "CPU decode trainer supports only M=1";
+
+        const std::string profiler_request_id =
+            native_vnni_dispatch::profilerRequestId();
+        CPUProfilerBatch profiler_batch;
+        ASSERT_FALSE(
+            !profiler_request_id.empty() && profiler_batch.enabled())
+            << "single-request and batch CPU profiling are mutually exclusive";
+        const bool profiling_requested =
+            !profiler_request_id.empty() || profiler_batch.enabled();
+        const std::string single_perf_output_path =
+            native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kPerfStatsPathEnvironment);
+        std::optional<native_vnni_dispatch::LinuxPerfControl> perf_control;
+        if (!profiler_request_id.empty())
+        {
+            perf_control.emplace(profiler_request_id);
+        }
+        else if (profiler_batch.enabled())
+        {
+            const CPUProfilerBatchRequest &first = profiler_batch.first();
+            perf_control.emplace(first.request_id, first.output_path);
+        }
+
+        const int warmups = std::max(
+            0,
+            getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_WARMUP").value_or(5));
+        const int samples = std::max(
+            1,
+            getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_ITERS").value_or(30));
+        const int max_cases = std::max(
+            1,
+            getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_MAX_CASES")
+                .value_or(1000000));
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(format_filters.size(), 1u);
+            ASSERT_EQ(candidate_filters.size(), 1u);
+            ASSERT_EQ(max_cases, 1);
+        }
+
+        constexpr ISAPath isa_path = ISAPath::AUTO;
+        const std::string build_isa = compiledNativeVNNIBuildISAName();
+        const std::string requested_runtime_isa =
+            requestedISANameForVerifierTrainer();
+        const std::string effective_runtime_isa =
+            activeISANameForVerifierTrainer();
+        ASSERT_TRUE(
+            effective_runtime_isa == "AVX2" ||
+            effective_runtime_isa == "AVX512");
+        if (requested_runtime_isa != "AUTO")
+            ASSERT_EQ(requested_runtime_isa, effective_runtime_isa);
+
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_DECODE_STRONG_CSV");
+        const std::string timing_csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_DECODE_TIMING_CSV");
+        (void)setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+        PerfStatsCollector::reset();
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr);
+            std::fprintf(
+                csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,build_isa,"
+                "runtime_isa_requested,runtime_isa_effective,threads,weight_bytes,"
+                "warmup_count,sample_count,min_us,median_us,p95_us,mad_us,cv,"
+                "bit_mismatches,first_bit_mismatch,repeat_byte_mismatches,max_abs,"
+                "relative_l2,cosine,symmetric_kld,output_digest,oracle_output_digest,"
+                "timing_sample_digest,route_counter_ok,observed_candidate_id,k_tiles,"
+                "n_block_chunks,serial_kpart,numerical_correctness,correctness_pass,"
+                "is_winner\n");
+        }
+        std::FILE *timing_csv = nullptr;
+        if (!timing_csv_path.empty())
+        {
+            timing_csv = std::fopen(timing_csv_path.c_str(), "w");
+            ASSERT_NE(timing_csv, nullptr);
+            std::fprintf(
+                timing_csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,build_isa,"
+                "runtime_isa_requested,runtime_isa_effective,sample_index,"
+                "latency_us,latency_us_hex\n");
+        }
+
+        struct CandidateRow
+        {
+            CPUDecodeScheduleCandidate candidate{};
+            StrongTimingMeasurement timing;
+            llaminar2::test::trainer::FP32Evidence comparison;
+            CPUDecodeRouteEvidence route;
+            size_t repeat_byte_mismatches = 0;
+            int timing_warmups = 0;
+            bool route_ok = false;
+            bool numerical_correctness = false;
+            bool correctness_pass = false;
+        };
+
+        /**
+         * @brief One format-local raw weight fixture prepared outside timing.
+         *
+         * The individual TestTensorFactory generators deliberately retain
+         * their historical format-specific seed and serial PRNG stream.  They
+         * are independent of one another, however, so preparing selected
+         * formats concurrently preserves every generated byte while avoiding
+         * a long single-core setup phase on large vocabulary projections.
+         * Packed-kernel construction and all measured launches remain
+         * sequential across formats so their OpenMP teams never contend.
+         */
+        struct PreparedDecodeWeights
+        {
+            const FormatSpec *format = nullptr;
+            std::unique_ptr<TensorBase> weights;
+        };
+
+        std::vector<const FormatSpec *> selected_formats;
+        selected_formats.reserve(MTP_SMALL_M_FORMATS.size());
+        for (const auto &format : MTP_SMALL_M_FORMATS)
+        {
+            if (!shouldRunName(format_filters, format.name))
+                continue;
+            if (static_cast<int>(selected_formats.size()) >= max_cases)
+                break;
+            if (profiler_batch.enabled() && !profiler_batch.containsCell(
+                    "NativeVNNIFastM1Projection",
+                    format.name,
+                    "eager",
+                    1,
+                    N,
+                    K))
+            {
+                continue;
+            }
+            selected_formats.push_back(&format);
+        }
+        ASSERT_FALSE(selected_formats.empty())
+            << "No CPU M=1 decode formats selected";
+
+        std::vector<PreparedDecodeWeights> prepared_weights(
+            selected_formats.size());
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int index = 0;
+             index < static_cast<int>(selected_formats.size());
+             ++index)
+        {
+            const FormatSpec *format =
+                selected_formats[static_cast<size_t>(index)];
+            prepared_weights[static_cast<size_t>(index)] = {
+                format,
+                createWeightsForFormat(
+                    format->name,
+                    static_cast<size_t>(N),
+                    static_cast<size_t>(K))};
+        }
+
+        int executed_cases = 0;
+        int emitted_rows = 0;
+        int isolated_profile_launches = 0;
+        for (auto &prepared : prepared_weights)
+        {
+            ASSERT_NE(prepared.format, nullptr);
+            const FormatSpec &format = *prepared.format;
+            auto weights = std::move(prepared.weights);
+            ASSERT_NE(weights, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << format.name;
+            const auto &packed = kernel.packedWeights();
+            const size_t weight_bytes =
+                packed.native_interleaved.size() + packed.payload.size();
+
+            std::mt19937 rng(static_cast<uint32_t>(
+                0xDEC0DEu + N + K + format.name.size()));
+            std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+            std::vector<float> input(static_cast<size_t>(K));
+            for (float &value : input)
+                value = distribution(rng);
+            std::vector<Q8_1Block> quantized(
+                static_cast<size_t>(packed.blocks_per_row));
+            quantize_activations_to_q8_1(
+                input.data(),
+                quantized.data(),
+                1,
+                K,
+                packed.blocks_per_row);
+
+            std::vector<float> oracle(static_cast<size_t>(N), 0.0f);
+            gemv_native_vnni_preq(
+                packed,
+                quantized.data(),
+                oracle.data(),
+                isa_path,
+                DecodeSchedulePolicy::FrozenSerialOracle);
+            const std::string oracle_digest =
+                llaminar2::test::trainer::nativeByteDigest(oracle);
+
+            std::vector<CandidateRow> rows;
+            rows.reserve(CPU_DECODE_SCHEDULE_CANDIDATES.size());
+            for (const CPUDecodeScheduleCandidate &candidate :
+                 CPU_DECODE_SCHEDULE_CANDIDATES)
+            {
+                if (!candidate_filters.empty() &&
+                    !shouldRunName(candidate_filters, candidate.route_name) &&
+                    !shouldRunName(candidate_filters, candidate.canonical_id))
+                {
+                    continue;
+                }
+                CPUProfilerBatchRequest *batch_request = nullptr;
+                if (profiler_batch.enabled())
+                {
+                    batch_request = profiler_batch.claim(
+                        "NativeVNNIFastM1Projection",
+                        format.name,
+                        "eager",
+                        1,
+                        N,
+                        K,
+                        candidate.canonical_id);
+                    if (!batch_request)
+                        continue;
+                }
+
+                std::vector<float> output(static_cast<size_t>(N), 0.0f);
+                const auto run_candidate = [&]()
+                {
+                    gemv_native_vnni_preq(
+                        packed,
+                        quantized.data(),
+                        output.data(),
+                        isa_path,
+                        candidate.policy);
+                };
+                PerfStatsCollector::reset();
+                run_candidate();
+                const CPUDecodeRouteEvidence route =
+                    findCPUDecodeRoute(N, K, packed.codebook_id);
+                const std::vector<float> first_output = output;
+                run_candidate();
+                const size_t repeat_byte_mismatches =
+                    llaminar2::test::trainer::nativeByteMismatchCount(
+                        first_output, output);
+                const auto comparison =
+                    llaminar2::test::trainer::compareFP32(
+                        output, oracle, static_cast<size_t>(N));
+                /*
+                 * The learned M=1 schedule is shared by three production
+                 * bundles: an ordinary projection, gate/up-style projections
+                 * sharing one activation, and expert-down projections with
+                 * projection-local activations. Exercise all three for every
+                 * format/candidate cell. Otherwise a correct ordinary GEMV
+                 * could conceal a fused launcher that ignored runtime ISA,
+                 * K-partition, or the selected N-block width.
+                 */
+                std::array<std::vector<float>, 2> shared_outputs = {
+                    std::vector<float>(static_cast<size_t>(N), 0.0f),
+                    std::vector<float>(static_cast<size_t>(N), 0.0f),
+                };
+                std::array<FusedGemvDesc, 2> shared_descriptors = {{
+                    {&packed, shared_outputs[0].data(), nullptr, N},
+                    {&packed, shared_outputs[1].data(), nullptr, N},
+                }};
+                gemv_native_vnni_fused_preq(
+                    quantized.data(),
+                    shared_descriptors.data(),
+                    static_cast<int>(shared_descriptors.size()),
+                    isa_path,
+                    candidate.policy);
+
+                std::array<std::vector<float>, 2> multi_input_outputs = {
+                    std::vector<float>(static_cast<size_t>(N), 0.0f),
+                    std::vector<float>(static_cast<size_t>(N), 0.0f),
+                };
+                std::array<FusedGemvMultiInputDesc, 2>
+                    multi_input_descriptors = {{
+                        {
+                            quantized.data(),
+                            &packed,
+                            multi_input_outputs[0].data(),
+                            N,
+                        },
+                        {
+                            quantized.data(),
+                            &packed,
+                            multi_input_outputs[1].data(),
+                            N,
+                        },
+                    }};
+                gemv_fused_multi_input_preq(
+                    multi_input_descriptors.data(),
+                    static_cast<int>(multi_input_descriptors.size()),
+                    isa_path,
+                    candidate.policy);
+
+                bool fused_outputs_equal = true;
+                for (const auto &fused_output : shared_outputs)
+                {
+                    fused_outputs_equal =
+                        fused_outputs_equal &&
+                        llaminar2::test::trainer::nativeByteMismatchCount(
+                            fused_output, oracle) == 0;
+                }
+                for (const auto &fused_output : multi_input_outputs)
+                {
+                    fused_outputs_equal =
+                        fused_outputs_equal &&
+                        llaminar2::test::trainer::nativeByteMismatchCount(
+                            fused_output, oracle) == 0;
+                }
+
+                uint64_t fused_route_count = 0;
+                bool fused_route_ok = true;
+                for (const auto &record : PerfStatsCollector::snapshot(
+                         {"kernel.cpu_native_vnni_fused_verifier_rows_projection_launch"}))
+                {
+                    if (record.name !=
+                        "cpu_native_vnni_fused_verifier_rows_projection_launch")
+                    {
+                        continue;
+                    }
+                    fused_route_ok =
+                        fused_route_ok && record.tags.at("m") == "1" &&
+                        record.tags.at("n") == std::to_string(N) &&
+                        record.tags.at("k") == std::to_string(K) &&
+                        record.tags.at("codebook") ==
+                            std::to_string(packed.codebook_id) &&
+                        record.tags.at("isa") == effective_runtime_isa &&
+                        record.tags.at("effective_decode_policy") ==
+                            route.effective_policy &&
+                        record.tags.at("n_block_chunks") ==
+                            std::to_string(route.n_block_chunks) &&
+                        record.tags.at("route") ==
+                            (route.k_tiles > 1
+                                 ? "decode_k_parallel_row"
+                                 : "decode_full_k_row");
+                    fused_route_count += record.count;
+                }
+                fused_route_ok =
+                    fused_route_ok && fused_route_count == 4;
+                const bool route_ok =
+                    route.found && route.count > 0 &&
+                    route.build_isa == build_isa &&
+                    route.isa == effective_runtime_isa &&
+                    route.effective_policy == candidate.route_name &&
+                    fused_route_ok;
+                const int candidate_warmups = route_ok ? warmups : 0;
+                const int candidate_samples = route_ok ? samples : 1;
+                if (profiling_requested)
+                {
+                    ASSERT_TRUE(route_ok)
+                        << "profiler selected a normalized CPU M=1 candidate";
+                    for (int warmup = 0;
+                         warmup < std::max(1, candidate_warmups);
+                         ++warmup)
+                    {
+                        run_candidate();
+                    }
+                    ASSERT_TRUE(perf_control.has_value());
+                    const std::string &exact_request_id = batch_request
+                        ? batch_request->request_id
+                        : profiler_request_id;
+                    const std::string &exact_output_path = batch_request
+                        ? batch_request->output_path
+                        : single_perf_output_path;
+                    profileExactCPURequest(
+                        *perf_control,
+                        exact_request_id,
+                        exact_output_path,
+                        run_candidate);
+                    ++isolated_profile_launches;
+                    std::fprintf(
+                        stderr,
+                        "[NativeVNNIProfiler][CPU_DECODE] request=%s "
+                        "candidate=%s format=%s M=1 N=%d K=%d launches=1\n",
+                        exact_request_id.c_str(),
+                        candidate.canonical_id,
+                        format.name.c_str(),
+                        N,
+                        K);
+                }
+                const StrongTimingMeasurement timing =
+                    timeStrongTrainerCandidate(
+                        candidate_warmups, candidate_samples, run_candidate);
+                const bool numerical_correctness =
+                    comparison.nonfinite_count == 0;
+                const bool correctness_pass =
+                    route_ok && comparison.bitwiseEqual() &&
+                    repeat_byte_mismatches == 0 && fused_outputs_equal &&
+                    numerical_correctness;
+                if (route_ok)
+                {
+                    EXPECT_TRUE(comparison.bitwiseEqual())
+                        << format.name << " candidate=" << candidate.canonical_id;
+                    EXPECT_EQ(repeat_byte_mismatches, 0u)
+                        << format.name << " candidate=" << candidate.canonical_id;
+                }
+                EXPECT_TRUE(fused_route_ok)
+                    << format.name << " candidate=" << candidate.canonical_id
+                    << " did not execute the requested fused M=1 schedule";
+                EXPECT_TRUE(fused_outputs_equal)
+                    << format.name << " candidate=" << candidate.canonical_id
+                    << " fused production bundle differs from serial decode";
+                rows.push_back(CandidateRow{
+                    candidate,
+                    timing,
+                    comparison,
+                    route,
+                    repeat_byte_mismatches,
+                    candidate_warmups,
+                    route_ok,
+                    numerical_correctness,
+                    correctness_pass});
+            }
+
+            int best_index = -1;
+            for (size_t index = 0; index < rows.size(); ++index)
+            {
+                if (!rows[index].correctness_pass)
+                    continue;
+                if (best_index < 0 ||
+                    rows[index].timing.evidence.median <
+                        rows[static_cast<size_t>(best_index)]
+                            .timing.evidence.median)
+                {
+                    best_index = static_cast<int>(index);
+                }
+            }
+            ASSERT_GE(best_index, 0)
+                << format.name << " has no forceable byte-exact M=1 candidate";
+
+            for (size_t index = 0; index < rows.size(); ++index)
+            {
+                const CandidateRow &row = rows[index];
+                if (csv)
+                {
+                    std::fprintf(
+                        csv,
+                        "cpu,decode_m1,%s,%u,%u,%s,eager,1,%d,%d,%s,%s,%s,%s,%d,%zu,"
+                        "%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,%.9g,%.9g,%.9g,"
+                        "%.9g,%s,%s,%s,%d,%s,%d,%d,%d,%d,%d,%d\n",
+                        format.name.c_str(),
+                        static_cast<unsigned>(packed.codebook_id),
+                        static_cast<unsigned>(packed.codebook_id),
+                        shape_name.c_str(),
+                        N,
+                        K,
+                        row.candidate.canonical_id,
+                        row.route.build_isa.c_str(),
+                        requested_runtime_isa.c_str(),
+                        row.route.isa.c_str(),
+                        row.route.threads,
+                        weight_bytes,
+                        row.timing_warmups,
+                        static_cast<int>(row.timing.samples_us.size()),
+                        row.timing.evidence.min,
+                        row.timing.evidence.median,
+                        row.timing.evidence.p95,
+                        row.timing.evidence.mad,
+                        row.timing.evidence.cv,
+                        row.comparison.mismatch_count,
+                        row.comparison.first_mismatch_index,
+                        row.repeat_byte_mismatches,
+                        row.comparison.max_abs,
+                        row.comparison.relative_l2,
+                        row.comparison.cosine,
+                        row.comparison.symmetric_kld,
+                        row.comparison.actual_digest.c_str(),
+                        oracle_digest.c_str(),
+                        row.timing.evidence.digest.c_str(),
+                        row.route_ok ? 1 : 0,
+                        row.route.effective_policy.c_str(),
+                        row.route.k_tiles,
+                        row.route.n_block_chunks,
+                        row.route.serial_kpart ? 1 : 0,
+                        row.numerical_correctness ? 1 : 0,
+                        row.correctness_pass ? 1 : 0,
+                        static_cast<int>(index) == best_index ? 1 : 0);
+                    ++emitted_rows;
+                }
+                if (timing_csv)
+                {
+                    for (size_t sample_index = 0;
+                         sample_index < row.timing.samples_us.size();
+                         ++sample_index)
+                    {
+                        const double latency_us =
+                            row.timing.samples_us[sample_index];
+                        std::fprintf(
+                            timing_csv,
+                            "cpu,decode_m1,%s,%u,%u,%s,eager,1,%d,%d,%s,%s,%s,%s,%zu,%.9f,%a\n",
+                            format.name.c_str(),
+                            static_cast<unsigned>(packed.codebook_id),
+                            static_cast<unsigned>(packed.codebook_id),
+                            shape_name.c_str(),
+                            N,
+                            K,
+                            row.candidate.canonical_id,
+                            row.route.build_isa.c_str(),
+                            requested_runtime_isa.c_str(),
+                            row.route.isa.c_str(),
+                            sample_index,
+                            latency_us,
+                            latency_us);
+                    }
+                }
+            }
+            if (csv)
+                std::fflush(csv);
+            if (timing_csv)
+                std::fflush(timing_csv);
+            ++executed_cases;
+        }
+
+        if (csv)
+        {
+            ASSERT_EQ(std::fclose(csv), 0);
+            ASSERT_GT(emitted_rows, 0);
+        }
+        if (timing_csv)
+            ASSERT_EQ(std::fclose(timing_csv), 0);
+        ASSERT_GT(executed_cases, 0) << "No CPU M=1 decode cases selected";
+        if (!profiler_request_id.empty())
+            ASSERT_EQ(isolated_profile_launches, 1);
+        else if (profiler_batch.enabled())
+        {
+            EXPECT_NO_THROW(profiler_batch.requireComplete());
+            ASSERT_EQ(
+                static_cast<size_t>(isolated_profile_launches),
+                profiler_batch.size());
+        }
+        PerfStatsCollector::reset();
+    }
+
+    /**
      * @test Emit promotion-grade CPU grouped-verifier candidate evidence.
      *
      * This is the only CPU verifier-row surface intended for learned-policy
@@ -2532,6 +4374,37 @@ namespace
             format_filters.clear();
         const std::set<std::string> m_filters =
             getEnvCsvSet("LLAMINAR_CPU_NVNNI_VERIFIER_M");
+        const std::set<std::string> candidate_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_VERIFIER_CANDIDATES");
+        const std::string profiler_request_id =
+            native_vnni_dispatch::profilerRequestId();
+        CPUProfilerBatch profiler_batch;
+        ASSERT_FALSE(
+            !profiler_request_id.empty() && profiler_batch.enabled())
+            << "single-request and batch CPU profiling are mutually exclusive";
+        const bool profiling_requested =
+            !profiler_request_id.empty() || profiler_batch.enabled();
+        const bool diagnostic_frozen_serial_oracle =
+            getEnvString(
+                "LLAMINAR_CPU_NVNNI_VERIFIER_DIAGNOSTIC_FROZEN_SERIAL_ORACLE") ==
+            "1";
+        ASSERT_FALSE(diagnostic_frozen_serial_oracle && !profiling_requested)
+            << "The frozen serial oracle is diagnostic-only and requires one "
+               "exact isolated profiler request";
+        const std::string single_perf_output_path =
+            native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kPerfStatsPathEnvironment);
+        std::optional<native_vnni_dispatch::LinuxPerfControl> perf_control;
+        if (!profiler_request_id.empty())
+        {
+            // Validate profiler provenance before allocating large fixtures.
+            perf_control.emplace(profiler_request_id);
+        }
+        else if (profiler_batch.enabled())
+        {
+            const CPUProfilerBatchRequest &first = profiler_batch.first();
+            perf_control.emplace(first.request_id, first.output_path);
+        }
         std::vector<int> verifier_rows;
         if (m_filters.empty())
         {
@@ -2569,6 +4442,17 @@ namespace
         const int max_cases = std::max(
             1,
             getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_MAX_CASES").value_or(1000000));
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(format_filters.size(), 1u)
+                << "isolated CPU profiling requires exactly one source format";
+            ASSERT_EQ(verifier_rows.size(), 1u)
+                << "isolated CPU profiling requires exactly one runtime M";
+            ASSERT_EQ(candidate_filters.size(), 1u)
+                << "isolated CPU profiling requires exactly one candidate";
+            ASSERT_EQ(max_cases, 1)
+                << "isolated CPU profiling requires exactly one shape case";
+        }
         /*
          * Promotion evidence must exercise the same ambient runtime dispatch
          * as inference. The older diagnostic can still force ISAPath directly,
@@ -2641,11 +4525,20 @@ namespace
         struct Candidate
         {
             const char *name;
+            const char *canonical_id;
             VerifierRowsPolicy policy;
         };
         constexpr std::array<Candidate, 2> CANDIDATES = {{
-            {"Pairwise", VerifierRowsPolicy::Pairwise},
-            {"WideRows", VerifierRowsPolicy::WideRows},
+            {
+                "Pairwise",
+                "cpu.nvnni.verifier.pairwise",
+                VerifierRowsPolicy::Pairwise,
+            },
+            {
+                "WideRows",
+                "cpu.nvnni.verifier.wide_rows",
+                VerifierRowsPolicy::WideRows,
+            },
         }};
 
         struct CandidateRow
@@ -2664,6 +4557,7 @@ namespace
 
         int executed_cases = 0;
         int emitted_rows = 0;
+        int isolated_profile_launches = 0;
         for (const auto &format : MTP_SMALL_M_FORMATS)
         {
             if (!shouldRunName(format_filters, format.name))
@@ -2684,6 +4578,16 @@ namespace
             {
                 if (executed_cases >= max_cases)
                     break;
+                if (profiler_batch.enabled() && !profiler_batch.containsCell(
+                        "NativeVNNIDecodeProjection",
+                        format.name,
+                        "eager",
+                        M,
+                        N,
+                        K))
+                {
+                    continue;
+                }
 
                 std::mt19937 rng(static_cast<uint32_t>(
                     0xC0DEu + M * 131u + N + K + format.name.size()));
@@ -2709,12 +4613,36 @@ namespace
                 {
                     for (int row = 0; row < M; ++row)
                     {
-                        gemv_native_vnni_preq(
-                            packed,
-                            quantized_rows.data() +
-                                static_cast<size_t>(row) * K_blocks,
-                            serial.data() + static_cast<size_t>(row) * N,
-                            isa_path);
+                        if (diagnostic_frozen_serial_oracle)
+                        {
+                            /*
+                             * The current generated M=1 selector deliberately
+                             * fails closed until certified. A profiler-only
+                             * investigation may still compare a real grouped
+                             * production candidate against the immutable
+                             * arithmetic oracle. This branch is outside the
+                             * isolated perf interval and is forbidden unless
+                             * an exact profiler transaction is active; it can
+                             * neither become runtime dispatch nor produce
+                             * installable timing evidence.
+                             */
+                            gemv_native_vnni_preq(
+                                packed,
+                                quantized_rows.data() +
+                                    static_cast<size_t>(row) * K_blocks,
+                                serial.data() + static_cast<size_t>(row) * N,
+                                isa_path,
+                                DecodeSchedulePolicy::FrozenSerialOracle);
+                        }
+                        else
+                        {
+                            gemv_native_vnni_preq(
+                                packed,
+                                quantized_rows.data() +
+                                    static_cast<size_t>(row) * K_blocks,
+                                serial.data() + static_cast<size_t>(row) * N,
+                                isa_path);
+                        }
                     }
                 };
                 run_serial();
@@ -2826,6 +4754,27 @@ namespace
                 rows.reserve(CANDIDATES.size());
                 for (const Candidate &candidate : CANDIDATES)
                 {
+                    if (!candidate_filters.empty() &&
+                        !shouldRunName(candidate_filters, candidate.name) &&
+                        !shouldRunName(
+                            candidate_filters, candidate.canonical_id))
+                    {
+                        continue;
+                    }
+                    CPUProfilerBatchRequest *batch_request = nullptr;
+                    if (profiler_batch.enabled())
+                    {
+                        batch_request = profiler_batch.claim(
+                            "NativeVNNIDecodeProjection",
+                            format.name,
+                            "eager",
+                            M,
+                            N,
+                            K,
+                            candidate.canonical_id);
+                        if (!batch_request)
+                            continue;
+                    }
                     std::vector<float> grouped(
                         static_cast<size_t>(M) * static_cast<size_t>(N),
                         0.0f);
@@ -2851,11 +4800,16 @@ namespace
                         llaminar2::test::trainer::nativeByteMismatchCount(
                             first_output,
                             grouped);
+                    /*
+                     * The candidate owns one contiguous M-by-N publication.
+                     * Compare all rows so work-sharing bugs on any row fail the
+                     * same byte gate used to authorize the generated policy.
+                     */
                     const auto comparison =
                         llaminar2::test::trainer::compareFP32(
                             grouped,
                             serial,
-                            static_cast<size_t>(N));
+                            static_cast<size_t>(M) * static_cast<size_t>(N));
                     const bool route_ok =
                         route.found && route.count > 0 &&
                         route.build_isa == build_isa &&
@@ -2871,6 +4825,45 @@ namespace
                      */
                     const int candidate_warmups = route_ok ? warmups : 0;
                     const int candidate_samples = route_ok ? samples : 1;
+                    if (profiling_requested)
+                    {
+                        ASSERT_TRUE(route_ok)
+                            << "profiler request selected a non-forceable CPU route";
+                        /*
+                         * This warmup belongs only to the separate profiler
+                         * process. It is deliberately outside both the perf
+                         * control region and the canonical timing helper below.
+                         */
+                        for (int warmup = 0;
+                             warmup < std::max(1, candidate_warmups);
+                             ++warmup)
+                        {
+                            run_candidate();
+                        }
+                        ASSERT_TRUE(perf_control.has_value());
+                        const std::string &exact_request_id = batch_request
+                            ? batch_request->request_id
+                            : profiler_request_id;
+                        const std::string &exact_output_path = batch_request
+                            ? batch_request->output_path
+                            : single_perf_output_path;
+                        profileExactCPURequest(
+                            *perf_control,
+                            exact_request_id,
+                            exact_output_path,
+                            run_candidate);
+                        ++isolated_profile_launches;
+                        std::fprintf(
+                            stderr,
+                            "[NativeVNNIProfiler][CPU] request=%s candidate=%s "
+                            "format=%s M=%d N=%d K=%d launches=1\n",
+                            exact_request_id.c_str(),
+                            candidate.canonical_id,
+                            format.name.c_str(),
+                            M,
+                            N,
+                            K);
+                    }
                     const StrongTimingMeasurement timing =
                         timeStrongTrainerCandidate(
                             candidate_warmups,
@@ -3048,6 +5041,1502 @@ namespace
             ASSERT_EQ(std::fclose(timing_csv), 0);
         ASSERT_GT(executed_cases, 0)
             << "No strong CPU verifier-row cases selected";
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(isolated_profile_launches, 1)
+                << "each CPU profiler request must execute one target launch";
+        }
+        else if (profiler_batch.enabled())
+        {
+            EXPECT_NO_THROW(profiler_batch.requireComplete());
+            ASSERT_EQ(
+                static_cast<size_t>(isolated_profile_launches),
+                profiler_batch.size())
+                << "every CPU profiler batch member must launch exactly once";
+        }
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @test Publish the production serial-M1 arithmetic route for planning.
+     *
+     * The ordinary-prefill covering array must know whether an unmeasured
+     * production geometry inherits a full-K serial row or a serial K-part
+     * reduction. Reimplementing the cache-aware tile heuristic in Python would
+     * let the collection plan silently drift from inference. This zero-kernel
+     * probe instead evaluates the production `computeTileConfig()` directly
+     * for every supported CPU execution codebook and every canonical shape.
+     *
+     * The refresh transaction runs this test once per build/runtime ISA
+     * regime before constructing its timing plan. The resulting manifest is
+     * architecture-local evidence: cache topology, OpenMP thread count, and
+     * the exact production helper all participate in the published route.
+     */
+    TEST_F(CPUNativeVNNIGemvTest, TrainerCsv_PrefillSerialRouteManifest)
+    {
+        applyVerifierRowsThreadCapForStandalonePerf();
+
+        const std::string output_path = getEnvString(
+            "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_CSV");
+        const std::string isa_regime = getEnvString(
+            "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_ISA_REGIME");
+        ASSERT_FALSE(output_path.empty())
+            << "route-manifest probe requires an explicit output path";
+        ASSERT_FALSE(isa_regime.empty())
+            << "route-manifest probe requires an explicit ISA regime";
+
+        std::FILE *csv = std::fopen(output_path.c_str(), "w");
+        ASSERT_NE(csv, nullptr) << "Unable to open " << output_path;
+        std::fprintf(
+            csv,
+            "schema_version,shape,n,k,execution_codebook,payload_bytes,"
+            "threads,isa_regime,k_tiles,bundle_signature\n");
+
+        const int threads = omp_get_max_threads();
+        size_t emitted_rows = 0;
+        std::vector<native_vnni_dispatch::NativeVNNIShapeSpec> route_shapes =
+            native_vnni_dispatch::nativeVnniShapeManifest();
+
+        /**
+         * A failed generic fit may need fresh geometries after every nearby
+         * checked-in certification point has already been measured. The Python
+         * planner authors a source-digest-bound candidate ring, and this test
+         * evaluates those dimensions with the production tile helper before any
+         * timed kernel is launched. The final refinement plan embeds only the
+         * selected route rows, so this transient probe file never becomes a
+         * production model-shape catalog.
+         */
+        const std::string refinement_probe_path = getEnvString(
+            "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_REFINEMENT_PROBE_JSON");
+        if (!refinement_probe_path.empty())
+        {
+            std::ifstream probe_input(refinement_probe_path);
+            ASSERT_TRUE(probe_input.good())
+                << "Unable to open refinement route probe "
+                << refinement_probe_path;
+            nlohmann::json probe;
+            ASSERT_NO_THROW(probe_input >> probe);
+            ASSERT_TRUE(probe.is_object());
+            ASSERT_EQ(
+                probe.value("schema_version", std::string()),
+                "cpu-prefill-generic-refinement-probe-v1");
+            ASSERT_TRUE(probe.contains("source_policy_digest"));
+            ASSERT_TRUE(probe.contains("source_promotion_diagnostics_digest"));
+            ASSERT_TRUE(probe.contains("shapes"));
+            ASSERT_TRUE(probe.at("shapes").is_array());
+            ASSERT_FALSE(probe.at("shapes").empty());
+
+            std::set<std::string> names;
+            std::set<std::pair<int, int>> dimensions;
+            for (const auto &shape : route_shapes)
+            {
+                names.insert(shape.name);
+                dimensions.emplace(shape.N, shape.K);
+            }
+            for (const auto &record : probe.at("shapes"))
+            {
+                ASSERT_TRUE(record.is_object());
+                ASSERT_EQ(record.size(), 3u);
+                native_vnni_dispatch::NativeVNNIShapeSpec shape;
+                ASSERT_NO_THROW(shape.name = record.at("name").get<std::string>());
+                ASSERT_NO_THROW(shape.N = record.at("n").get<int>());
+                ASSERT_NO_THROW(shape.K = record.at("k").get<int>());
+                ASSERT_EQ(shape.name.rfind("CPUPrefillAutoRefine_", 0), 0u);
+                ASSERT_GT(shape.N, 0);
+                ASSERT_GT(shape.K, 0);
+                ASSERT_EQ(shape.K % 32, 0);
+                ASSERT_TRUE(names.insert(shape.name).second)
+                    << "Duplicate route-probe shape " << shape.name;
+                ASSERT_TRUE(dimensions.emplace(shape.N, shape.K).second)
+                    << "Duplicate route-probe geometry "
+                    << shape.N << "x" << shape.K;
+                route_shapes.push_back(std::move(shape));
+            }
+        }
+
+        for (const auto &shape : route_shapes)
+        {
+            for (int raw_codebook = 0; raw_codebook <= 255; ++raw_codebook)
+            {
+                const auto format = getRuntimeFormatInfo(
+                    static_cast<uint8_t>(raw_codebook));
+                if (format.payload_bytes <= 0)
+                    continue;
+
+                const NativeVNNITileConfig serial = computeTileConfig(
+                    shape.N,
+                    shape.K,
+                    1,
+                    format.payload_bytes,
+                    threads);
+                const bool serial_kpart = serial.k_tiles > 1;
+                std::fprintf(
+                    csv,
+                    "cpu-prefill-serial-route-v1,%s,%d,%d,%d,%d,%d,%s,%d,%s\n",
+                    shape.name.c_str(),
+                    shape.N,
+                    shape.K,
+                    raw_codebook,
+                    format.payload_bytes,
+                    threads,
+                    isa_regime.c_str(),
+                    serial.k_tiles,
+                    serial_kpart
+                        ? "single-native-vnni-prefill:serial-kpart:fp32-output:v2"
+                        : "single-native-vnni-prefill:serial-full-k:fp32-output:v2");
+                ++emitted_rows;
+            }
+        }
+
+        ASSERT_EQ(std::fclose(csv), 0);
+        ASSERT_GT(emitted_rows, 0u);
+    }
+
+    /**
+     * @test Emit promotion-grade ordinary CPU prefill schedule evidence.
+     *
+     * Unlike grouped verifier rows, this surface represents ordinary M>1
+     * GEMM and may extend through long-prefill depths. Every candidate fixes a
+     * single full-K accumulation tile and varies only physical N work sharing.
+     * The test enters the production pre-quantized GEMM launcher, proves the
+     * complete M-by-N output twice against independent serial M1 rows, records
+     * the effective route (including normalized requests), and retains exact
+     * steady-clock samples for the common learned-policy pipeline.
+     */
+    TEST_F(CPUNativeVNNIGemvTest, TrainerCsv_StrongPrefill_AllFormats)
+    {
+        applyVerifierRowsThreadCapForStandalonePerf();
+
+        const int N = getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_N").value_or(1024);
+        const int K = getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_K").value_or(256);
+        ASSERT_GT(N, 0);
+        ASSERT_GT(K, 0);
+        ASSERT_EQ(K % 32, 0);
+
+        std::string shape_name =
+            getEnvString("LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME");
+        if (shape_name.empty())
+            shape_name = "CPUNativeVNNIPrefillSmoke";
+        std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_PREFILL_FORMATS");
+        if (format_filters.empty())
+            format_filters = {toLower("Q4_K")};
+        if (format_filters.count("all") != 0)
+            format_filters.clear();
+
+        std::vector<int> m_values;
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_PREFILL_M");
+        if (m_filters.empty())
+        {
+            m_values = {64, 256, 1024};
+        }
+        else
+        {
+            for (const std::string &raw_m : m_filters)
+            {
+                size_t consumed = 0;
+                const int parsed_m = std::stoi(raw_m, &consumed);
+                ASSERT_EQ(consumed, raw_m.size())
+                    << "Invalid CPU prefill M value: " << raw_m;
+                ASSERT_GT(parsed_m, 1)
+                    << "Ordinary CPU prefill M must be at least two";
+                m_values.push_back(parsed_m);
+            }
+            std::sort(m_values.begin(), m_values.end());
+            m_values.erase(
+                std::unique(m_values.begin(), m_values.end()),
+                m_values.end());
+        }
+        ASSERT_FALSE(m_values.empty());
+
+        const std::set<std::string> candidate_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_PREFILL_CANDIDATES");
+        const std::string profiler_request_id =
+            native_vnni_dispatch::profilerRequestId();
+        CPUProfilerBatch profiler_batch;
+        ASSERT_FALSE(
+            !profiler_request_id.empty() && profiler_batch.enabled())
+            << "single-request and batch CPU profiling are mutually exclusive";
+        const bool profiling_requested =
+            !profiler_request_id.empty() || profiler_batch.enabled();
+        const std::string single_perf_output_path =
+            native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kPerfStatsPathEnvironment);
+        std::optional<native_vnni_dispatch::LinuxPerfControl> perf_control;
+        if (!profiler_request_id.empty())
+        {
+            // Validate profiler provenance before allocating large fixtures.
+            perf_control.emplace(profiler_request_id);
+        }
+        else if (profiler_batch.enabled())
+        {
+            const CPUProfilerBatchRequest &first = profiler_batch.first();
+            perf_control.emplace(first.request_id, first.output_path);
+        }
+        const bool mpi_round_sync =
+            !profiling_requested &&
+            getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC")
+                    .value_or(0) != 0;
+        const bool anchored_candidate_expansion =
+            !profiling_requested &&
+            getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_ANCHORED_EXPANSION")
+                    .value_or(0) != 0;
+        std::vector<const FormatSpec *> selected_formats;
+        for (const auto &format : MTP_SMALL_M_FORMATS)
+        {
+            if (shouldRunName(format_filters, format.name))
+                selected_formats.push_back(&format);
+        }
+        ASSERT_FALSE(selected_formats.empty())
+            << "No strong CPU prefill source formats selected";
+        std::stable_sort(
+            selected_formats.begin(),
+            selected_formats.end(),
+            [](const FormatSpec *left, const FormatSpec *right)
+            {
+                return left->name.size() < right->name.size();
+            });
+        const MPIPrefillRoundCoordinator round_coordinator(mpi_round_sync);
+        round_coordinator.requireMatchingPhaseInventory(
+            selected_formats.size(), m_values);
+        const int warmups = std::max(
+            0, getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_WARMUP").value_or(5));
+        const int samples = std::max(
+            1, getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_ITERS").value_or(30));
+        const int maximum_samples = std::max(
+            samples,
+            getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_MAX_ITERS").value_or(90));
+        const int minimum_samples = std::clamp(
+            getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_MIN_ITERS").value_or(5),
+            1,
+            samples);
+        const int stationary_minimum_samples = std::clamp(
+            getEnvInt(
+                "LLAMINAR_CPU_NVNNI_PREFILL_STATIONARY_MIN_ITERS")
+                .value_or(minimum_samples),
+            minimum_samples,
+            maximum_samples);
+        const double warmup_round_timeout_us = std::max(
+            1000000.0,
+            getEnvDouble(
+                "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_ROUND_TIMEOUT_US")
+                .value_or(30000000.0));
+        const double transition_warmup_latency_multiplier = std::max(
+            0.0,
+            getEnvDouble(
+                "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_LATENCY_MULTIPLIER")
+                .value_or(60.0));
+        const double transition_warmup_budget_ceiling_us = std::max(
+            0.0,
+            getEnvDouble(
+                "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_CEILING_US")
+                .value_or(2000000.0));
+        const double timing_budget_us = std::max(
+            0.0,
+            getEnvDouble("LLAMINAR_CPU_NVNNI_PREFILL_TIMING_BUDGET_US")
+                .value_or(2000000.0));
+        const double median_stability_limit = std::clamp(
+            getEnvDouble("LLAMINAR_CPU_NVNNI_PREFILL_MEDIAN_STABILITY")
+                .value_or(0.02),
+            0.0,
+            1.0);
+        const int max_cases = std::max(
+            1,
+            getEnvInt("LLAMINAR_CPU_NVNNI_PREFILL_MAX_CASES")
+                .value_or(1000000));
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(format_filters.size(), 1u)
+                << "isolated CPU prefill profiling requires one format";
+            ASSERT_EQ(m_values.size(), 1u)
+                << "isolated CPU prefill profiling requires one M";
+            ASSERT_EQ(candidate_filters.size(), 1u)
+                << "isolated CPU prefill profiling requires one candidate";
+            ASSERT_EQ(max_cases, 1)
+                << "isolated CPU prefill profiling requires one shape";
+        }
+        const std::string build_isa = compiledNativeVNNIBuildISAName();
+        const std::string requested_runtime_isa =
+            requestedISANameForVerifierTrainer();
+        const std::string effective_runtime_isa =
+            activeISANameForVerifierTrainer();
+        ASSERT_TRUE(
+            effective_runtime_isa == "AVX2" ||
+            effective_runtime_isa == "AVX512")
+            << "Strong CPU prefill training cannot certify scalar dispatch";
+        if (requested_runtime_isa != "AUTO")
+        {
+            ASSERT_EQ(requested_runtime_isa, effective_runtime_isa)
+                << "Requested CPU prefill ISA was unavailable";
+        }
+
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_PREFILL_STRONG_CSV");
+        const std::string timing_csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_PREFILL_TIMING_CSV");
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr);
+            std::fprintf(
+                csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,build_isa,"
+                "runtime_isa_requested,runtime_isa_effective,threads,"
+                "measurement_coordination,mpi_world_size,mpi_rank,weight_bytes,"
+                "serial_oracle_policy,serial_oracle_rows,"
+                "preconditioning_policy,preconditioning_m,"
+                "preconditioning_budget_us,preconditioning_duration_us,"
+                "warmup_count,warmup_round_count,warmup_budget_policy,"
+                "warmup_probe_latency_us,warmup_budget_floor_us,"
+                "warmup_latency_multiplier,warmup_budget_ceiling_us,"
+                "warmup_budget_us,warmup_duration_us,global_warmup_round_count,"
+                "warmup_wall_duration_us,warmup_max_round_duration_us,"
+                "warmup_round_timeout_us,"
+                "timing_order_seed,global_timing_round_count,sample_count,"
+                "timing_protocol,timing_ceiling_policy,min_sample_count,stable_sample_count,"
+                "max_sample_count,timing_budget_us,timed_duration_us,"
+                "stationary_sample_begin,stationary_sample_count,"
+                "stationary_duration_us,"
+                "median_stability_limit,median_relative_drift,timing_converged,"
+                "timing_stop_reason,min_us,median_us,p95_us,mad_us,cv,"
+                "serial_median_us,speedup,bit_mismatches,first_bit_mismatch,"
+                "repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,"
+                "grouped_output_digest,serial_output_digest,timing_sample_digest,"
+                "route_counter_ok,observed_candidate_id,k_tiles,k_tile_blocks,"
+                "n_block_chunks,numerical_correctness,correctness_pass,is_winner\n");
+        }
+        std::FILE *timing_csv = nullptr;
+        if (!timing_csv_path.empty())
+        {
+            timing_csv = std::fopen(timing_csv_path.c_str(), "w");
+            ASSERT_NE(timing_csv, nullptr);
+            std::fprintf(
+                timing_csv,
+                "backend,phase,source_format,source_codebook,execution_codebook,"
+                "shape,execution_mode,m,n,k,candidate_id,build_isa,"
+                "runtime_isa_requested,runtime_isa_effective,sample_index,"
+                "latency_us,latency_us_hex\n");
+        }
+
+        struct Candidate
+        {
+            std::string id;
+            int n_block_chunks = 1;
+            VerifierRowsPolicy verifier_policy = VerifierRowsPolicy::Pairwise;
+            bool serial_kpart = false;
+            PrefillSchedulePolicy schedule =
+                PrefillSchedulePolicy::TwoRowNMajor;
+        };
+        std::vector<Candidate> candidates;
+        const int n_chunks = (N + 63) / 64;
+        const int row_chunk_target_tasks = std::max(1, omp_get_max_threads() / 4);
+        candidates.push_back({
+            .id = "cpu.nvnni.prefill.row_chunk_grid.full_k",
+            .n_block_chunks = std::max(
+                1,
+                (n_chunks + row_chunk_target_tasks - 1) /
+                    row_chunk_target_tasks),
+            .schedule = PrefillSchedulePolicy::RowChunkGrid,
+        });
+        for (int n_block_chunks : {1, 2, 4, 8, 16})
+        {
+            candidates.push_back({
+                .id = "cpu.nvnni.prefill.two_row_tiles.nbc" +
+                      std::to_string(n_block_chunks) + ".full_k",
+                .n_block_chunks = n_block_chunks,
+                .schedule = PrefillSchedulePolicy::TwoRowNMajor,
+            });
+            candidates.push_back({
+                .id = "cpu.nvnni.prefill.two_row_pair_grid.nbc" +
+                      std::to_string(n_block_chunks) + ".full_k",
+                .n_block_chunks = n_block_chunks,
+                .schedule = PrefillSchedulePolicy::TwoRowPairGrid,
+            });
+        }
+        candidates.push_back({
+            .id = "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise",
+            .n_block_chunks = 1,
+            .verifier_policy = VerifierRowsPolicy::Pairwise,
+            .serial_kpart = true,
+            .schedule = PrefillSchedulePolicy::Auto,
+        });
+        candidates.push_back({
+            .id = "cpu.nvnni.prefill.decode_equivalent_kpart.wide_rows",
+            .n_block_chunks = 1,
+            .verifier_policy = VerifierRowsPolicy::WideRows,
+            .serial_kpart = true,
+            .schedule = PrefillSchedulePolicy::Auto,
+        });
+
+        struct CandidateRow
+        {
+            Candidate candidate;
+            StrongTimingMeasurement timing;
+            llaminar2::test::trainer::FP32Evidence comparison;
+            CPUPrefillRouteEvidence route;
+            size_t repeat_byte_mismatches = 0;
+            double normalized_route_latency_us = 0.0;
+            double speedup = 0.0;
+            int timing_warmup_count = 0;
+            int warmup_round_count = 0;
+            double warmup_duration_us = 0.0;
+            bool route_ok = false;
+            bool numerical_correctness = false;
+            bool correctness_pass = false;
+            std::string warmup_budget_policy;
+            double warmup_probe_latency_us = 0.0;
+            double warmup_budget_floor_us = 0.0;
+            double warmup_latency_multiplier = 0.0;
+            double warmup_budget_ceiling_us = 0.0;
+            double warmup_budget_us = 0.0;
+        };
+
+        /**
+         * @brief Reusable evidence from one real production route launch.
+         *
+         * Several logical trainer candidates can normalize to the same
+         * physical route when their arithmetic family disagrees with serial
+         * M=1. The first compatible candidate launches and validates that
+         * route. Unsupported aliases copy this immutable probe instead of
+         * launching the identical kernel again. They remain ineligible for
+         * timing and promotion because their requested route ID still differs
+         * from the observed route ID.
+         */
+        struct PhysicalProbeEvidence
+        {
+            llaminar2::test::trainer::FP32Evidence comparison;
+            CPUPrefillRouteEvidence route;
+            size_t repeat_byte_mismatches = 0;
+            double latency_us = 0.0;
+            bool numerical_correctness = false;
+        };
+
+        (void)setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+        PerfStatsCollector::reset();
+        int executed_cases = 0;
+        int emitted_rows = 0;
+        int isolated_profile_launches = 0;
+        constexpr ISAPath isa_path = ISAPath::AUTO;
+        PrefillActivationFixtureCache activation_fixtures(N, K);
+        for (size_t format_index = 0;
+             format_index < selected_formats.size();
+             ++format_index)
+        {
+            const FormatSpec &format = *selected_formats[format_index];
+            auto weights = createWeightsForFormat(format.name, N, K);
+            ASSERT_NE(weights, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid()) << format.name;
+            const auto &packed = kernel.packedWeights();
+            const size_t weight_bytes =
+                packed.native_interleaved.size() + packed.payload.size();
+            const int k_blocks = packed.blocks_per_row;
+
+            // Long production jobs visit several M buckets for the same packed
+            // source tensor.  Frequency and memory-domain preconditioning is a
+            // process/source property, not a reason to burn one second per
+            // candidate again at every M.  The first measured cell establishes
+            // the complete-candidate load envelope.  Later cells use their first
+            // correctness launch as a latency probe and warm for enough complete
+            // rounds to cover the configured number of equivalent launches.
+            const double source_preconditioning_budget_us =
+                !profiling_requested
+                ? std::max(
+                      0.0,
+                      getEnvDouble(
+                          "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_BUDGET_US")
+                          .value_or(0.0))
+                : 0.0;
+            const double transition_warmup_budget_us =
+                !profiling_requested
+                ? std::max(
+                      0.0,
+                      getEnvDouble(
+                          "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_US")
+                          .value_or(0.0))
+                : 0.0;
+            const std::string preconditioning_policy =
+                source_preconditioning_budget_us > 0.0
+                ? "source-complete-round-v1"
+                : "disabled";
+            bool source_preconditioned =
+                source_preconditioning_budget_us <= 0.0;
+            int source_preconditioning_m = 0;
+            double source_preconditioning_duration_us = 0.0;
+
+            for (int M : m_values)
+            {
+                if (executed_cases >= max_cases)
+                    break;
+                if (profiler_batch.enabled() && !profiler_batch.containsCell(
+                        "NativeVNNIPrefillProjection",
+                        format.name,
+                        "eager",
+                        M,
+                        N,
+                        K))
+                {
+                    continue;
+                }
+                // Every rank enters the same M phase before fixture generation.
+                // A second boundary below prevents a faster correctness setup
+                // from entering warmup while a peer still runs its serial oracle.
+                round_coordinator.barrier();
+                const std::vector<Q8_1Block> &quantized_rows =
+                    activation_fixtures.fixtureFor(
+                        M, format.name, k_blocks);
+
+                const std::vector<int> serial_oracle_rows =
+                    prefillSerialOracleRows(M);
+                ASSERT_FALSE(serial_oracle_rows.empty());
+                std::vector<float> serial(
+                    serial_oracle_rows.size() * static_cast<size_t>(N), 0.0f);
+                const auto run_serial = [&]()
+                {
+                    for (size_t oracle_index = 0;
+                         oracle_index < serial_oracle_rows.size();
+                         ++oracle_index)
+                    {
+                        const int row = serial_oracle_rows[oracle_index];
+                        gemv_native_vnni_preq(
+                            packed,
+                            quantized_rows.data() +
+                                static_cast<size_t>(row) * k_blocks,
+                            serial.data() + oracle_index * static_cast<size_t>(N),
+                            isa_path);
+                    }
+                };
+                run_serial();
+                const std::string serial_digest =
+                    llaminar2::test::trainer::nativeByteDigest(serial);
+                const StrongTimingMeasurement serial_timing =
+                    timeStrongTrainerCandidateAdaptive(
+                        std::min(warmups, 2),
+                        std::min(minimum_samples, 3),
+                        std::min(samples, 5),
+                        std::min(timing_budget_us, 1000000.0),
+                        median_stability_limit,
+                        run_serial);
+
+                std::vector<CandidateRow> rows;
+                rows.reserve(candidates.size());
+                std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+                std::vector<float> grouped_oracle(serial.size(), 0.0f);
+
+                // Probe candidates from the production-compatible arithmetic
+                // family first. Their real launch populates the physical-route
+                // cache used by the unsupported family later in this loop.
+                // The final row order is restored to registry order below so
+                // existing corpus serialization remains stable.
+                const NativeVNNITileConfig serial_route = computeTileConfig(
+                    N,
+                    K,
+                    1,
+                    packed.payload_bytes,
+                    omp_get_max_threads());
+                const bool serial_m1_uses_kpart = serial_route.k_tiles > 1;
+                std::vector<Candidate> probe_candidates = candidates;
+                std::stable_sort(
+                    probe_candidates.begin(),
+                    probe_candidates.end(),
+                    [&](const Candidate &left, const Candidate &right)
+                    {
+                        const bool left_matches =
+                            left.serial_kpart == serial_m1_uses_kpart;
+                        const bool right_matches =
+                            right.serial_kpart == serial_m1_uses_kpart;
+                        return left_matches && !right_matches;
+                    });
+                std::unordered_map<std::string, PhysicalProbeEvidence>
+                    physical_route_probes;
+                const auto snapshot_grouped_oracle = [&]()
+                {
+                    for (size_t oracle_index = 0;
+                         oracle_index < serial_oracle_rows.size();
+                         ++oracle_index)
+                    {
+                        const size_t grouped_offset =
+                            static_cast<size_t>(serial_oracle_rows[oracle_index]) * N;
+                        std::copy_n(
+                            grouped.data() + grouped_offset,
+                            static_cast<size_t>(N),
+                            grouped_oracle.data() +
+                                oracle_index * static_cast<size_t>(N));
+                    }
+                };
+
+                const auto with_candidate_route =
+                    [&](const Candidate &candidate, auto &&operation)
+                {
+                    ScopedCPUNativeVNNITileOverride force_n_blocks(
+                        "LLAMINAR_CPU_VNNI_N_BLOCK_CHUNKS",
+                        std::to_string(candidate.n_block_chunks));
+                    ScopedCPUNativeVNNITileOverride force_full_k(
+                        "LLAMINAR_CPU_VNNI_K_TILE_BLOCKS",
+                        std::to_string(k_blocks));
+                    operation();
+                };
+                const auto run_candidate = [&](const Candidate &candidate)
+                {
+                    with_candidate_route(candidate, [&]()
+                    {
+                        gemm_native_vnni_preq(
+                            packed,
+                            quantized_rows.data(),
+                            grouped.data(),
+                            M,
+                            N,
+                            isa_path,
+                            candidate.verifier_policy,
+                            candidate.schedule);
+                    });
+                };
+                const auto measure_candidate = [&](const Candidate &candidate)
+                {
+                    double latency_us = 0.0;
+                    with_candidate_route(candidate, [&]()
+                    {
+                        const auto begin = std::chrono::steady_clock::now();
+                        gemm_native_vnni_preq(
+                            packed,
+                            quantized_rows.data(),
+                            grouped.data(),
+                            M,
+                            N,
+                            isa_path,
+                            candidate.verifier_policy,
+                            candidate.schedule);
+                        const auto end = std::chrono::steady_clock::now();
+                        latency_us = std::chrono::duration<double, std::micro>(
+                            end - begin).count();
+                    });
+                    return latency_us;
+                };
+
+                const auto route_matches_candidate =
+                    [&](const Candidate &candidate,
+                        const CPUPrefillRouteEvidence &route)
+                {
+                    return route.found && route.count > 0 &&
+                           route.build_isa == build_isa &&
+                           route.isa == effective_runtime_isa &&
+                           (candidate.serial_kpart
+                                ? route.k_tiles > 1 &&
+                                      route.k_tile_blocks ==
+                                          (k_blocks + route.k_tiles - 1) /
+                                              route.k_tiles
+                                : route.k_tiles == 1 &&
+                                      route.k_tile_blocks == k_blocks) &&
+                           (candidate.schedule !=
+                                    PrefillSchedulePolicy::TwoRowPairGrid ||
+                                (route.pair_grid_execution_found &&
+                                 route.pair_grid_execution_count == route.count &&
+                                 route.pair_grid_execution_n_block_chunks ==
+                                     candidate.n_block_chunks &&
+                                 route.pair_grid_parallel_tasks ==
+                                     ((M + 1) / 2) *
+                                         ((n_chunks +
+                                           candidate.n_block_chunks - 1) /
+                                          candidate.n_block_chunks))) &&
+                           route.candidateId() == candidate.id;
+                };
+
+                // Correctness and route identity are established before any
+                // latency can influence candidate eligibility. The same shared
+                // output allocation is reused across candidates so a long-M
+                // cell does not retain six multi-gigabyte output tensors. A
+                // normalized alias consumes an earlier physical probe only;
+                // it never contributes another launch or timing sample.
+                for (const Candidate &candidate : probe_candidates)
+                {
+                    if (!candidate_filters.empty() &&
+                        !shouldRunName(candidate_filters, candidate.id))
+                    {
+                        continue;
+                    }
+
+                    const std::string expected_physical_id(
+                        llaminar2::test::trainer::
+                            expectedCPUPrefillPhysicalCandidateId(
+                                candidate.id,
+                                serial_m1_uses_kpart,
+                                candidate.serial_kpart,
+                                candidate.verifier_policy ==
+                                    VerifierRowsPolicy::WideRows,
+                                effective_runtime_isa == "AVX512",
+                                M,
+                                N,
+                                omp_get_max_threads()));
+                    const auto cached_probe =
+                        physical_route_probes.find(expected_physical_id);
+                    if (cached_probe != physical_route_probes.end())
+                    {
+                        const PhysicalProbeEvidence &probe =
+                            cached_probe->second;
+                        const bool route_ok =
+                            route_matches_candidate(candidate, probe.route);
+                        rows.push_back(CandidateRow{
+                            candidate,
+                            {},
+                            probe.comparison,
+                            probe.route,
+                            probe.repeat_byte_mismatches,
+                            probe.latency_us,
+                            0.0,
+                            0,
+                            0,
+                            0.0,
+                            route_ok,
+                            probe.numerical_correctness,
+                            route_ok && probe.comparison.bitwiseEqual() &&
+                                probe.repeat_byte_mismatches == 0 &&
+                                probe.numerical_correctness,
+                        });
+                        continue;
+                    }
+
+                    PerfStatsCollector::reset();
+                    const double first_latency_us =
+                        measure_candidate(candidate);
+                    snapshot_grouped_oracle();
+                    const CPUPrefillRouteEvidence route =
+                        findCPUPrefillRoute(M, N, K, packed.codebook_id);
+                    const auto first_comparison =
+                        llaminar2::test::trainer::compareFP32(
+                            grouped_oracle, serial, serial.size());
+                    const std::string first_digest =
+                        llaminar2::test::trainer::nativeByteDigest(grouped_oracle);
+                    const bool route_ok =
+                        route_matches_candidate(candidate, route);
+                    auto comparison = first_comparison;
+                    std::string second_digest = first_digest;
+                    if (route_ok)
+                    {
+                        run_candidate(candidate);
+                        snapshot_grouped_oracle();
+                        comparison = llaminar2::test::trainer::compareFP32(
+                            grouped_oracle, serial, serial.size());
+                        second_digest =
+                            llaminar2::test::trainer::nativeByteDigest(
+                                grouped_oracle);
+                    }
+                    const size_t repeat_byte_mismatches =
+                        first_digest == second_digest ? 0u : 1u;
+                    const bool numerical_correctness =
+                        first_comparison.nonfinite_count == 0 &&
+                        comparison.nonfinite_count == 0;
+                    const bool correctness_pass =
+                        route_ok && first_comparison.bitwiseEqual() &&
+                        comparison.bitwiseEqual() &&
+                        repeat_byte_mismatches == 0 && numerical_correctness;
+                    if (route_ok)
+                    {
+                        EXPECT_TRUE(first_comparison.bitwiseEqual())
+                            << format.name << " M=" << M << " candidate="
+                            << candidate.id << " first launch differs from serial M1"
+                            << " mismatches=" << first_comparison.mismatch_count
+                            << " first=" << first_comparison.first_mismatch_index
+                            << " actual=" << first_comparison.actual_digest
+                            << " serial=" << first_comparison.expected_digest;
+                        EXPECT_TRUE(comparison.bitwiseEqual())
+                            << format.name << " M=" << M << " candidate="
+                            << candidate.id << " repeat differs from serial M1"
+                            << " mismatches=" << comparison.mismatch_count
+                            << " first=" << comparison.first_mismatch_index
+                            << " actual=" << comparison.actual_digest
+                            << " serial=" << comparison.expected_digest;
+                    }
+
+                    const std::string observed_physical_id =
+                        route.candidateId();
+                    if (!observed_physical_id.empty())
+                    {
+                        EXPECT_EQ(observed_physical_id, expected_physical_id)
+                            << format.name << " M=" << M << " candidate="
+                            << candidate.id
+                            << " disagrees with the probe normalization plan";
+                        physical_route_probes.try_emplace(
+                            observed_physical_id,
+                            PhysicalProbeEvidence{
+                                comparison,
+                                route,
+                                repeat_byte_mismatches,
+                                first_latency_us,
+                                numerical_correctness,
+                            });
+                    }
+                    rows.push_back(CandidateRow{
+                        candidate,
+                        {},
+                        comparison,
+                        route,
+                        repeat_byte_mismatches,
+                        first_latency_us,
+                        0.0,
+                        0,
+                        0,
+                        0.0,
+                        route_ok,
+                        numerical_correctness,
+                        correctness_pass,
+                    });
+                }
+
+                std::stable_sort(
+                    rows.begin(),
+                    rows.end(),
+                    [&](const CandidateRow &left, const CandidateRow &right)
+                    {
+                        const auto inventory_index =
+                            [&](const std::string &candidate_id)
+                        {
+                            const auto iterator = std::find_if(
+                                candidates.begin(),
+                                candidates.end(),
+                                [&](const Candidate &candidate)
+                                {
+                                    return candidate.id == candidate_id;
+                                });
+                            return std::distance(candidates.begin(), iterator);
+                        };
+                        return inventory_index(left.candidate.id) <
+                               inventory_index(right.candidate.id);
+                    });
+
+                std::vector<size_t> forceable_indices;
+                for (size_t index = 0; index < rows.size(); ++index)
+                {
+                    if (rows[index].route_ok)
+                        forceable_indices.push_back(index);
+                }
+                round_coordinator.failAllRanksIf(
+                    forceable_indices.empty(),
+                    "CPU prefill route discovery rejected: format=" +
+                        format.name + " M=" + std::to_string(M) +
+                        " has no forceable full-K prefill candidate");
+
+                const uint32_t timing_order_seed = static_cast<uint32_t>(
+                    0x51A7u + M * 257u + N * 17u + K * 31u +
+                    packed.codebook_id * 101u +
+                    (build_isa == "AVX512" ? 0xA512u : 0xA2u));
+                std::mt19937 order_rng(timing_order_seed);
+                const int minimum_warmup_rounds = std::max(0, warmups - 2);
+                const bool source_warmup = !source_preconditioned;
+                const double warmup_budget_floor_us = source_preconditioned
+                    ? transition_warmup_budget_us
+                    : source_preconditioning_budget_us;
+                size_t active_warmup_candidates = 0;
+                for (CandidateRow &row : rows)
+                {
+                    row.warmup_probe_latency_us =
+                        row.normalized_route_latency_us;
+                    row.warmup_budget_floor_us = warmup_budget_floor_us;
+                    if (warmup_budget_floor_us <= 0.0)
+                    {
+                        row.warmup_budget_policy = "disabled";
+                    }
+                    else if (source_warmup)
+                    {
+                        row.warmup_budget_policy = "source-fixed-v1";
+                        row.warmup_budget_us = warmup_budget_floor_us;
+                    }
+                    else if (transition_warmup_latency_multiplier == 0.0)
+                    {
+                        // An additive candidate-expansion run carries an
+                        // existing schedule in every complete round as a
+                        // contemporaneous clock anchor. Its transition phase
+                        // therefore needs to establish only the configured
+                        // fixed thermal/load floor; multiplying a very short
+                        // probe into hundreds of redundant launches would add
+                        // no independent evidence. The adapter admits this
+                        // policy only for an authenticated anchored cohort.
+                        row.warmup_budget_policy = "transition-fixed-v1";
+                        row.warmup_budget_us = warmup_budget_floor_us;
+                    }
+                    else
+                    {
+                        row.warmup_budget_policy =
+                            "transition-probe-scaled-v1";
+                        row.warmup_latency_multiplier =
+                            transition_warmup_latency_multiplier;
+                        row.warmup_budget_ceiling_us = std::max(
+                            warmup_budget_floor_us,
+                            transition_warmup_budget_ceiling_us);
+                        row.warmup_budget_us = std::max(
+                            warmup_budget_floor_us,
+                            std::min(
+                                row.warmup_budget_ceiling_us,
+                                row.warmup_probe_latency_us *
+                                    row.warmup_latency_multiplier));
+                    }
+                    if (row.route_ok &&
+                        (row.warmup_round_count < minimum_warmup_rounds ||
+                        row.warmup_duration_us < row.warmup_budget_us)
+                    )
+                    {
+                        ++active_warmup_candidates;
+                    }
+                }
+                // Warmup uses the same complete-round load envelope as timing.
+                // A candidate that reaches its own elapsed budget continues as
+                // a pacing launch until the final candidate on every socket is
+                // ready.  The pre-loop barrier also keeps serial-oracle setup
+                // outside the authenticated preconditioning cadence.
+                round_coordinator.barrier();
+                const auto warmup_wall_begin = std::chrono::steady_clock::now();
+                double warmup_max_round_duration_us = 0.0;
+                size_t global_warmup_round_count = 0;
+                bool any_rank_warming = round_coordinator.anyRankActive(
+                    active_warmup_candidates > 0);
+                while (any_rank_warming)
+                {
+                    const auto warmup_round_begin =
+                        std::chrono::steady_clock::now();
+                    bool local_warmup_failure = false;
+                    std::ostringstream local_warmup_diagnostic;
+                    std::vector<size_t> round = forceable_indices;
+                    std::shuffle(round.begin(), round.end(), order_rng);
+                    for (size_t index : round)
+                    {
+                        CandidateRow &row = rows[index];
+                        const double warmup_latency_us =
+                            measure_candidate(row.candidate);
+                        if ((!std::isfinite(warmup_latency_us) ||
+                             warmup_latency_us <= 0.0) &&
+                            !local_warmup_failure)
+                        {
+                            local_warmup_failure = true;
+                            local_warmup_diagnostic
+                                << "CPU prefill warmup rejected: format="
+                                << format.name << " M=" << M << " candidate="
+                                << row.candidate.id
+                                << " timer made no forward progress; latency_us="
+                                << warmup_latency_us;
+                        }
+                        if (local_warmup_failure)
+                            continue;
+                        row.warmup_duration_us += warmup_latency_us;
+                        ++row.warmup_round_count;
+                    }
+                    active_warmup_candidates = 0;
+                    for (size_t index : forceable_indices)
+                    {
+                        const CandidateRow &row = rows[index];
+                        if (row.warmup_round_count < minimum_warmup_rounds ||
+                            row.warmup_duration_us < row.warmup_budget_us)
+                        {
+                            ++active_warmup_candidates;
+                        }
+                    }
+                    ++global_warmup_round_count;
+                    const double round_wall_duration_us =
+                        std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - warmup_round_begin)
+                            .count();
+                    warmup_max_round_duration_us = std::max(
+                        warmup_max_round_duration_us,
+                        round_wall_duration_us);
+                    if (round_wall_duration_us >= warmup_round_timeout_us &&
+                        !local_warmup_failure)
+                    {
+                        local_warmup_failure = true;
+                        local_warmup_diagnostic
+                            << "CPU prefill warmup rejected: format="
+                            << format.name << " M=" << M
+                            << " one complete round exceeded the watchdog"
+                            << " duration_us=" << round_wall_duration_us
+                            << " timeout_us=" << warmup_round_timeout_us
+                            << " active_candidates=" << active_warmup_candidates
+                            << " rounds=" << global_warmup_round_count;
+                    }
+                    round_coordinator.failAllRanksIf(
+                        local_warmup_failure,
+                        local_warmup_diagnostic.str());
+                    any_rank_warming = round_coordinator.anyRankActive(
+                        active_warmup_candidates > 0);
+                }
+                const double warmup_wall_duration_us =
+                    std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - warmup_wall_begin)
+                        .count();
+                for (size_t index : forceable_indices)
+                {
+                    rows[index].timing_warmup_count =
+                        2 + rows[index].warmup_round_count;
+                }
+                if (!source_preconditioned)
+                {
+                    source_preconditioning_duration_us =
+                        std::numeric_limits<double>::infinity();
+                    for (size_t index : forceable_indices)
+                    {
+                        source_preconditioning_duration_us = std::min(
+                            source_preconditioning_duration_us,
+                            rows[index].warmup_duration_us);
+                    }
+                    round_coordinator.failAllRanksIf(
+                        source_preconditioning_duration_us <
+                            source_preconditioning_budget_us,
+                        "CPU prefill source preconditioning ended before its "
+                        "elapsed budget");
+                    source_preconditioning_m = M;
+                    source_preconditioned = true;
+                }
+
+                if (profiling_requested)
+                {
+                    ASSERT_TRUE(perf_control.has_value());
+                    size_t cell_profile_launches = 0;
+                    for (size_t index : forceable_indices)
+                    {
+                        const Candidate &candidate = rows[index].candidate;
+                        CPUProfilerBatchRequest *batch_request = nullptr;
+                        if (profiler_batch.enabled())
+                        {
+                            batch_request = profiler_batch.claim(
+                                "NativeVNNIPrefillProjection",
+                                format.name,
+                                "eager",
+                                M,
+                                N,
+                                K,
+                                candidate.id);
+                            if (!batch_request)
+                                continue;
+                        }
+                        const std::string &exact_request_id = batch_request
+                            ? batch_request->request_id
+                            : profiler_request_id;
+                        const std::string &exact_output_path = batch_request
+                            ? batch_request->output_path
+                            : single_perf_output_path;
+                        profileExactCPURequest(
+                            *perf_control,
+                            exact_request_id,
+                            exact_output_path,
+                            [&]() { run_candidate(candidate); });
+                        ++isolated_profile_launches;
+                        ++cell_profile_launches;
+                        std::fprintf(
+                            stderr,
+                            "[NativeVNNIProfiler][CPU_PREFILL] request=%s "
+                            "candidate=%s format=%s M=%d N=%d K=%d launches=1\n",
+                            exact_request_id.c_str(),
+                            candidate.id.c_str(),
+                            format.name.c_str(),
+                            M, N, K);
+                    }
+                    ASSERT_GT(cell_profile_launches, 0u)
+                        << "profiler batch selected a cell without a "
+                           "forceable requested candidate";
+                }
+
+                // Canonical timing is collected in shuffled complete rounds.
+                // Ordinary prefill waits until every candidate is independently
+                // stationary. Anchored candidate expansion instead retains one
+                // common elapsed/sample-complete epoch: all candidates and the
+                // existing route anchor see exactly the same rounds, and the
+                // adapter admits their medians only after attaching the
+                // contemporaneous-anchor normalization proof. Requiring seven
+                // independent raw half-window tests here would select lucky
+                // quiet tails and repeatedly discard otherwise valid common
+                // epochs, defeating both the normalization design and the
+                // bounded collection contract.
+                size_t global_timing_round_count = 0;
+                bool any_rank_timing = round_coordinator.anyRankActive(
+                    !profiling_requested && !forceable_indices.empty());
+                while (any_rank_timing)
+                {
+                    // Ordinary timing candidates are independent evidence
+                    // streams. Freeze each stream at its first promotable
+                    // stationary suffix so a later random tail cannot revoke
+                    // evidence merely because another candidate or MPI peer
+                    // needs more rounds. Anchored expansion is intentionally
+                    // different: all schedules must retain matching complete
+                    // rounds for contemporaneous-anchor normalization.
+                    std::vector<size_t> round;
+                    round.reserve(forceable_indices.size());
+                    for (size_t index : forceable_indices)
+                    {
+                        const CandidateRow &row = rows[index];
+                        const bool needs_another_sample =
+                            llaminar2::test::trainer::
+                                timingCandidateParticipatesInActiveRound(
+                                    anchored_candidate_expansion,
+                                    row.timing.adaptive,
+                                    row.timing.acquisition_samples_us.size(),
+                                    static_cast<size_t>(maximum_samples),
+                                    timing_budget_us);
+                        if (needs_another_sample)
+                            round.push_back(index);
+                    }
+                    std::shuffle(round.begin(), round.end(), order_rng);
+                    for (size_t index : round)
+                    {
+                        CandidateRow &row = rows[index];
+                        row.timing.acquisition_samples_us.push_back(
+                            measure_candidate(row.candidate));
+                        row.timing.adaptive =
+                            llaminar2::test::trainer::evaluateAdaptiveTiming(
+                                row.timing.acquisition_samples_us,
+                                static_cast<size_t>(
+                                    stationary_minimum_samples),
+                                static_cast<size_t>(maximum_samples),
+                                timing_budget_us,
+                                median_stability_limit);
+                    }
+                    ++global_timing_round_count;
+
+                    bool local_needs_timing = false;
+                    for (size_t index : forceable_indices)
+                    {
+                        const CandidateRow &row = rows[index];
+                        const bool anchored_epoch_complete =
+                            llaminar2::test::trainer::
+                                anchoredCompleteRoundTimingEvidence(
+                                    row.timing.acquisition_samples_us.size(),
+                                    static_cast<size_t>(
+                                        stationary_minimum_samples),
+                                    row.timing.adaptive.measured_duration_us,
+                                    timing_budget_us);
+                        local_needs_timing = local_needs_timing ||
+                            (anchored_candidate_expansion
+                                ? !anchored_epoch_complete
+                                : llaminar2::test::trainer::
+                                      adaptiveTimingNeedsAnotherSample(
+                                          row.timing.adaptive,
+                                          row.timing.acquisition_samples_us.size(),
+                                          static_cast<size_t>(maximum_samples),
+                                          timing_budget_us));
+                    }
+                    any_rank_timing = round_coordinator.anyRankActive(
+                        local_needs_timing);
+                }
+                if (anchored_candidate_expansion)
+                {
+                    // The entire acquisition sequence is the authenticated
+                    // common epoch. Re-evaluate its diagnostics with an
+                    // all-sample window so the aggregate and timing sidecar
+                    // prove the exact same bytes; median drift remains visible
+                    // but is not mistaken for seven independent promotion
+                    // gates before anchor normalization exists.
+                    for (size_t index : forceable_indices)
+                    {
+                        CandidateRow &row = rows[index];
+                        row.timing.adaptive =
+                            llaminar2::test::trainer::evaluateAdaptiveTiming(
+                                row.timing.acquisition_samples_us,
+                                row.timing.acquisition_samples_us.size(),
+                                static_cast<size_t>(maximum_samples),
+                                timing_budget_us,
+                                median_stability_limit);
+                    }
+                }
+                if (profiling_requested)
+                {
+                    // The profiler transaction owns exactly one controlled
+                    // target launch. Canonical latency came from the immutable
+                    // timing corpus that created this request; replaying an
+                    // adaptive timing series here would add cost and could
+                    // accidentally profile more than the requested dispatch.
+                    for (size_t index : forceable_indices)
+                    {
+                        CandidateRow &row = rows[index];
+                        row.timing.acquisition_samples_us = {
+                            row.normalized_route_latency_us};
+                        row.timing.adaptive =
+                            llaminar2::test::trainer::evaluateAdaptiveTiming(
+                                row.timing.acquisition_samples_us,
+                                1u,
+                                1u,
+                                0.0,
+                                median_stability_limit);
+                    }
+                }
+
+                for (CandidateRow &row : rows)
+                {
+                    if (!row.route_ok)
+                    {
+                        row.timing.acquisition_samples_us = {
+                            row.normalized_route_latency_us};
+                        row.timing.adaptive =
+                            llaminar2::test::trainer::evaluateAdaptiveTiming(
+                                row.timing.acquisition_samples_us,
+                                1u,
+                                1u,
+                                0.0,
+                                median_stability_limit);
+                    }
+                    const size_t stationary_begin = std::min(
+                        row.timing.adaptive.stationary_window_begin,
+                        row.timing.acquisition_samples_us.size());
+                    row.timing.samples_us.assign(
+                        row.timing.acquisition_samples_us.begin() +
+                            static_cast<std::ptrdiff_t>(stationary_begin),
+                        row.timing.acquisition_samples_us.end());
+                    std::sort(
+                        row.timing.samples_us.begin(),
+                        row.timing.samples_us.end());
+                    row.timing.evidence =
+                        llaminar2::test::trainer::summarizeSortedTimingSamples(
+                            row.timing.samples_us);
+                    row.timing.stop_reason =
+                        (!row.route_ok || profiling_requested)
+                        ? "fixed_samples"
+                        : (anchored_candidate_expansion
+                            ? "anchored_complete_rounds"
+                            : (row.timing.adaptive.promotion_evidence
+                            ? "stationary_window"
+                            : "hard_samples_and_four_elapsed"));
+                    const double projected_serial_median_us =
+                        serial_timing.evidence.median *
+                        static_cast<double>(M) /
+                        static_cast<double>(serial_oracle_rows.size());
+                    row.speedup = row.timing.evidence.median > 0.0
+                        ? projected_serial_median_us /
+                              row.timing.evidence.median
+                        : 0.0;
+                }
+
+                int best_index = -1;
+                for (size_t index = 0; index < rows.size(); ++index)
+                {
+                    const CandidateRow &row = rows[index];
+                    const bool timing_admitted = anchored_candidate_expansion
+                        ? llaminar2::test::trainer::
+                              anchoredCompleteRoundTimingEvidence(
+                                  row.timing.acquisition_samples_us.size(),
+                                  static_cast<size_t>(
+                                      stationary_minimum_samples),
+                                  row.timing.adaptive.measured_duration_us,
+                                  timing_budget_us)
+                        : row.timing.adaptive.promotion_evidence;
+                    if (!row.correctness_pass || !timing_admitted)
+                        continue;
+                    if (best_index < 0 ||
+                        row.timing.evidence.median <
+                            rows[static_cast<size_t>(best_index)]
+                                .timing.evidence.median)
+                    {
+                        best_index = static_cast<int>(index);
+                    }
+                }
+                for (size_t index = 0; index < rows.size(); ++index)
+                {
+                    const CandidateRow &row = rows[index];
+                    const std::string observed_id = row.route.candidateId();
+                    if (csv)
+                    {
+                        std::fprintf(
+                            csv,
+                            "cpu,prefill_gemm,%s,%u,%u,%s,eager,%d,%d,%d,%s,%s,%s,%s,%d,%s,%d,%d,%zu,%s,%zu,"
+                            "%s,%d,%.9f,%.9f,%d,%d,%s,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%.9f,%.9f,%.9f,%u,%zu,%d,elapsed-stability-interleaved-v16,samples-and-four-elapsed-v3,%d,%d,%d,"
+                            "%.9f,%.9f,%zu,%zu,%.9f,%.9f,%.9f,%d,%s,"
+                            "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,"
+                            "%.9g,%.9g,%.9g,%.9g,%s,%s,%s,%d,%s,%d,%d,%d,%d,%d,%d\n",
+                            format.name.c_str(),
+                            static_cast<unsigned>(packed.codebook_id),
+                            static_cast<unsigned>(packed.codebook_id),
+                            shape_name.c_str(),
+                            M, N, K,
+                            row.candidate.id.c_str(),
+                            row.route.build_isa.c_str(),
+                            requested_runtime_isa.c_str(),
+                            row.route.isa.c_str(),
+                            row.route.threads,
+                            round_coordinator.policyName(),
+                            round_coordinator.worldSize(),
+                            round_coordinator.rank(),
+                            weight_bytes,
+                            "boundary-quartile-sentinel-v1",
+                            serial_oracle_rows.size(),
+                            preconditioning_policy.c_str(),
+                            source_preconditioning_m,
+                            source_preconditioning_budget_us,
+                            source_preconditioning_duration_us,
+                            row.timing_warmup_count,
+                            row.warmup_round_count,
+                            row.warmup_budget_policy.c_str(),
+                            row.warmup_probe_latency_us,
+                            row.warmup_budget_floor_us,
+                            row.warmup_latency_multiplier,
+                            row.warmup_budget_ceiling_us,
+                            row.warmup_budget_us,
+                            row.warmup_duration_us,
+                            global_warmup_round_count,
+                            warmup_wall_duration_us,
+                            warmup_max_round_duration_us,
+                            warmup_round_timeout_us,
+                            timing_order_seed,
+                            global_timing_round_count,
+                            static_cast<int>(
+                                row.timing.acquisition_samples_us.size()),
+                            minimum_samples,
+                            stationary_minimum_samples,
+                            maximum_samples,
+                            timing_budget_us,
+                            row.timing.adaptive.measured_duration_us,
+                            row.timing.adaptive.stationary_window_begin,
+                            row.timing.adaptive.stationary_sample_count,
+                            row.timing.adaptive.stationary_duration_us,
+                            median_stability_limit,
+                            row.timing.adaptive.median_relative_drift,
+                            row.timing.adaptive.median_stable ? 1 : 0,
+                            row.timing.stop_reason.c_str(),
+                            row.timing.evidence.min,
+                            row.timing.evidence.median,
+                            row.timing.evidence.p95,
+                            row.timing.evidence.mad,
+                            row.timing.evidence.cv,
+                            serial_timing.evidence.median *
+                                static_cast<double>(M) /
+                                static_cast<double>(serial_oracle_rows.size()),
+                            row.speedup,
+                            row.comparison.mismatch_count,
+                            row.comparison.first_mismatch_index,
+                            row.repeat_byte_mismatches,
+                            row.comparison.max_abs,
+                            row.comparison.relative_l2,
+                            row.comparison.cosine,
+                            row.comparison.symmetric_kld,
+                            row.comparison.actual_digest.c_str(),
+                            serial_digest.c_str(),
+                            row.timing.evidence.digest.c_str(),
+                            row.route_ok ? 1 : 0,
+                            observed_id.c_str(),
+                            row.route.k_tiles,
+                            row.route.k_tile_blocks,
+                            row.route.n_block_chunks,
+                            row.numerical_correctness ? 1 : 0,
+                            row.correctness_pass ? 1 : 0,
+                            static_cast<int>(index) == best_index ? 1 : 0);
+                        ++emitted_rows;
+                    }
+                    if (timing_csv)
+                    {
+                        for (size_t sample_index = 0;
+                             sample_index < row.timing.acquisition_samples_us.size();
+                             ++sample_index)
+                        {
+                            const double latency_us =
+                                row.timing.acquisition_samples_us[sample_index];
+                            std::fprintf(
+                                timing_csv,
+                                "cpu,prefill_gemm,%s,%u,%u,%s,eager,%d,%d,%d,%s,%s,%s,%s,%zu,%.9f,%a\n",
+                                format.name.c_str(),
+                                static_cast<unsigned>(packed.codebook_id),
+                                static_cast<unsigned>(packed.codebook_id),
+                                shape_name.c_str(),
+                                M, N, K,
+                                row.candidate.id.c_str(),
+                                row.route.build_isa.c_str(),
+                                requested_runtime_isa.c_str(),
+                                row.route.isa.c_str(),
+                                sample_index,
+                                latency_us,
+                                latency_us);
+                        }
+                    }
+                }
+                if (csv)
+                    std::fflush(csv);
+                if (timing_csv)
+                    std::fflush(timing_csv);
+
+                // Preserve the complete aggregate and acquisition-order trace
+                // before rejecting an unstable cell.  The refresh transaction
+                // leaves these files marked `.inprogress`, so they are usable as
+                // diagnostics but can never be promoted into a dispatch table.
+                bool local_failure = false;
+                std::ostringstream local_diagnostic;
+                for (const CandidateRow &row : rows)
+                {
+                    if (!row.route_ok || profiling_requested)
+                        continue;
+                    const bool anchored_epoch_complete =
+                        llaminar2::test::trainer::
+                            anchoredCompleteRoundTimingEvidence(
+                                row.timing.acquisition_samples_us.size(),
+                                static_cast<size_t>(
+                                    stationary_minimum_samples),
+                                row.timing.adaptive.measured_duration_us,
+                                timing_budget_us);
+                    const bool timing_admitted = anchored_candidate_expansion
+                        ? anchored_epoch_complete
+                        : row.timing.adaptive.promotion_evidence;
+                    if (!timing_admitted && !local_failure)
+                    {
+                        local_failure = true;
+                        local_diagnostic
+                            << "CPU prefill timing rejected: format="
+                            << format.name << " M=" << M << " candidate="
+                            << row.candidate.id
+                            << " remained unstable at the hard timing ceiling"
+                            << " acquisition_samples="
+                            << row.timing.acquisition_samples_us.size()
+                            << " stationary_samples="
+                            << row.timing.adaptive.stationary_sample_count
+                            << " acquisition_duration_us="
+                            << row.timing.adaptive.measured_duration_us
+                            << " stationary_duration_us="
+                            << row.timing.adaptive.stationary_duration_us
+                            << " drift="
+                            << row.timing.adaptive.median_relative_drift
+                            << " cv=" << row.timing.evidence.cv;
+                    }
+                }
+                if (!profiling_requested && best_index < 0 &&
+                    !local_failure)
+                {
+                    local_failure = true;
+                    local_diagnostic
+                        << "CPU prefill timing rejected: format=" << format.name
+                        << " M=" << M
+                        << " has no stable, forceable, byte-exact full-K candidate";
+                }
+                round_coordinator.failAllRanksIf(
+                    local_failure, local_diagnostic.str());
+                ++executed_cases;
+            }
+            const bool final_seed_class =
+                format_index + 1 == selected_formats.size() ||
+                selected_formats[format_index + 1]->name.size() !=
+                    format.name.size();
+            if (final_seed_class)
+            {
+                activation_fixtures.releaseFormatNameLength(
+                    format.name.size());
+            }
+            if (executed_cases >= max_cases)
+                break;
+        }
+
+        if (csv)
+        {
+            ASSERT_EQ(std::fclose(csv), 0);
+            ASSERT_GT(emitted_rows, 0);
+        }
+        if (timing_csv)
+            ASSERT_EQ(std::fclose(timing_csv), 0);
+        ASSERT_GT(executed_cases, 0)
+            << "No strong CPU prefill cases selected";
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_EQ(isolated_profile_launches, 1)
+                << "each CPU prefill profiler request must launch once";
+        }
+        else if (profiler_batch.enabled())
+        {
+            EXPECT_NO_THROW(profiler_batch.requireComplete());
+            ASSERT_EQ(
+                static_cast<size_t>(isolated_profile_launches),
+                profiler_batch.size())
+                << "every CPU prefill profiler batch member must launch once";
+        }
         PerfStatsCollector::reset();
     }
 

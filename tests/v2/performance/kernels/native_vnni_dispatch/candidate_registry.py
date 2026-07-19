@@ -15,17 +15,23 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Any, Iterable
 
 from .schema import Backend, SemanticContract
 
 
-CANDIDATE_REGISTRY_VERSION = "native-vnni-candidates-v4"
+CANDIDATE_REGISTRY_VERSION = "native-vnni-candidates-v9"
+COMPATIBLE_CANDIDATE_REGISTRY_VERSIONS = tuple(
+    f"native-vnni-candidates-v{version}" for version in range(1, 10)
+)
 
 ROCM_MOE_GROUPED_PREFILL = "rocm_moe_grouped_prefill"
 ROCM_NATIVE_VNNI_DECODE = "rocm_native_vnni_decode"
 CUDA_NATIVE_VNNI_GEMV = "cuda_native_vnni_gemv"
+CPU_NATIVE_VNNI_DECODE = "cpu_native_vnni_decode"
 CPU_NATIVE_VNNI_VERIFIER_ROWS = "cpu_native_vnni_verifier_rows"
+CPU_NATIVE_VNNI_PREFILL_GEMM = "cpu_native_vnni_prefill_gemm"
 
 
 def _sha256_json(value: Any) -> str:
@@ -83,6 +89,7 @@ class CandidateSpec:
         result["config_items"] = [list(item) for item in self.config_items]
         return result
 
+    @lru_cache(maxsize=None)
     def candidate_policy_hash(self) -> str:
         """Bind emitted policy evidence to this complete registry entry."""
 
@@ -148,16 +155,37 @@ class CandidateRegistry:
                 f"{self.surface}: unknown forceable candidate {identifier!r}"
             ) from exc
 
-    def digest(self) -> str:
-        """Hash the complete ordered inventory for corpus provenance."""
+    def digest(self, *, registry_version: str = CANDIDATE_REGISTRY_VERSION) -> str:
+        """Hash this surface's complete ordered inventory.
+
+        ``registry_version`` is explicit for immutable-plan migration. The
+        project-wide version historically appeared in every surface digest,
+        so adding an unrelated backend surface changed an otherwise identical
+        CPU-prefill identity. Readers may recompute a historical version over
+        the *current complete entries*; any real change to this surface still
+        changes the digest and fails closed.
+        """
 
         payload = {
-            "version": CANDIDATE_REGISTRY_VERSION,
+            "version": registry_version,
             "backend": self.backend.value,
             "surface": self.surface,
             "entries": [entry.canonical_mapping() for entry in self._entries],
         }
         return _sha256_json(payload)
+
+    def matches_digest(self, expected: str) -> bool:
+        """Accept an exact current or historical-version surface identity.
+
+        Compatibility covers only the old project-wide version stamp. The
+        backend, surface, ordered candidate inventory, and every candidate
+        field are always recomputed from current code.
+        """
+
+        return any(
+            self.digest(registry_version=version) == expected
+            for version in COMPATIBLE_CANDIDATE_REGISTRY_VERSIONS
+        )
 
 
 def _candidate(
@@ -198,6 +226,7 @@ def _candidate(
     )
 
 
+@lru_cache(maxsize=1)
 def rocm_moe_grouped_prefill_registry() -> CandidateRegistry:
     """Return all 12 production HIP row-tile/column-tile combinations."""
 
@@ -231,6 +260,7 @@ def rocm_moe_grouped_prefill_registry() -> CandidateRegistry:
     return CandidateRegistry(entries)
 
 
+@lru_cache(maxsize=1)
 def rocm_native_vnni_decode_registry() -> CandidateRegistry:
     """Return normalized ROCm serial-decode and grouped-verifier candidates.
 
@@ -286,6 +316,55 @@ def rocm_native_vnni_decode_registry() -> CandidateRegistry:
     return CandidateRegistry(entries)
 
 
+@lru_cache(maxsize=1)
+def cpu_native_vnni_decode_registry() -> CandidateRegistry:
+    """Return forceable CPU M=1 task-ownership schedules.
+
+    CPU batch invariance freezes the production serial-M1 arithmetic partition:
+    a geometry is either full-K or uses the existing ordered K-part boundaries.
+    Learned decode dispatch may change how many adjacent 64-column chunks one
+    OpenMP task owns, but it may not change those K boundaries or the ascending
+    FP32 reduction tree.  The same five candidates therefore apply to both
+    arithmetic bundles without making a different numerical promise.
+    """
+
+    common = {
+        "backend": Backend.CPU,
+        "surface": CPU_NATIVE_VNNI_DECODE,
+        "family": "cpu_native_vnni_decode_n_chunk_grid",
+        "arithmetic": (
+            "frozen serial-M1 full-K or ordered K-part accumulation; "
+            "schedule cannot change K partition boundaries-v1"
+        ),
+        "contracts": (SemanticContract.FAST,),
+        "graph_capture": False,
+        "resources": (
+            "native_vnni_prepared_weights",
+            "prequantized_q8_1_row",
+            "ordered_kpart_partials",
+        ),
+        "workspace": "cpu-native-vnni-m1-persistent-partials-v1",
+    }
+    return CandidateRegistry(
+        _candidate(
+            **common,
+            candidate_id=f"cpu.nvnni.decode.n_chunk_grid.nbc{n_block_chunks}",
+            aliases=(f"NBC{n_block_chunks}",),
+            config={
+                "route": "n_chunk_grid",
+                "n_block_chunks": n_block_chunks,
+                "k_partition_policy": "frozen_serial_m1",
+            },
+            schedule=(
+                "cpu-native-vnni-m1-n-chunk-grid-"
+                f"nbc{n_block_chunks}-v1"
+            ),
+        )
+        for n_block_chunks in (1, 2, 4, 8, 16)
+    )
+
+
+@lru_cache(maxsize=1)
 def cpu_native_vnni_verifier_registry() -> CandidateRegistry:
     """Return the two currently forceable CPU grouped verifier schedules."""
 
@@ -319,6 +398,117 @@ def cpu_native_vnni_verifier_registry() -> CandidateRegistry:
     ))
 
 
+@lru_cache(maxsize=1)
+def cpu_native_vnni_prefill_registry() -> CandidateRegistry:
+    """Return byte-proven physical CPU prefill schedules.
+
+    The row-chunk grid ignores N blocking after route selection, so it is one
+    candidate. Two distinct two-row families retain N blocking as a physical
+    scheduling axis. N-major tasks own one N block and visit every row pair;
+    pair-grid tasks own one `(row pair, N block)` tile and expose M parallelism
+    to OpenMP. Both invoke the same byte-exact two-row microkernel. Long-K
+    shapes use explicit Pairwise/Wide grouped K-part candidates whose
+    independent row partials are reduced in the exact serial-M1 tile order.
+    """
+
+    common = {
+        "backend": Backend.CPU,
+        "surface": CPU_NATIVE_VNNI_PREFILL_GEMM,
+        "contracts": (
+            SemanticContract.FAST,
+            SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+        ),
+        "graph_capture": False,
+        "resources": (
+            "native_vnni_prepared_weights",
+            "prequantized_q8_1_rows",
+        ),
+        "workspace": "cpu-thread-local-prefill-accumulators-v2",
+    }
+    entries = [_candidate(
+        **common,
+        candidate_id="cpu.nvnni.prefill.row_chunk_grid.full_k",
+        aliases=(),
+        family="cpu_native_vnni_row_chunk_grid",
+        config={
+            "route": "row_chunk_grid",
+            "n_block_policy": "minimum_for_row_chunk_grid",
+            "k_tile_policy": "full_k",
+        },
+        arithmetic="independent ordered serial-M1 K accumulation per row-v1",
+        schedule="cpu-native-vnni-row-chunk-grid-full-k-v1",
+    )]
+    for n_block_chunks in (1, 2, 4, 8, 16):
+        entries.append(_candidate(
+            **common,
+            candidate_id=(
+                "cpu.nvnni.prefill.two_row_tiles."
+                f"nbc{n_block_chunks}.full_k"
+            ),
+            aliases=(),
+            family="cpu_native_vnni_two_row_output_tiles",
+            config={
+                "route": "two_row_full_output_tiles",
+                "n_block_chunks": n_block_chunks,
+                "k_tile_policy": "full_k",
+            },
+            arithmetic="independent ordered serial-M1 K accumulation per row-v1",
+            schedule=(
+                "cpu-native-vnni-two-row-output-tiles-"
+                f"nbc{n_block_chunks}-full-k-v1"
+            ),
+        ))
+    for n_block_chunks in (1, 2, 4, 8, 16):
+        entries.append(_candidate(
+            **common,
+            candidate_id=(
+                "cpu.nvnni.prefill.two_row_pair_grid."
+                f"nbc{n_block_chunks}.full_k"
+            ),
+            aliases=(),
+            family="cpu_native_vnni_two_row_pair_grid",
+            config={
+                "route": "two_row_pair_grid",
+                "n_block_chunks": n_block_chunks,
+                "row_tile": 2,
+                "k_tile_policy": "full_k",
+            },
+            arithmetic="independent ordered serial-M1 K accumulation per row-v1",
+            schedule=(
+                "cpu-native-vnni-two-row-pair-grid-"
+                f"nbc{n_block_chunks}-full-k-v1"
+            ),
+        ))
+    for policy, family, row_tile in (
+        ("Pairwise", "cpu_native_vnni_kpart_pairwise", 2),
+        ("WideRows", "cpu_native_vnni_kpart_wide_rows", 4),
+    ):
+        entries.append(_candidate(
+            **common,
+            candidate_id=(
+                "cpu.nvnni.prefill.decode_equivalent_kpart."
+                + ("pairwise" if policy == "Pairwise" else "wide_rows")
+            ),
+            aliases=(),
+            family=family,
+            config={
+                "route": "decode_equivalent_kpart_rows",
+                "policy": policy,
+                "row_tile": row_tile,
+                "k_tile_policy": "inherit_serial_m1",
+            },
+            arithmetic=(
+                "independent serial-M1 K partials with ordered exact reduction-v1"
+            ),
+            schedule=(
+                "cpu-native-vnni-decode-equivalent-kpart-"
+                + ("pairwise-v1" if policy == "Pairwise" else "wide-rows-v1")
+            ),
+        ))
+    return CandidateRegistry(entries)
+
+
+@lru_cache(maxsize=1)
 def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
     """Return effective public-M1 and grouped-verifier CUDA candidates.
 
@@ -405,6 +595,127 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                 workspace="CUDANativeVNNIKPartWorkspace-v2",
             ))
 
+    # Generic policy candidates resolve a concrete exact KB from N and K. The
+    # selected formula is deterministic and M-independent; grouped verifier
+    # publication therefore receives the same concrete partition tree as
+    # serial M1. Their costs are projected only from directly measured exact-KB
+    # rows by cuda_shape_resolved.py.
+    for tile_n, cpt in (
+        (128, 1), (128, 2), (256, 2), (256, 4),
+        (64, 1), (64, 2), (32, 1),
+    ):
+        for target_waves in range(1, 41):
+            for min_kgroups_per_cta in (1, 2, 4, 8):
+                target_blocks = 82 * target_waves
+                candidate_id = (
+                    "cuda.nvnni.decode.fast_m1.kpar_formula."
+                    f"tn{tile_n}.cpt{cpt}.tb{target_blocks}."
+                    f"mkg{min_kgroups_per_cta}"
+                )
+                entries.append(_candidate(
+                    backend=Backend.CUDA,
+                    surface=CUDA_NATIVE_VNNI_GEMV,
+                    candidate_id=candidate_id,
+                    aliases=(),
+                    family="cuda_public_m1_kpar_formula",
+                    config={
+                        "family": "kpar_formula",
+                        "formula_kind": "target_blocks",
+                        "tile_n": tile_n,
+                        "cpt": cpt,
+                        "target_blocks": target_blocks,
+                        "min_kgroups_per_cta": min_kgroups_per_cta,
+                        "max_kb": 256,
+                        "force_two_phase": 1,
+                    },
+                    arithmetic=(
+                        "N/K-resolved disjoint K partitions with ascending FP32 "
+                        "reduction; absolute target-block nearest-factor formula-v1"
+                    ),
+                    schedule=(
+                        f"cuda-public-m1-kpar-formula-tn{tile_n}-cpt{cpt}-"
+                        f"tb{target_blocks}-mkg{min_kgroups_per_cta}-v1"
+                    ),
+                    contracts=(SemanticContract.FAST,),
+                    resources=(
+                        "native_vnni_prepared_weights",
+                        "ordered_kpart_partials",
+                    ),
+                    workspace="CUDANativeVNNIKPartWorkspace-v2",
+                ))
+                canonical_id = (
+                    "cuda.nvnni.decode.fast_m1.kpar_formula."
+                    f"tn{tile_n}.cpt{cpt}.ctb{target_blocks}."
+                    f"mkg{min_kgroups_per_cta}"
+                )
+                entries.append(_candidate(
+                    backend=Backend.CUDA,
+                    surface=CUDA_NATIVE_VNNI_GEMV,
+                    candidate_id=canonical_id,
+                    aliases=(),
+                    family="cuda_public_m1_kpar_formula",
+                    config={
+                        "family": "kpar_formula",
+                        "formula_kind": "canonical_target_blocks",
+                        "tile_n": tile_n,
+                        "cpt": cpt,
+                        "target_blocks": target_blocks,
+                        "min_kgroups_per_cta": min_kgroups_per_cta,
+                        "max_kb": 256,
+                        "force_two_phase": 1,
+                    },
+                    arithmetic=(
+                        "N/K-resolved disjoint K partitions with ascending FP32 "
+                        "reduction; absolute target-block canonical uneven "
+                        "partition-width formula-v1"
+                    ),
+                    schedule=(
+                        f"cuda-public-m1-kpar-formula-tn{tile_n}-cpt{cpt}-"
+                        f"ctb{target_blocks}-mkg{min_kgroups_per_cta}-v1"
+                    ),
+                    contracts=(SemanticContract.FAST,),
+                    resources=(
+                        "native_vnni_prepared_weights",
+                        "ordered_kpart_partials",
+                    ),
+                    workspace="CUDANativeVNNIKPartWorkspace-v2",
+                ))
+        for blocks_per_partition in range(1, 65):
+            candidate_id = (
+                "cuda.nvnni.decode.fast_m1.kpar_formula."
+                f"tn{tile_n}.cpt{cpt}.bpp{blocks_per_partition}"
+            )
+            entries.append(_candidate(
+                backend=Backend.CUDA,
+                surface=CUDA_NATIVE_VNNI_GEMV,
+                candidate_id=candidate_id,
+                aliases=(),
+                family="cuda_public_m1_kpar_formula",
+                config={
+                    "family": "kpar_formula",
+                    "formula_kind": "blocks_per_partition",
+                    "tile_n": tile_n,
+                    "cpt": cpt,
+                    "blocks_per_partition": blocks_per_partition,
+                    "max_kb": 256,
+                    "force_two_phase": 1,
+                },
+                arithmetic=(
+                    "N/K-resolved disjoint K partitions with ascending FP32 "
+                    "reduction; fixed K-groups-per-partition formula-v1"
+                ),
+                schedule=(
+                    f"cuda-public-m1-kpar-formula-tn{tile_n}-cpt{cpt}-"
+                    f"bpp{blocks_per_partition}-v1"
+                ),
+                contracts=(SemanticContract.FAST,),
+                resources=(
+                    "native_vnni_prepared_weights",
+                    "ordered_kpart_partials",
+                ),
+                workspace="CUDANativeVNNIKPartWorkspace-v2",
+            ))
+
     entries.append(_candidate(
         backend=Backend.CUDA,
         surface=CUDA_NATIVE_VNNI_GEMV,
@@ -424,11 +735,14 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
     return CandidateRegistry(entries)
 
 
+@lru_cache(maxsize=1)
 def candidate_registry_digest() -> str:
     """Hash every initial backend registry as one transaction input."""
 
     registries = (
+        cpu_native_vnni_decode_registry(),
         cpu_native_vnni_verifier_registry(),
+        cpu_native_vnni_prefill_registry(),
         cuda_native_vnni_gemv_registry(),
         rocm_native_vnni_decode_registry(),
         rocm_moe_grouped_prefill_registry(),

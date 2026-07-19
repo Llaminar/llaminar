@@ -10,9 +10,13 @@
  * repeated to expose first-call or graph-lifetime instability.
  *
  * Timing uses an explicit non-default CUDA stream. Eager and graph-captured
- * launches are separate evidence surfaces, and every exact CUDA-event sample
- * is retained in a sidecar CSV. Serial row replay exists only inside this
- * performance oracle; production execution remains one grouped launch.
+ * launches are separate evidence surfaces. Each CUDA event brackets several
+ * identical launches so sub-20-microsecond kernels are not ranked by event
+ * quantization; the sidecar records both the replay count and exact per-launch
+ * sample. A separate paired-confirmation mode interleaves one frozen policy
+ * candidate with its exact-reference candidate, preserving pair identity for
+ * simultaneous confidence-bound analysis. Serial row replay exists only inside
+ * this performance oracle; production execution remains one grouped launch.
  */
 
 #include <gtest/gtest.h>
@@ -24,11 +28,15 @@
 #include "backends/DeviceId.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/KernelFactory.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../../utils/TestTensorFactory.h"
+#include "../../native_vnni_dispatch/NativeVNNIPairedRequestManifest.h"
+#include "../../native_vnni_dispatch/NativeVNNIProfilerControl.h"
+#include "../../native_vnni_dispatch/NativeVNNIShapeManifest.h"
 
 #include <algorithm>
 #include <array>
@@ -36,11 +44,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -70,6 +81,61 @@ namespace
     /** Default promotion-strength sample counts. */
     constexpr int kDefaultWarmups = 5;
     constexpr int kDefaultSamples = 30;
+
+    /**
+     * @brief Default maximum launches inside one CUDA event sample.
+     *
+     * CUDA events have finite timing resolution. A single event around a tiny
+     * decode kernel can therefore report a quantized value whose apparent
+     * variation is larger than the candidate differences being learned. The
+     * trainer amortizes that resolution over an adaptively selected number of
+     * launches up to this cap and stores the normalized per-launch latency.
+     * This changes measurement precision only; every launch still runs the
+     * exact candidate and production graph route.
+     */
+    constexpr int kDefaultTimedReplayCap = 16;
+
+    /**
+     * @brief Desired minimum duration of one CUDA event timing window.
+     *
+     * A probe launch chooses the smallest replay count that should make the
+     * event span approximately this duration, bounded by the configured cap.
+     * Large kernels therefore remain one replay while tiny decode kernels gain
+     * enough event resolution to distinguish nearby candidate schedules.
+     */
+    constexpr double kTargetTimedWindowUs = 512.0;
+
+    /** FNV-1a constants used for a stable cross-run measurement-order seed. */
+    constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
+    constexpr uint64_t kFnvPrime = 1099511628211ULL;
+    constexpr const char *kBroadMeasurementProtocol =
+        "sample_interleaved_v1";
+
+    /**
+     * @brief Invoke one CUDA driver profiler-control entry point by symbol.
+     *
+     * CUDA 13 still exports `cuProfilerStart`/`cuProfilerStop` from libcuda,
+     * but the minimal toolkit image used by this project no longer installs
+     * the historical `cuda_profiler_api.h` runtime header. Resolving the stable
+     * driver ABI keeps app-controlled Nsight collection available without
+     * declaring an undocumented runtime prototype or adding profiler behavior
+     * to production code.
+     */
+    bool invokeCudaProfilerControl(const char *symbol)
+    {
+        using ControlFunction = int (*)();
+        static void *driver = []
+        {
+            return ::dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+        }();
+        if (!driver)
+            return false;
+        ::dlerror();
+        void *raw = ::dlsym(driver, symbol);
+        if (!raw || ::dlerror() != nullptr)
+            return false;
+        return reinterpret_cast<ControlFunction>(raw)() == 0;
+    }
 
     /** One externally loadable source format and deterministic tensor factory. */
     struct FormatSpec
@@ -155,28 +221,20 @@ namespace
          { return createTrainerTensor<Q8_KTensor, Q8_KBlock>(n, k); }},
     };
 
-    /** One production decode projection shape. */
-    struct Shape
-    {
-        std::string name;
-        int n = 0;
-        int k = 0;
-    };
+    using Shape = native_vnni_dispatch::NativeVNNIShapeSpec;
 
-    const std::vector<Shape> kProductionShapes = {
-        {"Qwen36_Attn_QKVProjection", 12288, 5120},
-        {"Qwen36_FFN_GateUp", 17408, 5120},
-        {"Qwen36_FFN_DownProjection", 5120, 17408},
-        {"Qwen36_GDN_InnerProjection", 10240, 5120},
-        {"Qwen36_GDN_ZProjection", 6144, 5120},
-        {"Qwen36_GDN_TimeProjection", 1024, 5120},
-        {"Qwen36_GDN_OutputProjection", 5120, 6144},
-        {"Qwen36_LM_Head", 248320, 5120},
-        {"35BMoE_Expert_GateUp", 512, 2048},
-        {"35BMoE_Expert_Down", 2048, 512},
-        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
-        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
-    };
+    /**
+     * @brief Return the shared model and generic-certification shape inventory.
+     *
+     * CUDA deliberately owns no private shape list. The JSON manifest is also
+     * consumed by ROCm, CPU refresh orchestration, and the sealed common
+     * compiler, so adding a policy dimension to one backend necessarily adds it
+     * to all three.
+     */
+    const std::vector<Shape> &trainingShapes()
+    {
+        return native_vnni_dispatch::nativeVnniShapeManifest();
+    }
 
     /** Production execution surface represented by one corpus alias. */
     enum class ExecutionMode
@@ -188,6 +246,87 @@ namespace
     const char *executionModeName(ExecutionMode mode)
     {
         return mode == ExecutionMode::Eager ? "eager" : "graph_captured";
+    }
+
+    /**
+     * @brief Derive the deterministic candidate permutation seed for one cell.
+     *
+     * Candidate order must vary across shape and execution-mode cells so fixed
+     * registry position cannot correlate with clock, temperature, or first-use
+     * drift. The seed is emitted beside every aggregate and raw timing row,
+     * making the exact broad-sweep permutation auditable.
+     */
+    uint64_t measurementOrderSeed(
+        const FormatSpec &format,
+        const Shape &shape,
+        int m,
+        ExecutionMode mode)
+    {
+        uint64_t hash = kFnvOffsetBasis;
+        const auto mix_string = [&](const std::string &value)
+        {
+            for (const unsigned char byte : value)
+            {
+                hash ^= static_cast<uint64_t>(byte);
+                hash *= kFnvPrime;
+            }
+            hash ^= 0xffULL;
+            hash *= kFnvPrime;
+        };
+        const auto mix_integer = [&](uint64_t value)
+        {
+            for (int byte = 0; byte < 8; ++byte)
+            {
+                hash ^= (value >> (byte * 8)) & 0xffULL;
+                hash *= kFnvPrime;
+            }
+        };
+        mix_string(format.name);
+        mix_string(shape.name);
+        mix_integer(static_cast<uint64_t>(m));
+        mix_integer(static_cast<uint64_t>(mode));
+        return hash;
+    }
+
+    /**
+     * @brief Derive an auditable candidate-order seed for one paired sample.
+     *
+     * Every pair starts from the cell-level broad-sweep seed and mixes its
+     * zero-based pair index. This makes selected-first and reference-first
+     * execution vary within a cell while remaining exactly reproducible from
+     * the retained CSV. A paired result therefore cannot accidentally inherit
+     * a permanent first-candidate thermal or clock-order advantage.
+     */
+    uint64_t pairedOrderSeed(uint64_t cell_seed, size_t pair_index)
+    {
+        uint64_t hash = cell_seed;
+        for (int byte = 0; byte < 8; ++byte)
+        {
+            hash ^= (static_cast<uint64_t>(pair_index) >> (byte * 8)) & 0xffULL;
+            hash *= kFnvPrime;
+        }
+        return hash;
+    }
+
+    /**
+     * @brief Extend a runtime-cell seed with one typed request identity.
+     *
+     * A tournament may contain several candidate edges for the same
+     * format/shape/mode cell. Giving every edge an independently mixed seed
+     * prevents all of those sessions from running the selected role first on
+     * exactly the same sample indices while retaining complete replayability.
+     */
+    uint64_t pairedRequestSeed(
+        uint64_t cell_seed,
+        const std::string &request_id)
+    {
+        uint64_t hash = cell_seed;
+        for (const unsigned char byte : request_id)
+        {
+            hash ^= static_cast<uint64_t>(byte);
+            hash *= kFnvPrime;
+        }
+        return hash;
     }
 
     /** NativeVNNI launch family understood by the production sweep override. */
@@ -239,6 +378,7 @@ namespace
     {
         int warmups = kDefaultWarmups;
         int samples = kDefaultSamples;
+        int timed_replay_cap = kDefaultTimedReplayCap;
         int max_cases = std::numeric_limits<int>::max();
         std::set<std::string> formats;
         std::set<std::string> shapes;
@@ -246,13 +386,25 @@ namespace
         std::set<std::string> candidate_ids;
         std::vector<int> m_values = {
             1, 2, 3, 4, 5, 6, 7, 8,
-            9, 10, 11, 12, 13, 14, 15, 16};
+            9, 10, 11, 12, 13, 14, 15, 16, 31};
         std::vector<ExecutionMode> execution_modes = {
             ExecutionMode::Eager,
             ExecutionMode::GraphCaptured,
         };
         std::string aggregate_path = "/tmp/llaminar_cuda_decode_strong.csv";
         std::string timing_path = "/tmp/llaminar_cuda_decode_strong.timing.csv";
+        std::string paired_path;
+        std::string paired_request_manifest_path;
+        std::string profiler_request_id;
+        std::vector<
+            native_vnni_dispatch::NativeVNNIPairedTimingRequest>
+            paired_requests;
+
+        /** Return whether this invocation is a confirmation-only transaction. */
+        [[nodiscard]] bool pairedConfirmation() const
+        {
+            return !paired_path.empty() && !paired_request_manifest_path.empty();
+        }
     };
 
     std::string trim(std::string value)
@@ -329,6 +481,9 @@ namespace
             "LLAMINAR_CUDA_NVNNI_DECODE_WARMUPS", kDefaultWarmups);
         config.samples = envPositiveInt(
             "LLAMINAR_CUDA_NVNNI_DECODE_SAMPLES", kDefaultSamples);
+        config.timed_replay_cap = envPositiveInt(
+            "LLAMINAR_CUDA_NVNNI_DECODE_TIMED_REPLAYS",
+            kDefaultTimedReplayCap);
         config.max_cases = envPositiveInt(
             "LLAMINAR_CUDA_NVNNI_DECODE_MAX_CASES",
             std::numeric_limits<int>::max());
@@ -361,10 +516,68 @@ namespace
             "LLAMINAR_CUDA_NVNNI_DECODE_CSV");
         const std::string timing = envString(
             "LLAMINAR_CUDA_NVNNI_DECODE_TIMING_CSV");
+        const std::string paired = envString(
+            "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_CSV");
+        const std::string paired_requests = envString(
+            "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST");
         if (!aggregate.empty())
             config.aggregate_path = aggregate;
         if (!timing.empty())
             config.timing_path = timing;
+        if (paired.empty() != paired_requests.empty())
+        {
+            throw std::runtime_error(
+                "paired CUDA confirmation requires both "
+                "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST and "
+                "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_CSV");
+        }
+        if (!paired.empty())
+        {
+            if (!config.formats.empty() || !config.shapes.empty() ||
+                !config.candidate_families.empty() ||
+                !config.candidate_ids.empty() ||
+                !envString("LLAMINAR_CUDA_NVNNI_DECODE_M").empty() ||
+                !envString(
+                    "LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES").empty() ||
+                !envString("LLAMINAR_CUDA_NVNNI_DECODE_MAX_CASES").empty())
+            {
+                throw std::runtime_error(
+                    "paired request manifest is authoritative and cannot be "
+                    "combined with format/shape/candidate/M/mode/case filters");
+            }
+            const auto manifest =
+                native_vnni_dispatch::loadNativeVnniPairedRequestManifest(
+                    paired_requests);
+            if (manifest.requests.empty())
+            {
+                throw std::runtime_error(
+                    "paired request manifest is already green and has no work");
+            }
+            config.paired_path = paired;
+            config.paired_request_manifest_path = paired_requests;
+            config.paired_requests = manifest.requests;
+            config.m_values = {1};
+        }
+        config.profiler_request_id =
+            native_vnni_dispatch::profilerRequestId();
+        if (!config.profiler_request_id.empty())
+        {
+            if (config.pairedConfirmation())
+            {
+                throw std::runtime_error(
+                    "isolated CUDA profiling cannot run inside paired timing");
+            }
+            if (config.formats.size() != 1 || config.shapes.size() != 1 ||
+                config.candidate_ids.size() != 1 ||
+                !config.candidate_families.empty() ||
+                config.m_values.size() != 1 ||
+                config.execution_modes.size() != 1 || config.max_cases != 1)
+            {
+                throw std::runtime_error(
+                    "isolated CUDA profiling requires one explicit format, "
+                    "shape, candidate, M, mode, and max case");
+            }
+        }
         return config;
     }
 
@@ -373,7 +586,71 @@ namespace
         return filter.empty() || filter.count(lower(name)) != 0;
     }
 
-    std::vector<Candidate> fastM1Candidates(const TrainerConfig &config)
+    /**
+     * @brief Return the smallest exact KB spelling for every useful partition.
+     *
+     * @param k_groups Number of 32-value NativeVNNI groups along K.
+     * @return Sorted exact-KB candidates with one representative for each
+     *         distinct `ceil(k_groups / KB)` partition width.
+     *
+     * Two KB values that produce the same partition width execute identical
+     * useful dot products. The larger value merely launches more empty partial
+     * producers and asks the ordered reducer to consume more explicit zeroes.
+     * Keeping the smallest spelling therefore preserves every distinct FP32
+     * reduction tree while removing candidates that are strictly more costly.
+     */
+    std::vector<int> economicalExactKBlocks(int k_groups)
+    {
+        std::vector<int> result;
+        std::set<int> represented_partition_widths;
+        const int maximum = std::min(k_groups, 256);
+        for (int kb = 1; kb <= maximum; ++kb)
+        {
+            const int blocks_per_partition = (k_groups + kb - 1) / kb;
+            if (represented_partition_widths.insert(blocks_per_partition).second)
+                result.push_back(kb);
+        }
+        return result;
+    }
+
+    /**
+     * @brief Enumerate exact K-partition counts for the requested sweep mode.
+     *
+     * The unattended production sweep keeps only the first KB spelling for
+     * each distinct blocks-per-partition width.  Later spellings execute the
+     * same useful arithmetic while publishing one or more trailing zero
+     * partials, so they cannot be economical production winners.
+     *
+     * An explicit candidate-id filter has different semantics: it is a request
+     * to exercise that exact arithmetic and publication schedule.  Diagnostic
+     * integration tests use this path to poison the partial workspace and
+     * prove that trailing empty partitions overwrite stale bytes before the
+     * ordered reducer runs.  Keeping all valid KB values forceable here avoids
+     * weakening that regression while preserving the economical default
+     * corpus.
+     *
+     * @param config Parsed trainer selection filters.
+     * @param k_groups Number of 32-value K groups in the selected shape.
+     * @return Exact KB values to instantiate for this shape.
+     */
+    std::vector<int> exactKBlocksForSweep(
+        const TrainerConfig &config,
+        int k_groups)
+    {
+        if (config.candidate_ids.empty())
+            return economicalExactKBlocks(k_groups);
+
+        std::vector<int> result;
+        const int maximum = std::min(k_groups, 256);
+        result.reserve(static_cast<size_t>(maximum));
+        for (int kb = 1; kb <= maximum; ++kb)
+            result.push_back(kb);
+        return result;
+    }
+
+    std::vector<Candidate> fastM1Candidates(
+        const TrainerConfig &config,
+        int k_groups)
     {
         std::vector<Candidate> result;
         const auto add = [&](Candidate candidate)
@@ -422,21 +699,28 @@ namespace
                  std::pair{256, 4}, std::pair{64, 1}, std::pair{64, 2},
                  std::pair{32, 1}})
         {
-            for (int kb = 1; kb <= 64; ++kb)
+            /*
+             * Exact KB fixes partition boundaries and is therefore part of the
+             * arithmetic identity, not a continuous occupancy hint. Promotion
+             * evidence must represent every distinct reduction tree through
+             * KB256. KB values that produce the same blocks-per-partition as a
+             * smaller KB perform identical useful arithmetic plus trailing zero
+             * partitions, so the larger spelling is strictly dominated and is
+             * excluded by the shared economy rule.
+             */
+            for (const int kb : exactKBlocksForSweep(config, k_groups))
                 add_kpar(tile_n, cpt, kb);
-            for (int kb : std::array{72, 80, 88, 96, 104, 112,
-                                     120, 128, 144, 160, 192, 256})
-            {
-                add_kpar(tile_n, cpt, kb);
-            }
         }
         return result;
     }
 
-    std::vector<Candidate> candidatesForM(int m, const TrainerConfig &config)
+    std::vector<Candidate> candidatesForM(
+        int m,
+        int k_groups,
+        const TrainerConfig &config)
     {
         if (m == 1)
-            return fastM1Candidates(config);
+            return fastM1Candidates(config, k_groups);
         Candidate verifier{
             "cuda.nvnni.decode.verifier.inherit_serial_m1",
             CandidateFamily::InheritSerialM1};
@@ -446,6 +730,31 @@ namespace
             return {};
         }
         return {verifier};
+    }
+
+    /**
+     * @brief Return the explicit trainer-only oracle for an unseen M1 shape.
+     *
+     * A generated production policy cannot resolve a geometry before that
+     * geometry has been measured. The trainer therefore forces one universally
+     * reachable ordered K-partition schedule to establish numerical eligibility
+     * for Fast candidates. This is diagnostic evidence only: the override is
+     * scoped inside the harness, never exposed through production dispatch, and
+     * never used as the verifier oracle after the staged M1 policy exists.
+     */
+    const Candidate &diagnosticM1OracleCandidate()
+    {
+        static const Candidate candidate{
+            "cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb1",
+            CandidateFamily::KPar,
+            128,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1};
+        return candidate;
     }
 
     /** Set and restore PerfStats collection for trainer route proofs. */
@@ -594,6 +903,7 @@ namespace
     };
 
     RouteEvidence findRoute(
+        ExecutionMode mode,
         int m,
         int n,
         int k,
@@ -620,6 +930,7 @@ namespace
             if (tag("m") != std::to_string(m) ||
                 tag("n") != std::to_string(n) ||
                 tag("k") != std::to_string(k) ||
+                tag("execution_mode") != executionModeName(mode) ||
                 tag("codebook") != std::to_string(static_cast<unsigned>(codebook)) ||
                 tag("semantic_contract") != semantic_contract)
             {
@@ -654,7 +965,7 @@ namespace
                cudaStreamSynchronize(stream) == cudaSuccess;
     }
 
-    /** Public-M1 row oracle and the generated route that produced it. */
+    /** Serial-row oracle and the explicit route that produced it. */
     struct SerialEvidence
     {
         bool valid = false;
@@ -667,11 +978,13 @@ namespace
     SerialEvidence runSerialRows(
         ITensorGemm *kernel,
         const TensorBase *grouped_input,
+        ExecutionMode mode,
         int m,
         int n,
         int k,
         uint8_t codebook,
-        DeviceId device)
+        DeviceId device,
+        const Candidate *diagnostic_m1_oracle)
     {
         SerialEvidence result;
         auto fail = [&](const char *reason)
@@ -683,6 +996,9 @@ namespace
             return fail("invalid_arguments");
 
         cudaNativeVNNIGemvSweep_clearConfig();
+        std::optional<CandidateOverride> oracle_override;
+        if (diagnostic_m1_oracle)
+            oracle_override.emplace(*diagnostic_m1_oracle);
         cudaStream_t stream = nullptr;
         if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
             return fail("stream_create");
@@ -702,6 +1018,28 @@ namespace
                 return fail("workspace_allocate");
             }
             workspace_consumer->bindWorkspace(workspace.get());
+
+            /*
+             * Poison the reusable reduction arena before every candidate. This
+             * makes an omitted partial write deterministic and immediately
+             * visible to the serial oracle instead of relying on allocator
+             * history to reproduce stale graph-workspace bytes.
+             */
+            if (workspace->hasBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
+            {
+                void *partials = workspace->getBuffer(
+                    GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                const size_t partial_bytes = workspace->getBufferSize(
+                    GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                if (cudaMemsetAsync(partials, 0xA5, partial_bytes, stream) !=
+                    cudaSuccess)
+                {
+                    workspace_consumer->unbindWorkspace();
+                    kernel->setGPUStream(nullptr);
+                    (void)cudaStreamDestroy(stream);
+                    return fail("workspace_poison");
+                }
+            }
         }
         const auto cleanup = [&]
         {
@@ -712,8 +1050,11 @@ namespace
         };
 
         result.output.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
-        PerfStatsCollector::reset();
         const float *source = static_cast<const float *>(grouped_input->data());
+        std::vector<std::unique_ptr<FP32Tensor>> row_inputs;
+        std::vector<std::unique_ptr<FP32Tensor>> row_outputs;
+        row_inputs.reserve(static_cast<size_t>(m));
+        row_outputs.reserve(static_cast<size_t>(m));
         for (int row = 0; row < m; ++row)
         {
             auto row_input = TestTensorFactory::createFP32(
@@ -725,16 +1066,78 @@ namespace
                 source + static_cast<size_t>(row) * static_cast<size_t>(k),
                 static_cast<size_t>(k) * sizeof(float));
             if (!row_input->ensureOnDevice(device) ||
-                !row_output->allocateOnDevice(device) ||
-                !kernel->multiply_tensor(row_input.get(), row_output.get(), 1, n, k) ||
+                !row_output->allocateOnDevice(device))
+            {
+                cleanup();
+                return fail("serial_row_prepare");
+            }
+            row_inputs.push_back(std::move(row_input));
+            row_outputs.push_back(std::move(row_output));
+        }
+
+        const auto launch_serial_rows = [&]() -> bool
+        {
+            for (int row = 0; row < m; ++row)
+            {
+                if (!kernel->multiply_tensor(
+                        row_inputs[static_cast<size_t>(row)].get(),
+                        row_outputs[static_cast<size_t>(row)].get(),
+                        1,
+                        n,
+                        k))
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        CapturedLaunch captured;
+        if (mode == ExecutionMode::GraphCaptured)
+        {
+            /*
+             * Capture a disposable primer first. This performs any CUDA graph
+             * instantiation work without polluting route evidence, while also
+             * forcing the generated resolver to execute under the captured
+             * surface rather than borrowing the eager M1 route.
+             */
+            CapturedLaunch primer;
+            if (!primer.capture(stream, launch_serial_rows) ||
+                !primer.launch(stream) ||
                 cudaStreamSynchronize(stream) != cudaSuccess)
             {
                 cleanup();
-                return fail("serial_row_launch");
+                return fail("serial_graph_primer");
             }
+            primer.reset();
+            PerfStatsCollector::reset();
+            if (!captured.capture(stream, launch_serial_rows) ||
+                !captured.launch(stream) ||
+                cudaStreamSynchronize(stream) != cudaSuccess)
+            {
+                cleanup();
+                return fail("serial_graph_launch");
+            }
+        }
+        else
+        {
+            PerfStatsCollector::reset();
+            if (!launch_serial_rows() ||
+                cudaStreamSynchronize(stream) != cudaSuccess)
+            {
+                cleanup();
+                return fail("serial_eager_launch");
+            }
+        }
+
+        for (int row = 0; row < m; ++row)
+        {
             std::vector<float> row_host;
             if (!copyDeviceOutput(
-                    row_output.get(), static_cast<size_t>(n), stream, row_host))
+                    row_outputs[static_cast<size_t>(row)].get(),
+                    static_cast<size_t>(n),
+                    stream,
+                    row_host))
             {
                 cleanup();
                 return fail("serial_row_download");
@@ -745,7 +1148,7 @@ namespace
                 result.output.begin() +
                     static_cast<size_t>(row) * static_cast<size_t>(n));
         }
-        result.route = findRoute(1, n, k, codebook, "fast");
+        result.route = findRoute(mode, 1, n, k, codebook, "fast");
         result.valid = result.route.valid &&
                        result.route.count >= static_cast<uint64_t>(m);
         if (!result.valid)
@@ -769,14 +1172,39 @@ namespace
         bool numerical_correctness = false;
         trainer::TimingEvidence timing;
         std::vector<double> samples;
+        std::vector<size_t> sample_measurement_orders;
+        std::vector<uint64_t> sample_order_seeds;
+        int timed_replays = 0;
         double effective_bandwidth_gbs = 0.0;
     };
 
-    CandidateEvidence runCandidate(
+    /** Complete result for one sample-interleaved broad candidate matrix. */
+    struct InterleavedCandidateBatch
+    {
+        bool valid = false;
+        std::string failure;
+        std::vector<CandidateEvidence> evidence;
+        int isolated_profile_launches = 0;
+    };
+
+    /**
+     * @brief Measure a complete broad candidate set in shuffled sample rounds.
+     *
+     * Candidate-block timing is vulnerable to slow device clock and thermal
+     * drift: candidate A can finish all thirty samples before candidate B even
+     * begins. Randomizing that block once removes registry-order bias across
+     * cells but does not make the two medians contemporaneous. This routine
+     * prepares correctness, workspace, and captured graphs once per candidate,
+     * then runs exactly one timed window for every candidate in each shuffled
+     * round. All candidates therefore see the same sequence of device states.
+     *
+     * @return Per-candidate evidence in the same order as @p candidates.
+     */
+    InterleavedCandidateBatch runCandidatesInterleaved(
         ITensorGemm *kernel,
         TensorBase *input,
         const SerialEvidence &serial,
-        const Candidate &candidate,
+        const std::vector<Candidate> &candidates,
         ExecutionMode mode,
         int m,
         int n,
@@ -785,25 +1213,63 @@ namespace
         size_t weight_bytes,
         int warmups,
         int sample_count,
+        int timed_replay_cap,
+        uint64_t cell_order_seed,
+        const std::string &profiler_request_id,
         DeviceId device)
     {
-        CandidateEvidence result;
-        auto fail = [&](const char *reason)
+        InterleavedCandidateBatch result;
+        if (!kernel || !input || !serial.valid || candidates.empty() ||
+            warmups < 0 || sample_count <= 0 || timed_replay_cap <= 0)
         {
-            result.failure = reason;
+            result.failure = "invalid_arguments";
             return result;
-        };
-        if (!kernel || !input || !serial.valid || sample_count <= 0)
-            return fail("invalid_arguments");
+        }
 
-        CandidateOverride override(candidate);
+        struct PreparedCandidate
+        {
+            const Candidate *candidate = nullptr;
+            CandidateEvidence evidence;
+            std::unique_ptr<CapturedLaunch> captured;
+        };
+
         cudaStream_t stream = nullptr;
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
-            return fail("stream_create");
-        result.explicit_stream_ok = stream != nullptr;
-        kernel->setGPUStream(stream);
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
         auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
         std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::vector<PreparedCandidate> prepared;
+
+        const auto cleanup = [&]
+        {
+            if (start)
+                (void)cudaEventDestroy(start);
+            if (stop)
+                (void)cudaEventDestroy(stop);
+            for (PreparedCandidate &state : prepared)
+            {
+                if (state.captured)
+                    state.captured->reset();
+            }
+            if (workspace_consumer)
+                workspace_consumer->unbindWorkspace();
+            kernel->setGPUStream(nullptr);
+            if (stream)
+                (void)cudaStreamDestroy(stream);
+        };
+        const auto fail = [&](const std::string &reason)
+        {
+            result.failure = reason;
+            cleanup();
+            return std::move(result);
+        };
+
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) !=
+            cudaSuccess)
+        {
+            return fail("stream_create");
+        }
+        kernel->setGPUStream(stream);
         if (workspace_consumer)
         {
             const auto requirements = workspace_consumer->getWorkspaceRequirements(
@@ -811,24 +1277,18 @@ namespace
             workspace = std::make_unique<DeviceWorkspaceManager>(
                 device, workspaceBudgetFor(requirements));
             if (!workspace->allocate(requirements))
-            {
-                kernel->setGPUStream(nullptr);
-                (void)cudaStreamDestroy(stream);
                 return fail("workspace_allocate");
-            }
             workspace_consumer->bindWorkspace(workspace.get());
         }
-        result.workspace_ok = true;
 
         auto output = TestTensorFactory::createFP32(
             {static_cast<size_t>(m), static_cast<size_t>(n)});
         if (!input->ensureOnDevice(device) || !output->allocateOnDevice(device))
-        {
-            if (workspace_consumer)
-                workspace_consumer->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
-            (void)cudaStreamDestroy(stream);
             return fail("tensor_prepare");
+        if (cudaEventCreate(&start) != cudaSuccess ||
+            cudaEventCreate(&stop) != cudaSuccess)
+        {
+            return fail("event_create");
         }
 
         const auto run_once = [&]() -> bool
@@ -847,154 +1307,582 @@ namespace
             }
             return kernel->multiply_tensor(input, output.get(), m, n, k);
         };
-        CapturedLaunch captured;
-        if (mode == ExecutionMode::GraphCaptured)
+        const auto execute_once = [&](PreparedCandidate &state) -> bool
         {
-            // Prime lazy, non-captured host setup before starting capture.
-            if (!run_once() || cudaStreamSynchronize(stream) != cudaSuccess)
-            {
-                if (workspace_consumer)
-                    workspace_consumer->unbindWorkspace();
-                kernel->setGPUStream(nullptr);
-                (void)cudaStreamDestroy(stream);
-                return fail("graph_primer");
-            }
-            PerfStatsCollector::reset();
-            result.graph_capture_ok = captured.capture(stream, run_once);
-            if (!result.graph_capture_ok)
-            {
-                if (workspace_consumer)
-                    workspace_consumer->unbindWorkspace();
-                kernel->setGPUStream(nullptr);
-                (void)cudaStreamDestroy(stream);
-                return fail("graph_capture");
-            }
-        }
-        else
-        {
-            result.graph_capture_ok = true;
-            PerfStatsCollector::reset();
-        }
-        const auto execute_once = [&]() -> bool
-        {
-            return mode == ExecutionMode::GraphCaptured
-                       ? captured.launch(stream)
-                       : run_once();
-        };
-        const auto cleanup = [&]
-        {
-            captured.reset();
-            if (workspace_consumer)
-                workspace_consumer->unbindWorkspace();
-            kernel->setGPUStream(nullptr);
-            (void)cudaStreamDestroy(stream);
+            if (mode == ExecutionMode::GraphCaptured)
+                return state.captured && state.captured->launch(stream);
+            CandidateOverride override(*state.candidate);
+            return run_once();
         };
 
-        if (!execute_once() || cudaStreamSynchronize(stream) != cudaSuccess)
+        prepared.reserve(candidates.size());
+        for (const Candidate &candidate : candidates)
         {
-            cleanup();
-            return fail("candidate_launch");
-        }
-        result.route = findRoute(
-            m,
-            n,
-            k,
-            codebook,
-            m == 1 ? "fast" : "verifier_serial_m1_bitwise");
-        std::vector<float> first_output;
-        if (!copyDeviceOutput(
-                output.get(),
-                static_cast<size_t>(m) * static_cast<size_t>(n),
-                stream,
-                first_output) ||
-            !execute_once() ||
-            cudaStreamSynchronize(stream) != cudaSuccess)
-        {
-            cleanup();
-            return fail("repeat_launch");
-        }
-        std::vector<float> repeated_output;
-        if (!copyDeviceOutput(
-                output.get(),
-                static_cast<size_t>(m) * static_cast<size_t>(n),
-                stream,
-                repeated_output))
-        {
-            cleanup();
-            return fail("repeat_download");
-        }
-        result.repeat_byte_mismatches = trainer::nativeByteMismatchCount(
-            first_output, repeated_output);
-        result.comparison = trainer::compareFP32(
-            repeated_output, serial.output, static_cast<size_t>(n));
-        result.numerical_correctness =
-            result.comparison.nonfinite_count == 0 &&
-            result.comparison.cosine >= 0.999;
+            PreparedCandidate state;
+            state.candidate = &candidate;
+            state.evidence.explicit_stream_ok = stream != nullptr;
+            state.evidence.workspace_ok = true;
+            state.evidence.graph_capture_ok =
+                mode == ExecutionMode::Eager;
 
+            if (mode == ExecutionMode::GraphCaptured)
+            {
+                /*
+                 * The primer resolves lazy host setup. The scoped override is
+                 * needed only while the graph nodes are recorded; replay uses
+                 * the concrete launch parameters embedded in that graph.
+                 */
+                {
+                    CandidateOverride override(candidate);
+                    if (!run_once() ||
+                        cudaStreamSynchronize(stream) != cudaSuccess)
+                    {
+                        return fail(candidate.id + ":graph_primer");
+                    }
+                }
+                PerfStatsCollector::reset();
+                state.captured = std::make_unique<CapturedLaunch>();
+                {
+                    CandidateOverride override(candidate);
+                    state.evidence.graph_capture_ok = state.captured->capture(
+                        stream, run_once);
+                }
+                if (!state.evidence.graph_capture_ok)
+                    return fail(candidate.id + ":graph_capture");
+            }
+            else
+            {
+                PerfStatsCollector::reset();
+            }
+
+            prepared.push_back(std::move(state));
+            PreparedCandidate &current = prepared.back();
+            if (!execute_once(current) ||
+                cudaStreamSynchronize(stream) != cudaSuccess)
+            {
+                return fail(candidate.id + ":candidate_launch");
+            }
+            current.evidence.route = findRoute(
+                mode,
+                m,
+                n,
+                k,
+                codebook,
+                m == 1 ? "fast" : "verifier_serial_m1_bitwise");
+
+            std::vector<float> first_output;
+            if (!copyDeviceOutput(
+                    output.get(),
+                    static_cast<size_t>(m) * static_cast<size_t>(n),
+                    stream,
+                    first_output) ||
+                !execute_once(current) ||
+                cudaStreamSynchronize(stream) != cudaSuccess)
+            {
+                return fail(candidate.id + ":repeat_launch");
+            }
+            std::vector<float> repeated_output;
+            if (!copyDeviceOutput(
+                    output.get(),
+                    static_cast<size_t>(m) * static_cast<size_t>(n),
+                    stream,
+                    repeated_output))
+            {
+                return fail(candidate.id + ":repeat_download");
+            }
+            current.evidence.repeat_byte_mismatches =
+                trainer::nativeByteMismatchCount(
+                    first_output, repeated_output);
+            current.evidence.comparison = trainer::compareFP32(
+                repeated_output,
+                serial.output,
+                static_cast<size_t>(m) * static_cast<size_t>(n));
+            current.evidence.numerical_correctness =
+                current.evidence.comparison.nonfinite_count == 0 &&
+                current.evidence.comparison.cosine >= 0.999;
+
+            int timed_replays = timed_replay_cap;
+            if (timed_replay_cap > 1)
+            {
+                if (cudaEventRecord(start, stream) != cudaSuccess ||
+                    !execute_once(current) ||
+                    cudaEventRecord(stop, stream) != cudaSuccess ||
+                    cudaEventSynchronize(stop) != cudaSuccess)
+                {
+                    return fail(candidate.id + ":timed_probe");
+                }
+                float probe_ms = 0.0f;
+                if (cudaEventElapsedTime(&probe_ms, start, stop) != cudaSuccess)
+                    return fail(candidate.id + ":timed_probe_read");
+                const double probe_us =
+                    static_cast<double>(probe_ms) * 1000.0;
+                if (probe_us > 0.0)
+                {
+                    timed_replays = std::clamp(
+                        static_cast<int>(std::ceil(
+                            kTargetTimedWindowUs / probe_us)),
+                        1,
+                        timed_replay_cap);
+                }
+            }
+            current.evidence.timed_replays = timed_replays;
+            current.evidence.samples.reserve(
+                static_cast<size_t>(sample_count));
+            current.evidence.sample_measurement_orders.reserve(
+                static_cast<size_t>(sample_count));
+            current.evidence.sample_order_seeds.reserve(
+                static_cast<size_t>(sample_count));
+            current.evidence.valid = current.evidence.route.valid;
+            if (!current.evidence.valid)
+                return fail(candidate.id + ":route_proof");
+        }
+
+        std::vector<size_t> order(prepared.size());
+        std::iota(order.begin(), order.end(), 0u);
         for (int warmup = 0; warmup < warmups; ++warmup)
         {
-            if (!execute_once())
+            std::iota(order.begin(), order.end(), 0u);
+            const uint64_t seed = pairedOrderSeed(
+                cell_order_seed,
+                static_cast<size_t>(sample_count + warmup));
+            std::mt19937_64 engine(seed);
+            std::shuffle(order.begin(), order.end(), engine);
+            for (const size_t index : order)
             {
-                cleanup();
-                return fail("warmup_launch");
+                if (!execute_once(prepared[index]))
+                    return fail("interleaved_warmup_launch");
             }
-        }
-        if (cudaStreamSynchronize(stream) != cudaSuccess)
-        {
-            cleanup();
-            return fail("warmup_sync");
+            if (cudaStreamSynchronize(stream) != cudaSuccess)
+                return fail("interleaved_warmup_sync");
         }
 
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
-        if (cudaEventCreate(&start) != cudaSuccess ||
-            cudaEventCreate(&stop) != cudaSuccess)
+        if (!profiler_request_id.empty())
         {
-            if (start)
-                (void)cudaEventDestroy(start);
-            if (stop)
-                (void)cudaEventDestroy(stop);
-            cleanup();
-            return fail("event_create");
+            if (prepared.size() != 1)
+                return fail("profiler_requires_one_candidate");
+            /*
+             * Nsight Compute starts with collection disabled. Setup, graph
+             * capture, correctness launches, route proof, and warmup above are
+             * therefore absent from the profiler report. The only enabled
+             * work is this one production candidate launch (or graph replay)
+             * and its completion synchronization. This launch is not appended
+             * to any canonical timing sample.
+             */
+            if (!invokeCudaProfilerControl("cuProfilerStart"))
+                return fail("profiler_start");
+            const bool launch_ok = execute_once(prepared.front());
+            const cudaError_t synchronize_status =
+                cudaStreamSynchronize(stream);
+            const bool stop_ok =
+                invokeCudaProfilerControl("cuProfilerStop");
+            if (!launch_ok || synchronize_status != cudaSuccess ||
+                !stop_ok)
+            {
+                return fail("profiler_target_launch");
+            }
+            result.isolated_profile_launches = 1;
+            std::fprintf(
+                stderr,
+                "[NativeVNNIProfiler][CUDA] request=%s candidate=%s "
+                "mode=%s M=%d N=%d K=%d launches=1\n",
+                profiler_request_id.c_str(),
+                prepared.front().candidate->id.c_str(),
+                executionModeName(mode),
+                m,
+                n,
+                k);
         }
-        result.samples.reserve(static_cast<size_t>(sample_count));
+
+        /*
+         * A two-candidate confirmation must balance the first-launch role by
+         * construction. Independent shuffles only balance in expectation and
+         * can give one candidate a persistent clock, cache, or temperature
+         * advantage in a finite run. The cell seed chooses which role starts
+         * the alternating sequence, then every following sample reverses it.
+         * Even sample counts are exactly balanced; odd counts differ by one.
+         */
+        const size_t first_candidate_offset =
+            static_cast<size_t>(cell_order_seed & 1ULL);
         for (int sample = 0; sample < sample_count; ++sample)
         {
-            if (cudaEventRecord(start, stream) != cudaSuccess ||
-                !execute_once() ||
-                cudaEventRecord(stop, stream) != cudaSuccess ||
-                cudaEventSynchronize(stop) != cudaSuccess)
+            std::iota(order.begin(), order.end(), 0u);
+            const uint64_t sample_seed = pairedOrderSeed(
+                cell_order_seed, static_cast<size_t>(sample));
+            if (prepared.size() == 2)
             {
-                (void)cudaEventDestroy(start);
-                (void)cudaEventDestroy(stop);
-                cleanup();
-                return fail("timed_launch");
+                if ((static_cast<size_t>(sample) + first_candidate_offset) % 2 != 0)
+                    std::reverse(order.begin(), order.end());
             }
-            float elapsed_ms = 0.0f;
-            if (cudaEventElapsedTime(&elapsed_ms, start, stop) != cudaSuccess)
+            else
             {
-                (void)cudaEventDestroy(start);
-                (void)cudaEventDestroy(stop);
-                cleanup();
-                return fail("timed_read");
+                std::mt19937_64 engine(sample_seed);
+                std::shuffle(order.begin(), order.end(), engine);
             }
-            result.samples.push_back(static_cast<double>(elapsed_ms) * 1000.0);
+            for (size_t within_sample_order = 0;
+                 within_sample_order < order.size();
+                 ++within_sample_order)
+            {
+                PreparedCandidate &current = prepared[order[within_sample_order]];
+                if (cudaEventRecord(start, stream) != cudaSuccess)
+                    return fail("interleaved_timed_launch");
+                for (int replay = 0;
+                     replay < current.evidence.timed_replays;
+                     ++replay)
+                {
+                    if (!execute_once(current))
+                        return fail("interleaved_timed_launch");
+                }
+                if (cudaEventRecord(stop, stream) != cudaSuccess ||
+                    cudaEventSynchronize(stop) != cudaSuccess)
+                {
+                    return fail("interleaved_timed_launch");
+                }
+                float elapsed_ms = 0.0f;
+                if (cudaEventElapsedTime(&elapsed_ms, start, stop) != cudaSuccess)
+                    return fail("interleaved_timed_read");
+                current.evidence.samples.push_back(
+                    static_cast<double>(elapsed_ms) * 1000.0 /
+                    static_cast<double>(current.evidence.timed_replays));
+                current.evidence.sample_measurement_orders.push_back(
+                    within_sample_order);
+                current.evidence.sample_order_seeds.push_back(sample_seed);
+            }
         }
-        (void)cudaEventDestroy(start);
-        (void)cudaEventDestroy(stop);
-        std::sort(result.samples.begin(), result.samples.end());
-        result.timing = trainer::summarizeSortedTimingSamples(result.samples);
-        if (result.timing.median > 0.0)
+
+        result.evidence.reserve(prepared.size());
+        for (PreparedCandidate &state : prepared)
         {
-            result.effective_bandwidth_gbs =
-                static_cast<double>(weight_bytes) /
-                (result.timing.median * 1.0e-6) / 1.0e9;
+            std::vector<double> sorted_samples = state.evidence.samples;
+            std::sort(sorted_samples.begin(), sorted_samples.end());
+            state.evidence.timing =
+                trainer::summarizeSortedTimingSamples(sorted_samples);
+            if (state.evidence.timing.median > 0.0)
+            {
+                state.evidence.effective_bandwidth_gbs =
+                    static_cast<double>(weight_bytes) /
+                    (state.evidence.timing.median * 1.0e-6) / 1.0e9;
+            }
+            result.evidence.push_back(std::move(state.evidence));
         }
-        result.valid = result.route.valid;
-        if (!result.valid)
-            result.failure = "route_proof";
         cleanup();
+        result.valid = true;
         return result;
+    }
+
+    /**
+     * @brief Emit one candidate observation from an interleaved timing pair.
+     *
+     * The paired sidecar intentionally has its own schema. It is confirmation
+     * evidence for a frozen decision, not broad fitting evidence, and must not
+     * be accepted by the ordinary CUDA corpus adapter. Pair index, within-pair
+     * order, and both deterministic seeds are retained so the Python
+     * certificate can reject missing, duplicated, or non-interleaved rows.
+     */
+    void writePairedSample(
+        std::FILE *file,
+        const std::string &request_id,
+        const FormatSpec &format,
+        const Shape &shape,
+        ExecutionMode mode,
+        int m,
+        uint8_t source_codebook,
+        uint8_t execution_codebook,
+        size_t pair_index,
+        size_t within_pair_order,
+        uint64_t cell_order_seed,
+        uint64_t pair_order_seed,
+        const char *candidate_role,
+        const Candidate &candidate,
+        const CandidateEvidence &evidence,
+        double latency,
+        const SerialEvidence &serial,
+        const TrainerConfig &config,
+        bool correctness_pass)
+    {
+        if (!file || !std::isfinite(latency) || latency <= 0.0)
+            throw std::runtime_error("paired CUDA evidence has invalid latency");
+        const auto &comparison = evidence.comparison;
+        std::fprintf(
+            file,
+            "cuda-paired-interleaved-v2,%s,cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,"
+            "%zu,%d,%zu,%llu,%llu,%s,%s,%d,%.9f,%a,%d,%zu,%zu,%zu,"
+            "%.17g,%.17g,%.17g,%.17g,%s,%s,%d,%d,%d,%d,%s,%s,%d,%d,%d,"
+            "%s,%d,%d\n",
+            request_id.c_str(),
+            format.name.c_str(),
+            static_cast<unsigned>(source_codebook),
+            static_cast<unsigned>(execution_codebook),
+            shape.name.c_str(),
+            executionModeName(mode),
+            m,
+            shape.N,
+            shape.K,
+            pair_index,
+            config.samples,
+            within_pair_order,
+            static_cast<unsigned long long>(cell_order_seed),
+            static_cast<unsigned long long>(pair_order_seed),
+            candidate_role,
+            candidate.id.c_str(),
+            evidence.timed_replays,
+            latency,
+            latency,
+            config.warmups,
+            comparison.mismatch_count,
+            comparison.first_mismatch_index,
+            evidence.repeat_byte_mismatches,
+            comparison.max_abs,
+            comparison.relative_l2,
+            comparison.cosine,
+            comparison.symmetric_kld,
+            comparison.actual_digest.c_str(),
+            comparison.expected_digest.c_str(),
+            evidence.graph_capture_ok ? 1 : 0,
+            evidence.workspace_ok ? 1 : 0,
+            evidence.explicit_stream_ok ? 1 : 0,
+            evidence.route.valid ? 1 : 0,
+            evidence.route.candidate_id.c_str(),
+            evidence.route.path.c_str(),
+            evidence.route.tile_n,
+            evidence.route.cpt,
+            evidence.route.effective_kb,
+            serial.route.candidate_id.c_str(),
+            evidence.numerical_correctness ? 1 : 0,
+            correctness_pass ? 1 : 0);
+    }
+
+    /**
+     * @brief Execute every concrete edge in one typed paired request manifest.
+     *
+     * The manifest is authoritative for format, shape, execution mode, and the
+     * two forceable candidate IDs. For each request the persistent interleaved
+     * runner prepares one explicit stream, production workspace, output tensor,
+     * and captured graph per candidate. It then executes one timing window per
+     * candidate in independently shuffled sample rounds. This matches the broad
+     * trainer lifecycle while making selected/reference samples contemporary.
+     *
+     * Multiple tournament edges for the same runtime cell are written to one
+     * v2 CSV. The request ID gives every edge an independent pair-index
+     * namespace, allowing the strict Python reader to consume the transaction
+     * without splitting files or guessing candidate relationships.
+     */
+    void runPairedConfirmation(
+        const TrainerConfig &config,
+        DeviceId device)
+    {
+        ASSERT_TRUE(config.pairedConfirmation());
+        ASSERT_EQ(config.m_values, std::vector<int>({1}))
+            << "paired CUDA confirmation currently certifies Fast M1 only";
+        ASSERT_FALSE(config.paired_requests.empty());
+
+        const std::filesystem::path output_path(config.paired_path);
+        if (!output_path.parent_path().empty())
+            std::filesystem::create_directories(output_path.parent_path());
+        std::FILE *output = std::fopen(config.paired_path.c_str(), "w");
+        ASSERT_NE(output, nullptr) << config.paired_path;
+        std::fprintf(
+            output,
+            "protocol_version,request_id,backend,phase,source_format,source_codebook,"
+            "execution_codebook,shape,execution_mode,m,n,k,pair_index,"
+            "configured_pair_count,within_pair_order,cell_order_seed,"
+            "pair_order_seed,candidate_role,candidate_id,timed_replays,"
+            "latency_us,latency_us_hex,warmup_count,bit_mismatches,"
+            "first_bit_mismatch,repeat_byte_mismatches,max_abs,relative_l2,"
+            "cosine,symmetric_kld,grouped_output_digest,serial_output_digest,"
+            "graph_capture_ok,workspace_ok,explicit_stream_ok,route_counter_ok,"
+            "observed_candidate_id,observed_path,observed_tile_n,observed_cpt,"
+            "observed_effective_kb,serial_m1_candidate_id,numerical_correctness,"
+            "correctness_pass\n");
+
+        size_t executed_cases = 0;
+        for (const auto &request : config.paired_requests)
+        {
+            const auto format_iterator = std::find_if(
+                kFormats.begin(),
+                kFormats.end(),
+                [&](const FormatSpec &format)
+                { return lower(format.name) == lower(request.source_format); });
+            ASSERT_NE(format_iterator, kFormats.end())
+                << request.request_id << " unknown format "
+                << request.source_format;
+            const FormatSpec &format = *format_iterator;
+
+            const auto shape_iterator = std::find_if(
+                trainingShapes().begin(),
+                trainingShapes().end(),
+                [&](const Shape &shape)
+                { return shape.name == request.shape; });
+            ASSERT_NE(shape_iterator, trainingShapes().end())
+                << request.request_id << " unknown shape " << request.shape;
+            const Shape &shape = *shape_iterator;
+            ASSERT_EQ(shape.N, request.n) << request.request_id;
+            ASSERT_EQ(shape.K, request.k) << request.request_id;
+            ASSERT_EQ(request.m, 1) << request.request_id;
+
+            ExecutionMode mode = ExecutionMode::Eager;
+            if (request.execution_mode == "eager")
+                mode = ExecutionMode::Eager;
+            else if (request.execution_mode == "graph_captured")
+                mode = ExecutionMode::GraphCaptured;
+            else
+            {
+                FAIL() << request.request_id << " unsupported execution mode";
+            }
+
+            auto weights = format.create(
+                static_cast<size_t>(shape.N),
+                static_cast<size_t>(shape.K));
+            ASSERT_NE(weights, nullptr) << request.request_id;
+            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(
+                weights.get());
+            ASSERT_NE(unpackable, nullptr) << request.request_id;
+            const NativeVnniFormatInfo *source_info =
+                unpackable->vnniFormatInfo();
+            ASSERT_NE(source_info, nullptr) << request.request_id;
+            ASSERT_EQ(
+                static_cast<int>(source_info->codebook_id),
+                request.source_codebook) << request.request_id;
+
+            auto prepared = makeGpuPreparedGemm(
+                weights.get(),
+                device,
+                "perf.cuda_native_vnni_decode_paired.weight");
+            ASSERT_NE(prepared.kernel, nullptr) << request.request_id;
+            DeviceNativeVNNIMatrixDesc matrix_desc;
+            ASSERT_TRUE(prepared.kernel->exportNativeVNNIMatrixDesc(matrix_desc))
+                << request.request_id;
+            ASSERT_EQ(
+                static_cast<int>(matrix_desc.codebook_id),
+                request.execution_codebook) << request.request_id;
+
+            TrainerConfig pair_config = config;
+            pair_config.candidate_ids = {
+                lower(request.selected_candidate_id),
+                lower(request.exact_candidate_id),
+            };
+            const std::vector<Candidate> candidates = candidatesForM(
+                request.m, shape.K / 32, pair_config);
+            ASSERT_EQ(candidates.size(), 2u)
+                << request.request_id
+                << " did not resolve both concrete paired candidates";
+            const auto candidate_by_id = [&](const std::string &id)
+                -> const Candidate *
+            {
+                const auto iterator = std::find_if(
+                    candidates.begin(),
+                    candidates.end(),
+                    [&](const Candidate &candidate)
+                    { return candidate.id == lower(id); });
+                return iterator == candidates.end() ? nullptr : &*iterator;
+            };
+            const Candidate *selected_candidate = candidate_by_id(
+                request.selected_candidate_id);
+            const Candidate *exact_candidate = candidate_by_id(
+                request.exact_candidate_id);
+            ASSERT_NE(selected_candidate, nullptr) << request.request_id;
+            ASSERT_NE(exact_candidate, nullptr) << request.request_id;
+
+            auto input = TestTensorFactory::createFP32Random(
+                {1u, static_cast<size_t>(shape.K)},
+                -0.25f,
+                0.25f,
+                0xC0DBu);
+            const SerialEvidence serial = runSerialRows(
+                prepared.kernel,
+                input.get(),
+                mode,
+                request.m,
+                shape.N,
+                shape.K,
+                matrix_desc.codebook_id,
+                device,
+                &diagnosticM1OracleCandidate());
+            ASSERT_TRUE(serial.valid)
+                << request.request_id << " serial failure=" << serial.failure;
+
+            const uint64_t cell_seed = pairedRequestSeed(
+                measurementOrderSeed(format, shape, request.m, mode),
+                request.request_id);
+            const std::vector<Candidate> paired_candidates = {
+                *selected_candidate,
+                *exact_candidate,
+            };
+            InterleavedCandidateBatch batch = runCandidatesInterleaved(
+                prepared.kernel,
+                input.get(),
+                serial,
+                paired_candidates,
+                mode,
+                request.m,
+                shape.N,
+                shape.K,
+                matrix_desc.codebook_id,
+                weights->size_bytes(),
+                config.warmups,
+                config.samples,
+                config.timed_replay_cap,
+                cell_seed,
+                config.profiler_request_id,
+                device);
+            ASSERT_TRUE(batch.valid)
+                << request.request_id
+                << " paired interleaved failure=" << batch.failure;
+            ASSERT_EQ(batch.evidence.size(), paired_candidates.size());
+
+            for (size_t candidate_index = 0;
+                 candidate_index < paired_candidates.size();
+                 ++candidate_index)
+            {
+                const Candidate &candidate = paired_candidates[candidate_index];
+                const CandidateEvidence &evidence = batch.evidence[candidate_index];
+                const bool correctness_pass =
+                    evidence.route.candidate_id == candidate.id &&
+                    evidence.repeat_byte_mismatches == 0 &&
+                    evidence.numerical_correctness;
+                ASSERT_TRUE(correctness_pass)
+                    << request.request_id << " candidate=" << candidate.id;
+                ASSERT_EQ(
+                    evidence.samples.size(),
+                    static_cast<size_t>(config.samples));
+                ASSERT_EQ(
+                    evidence.sample_measurement_orders.size(),
+                    evidence.samples.size());
+                ASSERT_EQ(
+                    evidence.sample_order_seeds.size(),
+                    evidence.samples.size());
+                const char *role = candidate_index == 0 ? "selected" : "exact";
+                for (int pair_index = 0; pair_index < config.samples; ++pair_index)
+                {
+                    writePairedSample(
+                        output,
+                        request.request_id,
+                        format,
+                        shape,
+                        mode,
+                        request.m,
+                        source_info->codebook_id,
+                        matrix_desc.codebook_id,
+                        static_cast<size_t>(pair_index),
+                        evidence.sample_measurement_orders[
+                            static_cast<size_t>(pair_index)],
+                        cell_seed,
+                        evidence.sample_order_seeds[
+                            static_cast<size_t>(pair_index)],
+                        role,
+                        candidate,
+                        evidence,
+                        evidence.samples[static_cast<size_t>(pair_index)],
+                        serial,
+                        config,
+                        correctness_pass);
+                }
+            }
+            std::fflush(output);
+            ++executed_cases;
+        }
+        std::fclose(output);
+        ASSERT_EQ(executed_cases, config.paired_requests.size())
+            << "CUDA paired confirmation did not execute the complete manifest";
     }
 
     /** Aggregate row retained until the winner bit is known. */
@@ -1005,6 +1893,8 @@ namespace
         Candidate candidate;
         ExecutionMode mode = ExecutionMode::Eager;
         int m = 0;
+        size_t measurement_order = 0;
+        uint64_t measurement_order_seed = 0;
         uint8_t source_codebook = 0;
         uint8_t execution_codebook = 0;
         size_t weight_bytes = 0;
@@ -1018,6 +1908,14 @@ namespace
         std::FILE *file,
         const MeasuredRow &row)
     {
+        if (row.candidate_evidence.sample_measurement_orders.size() !=
+                row.candidate_evidence.samples.size() ||
+            row.candidate_evidence.sample_order_seeds.size() !=
+                row.candidate_evidence.samples.size())
+        {
+            throw std::runtime_error(
+                "interleaved CUDA timing metadata does not match samples");
+        }
         for (size_t index = 0;
              index < row.candidate_evidence.samples.size();
              ++index)
@@ -1025,17 +1923,24 @@ namespace
             const double latency = row.candidate_evidence.samples[index];
             std::fprintf(
                 file,
-                "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,1,%.9f,%a\n",
+                "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%zu,%llu,%zu,%d,%.9f,%a\n",
                 row.format->name.c_str(),
                 static_cast<unsigned>(row.source_codebook),
                 static_cast<unsigned>(row.execution_codebook),
                 row.shape->name.c_str(),
                 executionModeName(row.mode),
                 row.m,
-                row.shape->n,
-                row.shape->k,
+                row.shape->N,
+                row.shape->K,
                 row.candidate.id.c_str(),
+                row.measurement_order,
+                static_cast<unsigned long long>(row.measurement_order_seed),
+                kBroadMeasurementProtocol,
+                row.candidate_evidence.sample_measurement_orders[index],
+                static_cast<unsigned long long>(
+                    row.candidate_evidence.sample_order_seeds[index]),
                 index,
+                row.candidate_evidence.timed_replays,
                 latency,
                 latency);
         }
@@ -1050,7 +1955,7 @@ namespace
         const auto &comparison = evidence.comparison;
         std::fprintf(
             file,
-            "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%s,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%zu,"
+            "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%zu,"
             "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,%.17g,%.17g,%.17g,%.17g,%s,%s,%s,"
             "1,%d,1,1,%d,%s,%s,%d,%d,%d,%s,1,%d,%d,%d\n",
             row.format->name.c_str(),
@@ -1059,9 +1964,12 @@ namespace
             row.shape->name.c_str(),
             executionModeName(row.mode),
             row.m,
-            row.shape->n,
-            row.shape->k,
+            row.shape->N,
+            row.shape->K,
             row.candidate.id.c_str(),
+            row.measurement_order,
+            static_cast<unsigned long long>(row.measurement_order_seed),
+            kBroadMeasurementProtocol,
             row.candidate.familyName().c_str(),
             row.candidate.tile_n,
             row.candidate.cpt,
@@ -1122,6 +2030,11 @@ namespace
     {
         ScopedPerfStatsEnvironment perf_stats;
         const TrainerConfig config = loadTrainerConfig();
+        if (config.pairedConfirmation())
+        {
+            runPairedConfirmation(config, device_);
+            return;
+        }
         std::filesystem::create_directories(
             std::filesystem::path(config.aggregate_path).parent_path());
         std::filesystem::create_directories(
@@ -1134,7 +2047,7 @@ namespace
         std::fprintf(
             aggregate,
             "backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,"
-            "candidate_id,family,tile_n,cpt,target_waves,mkg,max_kb,exact_kb,force_two_phase,weight_bytes,warmup_count,"
+            "candidate_id,measurement_order,measurement_order_seed,measurement_protocol,family,tile_n,cpt,target_waves,mkg,max_kb,exact_kb,force_two_phase,weight_bytes,warmup_count,"
             "sample_count,min_us,median_us,p95_us,mad_us,cv,effective_bandwidth_gbs,bit_mismatches,"
             "first_bit_mismatch,repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,"
             "grouped_output_digest,serial_output_digest,timing_sample_digest,supported,graph_capture_ok,"
@@ -1144,14 +2057,15 @@ namespace
         std::fprintf(
             timing,
             "backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,"
-            "candidate_id,sample_index,timed_replays,latency_us,latency_us_hex\n");
+            "candidate_id,measurement_order,measurement_order_seed,measurement_protocol,sample_measurement_order,sample_order_seed,sample_index,timed_replays,latency_us,latency_us_hex\n");
 
         int executed_cases = 0;
+        int isolated_profile_launches = 0;
         for (const FormatSpec &format : kFormats)
         {
             if (!selected(config.formats, format.name))
                 continue;
-            for (const Shape &shape : kProductionShapes)
+            for (const Shape &shape : trainingShapes())
             {
                 if (!selected(config.shapes, shape.name))
                     continue;
@@ -1159,8 +2073,8 @@ namespace
                     break;
 
                 auto weights = format.create(
-                    static_cast<size_t>(shape.n),
-                    static_cast<size_t>(shape.k));
+                    static_cast<size_t>(shape.N),
+                    static_cast<size_t>(shape.K));
                 ASSERT_NE(weights, nullptr) << format.name;
                 const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(
                     weights.get());
@@ -1180,45 +2094,75 @@ namespace
                 for (const int m : config.m_values)
                 {
                     const std::vector<Candidate> candidates = candidatesForM(
-                        m, config);
+                        m, shape.K / 32, config);
                     ASSERT_FALSE(candidates.empty())
                         << "No CUDA candidates selected for M=" << m;
                     auto input = TestTensorFactory::createFP32Random(
-                        {static_cast<size_t>(m), static_cast<size_t>(shape.k)},
+                        {static_cast<size_t>(m), static_cast<size_t>(shape.K)},
                         -0.25f,
                         0.25f,
                         0xC0DAu + static_cast<uint32_t>(m));
-                    const SerialEvidence serial = runSerialRows(
-                        prepared.kernel,
-                        input.get(),
-                        m,
-                        shape.n,
-                        shape.k,
-                        matrix_desc.codebook_id,
-                        device_);
-                    ASSERT_TRUE(serial.valid)
-                        << format.name << " " << shape.name << " M=" << m
-                        << " serial failure=" << serial.failure;
-
                     std::vector<MeasuredRow> rows;
                     for (const ExecutionMode mode : config.execution_modes)
                     {
-                        for (const Candidate &candidate : candidates)
-                        {
-                            CandidateEvidence evidence = runCandidate(
+                        const SerialEvidence serial = runSerialRows(
+                            prepared.kernel,
+                            input.get(),
+                            mode,
+                            m,
+                            shape.N,
+                            shape.K,
+                            matrix_desc.codebook_id,
+                            device_,
+                            m == 1 ? &diagnosticM1OracleCandidate() : nullptr);
+                        ASSERT_TRUE(serial.valid)
+                            << format.name << " " << shape.name << " M=" << m
+                            << " mode=" << executionModeName(mode)
+                            << " serial failure=" << serial.failure;
+
+                        std::vector<Candidate> ordered_candidates = candidates;
+                        const uint64_t order_seed = measurementOrderSeed(
+                            format, shape, m, mode);
+                        std::mt19937_64 order_engine(order_seed);
+                        std::shuffle(
+                            ordered_candidates.begin(),
+                            ordered_candidates.end(),
+                            order_engine);
+                        InterleavedCandidateBatch batch =
+                            runCandidatesInterleaved(
                                 prepared.kernel,
                                 input.get(),
                                 serial,
-                                candidate,
+                                ordered_candidates,
                                 mode,
                                 m,
-                                shape.n,
-                                shape.k,
+                                shape.N,
+                                shape.K,
                                 matrix_desc.codebook_id,
                                 weights->size_bytes(),
                                 config.warmups,
                                 config.samples,
+                                config.timed_replay_cap,
+                                order_seed,
+                                config.profiler_request_id,
                                 device_);
+                        ASSERT_TRUE(batch.valid)
+                            << format.name << " " << shape.name << " M=" << m
+                            << " mode=" << executionModeName(mode)
+                            << " interleaved failure=" << batch.failure;
+                        ASSERT_EQ(
+                            batch.evidence.size(),
+                            ordered_candidates.size());
+                        isolated_profile_launches +=
+                            batch.isolated_profile_launches;
+                        for (size_t measurement_order = 0;
+                             measurement_order < ordered_candidates.size();
+                             ++measurement_order)
+                        {
+                            const Candidate &candidate =
+                                ordered_candidates[measurement_order];
+                            CandidateEvidence evidence = std::move(
+                                batch.evidence[measurement_order]);
                             ASSERT_TRUE(evidence.valid)
                                 << format.name << " " << shape.name << " M=" << m
                                 << " candidate=" << candidate.id
@@ -1234,18 +2178,20 @@ namespace
                                 (!exact_required ||
                                  evidence.comparison.mismatch_count == 0);
                             rows.push_back(MeasuredRow{
-                                &format,
-                                &shape,
-                                candidate,
-                                mode,
-                                m,
-                                source_info->codebook_id,
-                                matrix_desc.codebook_id,
-                                weights->size_bytes(),
-                                serial,
-                                std::move(evidence),
-                                correctness_pass,
-                                false});
+                                .format = &format,
+                                .shape = &shape,
+                                .candidate = candidate,
+                                .mode = mode,
+                                .m = m,
+                                .measurement_order = measurement_order,
+                                .measurement_order_seed = order_seed,
+                                .source_codebook = source_info->codebook_id,
+                                .execution_codebook = matrix_desc.codebook_id,
+                                .weight_bytes = weights->size_bytes(),
+                                .serial = serial,
+                                .candidate_evidence = std::move(evidence),
+                                .correctness_pass = correctness_pass,
+                                .is_winner = false});
                         }
                     }
 
@@ -1303,6 +2249,11 @@ namespace
         std::fclose(aggregate);
         std::fclose(timing);
         ASSERT_GT(executed_cases, 0) << "CUDA strong trainer selected no cases";
+        if (!config.profiler_request_id.empty())
+        {
+            ASSERT_EQ(isolated_profile_launches, 1)
+                << "each CUDA profiler request must execute one target launch";
+        }
     }
 } // namespace
 

@@ -38,6 +38,25 @@ namespace llaminar2
             return std::to_string(bytes / (1024 * 1024)) + " MiB";
         }
 
+        int quantSourceBlockElements(RepackFormat format)
+        {
+            switch (format)
+            {
+            case RepackFormat::Q4_0:
+            case RepackFormat::IQ4_NL:
+            case RepackFormat::Q4_1:
+            case RepackFormat::Q5_0:
+            case RepackFormat::Q5_1:
+            case RepackFormat::Q8_0:
+            case RepackFormat::Q8_1:
+                return 32;
+            case RepackFormat::RAW_FP:
+                return 0;
+            default:
+                return 256;
+            }
+        }
+
         bool vramBudgetPreflight(IBackend *backend,
                                  int device_id,
                                  size_t planned_weight_bytes,
@@ -205,7 +224,8 @@ namespace llaminar2
             }
 
             // Allocate VRAM pool with staging slots
-            if (!ctx.pool->allocate(backend_, ctx.device_id, num_h2d_streams))
+            if (!ctx.pool->allocate(backend_, ctx.device_id, num_h2d_streams,
+                                    pinned_slot_size))
             {
                 throw std::runtime_error("LoadOrchestrator: failed to allocate pool for device " +
                                          std::to_string(ctx.device_id));
@@ -249,7 +269,137 @@ namespace llaminar2
             throw std::runtime_error("LoadOrchestrator: unknown device " +
                                      std::to_string(device_id));
         }
-        ctx->pending_jobs.push_back(job);
+        if (!ctx->pinned_ring || !ctx->pinned_ring->isAllocated())
+        {
+            throw std::runtime_error(
+                "LoadOrchestrator::addWeightJob requires allocated pinned staging for device " +
+                std::to_string(device_id));
+        }
+
+        const size_t slot_bytes = ctx->pinned_ring->slotSize();
+        if (job.raw_bytes <= slot_bytes)
+        {
+            WeightJob whole = job;
+            whole.full_N = whole.full_N > 0 ? whole.full_N : whole.N;
+            whole.full_K = whole.full_K > 0 ? whole.full_K : whole.K;
+            ctx->pending_jobs.push_back(std::move(whole));
+            return;
+        }
+
+        if (job.N <= 0 || job.raw_bytes % static_cast<size_t>(job.N) != 0)
+        {
+            throw std::runtime_error(
+                "LoadOrchestrator: oversized weight '" + job.name +
+                "' cannot be row-chunked because raw bytes are not divisible by N");
+        }
+
+        if (!job.host_raw_data)
+        {
+            throw std::runtime_error(
+                "LoadOrchestrator: oversized weight '" + job.name +
+                "' has a null host source");
+        }
+
+        const auto *source = static_cast<const uint8_t *>(job.host_raw_data);
+        size_t chunk_count = 0;
+
+        if (job.format != RepackFormat::RAW_FP)
+        {
+            const int source_block_elements = quantSourceBlockElements(job.format);
+            if (job.K <= 0 || source_block_elements <= 0 ||
+                job.K % source_block_elements != 0)
+            {
+                throw std::runtime_error(
+                    "LoadOrchestrator: oversized quantized weight '" + job.name +
+                    "' has an invalid K/source-block layout");
+            }
+
+            const size_t bytes_per_row = job.raw_bytes / static_cast<size_t>(job.N);
+            const size_t source_blocks_per_row =
+                static_cast<size_t>(job.K / source_block_elements);
+            if (source_blocks_per_row == 0 || bytes_per_row % source_blocks_per_row != 0)
+            {
+                throw std::runtime_error(
+                    "LoadOrchestrator: oversized quantized weight '" + job.name +
+                    "' raw row is not divisible by its source-block count");
+            }
+
+            const size_t source_block_bytes = bytes_per_row / source_blocks_per_row;
+            const size_t bytes_per_block_column =
+                static_cast<size_t>(job.N) * source_block_bytes;
+            const size_t blocks_per_chunk = slot_bytes / bytes_per_block_column;
+            if (blocks_per_chunk == 0)
+            {
+                throw std::runtime_error(
+                    "LoadOrchestrator: staging slot is smaller than one quantized K block-column for weight '" +
+                    job.name + "'");
+            }
+
+            for (size_t block = 0; block < source_blocks_per_row;)
+            {
+                const size_t chunk_blocks = std::min(
+                    blocks_per_chunk, source_blocks_per_row - block);
+                WeightJob chunk = job;
+                chunk.host_raw_data = source + block * source_block_bytes;
+                chunk.host_row_stride_bytes = bytes_per_row;
+                chunk.host_row_copy_bytes = chunk_blocks * source_block_bytes;
+                chunk.raw_bytes = static_cast<size_t>(job.N) * chunk.host_row_copy_bytes;
+                chunk.full_N = job.full_N > 0 ? job.full_N : job.N;
+                chunk.full_K = job.full_K > 0 ? job.full_K : job.K;
+                chunk.K = static_cast<int>(chunk_blocks) * source_block_elements;
+                chunk.output_block_offset = job.output_block_offset +
+                                            static_cast<int>(block) *
+                                                (source_block_elements / 32);
+                chunk.advise_mmap_dontneed_after_staging = false;
+                if (block + chunk_blocks == source_blocks_per_row &&
+                    job.advise_mmap_dontneed_after_staging)
+                {
+                    chunk.mmap_discard_data = job.host_raw_data;
+                    chunk.mmap_discard_bytes = job.raw_bytes;
+                }
+                ctx->pending_jobs.push_back(std::move(chunk));
+                ++chunk_count;
+                block += chunk_blocks;
+            }
+
+            LOG_DEBUG("LoadOrchestrator: split oversized quantized weight '" << job.name
+                                                                               << "' raw_bytes=" << job.raw_bytes
+                                                                               << " into " << chunk_count
+                                                                               << " K-chunk jobs"
+                                                                               << " (slot_bytes=" << slot_bytes << ")");
+            return;
+        }
+
+        const size_t bytes_per_row = job.raw_bytes / static_cast<size_t>(job.N);
+        const size_t rows_per_chunk = slot_bytes / bytes_per_row;
+        if (rows_per_chunk == 0)
+        {
+            throw std::runtime_error(
+                "LoadOrchestrator: staging slot is smaller than one raw row for weight '" +
+                job.name + "'");
+        }
+
+        for (int row = 0; row < job.N;)
+        {
+            const int chunk_rows = static_cast<int>(std::min(
+                rows_per_chunk, static_cast<size_t>(job.N - row)));
+            WeightJob chunk = job;
+            chunk.host_raw_data = source + static_cast<size_t>(row) * bytes_per_row;
+            chunk.raw_bytes = static_cast<size_t>(chunk_rows) * bytes_per_row;
+            chunk.row_offset = job.row_offset + row;
+            chunk.full_N = job.full_N > 0 ? job.full_N : job.N;
+            chunk.full_K = job.full_K > 0 ? job.full_K : job.K;
+            chunk.N = chunk_rows;
+            ctx->pending_jobs.push_back(std::move(chunk));
+            ++chunk_count;
+            row += chunk_rows;
+        }
+
+        LOG_DEBUG("LoadOrchestrator: split oversized weight '" << job.name
+                                                                << "' raw_bytes=" << job.raw_bytes
+                                                                << " into " << chunk_count
+                                                                << " row-chunk jobs"
+                                                                << " (slot_bytes=" << slot_bytes << ")");
     }
 
     RepackKernels LoadOrchestrator::createRepackKernels() const
@@ -290,6 +440,12 @@ namespace llaminar2
         for (const auto &job : ctx->pending_jobs)
             total += job.raw_bytes;
         return total;
+    }
+
+    size_t LoadOrchestrator::pendingJobCount(int device_id) const
+    {
+        const auto *ctx = findDevice(device_id);
+        return ctx ? ctx->pending_jobs.size() : 0;
     }
 
     void LoadOrchestrator::load(DeviceLoadPipeline::ProgressCallback progress_cb)

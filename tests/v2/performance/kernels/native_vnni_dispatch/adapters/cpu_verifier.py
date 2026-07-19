@@ -13,10 +13,11 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .evidence import verify_aggregate_timing
+from .evidence import raw_corpus_id, verify_aggregate_timing
 from ..candidate_registry import cpu_native_vnni_verifier_registry
 from ..corpus import ObservationCorpus
 from ..format_registry import format_spec
@@ -121,7 +122,7 @@ def read_cpu_verifier_timing_sidecars(
 ) -> dict[RawTimingKey, tuple[float, ...]]:
     """Read exact steady-clock samples with contiguous sorted indices."""
 
-    indexed: dict[RawTimingKey, dict[int, float]] = {}
+    indexed: dict[RawTimingKey, list[float]] = {}
     for path in (Path(item) for item in paths):
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -139,9 +140,11 @@ def read_cpu_verifier_timing_sidecars(
                     raise ValueError(f"{path}:{row_number}: CPU execution mode must be eager")
                 key = _timing_key(raw)
                 sample_index = int(raw["sample_index"])
-                if sample_index < 0 or sample_index in indexed.setdefault(key, {}):
+                samples = indexed.setdefault(key, [])
+                if sample_index != len(samples):
                     raise ValueError(
-                        f"{path}:{row_number}: duplicate/negative sample index {sample_index}"
+                        f"{path}:{row_number}: timing sample index {sample_index} "
+                        f"is not the next contiguous index {len(samples)}"
                     )
                 latency_us = float.fromhex(raw["latency_us_hex"].strip())
                 readable_us = float(raw["latency_us"])
@@ -153,13 +156,11 @@ def read_cpu_verifier_timing_sidecars(
                     raise ValueError(
                         f"{path}:{row_number}: readable and exact latency fields disagree"
                     )
-                indexed[key][sample_index] = latency_us
+                samples.append(latency_us)
 
     result = {}
     for key, samples in indexed.items():
-        if sorted(samples) != list(range(len(samples))):
-            raise ValueError(f"timing sidecar has non-contiguous samples for {key}")
-        values = tuple(samples[index] for index in range(len(samples)))
+        values = tuple(samples)
         if tuple(sorted(values)) != values:
             raise ValueError(f"timing sidecar samples are not trainer-sorted for {key}")
         result[key] = values
@@ -221,14 +222,30 @@ class CPUVerifierAdapterContext:
                 raise ValueError("installable CPU verifier evidence needs raw timing sidecars")
 
 
-def raw_corpus_id(paths: Iterable[Path]) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(Path(item) for item in paths):
-        digest.update(str(path).encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return "sha256:" + digest.hexdigest()
+@lru_cache(maxsize=None)
+def _trial_set_hash(
+    source_format: str,
+    shape: str,
+    m: int,
+    n: int,
+    k: int,
+    build_isa: str,
+    runtime_isa: str,
+    threads: int,
+) -> str:
+    """Hash one reused CPU tensor/ISA/thread trial identity once."""
+
+    return _sha256({
+        "version": CPU_VERIFIER_TRIAL_SET_VERSION,
+        "source_format": source_format,
+        "shape": shape,
+        "m": m,
+        "n": n,
+        "k": k,
+        "build_isa": build_isa,
+        "runtime_isa": runtime_isa,
+        "threads": threads,
+    })
 
 
 def adapt_cpu_verifier_row(
@@ -397,17 +414,16 @@ def adapt_cpu_verifier_row(
         candidate_policy_hash=candidate.candidate_policy_hash(),
         ordered_reduction=candidate.ordered_reduction,
         uses_atomic_reduction=False,
-        trial_set_hash=_sha256({
-            "version": CPU_VERIFIER_TRIAL_SET_VERSION,
-            "source_format": source_format,
-            "shape": raw["shape"],
-            "m": m,
-            "n": n,
-            "k": k,
-            "build_isa": build_isa,
-            "runtime_isa": effective_runtime_isa,
-            "threads": threads,
-        }),
+        trial_set_hash=_trial_set_hash(
+            source_format,
+            raw["shape"],
+            m,
+            n,
+            k,
+            build_isa,
+            effective_runtime_isa,
+            threads,
+        ),
         numerical_correctness=numerical_correctness,
         bitwise_equal=mismatch_count == 0,
         repeat_equal=repeat_mismatches == 0,

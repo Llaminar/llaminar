@@ -63,6 +63,8 @@ namespace llaminar2
             ASSERT_EQ(shape.size(), 2) << "Slice should be 2D";
             EXPECT_EQ(shape[0], 448) << "Slice should have 448 rows";
             EXPECT_EQ(shape[1], 896) << "Slice should have 896 columns";
+            EXPECT_TRUE(slice->is_mmap_data())
+                << "Native quantized row slices should retain zero-copy mmap backing";
         }
 
         TEST_F(ModelLoaderRowSliceTest, SliceMatchesFullTensorData)

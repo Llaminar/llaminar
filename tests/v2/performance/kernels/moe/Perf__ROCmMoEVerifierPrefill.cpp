@@ -323,6 +323,42 @@ namespace
         return values;
     }
 
+    /**
+     * @brief Publish the separately numbered shared expert in the final route.
+     *
+     * Qwen 3.6 exposes 256 routed experts plus a shared expert. A fused
+     * descriptor table therefore has 257 entries, with shared expert id 256.
+     * Allocating that table alone is a weak test because ordinary routed
+     * patterns never select its last descriptor. This helper rewrites the final
+     * route of every verifier row so grouped gate/up and down must dereference
+     * the 257th entry on the real device path.
+     *
+     * @param values Mutable row-major route-id matrix.
+     * @param rows Number of verifier rows in the matrix.
+     * @param top_k Number of routes per verifier row.
+     * @param num_experts Width of the descriptor table, including shared.
+     */
+    void publishTerminalExpertRoute(
+        std::vector<float> &values,
+        int rows,
+        int top_k,
+        int num_experts)
+    {
+        if (rows <= 0 || top_k <= 0 || num_experts <= 1 ||
+            values.size() != static_cast<size_t>(rows * top_k))
+        {
+            throw std::invalid_argument(
+                "terminal expert route requires a non-empty row-major route matrix");
+        }
+
+        const float terminal_expert = static_cast<float>(num_experts - 1);
+        for (int row = 0; row < rows; ++row)
+        {
+            values[static_cast<size_t>(row * top_k + top_k - 1)] =
+                terminal_expert;
+        }
+    }
+
     std::vector<float> makeRoutingWeights(int rows, int top_k)
     {
         std::vector<float> values(static_cast<size_t>(rows) * top_k);
@@ -862,6 +898,24 @@ namespace
         hipGraphExec_t exec_ = nullptr;
     };
 
+    /**
+     * @brief Stop a timing cell immediately when its launch body is rejected.
+     *
+     * Continuing after a false grouped-pipeline return records an empty event
+     * interval and emits one assertion per iteration. A thrown test failure
+     * identifies the first broken phase and ensures failed launches can never
+     * appear as high-throughput benchmark winners.
+     */
+    void requireHipBenchBody(bool ok, const char *phase)
+    {
+        if (!ok)
+        {
+            throw std::runtime_error(
+                std::string("ROCm MoE verifier benchmark body failed during ") +
+                (phase ? phase : "unknown phase"));
+        }
+    }
+
     double timeHipEvents(hipStream_t stream, int iterations, const std::function<bool()> &body)
     {
         hipEvent_t start = nullptr;
@@ -870,7 +924,7 @@ namespace
         EXPECT_EQ(hipEventCreate(&stop), hipSuccess);
         EXPECT_EQ(hipEventRecord(start, stream), hipSuccess);
         for (int i = 0; i < iterations; ++i)
-            EXPECT_TRUE(body());
+            requireHipBenchBody(body(), "timed replay");
         EXPECT_EQ(hipEventRecord(stop, stream), hipSuccess);
         EXPECT_EQ(hipEventSynchronize(stop), hipSuccess);
         float ms = 0.0f;
@@ -968,6 +1022,7 @@ namespace
         int routed_num_experts = 256,
         const char *case_name_override = nullptr,
         bool unique_routes = false,
+        bool include_terminal_expert = false,
         int d_model = 2048,
         int intermediate = 512,
         const llaminar2::test::QuantizedVerifierFormatCase *gateup_format = nullptr,
@@ -1028,9 +1083,11 @@ namespace
         workspace_consumer->bindWorkspace(workspace.get());
 
         const auto hidden_values = makeHiddenValues(rows, d_model);
-        const auto routing_indices = unique_routes
-                                         ? makeUniqueRoutingIndices(rows, top_k, num_experts)
-                                         : makeRoutingIndices(rows, top_k, num_experts);
+        auto routing_indices = unique_routes
+                                   ? makeUniqueRoutingIndices(rows, top_k, num_experts)
+                                   : makeRoutingIndices(rows, top_k, num_experts);
+        if (include_terminal_expert)
+            publishTerminalExpertRoute(routing_indices, rows, top_k, num_experts);
         const auto routing_weights = makeRoutingWeights(rows, top_k);
         auto tables = prepareExpertTables(
             moe, device, num_experts, d_model, intermediate,
@@ -1078,26 +1135,44 @@ namespace
         };
 
         for (int i = 0; i < warmups; ++i)
-            EXPECT_TRUE(run_grouped());
+            requireHipBenchBody(run_grouped(), "warmup");
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         const double eager_ms = timeHipEvents(stream, iterations, run_grouped);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
         const double prepare_ms = timeHipEvents(stream, iterations, run_prepare);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        EXPECT_TRUE(run_prepare());
+        requireHipBenchBody(run_prepare(), "pipeline preparation");
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
         const double pipeline_ms = timeHipEvents(stream, iterations, run_pipeline);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
         HipGraphOwner graph;
-        EXPECT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+        const hipError_t begin_status =
+            hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal);
+        if (begin_status != hipSuccess)
+        {
+            throw std::runtime_error(
+                std::string("ROCm MoE verifier graph capture begin failed: ") +
+                hipGetErrorString(begin_status));
+        }
         const bool captured = run_grouped();
         const hipError_t end_status = hipStreamEndCapture(stream, graph.graphPtr());
-        EXPECT_TRUE(captured);
-        EXPECT_EQ(end_status, hipSuccess) << hipGetErrorString(end_status);
-        EXPECT_NE(*graph.graphPtr(), nullptr);
-        EXPECT_EQ(hipGraphInstantiate(graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0), hipSuccess);
+        if (!captured || end_status != hipSuccess || *graph.graphPtr() == nullptr)
+        {
+            throw std::runtime_error(
+                std::string("ROCm MoE verifier graph capture body failed: ") +
+                hipGetErrorString(end_status));
+        }
+        const hipError_t instantiate_status =
+            hipGraphInstantiate(
+                graph.execPtr(), *graph.graphPtr(), nullptr, nullptr, 0);
+        if (instantiate_status != hipSuccess)
+        {
+            throw std::runtime_error(
+                std::string("ROCm MoE verifier graph instantiate failed: ") +
+                hipGetErrorString(instantiate_status));
+        }
         for (int i = 0; i < warmups; ++i)
             EXPECT_EQ(hipGraphLaunch(graph.execHandle(), stream), hipSuccess);
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -2507,15 +2582,21 @@ namespace
                     const std::vector<float> actual(
                         grouped_output->data(),
                         grouped_output->data() + grouped_output->numel());
+                    /*
+                     * Grouped MoE publication contains one hidden vector per
+                     * routed row. The former d_model count inspected only the
+                     * first vector; use the complete downloaded tensor for both
+                     * diagnostics and the hard NativeVNNI byte certificate.
+                     */
                     const CloseMetrics metrics = compareVectors(
                         actual,
                         serial,
-                        static_cast<size_t>(shape.d_model));
+                        actual.size());
                     const auto common_evidence =
                         llaminar2::test::trainer::compareFP32(
                             actual,
                             serial,
-                            static_cast<size_t>(shape.d_model));
+                            actual.size());
                     EXPECT_EQ(common_evidence.mismatch_count, 0u)
                         << format.label << ' ' << shape.name << " M=" << rows
                         << ' ' << role << ' ' << candidate_name
@@ -2924,10 +3005,56 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M4_CombinedRoutedSharedUpperBound)
         /*routed_top_k=*/9,
         /*routed_num_experts=*/257,
         /*case_name_override=*/"combined_top9_upper_bound",
-        /*unique_routes=*/true);
+        /*unique_routes=*/true,
+        /*include_terminal_expert=*/true);
     expectClose(combined.metrics);
     expectGraphReplayFasterThanReference(combined);
     printResult(combined);
+#endif
+}
+
+TEST(Perf__MoEVerifierPrefill, ROCm_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    /*
+     * M=4 covers the direct small-verifier projection, while M=9 and M=31
+     * enter the expert-row-tiled path and its 512-entry device directory.
+     * Keep timing to one replay because the acceptance condition here is native
+     * byte equality for every model-loadable format; the dedicated speedometer
+     * above retains the statistically useful economy window.
+     */
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvOverride iters_env("LLAMINAR_MOE_VERIFIER_PREFILL_ITERS", "1");
+    ScopedEnvOverride warmups_env("LLAMINAR_MOE_VERIFIER_PREFILL_WARMUPS", "0");
+    ScopedEnvOverride rowwise_env(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        for (const int rows : {4, 9, 31})
+        {
+            SCOPED_TRACE(rows);
+            auto combined = runROCmCase(
+                /*shared=*/false,
+                rows,
+                /*routed_top_k=*/9,
+                /*routed_num_experts=*/257,
+                /*case_name_override=*/"combined_top9_all_formats",
+                /*unique_routes=*/false,
+                /*include_terminal_expert=*/true,
+                /*d_model=*/2048,
+                /*intermediate=*/512,
+                &format,
+                &format);
+            expectClose(combined.metrics);
+            expectGraphReplayFasterThanReference(combined);
+        }
+    }
 #endif
 }
 

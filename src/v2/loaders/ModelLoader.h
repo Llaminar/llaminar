@@ -218,13 +218,14 @@ namespace llaminar2
         /**
          * @brief Enable or disable mmap-based file loading
          *
-         * When enabled (default), the GGUF file is memory-mapped with MAP_POPULATE
-         * during loadModel(). Subsequent tensor loads use memcpy from the mapped
-         * region instead of seekg+read through an ifstream, eliminating file_mutex_
-         * serialization and enabling fully parallel tensor loading.
+         * When enabled (default), the GGUF file is memory-mapped during loadModel().
+         * GPU targets use demand paging; CPU targets may prefault for NUMA-local
+         * access. Native quantized tensors and contiguous slices can then reference
+         * the mapping directly without anonymous host copies.
          *
          * When disabled (--no-mmap), falls back to the original ifstream + file_mutex_
-         * path. Use this for extremely large models that won't fit in RAM.
+         * path. This mode may require host memory proportional to the materialized
+         * weights and is therefore not the bounded-memory GPU loading path.
          *
          * Must be called BEFORE loadModel().
          */
@@ -245,9 +246,9 @@ namespace llaminar2
         /**
          * @brief Indicate target device is GPU — skip NUMA mmap binding
          *
-         * When enabled, mmap uses MAP_POPULATE (fast sequential kernel readahead)
-         * instead of NUMA-bound first-touch. For GPU inference, weights are uploaded
-         * to VRAM anyway, so NUMA placement of the host staging area doesn't matter.
+         * When enabled, mmap is demand-paged instead of NUMA-bound/prefaulted. For
+         * GPU inference, weights are uploaded to VRAM, so NUMA placement of the host
+         * staging mapping does not justify touching the whole model up front.
          *
          * Must be called BEFORE loadModel().
          */

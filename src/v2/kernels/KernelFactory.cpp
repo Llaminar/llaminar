@@ -44,6 +44,7 @@
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
+#include "../loaders/MmapRegion.h"
 #include "common/EmbedQ8Repack.h"
 // CUDA kernel classes
 #ifdef HAVE_CUDA
@@ -3529,12 +3530,11 @@ namespace llaminar
                 const size_t effective_total = (total_vocab > 0) ? total_vocab : shard_rows;
                 const bool is_sharded = (shard_rows < effective_total);
 
-                auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model);
-
                 auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
-                weights->byte_size = repacked.byte_size;
-                weights->blocks_per_row = repacked.blocks_per_row;
-                weights->vocab_size = repacked.vocab_size;
+                weights->blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+                weights->vocab_size = shard_rows;
+                weights->byte_size = shard_rows * weights->blocks_per_row *
+                                     sizeof(llaminar2::EmbedQ8Block);
                 weights->vocab_offset = vocab_offset;
                 weights->total_vocab = effective_total;
                 weights->d_model = d_model;
@@ -3547,16 +3547,54 @@ namespace llaminar
                     return nullptr;
                 }
 
-                weights->device_data = backend->allocate(repacked.byte_size, target_device.ordinal);
+                weights->device_data = backend->allocate(weights->byte_size, target_device.ordinal);
                 if (!weights->device_data)
                 {
                     LOG_ERROR("[PreparedEmbeddingWeights] GPU allocation failed for "
-                              << target_device.to_string() << " (" << (repacked.byte_size / (1024 * 1024)) << " MB)");
+                              << target_device.to_string() << " (" << (weights->byte_size / (1024 * 1024)) << " MB)");
                     return nullptr;
                 }
 
-                const bool upload_ok = backend->hostToDevice(weights->device_data, repacked.data.data(),
-                                                             repacked.byte_size, target_device.ordinal);
+                // Repack and upload embeddings by contiguous vocabulary rows.
+                // The old path materialized the entire EmbedQ8 table in a host
+                // vector before the first H2D copy, which could independently
+                // exceed the load-pipeline staging cap for large vocabularies.
+                const auto &load_cfg = llaminar2::debugEnv().rocm;
+                const size_t staging_budget_bytes = load_cfg.repack_budget_mb > 0
+                                                        ? static_cast<size_t>(load_cfg.repack_budget_mb) *
+                                                              1024ULL * 1024ULL
+                                                        : weights->byte_size;
+                const size_t bytes_per_row = weights->blocks_per_row * sizeof(llaminar2::EmbedQ8Block);
+                const size_t rows_per_chunk = std::max<size_t>(
+                    1, staging_budget_bytes > 0 ? staging_budget_bytes / bytes_per_row : shard_rows);
+                const bool can_discard_mmap_rows = tensor->is_mmap_data() && shard_rows > 0 &&
+                                                   tensor->size_bytes() % shard_rows == 0;
+                const size_t raw_bytes_per_row = can_discard_mmap_rows
+                                                     ? tensor->size_bytes() / shard_rows
+                                                     : 0;
+                const auto *raw_base = static_cast<const uint8_t *>(tensor->raw_data());
+
+                bool upload_ok = true;
+                for (size_t row = 0; row < shard_rows; row += rows_per_chunk)
+                {
+                    const size_t row_count = std::min(rows_per_chunk, shard_rows - row);
+                    auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model, row, row_count);
+                    auto *dst = static_cast<uint8_t *>(weights->device_data) + row * bytes_per_row;
+                    if (!backend->hostToDevice(dst, repacked.data.data(), repacked.byte_size,
+                                               target_device.ordinal))
+                    {
+                        upload_ok = false;
+                        break;
+                    }
+
+                    if (can_discard_mmap_rows && raw_base)
+                    {
+                        llaminar2::MmapRegion::adviseDontneedRange(
+                            raw_base + row * raw_bytes_per_row,
+                            row_count * raw_bytes_per_row);
+                    }
+                }
+
                 if (!upload_ok)
                 {
                     LOG_ERROR("[PreparedEmbeddingWeights] H2D upload failed for " << target_device.to_string());
@@ -3568,12 +3606,13 @@ namespace llaminar
                 LOG_DEBUG("[PreparedEmbeddingWeights] Prepared embedding for "
                           << target_device.to_string() << ": "
                           << llaminar2::tensorTypeName(tensor->native_type()) << " "
-                          << repacked.vocab_size << "x" << d_model
+                          << weights->vocab_size << "x" << d_model
                           << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
                                             " of " + std::to_string(effective_total) + ")")
                                          : "")
-                          << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                          << " (" << repacked.blocks_per_row << " blocks/row)");
+                          << " → " << (weights->byte_size / (1024 * 1024)) << " MB"
+                          << " (" << weights->blocks_per_row << " blocks/row, staging <= "
+                          << (staging_budget_bytes / (1024 * 1024)) << " MB)");
 
                 auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
                 handle->tensor = tensor;

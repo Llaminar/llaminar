@@ -162,12 +162,7 @@ namespace llaminar2::cpu::native_vnni
             // Legacy deferred-packing guard. New CPU VNNI engines are eager and
             // transferred blobs with native-block deferred payloads are rejected.
             if (deferred_packing_)
-            {
-                if (m == 1 && packed_.codebook_id == 19)
-                    ensureWorkspaceRaw(); // Q8_0 M=1: just memcpy raw blocks (no interleave)
-                else
-                    ensureWorkspace(); // All other cases: full VNNI interleave
-            }
+                ensureWorkspace();
 
             if (m == 1)
             {
@@ -392,12 +387,7 @@ namespace llaminar2::cpu::native_vnni
 
             // Legacy deferred-packing guard; eager engines should never enter it.
             if (deferred_packing_)
-            {
-                if (m == 1 && packed_.codebook_id == 19)
-                    ensureWorkspaceRaw();
-                else
-                    ensureWorkspace();
-            }
+                ensureWorkspace();
 
             // M=1 fast path: call GEMV directly with raw pointer, skip TensorBase wrapper
             if (m == 1 && alpha == 1.0f && beta == 0.0f)
@@ -625,7 +615,7 @@ namespace llaminar2::cpu::native_vnni
                         for (const auto &proj : projections)
                         {
                             auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                            if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                            if (vnni->deferred_packing_)
                             {
                                 max_interleave_ws = std::max(max_interleave_ws,
                                                              interleavedWorkspaceSize(vnni->packed_));
@@ -645,20 +635,13 @@ namespace llaminar2::cpu::native_vnni
                             auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
                             if (vnni->deferred_packing_)
                             {
-                                if (vnni->packed_.codebook_id == 19)
-                                {
-                                    vnni->ensureWorkspaceRaw();
-                                }
-                                else
-                                {
-                                    uint8_t *slot = sharedWorkspace().data() +
-                                                    static_cast<size_t>(slot_idx) * max_interleave_ws;
-                                    repackNativeBlocksToInterleaved(
-                                        vnni->native_blocks_ptr_, vnni->native_block_size_,
-                                        vnni->packed_, slot);
-                                    vnni->packed_.setWorkspace(slot);
-                                    slot_idx++;
-                                }
+                                uint8_t *slot = sharedWorkspace().data() +
+                                                static_cast<size_t>(slot_idx) * max_interleave_ws;
+                                repackNativeBlocksToInterleaved(
+                                    vnni->native_blocks_ptr_, vnni->native_block_size_,
+                                    vnni->packed_, slot);
+                                vnni->packed_.setWorkspace(slot);
+                                slot_idx++;
                             }
                         }
                     }
@@ -692,13 +675,6 @@ namespace llaminar2::cpu::native_vnni
                         d.output = proj.output->mutable_data();
                         d.bias = proj.bias ? proj.bias->data() : nullptr;
                         d.N = proj.n;
-                        d.bpr = K_blocks;
-
-                        // Check for Q8_0 raw path (deferred zero-copy)
-                        if (vnni->packed_.codebook_id == 19 && vnni->packed_.workspace_data_)
-                            d.q8_0_raw = reinterpret_cast<const Q8_0Block *>(vnni->packed_.workspace_data_);
-                        else
-                            d.q8_0_raw = nullptr;
                     }
 
                     // Single OMP region with nowait between projections
@@ -1115,8 +1091,6 @@ namespace llaminar2::cpu::native_vnni
                     descriptor.output = projection.output->mutable_data();
                     descriptor.bias = projection.bias ? projection.bias->data() : nullptr;
                     descriptor.N = projection.n;
-                    descriptor.bpr = K_blocks;
-                    descriptor.q8_0_raw = nullptr;
                     if (!descriptor.output || (projection.bias && !descriptor.bias))
                         return false;
                 }
@@ -1205,7 +1179,7 @@ namespace llaminar2::cpu::native_vnni
                 for (int i = 0; i < num_descs; ++i)
                 {
                     auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
-                    if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                    if (vnni->deferred_packing_)
                     {
                         max_interleave_ws = std::max(max_interleave_ws,
                                                      interleavedWorkspaceSize(vnni->packed_));
@@ -1225,20 +1199,13 @@ namespace llaminar2::cpu::native_vnni
                     auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
                     if (vnni->deferred_packing_)
                     {
-                        if (vnni->packed_.codebook_id == 19)
-                        {
-                            vnni->ensureWorkspaceRaw();
-                        }
-                        else
-                        {
-                            uint8_t *slot = sharedWorkspace().data() +
-                                            static_cast<size_t>(slot_idx) * max_interleave_ws;
-                            repackNativeBlocksToInterleaved(
-                                vnni->native_blocks_ptr_, vnni->native_block_size_,
-                                vnni->packed_, slot);
-                            vnni->packed_.setWorkspace(slot);
-                            slot_idx++;
-                        }
+                        uint8_t *slot = sharedWorkspace().data() +
+                                        static_cast<size_t>(slot_idx) * max_interleave_ws;
+                        repackNativeBlocksToInterleaved(
+                            vnni->native_blocks_ptr_, vnni->native_block_size_,
+                            vnni->packed_, slot);
+                        vnni->packed_.setWorkspace(slot);
+                        slot_idx++;
                     }
                 }
             }
@@ -1281,10 +1248,6 @@ namespace llaminar2::cpu::native_vnni
                 d.packed = &vnni->packed_;
                 d.output = descs[i].output;
                 d.N = descs[i].n;
-                d.bpr = K_blocks;
-                d.q8_0_raw = (vnni->packed_.codebook_id == 19 && vnni->packed_.workspace_data_)
-                                 ? reinterpret_cast<const Q8_0Block *>(vnni->packed_.workspace_data_)
-                                 : nullptr;
             }
 
             // Single OMP region with nowait between expert projections
@@ -1537,14 +1500,6 @@ namespace llaminar2::cpu::native_vnni
                 native_blocks_ptr_, native_block_size_, packed_, ws.data());
 
             packed_.setWorkspace(ws.data());
-        }
-
-        /// Q8_0 fast path: point workspace directly at native blocks (zero-copy).
-        /// The GEMV dispatcher detects Q8_0 and redirects to q8_0_native_gemv()
-        /// which reads raw Q8_0Block layout directly.
-        void ensureWorkspaceRaw() const
-        {
-            packed_.setWorkspace(native_blocks_ptr_);
         }
 
         /// Apply rotation to FP32 activation data, returns pointer to rotated data.

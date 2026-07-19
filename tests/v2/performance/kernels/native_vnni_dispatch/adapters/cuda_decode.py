@@ -14,11 +14,13 @@ import csv
 import hashlib
 import json
 import math
+from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .evidence import verify_aggregate_timing
+from .evidence import raw_corpus_id, verify_aggregate_timing
 from ..candidate_registry import cuda_native_vnni_gemv_registry
 from ..corpus import ObservationCorpus
 from ..format_registry import format_spec
@@ -39,13 +41,16 @@ from ..schema import (
 )
 
 
-CUDA_DECODE_TRIAL_SET_VERSION = "cuda-decode-deterministic-input-weights-v4"
+CUDA_DECODE_TRIAL_SET_VERSION = "cuda-decode-sample-interleaved-order-v6"
 CUDA_DECODE_SERIAL_POLICY_ID = "cuda.nvnni.production.public-m1-policy-v4"
+CUDA_DECODE_MEASUREMENT_PROTOCOL = "sample_interleaved_v1"
 
 REQUIRED_RAW_COLUMNS = frozenset({
     "backend", "phase", "source_format", "source_codebook",
     "execution_codebook", "shape", "execution_mode", "m", "n", "k",
-    "candidate_id", "family", "tile_n", "cpt", "target_waves", "mkg",
+    "candidate_id", "measurement_order", "measurement_order_seed",
+    "measurement_protocol", "family",
+    "tile_n", "cpt", "target_waves", "mkg",
     "max_kb", "exact_kb", "force_two_phase", "weight_bytes", "warmup_count",
     "sample_count", "min_us", "median_us", "p95_us", "mad_us", "cv",
     "effective_bandwidth_gbs", "bit_mismatches", "first_bit_mismatch",
@@ -61,11 +66,14 @@ REQUIRED_RAW_COLUMNS = frozenset({
 REQUIRED_TIMING_COLUMNS = frozenset({
     "backend", "phase", "source_format", "source_codebook",
     "execution_codebook", "shape", "execution_mode", "m", "n", "k",
-    "candidate_id", "sample_index", "timed_replays", "latency_us",
+    "candidate_id", "measurement_order", "measurement_order_seed",
+    "measurement_protocol", "sample_measurement_order", "sample_order_seed",
+    "sample_index", "timed_replays", "latency_us",
     "latency_us_hex",
 })
 
-RawTimingKey = tuple[str, int, int, str, str, int, int, int, str]
+RawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int]
+MeasurementGroupKey = tuple[str, int, int, str, str, int, int, int]
 
 
 def _sha256(value: object) -> str:
@@ -119,15 +127,61 @@ def _timing_key(raw: Mapping[str, str]) -> RawTimingKey:
         int(raw["n"]),
         int(raw["k"]),
         raw["candidate_id"].strip().lower(),
+        int(raw["measurement_order"]),
+        int(raw["measurement_order_seed"]),
     )
+
+
+def _measurement_group_key(raw: Mapping[str, str]) -> MeasurementGroupKey:
+    """Identify one candidate permutation shared by aggregate rows."""
+
+    return (
+        raw["source_format"].strip().upper(),
+        int(raw["source_codebook"]),
+        int(raw["execution_codebook"]),
+        raw["shape"].strip(),
+        raw["execution_mode"].strip().lower(),
+        int(raw["m"]),
+        int(raw["n"]),
+        int(raw["k"]),
+    )
+
+
+def _validate_measurement_orders(
+    groups: Mapping[MeasurementGroupKey, list[tuple[int, int, str]]],
+) -> None:
+    """Require one complete deterministic candidate permutation per cell."""
+
+    for key, entries in groups.items():
+        seeds = {seed for _order, seed, _candidate in entries}
+        orders = [order for order, _seed, _candidate in entries]
+        candidates = [candidate for _order, _seed, candidate in entries]
+        if len(seeds) != 1 or next(iter(seeds), 0) <= 0:
+            raise ValueError(
+                f"CUDA measurement-order seed is inconsistent for {key}"
+            )
+        if sorted(orders) != list(range(len(entries))):
+            raise ValueError(
+                "CUDA measurement order is not one contiguous permutation "
+                f"for {key}: {sorted(orders)}"
+            )
+        if len(candidates) != len(set(candidates)):
+            raise ValueError(
+                f"CUDA measurement order repeats a candidate for {key}"
+            )
 
 
 def read_cuda_decode_timing_sidecars(
     paths: Iterable[Path],
 ) -> dict[RawTimingKey, tuple[float, ...]]:
-    """Read exact CUDA-event samples and require sorted contiguous indices."""
+    """Read exact samples and prove complete interleaved candidate rounds."""
 
-    indexed: dict[RawTimingKey, dict[int, float]] = {}
+    indexed: dict[RawTimingKey, list[float]] = {}
+    replay_count: dict[RawTimingKey, int] = {}
+    sample_rounds: dict[
+        tuple[MeasurementGroupKey, int],
+        list[tuple[int, int, str]],
+    ] = defaultdict(list)
     for path in (Path(item) for item in paths):
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -141,18 +195,46 @@ def read_cuda_decode_timing_sidecars(
                     raw["phase"].strip() != "decode"
                 ):
                     raise ValueError(f"{path}:{row_number}: wrong timing sidecar surface")
-                _execution_mode(raw["execution_mode"])
-                if int(raw["timed_replays"]) != 1:
+                if raw["measurement_protocol"].strip() != (
+                    CUDA_DECODE_MEASUREMENT_PROTOCOL
+                ):
                     raise ValueError(
-                        f"{path}:{row_number}: CUDA timings require one replay"
+                        f"{path}:{row_number}: CUDA timing is not "
+                        "sample-interleaved"
+                    )
+                _execution_mode(raw["execution_mode"])
+                timed_replays = int(raw["timed_replays"])
+                if timed_replays <= 0:
+                    raise ValueError(
+                        f"{path}:{row_number}: CUDA timed_replays must be positive"
                     )
                 key = _timing_key(raw)
-                sample_index = int(raw["sample_index"])
-                if sample_index < 0 or sample_index in indexed.setdefault(key, {}):
+                previous_replays = replay_count.setdefault(key, timed_replays)
+                if previous_replays != timed_replays:
                     raise ValueError(
-                        f"{path}:{row_number}: duplicate/negative sample index "
-                        f"{sample_index}"
+                        f"{path}:{row_number}: CUDA timed_replays changed from "
+                        f"{previous_replays} to {timed_replays} within one trial"
                     )
+                sample_index = int(raw["sample_index"])
+                samples = indexed.setdefault(key, [])
+                if sample_index != len(samples):
+                    raise ValueError(
+                        f"{path}:{row_number}: timing sample index {sample_index} "
+                        f"is not the next contiguous index {len(samples)}"
+                    )
+                sample_measurement_order = int(raw["sample_measurement_order"])
+                sample_order_seed = int(raw["sample_order_seed"])
+                if sample_measurement_order < 0 or sample_order_seed <= 0:
+                    raise ValueError(
+                        f"{path}:{row_number}: invalid interleaved sample order"
+                    )
+                sample_rounds[
+                    (_measurement_group_key(raw), sample_index)
+                ].append((
+                    sample_measurement_order,
+                    sample_order_seed,
+                    raw["candidate_id"].strip().lower(),
+                ))
                 latency_us = float.fromhex(raw["latency_us_hex"].strip())
                 readable_us = float(raw["latency_us"])
                 if latency_us <= 0.0 or not math.isfinite(latency_us):
@@ -163,16 +245,53 @@ def read_cuda_decode_timing_sidecars(
                     raise ValueError(
                         f"{path}:{row_number}: readable and exact latency disagree"
                     )
-                indexed[key][sample_index] = latency_us
+                samples.append(latency_us)
+
+    rounds_by_group: dict[
+        MeasurementGroupKey,
+        dict[int, list[tuple[int, int, str]]],
+    ] = defaultdict(dict)
+    for (group, sample_index), rows in sample_rounds.items():
+        rounds_by_group[group][sample_index] = rows
+    for group, rounds in rounds_by_group.items():
+        if sorted(rounds) != list(range(len(rounds))):
+            raise ValueError(
+                f"CUDA interleaved sample indices are not contiguous for {group}"
+            )
+        expected_candidates: set[str] | None = None
+        for sample_index, rows in sorted(rounds.items()):
+            orders = [order for order, _seed, _candidate in rows]
+            seeds = {seed for _order, seed, _candidate in rows}
+            candidates = {candidate for _order, _seed, candidate in rows}
+            if sorted(orders) != list(range(len(rows))):
+                raise ValueError(
+                    "CUDA sample measurement order is not one contiguous "
+                    f"permutation for {group} sample {sample_index}"
+                )
+            if len(seeds) != 1 or next(iter(seeds), 0) <= 0:
+                raise ValueError(
+                    f"CUDA sample-order seed is inconsistent for {group} "
+                    f"sample {sample_index}"
+                )
+            if len(candidates) != len(rows):
+                raise ValueError(
+                    f"CUDA sample round repeats a candidate for {group} "
+                    f"sample {sample_index}"
+                )
+            if expected_candidates is None:
+                expected_candidates = candidates
+            elif candidates != expected_candidates:
+                raise ValueError(
+                    f"CUDA sample round candidate set changed for {group} "
+                    f"sample {sample_index}"
+                )
 
     result = {}
     for key, samples in indexed.items():
-        if sorted(samples) != list(range(len(samples))):
-            raise ValueError(f"timing sidecar has non-contiguous samples for {key}")
-        values = tuple(samples[index] for index in range(len(samples)))
-        if tuple(sorted(values)) != values:
-            raise ValueError(f"timing sidecar samples are not trainer-sorted for {key}")
-        result[key] = values
+        # Aggregate statistics and timing digests are intentionally computed
+        # from sorted samples. The raw sidecar remains in chronological sample
+        # order so the independent per-round permutations can be audited.
+        result[key] = tuple(sorted(samples))
     return result
 
 
@@ -236,29 +355,36 @@ class CUDADecodeAdapterContext:
                 raise ValueError("installable CUDA evidence requires timing sidecars")
 
 
-def raw_corpus_id(paths: Iterable[Path]) -> str:
-    """Hash ordered aggregate and sidecar bytes for corpus provenance."""
+@lru_cache(maxsize=None)
+def _trial_set_hash_values(
+    source_format: str,
+    shape: str,
+    m: int,
+    n: int,
+    k: int,
+) -> str:
+    """Hash one reused deterministic trial identity exactly once."""
 
-    digest = hashlib.sha256()
-    for path in sorted(Path(item) for item in paths):
-        digest.update(str(path).encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return "sha256:" + digest.hexdigest()
+    return _sha256({
+        "version": CUDA_DECODE_TRIAL_SET_VERSION,
+        "source_format": source_format,
+        "shape": shape,
+        "m": m,
+        "n": n,
+        "k": k,
+    })
 
 
 def _trial_set_hash(raw: Mapping[str, str]) -> str:
     """Identify the deterministic input and packed-weight fixture."""
 
-    return _sha256({
-        "version": CUDA_DECODE_TRIAL_SET_VERSION,
-        "source_format": raw["source_format"].strip().upper(),
-        "shape": raw["shape"].strip(),
-        "m": int(raw["m"]),
-        "n": int(raw["n"]),
-        "k": int(raw["k"]),
-    })
+    return _trial_set_hash_values(
+        raw["source_format"].strip().upper(),
+        raw["shape"].strip(),
+        int(raw["m"]),
+        int(raw["n"]),
+        int(raw["k"]),
+    )
 
 
 def _raw_candidate_config(raw: Mapping[str, str]) -> dict[str, object]:
@@ -296,6 +422,16 @@ def adapt_cuda_decode_row(
     k = int(raw["k"])
     contract = _semantic_contract(m)
     execution_mode = _execution_mode(raw["execution_mode"])
+    measurement_order = int(raw["measurement_order"])
+    measurement_order_seed = int(raw["measurement_order_seed"])
+    if raw["measurement_protocol"].strip() != CUDA_DECODE_MEASUREMENT_PROTOCOL:
+        raise ValueError(
+            "CUDA broad evidence must use sample-interleaved measurement"
+        )
+    if measurement_order < 0 or measurement_order_seed <= 0:
+        raise ValueError(
+            "CUDA measurement order must be non-negative with a positive seed"
+        )
     registry = cuda_native_vnni_gemv_registry()
     candidate = registry.resolve(raw["candidate_id"])
     if not candidate.supports_contract(contract):
@@ -505,6 +641,9 @@ def adapt_cuda_decode_csv(
     if context.profile.installable and not timing_index:
         raise ValueError("installable CUDA corpus is missing timing sidecars")
     observations = []
+    measurement_groups: dict[
+        MeasurementGroupKey, list[tuple[int, int, str]]
+    ] = defaultdict(list)
     for path in (Path(item) for item in paths):
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -515,12 +654,18 @@ def adapt_cuda_decode_csv(
                 )
             for row_number, raw in enumerate(reader, start=2):
                 try:
+                    measurement_groups[_measurement_group_key(raw)].append((
+                        int(raw["measurement_order"]),
+                        int(raw["measurement_order_seed"]),
+                        raw["candidate_id"].strip().lower(),
+                    ))
                     samples = timing_index.pop(_timing_key(raw), None)
                     observations.append(adapt_cuda_decode_row(raw, context, samples))
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError(f"{path}:{row_number}: {exc}") from exc
     if not observations:
         raise ValueError("CUDA decode trainer inputs contained no observations")
+    _validate_measurement_orders(measurement_groups)
     if timing_index:
         first = next(iter(timing_index))
         raise ValueError(f"CUDA timing sidecar has no aggregate row for {first}")

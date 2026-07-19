@@ -22,14 +22,14 @@ def require_canonical_alias_coverage(
     *,
     required_execution_modes: Iterable[ExecutionMode] | None = None,
 ) -> None:
-    """Require every canonical runtime alias on every represented exact key."""
+    """Require every alias per mode and every requested policy-v2 mode key."""
 
     mode_override = tuple(required_execution_modes or ())
     failures = []
     for key in corpus.runtime_keys():
         rows = corpus.rows_for_runtime_key(key)
         expected_aliases = set(runtime_aliases(key.backend.value, key.runtime_codebook_id))
-        expected_modes = set(mode_override) or {row.execution_mode for row in rows}
+        expected_modes = {key.execution_mode}
         expected = {
             SurfaceKey(alias, mode)
             for alias in expected_aliases
@@ -39,6 +39,29 @@ def require_canonical_alias_coverage(
         missing = sorted(expected - actual)
         if missing:
             failures.append((key, missing))
+    if mode_override:
+        represented_modes = defaultdict(set)
+        for key in corpus.runtime_keys():
+            identity = (
+                key.backend,
+                key.architecture_class,
+                key.semantic_contract,
+                key.operation_kind,
+                key.bundle_signature,
+                key.projection_n_vector,
+                key.prepared_family_id,
+                key.packing_abi,
+                key.runtime_codebook_id,
+                key.m,
+                key.aggregate_n,
+                key.k,
+            )
+            represented_modes[identity].add(key.execution_mode)
+        required_modes = set(mode_override)
+        for identity, modes in represented_modes.items():
+            missing_modes = sorted(required_modes - modes, key=lambda mode: mode.value)
+            if missing_modes:
+                failures.append((identity, missing_modes))
     if failures:
         first_key, first_missing = failures[0]
         raise ValueError(

@@ -1,4 +1,4 @@
-"""Generic-only sealed evaluation and simultaneous maximum-regret certificate."""
+"""Generic-only sealed evaluation and p95-regret certificate."""
 
 from __future__ import annotations
 
@@ -14,12 +14,23 @@ from .corpus import (
     ObservationCorpus,
     RuntimeKey,
     SurfaceKey,
-    generic_domain,
-    runtime_key,
 )
 from .exact_oracle import build_exact_winner, candidate_is_eligible
 from .policy_ir import PolicyIR
-from .schema import SemanticContract
+from .schema import P95_REGRET_BUDGET, SemanticContract
+from .segmented_policy import (
+    GenericDispatchRule,
+    domain_promotion_quota_is_satisfied,
+)
+
+
+def _nearest_rank_p95(values: tuple[float, ...]) -> float:
+    """Return the deterministic nearest-rank p95 used by every regret gate."""
+
+    if not values:
+        return math.inf
+    ordered = sorted(values)
+    return ordered[math.ceil(0.95 * len(ordered)) - 1]
 
 
 @dataclass(frozen=True)
@@ -38,15 +49,50 @@ class CertificationCell:
 
 
 @dataclass(frozen=True)
+class CertificationRuleCoverage:
+    """One frozen generic leaf and its independent sealed exercise count.
+
+    Keeping the complete rule in the diagnostic report makes an unreachable
+    leaf actionable: the report identifies its backend/domain, candidate, and
+    predicates instead of reducing a split-design failure to one integer.
+    """
+
+    rule: GenericDispatchRule
+    sealed_hit_count: int
+
+
+@dataclass(frozen=True)
+class CertificationDomainResult:
+    """Sealed p95 evidence for one complete generic dispatch domain."""
+
+    domain: GenericDomain
+    sealed_cell_count: int
+    p95_observed_regret: float
+    p95_simultaneous_95pct_upper_regret: float
+
+    def passes(self, p95_regret: float = P95_REGRET_BUDGET) -> bool:
+        """Return whether both strict per-domain performance gates pass."""
+
+        return (
+            self.p95_observed_regret < p95_regret
+            and self.p95_simultaneous_95pct_upper_regret < p95_regret
+        )
+
+
+@dataclass(frozen=True)
 class CertificationReport:
     """Immutable sealed certificate bound to a frozen generic policy digest."""
 
     frozen_generic_policy_digest: str
     cells: tuple[CertificationCell, ...]
+    sealed_cell_count: int
+    out_of_scope_cell_count: int
     required_cell_count: int
     covered_cell_count: int
     verifier_bitwise_failures: int
     unexercised_rule_count: int
+    unpromoted_domain_count: int
+    rule_coverage: tuple[CertificationRuleCoverage, ...] = ()
 
     @property
     def coverage(self) -> float:
@@ -62,35 +108,131 @@ class CertificationReport:
 
     @property
     def p95_observed_regret(self) -> float:
-        values = sorted(cell.observed_worst_surface_regret for cell in self.cells)
-        if not values:
-            return math.inf
-        return values[math.ceil(0.95 * len(values)) - 1]
+        return _nearest_rank_p95(tuple(
+            cell.observed_worst_surface_regret for cell in self.cells
+        ))
 
     @property
     def max_simultaneous_95pct_upper_regret(self) -> float:
         return max((cell.simultaneous_95pct_upper_regret for cell in self.cells), default=math.inf)
 
-    def require_promotable(self, *, max_regret: float = 0.03) -> None:
-        """Fail unless coverage, byte correctness, and both max gates pass."""
+    @property
+    def p95_simultaneous_95pct_upper_regret(self) -> float:
+        """Return nearest-rank p95 of conservative per-cell regret bounds."""
+
+        return _nearest_rank_p95(tuple(
+            cell.simultaneous_95pct_upper_regret for cell in self.cells
+        ))
+
+    @property
+    def domain_results(self) -> tuple[CertificationDomainResult, ...]:
+        """Aggregate sealed cells into the domains that own promotion."""
+
+        grouped: dict[GenericDomain, list[CertificationCell]] = defaultdict(list)
+        for cell in self.cells:
+            grouped[cell.domain].append(cell)
+        return tuple(
+            CertificationDomainResult(
+                domain=domain,
+                sealed_cell_count=len(cells),
+                p95_observed_regret=_nearest_rank_p95(tuple(
+                    cell.observed_worst_surface_regret for cell in cells
+                )),
+                p95_simultaneous_95pct_upper_regret=_nearest_rank_p95(tuple(
+                    cell.simultaneous_95pct_upper_regret for cell in cells
+                )),
+            )
+            for domain, cells in sorted(grouped.items())
+        )
+
+    def passing_domain_count(
+        self,
+        p95_regret: float = P95_REGRET_BUDGET,
+    ) -> int:
+        """Count domains whose observed and conservative p95 are in budget."""
+
+        return sum(result.passes(p95_regret) for result in self.domain_results)
+
+    @property
+    def required_domain_count(self) -> int:
+        """Return the number of independently certified generic domains."""
+
+        return len(self.domain_results)
+
+    @property
+    def passing_domain_fraction(self) -> float:
+        """Return the default-budget fraction used by artifact publication."""
+
+        return (
+            float(self.passing_domain_count()) / float(self.required_domain_count)
+            if self.required_domain_count
+            else 0.0
+        )
+
+    @property
+    def over_budget_domains(self) -> tuple[CertificationDomainResult, ...]:
+        """Retain every default-budget exception as explicit diagnostics."""
+
+        return tuple(
+            result for result in self.domain_results if not result.passes()
+        )
+
+    def require_promotable(
+        self,
+        *,
+        p95_regret: float = P95_REGRET_BUDGET,
+    ) -> None:
+        """Fail unless hard gates and the 99%-of-domains p95 quota pass."""
 
         failures = []
         if self.coverage != 1.0:
             failures.append(
                 f"sealed coverage {self.covered_cell_count}/{self.required_cell_count}"
             )
+        if self.out_of_scope_cell_count:
+            failures.append(
+                f"{self.out_of_scope_cell_count} sealed cell(s) lack generic scope"
+            )
+        if self.unpromoted_domain_count:
+            failures.append(
+                f"{self.unpromoted_domain_count} generic domain(s) are unpromoted"
+            )
         if self.unexercised_rule_count:
             failures.append(f"{self.unexercised_rule_count} generic rule(s) lack sealed exercise")
         if self.verifier_bitwise_failures:
             failures.append(f"{self.verifier_bitwise_failures} verifier byte failure(s)")
-        if self.max_observed_regret > max_regret:
-            failures.append(
-                f"max observed regret {self.max_observed_regret:.4%} > {max_regret:.2%}"
+        passing_domains = self.passing_domain_count(p95_regret)
+        required_domains = self.required_domain_count
+        if not domain_promotion_quota_is_satisfied(
+            passing_domains,
+            required_domains,
+        ):
+            over_budget = tuple(
+                result
+                for result in self.domain_results
+                if not result.passes(p95_regret)
             )
-        if self.max_simultaneous_95pct_upper_regret > max_regret:
+            worst = max(
+                over_budget,
+                key=lambda result: (
+                    result.p95_observed_regret,
+                    result.p95_simultaneous_95pct_upper_regret,
+                    result.domain,
+                ),
+                default=None,
+            )
+            detail = (
+                "; worst p95 observed regret "
+                f"{worst.p95_observed_regret:.4%}, p95 simultaneous regret UCB "
+                f"{worst.p95_simultaneous_95pct_upper_regret:.4%}"
+                if worst is not None
+                else ""
+            )
             failures.append(
-                "simultaneous max-regret UCB "
-                f"{self.max_simultaneous_95pct_upper_regret:.4%} > {max_regret:.2%}"
+                "sealed domain promotion quota "
+                f"{passing_domains}/{required_domains} "
+                "does not reach 99%"
+                f"{detail}"
             )
         if failures:
             raise ValueError("generic policy is not promotable: " + "; ".join(failures))
@@ -99,7 +241,7 @@ class CertificationReport:
 def _aggregate_candidate_surface(rows, candidate_id, serial_hash):
     grouped = defaultdict(list)
     for row in rows:
-        if row.effective_candidate_id != candidate_id:
+        if row.candidate_id != candidate_id:
             continue
         if not row.generic_eligible or not candidate_is_eligible(row, serial_hash):
             continue
@@ -109,6 +251,10 @@ def _aggregate_candidate_surface(rows, candidate_id, serial_hash):
             "median": statistics.median(item.median_us for item in values),
             "cv": max(item.cv for item in values),
             "samples": sum(item.sample_count for item in values),
+            "effective_candidates": {
+                item.effective_candidate_id for item in values
+            },
+            "timing_hashes": {item.timing_sample_hash for item in values},
         }
         for surface, values in grouped.items()
     }
@@ -134,23 +280,35 @@ def certify_generic_policy(
     frozen_digest = policy.digest(generic_only=True)
     point_rows = defaultdict(list)
     for row in sealed:
-        point_rows[(runtime_key(row), row.shape_group_id)].append(row)
+        point_rows[(sealed.runtime_key_for(row), row.shape_group_id)].append(row)
 
-    required_count = len(point_rows)
+    sealed_count = len(point_rows)
+    required_count = 0
+    out_of_scope_count = 0
     provisional = []
     verifier_failures = 0
     rule_hits = Counter()
+    promoted_domains = {rule.domain for rule in policy.generic_rules}
+    unpromoted_domains = set(policy.unpromoted_domains)
+    if promoted_domains & unpromoted_domains:
+        raise ValueError("policy domain is both promoted and unpromoted")
 
     for (key, shape_group_id), rows in sorted(point_rows.items(), key=lambda item: item[0]):
-        domain = generic_domain(rows[0])
-        rule = policy.resolve_generic(domain, key.aggregate_n * key.k)
+        domain = sealed.generic_domain_for(rows[0])
+        if domain not in promoted_domains:
+            # Keep the cell in diagnostics, but never let an exact overlay turn
+            # this missing generic domain into an installable policy.
+            out_of_scope_count += 1
+            continue
+        required_count += 1
+        rule = policy.resolve_generic(domain, key.aggregate_n, key.k)
         if rule is None:
             continue
-        rule_hits[(rule.domain, rule.min_work_items, rule.max_work_items, rule.candidate_id)] += 1
+        rule_hits[rule.identity()] += 1
         serial_hash = (serial_m1_hashes or {}).get(key)
 
         eligible_candidates = sorted({
-            row.effective_candidate_id
+            row.candidate_id
             for row in rows
             if row.generic_eligible and candidate_is_eligible(row, serial_hash)
         })
@@ -158,7 +316,7 @@ def certify_generic_policy(
             verifier_failures += sum(
                 1
                 for row in rows
-                if row.effective_candidate_id == rule.candidate_id
+                if row.candidate_id == rule.candidate_id
                 and (not row.bitwise_equal or not row.repeat_equal)
             )
         surfaces = {(row.source_format, row.execution_mode) for row in rows}
@@ -192,7 +350,10 @@ def certify_generic_policy(
             exact_latency = exact_stats["median"]
             selected_stats = selected[surface]
             ratio = selected_stats["median"] / exact_latency
-            variance = 0.0 if rule.candidate_id == exact_candidate else (
+            same_timing_evidence = bool(
+                selected_stats["timing_hashes"] & exact_stats["timing_hashes"]
+            )
+            variance = 0.0 if same_timing_evidence else (
                 selected_stats["cv"] ** 2 / max(1, selected_stats["samples"])
                 + exact_stats["cv"] ** 2 / max(1, exact_stats["samples"])
             )
@@ -226,15 +387,26 @@ def certify_generic_policy(
         ))
 
     expected_rules = {
-        (rule.domain, rule.min_work_items, rule.max_work_items, rule.candidate_id)
+        rule.identity()
         for rule in policy.generic_rules
     }
     unexercised = len(expected_rules - set(rule_hits))
+    rule_coverage = tuple(
+        CertificationRuleCoverage(
+            rule=rule,
+            sealed_hit_count=rule_hits[rule.identity()],
+        )
+        for rule in policy.generic_rules
+    )
     return CertificationReport(
         frozen_generic_policy_digest=frozen_digest,
         cells=tuple(cells),
+        sealed_cell_count=sealed_count,
+        out_of_scope_cell_count=out_of_scope_count,
         required_cell_count=required_count,
         covered_cell_count=len(cells),
         verifier_bitwise_failures=verifier_failures,
         unexercised_rule_count=unexercised,
+        unpromoted_domain_count=len(unpromoted_domains),
+        rule_coverage=rule_coverage,
     )

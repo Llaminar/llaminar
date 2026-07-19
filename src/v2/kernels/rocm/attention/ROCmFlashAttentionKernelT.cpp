@@ -249,10 +249,10 @@ namespace llaminar2
         constexpr int DEFAULT_NUM_SPLITS = 8;
         /*
          * MTP target verification runs `draft_count + 1` continuation rows.
-         * The production controller currently uses draft depths 1..3, so the
-         * attention backend must keep M=2..4 on the continuation/decode path.
-         * Falling back to prefill for M=4 changes the causal continuation
-         * semantics and can make ROCm accept a token CUDA/CPU reject.
+         * Draft depths through fifteen therefore require M=2..16 to remain on
+         * the continuation/decode path. Treating any of those rows as prefill
+         * changes causal semantics and can make ROCm accept a token CUDA/CPU
+         * reject.
          */
         constexpr int MAX_SMALL_DECODE_ROWS =
             attention::kMaxGroupedVerifierAttentionRows;

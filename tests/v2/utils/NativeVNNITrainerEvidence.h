@@ -27,6 +27,16 @@
 namespace llaminar2::test::trainer
 {
     /**
+     * @brief Maximum acquisition duration measured in stationary windows.
+     *
+     * AVX-512 frequency-state transitions can consume more than two complete
+     * timing windows after source preconditioning. Four windows allow the
+     * first observation window plus three replacement windows while retaining
+     * a deterministic bound for a genuinely nonstationary kernel.
+     */
+    inline constexpr double ADAPTIVE_TIMING_RECOVERY_WINDOW_MULTIPLIER = 4.0;
+
+    /**
      * @brief Robust aggregate and provenance for sorted timing samples.
      */
     struct TimingEvidence
@@ -38,6 +48,230 @@ namespace llaminar2::test::trainer
         double cv = 0.0;     ///< Population coefficient of variation.
         std::string digest;  ///< Native-double byte fingerprint.
     };
+
+    /**
+     * @brief Decision produced by the elapsed-evidence timing protocol.
+     *
+     * NativeVNNI training spans sub-millisecond decode kernels and CPU GEMMs
+     * whose individual launches can take hundreds of milliseconds.  A fixed
+     * repetition count therefore either undersamples the former or spends
+     * minutes repeatedly measuring the latter.  This value reports whether a
+     * candidate has accumulated both an elapsed-time floor and a stable timing
+     * window, while retaining a hard sample ceiling for bounded collection.
+     */
+    struct AdaptiveTimingDecision
+    {
+        bool sample_floor_reached = false;
+        bool elapsed_floor_reached = false;
+        bool median_stable = false;
+        bool promotion_evidence = false;
+        bool should_stop = false;
+        double measured_duration_us = 0.0;
+        size_t stationary_window_begin = 0;
+        size_t stationary_sample_count = 0;
+        double stationary_duration_us = 0.0;
+        double median_relative_drift = std::numeric_limits<double>::infinity();
+    };
+
+    /**
+     * @brief Test whether one anchored complete-round epoch has enough evidence.
+     *
+     * Candidate expansion times every new schedule and its existing route
+     * anchor in the same shuffled rounds. Its bounded acquisition is complete
+     * only when both the launch population and elapsed-kernel floor hold for
+     * every participant. The requested maximum sample count is a recovery
+     * trigger, not permission to publish a 97 ms epoch against a 100 ms floor;
+     * inexpensive candidates may therefore execute a few additional common
+     * rounds until elapsed evidence catches up.
+     *
+     * @param sample_count Number of common rounds retained for the candidate.
+     * @param minimum_samples Required complete-round population.
+     * @param measured_duration_us Sum of retained candidate launch durations.
+     * @param minimum_duration_us Required elapsed kernel duration.
+     * @return True only when both independent evidence floors are satisfied.
+     */
+    inline bool anchoredCompleteRoundTimingEvidence(
+        size_t sample_count,
+        size_t minimum_samples,
+        double measured_duration_us,
+        double minimum_duration_us) noexcept
+    {
+        return sample_count >= minimum_samples &&
+            measured_duration_us >= minimum_duration_us;
+    }
+
+    /**
+     * @brief Evaluate whether acquisition-order timings contain enough evidence.
+     *
+     * The stability statistic compares upper medians from the first and second
+     * halves of the shortest trailing acquisition window that independently
+     * satisfies both the sample and elapsed-time floors.  A trailing window is
+     * essential here: CPU frequency can take several seconds to settle after a
+     * new matrix geometry starts. Comparing the complete historical first half
+     * against the complete second half makes a finite startup transient poison
+     * the decision forever, even after hundreds of stationary launches.
+     *
+     * The selected suffix remains in acquisition order so that sustained clock
+     * or thermal drift is visible. Callers use @ref stationary_window_begin to
+     * derive policy-facing aggregates from exactly the same stationary suffix,
+     * while retaining the complete acquisition sequence as diagnostic evidence.
+     *
+     * @param acquisition_samples_us Positive launch latencies in collection order.
+     * @param minimum_samples Smallest statistically useful sample population.
+     * @param maximum_samples Hard collection ceiling for inexpensive kernels.
+     * @param minimum_duration_us Required cumulative measured kernel duration.
+     * @param maximum_median_relative_drift Maximum admitted half-window drift.
+     */
+    inline AdaptiveTimingDecision evaluateAdaptiveTiming(
+        const std::vector<double> &acquisition_samples_us,
+        size_t minimum_samples,
+        size_t maximum_samples,
+        double minimum_duration_us,
+        double maximum_median_relative_drift)
+    {
+        AdaptiveTimingDecision result;
+        result.measured_duration_us = std::accumulate(
+            acquisition_samples_us.begin(), acquisition_samples_us.end(), 0.0);
+        result.sample_floor_reached =
+            acquisition_samples_us.size() >= minimum_samples;
+        result.elapsed_floor_reached =
+            result.measured_duration_us >= minimum_duration_us;
+
+        if (result.sample_floor_reached && result.elapsed_floor_reached)
+        {
+            size_t begin = acquisition_samples_us.size();
+            double duration_us = 0.0;
+            while (begin > 0u &&
+                   (acquisition_samples_us.size() - begin < minimum_samples ||
+                    duration_us < minimum_duration_us))
+            {
+                --begin;
+                duration_us += acquisition_samples_us[begin];
+            }
+
+            result.stationary_window_begin = begin;
+            result.stationary_sample_count =
+                acquisition_samples_us.size() - begin;
+            result.stationary_duration_us = duration_us;
+        }
+
+        if (result.stationary_sample_count >= 2u)
+        {
+            const size_t midpoint = result.stationary_window_begin +
+                result.stationary_sample_count / 2u;
+            std::vector<double> first(
+                acquisition_samples_us.begin() + static_cast<std::ptrdiff_t>(
+                    result.stationary_window_begin),
+                acquisition_samples_us.begin() + static_cast<std::ptrdiff_t>(midpoint));
+            std::vector<double> second(
+                acquisition_samples_us.begin() + static_cast<std::ptrdiff_t>(midpoint),
+                acquisition_samples_us.end());
+            std::sort(first.begin(), first.end());
+            std::sort(second.begin(), second.end());
+            const double first_median = first[first.size() / 2u];
+            const double second_median = second[second.size() / 2u];
+            const double denominator = std::max(first_median, second_median);
+            if (denominator > 0.0 && std::isfinite(denominator))
+            {
+                result.median_relative_drift =
+                    std::abs(first_median - second_median) / denominator;
+                result.median_stable =
+                    result.median_relative_drift <=
+                    maximum_median_relative_drift;
+            }
+        }
+
+        result.promotion_evidence =
+            result.sample_floor_reached && result.elapsed_floor_reached &&
+            result.median_stable;
+        result.should_stop = result.promotion_evidence ||
+            (acquisition_samples_us.size() >= maximum_samples &&
+             result.measured_duration_us >=
+                 ADAPTIVE_TIMING_RECOVERY_WINDOW_MULTIPLIER *
+                     minimum_duration_us);
+        return result;
+    }
+
+    /**
+     * @brief Decide whether an independently timed candidate needs another launch.
+     *
+     * Ordinary trainer evidence is terminal once a candidate has produced a
+     * promotable stationary window.  Continuing to sample that candidate while
+     * a slower peer is still converging can replace its valid suffix with a
+     * later chance fluctuation.  With many candidates in one cell, requiring
+     * every latest suffix to be stable simultaneously becomes a multiple-testing
+     * gate rather than an independent stationarity test.
+     *
+     * A candidate that has not converged remains active until it reaches both
+     * the hard sample floor and the bounded recovery-duration ceiling.  The
+     * caller may then retain its complete diagnostic trace, but must not promote
+     * it as installable timing evidence.
+     *
+     * Anchored candidate-expansion collection deliberately does not use this
+     * helper: every candidate in an anchored epoch must observe the same number
+     * of shuffled complete rounds so its contemporaneous normalization proof is
+     * meaningful.
+     *
+     * @param decision Latest adaptive timing decision for this candidate.
+     * @param sample_count Number of acquisition-order samples retained so far.
+     * @param maximum_samples Hard sample floor for recovery-ceiling admission.
+     * @param minimum_duration_us Requested stationary-window duration.
+     * @return True only while another candidate launch can add required evidence.
+     */
+    inline bool adaptiveTimingNeedsAnotherSample(
+        const AdaptiveTimingDecision &decision,
+        size_t sample_count,
+        size_t maximum_samples,
+        double minimum_duration_us) noexcept
+    {
+        if (decision.promotion_evidence)
+            return false;
+
+        const bool recovery_ceiling_reached =
+            sample_count >= maximum_samples &&
+            decision.measured_duration_us >=
+                ADAPTIVE_TIMING_RECOVERY_WINDOW_MULTIPLIER *
+                    minimum_duration_us;
+        return !recovery_ceiling_reached;
+    }
+
+    /**
+     * @brief Decide whether one candidate participates in an active timing round.
+     *
+     * Ordinary evidence streams retire independently as soon as they either
+     * become promotable or reach the bounded diagnostic ceiling. Anchored
+     * candidate expansion has a different contract: every forceable candidate
+     * must execute once in every globally active round, including rounds kept
+     * open by a slower local candidate or another MPI rank. This common cadence
+     * is what makes a contemporaneous anchor ratio meaningful.
+     *
+     * The caller invokes this helper only while the MPI coordinator reports
+     * that the global timing epoch remains active. Consequently anchored mode
+     * always returns true; local completion controls whether this rank asks to
+     * close the next round, but never removes a candidate from a round that a
+     * peer still requires.
+     *
+     * @param anchored_candidate_expansion True for anchor-normalized evidence.
+     * @param decision Latest adaptive timing decision for this candidate.
+     * @param sample_count Number of acquisition-order samples retained so far.
+     * @param maximum_samples Hard sample floor for recovery-ceiling admission.
+     * @param minimum_duration_us Requested stationary-window duration.
+     * @return True when the candidate must launch in the active global round.
+     */
+    inline bool timingCandidateParticipatesInActiveRound(
+        bool anchored_candidate_expansion,
+        const AdaptiveTimingDecision &decision,
+        size_t sample_count,
+        size_t maximum_samples,
+        double minimum_duration_us) noexcept
+    {
+        return anchored_candidate_expansion ||
+            adaptiveTimingNeedsAnotherSample(
+                decision,
+                sample_count,
+                maximum_samples,
+                minimum_duration_us);
+    }
 
     /**
      * @brief Full native-byte and numerical comparison of two FP32 tensors.

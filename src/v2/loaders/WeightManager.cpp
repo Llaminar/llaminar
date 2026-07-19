@@ -3106,6 +3106,17 @@ namespace llaminar2
 
         const auto gemm_wall_start = std::chrono::high_resolution_clock::now();
 
+        const size_t gpu_device_count = static_cast<size_t>(std::count_if(
+            devices.begin(), devices.end(), [](DeviceId device)
+            { return device.is_gpu(); }));
+        const auto &gpu_load_cfg = debugEnv().rocm;
+        const std::optional<size_t> per_gpu_staging_budget =
+            gpu_load_cfg.repack_budget_mb > 0 && gpu_device_count > 0
+                ? std::optional<size_t>{
+                      (static_cast<size_t>(gpu_load_cfg.repack_budget_mb) * 1024ULL * 1024ULL) /
+                      gpu_device_count}
+                : std::nullopt;
+
         {
             std::vector<std::future<bool>> gemm_futures;
             std::vector<std::chrono::high_resolution_clock::time_point> per_device_start(devices.size());
@@ -3121,8 +3132,12 @@ namespace llaminar2
                     LOG_DEBUG("[WeightManager] finalizeForDevices: launching GPU pipeline for "
                               << dev.toString());
                     gemm_futures.push_back(std::async(std::launch::async,
-                                                      [this, dev, include_expert_jobs]()
-                                                      { return packGemmWeightsViaPipeline(dev, nullptr, nullptr, include_expert_jobs); }));
+                                                      [this, dev, include_expert_jobs, per_gpu_staging_budget]()
+                                                      {
+                                                          return packGemmWeightsViaPipeline(
+                                                              dev, nullptr, nullptr, include_expert_jobs,
+                                                              nullptr, per_gpu_staging_budget);
+                                                      }));
                 }
                 else
                 {
@@ -4137,7 +4152,8 @@ namespace llaminar2
         std::function<bool(const std::string &)> layer_filter,
         const FrozenModelWeightSet *frozen_weights,
         bool include_expert_jobs,
-        const MoEExpertOverlayPreparationPlan *overlay_preparation_plan)
+        const MoEExpertOverlayPreparationPlan *overlay_preparation_plan,
+        std::optional<size_t> staging_budget_bytes_override)
     {
         using namespace llaminar::v2::kernels;
         using Clock = std::chrono::high_resolution_clock;
@@ -5024,9 +5040,19 @@ namespace llaminar2
          * bind.
          */
         const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
+        const size_t staging_budget_bytes = staging_budget_bytes_override.value_or(
+            rocm_cfg.repack_budget_mb > 0
+                ? static_cast<size_t>(rocm_cfg.repack_budget_mb) * 1024ULL * 1024ULL
+                : 0);
+        const size_t staging_slot_bytes = staging_budget_bytes > 0
+                                              ? std::min(
+                                                    max_raw_bytes,
+                                                    std::max<size_t>(1, staging_budget_bytes /
+                                                                            static_cast<size_t>(repack_streams)))
+                                              : max_raw_bytes;
         const auto *planned_pool = orchestrator->getPool(target_device.ordinal);
         const size_t planned_weight_bytes = planned_pool ? planned_pool->totalPlannedBytes() : 0;
-        const size_t staging_bytes = max_raw_bytes * static_cast<size_t>(std::max(0, repack_streams));
+        const size_t staging_bytes = staging_slot_bytes * static_cast<size_t>(repack_streams);
         const size_t required_vram_bytes = planned_weight_bytes + staging_bytes;
         const size_t free_vram_bytes = backend->deviceMemoryFree(target_device.ordinal);
         const size_t total_vram_bytes = backend->deviceMemoryTotal(target_device.ordinal);
@@ -5088,7 +5114,11 @@ namespace llaminar2
                                                                      << " free=" << formatMiB(free_vram_bytes)
                                                                      << " safety_margin=" << formatMiB(safety_margin_bytes));
 
-        orchestrator->allocate(max_raw_bytes, repack_streams);
+        LOG_DEBUG("[WeightManager] GPU load staging bounded to " << formatMiB(staging_bytes)
+                                                                  << " total (" << repack_streams
+                                                                  << " slots x " << formatMiB(staging_slot_bytes)
+                                                                  << ", largest weight=" << formatMiB(max_raw_bytes) << ")");
+        orchestrator->allocate(staging_slot_bytes, repack_streams);
 
         // ------------------------------------------------------------------
         // Step 5: Create weight jobs
@@ -5115,6 +5145,7 @@ namespace llaminar2
                     job.N = static_cast<int>(tensor->rows());
                     job.K = static_cast<int>(tensor->cols());
                     job.is_asymmetric = false;
+                    job.advise_mmap_dontneed_after_staging = tensor->is_mmap_data();
                     orchestrator->addWeightJob(target_device.ordinal, job);
                 }
                 continue;
@@ -5150,6 +5181,7 @@ namespace llaminar2
             job.N = static_cast<int>(tensor->rows());
             job.K = static_cast<int>(tensor->cols());
             job.is_asymmetric = vnni->is_asymmetric;
+            job.advise_mmap_dontneed_after_staging = tensor->is_mmap_data();
 
             orchestrator->addWeightJob(target_device.ordinal, job);
         }
@@ -5173,6 +5205,7 @@ namespace llaminar2
                     job.N = static_cast<int>(mj.view->rows());
                     job.K = static_cast<int>(mj.view->cols());
                     job.is_asymmetric = false;
+                    job.advise_mmap_dontneed_after_staging = mj.view->is_mmap_data();
                     orchestrator->addWeightJob(target_device.ordinal, job);
                 }
                 continue;
@@ -5208,6 +5241,7 @@ namespace llaminar2
             job.N = static_cast<int>(moe_jobs[i].view->rows());
             job.K = static_cast<int>(moe_jobs[i].view->cols());
             job.is_asymmetric = vnni->is_asymmetric;
+            job.advise_mmap_dontneed_after_staging = moe_jobs[i].view->is_mmap_data();
 
             orchestrator->addWeightJob(target_device.ordinal, job);
         }

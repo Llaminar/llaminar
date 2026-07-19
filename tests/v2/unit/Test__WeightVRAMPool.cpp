@@ -179,6 +179,20 @@ namespace llaminar2
         EXPECT_GE(pool.totalPlannedBytes(), bytes_no_staging + 600000);
     }
 
+    TEST(Test__WeightVRAMPool, ExplicitStagingSlotSizeCapsTemporaryAllocation)
+    {
+        WeightVRAMPool pool;
+        pool.planWeight("large", 1024, 1024, kQ4PayloadBytes, false, false, 800000);
+        const size_t persistent_bytes = pool.totalPlannedBytes();
+
+        ASSERT_TRUE(pool.allocate(nullptr, 0, /*staging_slot_count=*/3,
+                                  /*staging_slot_bytes=*/200000));
+
+        EXPECT_EQ(pool.maxStagingSlotBytes(), 200000u);
+        EXPECT_GE(pool.totalPlannedBytes(), persistent_bytes + 600000u);
+        EXPECT_LT(pool.totalPlannedBytes(), persistent_bytes + 800000u * 3u);
+    }
+
     TEST(Test__WeightVRAMPool, ReleaseStagingKeepsWeightSlotValid)
     {
         test::MockBackend backend(DeviceType::ROCm);

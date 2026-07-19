@@ -72,10 +72,16 @@ namespace llaminar2
         size_t numDevices() const;
 
         /// Add a weight job to be loaded on a specific device.
+        /// Jobs larger than the allocated staging slot are split at FP row
+        /// boundaries or quantized K-block boundaries so staging stays bounded
+        /// while preserving the final packed layout.
         void addWeightJob(int device_id, const WeightJob &job);
 
         /// Total raw bytes of pending jobs for a specific device.
         size_t totalPendingBytes(int device_id) const;
+
+        /// Number of physical (possibly row-chunked) jobs pending for a device.
+        size_t pendingJobCount(int device_id) const;
 
         /// Execute all pending weight jobs with pipelined H2D + GPU repack.
         /// Each device is processed via a DeviceLoadPipeline. Throws on failure.

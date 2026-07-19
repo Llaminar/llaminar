@@ -523,15 +523,15 @@ namespace llaminar2
             }
 
             /*
-             * MTP verifier publication compares grouped M=2..4 rows against
-             * the same backend's M=1 decode row.  oneDNN is free to choose a
-             * different reduction tree for M=1 and M>1, so verifier-sized
-             * transposed weight projections use the local skinny primitive for
-             * both serial decode and grouped rows.  The primitive still
-             * parallelizes across output columns, but every dot product walks K
-             * in the same order.
+             * Public M=1 decode is the arithmetic oracle for MTP verifier
+             * publication, so transposed-weight decode uses the local skinny
+             * primitive. Dedicated grouped-verifier entrypoints below invoke
+             * the same row-tiled primitive explicitly for every runtime M.
+             * Ordinary M>1 GEMM remains on oneDNN; inferring verifier semantics
+             * from a historical `M<=4` size range would conflate execution mode
+             * with shape and break as soon as speculative depth grows.
              */
-            if (B && transpose_B && M >= 1 && M <= 4)
+            if (B && transpose_B && M == 1)
             {
                 return run_fp32_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta, bias);
             }
@@ -642,7 +642,7 @@ namespace llaminar2
             const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
             KERNEL_PROFILE_SCOPE(profile_type);
 
-            if (B && transpose_B && M >= 1 && M <= 4)
+            if (B && transpose_B && M == 1)
             {
                 return run_bf16_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta);
             }
@@ -724,7 +724,7 @@ namespace llaminar2
             const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
             KERNEL_PROFILE_SCOPE(profile_type);
 
-            if (B && transpose_B && M >= 1 && M <= 4)
+            if (B && transpose_B && M == 1)
             {
                 return run_fp16_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta);
             }

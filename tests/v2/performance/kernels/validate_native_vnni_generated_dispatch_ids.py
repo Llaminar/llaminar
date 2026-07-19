@@ -40,7 +40,53 @@ def _extract_codebooks(text: str) -> set[int]:
     for pattern in patterns:
         for match in re.finditer(pattern, text):
             ids.add(int(match.group(1)))
+    if "packCPUNativeVNNIPrefillPolicyKey" in text:
+        for match in re.finditer(
+            r"\bcase\s+0x([0-9a-fA-F]{16})ULL\s*:", text
+        ):
+            ids.add((int(match.group(1), 16) >> 56) & 0xFF)
     return ids
+
+
+def _validate_cpu_prefill_packed_keys(path: Path, text: str) -> None:
+    """Decode and validate the staged CPU prefill selector's 8/16/20/20 ABI."""
+
+    if "packCPUNativeVNNIPrefillPolicyKey" not in text:
+        return
+    keys = [
+        int(match.group(1), 16)
+        for match in re.finditer(
+            r"\bcase\s+0x([0-9a-fA-F]{16})ULL\s*:", text
+        )
+    ]
+    if not keys:
+        raise SystemExit(f"{path}: CPU prefill selector has no packed exact keys")
+    for switch_index, match in enumerate(re.finditer(
+        r"switch\s*\(key\)\s*\{(?P<body>.*?)\bdefault\s*:",
+        text,
+        re.DOTALL,
+    ), start=1):
+        switch_keys = re.findall(
+            r"\bcase\s+0x([0-9a-fA-F]{16})ULL\s*:",
+            match.group("body"),
+        )
+        if len(switch_keys) != len(set(switch_keys)):
+            raise SystemExit(
+                f"{path}: CPU prefill switch #{switch_index} has duplicate keys"
+            )
+    for key in keys:
+        codebook = (key >> 56) & 0xFF
+        m = (key >> 40) & 0xFFFF
+        k = (key >> 20) & 0xFFFFF
+        n = key & 0xFFFFF
+        if codebook not in CODEBOOK_TO_FORMAT:
+            raise SystemExit(
+                f"{path}: CPU prefill key references unknown codebook {codebook}"
+            )
+        if m < 2 or n == 0 or k == 0:
+            raise SystemExit(
+                f"{path}: malformed CPU prefill key M={m} N={n} K={k}"
+            )
 
 
 def _validate_labeled_branches(path: Path, text: str) -> None:
@@ -130,6 +176,7 @@ def validate_file(path: Path) -> int:
         )
 
     _validate_labeled_branches(path, text)
+    _validate_cpu_prefill_packed_keys(path, text)
     _validate_rocm_decode_graph_safe_kb(path, text)
     _validate_binary_search_tables_sorted(path, text)
     return len(codebooks)

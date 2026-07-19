@@ -9,9 +9,11 @@ alone would allow truncated, reordered, or stale sidecars to pass unnoticed.
 from __future__ import annotations
 
 import math
+import hashlib
 import statistics
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Mapping
 
 
@@ -25,6 +27,26 @@ class RobustTimingEvidence:
     mad: float
     cv: float
     digest: str
+
+
+def raw_corpus_id(paths: Iterable[Path]) -> str:
+    """Stream-hash ordered evidence paths and bytes without a whole-file copy.
+
+    The path is part of the existing corpus identity, so moving a shard remains
+    a deliberate provenance change. Reading fixed-size chunks preserves the
+    exact historical digest while avoiding a second in-memory copy of timing
+    sidecars that can contain millions of rows.
+    """
+
+    digest = hashlib.sha256()
+    for path in sorted(Path(item) for item in paths):
+        digest.update(str(path).encode())
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
 
 
 def native_double_digest(values: Iterable[float]) -> str:

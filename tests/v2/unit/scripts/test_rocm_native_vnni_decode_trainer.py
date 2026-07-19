@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,25 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+KERNEL_PERF_ROOT = REPO_ROOT / "tests" / "v2" / "performance" / "kernels"
+if str(KERNEL_PERF_ROOT) not in sys.path:
+    sys.path.insert(0, str(KERNEL_PERF_ROOT))
+
+from native_vnni_dispatch.corpus import GenericDomain  # noqa: E402
+from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.schema import (  # noqa: E402
+    AspectBucket,
+    Backend,
+    ExecutionMode,
+    SemanticContract,
+)
+from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    FeatureAxis,
+    FeaturePredicate,
+    FeatureThreshold,
+    GenericDispatchRule,
+)
+
 ANALYZER = (
     REPO_ROOT
     / "tests"
@@ -20,6 +40,15 @@ ANALYZER = (
     / "kernels"
     / "rocm"
     / "analyze_rocm_native_vnni_decode_trainer.py"
+)
+TRAINER_SOURCE = (
+    REPO_ROOT
+    / "tests"
+    / "v2"
+    / "performance"
+    / "kernels"
+    / "rocm"
+    / "Perf__NativeVNNI_Throughput.cpp"
 )
 
 
@@ -166,6 +195,35 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("canonical alias/mode coverage is incomplete", result.stderr)
 
+    def test_production_rejects_obsolete_one_pass_policy_emission(self) -> None:
+        result, _, _ = self.run_analyzer(
+            [self.row("KB32", "eager", 20.0)],
+            "--profile",
+            "production",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "requires development freeze and separate sealed certification",
+            result.stderr,
+        )
+
+    def test_production_freeze_requires_profiler_evidence(self) -> None:
+        result, _, _ = self.run_analyzer(
+            [self.row("KB32", "eager", 20.0)],
+            "--profile",
+            "production",
+            "--freeze-generic",
+            "--policy-json",
+            "/tmp/unused-rocm-policy.json",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "requires complete development profiler evidence",
+            result.stderr,
+        )
+
     def test_legacy_weak_csv_is_rejected(self) -> None:
         row = self.row("KB32", "eager", 20.0)
         del row["repeat_byte_mismatches"]
@@ -174,6 +232,93 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing strong ROCm decode columns", result.stderr)
+
+    def test_cpp_trainer_does_not_cap_grouped_verifier_runtime_m(self) -> None:
+        """Verifier inheritance and no-atomic gates apply beyond legacy M=4."""
+
+        source = TRAINER_SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("M >= 2 && M <= 4", source)
+        self.assertIn(
+            "M >= 2 &&\n"
+            "                    kind == "
+            "DecodeCandidateKind::VerifierInheritSerialM1",
+            source,
+        )
+
+    def test_generic_tree_emitter_compiles_every_launch_geometry_axis(self) -> None:
+        """ROCm must consume the common predicate IR rather than legacy ranges."""
+
+        spec = importlib.util.spec_from_file_location(
+            "rocm_native_vnni_analyzer_test_module",
+            ANALYZER,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        domain = GenericDomain(
+            backend=Backend.ROCM,
+            architecture_class="gfx906-test",
+            semantic_contract=SemanticContract.FAST,
+            operation_kind="NativeVNNIDecodeProjection",
+            bundle_signature="single",
+            prepared_family_id="NativeVNNI_rocm_CB19",
+            packing_abi="native-vnni-rocm-cb19-v1",
+            runtime_codebook_id=19,
+            execution_mode=ExecutionMode.EAGER,
+            m=1,
+            aspect_bucket=AspectBucket.BALANCED,
+        )
+        rule = GenericDispatchRule(
+            domain=domain,
+            predicates=(
+                FeaturePredicate(
+                    FeatureThreshold(FeatureAxis.N_TILES_256, 4, 1),
+                    True,
+                ),
+                FeaturePredicate(
+                    FeatureThreshold(
+                        FeatureAxis.K_GROUPS_PER_N_TILE_256,
+                        9,
+                        2,
+                    ),
+                    False,
+                ),
+            ),
+            candidate_id="rocm.nvnni.decode.fast.kb32",
+            arithmetic_fingerprint="sha256:test-rocm-rule",
+            development_shape_groups=("shape-a", "shape-b"),
+            development_max_regret=0.01,
+            development_p95_regret=0.01,
+            development_mean_regret=0.01,
+        )
+        generated = module.generate_include(
+            [],
+            [rule],
+            corpus_digest="sha256:test-corpus",
+            registry_digest="sha256:test-registry",
+            profile=MeasurementProfile.QUICK,
+        )
+        source = "\n".join((
+            generated,
+            "int main() {",
+            "  llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig out{};",
+            "  return llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(",
+            "      19, 1, 900, 1024, out) ? 0 : 1;",
+            "}",
+        ))
+        compiled = subprocess.run(
+            ["g++", "-std=c++20", "-x", "c++", "-fsyntax-only", "-"],
+            input=source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        self.assertNotIn("aspect_ratio", generated)
+        self.assertNotIn("min_work_items", generated)
 
 
 if __name__ == "__main__":

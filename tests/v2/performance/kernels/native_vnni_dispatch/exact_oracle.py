@@ -1,14 +1,20 @@
-"""Contract eligibility and alias/mode-robust exact winner construction."""
+"""Contract eligibility and mode-specific, alias-robust exact winners."""
 
 from __future__ import annotations
 
 import math
 import statistics
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
-from .corpus import ObservationCorpus, RuntimeKey, SurfaceKey, observed_surfaces
+from .corpus import (
+    ObservationCorpus,
+    RuntimeKey,
+    SurfaceKey,
+    observed_surfaces,
+    runtime_key,
+)
 from .schema import ExecutionMode, NativeVNNIObservation, SemanticContract
 
 
@@ -99,35 +105,31 @@ def build_exact_winner(
     *,
     required_surfaces: frozenset[SurfaceKey] | None = None,
     current_serial_m1_hash: str | None = None,
+    runtime_key_override: RuntimeKey | None = None,
 ) -> ExactWinner:
-    """Select one exact candidate using worst alias/mode normalized latency.
+    """Select one exact candidate using worst source-alias normalized latency.
 
-    The runtime cannot discriminate source aliases or execution modes in policy
-    ABI v1. A candidate missing or ineligible on any required surface is removed
-    before timing comparison. This is intentionally different from selecting a
-    winner per source row and taking a modal label afterward.
+    Policy ABI v2 discriminates eager from graph-captured execution because
+    multi-kernel launch gaps can change the economical schedule. It still cannot
+    discriminate source aliases that normalize to the same prepared codebook.
+    A candidate missing or ineligible on any required alias surface is removed
+    before timing comparison.
     """
 
     row_list = list(rows)
     if not row_list:
         raise ValueError("cannot construct an exact winner from an empty row set")
-    keys = {RuntimeKey(
-        backend=row.backend,
-        architecture_class=row.architecture_class,
-        semantic_contract=row.semantic_contract,
-        operation_kind=row.operation_kind,
-        bundle_signature=row.bundle_signature,
-        projection_n_vector=row.projection_n_vector,
-        prepared_family_id=row.prepared_family_id,
-        packing_abi=row.packing_abi,
-        runtime_codebook_id=row.runtime_codebook_id,
-        m=row.m,
-        aggregate_n=row.aggregate_n,
-        k=row.k,
-    ) for row in row_list}
+    keys = {runtime_key(row) for row in row_list}
+    if runtime_key_override is not None:
+        keys = {
+            replace(key, execution_mode=runtime_key_override.execution_mode)
+            for key in keys
+        }
     if len(keys) != 1:
         raise ValueError("exact winner rows span multiple runtime keys")
     key = next(iter(keys))
+    if runtime_key_override is not None and key != runtime_key_override:
+        raise ValueError("exact winner override disagrees with normalized rows")
     surfaces = required_surfaces or observed_surfaces(row_list)
     if not surfaces:
         raise ValueError("an exact runtime key has no alias/mode surfaces")
@@ -136,6 +138,12 @@ def build_exact_winner(
     exemplars: dict[str, NativeVNNIObservation] = {}
     for row in row_list:
         if not candidate_is_eligible(row, current_serial_m1_hash):
+            continue
+        # Exact overlays publish one concrete launch identity. Shape-resolved
+        # candidates are generic policy formulas whose effective launch varies
+        # with N/K; their directly measured concrete source row remains the
+        # eligible exact candidate for this key.
+        if row.candidate_id != row.effective_candidate_id:
             continue
         candidate = row.effective_candidate_id
         surface = SurfaceKey(row.source_format, row.execution_mode)
@@ -220,5 +228,6 @@ def build_exact_winners(
             corpus.rows_for_runtime_key(key),
             required_surfaces=(required_surfaces or {}).get(key),
             current_serial_m1_hash=(serial_m1_hashes or {}).get(key),
+            runtime_key_override=key,
         )
     return result

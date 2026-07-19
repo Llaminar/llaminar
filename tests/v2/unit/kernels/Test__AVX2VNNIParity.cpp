@@ -197,6 +197,66 @@ protected:
     }
 };
 
+/**
+ * @test Prove nominal M=1 candidates collapse only when N makes them aliases.
+ *
+ * This policy-only test launches no kernel.  It protects profiler ownership:
+ * NBC8 and NBC16 at a three-chunk shape are the same physical NBC4 launch and
+ * must never receive independent counter records.
+ */
+TEST(CPUNativeVNNIDecodePolicy, NormalizesGeometryDependentAliases)
+{
+    EXPECT_EQ(
+        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc16, 1),
+        DecodeSchedulePolicy::Nbc1);
+    EXPECT_EQ(
+        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc8, 3),
+        DecodeSchedulePolicy::Nbc4);
+    EXPECT_EQ(
+        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc16, 7),
+        DecodeSchedulePolicy::Nbc8);
+    EXPECT_EQ(
+        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc2, 7),
+        DecodeSchedulePolicy::Nbc2);
+    EXPECT_EQ(
+        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc16, 32),
+        DecodeSchedulePolicy::Nbc16);
+}
+
+/**
+ * @test Scalar M=1 execution remains an explicit diagnostic oracle only.
+ *
+ * Production `Auto` and concrete learned schedule requests must never turn an
+ * unsupported runtime ISA into scalar row replay. The packed payload can stay
+ * empty because the policy guard must reject the call before arithmetic begins.
+ */
+TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
+{
+    CPUNativeVNNIPackedWeights packed;
+    packed.N = 64;
+    packed.K = 32;
+    packed.blocks_per_row = 1;
+    std::array<Q8_1Block, 1> activation{};
+    std::array<float, 64> output{};
+
+    EXPECT_THROW(
+        gemv_native_vnni_preq(
+            packed,
+            activation.data(),
+            output.data(),
+            ISAPath::SCALAR,
+            DecodeSchedulePolicy::Auto),
+        std::runtime_error);
+    EXPECT_THROW(
+        gemv_native_vnni_preq(
+            packed,
+            activation.data(),
+            output.data(),
+            ISAPath::SCALAR,
+            DecodeSchedulePolicy::Nbc1),
+        std::runtime_error);
+}
+
 // ============================================================================
 // Level 1: Intrinsic-level dpbusd parity
 // ============================================================================
@@ -434,9 +494,11 @@ CHUNK_PARITY_TEST(IQ1_M, createIQ1_MRandom, 64, 256)
         std::vector<float> result_256(N, 0.0f);                                            \
                                                                                            \
         gemv_native_vnni_preq(packed, A_q8.data(), result_512.data(),                      \
-                              ISAPath::AVX512);                                            \
+                              ISAPath::AVX512,                                             \
+                              DecodeSchedulePolicy::FrozenSerialOracle);                  \
         gemv_native_vnni_preq(packed, A_q8.data(), result_256.data(),                      \
-                              ISAPath::AVX2);                                              \
+                              ISAPath::AVX2,                                               \
+                              DecodeSchedulePolicy::FrozenSerialOracle);                  \
                                                                                            \
         assertExactEqual(result_512.data(), result_256.data(), N,                           \
                          #FORMAT " full GEMV " #N "x" #K);                                 \
@@ -631,9 +693,15 @@ TEST_F(AVX2VNNIParity, RuntimeISADispatch_ScalarAVX2AVX512_VerifierRows)
         std::vector<float> gemv_512(N, 0.0f);
         std::vector<float> gemv_256(N, 0.0f);
         std::vector<float> gemv_scalar(N, 0.0f);
-        gemv_native_vnni_preq(packed, A_q8_all.data(), gemv_512.data(), ISAPath::AVX512);
-        gemv_native_vnni_preq(packed, A_q8_all.data(), gemv_256.data(), ISAPath::AVX2);
-        gemv_native_vnni_preq(packed, A_q8_all.data(), gemv_scalar.data(), ISAPath::SCALAR);
+        gemv_native_vnni_preq(
+            packed, A_q8_all.data(), gemv_512.data(), ISAPath::AVX512,
+            DecodeSchedulePolicy::FrozenSerialOracle);
+        gemv_native_vnni_preq(
+            packed, A_q8_all.data(), gemv_256.data(), ISAPath::AVX2,
+            DecodeSchedulePolicy::FrozenSerialOracle);
+        gemv_native_vnni_preq(
+            packed, A_q8_all.data(), gemv_scalar.data(), ISAPath::SCALAR,
+            DecodeSchedulePolicy::FrozenSerialOracle);
 
         assertExactEqual(gemv_512.data(), gemv_256.data(), N,
                          test_case.name + " M=1 AVX512 vs AVX2");

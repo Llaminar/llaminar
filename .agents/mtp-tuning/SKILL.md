@@ -179,14 +179,22 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_CU
 ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_ROCm_" --output-on-failure --parallel
 ```
 
-As of 2026-07-11 the prefix gate discovers 49 substantive lanes: 13 CPU, 16
-CUDA, and 20 ROCm (`50` CTest entries including the model fixture). The
+As of 2026-07-13 the prefix gate discovers 51 substantive lanes: 13 CPU, 17
+CUDA, and 21 ROCm (`52` CTest entries including the model fixture). The
 inventory includes all-format GEMM, MoE codegroups and
 expert paths, floating formats, dense QKV/GDN projections, replicated LocalTP
 output projection, embedding, RMSNorm, fused residual norm, residual add,
-SwiGLU, RoPE, attention, KV-cache append, GDN recurrence, and short-conv. The
+SwiGLU, RoPE, attention, KV-cache append, GDN recurrence, short-conv,
+request-batched GDN state, and device-resident stochastic sampling. The
 prefix command is canonical precisely so a newly registered operation cannot be
 omitted from an otherwise plausible-looking hand-maintained regex.
+
+The backend counts are an inventory, not a symmetry waiver. Before the final
+MTP gate, compare the semantic operation matrix across CPU, CUDA, and ROCm and
+add every applicable missing lane. In particular, CPU currently lacks the GPU
+stochastic-resident and request-batched recurrent-state lanes, while explicit
+all-format/runtime-M projection and MoE codegroup discovery is not named
+uniformly across the three backends.
 
 The CUDA and ROCm `GDNRecurrence` and `ShortConv` lanes also prove captured
 graph lifetime across accepted-state publication. Each backend captures the
@@ -307,6 +315,266 @@ Use `scripts/summarize_mtp_perfstats.py` to compare:
 - response-ready wait versus actual D2H enqueue/wait
 - acceptance, rejection, and rollback counts
 
+### Isolated NativeVNNI profiler evidence
+
+NativeVNNI policy training has two physically separate evidence transactions.
+Canonical candidate timing runs first, with production warmups and
+sample-interleaved rounds. Only after those observations and raw timing samples
+are immutable may `profiler_evidence.py` derive per-candidate requests.
+`profiler_collectors.py` then starts one fresh process per request and gathers
+Linux `perf`, Nsight Compute, or rocprofiler metrics from an extra isolated
+launch. Profiler replay duration is never a timing label.
+
+Every supported observation needs one evidence record; unsupported candidates
+need an explicit non-profile state. CUDA/ROCm candidates may be pipelines, so
+retain quantization, producer, reducer, and epilogue dispatches independently
+and in launch order. Optional counters unavailable on one architecture remain
+typed unavailable fields. A missing tool, raw report, required counter, or
+supported candidate record blocks production evidence completeness. Production
+`scripts/refresh_native_vnni_dispatch_tables.sh --profile all` enables this gate
+by default, and `--install --skip-profiler-evidence` is forbidden.
+
+The required `*_profiler_features.csv` export is an authenticated join of the
+canonical common-observation timing CSV, request manifest, and evidence
+manifest. It retains pipeline-level canonical timing alongside one ordered row
+per physical dispatch and that dispatch's own counters. Never train from a
+hand-joined profiler CSV or treat profiler replay duration as canonical
+latency; a corpus/request/evidence digest mismatch must fail the refresh.
+
+### Immutable Git LFS corpora and turnkey refits
+
+The canonical cross-backend procedure now lives in
+`.agents/nativevnni-gemm-tuning/SKILL.md`. Keep this section focused on MTP's
+strict grouped-row equivalence and its interaction with speculative decode.
+
+Use `scripts/train_native_vnni_dispatch.sh --backend <backend> --install` as the
+normal production entry point for `cuda`, `rocm`, `cpu`, and `cpu-prefill`.
+The command rebuilds both vendor policy scorers, validates their integration
+oracles, benchmarks and profiles only when no matching corpus generation is
+published, fits and certifies, and atomically installs the generated include.
+Additional refresh options belong after `--`.
+
+Published generations live under
+`benchmark_results/native_vnni_dispatch/corpora/<backend>/<architecture>/<shape-digest>-<configuration-digest>/`.
+`corpus.manifest.json` is ordinary Git metadata; large timing/profiler payloads
+are Git LFS objects. Never hand-edit a sealed generation. The corpus verifier
+must reject unresolved LFS pointers, partial files, symlinks, changed payload
+digests, and stale resolved shape inventories. Fit-only replay materializes a
+disposable workspace and uses `--skip-sweep --reuse-profiler-evidence`; it may
+re-export authenticated profiler features but must launch no candidate kernel
+and no profiler. A failed fit is mined again from the same corpus rather than
+triggering another timing sweep.
+
+The final corpus directory suffix also binds forwarded collection arguments.
+Do not pass `--shapes` or `--shape-partition` through the turnkey command;
+production overlays belong in the shared inventory so all backends see them.
+
+Every exact overlay comes from the shared resolved shape inventory consumed by
+the CPU, CUDA, and ROCm trainers. Backend-private shape lists are forbidden.
+An overlay addition changes the inventory digest and therefore requires a new
+corpus generation; exact overlays remain additive to mandatory generic rules.
+
+### GPU-accelerated NativeVNNI policy fitting
+
+The common policy learner can batch its first two exact leaf keys on CUDA and
+ROCm. Build `v2_native_vnni_leaf_primary_scorer_cuda` and
+`v2_native_vnni_leaf_primary_scorer_rocm`; production
+`refresh_native_vnni_dispatch_tables.sh --profile all` auto-discovers both
+vendor inventories and uses isolated one-vendor worker processes. Each physical
+device defaults to eight CPU orchestration lanes because tree construction is
+still host work and the scorer kernels are brief. Tune with `--policy-lanes`,
+or explicitly choose `--policy-accelerators cpu` for the canonical CPU fitter.
+
+Each GPU scorer lane must keep one uploaded regret matrix, non-default stream,
+and growable scratch session alive across all leaf batches for a fit. Do not
+reintroduce per-call stream creation, device allocation, or full-matrix upload.
+Schedule CV/final-fit tasks through the longest-first dynamic device queue and
+refill whichever lane completes first; restore task-index order before policy
+reduction so scheduling cannot affect generated bytes. Static per-lane task
+partitions are forbidden because heterogeneous folds create a severe idle tail.
+Represent tree point subsets as arbitrary-width integer masks, cache exact
+threshold membership masks, and retain ordered point tuples only for canonical
+later-key/report materialization. Keep the unit invariant that leaf masks are
+disjoint, cover the full point inventory, and map exactly to retained ordered
+points; generated report and request bytes must match before/after any beam
+representation optimization.
+
+The GPU computes maximum regret as a diagnostic and the integer count at or
+above the strict 5% boundary. Python derives p95 and mean regret and retains
+candidate-name tie-breaking so report/request bytes stay identical to CPU
+fitting. A policy is installable only when measured p95 regret and conservative
+p95 regret upper bound are both strictly below 5%; maximum regret is never an
+installation gate. Run
+`V2_Integration_NativeVNNILeafPrimaryScorer_CUDA` and `_ROCm`; unit tests must
+remain GPU-free. Once acceleration is explicitly requested, a missing DSO,
+device, or worker is a hard failure. Never silently resume on CPU, and never
+confuse policy-scoring GPU work with separately timed candidate kernels or
+isolated profiler launches.
+
+GPU scorers do not replace backend candidate measurement. In particular, CPU
+kernel timing must remain on CPU. On a multisocket trainer host, split distinct
+shape/source/ISA jobs across an MPMD MPI launch with one rank per socket. Never
+launch the same tuple on both ranks, and give every rank distinct aggregate and
+raw-timing paths. Pair only jobs with identical ordered M inventories. Enable
+`LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC=1` so every warmup and timing round
+ends in an MPI active-rank reduction; a locally converged rank must continue
+unmeasured complete-round pacing until every rank finishes the same M phase.
+Without that coordination, one rank can advance to a larger M and manufacture
+frequency or memory-pressure drift in its peer's timing series.
+
+Installable CPU prefill evidence must authenticate
+`mpi-complete-round-v1`, MPI world size/rank, and global warmup/timing round
+counts. The adapter must reject candidate/global round disagreement and any
+multi-rank production corpus collected with process-local pacing. Do not fix a
+cross-rank transient by raising the sample ceiling, relaxing the 2% drift gate,
+or selecting a convenient stable tail.
+
+Warmup is elapsed-evidence controlled, not round-count controlled. An M64
+candidate can legitimately require more than 10,000 launches to accumulate one
+second, so do not reintroduce a fixed warmup-round ceiling. Keep the 30-second
+per-complete-round watchdog, require every measured launch to make finite
+positive timer progress, and record total phase wall time plus maximum round
+duration. Long-M phases may legitimately exceed 30 seconds across several
+rounds; retain the per-candidate measured-duration gate as the promotion
+requirement.
+
+After the one-second source preconditioning cell, derive each CPU prefill
+candidate's M-transition warmup from its first production-route latency probe:
+`max(100 ms, min(2 s, probe_latency * 60))`. Authenticate the policy, probe,
+floor, multiplier, ceiling, effective budget, and achieved duration in raw
+evidence. A fixed 100 ms budget was insufficient for a real IQ3_S M4096
+transition whose first roughly 45 timing launches were still elevated. Do not
+repair this class of failure by filtering the timing tail or relaxing the 2%
+full-history drift gate.
+
+Use timing protocol `elapsed-stability-interleaved-v13` with ceiling policy
+`samples-and-elapsed-v1`. A stable candidate may still stop at the ordinary
+30-sample floor. An unstable candidate must satisfy both `sample_count >= 180`
+and `timed_duration_us >= 2,000,000` before the trainer can reject it; 180 is
+not an unconditional maximum. A real cheap M64 route reached 180 samples after
+only about 203 ms while still settling. The forced zero-drift regression must
+continue beyond 180 samples, accumulate the full measured-time budget, flush
+both evidence files, and fail collectively without hanging its peer.
+
+All MPMD ranks must make timing rejection collectively after flushing their
+aggregate and timing sidecars. A rank-local GTest fatal assertion can strand a
+peer in the next-M barrier or MPI finalization. Reduce the failure decision and
+abort the communicator before any rank advances; retain an asymmetric direct
+regression that proves the failure exits instead of hanging.
+
+For a production CPU corpus, add `--cpu-format-shards` and bound each invocation
+with `--cpu-batch-limit N`. Re-run against the same output directory with
+`--resume-cpu-partials`; completed shape/format/ISA outputs are atomic and must
+not be measured twice. Never treat `.inprogress` files as evidence, combine a
+partial checkpoint, invoke the learner on it, or install from it.
+
+For GPU corpora, use `--cuda-measurement-lanes N` and
+`--rocm-measurement-lanes N` to assign disjoint round-robin format shards to
+homogeneous physical devices. The wrapper must reject excess or heterogeneous
+lanes, keep one aggregate/timing pair per lane, and merge only after every lane
+is green. CUDA and ROCm timing transactions may run concurrently when they own
+separate GPUs, but each concurrent command must restrict
+`--policy-accelerators` to its own backend. Never let CUDA policy fitting borrow
+ROCm devices, or vice versa, while the borrowed backend is collecting canonical
+timing. Profiler replay is a separate launch and must never overlap canonical
+timing on the same physical device.
+
+Treat the checked-in GPU measurement plan as the physical timing authority;
+the broader shape manifest is the support inventory. Common development shapes
+must cover every production geometry and every reviewed feature bucket on all
+formats. Backend/format-specific refinements must run only on their declared
+surface: the v1 `fast-m1-cv-refinement-v5` extension is CUDA + Q4_0 + Fast M1,
+is shape-sharded across CUDA lanes, and must never appear in ROCm, another
+format, or grouped-verifier evidence. Before a production run, execute
+`test_native_vnni_gpu_measurement_plan.py` and the refresh-wrapper regressions;
+the analyzers must reject missing and unexpected
+`(contract, M, shape, format, execution mode)` surfaces.
+
+The CPU ordinary-prefill covering plan must include the minimum-N*K production
+geometry for every codebook/M/aspect/ISA domain. Pairwise feature coverage alone
+can choose all witnesses from one larger model group, leaving the generic
+learner without enough independent groups to certify a small-shape decision.
+Plan v7's generic covering array contains 1,583 runtime cells and 1,829
+source-alias cells. Do not install from that base plan alone. Run the zero-kernel
+production route probe in all three build/runtime ISA regimes and pass its
+manifests to the planner and analyzer. Route closure expands the blessed host
+plan to 1,820 runtime cells, 2,107 source cells, and 653 process jobs because the
+finite native-AVX512 serial-K-part family must be timed exactly. Its
+lower-boundary anchors add only about 2.65% estimated GEMM work. When rebasing a
+checkpoint to a new plan contract, reuse an atomic shard only if its complete M
+inventory exactly matches the new source record; otherwise omit the whole
+aggregate and timing pair for recollection.
+
+Treat the C++ route manifest as authoritative for thread count, `k_tiles`, and
+the full-K versus serial-K-part arithmetic bundle. Do not reproduce the
+cache-aware `computeTileConfig()` heuristic in Python. AVX2 serial-K-part has a
+single forceable Pairwise schedule and needs no learned tournament. Native
+AVX512 must measure Pairwise and WideRows over its complete finite production
+family; the current route-certified corpus selects Pairwise for `M=2`, where
+WideRows is unavailable, and measured WideRows for `M>=3`. Production `Auto`
+must consume the generated table and fail hard on an unresolved surface.
+
+Keep certification geometry inside the checked-in manifest's supported
+production envelope. The current maximum is `1,271,398,400` weight elements,
+set by the largest supported production projection. CPU timing has a narrower
+checked-in ceiling of `778,567,680` weight elements, exactly the Qwen2.5 32B
+`152064x5120` LM head; retain explicit 32B attention, QKV, FFN-up, FFN-down,
+and LM-head overlays in that matrix. Do not delete larger runtime geometries
+from the shared manifest merely to shorten CPU collection. Do not add larger
+synthetic lattice points merely to make a sweep look exhaustive; the manifest
+loader must reject them.
+
+Keep MTP grouped-verifier measurements at `M=2..16,31`. The ordinary CPU
+NativeVNNI GEMM/prefill buckets are
+`M={64,256,1024,2048,4096,8192,16384}`. Cap 32B at `1024`, cap 14B at `4096`,
+and run the full range through `16384` for 9B-and-smaller models. The verifier
+and prefill matrices are separate contracts; do not inflate verifier collection
+with prefill-only batch sizes or run giant 32B prefills merely for symmetry.
+CUDA and ROCm use the same buckets but directly measure every 14B/32B
+projection through `8192`; their higher ceiling is a backend-specific economy
+obligation, not permission to weaken the CPU timing target.
+
+Query the authoritative ordinary-prefill matrix with:
+
+```bash
+PYTHONPATH=tests/v2/performance/kernels \
+  python3 -m native_vnni_dispatch.prefill_matrix --records
+```
+
+The production measurement test is
+`CPUNativeVNNIGemvTest.TrainerCsv_StrongPrefill_AllFormats`. It must emit all
+eight registry requests, retain normalized requests as unsupported evidence,
+prove both launches byte-equal to serial M1 rows, and keep isolated Linux
+`perf` collection outside the timing samples.
+
+Paired refinement uses the wrapper-owned `fit-cache` directory. The compact
+source/manifest/projection identity, candidate costs, and CV results are
+content-addressed; candidate costs and CV are cached independently per
+mode/codebook/aspect domain and keyed by only that domain's tournament evidence.
+A new edge must not refit unaffected domains. Formula rows are projected lazily
+only for a cost-miss or final-fit domain; CV traverses fitted trees directly
+from the cost matrix. Never serialize the expanded projected corpus. The
+learner requests unresolved edges from its complete evaluated CV-model frontier
+in the current timing batch. Keep the cache-hit and domain-invalidation
+unit regressions green whenever changing CV, candidate costs, or paired request
+planning.
+
+Ordinary NativeVNNI prefill is an independent common-policy surface. On CPU,
+train only physical schedules proven by
+`NativeVNNIPrefillFullKAllFormatsRuntimeMMatchesSerialDecode`: the row-chunk
+grid formula and eligible two-row N-block schedules, each with exactly one
+full-K tile. Reject K-tiled accumulation candidates whose intermediate FP32
+stores change serial-M1 parenthesization. Require the
+`cpu_native_vnni_prefill_gemm_launch` perfstats route to match the requested
+candidate before admitting timing evidence.
+
+For M=1 GEMV, report useful prepared-weight bandwidth as a fraction of an
+empirically measured sustainable HBM roofline, alongside physical profiler
+traffic. Keep canonical median latency as the dispatch label: launch overhead,
+unpack work, and deterministic K-partition traffic can make bandwidth alone
+choose the wrong winner. Grouped M>1 reports also need GOPS and arithmetic
+intensity because weight reuse can move the kernel away from the HBM roofline.
+
 ## Grouped Kernel Tuning
 
 MTP only becomes economical when grouped verifier work is genuinely grouped.
@@ -365,19 +633,26 @@ The canonical CPU production refresh is:
 ```bash
 scripts/refresh_native_vnni_dispatch_tables.sh \
   --backend cpu \
-  --profile qwen36 \
+  --profile all \
   --cpu-threads 28 \
+  --cpu-measurement-lanes 2 \
   --cpu-avx2-sweep-bin build_v2_release/tests/v2/v2_perf_cpu_native_vnni_gemv \
   --cpu-avx512-sweep-bin build_v2_release_avx512/tests/v2/v2_perf_cpu_native_vnni_gemv \
   --output-dir benchmark_results/native_vnni_dispatch/<run-id> \
   --install
 ```
 
-Use the physical cores per socket for `--cpu-threads` on the blessed training
-host. The wrapper runs the AVX512 binary twice with distinct runtime dispatch,
+Use the physical cores per socket for `--cpu-threads` and the physical socket
+count for `--cpu-measurement-lanes` on the blessed training host. The wrapper
+assigns distinct even/odd shape shards to MPI ranks mapped one per socket and
+runs the AVX512 binary twice with distinct runtime dispatch,
 requires the complete ISA matrix, and permits `--install` only for a production
 Qwen 3.6/all-shape profile. Retain the aggregate CSV, timing sidecar, common
 observation CSV, generated include, and summary from every production run.
+Also retain the profiler request/evidence manifests, authenticated
+`*_profiler_features.csv`, and raw artifact directory; they are bound to the
+observation and timing-sample digests and cannot be regenerated from a
+different run.
 
 After a CPU refresh, rebuild both binaries and run these gates:
 

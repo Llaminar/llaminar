@@ -91,15 +91,22 @@ class PolicyIR:
 
         return next((entry for entry in self.exact_entries if entry.key == key), None)
 
-    def resolve_generic(self, domain: GenericDomain, work_items: int) -> GenericDispatchRule | None:
-        """Resolve only the frozen generic policy for sealed certification."""
+    def resolve_generic(
+        self,
+        domain: GenericDomain,
+        aggregate_n: int,
+        k: int,
+    ) -> GenericDispatchRule | None:
+        """Resolve only the frozen generic tree for sealed certification."""
 
-        return next((
+        matches = [
             rule
             for rule in self.generic_rules
-            if rule.domain == domain
-            and rule.min_work_items <= work_items <= rule.max_work_items
-        ), None)
+            if rule.domain == domain and rule.matches(aggregate_n, k)
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"generic policy leaves overlap for {domain}")
+        return matches[0] if matches else None
 
 
 def make_policy_ir(

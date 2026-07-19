@@ -739,6 +739,17 @@ namespace
 {
     /** Number of low bits reserved for an expert id in a packed work item. */
     constexpr uint32_t kMoEPrefillExpertBits = 9u;
+    /**
+     * @brief Maximum descriptor-table width represented by the work directory.
+     *
+     * Qwen 3.6 has 256 routed experts and one separate shared expert.  A
+     * verifier may economically publish those nine selected routes through one
+     * descriptor table, so the directory must admit expert id 256 rather than
+     * treating 256 as a hard table-size limit.  Nine id bits represent ids
+     * 0..511, hence 512 table entries without enlarging each packed work item.
+     */
+    constexpr int kMoEPrefillMaxExperts =
+        static_cast<int>(uint32_t{1} << kMoEPrefillExpertBits);
     /** Maximum expert id representable by the compact device work directory. */
     constexpr uint32_t kMoEPrefillExpertMask =
         (uint32_t{1} << kMoEPrefillExpertBits) - 1u;
@@ -760,17 +771,17 @@ namespace
  * and skip the `UINT32_MAX` tail.
  *
  * Each directory entry uses nine low bits for the expert id and the remaining
- * bits for the first row local to that expert.  Llaminar's device MoE runtime is
- * capped at 256 experts, so nine bits leave one explicit guard value while still
- * supporting millions of grouped rows.  Planning is deterministic, contains no
- * host synchronization, and is safe to capture and replay as part of the full
- * GPU graph.
+ * bits for the first row local to that expert. Nine bits support descriptor
+ * tables with up to 512 entries, including a 256-routed-plus-one-shared fused
+ * verifier table, while still supporting millions of grouped rows. Planning is
+ * deterministic, contains no host synchronization, and is safe to capture and
+ * replay as part of the full GPU graph.
  *
  * @tparam TILE_M Number of consecutive grouped rows consumed by one projection
  *                 workgroup.
  */
 template <int TILE_M>
-__global__ __launch_bounds__(256, 1)
+__global__ __launch_bounds__(kMoEPrefillMaxExperts, 1)
 void moe_grouped_build_prefill_tile_directory_kernel(
     const int* __restrict__ group_counts,
     uint32_t* __restrict__ directory,
@@ -780,10 +791,9 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     static_assert(TILE_M == 4 || TILE_M == 8 ||
                   TILE_M == 12 || TILE_M == 16,
                   "grouped-prefill sweep supports row tiles 4/8/12/16");
-    constexpr int MAX_EXPERTS = 256;
     const int tid = threadIdx.x;
 
-    if (num_experts <= 0 || num_experts > MAX_EXPERTS ||
+    if (num_experts <= 0 || num_experts > kMoEPrefillMaxExperts ||
         max_directory_tiles <= 0)
     {
         if (tid == 0)
@@ -794,7 +804,7 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     for (int tile = tid; tile < max_directory_tiles; tile += blockDim.x)
         directory[tile] = kMoEPrefillUnusedTile;
 
-    __shared__ int inclusive_tile_counts[MAX_EXPERTS];
+    __shared__ int inclusive_tile_counts[kMoEPrefillMaxExperts];
     int count = tid < num_experts ? group_counts[tid] : 0;
     if (count < 0)
     {
@@ -808,7 +818,7 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     // Hillis-Steele is deliberately used for this tiny 256-element directory:
     // its regular barriers are graph-capture friendly and much cheaper than a
     // lane-zero serial scan on gfx906.
-    for (int stride = 1; stride < MAX_EXPERTS; stride <<= 1)
+    for (int stride = 1; stride < kMoEPrefillMaxExperts; stride <<= 1)
     {
         const int addend = tid >= stride
                                ? inclusive_tile_counts[tid - stride]
@@ -818,7 +828,7 @@ void moe_grouped_build_prefill_tile_directory_kernel(
         __syncthreads();
     }
 
-    const int total_tiles = inclusive_tile_counts[MAX_EXPERTS - 1];
+    const int total_tiles = inclusive_tile_counts[kMoEPrefillMaxExperts - 1];
     if (total_tiles > max_directory_tiles)
     {
         if (tid == 0)
@@ -1656,7 +1666,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     int device_id,
     void* stream)
 {
-    if (num_experts <= 0 || num_experts > 256 ||
+    if (num_experts <= 0 || num_experts > kMoEPrefillMaxExperts ||
         d_model <= 0 || intermediate <= 0 ||
         total_slots <= 0 || top_k <= 0 || (total_slots % top_k) != 0 ||
         (d_model % 32) != 0 || (intermediate % 32) != 0 ||
@@ -1695,7 +1705,13 @@ bool rocmMoE_grouped_prefill_pipeline(
         if (directory_tile_rows == tile_rows)
             return current_directory_capacity;
 
-        dim3 directory_block(256);
+        /*
+         * One thread owns one descriptor-table entry in the inclusive scan.
+         * Launch the full representable width so inactive tail entries are
+         * explicitly zero and the final scan element always contains the
+         * complete tile count, including expert id 256 and above.
+         */
+        dim3 directory_block(kMoEPrefillMaxExperts);
         switch (tile_rows)
         {
         case 4:

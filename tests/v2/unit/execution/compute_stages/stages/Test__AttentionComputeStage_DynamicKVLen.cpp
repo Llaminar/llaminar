@@ -1088,9 +1088,9 @@ namespace llaminar2
             ASSERT_FALSE(rocm_source.empty());
             ASSERT_FALSE(cuda_source.empty());
 
-            EXPECT_NE(policy.find("inline constexpr int kMaxGroupedVerifierAttentionRows = 4"),
+            EXPECT_NE(policy.find("inline constexpr int kMaxGroupedVerifierAttentionRows = 16"),
                       std::string::npos)
-                << "Fixed-depth-3 MTP verification needs draft_count + 1 == 4 continuation rows.";
+                << "Depth-15 MTP verification needs draft_count + 1 == 16 continuation rows.";
             EXPECT_NE(rocm_source.find("attention::kMaxGroupedVerifierAttentionRows"),
                       std::string::npos)
                 << "ROCm must consume the shared grouped-attention row policy.";
@@ -1103,13 +1103,13 @@ namespace llaminar2
             ASSERT_FALSE(stage_source.empty());
             EXPECT_NE(stage_source.find("logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows"),
                       std::string::npos)
-                << "ROCm graph-capture preparation must materialize four device-owned verifier parameter rows.";
-            EXPECT_NE(stage_source.find("native-KV M=2..4 verifier path"),
+                << "ROCm graph-capture preparation must materialize sixteen device-owned verifier parameter rows.";
+            EXPECT_NE(stage_source.find("native-KV M=2..16 verifier path"),
                       std::string::npos)
-                << "ROCm graph replay signatures must document and cover the four-row verifier path.";
+                << "ROCm graph replay signatures must document and cover the sixteen-row verifier path.";
             EXPECT_NE(stage_source.find("params_.seq_len > attention::kMaxGroupedVerifierAttentionRows"),
                       std::string::npos)
-                << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=4.";
+                << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=16.";
 
             const std::string rocm_kernels = readFile(
                 root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
@@ -1131,10 +1131,10 @@ namespace llaminar2
 
             EXPECT_NE(rocm_body.find("out[row].position_offset = position_offset + row"),
                       std::string::npos)
-                << "ROCm M=2..4 verifier rows must use absolute continuation positions.";
+                << "ROCm M=2..16 verifier rows must use absolute continuation positions.";
             EXPECT_NE(rocm_body.find("out[row].mask_stride = kv_len"),
                       std::string::npos)
-                << "ROCm M=2..4 verifier rows must keep the full verifier KV stride.";
+                << "ROCm M=2..16 verifier rows must keep the full verifier KV stride.";
             EXPECT_EQ(rocm_body.find("position_offset = row_kv_len"),
                       std::string::npos)
                 << "Row-local KV length must not replace the caller's continuation offset.";

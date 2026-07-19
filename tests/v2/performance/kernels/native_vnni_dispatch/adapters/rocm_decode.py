@@ -14,10 +14,11 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .evidence import verify_aggregate_timing
+from .evidence import raw_corpus_id, verify_aggregate_timing
 from ..candidate_registry import rocm_native_vnni_decode_registry
 from ..corpus import ObservationCorpus
 from ..format_registry import format_spec
@@ -126,7 +127,7 @@ def read_rocm_decode_timing_sidecars(
 ) -> dict[RawTimingKey, tuple[float, ...]]:
     """Read exact HIP-event microseconds and validate sidecar continuity."""
 
-    indexed: dict[RawTimingKey, dict[int, float]] = {}
+    indexed: dict[RawTimingKey, list[float]] = {}
     for path in (Path(item) for item in paths):
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -147,9 +148,11 @@ def read_rocm_decode_timing_sidecars(
                     )
                 key = _timing_key(raw)
                 sample_index = int(raw["sample_index"])
-                if sample_index < 0 or sample_index in indexed.setdefault(key, {}):
+                samples = indexed.setdefault(key, [])
+                if sample_index != len(samples):
                     raise ValueError(
-                        f"{path}:{row_number}: duplicate/negative sample index {sample_index}"
+                        f"{path}:{row_number}: timing sample index {sample_index} "
+                        f"is not the next contiguous index {len(samples)}"
                     )
 
                 latency_us = float.fromhex(raw["latency_us_hex"].strip())
@@ -162,14 +165,11 @@ def read_rocm_decode_timing_sidecars(
                     raise ValueError(
                         f"{path}:{row_number}: readable and exact latency fields disagree"
                     )
-                indexed[key][sample_index] = latency_us
+                samples.append(latency_us)
 
     result = {}
     for key, samples in indexed.items():
-        expected = list(range(len(samples)))
-        if sorted(samples) != expected:
-            raise ValueError(f"timing sidecar has non-contiguous samples for {key}")
-        values = tuple(samples[index] for index in expected)
+        values = tuple(samples)
         if tuple(sorted(values)) != values:
             raise ValueError(f"timing sidecar samples are not trainer-sorted for {key}")
         result[key] = values
@@ -243,29 +243,36 @@ class ROCmDecodeAdapterContext:
                 )
 
 
-def raw_corpus_id(paths: Iterable[Path]) -> str:
-    """Hash ordered aggregate/sidecar shard bytes for corpus provenance."""
+@lru_cache(maxsize=None)
+def _trial_set_hash_values(
+    source_format: str,
+    shape: str,
+    m: int,
+    n: int,
+    k: int,
+) -> str:
+    """Hash one reused deterministic ROCm decode trial identity once."""
 
-    digest = hashlib.sha256()
-    for path in sorted(Path(item) for item in paths):
-        digest.update(str(path).encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return "sha256:" + digest.hexdigest()
+    return _sha256({
+        "version": ROCM_DECODE_TRIAL_SET_VERSION,
+        "source_format": source_format,
+        "shape": shape,
+        "m": m,
+        "n": n,
+        "k": k,
+    })
 
 
 def _trial_set_hash(raw: Mapping[str, str]) -> str:
     """Identify the deterministic C++ input/weight fixture for one row."""
 
-    return _sha256({
-        "version": ROCM_DECODE_TRIAL_SET_VERSION,
-        "source_format": raw["source_format"].strip().upper(),
-        "shape": raw["shape"].strip(),
-        "m": int(raw["m"]),
-        "n": int(raw["n"]),
-        "k": int(raw["k"]),
-    })
+    return _trial_set_hash_values(
+        raw["source_format"].strip().upper(),
+        raw["shape"].strip(),
+        int(raw["m"]),
+        int(raw["n"]),
+        int(raw["k"]),
+    )
 
 
 def adapt_rocm_decode_row(

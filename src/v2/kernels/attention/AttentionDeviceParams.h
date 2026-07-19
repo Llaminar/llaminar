@@ -17,12 +17,14 @@ namespace llaminar2
         /**
          * @brief Maximum number of target-model rows in one grouped verifier pass.
          *
-         * An MTP draft depth of one through three produces two through four
-         * target-model rows: the current token plus each drafted continuation.
-         * Production GPU attention must therefore reserve and validate four
-         * row-local parameter records and four rows of split-decode partials.
+         * An MTP draft depth of up to fifteen produces sixteen target-model
+         * rows: the current token plus each drafted continuation. Production
+         * GPU attention therefore reserves sixteen row-local parameter records
+         * and sixteen rows of split-decode partials. The canonical kernel sweep
+         * additionally probes M=31 as a stress geometry, but that is not a
+         * production speculative-depth promise.
          */
-        inline constexpr int kMaxGroupedVerifierAttentionRows = 4;
+        inline constexpr int kMaxGroupedVerifierAttentionRows = 16;
 
         /**
          * @brief Row-local dynamic geometry consumed by graph-captured attention.

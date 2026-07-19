@@ -1,6 +1,7 @@
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
+#include "loaders/MmapRegion.h"
 #include "backends/IBackend.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -224,6 +225,26 @@ namespace llaminar2
                 return false;
             }
 
+            const int full_n = job.full_N > 0 ? job.full_N : job.N;
+            const int full_k = job.full_K > 0 ? job.full_K : job.K;
+            if (job.N <= 0 || full_n <= 0 || job.row_offset < 0 ||
+                job.row_offset + job.N > full_n)
+            {
+                LOG_ERROR("DeviceLoadPipeline: invalid row chunk for '" << job.name
+                                                                         << "' row_offset=" << job.row_offset
+                                                                         << " N=" << job.N
+                                                                         << " full_N=" << full_n);
+                return false;
+            }
+            if (job.K <= 0 || full_k <= 0 || job.output_block_offset < 0)
+            {
+                LOG_ERROR("DeviceLoadPipeline: invalid K chunk for '" << job.name
+                                                                        << "' K=" << job.K
+                                                                        << " full_K=" << full_k
+                                                                        << " output_block_offset=" << job.output_block_offset);
+                return false;
+            }
+
             // Validate raw bytes fit in staging slot
             if (job.raw_bytes > max_staging)
             {
@@ -260,7 +281,28 @@ namespace llaminar2
             }
             {
                 const auto memcpy_start = Clock::now();
-                std::memcpy(pinned_ptr, job.host_raw_data, job.raw_bytes);
+                if (job.host_row_stride_bytes > 0)
+                {
+                    if (job.host_row_copy_bytes == 0 ||
+                        job.raw_bytes != static_cast<size_t>(job.N) * job.host_row_copy_bytes)
+                    {
+                        LOG_ERROR("DeviceLoadPipeline: invalid gathered host chunk for '"
+                                  << job.name << "'");
+                        return false;
+                    }
+                    auto *dst = static_cast<uint8_t *>(pinned_ptr);
+                    const auto *src = static_cast<const uint8_t *>(job.host_raw_data);
+                    for (int row = 0; row < job.N; ++row)
+                    {
+                        std::memcpy(dst + static_cast<size_t>(row) * job.host_row_copy_bytes,
+                                    src + static_cast<size_t>(row) * job.host_row_stride_bytes,
+                                    job.host_row_copy_bytes);
+                    }
+                }
+                else
+                {
+                    std::memcpy(pinned_ptr, job.host_raw_data, job.raw_bytes);
+                }
                 if (profiling)
                 {
                     cpu_staging_ms += std::chrono::duration<double, std::milli>(
@@ -269,6 +311,21 @@ namespace llaminar2
                 }
             }
             total_bytes += job.raw_bytes;
+
+            // The source bytes are no longer needed once they have reached the
+            // pinned slot. For demand-paged GGUF mappings, discard the process
+            // PTEs incrementally so RSS follows the bounded ring instead of the
+            // total model size. The underlying file remains available for a
+            // harmless re-fault if another alias still needs the same pages.
+            if (job.advise_mmap_dontneed_after_staging)
+            {
+                MmapRegion::adviseDontneedRange(job.host_raw_data, job.raw_bytes);
+            }
+            else if (job.mmap_discard_data && job.mmap_discard_bytes > 0)
+            {
+                MmapRegion::adviseDontneedRange(job.mmap_discard_data,
+                                                job.mmap_discard_bytes);
+            }
 
             // Fire progress callback after host memcpy completes
             if (progress_cb)
@@ -315,10 +372,20 @@ namespace llaminar2
 
             if (job.format == RepackFormat::RAW_FP)
             {
+                if (slot->payload_bytes % static_cast<size_t>(full_n) != 0)
+                {
+                    LOG_ERROR("DeviceLoadPipeline: FP payload bytes for '" << job.name
+                                                                            << "' are not divisible by full_N=" << full_n);
+                    return false;
+                }
+                const size_t payload_bytes_per_row =
+                    slot->payload_bytes / static_cast<size_t>(full_n);
+                auto *chunk_payload = slot->d_native_vnni_payload +
+                                      static_cast<size_t>(job.row_offset) * payload_bytes_per_row;
                 // Floating-point passthrough: copy staging → payload (no repack needed).
                 // Use the repack stream for ordering consistency with other slots.
                 if (!backend_.deviceToDevice(
-                        slot->d_native_vnni_payload, staging_ptr, job.raw_bytes,
+                        chunk_payload, staging_ptr, job.raw_bytes,
                         device_id_, repack_stream_))
                 {
                     LOG_ERROR("DeviceLoadPipeline: D2D copy failed for FP weight '"
@@ -328,13 +395,53 @@ namespace llaminar2
             }
             else
             {
+                if (job.N != full_n || job.row_offset != 0 || job.K % 32 != 0 ||
+                    full_k % 32 != 0)
+                {
+                    LOG_ERROR("DeviceLoadPipeline: quantized chunks must span full N and 32-wide K blocks for '"
+                              << job.name << "'");
+                    return false;
+                }
+                const size_t total_blocks_per_row = static_cast<size_t>(full_k) / 32;
+                const size_t chunk_blocks_per_row = static_cast<size_t>(job.K) / 32;
+                const size_t output_block_offset = static_cast<size_t>(job.output_block_offset);
+                if (output_block_offset + chunk_blocks_per_row > total_blocks_per_row)
+                {
+                    LOG_ERROR("DeviceLoadPipeline: quantized K chunk exceeds planned output for '"
+                              << job.name << "'");
+                    return false;
+                }
+                const size_t total_output_blocks =
+                    total_blocks_per_row * static_cast<size_t>(full_n);
+                if (total_output_blocks == 0 ||
+                    slot->payload_bytes % total_output_blocks != 0)
+                {
+                    LOG_ERROR("DeviceLoadPipeline: invalid quantized payload layout for '"
+                              << job.name << "'");
+                    return false;
+                }
+                const size_t payload_bytes_per_block =
+                    slot->payload_bytes / total_output_blocks;
+                const size_t block_offset =
+                    output_block_offset * static_cast<size_t>(full_n);
+                auto *chunk_payload = slot->d_native_vnni_payload +
+                                      block_offset * payload_bytes_per_block;
+                auto *chunk_scales = slot->d_native_vnni_scales
+                                         ? static_cast<uint16_t *>(slot->d_native_vnni_scales) + block_offset
+                                         : nullptr;
+                auto *chunk_mins = slot->d_native_vnni_mins
+                                       ? static_cast<uint16_t *>(slot->d_native_vnni_mins) + block_offset
+                                       : nullptr;
+                auto *chunk_emins = slot->d_native_vnni_emins
+                                        ? static_cast<uint32_t *>(slot->d_native_vnni_emins) + block_offset
+                                        : nullptr;
                 bool repack_ok = kernels_.vnniRepack(
                     job.format,
                     staging_ptr,
-                    slot->d_native_vnni_payload,
-                    static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                    static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                    static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                    chunk_payload,
+                    chunk_scales,
+                    chunk_mins,
+                    chunk_emins,
                     job.N, job.K, repack_stream_);
 
                 if (!repack_ok)

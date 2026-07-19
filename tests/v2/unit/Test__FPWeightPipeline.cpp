@@ -502,4 +502,46 @@ TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_EndToEnd_RawFP)
     orch.release();
 }
 
+TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_ChunkedRawFPParity)
+{
+    LoadOrchestrator orch(backend_);
+    orch.addDevice(0);
+
+    const int N = 64;
+    const int K = 128;
+    const size_t bytes_per_row = static_cast<size_t>(K) * sizeof(float);
+    const size_t raw_bytes = static_cast<size_t>(N) * bytes_per_row;
+    const size_t slot_bytes = 8 * bytes_per_row;
+
+    orch.planRawWeight(0, "chunked_fp", N, K, raw_bytes);
+    orch.allocate(slot_bytes, 3);
+
+    std::vector<float> host_data(static_cast<size_t>(N) * K);
+    std::iota(host_data.begin(), host_data.end(), -17.0f);
+
+    WeightJob job;
+    job.name = "chunked_fp";
+    job.host_raw_data = host_data.data();
+    job.raw_bytes = raw_bytes;
+    job.format = RepackFormat::RAW_FP;
+    job.N = N;
+    job.K = K;
+    job.is_asymmetric = false;
+    orch.addWeightJob(0, job);
+
+    EXPECT_EQ(orch.pendingJobCount(0), 8u);
+    ASSERT_NO_THROW(orch.load());
+
+    auto *pool = orch.getPool(0);
+    ASSERT_NE(pool, nullptr);
+    auto slot = pool->getSlot("chunked_fp");
+    ASSERT_TRUE(slot.has_value());
+
+    std::vector<float> gpu_data(static_cast<size_t>(N) * K);
+    backend_->deviceToHost(gpu_data.data(), slot->d_native_vnni_payload, raw_bytes, 0);
+    EXPECT_EQ(gpu_data, host_data);
+
+    orch.release();
+}
+
 } // namespace llaminar2

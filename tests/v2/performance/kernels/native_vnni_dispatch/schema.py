@@ -11,17 +11,41 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
+from functools import cached_property
 from typing import Any, Mapping
 
 from .format_registry import format_spec
 
 
 SCHEMA_VERSION = 1
-POLICY_ABI = 1
-LEARNER_VERSION = "native-vnni-segmented-regret-v1"
-FEATURE_SCHEMA_VERSION = "aspect-work-v1"
+POLICY_ABI = 2
+P95_REGRET_BUDGET = 0.05
+LEARNER_VERSION = "native-vnni-bounded-tree-beam-regret-v20"
+COMPATIBLE_OBSERVATION_LEARNER_VERSIONS = frozenset((
+    "native-vnni-bounded-tree-beam-regret-v8",
+    "native-vnni-bounded-tree-beam-regret-v9",
+    "native-vnni-bounded-tree-beam-regret-v10",
+    "native-vnni-bounded-tree-beam-regret-v11",
+    "native-vnni-bounded-tree-beam-regret-v12",
+    "native-vnni-bounded-tree-beam-regret-v13",
+    "native-vnni-bounded-tree-beam-regret-v14",
+    "native-vnni-bounded-tree-beam-regret-v15",
+    "native-vnni-bounded-tree-beam-regret-v16",
+    "native-vnni-bounded-tree-beam-regret-v17",
+    "native-vnni-bounded-tree-beam-regret-v18",
+    "native-vnni-bounded-tree-beam-regret-v19",
+    LEARNER_VERSION,
+))
+FEATURE_SCHEMA_VERSION = "execution-mode-n-k-work-aspect-tile-wave-tree-v9"
+COMPATIBLE_PROFILER_FEATURE_SCHEMA_VERSIONS = frozenset((
+    "execution-mode-n-k-work-aspect-tile-occupancy-tree-v5",
+    "execution-mode-n-k-work-aspect-tile-wave-tree-v6",
+    "execution-mode-n-k-work-aspect-tile-wave-tree-v7",
+    "execution-mode-n-k-work-aspect-tile-wave-tree-v8",
+    FEATURE_SCHEMA_VERSION,
+))
 
 
 class Backend(str, Enum):
@@ -195,6 +219,10 @@ class NativeVNNIObservation:
     workspace_ok: bool
     explicit_stream_ok: bool
 
+    # Optional structured proof for reviewed adaptive timing protocols. Empty
+    # preserves the original fixed-sample schema and its corpus/request digests.
+    adaptive_timing_evidence: dict[str, Any] = field(default_factory=dict)
+
     def validate(self) -> None:
         """Reject malformed, ambiguous, or runtime-inexpressible observations."""
 
@@ -204,9 +232,11 @@ class NativeVNNIObservation:
             )
         if self.policy_abi != POLICY_ABI:
             raise ValueError(f"unsupported policy_abi={self.policy_abi}; expected {POLICY_ABI}")
-        if self.learner_version != LEARNER_VERSION:
+        if self.learner_version not in COMPATIBLE_OBSERVATION_LEARNER_VERSIONS:
             raise ValueError(
-                f"unsupported learner_version={self.learner_version!r}; expected {LEARNER_VERSION!r}"
+                f"unsupported learner_version={self.learner_version!r}; "
+                "accepted observation versions are "
+                f"{sorted(COMPATIBLE_OBSERVATION_LEARNER_VERSIONS)!r}"
             )
 
         for name in (
@@ -271,6 +301,10 @@ class NativeVNNIObservation:
             raise ValueError("first_mismatch_index is required for a byte mismatch")
         if self.warmup_count < 0 or self.sample_count <= 0:
             raise ValueError("timing counts are invalid")
+        if not isinstance(self.adaptive_timing_evidence, dict):
+            raise ValueError("adaptive_timing_evidence must be a JSON object")
+        if any(not str(name).strip() for name in self.adaptive_timing_evidence):
+            raise ValueError("adaptive timing evidence keys must be non-empty")
         if self.min_us <= 0.0 or self.median_us <= 0.0 or self.p95_us <= 0.0:
             raise ValueError("timing values must be positive")
         if self.min_us > self.median_us or self.median_us > self.p95_us:
@@ -281,27 +315,74 @@ class NativeVNNIObservation:
     def canonical_mapping(self) -> dict[str, Any]:
         """Return a deterministic JSON-compatible flat representation."""
 
-        result = asdict(self)
+        # NativeVNNIObservation is frozen and structured members are immutable
+        # by contract. Avoid recursive deepcopy while authenticating large
+        # profiler corpora; explicit JSON normalization below remains unchanged.
+        result = {item.name: getattr(self, item.name) for item in fields(self)}
         result["backend"] = self.backend.value
         result["semantic_contract"] = self.semantic_contract.value
         result["execution_mode"] = self.execution_mode.value
         result["aspect_bucket"] = self.aspect_bucket.value
         result["projection_n_vector"] = list(self.projection_n_vector)
+        # Empty evidence is the backward-compatible fixed-sample representation.
+        # Omitting it from digests keeps pre-extension fixed timing corpora and
+        # their profiler request IDs reusable without a migration.
+        if not self.adaptive_timing_evidence:
+            result.pop("adaptive_timing_evidence")
         return result
 
     def digest(self) -> str:
         """Hash the complete observation for corpus identity and deduplication."""
 
-        encoded = json.dumps(
+        return self._cached_digest
+
+    @cached_property
+    def _cached_canonical_json(self) -> str:
+        """Serialize the frozen observation once for every identity consumer.
+
+        Per-row profiler joins and whole-corpus authentication use the same
+        canonical JSON bytes. Keeping that immutable serialization beside the
+        value prevents a production fit from encoding roughly eighty fields once
+        for the observation digest and again for the corpus digest. The property
+        is not a dataclass field, so it cannot enter ``asdict()`` or alter the
+        historical hash representation.
+        """
+
+        return json.dumps(
             self.canonical_mapping(), sort_keys=True, separators=(",", ":")
-        ).encode()
+        )
+
+    @cached_property
+    def _cached_digest(self) -> str:
+        """Compute the immutable observation identity once per parsed row.
+
+        Production corpora repeatedly authenticate the same row while they
+        compact profiler witnesses, compose additive transactions, and join
+        profiler features. ``NativeVNNIObservation`` is a frozen value object,
+        so serializing its roughly eighty fields on every one of those passes
+        only burns preprocessing time. ``cached_property`` stores no dataclass
+        field and therefore cannot alter ``asdict()``, CSV output, or the
+        historical digest bytes.
+
+        Structured members such as ``config_json`` are part of the frozen
+        value contract: callers must create a replacement observation rather
+        than mutate a nested dictionary after construction. All corpus readers
+        validate and then transfer exclusive immutable ownership accordingly.
+        """
+
+        encoded = self._cached_canonical_json.encode()
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "NativeVNNIObservation":
         """Parse one CSV/JSON mapping and reject every missing required field."""
 
-        missing = [name for name in cls.__dataclass_fields__ if name not in raw]
+        optional = {"adaptive_timing_evidence"}
+        missing = [
+            name
+            for name in cls.__dataclass_fields__
+            if name not in raw and name not in optional
+        ]
         if missing:
             raise ValueError(f"observation is missing required fields: {missing}")
 
@@ -315,6 +396,14 @@ class NativeVNNIObservation:
             "projection_n_vector", raw["projection_n_vector"], list
         )
         config = _parse_json("config_json", raw["config_json"], dict)
+        adaptive_raw = raw.get("adaptive_timing_evidence", "")
+        adaptive_timing_evidence = (
+            {}
+            if adaptive_raw is None or str(adaptive_raw).strip() == ""
+            else _parse_json(
+                "adaptive_timing_evidence", adaptive_raw, dict
+            )
+        )
 
         observation = cls(
             schema_version=int(raw["schema_version"]),
@@ -412,6 +501,7 @@ class NativeVNNIObservation:
             route_counter_ok=_parse_bool("route_counter_ok", raw["route_counter_ok"]),
             workspace_ok=_parse_bool("workspace_ok", raw["workspace_ok"]),
             explicit_stream_ok=_parse_bool("explicit_stream_ok", raw["explicit_stream_ok"]),
+            adaptive_timing_evidence=adaptive_timing_evidence,
         )
         observation.validate()
         return observation

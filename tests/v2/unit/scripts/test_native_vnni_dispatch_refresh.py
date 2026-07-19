@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,9 +24,52 @@ VALIDATOR = (
 )
 
 
+def _current_cpu_serial_policy_hash() -> str:
+    """Reproduce the refresh script's content identity for a fresh seal."""
+
+    paths = tuple(
+        REPO_ROOT / "src" / "v2" / "kernels" / "cpu" / "native_vnni" / name
+        for name in (
+            "CPUNativeVNNIGemv.h",
+            "CPUNativeAVX2Gemv.h",
+            "CPUNativeVNNIDecode.h",
+            "CPUNativeVNNITileConfig.h",
+        )
+    )
+    first_pass = subprocess.run(
+        ("sha256sum", *(str(path) for path in paths)),
+        check=True,
+        capture_output=True,
+    ).stdout
+    return "sha256:" + hashlib.sha256(first_pass).hexdigest()
+
+CPU_PREFILL_CHECKPOINT = (
+    "run_id,git_revision,build_id,compiler_id,architecture_class,device_name,"
+    "driver_runtime,serial_m1_policy_hash,marker\n"
+    "stable-cpu-prefill-development,deadbeef,sha256:fixture|cpu_isa=AVX2,"
+    "fixture-cxx,x86_64-fixture|build=AVX2,fixture-cpu,fixture-linux,"
+    f"{_current_cpu_serial_policy_hash()},fixture\n"
+)
+
+
 class NativeVNNIDispatchRefreshTest(unittest.TestCase):
     def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.run_script_with_output_files({}, *args)
+
+    def run_script_with_output_files(
+        self,
+        output_files: dict[str, str],
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one dry transaction after publishing resumable output fixtures."""
+
         with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "out"
+            output_dir.mkdir(parents=True)
+            for relative_path, contents in output_files.items():
+                path = output_dir / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
             return subprocess.run(
                 [
                     str(SCRIPT),
@@ -40,7 +85,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
                     "--cpu-threads",
                     "28",
                     "--output-dir",
-                    str(Path(tmp) / "out"),
+                    str(output_dir),
                     *args,
                 ],
                 cwd=REPO_ROOT,
@@ -56,18 +101,433 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
         runtime_m = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31"
-        self.assertIn(f"LLAMINAR_CUDA_TC_SWEEP_M={runtime_m}", stdout)
+        self.assertIn(f"LLAMINAR_CUDA_NVNNI_DECODE_M={runtime_m}", stdout)
         self.assertIn(f"LLAMINAR_ROCM_NVNNI_DECODE_M={runtime_m}", stdout)
         self.assertIn(
             "LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured",
             stdout,
         )
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV=", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_SWEEP_FAMILIES=wide,kpar,direct", stdout)
-        self.assertIn("infer_gemv_dispatch_heuristic.py", result.stdout)
-        self.assertIn("analyze_cuda_tc_gemv_dispatch.py", result.stdout)
+        self.assertIn(
+            "LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES=eager,graph_captured",
+            stdout,
+        )
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_TIMING_CSV=", stdout)
+        self.assertIn("analyze_cuda_native_vnni_decode_trainer.py", result.stdout)
+        self.assertNotIn("infer_gemv_dispatch_heuristic.py", result.stdout)
+        self.assertNotIn("analyze_cuda_tc_gemv_dispatch.py", result.stdout)
         self.assertIn("analyze_rocm_native_vnni_decode_trainer.py", result.stdout)
         self.assertIn("validate_native_vnni_generated_dispatch_ids.py", result.stdout)
+        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
+
+    def test_gpu_measurement_lanes_partition_formats_without_duplication(self) -> None:
+        formats = "Q4_0,Q5_0,Q6_K,Q8_0"
+        result = self.run_script(
+            "--backend",
+            "both",
+            "--profile",
+            "quick",
+            "--cuda-formats",
+            formats,
+            "--rocm-formats",
+            formats,
+            "--cuda-measurement-lanes",
+            "2",
+            "--rocm-measurement-lanes",
+            "4",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("CUDA measurement lanes: 2 disjoint format shard(s)", stdout)
+        self.assertIn("ROCm measurement lanes: 4 disjoint format shard(s)", stdout)
+        self.assertIn("CUDA_VISIBLE_DEVICES=0", stdout)
+        self.assertIn("CUDA_VISIBLE_DEVICES=1", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_0,Q6_K", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q5_0,Q8_0", stdout)
+        for lane, source_format in enumerate(formats.split(",")):
+            self.assertIn(f"ROCR_VISIBLE_DEVICES={lane}", stdout)
+            self.assertIn(
+                f"LLAMINAR_ROCM_NVNNI_DECODE_FORMATS={source_format}",
+                stdout,
+            )
+        self.assertIn("cuda_decode_sweep.lane0.csv", stdout)
+        self.assertIn("cuda_decode_sweep.lane1.csv", stdout)
+        self.assertIn("rocm_decode_sweep.lane3.csv", stdout)
+        self.assertEqual(stdout.count("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS="), 2)
+        self.assertEqual(stdout.count("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS="), 4)
+
+    def test_gpu_measurement_lane_count_must_be_positive(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--cuda-measurement-lanes",
+            "0",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--cuda-measurement-lanes must be a positive integer or auto",
+            result.stderr,
+        )
+
+    def test_single_gpu_backend_does_not_validate_inactive_lane_inventory(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "quick",
+            "--cuda-formats",
+            "Q4_0,Q5_0",
+            "--cuda-measurement-lanes",
+            "2",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CUDA measurement lanes: 2", result.stdout)
+        self.assertNotIn("ROCm measurement lanes:", result.stdout)
+
+    def test_metadata_readers_do_not_sigpipe_verbose_tool_producers(self) -> None:
+        """Strict pipefail must not turn a version-banner read into exit 141."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("first_output_line()", wrapper)
+        self.assertIn("hipcc --version | first_output_line", wrapper)
+        self.assertIn("driver_version --format=csv,noheader -i 0 | first_output_line", wrapper)
+        self.assertNotRegex(wrapper, r"--version\s*\|\s*head\s+-n\s+1")
+
+    def test_cpu_prefill_refinement_probes_generated_boundary_rings(self) -> None:
+        """Each failed fit obtains C++ routes before timing dynamic shapes."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("--probe-development-fit", wrapper)
+        self.assertIn("--refinement-probe-plan", wrapper)
+        self.assertIn("--refinement-probe-route-manifest", wrapper)
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_ROUTE_REFINEMENT_PROBE_JSON=",
+            wrapper,
+        )
+
+    def test_cpu_prefill_fit_only_retains_measured_build_provenance(self) -> None:
+        """A fitter replay must not claim that a rebuilt harness timed rows."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("csv_unique_field_prefix()", wrapper)
+        self.assertIn(
+            'if (( skip_sweep )) && [[ -s "${cpu_prefill_common_csv}" ]]',
+            wrapper,
+        )
+        self.assertIn(
+            '"${cpu_prefill_common_csv}" build_id \'|cpu_isa=\'',
+            wrapper,
+        )
+        self.assertIn(
+            '"${cpu_prefill_common_csv}" architecture_class \'|build=\'',
+            wrapper,
+        )
+        self.assertIn(
+            "Fit-only CPU prefill replay retains measured build provenance",
+            wrapper,
+        )
+
+    def test_fresh_sealed_rows_use_current_measurement_provenance(self) -> None:
+        """A reused development fit must not relabel newly timed holdout rows."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        prefill = wrapper[wrapper.index("refresh_cpu_prefill()") :]
+
+        self.assertIn("cpu_measurement_build_id", prefill)
+        self.assertIn(
+            '"collection_build_id=${cpu_measurement_build_id}"',
+            prefill,
+        )
+        self.assertIn(
+            'cpu_build_id="${cpu_measurement_build_id}"',
+            prefill,
+        )
+        self.assertIn(
+            'cpu_development_build_id="${cpu_build_id}"',
+            prefill,
+        )
+        self.assertIn(
+            '--build-id "${cpu_development_build_id}"',
+            prefill,
+        )
+        self.assertIn(
+            '--sealed-build-id "${cpu_measurement_build_id}"',
+            prefill,
+        )
+        self.assertIn(
+            '--sealed-serial-m1-policy-hash',
+            prefill,
+        )
+        self.assertIn(
+            '[[ "${cpu_serial_policy_hash}" != "${cpu_measurement_serial_policy_hash}" ]]',
+            prefill,
+        )
+        restore = prefill.index(
+            'cpu_build_id="${cpu_measurement_build_id}"',
+            prefill.index("The certification holdout is launched"),
+        )
+        sealed_launch = prefill.index(
+            '--sealed-witness-plan "${cpu_prefill_sealed_witness_plan_json}"',
+            restore,
+        )
+        certify = prefill.index("local -a cpu_prefill_certify=(", restore)
+        self.assertLess(restore, sealed_launch)
+        self.assertLess(restore, certify)
+
+    def test_cpu_prefill_sealed_replay_always_reuses_final_shards(self) -> None:
+        """Installation replay must not require a flag to preserve sealed data."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        prefill = wrapper[wrapper.index("refresh_cpu_prefill()") :]
+        sealed = prefill[
+            prefill.index("local sealed_partials=()") :
+            prefill.index("combine_csvs \"${cpu_prefill_sealed_csv}\"")
+        ]
+
+        self.assertIn(
+            'if [[ -s "${partial}" && -s "${timing_partial}" ]]; then',
+            sealed,
+        )
+        self.assertNotIn(
+            'if (( resume_cpu_partials )) &&',
+            sealed,
+        )
+
+    def test_rocm_device_identity_cannot_select_a_cpu_agent(self) -> None:
+        """ROCm policy provenance must come from the GPU-only product table."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("detect_rocm_device_name()", wrapper)
+        self.assertIn("rocm-smi --showproductname --csv", wrapper)
+        self.assertIn('row.get("device", "").startswith("card")', wrapper)
+        self.assertIn('row.get("Card Series", "").strip()', wrapper)
+        self.assertNotRegex(
+            wrapper,
+            r'rocm_device_name=.*rocminfo.*Marketing Name',
+        )
+
+    def test_cuda_production_scopes_q4_refinement_across_shape_lanes(self) -> None:
+        """CUDA-only Q4 evidence is shape-sharded, never format-multiplied."""
+
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--cuda-formats",
+            "Q4_0,Q5_0",
+            "--cuda-measurement-lanes",
+            "2",
+            "--skip-profiler-evidence",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        common_lines = [
+            line for line in stdout.splitlines()
+            if "cuda_decode_m1-development-common.lane" in line
+            and "LLAMINAR_CUDA_NVNNI_DECODE_SHAPES=" in line
+        ]
+        refinement_lines = [
+            line for line in stdout.splitlines()
+            if "cuda_decode_m1-development-cuda-q4-refinement.lane" in line
+            and "LLAMINAR_CUDA_NVNNI_DECODE_SHAPES=" in line
+        ]
+        self.assertEqual(len(common_lines), 2)
+        self.assertEqual(len(refinement_lines), 2)
+        scoped_lane0 = "FastM1RefineV5_3B_FFN_Dn_Nm128_1920x11008"
+        scoped_lane1 = "FastM1RefineV5_3B_FFN_Dn_Nm64_1984x11008"
+        self.assertTrue(all(scoped_lane0 not in line for line in common_lines))
+        self.assertIn("CUDA_VISIBLE_DEVICES=0", refinement_lines[0])
+        self.assertIn("CUDA_VISIBLE_DEVICES=1", refinement_lines[1])
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_0", refinement_lines[0])
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_0", refinement_lines[1])
+        self.assertIn(scoped_lane0, refinement_lines[0])
+        self.assertNotIn(scoped_lane0, refinement_lines[1])
+        self.assertIn(scoped_lane1, refinement_lines[1])
+        self.assertNotIn(scoped_lane1, refinement_lines[0])
+
+    def test_cuda_fit_only_reuses_corpus_without_kernel_or_profiler_launch(self) -> None:
+        """A sealed corpus may refit, but cannot silently recollect evidence."""
+
+        required = {
+            "cuda_decode_m1.development.csv": "header\nrow\n",
+            "cuda_decode_m1.development.timing.csv": "header\nrow\n",
+            "cuda_decode_m1.sealed.csv": "header\nrow\n",
+            "cuda_decode_m1.sealed.timing.csv": "header\nrow\n",
+            "cuda_decode_verifier.csv": "header\nrow\n",
+            "cuda_decode_verifier.timing.csv": "header\nrow\n",
+            "cuda_decode_m1_common_observations.csv": "header\nrow\n",
+            "cuda_profiler_requests.json": "{}\n",
+            "cuda_profiler_evidence.json": "{}\n",
+            "cuda_decode_common_observations.csv": "header\nrow\n",
+            "cuda_final_profiler_requests.json": "{}\n",
+            "cuda_final_profiler_evidence.json": "{}\n",
+            "cuda_paired_refinement/iteration-000.csv": "header\nrow\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--reuse-profiler-evidence",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("compact-witnesses", result.stdout)
+        self.assertIn("export-features", result.stdout)
+        self.assertIn("--paired-csv", result.stdout)
+        self.assertIn("analyze_cuda_native_vnni_decode_trainer.py", result.stdout)
+        self.assertNotIn(
+            "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST=",
+            result.stdout,
+        )
+        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
+        self.assertNotIn("LLAMINAR_CUDA_NVNNI_DECODE_CSV=", result.stdout)
+
+    def test_rocm_fit_only_reuses_corpus_without_kernel_or_profiler_launch(self) -> None:
+        """ROCm fit replay authenticates sidecars and performs no HIP sweep."""
+
+        required = {
+            "rocm_decode_fast.development.csv": "header\nrow\n",
+            "rocm_decode_fast.development.timing.csv": "header\nrow\n",
+            "rocm_decode_fast.sealed.csv": "header\nrow\n",
+            "rocm_decode_fast.sealed.timing.csv": "header\nrow\n",
+            "rocm_decode_verifier.csv": "header\nrow\n",
+            "rocm_decode_verifier.timing.csv": "header\nrow\n",
+            "rocm_decode_fast_common_observations.csv": "header\nrow\n",
+            "rocm_profiler_requests.json": "{}\n",
+            "rocm_profiler_evidence.json": "{}\n",
+            "rocm_decode_common_observations.csv": "header\nrow\n",
+            "rocm_final_profiler_requests.json": "{}\n",
+            "rocm_final_profiler_evidence.json": "{}\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--reuse-profiler-evidence",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("compact-witnesses", result.stdout)
+        self.assertIn("export-features", result.stdout)
+        self.assertIn("analyze_rocm_native_vnni_decode_trainer.py", result.stdout)
+        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
+        self.assertNotIn("LLAMINAR_ROCM_NVNNI_DECODE_CSV=", result.stdout)
+
+    def test_cpu_verifier_fit_only_reuses_all_isa_corpus_evidence(self) -> None:
+        """CPU policy replay retains ISA evidence and launches no timing test."""
+
+        required = {
+            "cpu_decode_m1.development.csv": "header\nrow\n",
+            "cpu_decode_m1.development.timing.csv": "header\nrow\n",
+            "cpu_decode_m1.sealed.csv": "header\nrow\n",
+            "cpu_decode_m1.sealed.timing.csv": "header\nrow\n",
+            "cpu_decode_m1_common_observations.csv": "header\nrow\n",
+            "cpu_decode_profiler_requests.json": "{}\n",
+            "cpu_decode_profiler_evidence.json": "{}\n",
+            "cpu_verifier_rows.development.csv": "header\nrow\n",
+            "cpu_verifier_rows.development.timing.csv": "header\nrow\n",
+            "cpu_verifier_rows.sealed.csv": "header\nrow\n",
+            "cpu_verifier_rows.sealed.timing.csv": "header\nrow\n",
+            "cpu_verifier_rows_common_observations.csv": "header\nrow\n",
+            "cpu_profiler_requests.json": "{}\n",
+            "cpu_profiler_evidence.json": "{}\n",
+            "cpu_final_profiler_requests.json": "{}\n",
+            "cpu_final_profiler_evidence.json": "{}\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--reuse-profiler-evidence",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("compact-witnesses", result.stdout)
+        self.assertIn("export-features", result.stdout)
+        self.assertIn("analyze_cpu_native_vnni_verifier_trainer.py", result.stdout)
+        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=", result.stdout)
+
+    def test_cpu_prefill_fit_only_authenticates_without_measurement(self) -> None:
+        """CPU GEMM fit replay consumes sealed timing and profiler evidence only."""
+
+        required = {
+            "cpu_prefill_sweep.development-v8.csv": "header\nrow\n",
+            "cpu_prefill_sweep.development-v8.timing.csv": "header\nrow\n",
+            "cpu_prefill_sweep.sealed-v8.csv": "header\nrow\n",
+            "cpu_prefill_sweep.sealed-v8.timing.csv": "header\nrow\n",
+            "cpu_prefill_common_observations.v8.csv": CPU_PREFILL_CHECKPOINT,
+            "cpu_prefill_profiler_source_observations.csv": "header\nrow\n",
+            "cpu_prefill_profiler_requests.json": "{}\n",
+            "cpu_prefill_profiler_evidence.json": "{}\n",
+            "cpu_prefill_final_profiler_requests.json": "{}\n",
+            "cpu_prefill_final_profiler_evidence.json": "{}\n",
+        }
+        result = self.run_script_with_output_files(
+            required,
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--reuse-profiler-evidence",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(result.stdout.count("compact-witnesses"), 2)
+        self.assertGreaterEqual(result.stdout.count("export-features"), 2)
+        self.assertIn("analyze_cpu_native_vnni_prefill_trainer.py", result.stdout)
+        self.assertIn(
+            "cpu_prefill_profiler_observation_witnesses.csv",
+            result.stdout,
+        )
+        self.assertIn("--adapted-full-development-input", result.stdout)
+        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_PREFILL_STRONG_CSV=", result.stdout)
+
+    def test_dispatch_validator_decodes_cpu_prefill_packed_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            include = Path(tmp) / "prefill.inc"
+            # CB=5, M=1024, K=5120, N=27648 in the 8/16/20/20 ABI.
+            key = (5 << 56) | (1024 << 40) | (5120 << 20) | 27648
+            include.write_text(
+                "packCPUNativeVNNIPrefillPolicyKey\n"
+                f"switch (key) {{ case 0x{key:016x}ULL: break; }}\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(VALIDATOR), str(include)],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("validated 1", result.stdout)
 
     def test_onednn_build_cache_is_partitioned_by_compiled_cpu_isa(self) -> None:
         cmake = (REPO_ROOT / "src" / "v2" / "CMakeLists.txt").read_text(
@@ -86,33 +546,176 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             dockerfile,
         )
 
+    def test_profiler_delta_resume_recovers_completed_and_journaled_work(self) -> None:
+        """The transaction driver must never repay a timestamped delta."""
+
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("count-uncovered-requests", script)
+        self.assertIn('delta_request_candidates=("${request_prefix}".delta-*', script)
+        self.assertIn(
+            '-s "${active_evidence_manifest}.inprogress.jsonl"',
+            script,
+        )
+        self.assertIn("cpu_decode_development_run_id_file", script)
+        self.assertIn("retained_delta_witnesses", script)
+
     def test_custom_m_values_are_forwarded_to_cuda_and_rocm(self) -> None:
         result = self.run_script("--backend", "all", "--m-values", "2,4")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
-        self.assertIn("LLAMINAR_CUDA_TC_SWEEP_M=2,4", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_M=2,4", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_M=2,4", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=2,4", stdout)
 
     def test_install_copies_generated_backend_artifacts(self) -> None:
         result = self.run_script(
-            "--backend", "all", "--profile", "qwen36", "--install"
+            "--backend", "all", "--profile", "all", "--install",
+            "--cuda-measurement-lanes", "2",
+            "--rocm-measurement-lanes", "4",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CUDANativeVNNIGemvDispatchHeuristicGenerated.inc", result.stdout)
         self.assertIn("ROCmNativeVNNIDecodeDispatchGenerated.inc", result.stdout)
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", result.stdout)
+        self.assertIn("CPUNativeVNNIPrefillPolicyGenerated.inc", result.stdout)
         self.assertIn("src/v2/kernels/cuda/gemm", result.stdout)
         self.assertIn("src/v2/kernels/rocm/gemm", result.stdout)
         self.assertIn("src/v2/kernels/cpu/native_vnni", result.stdout)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=32B_LM_Head",
+            stdout,
+        )
+        self.assertNotIn(
+            "LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_LM_Head",
+            stdout,
+        )
+        self.assertIn(
+            "native_vnni_dispatch.profiler_evidence emit-requests",
+            result.stdout,
+        )
+        self.assertEqual(
+            result.stdout.count("native_vnni_dispatch.profiler_collectors"),
+            9,
+        )
+        self.assertEqual(
+            result.stdout.count(
+                "native_vnni_dispatch.profiler_evidence export-features"
+            ),
+            9,
+        )
+        self.assertEqual(
+            result.stdout.count(
+                "native_vnni_dispatch.profiler_evidence emit-requests"
+            ),
+            9,
+        )
+        self.assertEqual(
+            result.stdout.count(
+                "native_vnni_dispatch.profiler_evidence compact-witnesses"
+            ),
+            9,
+        )
+        self.assertIn("--backend cuda", result.stdout)
+        self.assertIn("--backend rocm", result.stdout)
+        self.assertIn("--device-lanes 2", result.stdout)
+        self.assertIn("--device-lanes 4", result.stdout)
+        self.assertIn("--backend cpu", result.stdout)
+        self.assertIn("--cpu-avx2-binary /bin/true", result.stdout)
+        self.assertIn("--cpu-avx512-binary /bin/true", result.stdout)
+        self.assertIn("--finalize", result.stdout)
+        self.assertIn("cuda_profiler_features.csv", result.stdout)
+        self.assertIn("rocm_profiler_features.csv", result.stdout)
+        self.assertIn("cpu_profiler_features.csv", result.stdout)
+        self.assertIn("--observation", result.stdout)
 
-    def test_cpu_smoke_profile_cannot_install_a_production_policy(self) -> None:
+    def test_production_refresh_exports_explicit_gpu_policy_workers(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--policy-accelerators",
+            "cuda:0,rocm:0",
+            "--policy-lanes",
+            "3",
+            "--policy-cuda-scorer",
+            "/bin/true",
+            "--policy-rocm-scorer",
+            "/bin/true",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "NativeVNNI policy fitter: rebuilding scorer targets="
+            "v2_native_vnni_leaf_primary_scorer_cuda,"
+            "v2_native_vnni_leaf_primary_scorer_rocm",
+            result.stdout,
+        )
+        self.assertIn(
+            "--target v2_native_vnni_leaf_primary_scorer_cuda "
+            "v2_native_vnni_leaf_primary_scorer_rocm",
+            result.stdout,
+        )
+        self.assertIn(
+            "NativeVNNI policy fitter: accelerators=cuda:0,rocm:0 "
+            "lanes-per-device=3",
+            result.stdout,
+        )
+        self.assertIn("native_vnni_dispatch.paired_requests", result.stdout)
+        self.assertIn("--fit-cache-dir", result.stdout)
+        self.assertIn("cuda_paired_refinement/fit-cache", result.stdout)
+
+    def test_production_refresh_can_explicitly_select_cpu_policy_fit(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--policy-accelerators",
+            "cpu",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "NativeVNNI policy fitter: canonical CPU process pool",
+            result.stdout,
+        )
+
+    def test_install_cannot_skip_per_candidate_profiler_evidence(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--install",
+            "--skip-profiler-evidence",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires complete isolated profiler evidence", result.stderr)
+
+    def test_smoke_profile_cannot_install_any_production_policy(self) -> None:
         result = self.run_script("--backend", "cpu", "--install")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("installing CPU dispatch requires", result.stderr)
+        self.assertIn("installing NativeVNNI dispatch requires", result.stderr)
+
+    def test_install_requires_complete_runtime_m_envelope(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "all",
+            "--profile",
+            "all",
+            "--m-values",
+            "1,2,3,4,16",
+            "--install",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("complete M=1,2..16,31 matrix", result.stderr)
 
     def test_family_smoke_is_stratified_by_format(self) -> None:
         result = self.run_script(
@@ -132,13 +735,13 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q4_0", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=IQ4_XS", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_0", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=IQ4_XS", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=IQ4_XS", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=IQ4_XS", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_SWEEP_M=1,2", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_M=1,2", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_M=1,2", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=1,2", stdout)
         self.assertIn("combine-csv", stdout)
@@ -154,11 +757,11 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q4_0", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=IQ1_M", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_0", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_1", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q8_K", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_0", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=IQ1_M", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q8_0", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q8_1", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q8_K", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_0", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=IQ1_M", stdout)
         self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q8_0", stdout)
@@ -173,20 +776,328 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("rocm_decode_sweep.IQ1_M.csv", stdout)
         self.assertIn("cpu_verifier_rows.Q8_1.", stdout)
 
-    def test_cuda_family_smoke_uses_proxy_thresholds(self) -> None:
+    def test_cuda_production_uses_strong_samples_and_complete_matrix(self) -> None:
         smoke = self.run_script("--backend", "cuda", "--profile", "family-smoke")
-        strict = self.run_script("--backend", "cuda", "--profile", "qwen36")
+        strict = self.run_script("--backend", "cuda", "--profile", "all")
 
         self.assertEqual(smoke.returncode, 0, smoke.stderr)
         self.assertEqual(strict.returncode, 0, strict.stderr)
-        self.assertIn("--min-overall-family-pct 0.0", smoke.stdout)
-        self.assertIn("--min-overall-exact-pct 0.0", smoke.stdout)
-        self.assertIn("--min-fallback-family-pct 0.0", smoke.stdout)
-        self.assertIn("--min-fallback-exact-pct 0.0", smoke.stdout)
-        self.assertIn("--min-overall-family-pct 99.0", strict.stdout)
-        self.assertIn("--min-overall-exact-pct 99.0", strict.stdout)
-        self.assertIn("--min-fallback-family-pct 97.0", strict.stdout)
-        self.assertIn("--min-fallback-exact-pct 30.0", strict.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_WARMUPS=2", smoke.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_SAMPLES=5", smoke.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_TIMED_REPLAYS=4", smoke.stdout)
+        self.assertNotIn("--require-complete", smoke.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_WARMUPS=5", strict.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_SAMPLES=30", strict.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_TIMED_REPLAYS=16", strict.stdout)
+        self.assertIn("--profile production", strict.stdout)
+        self.assertIn("--require-complete", strict.stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_M=1", strict.stdout)
+        self.assertIn(
+            "LLAMINAR_CUDA_NVNNI_DECODE_M=2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31",
+            strict.stdout.replace("\\,", ","),
+        )
+        self.assertIn("--require-fast-m1-complete", strict.stdout)
+        self.assertIn("--m1-input", strict.stdout)
+        self.assertIn("--verifier-input", strict.stdout)
+        self.assertIn("--m1-build-id", strict.stdout)
+        self.assertIn("--m1-baseline-policy-hash", strict.stdout)
+        self.assertIn("--freeze-generic", strict.stdout)
+        self.assertIn("--certify-generic", strict.stdout)
+        self.assertIn("--development-input", strict.stdout)
+        self.assertIn("--sealed-input", strict.stdout)
+        self.assertIn("--frozen-policy-json", strict.stdout)
+        self.assertIn("--certified-m1-include", strict.stdout)
+        self.assertIn("--certified-m1-policy-json", strict.stdout)
+        self.assertNotIn("--frozen-m1-include", strict.stdout)
+        self.assertIn("--shape-manifest", strict.stdout)
+        self.assertIn("--policy-json", strict.stdout)
+        self.assertIn("--exact-only", strict.stdout)
+        self.assertIn("native_vnni_dispatch.paired_requests", strict.stdout)
+        self.assertIn(
+            "LLAMINAR_CUDA_NVNNI_DECODE_PAIRED_REQUEST_MANIFEST=",
+            strict.stdout,
+        )
+        self.assertIn("--paired-development-csv", strict.stdout)
+        self.assertIn("Integration_Balanced_192x256", strict.stdout)
+        self.assertIn("Integration_Tall_128x256", strict.stdout)
+
+        development = strict.stdout.index("cuda_decode_m1.development.csv")
+        frozen = strict.stdout.index("--freeze-generic")
+        sealed = strict.stdout.index("cuda_decode_m1.sealed.csv")
+        certified = strict.stdout.index("--certify-generic")
+        verifier_development = strict.stdout.index(
+            "cuda_decode_verifier.development.csv"
+        )
+        verifier_sealed = strict.stdout.index("cuda_decode_verifier.sealed.csv")
+        self.assertLess(development, frozen)
+        self.assertLess(frozen, sealed)
+        self.assertLess(sealed, certified)
+        self.assertLess(certified, verifier_development)
+        self.assertLess(verifier_development, verifier_sealed)
+
+    def test_cuda_production_skip_sweep_requires_complete_fit_corpus(self) -> None:
+        """Fit-only replay cannot synthesize a development corpus from nothing."""
+
+        result = self.run_script(
+            "--backend", "cuda", "--profile", "all", "--skip-sweep"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CUDA fit-only corpus is missing", result.stderr)
+        self.assertIn("cuda_decode_m1.development.csv", result.stderr)
+
+    def test_cpu_production_freezes_before_opening_sealed_and_installing(self) -> None:
+        """CPU publication must pass the shared sealed certificate transaction."""
+
+        result = self.run_script(
+            "--backend", "cpu", "--profile", "all", "--install"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout
+        self.assertIn("--freeze-generic", stdout)
+        self.assertIn("--certify-generic", stdout)
+        self.assertIn("--development-input", stdout)
+        self.assertIn("--sealed-input", stdout)
+        self.assertIn("--frozen-policy-json", stdout)
+        self.assertIn("native_vnni_dispatch.policy_artifact", stdout)
+        self.assertIn("cpu_verifier_rows_policy.json", stdout)
+        self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc.inprogress", stdout)
+
+        verifier = stdout.index("analyze_cpu_native_vnni_verifier_trainer.py")
+        frozen = stdout.index("--freeze-generic", verifier)
+        sealed = stdout.index("dry-run: combine-csv", frozen)
+        certified = stdout.index("--certify-generic", sealed)
+        install_gate = stdout.index(
+            "native_vnni_dispatch.policy_artifact", certified
+        )
+        install_copy = stdout.index(
+            "CPUNativeVNNIVerifierRowsPolicyGenerated.inc.inprogress"
+        )
+        self.assertLess(frozen, sealed)
+        self.assertLess(sealed, certified)
+        self.assertLess(certified, install_gate)
+        self.assertLess(install_gate, install_copy)
+
+    def test_partitioned_cuda_fast_sweep_is_m1_measurement_only(self) -> None:
+        """Development evidence cannot accidentally open the Fast holdout."""
+
+        result = self.run_script(
+            "--backend",
+            "cuda",
+            "--profile",
+            "all",
+            "--shape-partition",
+            "fast-development",
+            "--cuda-formats",
+            "Q4_0",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_M=1", stdout)
+        self.assertIn("V4VerifierSealed_Tall_192x416", stdout)
+        self.assertNotIn("V4FastSealed_Tall_160x288", stdout)
+        self.assertIn("cuda_decode_fast-development.csv", stdout)
+        self.assertNotIn("analyze_cuda_native_vnni_decode_trainer.py", stdout)
+
+    def test_partitioned_rocm_verifier_sweep_uses_complete_runtime_m(self) -> None:
+        """Verifier holdout collection excludes M1 and remains measurement-only."""
+
+        result = self.run_script(
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--shape-partition",
+            "verifier-sealed",
+            "--rocm-formats",
+            "Q4_0",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_M="
+            "2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31",
+            stdout,
+        )
+        self.assertIn("V4VerifierSealed_Tall_192x416", stdout)
+        self.assertNotIn("V4FastSealed_Tall_160x288", stdout)
+        self.assertNotIn("analyze_rocm_native_vnni_decode_trainer.py", stdout)
+
+    def test_full_rocm_refresh_excludes_cuda_q4_fast_refinement(self) -> None:
+        """CUDA/Q4-only refinement geometry must never leak into ROCm."""
+
+        result = self.run_script(
+            "--backend",
+            "rocm",
+            "--profile",
+            "all",
+            "--rocm-formats",
+            "Q4_0",
+            "--skip-profiler-evidence",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        fast_line = next(
+            line for line in stdout.splitlines()
+            if "LLAMINAR_ROCM_NVNNI_DECODE_CSV=" in line
+            and "rocm_decode_fast.development.csv" in line
+        )
+        verifier_line = next(
+            line for line in stdout.splitlines()
+            if "LLAMINAR_ROCM_NVNNI_DECODE_CSV=" in line
+            and "rocm_decode_verifier.csv" in line
+        )
+        fast_only = "FastM1RefineV5_3B_FFN_Dn_Nm128_1920x11008"
+        self.assertIn("LLAMINAR_ROCM_NVNNI_DECODE_M=1", fast_line)
+        self.assertNotIn(fast_only, fast_line)
+        self.assertIn(
+            "LLAMINAR_ROCM_NVNNI_DECODE_M="
+            "2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31",
+            verifier_line,
+        )
+        self.assertNotIn(fast_only, verifier_line)
+        self.assertIn("combine-csv", stdout)
+
+    def test_full_cpu_refresh_collects_decode_before_grouped_verifier(self) -> None:
+        """CPU owns independent Fast-M1 and grouped-verifier transactions."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--cpu-formats",
+            "Q4_0",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        trainer_lines = [
+            line for line in stdout.splitlines()
+            if "LLAMINAR_CPU_NVNNI_VERIFIER_M=" in line
+        ]
+        self.assertTrue(trainer_lines)
+        expected_m = (
+            "LLAMINAR_CPU_NVNNI_VERIFIER_M="
+            "2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31"
+        )
+        self.assertTrue(all(expected_m in line for line in trainer_lines))
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_M=1", stdout)
+        self.assertIn(
+            "FastM1RefineV5_3B_FFN_Dn_Nm128_1920x11008",
+            stdout,
+        )
+        self.assertIn("V4VerifierSealed_Tall_192x416", stdout)
+        self.assertLess(
+            stdout.index("TrainerCsv_StrongDecode_AllFormats"),
+            stdout.index("TrainerCsv_StrongVerifierRows_AllFormats"),
+        )
+
+    def test_cpu_fast_partition_runs_only_cpu_decode_trainer(self) -> None:
+        """A Fast partition is isolated from grouped-verifier collection."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--shape-partition",
+            "fast-development",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_M=1", result.stdout)
+        self.assertIn("TrainerCsv_StrongDecode_AllFormats", result.stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=", result.stdout)
+
+    def test_cpu_decode_checkpoint_installs_and_stops_before_grouped(self) -> None:
+        """The certified M=1 prerequisite can be completed independently."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--cpu-formats",
+            "Q4_0",
+            "--install",
+            "--stop-after-cpu-decode",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_M=1", stdout)
+        self.assertIn("--certify-generic", stdout)
+        self.assertIn("CPUNativeVNNIDecodePolicyGenerated.inc.inprogress", stdout)
+        self.assertIn("--target v2_perf_cpu_native_vnni_gemv", stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=", stdout)
+
+    def test_cpu_decode_checkpoint_requires_certified_install_transaction(self) -> None:
+        """Stopping after decode cannot leave an uninstalled prerequisite."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--stop-after-cpu-decode",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--stop-after-cpu-decode requires --install", result.stderr)
+
+    def test_cpu_decode_batch_limit_checkpoints_before_fitting(self) -> None:
+        """A bounded M=1 run publishes partials and remains resumable."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--shape-partition",
+            "fast-development",
+            "--cpu-formats",
+            "Q4_0",
+            "--cpu-batch-limit",
+            "1",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "CPU M=1 collection checkpointed after 1 pending batch(es)",
+            result.stdout,
+        )
+        self.assertEqual(
+            result.stdout.count("TrainerCsv_StrongDecode_AllFormats"),
+            2,
+        )
+        self.assertNotIn("analyze_cpu_native_vnni_decode_trainer.py", result.stdout)
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=", result.stdout)
+
+    def test_obsolete_cuda_decode_generators_are_retired(self) -> None:
+        """The common analyzer is the sole CUDA decode policy authority."""
+
+        gemm = (
+            REPO_ROOT
+            / "tests"
+            / "v2"
+            / "performance"
+            / "kernels"
+            / "cuda"
+            / "gemm"
+        )
+        for name in (
+            "infer_gemv_dispatch_heuristic.py",
+            "analyze_cuda_tc_gemv_dispatch.py",
+            "validate_cuda_gemv_dispatch_generator.py",
+            "validate_cuda_gemv_dispatch_base_merge.py",
+        ):
+            self.assertFalse((gemm / name).exists(), name)
 
     def test_qwen36_profiles_split_lm_head_without_changing_full_profile(self) -> None:
         core = self.run_script("--backend", "rocm", "--profile", "qwen36-core")
@@ -233,8 +1144,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("Qwen36_LM_Head", full_stdout)
         self.assertIn("35BMoE_Expert_GateUp", full_stdout)
         self.assertNotIn("LLAMINAR_ROCM_NVNNI_DECODE_REFERENCE", core_stdout)
-        self.assertIn("--min-overall-family-pct 99.0", cuda_core.stdout)
-        self.assertIn("--min-fallback-family-pct 97.0", cuda_core.stdout)
+        self.assertIn("--profile partial-production", cuda_core.stdout)
+        self.assertIn("--require-complete", cuda_core.stdout)
 
     def test_cuda_qwen36_moe_profile_uses_real_expert_buckets(self) -> None:
         result = self.run_script(
@@ -251,15 +1162,15 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
         self.assertIn(
-            "LLAMINAR_CUDA_TC_SHAPES=35BMoE_Expert_GateUp,35BMoE_Expert_Down,"
+            "LLAMINAR_CUDA_NVNNI_DECODE_SHAPES=35BMoE_Expert_GateUp,35BMoE_Expert_Down,"
             "Qwen36MoE_GDN_QKVProjection,Qwen36MoE_GDN_ZProjection",
             stdout,
         )
-        self.assertIn("LLAMINAR_CUDA_TC_SWEEP_M=2,3,4", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_FORMATS=Q4_K,Q6_K", stdout)
-        self.assertIn("LLAMINAR_CUDA_TC_SWEEP_FAMILIES=wide,kpar,direct", stdout)
-        self.assertIn("--min-overall-family-pct 99.0", stdout)
-        self.assertIn("--min-overall-exact-pct 99.0", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_M=2,3,4", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_FORMATS=Q4_K,Q6_K", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_CANDIDATES=", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_WARMUPS=5", stdout)
+        self.assertIn("LLAMINAR_CUDA_NVNNI_DECODE_SAMPLES=30", stdout)
         self.assertIn("cuda_decode_sweep.csv", stdout)
         self.assertIn("CUDANativeVNNIGemvDispatchHeuristicGenerated.inc", stdout)
 
@@ -277,6 +1188,13 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_FORMATS=Q4_K,Q6_K", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_M=1", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_STRONG_CSV=", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_DECODE_TIMING_CSV=", stdout)
+        self.assertIn("TrainerCsv_StrongDecode_AllFormats", stdout)
+        self.assertIn("analyze_cpu_native_vnni_decode_trainer.py", stdout)
+        self.assertIn("CPUNativeVNNIDecodePolicyGenerated.inc", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q4_K,Q6_K", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=2,3,4", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_FFN_DownProjection", stdout)
@@ -288,6 +1206,11 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_TIMING_CSV=", stdout)
         self.assertIn("LLAMINAR_CPU_NVNNI_VERIFIER_THREADS=28", stdout)
+        self.assertIn("OMP_NUM_THREADS=28", stdout)
+        self.assertIn("OMP_PLACES=cores", stdout)
+        self.assertIn("OMP_PROC_BIND=close", stdout)
+        self.assertIn("OMP_DYNAMIC=false", stdout)
+        self.assertIn("mpirun --bind-to socket --map-by socket", stdout)
         self.assertIn("TrainerCsv_StrongVerifierRows_AllFormats", stdout)
         self.assertIn("avx2-build.avx2-runtime", stdout)
         self.assertIn("avx512-build.avx2-runtime", stdout)
@@ -296,6 +1219,1075 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("--require-isa-matrix", stdout)
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", stdout)
         self.assertIn("validate_native_vnni_generated_dispatch_ids.py", stdout)
+
+    def test_cpu_two_socket_mpi_batch_assigns_distinct_jobs(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "quick",
+            "--cpu-formats",
+            "Q4_K",
+            "--m-values",
+            "2,3,4",
+            "--cpu-measurement-lanes",
+            "2",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mpi_lines = [
+            line.replace("\\,", ",")
+            for line in result.stdout.splitlines()
+            if "mpirun --bind-to socket --map-by socket" in line
+            and "LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=" in line
+        ]
+        self.assertTrue(mpi_lines)
+        first = mpi_lines[0]
+        self.assertEqual(first.count(" -np 1 env "), 2)
+        self.assertIn("Qwen36_FFN_DownProjection", first)
+        self.assertIn("Qwen36_GDN_OutputProjection", first)
+        self.assertIn("avx2-build.avx2-runtime.csv", first)
+        self.assertTrue(
+            any("avx512-build.avx2-runtime.csv" in line for line in mpi_lines)
+        )
+        self.assertTrue(
+            any("avx512-build.avx512-runtime.csv" in line for line in mpi_lines)
+        )
+        csv_paths = re.findall(
+            r"LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=([^ ]+)", first
+        )
+        self.assertEqual(len(csv_paths), 2)
+        self.assertEqual(len(set(csv_paths)), 2)
+
+    def test_cpu_measurement_lanes_default_to_detected_sockets(self) -> None:
+        """Turnkey CPU collection must not silently leave sockets idle."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "quick",
+            "--cpu-formats",
+            "Q4_K",
+            "--m-values",
+            "2,3,4",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        socket_rows = subprocess.run(
+            ["lscpu", "-p=socket"],
+            text=True,
+            stdout=subprocess.PIPE,
+            check=True,
+        ).stdout.splitlines()
+        socket_count = len({
+            row for row in socket_rows if row and not row.startswith("#")
+        })
+        first = next(
+            line.replace("\\,", ",")
+            for line in result.stdout.splitlines()
+            if "mpirun --bind-to socket --map-by socket" in line
+            and "LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=" in line
+        )
+        self.assertEqual(first.count(" -np 1 env "), socket_count)
+        csv_paths = re.findall(
+            r"LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=([^ ]+)", first
+        )
+        self.assertEqual(len(csv_paths), socket_count)
+        self.assertEqual(len(set(csv_paths)), socket_count)
+
+    def test_cpu_bounded_collection_checkpoints_atomic_format_shards(self) -> None:
+        """A bounded invocation leaves resumable finals, never partial CSVs."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "quick",
+            "--cpu-formats",
+            "Q4_K,Q6_K",
+            "--m-values",
+            "2,3,4",
+            "--cpu-measurement-lanes",
+            "2",
+            "--cpu-format-shards",
+            "--cpu-batch-limit",
+            "1",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn(".csv.inprogress", stdout)
+        self.assertIn("dry-run: mv", stdout)
+        self.assertIn("CPU M=1 collection checkpointed after 1", stdout)
+        self.assertIn("resume from", stdout)
+        self.assertNotIn("analyze_cpu_native_vnni_verifier_trainer.py", stdout)
+        mpi_lines = [
+            line for line in stdout.splitlines()
+            if "mpirun --bind-to socket --map-by socket" in line
+        ]
+        self.assertEqual(len(mpi_lines), 1)
+        self.assertIn("DECODE_FORMATS=Q4_K", mpi_lines[0])
+        self.assertNotIn("DECODE_FORMATS=Q4_K,Q6_K", mpi_lines[0])
+
+    def test_cpu_batch_limit_rejects_negative_values(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--cpu-batch-limit",
+            "-1",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("non-negative integer", result.stderr)
+
+    def test_cpu_resume_fails_closed_on_collection_contract_change(self) -> None:
+        """Completed shard names cannot be reused with different M or formats."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out"
+            output.mkdir()
+            (output / "cpu_collection_contract.sha256").write_text(
+                "stale-contract\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--backend",
+                    "cpu",
+                    "--profile",
+                    "all",
+                    "--output-dir",
+                    str(output),
+                    "--cpu-avx2-sweep-bin",
+                    "/bin/true",
+                    "--cpu-avx512-sweep-bin",
+                    "/bin/true",
+                    "--cpu-threads",
+                    "28",
+                    "--cpu-formats",
+                    "Q4_K",
+                    "--m-values",
+                    "2",
+                    "--shape-partition",
+                    "verifier-development",
+                    "--resume-cpu-partials",
+                    "--skip-profiler-evidence",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("collection contract changed", result.stderr)
+
+    def test_cpu_prefill_fails_before_collection_when_isa_binary_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--backend",
+                    "cpu-prefill",
+                    "--profile",
+                    "quick",
+                    "--output-dir",
+                    str(Path(tmp) / "out"),
+                    "--cpu-avx2-sweep-bin",
+                    "/bin/true",
+                    "--cpu-avx512-sweep-bin",
+                    "/bin/true",
+                    "--cpu-threads",
+                    "28",
+                    "--skip-profiler-evidence",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("does not contain required gtest", result.stderr)
+        self.assertIn("rebuild the matching ISA trainer", result.stderr)
+
+    def test_cpu_prefill_backend_uses_tiered_matrix_and_generator(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "quick",
+            "--cpu-formats",
+            "Q4_K",
+            "--cpu-measurement-lanes",
+            "2",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_M=64", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME=7B_FFN_Up", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_SHAPE_NAME=0.5B_AttnOut", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MIN_ITERS=5", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MAX_ITERS=180", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_BUDGET_US=0", stdout)
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_US=0",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_LATENCY_MULTIPLIER=60",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_ROUND_TIMEOUT_US=30000000",
+            stdout,
+        )
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_TIMING_BUDGET_US=100000", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MEDIAN_STABILITY=0.02", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC=0", stdout)
+        self.assertIn("TrainerCsv_StrongPrefill_AllFormats", stdout)
+        self.assertIn("analyze_cpu_native_vnni_prefill_trainer.py", stdout)
+        self.assertIn("CPUNativeVNNIPrefillPolicyGenerated.inc", stdout)
+        self.assertIn("validate_native_vnni_generated_dispatch_ids.py", stdout)
+
+    def test_cpu_prefill_production_checkpoint_uses_covering_plan(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--cpu-formats",
+            "Q4_K",
+            "--cpu-measurement-lanes",
+            "2",
+            "--cpu-batch-limit",
+            "1",
+            "--skip-profiler-evidence",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_M=64,256,1024,2048,4096,8192,16384",
+            stdout,
+        )
+        self.assertIn("PREFILL_SHAPE_NAME=35BMoE_Expert_Down", stdout)
+        self.assertGreaterEqual(
+            stdout.count("PREFILL_SHAPE_NAME=35BMoE_Expert_Down"),
+            2,
+        )
+        self.assertIn("avx2-build.avx2-runtime", stdout)
+        self.assertIn("avx512-build.avx2-runtime", stdout)
+        self.assertIn("TrainerCsv_PrefillSerialRouteManifest", stdout)
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_BUDGET_US=50000", stdout)
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_US=50000",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_CEILING_US=500000",
+            stdout,
+        )
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC=1", stdout)
+        self.assertIn("CPU NativeVNNI prefill checkpoint", stdout)
+        self.assertIn(
+            "require every CPU frequency policy governor == performance",
+            stdout,
+        )
+        self.assertIn("CPU prefill corpus transaction completed", stdout)
+        self.assertNotIn("analyze_cpu_native_vnni_prefill_trainer.py", stdout)
+
+    def test_cpu_prefill_candidate_expansion_collects_only_anchor_and_new_family(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--cpu-measurement-lanes",
+            "2",
+            "--collect-cpu-prefill-candidate-expansion-source-aggregate",
+            "/evidence/immutable-source.csv",
+            "--collect-cpu-prefill-candidate-expansion-source-timing",
+            "/evidence/immutable-source.timing.csv",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("authenticate candidate-expansion source", stdout)
+        self.assertIn("cpu_prefill_candidate_expansion.v4.json", stdout)
+        self.assertIn(
+            '--collection-build-digest "${cpu_build_id}"',
+            SCRIPT.read_text(encoding="utf-8"),
+        )
+        candidate_environment = next(
+            item for item in stdout.split()
+            if item.startswith("LLAMINAR_CPU_NVNNI_PREFILL_CANDIDATES=")
+        )
+        self.assertIn("row_chunk_grid", candidate_environment)
+        self.assertEqual(candidate_environment.count("two_row_pair_grid"), 5)
+        self.assertNotIn("two_row_tiles", candidate_environment)
+        self.assertEqual(
+            candidate_environment.count("decode_equivalent_kpart"),
+            1,
+        )
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_MPI_ROUND_SYNC=1", stdout)
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_ANCHORED_EXPANSION=1",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_WARMUP_BUDGET_US=0",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_BUDGET_US=0",
+            stdout,
+        )
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_WARMUP=2", stdout)
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TRANSITION_WARMUP_LATENCY_MULTIPLIER=0",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_MIN_ITERS=5",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_STATIONARY_MIN_ITERS=5",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_MAX_ITERS=180",
+            stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_CPU_NVNNI_PREFILL_TIMING_BUDGET_US=100000",
+            stdout,
+        )
+        self.assertIn("--candidate-expansion-plan-json", stdout)
+        self.assertIn("--candidate-expansion-input", stdout)
+        self.assertIn("--candidate-expansion-timing-sidecar", stdout)
+        self.assertNotIn(
+            "--development-only",
+            SCRIPT.read_text(encoding="utf-8"),
+        )
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            '"${cpu_prefill_candidate_expansion_max_iters}" 5 2 3',
+            wrapper,
+        )
+        self.assertIn(
+            '"${cpu_prefill_candidate_expansion_timing_budget_us}"',
+            wrapper,
+        )
+        self.assertIn(
+            "Validate the complete MPMD batch before publishing either rank",
+            wrapper,
+        )
+        self.assertLess(
+            wrapper.index("for ((launch_attempt = 1;"),
+            wrapper.index(
+                'run_cmd mv "${partials_ref[job_index]}.inprogress"'
+            ),
+        )
+
+    def test_cpu_prefill_candidate_expansion_rebases_an_older_checkpoint(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--collect-cpu-prefill-candidate-expansion-source-aggregate",
+            "/evidence/immutable-source.csv",
+            "--collect-cpu-prefill-candidate-expansion-source-timing",
+            "/evidence/immutable-source.timing.csv",
+            "--resume-cpu-partials",
+            "--resume-cpu-candidate-expansion-from",
+            "/evidence/older-checkpoint",
+            "--cpu-prefill-harness-build-change-audit",
+            "reviewed timing harness only",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "rebase CPU prefill candidate-expansion checkpoint",
+            result.stdout,
+        )
+        self.assertIn("/evidence/older-checkpoint", result.stdout)
+        self.assertIn(
+            "audit timing-harness-only build change",
+            result.stdout,
+        )
+        self.assertIn(
+            "rebased_candidate_expansion_records",
+            SCRIPT.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            '("\\n" if records else "")',
+            SCRIPT.read_text(encoding="utf-8"),
+        )
+
+    def test_candidate_expansion_rebase_requires_resume_mode(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--collect-cpu-prefill-candidate-expansion-source-aggregate",
+            "/evidence/immutable-source.csv",
+            "--collect-cpu-prefill-candidate-expansion-source-timing",
+            "/evidence/immutable-source.timing.csv",
+            "--resume-cpu-candidate-expansion-from",
+            "/evidence/older-checkpoint",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires --resume-cpu-partials", result.stderr)
+
+    def test_cpu_prefill_sealed_holdout_launches_only_after_freeze(self) -> None:
+        """Each evidence lifetime must remain explicit and correctly ordered."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        production = wrapper[wrapper.index('if [[ "${measurement_profile}" == "production" ]]') :]
+        refinement = production.index("--development-update-records-from")
+        development_fit = production.index("--development-fit-diagnostic")
+        freeze = production.index('run_cmd "${cpu_prefill_freeze[@]}"')
+        freeze_checkpoint = production.index(
+            'if (( stop_after_cpu_prefill_freeze )); then'
+        )
+        sealed_launch = production.index(
+            '--sealed-witness-plan "${cpu_prefill_sealed_witness_plan_json}"'
+        )
+        certify = production.index('local -a cpu_prefill_certify=(')
+
+        self.assertLess(refinement, freeze)
+        self.assertLess(refinement, development_fit)
+        self.assertLess(development_fit, freeze)
+        self.assertLess(freeze, freeze_checkpoint)
+        self.assertLess(freeze_checkpoint, sealed_launch)
+        self.assertLess(freeze, sealed_launch)
+        self.assertLess(sealed_launch, certify)
+        self.assertNotIn(
+            "native_vnni_dispatch.cpu_prefill_split_manifest",
+            production,
+        )
+        self.assertIn(
+            '"${cpu_prefill_active_development_csvs[${certify_development_index}]}"',
+            production,
+        )
+        self.assertIn("cpu_prefill_generic_refinement_module", wrapper)
+        self.assertIn("--generic-refinement-plan-json", production)
+        self.assertIn(
+            'generic-refinement-r${round}.${plan_token}.${format_spec}',
+            production,
+        )
+        self.assertIn("validate_cpu_prefill_partial", production)
+        self.assertIn(
+            "Discarding non-installable CPU prefill refinement partial",
+            production,
+        )
+        self.assertIn(
+            "Ignoring non-installable completed CPU prefill refinement round",
+            production,
+        )
+        self.assertLess(
+            production.index("validate_cpu_prefill_partial"),
+            production.index(
+                'run_cmd mv "${partials_ref[job_index]}.inprogress"'
+            ),
+        )
+        self.assertIn('sha256sum "${plan_path}"', production)
+        self.assertIn("cpu_prefill_sweep.development-refinement-v4.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.development-v4.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.sealed-v5.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.development-v6.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.sealed-v6.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.development-v7.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.sealed-v7.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.development-v8.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.sealed-v8.csv", wrapper)
+        self.assertIn("cpu_prefill_sweep.sealed.csv", wrapper)
+        self.assertNotIn("--sealed-records", production)
+        self.assertIn("sealed_pending_phase_inventory", production)
+        self.assertIn(
+            '[[ "${sealed_phase_inventory}" != "${sealed_pending_phase_inventory}" ]]',
+            production,
+        )
+        self.assertIn("--coalesce-format-fixtures", production)
+        self.assertIn('--source-formats "${cpu_formats}"', production)
+        self.assertIn(
+            'sealed_group_ends+=("${#sealed_job_shapes[@]}")',
+            production,
+        )
+        self.assertIn("reuse_cpu_prefill_profiler_evidence", production)
+        self.assertIn(
+            "Reusing per-variant CPU prefill profiler evidence",
+            production,
+        )
+
+    def test_cpu_prefill_resume_restores_completed_generic_round_chain(self) -> None:
+        """A restart must fit the latest aggregate without repeating old rounds."""
+
+        fixtures = {
+            "cpu_prefill_common_observations.v8.csv": CPU_PREFILL_CHECKPOINT,
+            "cpu_prefill_generic_refinement.round1.json": "round-1-plan\n",
+            "cpu_prefill_sweep.development-generic-r1.csv": "round-1-csv\n",
+            "cpu_prefill_sweep.development-generic-r1.timing.csv": (
+                "round-1-timing\n"
+            ),
+            "cpu_prefill_generic_refinement.round2.json": "round-2-plan\n",
+            "cpu_prefill_sweep.development-generic-r2.csv": "round-2-csv\n",
+            "cpu_prefill_sweep.development-generic-r2.timing.csv": (
+                "round-2-timing\n"
+            ),
+            # A plan without its completed aggregate is an interrupted next
+            # round. The current fit must regenerate/authenticate it.
+            "cpu_prefill_generic_refinement.round3.json": "stale-round-3-plan\n",
+        }
+        result = self.run_script_with_output_files(
+            fixtures,
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--resume-cpu-partials",
+            "--skip-profiler-evidence",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout
+        self.assertIn(
+            "Resuming CPU prefill from completed generic refinement round 2",
+            stdout,
+        )
+        self.assertIn(
+            "Resuming CPU prefill common observation run identity: "
+            "stable-cpu-prefill-development",
+            stdout,
+        )
+        self.assertRegex(
+            stdout,
+            r"--run-id(?:\\ | )stable-cpu-prefill-development",
+        )
+        self.assertIn("cpu_prefill_sweep.development-generic-r2.csv", stdout)
+        self.assertIn(
+            "cpu_prefill_generic_refinement.round1.json",
+            stdout,
+        )
+        self.assertIn(
+            "cpu_prefill_generic_refinement.round2.json",
+            stdout,
+        )
+        self.assertNotRegex(
+            stdout,
+            r"--generic-refinement-plan-json[^\n]*round3\.json",
+        )
+
+    def test_existing_cpu_prefill_refinement_requires_complete_provenance(self) -> None:
+        """Direct collection cannot accept only a convenient plan pathname."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--collect-cpu-prefill-refinement-plan",
+            "/tmp/round7.json",
+            "--cpu-prefill-refinement-round",
+            "7",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "requires its plan, source fit, source observations, and round",
+            result.stderr,
+        )
+
+    def test_explicit_refinement_predecessor_requires_aggregate_and_timing(self) -> None:
+        """A post-lineage refinement cannot authenticate half a predecessor."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--collect-cpu-prefill-refinement-plan",
+            "/tmp/round8.json",
+            "--cpu-prefill-refinement-source-fit",
+            "/tmp/fit.json",
+            "--cpu-prefill-refinement-source-observations",
+            "/tmp/observations.csv",
+            "--cpu-prefill-refinement-source-aggregate",
+            "/tmp/development-v9.csv",
+            "--cpu-prefill-refinement-round",
+            "8",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "requires both source aggregate and timing sidecar",
+            result.stderr,
+        )
+
+    def test_existing_cpu_prefill_refinement_uses_canonical_collector(self) -> None:
+        """The resume entry point must not grow a second measurement path."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        direct = wrapper[wrapper.index(
+            'if [[ -n "${collect_cpu_prefill_refinement_plan}" ]]; then'
+        ):]
+
+        self.assertIn(
+            "collect_cpu_prefill_generic_refinement_round",
+            direct,
+        )
+        self.assertIn(
+            "cpu_prefill_refinement_launch_attempts",
+            wrapper,
+        )
+        self.assertIn("|| return $?", wrapper)
+        self.assertIn("cpu_prefill_refinement_source_fit", direct)
+        self.assertIn("cpu_prefill_refinement_source_observations", direct)
+        self.assertIn("cpu_prefill_refinement_source_aggregate", direct)
+        self.assertIn("cpu_prefill_refinement_source_timing", direct)
+        self.assertIn(
+            '--split-manifest "${cpu_prefill_split_manifest_path}"',
+            direct,
+        )
+        self.assertIn("validate_cpu_prefill_partial", direct)
+        self.assertIn("combine_compatible_csvs", direct)
+        self.assertIn("--thread-count", direct)
+        self.assertIn(
+            'lineage_thread_count}" != "${cpu_threads}',
+            direct,
+        )
+        self.assertLess(
+            direct.index("validate_cpu_prefill_partial"),
+            direct.index("collect_cpu_prefill_generic_refinement_round"),
+        )
+
+    def test_cpu_prefill_lineage_requires_every_immutable_source(self) -> None:
+        """An additive split migration cannot be named by its plan alone."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--collect-cpu-prefill-development-lineage-plan",
+            "/tmp/v8-to-v9.json",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "requires its plan, source aggregate, timing sidecar, source split manifest, and source route manifests",
+            result.stderr,
+        )
+
+    def test_cpu_prefill_replay_recipe_replaces_manual_lineage_flags(self) -> None:
+        """Production replay cannot combine typed and hand-assembled provenance."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--cpu-prefill-fit-replay-recipe",
+            "/tmp/replay.json",
+            "--cpu-prefill-fit-candidate-expansion-plan",
+            "/tmp/manual-expansion.json",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "replaces every manual CPU prefill fit lineage option",
+            result.stderr,
+        )
+
+    def test_cpu_prefill_primary_profiler_requires_complete_triplet(self) -> None:
+        """A replacement base cannot infer evidence or witnesses by filename."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--reuse-profiler-evidence",
+            "--cpu-prefill-fit-candidate-expansion-plan",
+            "/tmp/candidate-expansion.json",
+            "--cpu-prefill-fit-candidate-expansion-source-aggregate",
+            "/tmp/base.csv",
+            "--cpu-prefill-fit-candidate-expansion-source-timing",
+            "/tmp/base.timing.csv",
+            "--cpu-prefill-fit-candidate-expansion-input",
+            "/tmp/expansion.csv",
+            "--cpu-prefill-fit-candidate-expansion-timing",
+            "/tmp/expansion.timing.csv",
+            "--cpu-prefill-fit-primary-profiler-requests",
+            "/tmp/aligned-requests.json",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "primary profiler requests, evidence, and observations must form "
+            "one complete transaction",
+            result.stderr,
+        )
+
+    def test_cpu_prefill_primary_profiler_is_fit_only_evidence(self) -> None:
+        """A paid replacement transaction cannot silently relaunch profilers."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--cpu-prefill-fit-candidate-expansion-plan",
+            "/tmp/candidate-expansion.json",
+            "--cpu-prefill-fit-candidate-expansion-source-aggregate",
+            "/tmp/base.csv",
+            "--cpu-prefill-fit-candidate-expansion-source-timing",
+            "/tmp/base.timing.csv",
+            "--cpu-prefill-fit-candidate-expansion-input",
+            "/tmp/expansion.csv",
+            "--cpu-prefill-fit-candidate-expansion-timing",
+            "/tmp/expansion.timing.csv",
+            "--cpu-prefill-fit-primary-profiler-requests",
+            "/tmp/aligned-requests.json",
+            "--cpu-prefill-fit-primary-profiler-evidence",
+            "/tmp/aligned-evidence.json",
+            "--cpu-prefill-fit-primary-profiler-observations",
+            "/tmp/aligned-observations.csv",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "primary profiler replacement requires --reuse-profiler-evidence",
+            result.stderr,
+        )
+
+    def test_cpu_prefill_recipe_preflight_precedes_route_probes(self) -> None:
+        """Invalid replay lineage must fail before invoking any CPU binary."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        preflight = wrapper.index(
+            "native_vnni_dispatch.cpu_prefill_replay_recipe"
+        )
+        route_probe = wrapper.index(
+            "Ask the production C++ tile planner which serial arithmetic family"
+        )
+        self.assertLess(preflight, route_probe)
+        self.assertIn(
+            "preflight failed before expensive work",
+            wrapper[preflight:route_probe],
+        )
+
+    def test_cpu_prefill_lineage_fit_forwards_complete_mixed_split_provenance(
+        self,
+    ) -> None:
+        """Fit-only replay must preserve source routes, rounds, and splits."""
+
+        result = self.run_script_with_output_files(
+            {"cpu_prefill_common_observations.v8.csv": CPU_PREFILL_CHECKPOINT},
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--skip-profiler-evidence",
+            "--cpu-prefill-fit-development-lineage-plan",
+            "/tmp/v9-to-v10.json",
+            "--cpu-prefill-lineage-source-aggregate",
+            "/tmp/development-v9.csv",
+            "--cpu-prefill-lineage-source-timing",
+            "/tmp/development-v9.timing.csv",
+            "--cpu-prefill-lineage-source-split-manifest",
+            "/tmp/split-v9.json",
+            "--cpu-prefill-lineage-source-refinement-split-manifest",
+            "/tmp/split-v8.json",
+            "--cpu-prefill-lineage-source-route-manifest",
+            "/tmp/route-avx2.csv",
+            "--cpu-prefill-lineage-source-route-manifest",
+            "/tmp/route-avx512-avx2.csv",
+            "--cpu-prefill-lineage-source-route-manifest",
+            "/tmp/route-avx512.csv",
+            "--cpu-prefill-lineage-source-refinement-plan",
+            "/tmp/round-v8.json",
+            "--cpu-prefill-lineage-source-refinement-plan",
+            "/tmp/round-v9.json",
+            "--cpu-prefill-fit-candidate-expansion-plan",
+            "/tmp/candidate-expansion.json",
+            "--cpu-prefill-fit-candidate-expansion-source-aggregate",
+            "/tmp/base-r16.csv",
+            "--cpu-prefill-fit-candidate-expansion-source-timing",
+            "/tmp/base-r16.timing.csv",
+            "--cpu-prefill-fit-candidate-expansion-input",
+            "/tmp/candidate-expansion.csv",
+            "--cpu-prefill-fit-candidate-expansion-timing",
+            "/tmp/candidate-expansion.timing.csv",
+            "--cpu-prefill-fit-additive-aggregate",
+            "/tmp/refinement-r17.csv",
+            "--cpu-prefill-fit-additive-timing",
+            "/tmp/refinement-r17.timing.csv",
+            "--cpu-prefill-fit-additive-aggregate",
+            "/tmp/lineage-v10.csv",
+            "--cpu-prefill-fit-additive-timing",
+            "/tmp/lineage-v10.timing.csv",
+            "--cpu-prefill-fit-additive-aggregate",
+            "/tmp/generic-refinement-r1.csv",
+            "--cpu-prefill-fit-additive-timing",
+            "/tmp/generic-refinement-r1.timing.csv",
+            "--cpu-prefill-fit-generic-refinement-plan",
+            "/tmp/generic-refinement-r1.json",
+            "--cpu-prefill-fit-additive-profiler-requests",
+            "/tmp/pair-grid-profiler-requests.json",
+            "--cpu-prefill-fit-additive-profiler-evidence",
+            "/tmp/pair-grid-profiler-evidence.json",
+            "--cpu-prefill-fit-additive-profiler-observations",
+            "/tmp/pair-grid-profiler-witnesses.csv",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout
+        self.assertIn(
+            "require complete CPU prefill candidate-expansion fit transaction",
+            stdout,
+        )
+        self.assertIn(
+            "--development-lineage-plan-json /tmp/v9-to-v10.json",
+            stdout,
+        )
+        self.assertIn(
+            "--development-lineage-source-route-manifest /tmp/route-avx2.csv",
+            stdout,
+        )
+        self.assertIn(
+            "--development-lineage-source-refinement-split-manifest /tmp/split-v8.json",
+            stdout,
+        )
+        self.assertIn(
+            "--development-lineage-source-refinement-plan-json /tmp/round-v9.json",
+            stdout,
+        )
+        self.assertIn(
+            "--input /tmp/base-r16.csv /tmp/refinement-r17.csv /tmp/lineage-v10.csv /tmp/generic-refinement-r1.csv",
+            stdout,
+        )
+        self.assertIn(
+            "--generic-refinement-plan-json /tmp/generic-refinement-r1.json",
+            stdout,
+        )
+        self.assertIn(
+            "--adapted-development-prefix-input",
+            stdout,
+        )
+        self.assertNotIn("--adapted-development-prefix-count", stdout)
+        self.assertIn(
+            "--candidate-expansion-plan-json /tmp/candidate-expansion.json",
+            stdout,
+        )
+        self.assertIn(
+            "--candidate-expansion-input /tmp/candidate-expansion.csv",
+            stdout,
+        )
+        self.assertIn(
+            "--candidate-expansion-timing-sidecar /tmp/candidate-expansion.timing.csv",
+            stdout,
+        )
+        self.assertIn(
+            "--development-profiler-requests /tmp/pair-grid-profiler-requests.json",
+            stdout,
+        )
+        self.assertIn(
+            "--development-profiler-evidence /tmp/pair-grid-profiler-evidence.json",
+            stdout,
+        )
+        self.assertIn(
+            "--development-profiler-observations /tmp/pair-grid-profiler-witnesses.csv",
+            stdout,
+        )
+        self.assertGreaterEqual(
+            stdout.count("--development-lineage-plan-json"),
+            4,
+        )
+
+    def test_cpu_prefill_lineage_is_additive_and_plan_authenticated(self) -> None:
+        """The migration collector must preserve source bytes and add one plan."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        direct = wrapper[wrapper.index(
+            'if [[ -n "${collect_cpu_prefill_development_lineage_plan}" ]]; then'
+        ):]
+
+        self.assertIn("cpu_prefill_development_lineage_module", direct)
+        self.assertIn(
+            "collect_cpu_prefill_development_lineage_increment",
+            direct,
+        )
+        self.assertIn("cpu_prefill_lineage_source_aggregate", direct)
+        self.assertIn("cpu_prefill_lineage_source_timing", direct)
+        self.assertIn("cpu_prefill_lineage_source_route_manifests", direct)
+        self.assertIn(
+            "cpu_prefill_lineage_source_refinement_split_manifests",
+            direct,
+        )
+        self.assertIn("validate_cpu_prefill_partial", direct)
+        self.assertIn(
+            'combine_compatible_csvs "${lineage_development_csv}"',
+            direct,
+        )
+        self.assertIn(
+            'combine_compatible_csvs "${lineage_development_timing_csv}"',
+            direct,
+        )
+        self.assertIn('--build', direct)
+        self.assertIn(
+            '[[ ! -s "${collect_cpu_prefill_development_lineage_plan}" ]]',
+            direct,
+        )
+        self.assertIn("development-lineage.increment.csv", direct)
+        self.assertIn("development-lineage.combined.csv", direct)
+        self.assertNotRegex(direct, r"development-lineage-v[0-9]+")
+        self.assertLess(
+            direct.index("cpu_prefill_development_lineage_module"),
+            direct.index("collect_cpu_prefill_development_lineage_increment"),
+        )
+
+        collector = wrapper[
+            wrapper.index("collect_cpu_prefill_development_lineage_increment()"):
+            wrapper.index("collect_cpu_prefill_candidate_expansion()")
+        ]
+        self.assertIn("--launch-records", collector)
+        self.assertNotIn("--thread-count", collector)
+        self.assertNotIn("--candidate-expansion", collector)
+        self.assertIn(
+            "job_timing_partials || return $?",
+            collector,
+        )
+        self.assertIn(
+            'combine_csvs "${aggregate}" "${partials[@]}"',
+            collector,
+        )
+
+    def test_cpu_prefill_baseline_reuse_is_an_explicit_production_mode(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-cpu-prefill-baseline",
+            "--cpu-batch-limit",
+            "1",
+            "--skip-profiler-evidence",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        self.assertIn("require complete CPU prefill baseline", stdout)
+        self.assertIn("cpu_prefill.refinement-v4.", stdout)
+        self.assertIn("CPU NativeVNNI prefill refinement-v4 checkpoint", stdout)
+        self.assertNotIn("publish CPU prefill contract", stdout)
+
+    def test_cpu_prefill_freeze_checkpoint_rejects_installation(self) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--stop-after-cpu-prefill-freeze",
+            "--install",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot install an uncertified policy", result.stderr)
+
+    def test_cpu_prefill_profiler_ablation_is_diagnostic_only(self) -> None:
+        """The timing-only A/B half cannot enter a production freeze."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--cpu-prefill-ablate-profiler-features",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "requires --cpu-prefill-diagnostic-max-leaves",
+            result.stderr,
+        )
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("--ablate-profiler-features", script)
+        self.assertIn(".profiler-ablated", script)
+        self.assertIn(".profiler-informed", script)
+        self.assertLess(
+            script.index("development diagnostic complete"),
+            script.index("if (( cpu_prefill_unpromoted_domains == 0 ))"),
+        )
+
+    def test_cpu_prefill_reused_development_can_collect_fresh_sealed_holdout(
+        self,
+    ) -> None:
+        """A lineage replay may freeze, measure sealed evidence, and certify."""
+
+        result = self.run_script_with_output_files(
+            {
+                "cpu_prefill_common_observations.v8.csv": (
+                    CPU_PREFILL_CHECKPOINT
+                ),
+                "cpu_prefill_profiler_source_observations.csv": "header\nrow\n",
+                "cpu_prefill_profiler_observation_witnesses.csv": "header\nrow\n",
+                "cpu_prefill_profiler_requests.json": "{}\n",
+                "cpu_prefill_profiler_evidence.json": "{}\n",
+            },
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--skip-sweep",
+            "--collect-cpu-prefill-sealed-after-freeze",
+            "--reuse-profiler-evidence",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("publish CPU prefill contract", result.stdout)
+        self.assertIn(
+            "collect fresh CPU prefill sealed-v8 witness holdout",
+            result.stdout,
+        )
+        self.assertIn("--freeze-generic", result.stdout)
+        self.assertIn("--certify-generic", result.stdout)
+        self.assertIn("cpu_prefill_final_profiler_requests.json", result.stdout)
+        self.assertIn("compose-evidence", result.stdout)
+        self.assertIn(
+            "cpu_prefill_final_profiler_observation_witnesses.csv",
+            result.stdout,
+        )
+        self.assertNotIn("native_vnni_dispatch.profiler_collectors", result.stdout)
+
+    def test_cpu_prefill_fresh_sealed_collection_requires_reused_development(
+        self,
+    ) -> None:
+        result = self.run_script(
+            "--backend",
+            "cpu-prefill",
+            "--profile",
+            "all",
+            "--collect-cpu-prefill-sealed-after-freeze",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires --skip-sweep", result.stderr)
 
     def test_cpu_qwen36_profile_trains_forced_policy_variants(self) -> None:
         result = self.run_script(
@@ -333,6 +2325,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout.replace("\\,", ",")
         self.assertIn("--require-key Q4_K:2:17408:5120", stdout)
+        self.assertIn("--require-key Q4_K:16:17408:5120", stdout)
+        self.assertIn("--require-key Q4_K:31:17408:5120", stdout)
         self.assertNotIn("--require-key Q4_K:1:", stdout)
 
     def test_cpu_qwen36_lm_head_uses_stable_required_key_training_budget(self) -> None:
@@ -409,9 +2403,12 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("return VerifierRowsPolicy::Pairwise;", source)
         self.assertIn("use_avx512 && M >= 3 && use_wide_rows", source)
         self.assertIn("const int row_tile_count = (M + 3) / 4", source)
-        self.assertIn("const int policy_tile_rows = std::min(M, 4)", source)
-        self.assertIn("resolve_generated_policy(M)", source)
-        self.assertIn("M > 4 && resolve_generated_policy(policy_tile_rows)", source)
+        self.assertNotIn("policy_tile_rows", source)
+        self.assertNotIn("M > 4 && resolve_generated_policy", source)
+        self.assertIn(
+            "selectCPUNativeVNNIVerifierRowsGeneratedPolicy(",
+            source,
+        )
         self.assertIn("reduceNativeVNNIKTilePartialsExact", source)
         self.assertEqual(
             len(
@@ -421,7 +2418,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
                     flags=re.MULTILINE,
                 )
             ),
-            3,
+            4,
         )
         self.assertEqual(source.count("_mm512_loadu_ps(base)"), 1)
         self.assertIn("grouped_k_parallel_row_tiles", source)
@@ -441,6 +2438,78 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(validated.returncode, 0, validated.stderr)
+
+    def test_cpu_generated_prefill_policy_is_checked_in_and_consumed(self) -> None:
+        source_path = (
+            REPO_ROOT
+            / "src"
+            / "v2"
+            / "kernels"
+            / "cpu"
+            / "native_vnni"
+            / "CPUNativeVNNIGemv.h"
+        )
+        generated_path = source_path.parent / "CPUNativeVNNIPrefillPolicyGenerated.inc"
+
+        self.assertTrue(generated_path.is_file(), "CPU prefill generated policy include is missing")
+        source = source_path.read_text(encoding="utf-8")
+        generated_source = generated_path.read_text(encoding="utf-8")
+
+        self.assertIn("CPUNativeVNNIPrefillPolicyGenerated.inc", source)
+        self.assertIn("selectCPUNativeVNNIPrefillGeneratedPolicy", source)
+        self.assertIn("selectPrefillPolicy(", source)
+        self.assertIn("No certified CPU NativeVNNI prefill policy", source)
+        self.assertIn("verifier_policy_override == VerifierRowsPolicy::Auto", source)
+        self.assertIn("serial_cfg.k_tiles > 1", source)
+        selector_start = source.index(
+            "inline generated::CPUNativeVNNIPrefillPolicy selectPrefillPolicy("
+        )
+        selector_end = source.index(
+            "// =========================================================================",
+            selector_start,
+        )
+        selector_source = source[selector_start:selector_end]
+        self.assertNotIn("computeTileConfig", selector_source)
+        self.assertNotIn("catch", selector_source)
+        self.assertNotIn("return generated::CPUNativeVNNIPrefillPolicy::", selector_source)
+
+        self.assertIn("LLAMINAR_CPU_NVNNI_PREFILL_POLICY_ABI 2", generated_source)
+        self.assertIn("TwoRowPairGridNbc1", generated_source)
+        self.assertIn("TwoRowPairGridNbc16", generated_source)
+        self.assertIn("enum class CPUNativeVNNIPrefillBuildISA", generated_source)
+        self.assertIn("enum class CPUNativeVNNIPrefillRuntimeISA", generated_source)
+        self.assertIn("if (serial_kpart && m < 3)", generated_source)
+        self.assertIn("CPUNativeVNNIPrefillPolicy::KPartPairwise", generated_source)
+        self.assertIn("CPUNativeVNNIPrefillPolicy::KPartWideRows", generated_source)
+        self.assertIn("if (serial_kpart != true)", generated_source)
+        self.assertIn("threads == 28", generated_source)
+
+        validated = subprocess.run(
+            ["python3", str(VALIDATOR), str(generated_path)],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+
+    def test_strong_gpu_trainers_own_the_complete_runtime_m_envelope(self) -> None:
+        cuda_trainer = (
+            REPO_ROOT
+            / "tests/v2/performance/kernels/cuda/gemm"
+            / "Perf__CUDANativeVNNIDecodeTrainer.cpp"
+        ).read_text(encoding="utf-8")
+        rocm_trainer = (
+            REPO_ROOT
+            / "tests/v2/performance/kernels/rocm"
+            / "Perf__NativeVNNI_Throughput.cpp"
+        ).read_text(encoding="utf-8")
+        canonical = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31"
+
+        self.assertIn("9, 10, 11, 12, 13, 14, 15, 16, 31", cuda_trainer)
+        self.assertIn(canonical, rocm_trainer)
+        self.assertNotIn("m > 4", rocm_trainer)
 
 
 if __name__ == "__main__":

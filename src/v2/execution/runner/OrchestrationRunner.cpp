@@ -13996,6 +13996,20 @@ namespace llaminar2
         // independently. An intra-node barrier ensures same-node ranks wait only
         // for their own leader, not a global rank-0.
         const bool is_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        bool node_has_cpu_weight_target = !weight_config.target_is_gpu;
+        if (is_multi_rank)
+        {
+            int local_cpu_target = node_has_cpu_weight_target ? 1 : 0;
+            int any_cpu_target = local_cpu_target;
+            MPI_Comm cache_comm = mpi_ctx_->intra_node_comm();
+            if (cache_comm == MPI_COMM_NULL)
+                cache_comm = mpi_ctx_->communicator();
+            if (cache_comm != MPI_COMM_NULL)
+            {
+                MPI_Allreduce(&local_cpu_target, &any_cpu_target, 1, MPI_INT, MPI_MAX, cache_comm);
+            }
+            node_has_cpu_weight_target = any_cpu_target != 0;
+        }
         const auto prepopulate_page_cache = [&](const std::string &reason)
         {
             LOG_DEBUG(reason << " pre-populating page cache for mmap load...");
@@ -14041,24 +14055,19 @@ namespace llaminar2
             return ok;
         };
 
-        if (prepopulate_page_cache_enabled && !is_multi_rank && config_.use_mmap)
+        const bool should_prepopulate_page_cache =
+            prepopulate_page_cache_enabled && config_.use_mmap && node_has_cpu_weight_target;
+
+        if (should_prepopulate_page_cache && !is_multi_rank)
         {
-            // Single-rank loads need the same protection as multi-rank loads.
-            //
-            // CPU: NUMA-bound parallel first-touch otherwise creates many cold
-            // page-fault streams.
-            //
-            // GPU: the demand-paged upload path copies tensor-sized mmap ranges
-            // into pinned staging slots.  On a cold file those copies can also
-            // defeat disk readahead and collapse to ~100 MB/s.  A single
-            // sequential prewarm keeps the upload path demand-paged while making
-            // the backing reads deterministic and full-bandwidth.
-            prepopulate_page_cache(weight_config.target_is_gpu
-                                       ? "Single-rank GPU"
-                                       : "Single-rank CPU");
+            // CPU decode reads weights from the mapping for the lifetime of the
+            // model, so a NUMA-local prewarm remains useful. GPU-only startup is
+            // deliberately demand-paged: pre-reading the entire GGUF defeats the
+            // bounded staging contract on low-RAM/high-VRAM hosts.
+            prepopulate_page_cache("Single-rank CPU");
             weight_config.skip_mmap_cache_eviction = true;
         }
-        else if (prepopulate_page_cache_enabled && is_multi_rank && config_.use_mmap)
+        else if (should_prepopulate_page_cache && is_multi_rank)
         {
             const auto *topo = mpi_ctx_->topology();
             if (topo)
@@ -14089,6 +14098,11 @@ namespace llaminar2
                 MPI_Barrier(mpi_ctx_->communicator());
             }
             weight_config.skip_mmap_cache_eviction = true;
+        }
+        else if (prepopulate_page_cache_enabled && config_.use_mmap && weight_config.target_is_gpu)
+        {
+            LOG_DEBUG("GPU-only weight loading: skipping whole-file page-cache prepopulation; "
+                      "GGUF pages will be consumed and discarded incrementally");
         }
 
         // Validate config

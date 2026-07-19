@@ -5,10 +5,18 @@ from __future__ import annotations
 
 import dataclasses
 import csv
+import hashlib
+import json
 import math
+import os
+import statistics
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from fractions import Fraction
+from unittest import mock
 from pathlib import Path
 
 
@@ -18,19 +26,40 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
     sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
 from native_vnni_dispatch.certification import certify_generic_policy  # noqa: E402
+from native_vnni_dispatch.candidate_observation import (  # noqa: E402
+    read_observation_csv,
+    write_observation_csv,
+)
 from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     candidate_registry_digest,
+    cpu_native_vnni_decode_registry,
+    cpu_native_vnni_prefill_registry,
     cpu_native_vnni_verifier_registry,
     cuda_native_vnni_gemv_registry,
     rocm_moe_grouped_prefill_registry,
     rocm_native_vnni_decode_registry,
 )
-from native_vnni_dispatch.compiler import compile_policy  # noqa: E402
+from native_vnni_dispatch.compiler import (  # noqa: E402
+    certify_frozen_policy,
+    compile_policy,
+    freeze_policy,
+)
 from native_vnni_dispatch.corpus import (  # noqa: E402
+    GenericDomain,
     ObservationCorpus,
+    RuntimeKey,
     SurfaceKey,
     generic_domain,
     runtime_key,
+)
+from native_vnni_dispatch.cpp_predicates import (  # noqa: E402
+    aspect_condition,
+    predicate_condition,
+)
+from native_vnni_dispatch.cuda_shape_resolved import (  # noqa: E402
+    _nearest_factor_kb,
+    project_cuda_shape_resolved_candidates,
+    resolve_cuda_formula_kb,
 )
 from native_vnni_dispatch.exact_oracle import (  # noqa: E402
     build_exact_winner,
@@ -44,23 +73,46 @@ from native_vnni_dispatch.format_registry import (  # noqa: E402
     runtime_aliases,
 )
 from native_vnni_dispatch.policy_ir import make_policy_ir  # noqa: E402
+from native_vnni_dispatch.policy_artifact import (  # noqa: E402
+    validate_installable_policy_artifact,
+    write_certification_diagnostic,
+    write_compiled_policy,
+)
+from native_vnni_dispatch.paired_confirmation import (  # noqa: E402
+    PairedCellEvidence,
+    PairedCellKey,
+    paired_timing_comparisons,
+)
 from native_vnni_dispatch.schema import (  # noqa: E402
     AspectBucket,
     Backend,
     ExecutionMode,
     LEARNER_VERSION,
     NativeVNNIObservation,
+    P95_REGRET_BUDGET,
+    POLICY_ABI,
     SemanticContract,
     classify_aspect,
 )
 from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    BoundaryPlacement,
+    FeatureAxis,
+    FeaturePolicy,
+    FeaturePredicate,
+    FeatureThreshold,
     GenericPolicy,
+    GenericDispatchRule,
+    PolicyFitCache,
+    build_candidate_point_costs,
     fit_generic_policy,
+    generic_domain_corpus_digest,
+    validate_generic_rule_partition,
 )
 from native_vnni_dispatch.splits import (  # noqa: E402
     Partition,
     SplitManifest,
 )
+import native_vnni_dispatch.segmented_policy as segmented_policy  # noqa: E402
 from native_vnni_dispatch.validation import (  # noqa: E402
     require_candidate_matrix_complete,
     require_verifier_m_matrix,
@@ -76,6 +128,46 @@ from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
 
 
 SERIAL_HASH = "sha256:serial-m1-policy-v1"
+
+
+@dataclasses.dataclass(frozen=True)
+class _SchedulerProbeSpec:
+    """Minimal device identity consumed by the scheduler-only fork probe."""
+
+    label: str
+
+
+def _scheduler_probe_worker(
+    spec,
+    task_kind,
+    connection,
+    expected_parent_pid,
+) -> None:
+    """Model one slow lane and one fast lane without loading a GPU runtime."""
+
+    del task_kind, expected_parent_pid
+    connection.send(("ready",))
+    lane_sequence = 0
+    while True:
+        message = connection.recv()
+        if message[0] == "stop":
+            connection.send(("done",))
+            connection.close()
+            return
+        task_index = message[1]
+        if spec.label == "slow" and task_index == 0:
+            time.sleep(0.2)
+        else:
+            time.sleep(0.005)
+        connection.send((
+            "result",
+            task_index,
+            (spec.label, task_index),
+            0,
+            lane_sequence,
+            0.2 if spec.label == "slow" and task_index == 0 else 0.005,
+        ))
+        lane_sequence += 1
 
 
 def observation(
@@ -99,11 +191,13 @@ def observation(
     route_ok: bool = True,
     generic_eligible: bool = True,
     serial_hash: str = SERIAL_HASH,
+    backend: Backend = Backend.ROCM,
 ) -> NativeVNNIObservation:
     """Build one complete strict observation for compact synthetic corpora."""
 
     spec = format_spec(source_format)
-    runtime_codebook = spec.runtime_codebook("rocm")
+    backend_name = backend.value
+    runtime_codebook = spec.runtime_codebook(backend_name)
     mismatch_count = 0 if bitwise_equal else 1
     result = NativeVNNIObservation(
         schema_version=1,
@@ -112,12 +206,12 @@ def observation(
         git_revision="0123456789abcdef",
         build_id="unit-release-build",
         compiler_id="unit-compiler",
-        policy_abi=1,
+        policy_abi=POLICY_ABI,
         learner_version=LEARNER_VERSION,
-        backend=Backend.ROCM,
-        architecture_class="gfx906-native-vnni-v1",
-        device_name="unit-gfx906",
-        driver_runtime="unit-rocm",
+        backend=backend,
+        architecture_class=f"unit-{backend_name}-native-vnni-v1",
+        device_name=f"unit-{backend_name}-device",
+        driver_runtime=f"unit-{backend_name}-runtime",
         threading_or_stream_mode="explicit_non_default_stream",
         semantic_contract=contract,
         operation_kind="SingleProjection",
@@ -125,8 +219,8 @@ def observation(
         projection_n_vector=(n,),
         source_format=spec.label,
         source_codebook_id=spec.source_codebook_id,
-        prepared_family_id=spec.prepared_family("rocm"),
-        packing_abi=spec.packing_abi("rocm"),
+        prepared_family_id=spec.prepared_family(backend_name),
+        packing_abi=spec.packing_abi(backend_name),
         runtime_codebook_id=runtime_codebook,
         shape_group_id=shape_group,
         shape_name=shape_name or shape_group,
@@ -206,6 +300,1118 @@ def candidate_rows_for_aliases(
 
 
 class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
+    def test_policy_worker_default_counts_affinity_visible_physical_cores(
+        self,
+    ) -> None:
+        """SMT siblings share one default process-pool worker slot."""
+
+        topology = (
+            (0, 0, 0),
+            (1, 0, 0),
+            (2, 0, 1),
+            (3, 0, 1),
+            (4, 1, 0),
+            (5, 1, 0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for cpu, package_id, core_id in topology:
+                cpu_topology = root / f"cpu{cpu}" / "topology"
+                cpu_topology.mkdir(parents=True)
+                (cpu_topology / "physical_package_id").write_text(
+                    f"{package_id}\n", encoding="utf-8"
+                )
+                (cpu_topology / "core_id").write_text(
+                    f"{core_id}\n", encoding="utf-8"
+                )
+
+            self.assertEqual(
+                segmented_policy._physical_core_worker_count(
+                    affinity=range(6), topology_root=root
+                ),
+                3,
+            )
+            self.assertEqual(
+                segmented_policy._physical_core_worker_count(
+                    affinity=(0, 1, 4, 5), topology_root=root
+                ),
+                2,
+            )
+
+            # Incomplete topology fails conservatively to the visible logical
+            # count instead of guessing an SMT width.
+            (root / "cpu5" / "topology" / "core_id").unlink()
+            self.assertEqual(
+                segmented_policy._physical_core_worker_count(
+                    affinity=range(6), topology_root=root
+                ),
+                6,
+            )
+
+    def test_cv_reduction_workers_never_exceed_physical_cores(self) -> None:
+        """Explicit tuning cannot schedule reduction work onto SMT siblings."""
+
+        with mock.patch.object(
+            segmented_policy,
+            "_physical_core_worker_count",
+            return_value=3,
+        ), mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "99"},
+        ):
+            self.assertEqual(
+                segmented_policy._cv_reduction_worker_count(10),
+                3,
+            )
+            self.assertEqual(
+                segmented_policy._cv_reduction_worker_count(
+                    2, requested_workers=99
+                ),
+                2,
+            )
+            self.assertEqual(
+                segmented_policy._cv_reduction_worker_count(
+                    10, requested_workers=1
+                ),
+                1,
+            )
+            self.assertEqual(
+                segmented_policy._cv_reduction_worker_count(0),
+                0,
+            )
+
+    def test_parallel_corpus_digest_preserves_legacy_bytes_and_is_memoized(
+        self,
+    ) -> None:
+        """Parallel canonicalization must not fork the evidence identity."""
+
+        # Repeating a validated immutable row is enough to cross the production
+        # parallelization threshold without manufacturing thousands of unique
+        # runtime surfaces.  Two workers exercise ordered shard reduction.
+        row = observation()
+        corpus = ObservationCorpus((row,) * 8192)
+        canonical = json.dumps(
+            row.canonical_mapping(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        historical_bytes = (
+            "[" + ",".join((canonical,) * 8192) + "]"
+        ).encode()
+        expected = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+        ):
+            first = corpus.digest()
+        self.assertEqual(first, expected)
+
+        # A second call must be a constant-time identity lookup.  An invalid
+        # worker setting would fail if digest computation ran a second time.
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "0"},
+        ):
+            self.assertEqual(corpus.digest(), expected)
+
+    def test_parallel_corpus_digest_preserves_collapsed_prefix_order(self) -> None:
+        """Mode/aspect visibility markers retain their historical hash order."""
+
+        row = observation()
+        corpus = ObservationCorpus(
+            (row,) * 8192,
+            distinguish_execution_mode=False,
+            distinguish_aspect_bucket=False,
+        )
+        canonical = json.dumps(
+            row.canonical_mapping(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        historical_bytes = (
+            "aspect-collapsed:mode-collapsed:["
+            + ",".join((canonical,) * 8192)
+            + "]"
+        ).encode()
+        expected = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+        ):
+            self.assertEqual(corpus.digest(), expected)
+
+    def test_row_and_corpus_digests_share_one_canonical_serialization(self) -> None:
+        """Profiler-row authentication must not encode immutable rows twice."""
+
+        row = observation()
+        row_digest = row.digest()
+        canonical = row._cached_canonical_json
+        expected_corpus = "sha256:" + hashlib.sha256(
+            ("[" + canonical + "]").encode()
+        ).hexdigest()
+
+        with mock.patch.object(
+            NativeVNNIObservation,
+            "canonical_mapping",
+            side_effect=AssertionError("canonical observation was reserialized"),
+        ), mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "1"},
+        ):
+            self.assertEqual(ObservationCorpus((row,)).digest(), expected_corpus)
+            self.assertEqual(row.digest(), row_digest)
+
+    def test_parallel_domain_cache_identities_match_serial_generation(self) -> None:
+        """Parallel fit-cache preparation must preserve every cache key input."""
+
+        exemplars = tuple(
+            observation(
+                source_format=source_format,
+                shape_group=f"shape-{index}",
+            )
+            for index, source_format in enumerate(
+                ("Q4_0", "Q5_0", "Q8_0", "IQ4_NL")
+            )
+        )
+        corpus = ObservationCorpus(tuple(
+            row for exemplar in exemplars for row in (exemplar,) * 2048
+        )).with_collapsed_aspect_domains()
+        serial_hashes = {
+            corpus.runtime_key_for(row): SERIAL_HASH for row in exemplars
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            serial = segmented_policy._domain_cache_identity_inputs(
+                corpus,
+                corpus.generic_domains(),
+                None,
+                serial_hashes,
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "4"},
+        ):
+            parallel = segmented_policy._domain_cache_identity_inputs(
+                corpus,
+                corpus.generic_domains(),
+                None,
+                serial_hashes,
+            )
+
+        self.assertEqual(parallel, serial)
+
+    def test_p95_uses_exact_nearest_rank_for_every_accelerated_population(
+        self,
+    ) -> None:
+        """Host and device searches must select the same observed p95 row."""
+
+        for population_size in range(1, 65):
+            values = tuple(float(index) for index in range(population_size))
+            rank = (95 * population_size + 99) // 100
+            with self.subTest(population_size=population_size):
+                self.assertEqual(
+                    segmented_policy._percentile(values, 0.95),
+                    values[rank - 1],
+                )
+
+    def test_accelerator_scheduler_refills_the_first_free_device_lane(self) -> None:
+        """A fast lane must consume tail tasks while another lane is busy."""
+
+        specs = (_SchedulerProbeSpec("slow"), _SchedulerProbeSpec("fast"))
+        task_timings = []
+        with mock.patch.object(
+            segmented_policy,
+            "_accelerated_worker",
+            _scheduler_probe_worker,
+        ):
+            results = segmented_policy._run_accelerated_tasks(
+                specs,
+                (100, 90, 80, 70),
+                "cv",
+                task_timings,
+            )
+
+        self.assertEqual(
+            results,
+            [
+                ("slow", 0),
+                ("fast", 1),
+                ("fast", 2),
+                ("fast", 3),
+            ],
+        )
+        self.assertEqual(
+            {timing.task_index for timing in task_timings},
+            {0, 1, 2, 3},
+        )
+        self.assertEqual(
+            {timing.accelerator_label for timing in task_timings},
+            {"slow", "fast"},
+        )
+        self.assertTrue(all(
+            timing.elapsed_seconds > 0.0 for timing in task_timings
+        ))
+
+    def test_accelerated_cv_groups_reuse_one_geometry_across_influences(
+        self,
+    ) -> None:
+        """Keep profiler variants together without changing original indices."""
+
+        domain = object()
+        heldout = frozenset(("held-a", "held-b"))
+        tasks = []
+        for feature_policy in (
+            segmented_policy.FeaturePolicy.CONTINUOUS,
+            segmented_policy.FeaturePolicy.TILE_64,
+        ):
+            for influence in segmented_policy.TREE_PROFILER_INFLUENCES:
+                tasks.append((
+                    domain,
+                    2,
+                    heldout,
+                    feature_policy,
+                    segmented_policy.BoundaryPlacement.MIDPOINT,
+                    influence,
+                    (f"costs-{influence.value}",),
+                    16,
+                    2,
+                ))
+
+        groups = segmented_policy._group_accelerated_cv_tasks(tasks)
+
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(
+            len(group) == len(segmented_policy.TREE_PROFILER_INFLUENCES)
+            for group in groups
+        ))
+        self.assertEqual(
+            tuple(index for group in groups for index, _task in group),
+            tuple(range(len(tasks))),
+        )
+        self.assertTrue(all(
+            len({task[3] for _index, task in group}) == 1
+            for group in groups
+        ))
+
+    def test_accelerated_threshold_scalar_builder_is_exact(self) -> None:
+        """Allocation-free pair arithmetic must preserve rational ABI fields."""
+
+        cases = (
+            (
+                segmented_policy.FeatureAxis.AGGREGATE_N,
+                Fraction(17, 3),
+                Fraction(29, 4),
+            ),
+            (
+                segmented_policy.FeatureAxis.N_PARALLEL_WAVES_64,
+                Fraction(2, 1),
+                Fraction(5, 1),
+            ),
+            (
+                segmented_policy.FeatureAxis.MN_FINAL_PARALLEL_WAVE_UTILIZATION_64,
+                Fraction(3, 28),
+                Fraction(11, 28),
+            ),
+        )
+        for axis, lower, upper in cases:
+            for placement in segmented_policy.BOUNDARY_PLACEMENTS:
+                with self.subTest(axis=axis, placement=placement):
+                    expected = segmented_policy._threshold_between(
+                        axis,
+                        lower,
+                        upper,
+                        placement,
+                        28,
+                        15,
+                    )
+                    actual = (
+                        segmented_policy._accelerated_threshold_components_between(
+                            axis,
+                            lower,
+                            upper,
+                            placement,
+                            28,
+                            15,
+                        )
+                    )
+                    self.assertEqual(
+                        actual,
+                        (
+                            expected.numerator,
+                            expected.denominator,
+                            expected.parallelism_width,
+                            expected.task_multiplier,
+                        ),
+                    )
+
+    def test_accelerated_axis_policy_is_compact_and_device_generated(self) -> None:
+        """The host must publish O(axis) policy, never O(axis*point^2) tables."""
+
+        axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            segmented_policy.FeaturePolicy.FULL_ROW_GRID_LAUNCH_GEOMETRY
+        ]
+        descriptors = tuple(
+            segmented_policy._accelerated_feature_axis_descriptor(axis)
+            for axis in axes
+        )
+        self.assertEqual(len(descriptors), len(axes))
+        self.assertEqual(
+            len({descriptor.axis_priority for descriptor in descriptors}),
+            len(axes),
+        )
+        self.assertFalse(
+            hasattr(segmented_policy, "_accelerated_tree_feature_metadata")
+        )
+
+    def test_cached_cuda_nearest_factor_matches_brute_force_resolver(self) -> None:
+        """Faster formula projection must preserve every exact KB decision."""
+
+        def brute_force(
+            *,
+            grid_n,
+            k_groups,
+            target_blocks,
+            min_kgroups_per_cta,
+            max_kb,
+        ):
+            kb = max(2, (target_blocks + grid_n - 1) // grid_n)
+            kb_max = max(2, k_groups // min_kgroups_per_cta)
+            kb = min(kb, kb_max)
+            if k_groups % kb:
+                lower = next((
+                    kb - distance
+                    for distance in range(1, kb)
+                    if kb - distance >= 2
+                    and k_groups % (kb - distance) == 0
+                ), -1)
+                upper = next((
+                    kb + distance
+                    for distance in range(1, kb_max - kb + 1)
+                    if k_groups % (kb + distance) == 0
+                ), -1)
+                if lower > 0 and upper > 0:
+                    lower_distance = abs(grid_n * lower - target_blocks)
+                    upper_distance = abs(grid_n * upper - target_blocks)
+                    kb = upper if upper_distance < lower_distance else lower
+                elif lower > 0:
+                    kb = lower
+                elif upper > 0:
+                    kb = upper
+            return min(max_kb, k_groups, max(1, kb))
+
+        for grid_n in (1, 2, 3, 7, 16, 65):
+            for k_groups in (
+                1, 2, 3, 17, 31, 32, 33, 64, 83, 128, 152, 160, 161,
+                256, 512, 1792,
+            ):
+                for target_blocks in range(1, 161):
+                    for minimum in (1, 2, 4, 8):
+                        arguments = {
+                            "grid_n": grid_n,
+                            "k_groups": k_groups,
+                            "target_blocks": target_blocks,
+                            "min_kgroups_per_cta": minimum,
+                            "max_kb": 256,
+                        }
+                        self.assertEqual(
+                            _nearest_factor_kb(**arguments),
+                            brute_force(**arguments),
+                            arguments,
+                        )
+
+    def test_strict_csv_rows_are_validated_once_before_corpus_indexing(self) -> None:
+        """Immutable ownership transfer must avoid duplicate schema validation."""
+
+        row = observation()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "observations.csv"
+            write_observation_csv(path, (row,))
+            original_validate = NativeVNNIObservation.validate
+            validated = []
+
+            def counted_validate(instance) -> None:
+                validated.append(instance.candidate_id)
+                original_validate(instance)
+
+            with mock.patch.object(
+                NativeVNNIObservation,
+                "validate",
+                counted_validate,
+            ):
+                corpus = read_observation_csv((path,))
+
+        self.assertEqual(len(corpus), 1)
+        self.assertEqual(validated, [row.candidate_id])
+
+    def test_observation_digest_is_memoized_without_changing_canonical_bytes(self) -> None:
+        """Repeated profiler joins must reuse the exact historical row digest."""
+
+        row = observation()
+        canonical_before = row.canonical_mapping()
+        with mock.patch(
+            "native_vnni_dispatch.schema.hashlib.sha256",
+            wraps=hashlib.sha256,
+        ) as sha256:
+            first = row.digest()
+            second = row.digest()
+
+        self.assertEqual(first, second)
+        self.assertEqual(sha256.call_count, 1)
+        self.assertEqual(row.canonical_mapping(), canonical_before)
+        self.assertNotIn("_cached_digest", row.canonical_mapping())
+
+    def test_parallel_observation_writer_is_byte_identical_to_serial(self) -> None:
+        """Parallel checkpoint emission must preserve canonical row ordering."""
+
+        rows = tuple(
+            observation(
+                candidate=f"candidate.{index}",
+                family=f"family-{index % 2}",
+                shape_group=f"shape-{index}",
+                n=128 + index * 16,
+                k=1024 + index * 32,
+                m=1 + index,
+            )
+            for index in range(7)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            serial_path = Path(temporary) / "serial.csv"
+            parallel_path = Path(temporary) / "parallel.csv"
+            write_observation_csv(
+                serial_path,
+                rows,
+                workers=1,
+                parallel_threshold=1,
+            )
+            write_observation_csv(
+                parallel_path,
+                rows,
+                workers=3,
+                parallel_threshold=1,
+            )
+            self.assertEqual(
+                parallel_path.read_bytes(),
+                serial_path.read_bytes(),
+            )
+            self.assertEqual(
+                tuple(read_observation_csv((parallel_path,))),
+                rows,
+            )
+
+    def test_validated_csv_handoff_still_rejects_candidate_identity_drift(self) -> None:
+        """Skipping repeat row checks cannot skip cross-row identity checks."""
+
+        first = observation()
+        changed = dataclasses.replace(first, candidate_family="changed-family")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "identity-drift.csv"
+            write_observation_csv(path, (first, changed))
+            with self.assertRaisesRegex(
+                ValueError, "candidate identity changed"
+            ):
+                read_observation_csv((path,))
+
+    def test_cv_folds_withhold_geometry_aliases_in_coherent_regions(self) -> None:
+        """CV must not train on an alias or neighbor of held-out geometry."""
+
+        exemplar = observation(
+            backend=Backend.CUDA,
+            contract=SemanticContract.FAST,
+            mode=ExecutionMode.EAGER,
+            m=1,
+            n=128,
+            k=32,
+        )
+        domain = generic_domain(exemplar)
+        exemplar_key = runtime_key(exemplar)
+        costs = []
+        groups_by_geometry = {}
+        for k in (32, 4096):
+            for point_index in range(10):
+                n = 128 + point_index * 32
+                geometry = (n, k)
+                groups = (
+                    f"shape-{n}x{k}-primary",
+                    f"shape-{n}x{k}-alias",
+                )
+                groups_by_geometry[geometry] = frozenset(groups)
+                key = dataclasses.replace(
+                    exemplar_key,
+                    projection_n_vector=(n,),
+                    aggregate_n=n,
+                    k=k,
+                )
+                costs.extend(
+                    segmented_policy.CandidatePointCost(
+                        runtime_key=key,
+                        shape_group_id=group,
+                        candidate_id="candidate.a",
+                        max_surface_regret=0.0,
+                        p95_surface_regret=0.0,
+                        mean_surface_regret=0.0,
+                    )
+                    for group in groups
+                )
+
+        folds = segmented_policy._domain_folds(
+            domain,
+            costs,
+            seed="unit-coherent-regions",
+        )
+        self.assertEqual(len(folds), 5)
+        all_groups = set().union(*folds)
+        self.assertEqual(len(all_groups), sum(map(len, folds)))
+        self.assertEqual(
+            all_groups,
+            {
+                group
+                for groups in groups_by_geometry.values()
+                for group in groups
+            },
+        )
+        fold_by_group = {
+            group: fold_index
+            for fold_index, fold in enumerate(folds)
+            for group in fold
+        }
+        for groups in groups_by_geometry.values():
+            self.assertEqual(
+                {fold_by_group[group] for group in groups},
+                {fold_by_group[next(iter(groups))]},
+            )
+
+        k_by_group = {
+            group: k
+            for (_n, k), groups in groups_by_geometry.items()
+            for group in groups
+        }
+        self.assertTrue(all(
+            len({k_by_group[group] for group in fold}) == 1
+            for fold in folds
+        ))
+
+    def test_leaf_primary_pruning_is_exact_and_skips_dominated_percentiles(
+        self,
+    ) -> None:
+        """Dominated candidates cannot reach later lexicographic score keys."""
+
+        candidates = {
+            "candidate.a": (0.10, 0.02, 0.00, 0.00, 0.00),
+            "candidate.b": (0.10, 0.01, 0.01, 0.00, 0.00),
+            "candidate.dominated": (0.20, 0.00, 0.00, 0.00, 0.00),
+        }
+        costs = []
+        for point_index in range(5):
+            n = 128 + point_index * 32
+            key = RuntimeKey(
+                backend=Backend.CUDA,
+                architecture_class="unit-sm",
+                semantic_contract=SemanticContract.FAST,
+                operation_kind="NativeVNNIDecodeProjection",
+                bundle_signature="unit-single-projection",
+                projection_n_vector=(n,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=0,
+                execution_mode=ExecutionMode.EAGER,
+                m=1,
+                aggregate_n=n,
+                k=256,
+            )
+            for candidate, regrets in candidates.items():
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"shape-{point_index}",
+                    candidate_id=candidate,
+                    max_surface_regret=regrets[point_index],
+                    p95_surface_regret=regrets[point_index],
+                    mean_surface_regret=regrets[point_index],
+                ))
+
+        matrix = segmented_policy._point_matrix(costs)
+        points = tuple(sorted(
+            matrix,
+            key=lambda point: (
+                point[0].aggregate_n,
+                point[0].k,
+                point[1],
+            ),
+        ))
+        exhaustive = []
+        for candidate in sorted(candidates):
+            rows = [matrix[point][candidate] for point in points]
+            regrets = tuple(row.max_surface_regret for row in rows)
+            measured_p95 = segmented_policy._percentile(
+                (row.p95_surface_regret for row in rows), 0.95
+            )
+            exhaustive.append((
+                int(measured_p95 >= P95_REGRET_BUDGET),
+                segmented_policy._percentile(regrets, 0.95),
+                statistics.fmean(regrets),
+                measured_p95,
+                statistics.fmean(row.mean_surface_regret for row in rows),
+                sum(
+                    row.max_surface_regret >= P95_REGRET_BUDGET
+                    for row in rows
+                ),
+                max(row.max_surface_regret for row in rows),
+                candidate,
+                regrets,
+            ))
+        expected = min(exhaustive, key=lambda item: item[:8])
+
+        with mock.patch.object(
+            segmented_policy,
+            "_percentile",
+            wraps=segmented_policy._percentile,
+        ) as percentile:
+            fitted = segmented_policy._best_leaf(points, matrix)
+
+        self.assertIsNotNone(fitted)
+        self.assertEqual(fitted.root.candidate_id, expected[7])
+        self.assertEqual(fitted.regrets, expected[8])
+        # Every candidate needs the two exact primary percentiles. Only the two
+        # primary survivors reach the complete measured diagnostic score.
+        self.assertEqual(percentile.call_count, 10)
+
+    def test_batched_primary_scorer_preserves_complete_tree_sequence(self) -> None:
+        """GPU plumbing may batch primary keys but cannot change fitted trees."""
+
+        costs = []
+        for point_index, n in enumerate(
+            (128, 160, 192, 224, 288, 320, 352, 384)
+        ):
+            key = RuntimeKey(
+                backend=Backend.CUDA,
+                architecture_class="unit-sm",
+                semantic_contract=SemanticContract.FAST,
+                operation_kind="NativeVNNIDecodeProjection",
+                bundle_signature="unit-single-projection",
+                projection_n_vector=(n,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=0,
+                execution_mode=ExecutionMode.EAGER,
+                m=1,
+                aggregate_n=n,
+                k=2048,
+            )
+            lower = point_index < 4
+            for candidate, regret in (
+                ("candidate.low", 0.0 if lower else 0.40),
+                ("candidate.high", 0.40 if lower else 0.0),
+                ("candidate.middle", 0.12),
+            ):
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"accelerated-shape-{point_index}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        expected = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=3,
+            min_shape_groups_per_leaf=2,
+        )
+        matrix = segmented_policy._point_matrix(costs)
+        ordered_points = tuple(sorted(
+            matrix,
+            key=lambda point: (
+                point[0].aggregate_n,
+                point[0].k,
+                point[1],
+            ),
+        ))
+        candidates = tuple(sorted({
+            cost.candidate_id for cost in costs
+        }))
+
+        def encode(fit):
+            leaf_masks = []
+            candidate_indices = []
+            structure = []
+            split_thresholds = []
+
+            def visit(node):
+                if isinstance(node, segmented_policy._LeafNode):
+                    structure.append(0)
+                    split_thresholds.append(None)
+                    leaf_masks.append(node.point_mask)
+                    candidate_indices.append(candidates.index(node.candidate_id))
+                    return
+                structure.append(1)
+                split_thresholds.append(
+                    segmented_policy._accelerated_threshold_descriptor(
+                        node.threshold
+                    )
+                )
+                visit(node.left)
+                visit(node.right)
+
+            visit(fit.root)
+            return segmented_policy.AcceleratedTreeFitResult(
+                tuple(leaf_masks),
+                tuple(candidate_indices),
+                tuple(structure),
+                tuple(split_thresholds),
+            )
+
+        class ExactFakeTreeScorer:
+            """Publish the CPU oracle through the compact device result ABI."""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fit_tree_budgets(self, *args, **kwargs):
+                self.calls += 1
+                self.point_count = kwargs["point_count"]
+                self.feature_axes = kwargs["feature_axes"]
+                return tuple(encode(fit) for fit in expected)
+
+        scorer = ExactFakeTreeScorer()
+        actual = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=3,
+            min_shape_groups_per_leaf=2,
+            primary_scorer=scorer,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(scorer.calls, 1)
+        self.assertEqual(scorer.point_count, len(ordered_points))
+        self.assertEqual(
+            len(scorer.feature_axes),
+            len(segmented_policy.FEATURE_AXES_BY_POLICY[
+                segmented_policy.FeaturePolicy.CONTINUOUS
+            ]),
+        )
+
+        def leaf_nodes(root):
+            if isinstance(root, segmented_policy._LeafNode):
+                return (root,)
+            return (*leaf_nodes(root.left), *leaf_nodes(root.right))
+
+        for fit in actual:
+            masks = 0
+            for leaf in leaf_nodes(fit.root):
+                self.assertEqual(masks & leaf.point_mask, 0)
+                masks |= leaf.point_mask
+                self.assertEqual(
+                    leaf.points,
+                    tuple(
+                        point
+                        for index, point in enumerate(ordered_points)
+                        if leaf.point_mask & (1 << index)
+                    ),
+                )
+            self.assertEqual(masks, (1 << len(ordered_points)) - 1)
+
+    def test_grouped_cv_uses_fused_accelerator_evaluation_contract(self) -> None:
+        """Accelerated CV must consume compact decisions, never temporary trees."""
+
+        heldout_groups = frozenset(("fused-unit-2", "fused-unit-7"))
+        costs = []
+        for point_index in range(10):
+            n = 128 + point_index * 64
+            key = RuntimeKey(
+                backend=Backend.CPU,
+                architecture_class="unit|threads=28",
+                semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                operation_kind="NativeVNNIPrefillProjection",
+                bundle_signature="unit-fused-contract",
+                projection_n_vector=(n,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=0,
+                execution_mode=ExecutionMode.EAGER,
+                m=64,
+                aggregate_n=n,
+                k=1024,
+            )
+            for candidate, regret in (
+                ("candidate.alpha", 0.01),
+                ("candidate.beta", 0.04),
+            ):
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"fused-unit-{point_index}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        domain = GenericDomain(
+            backend=Backend.CPU,
+            architecture_class="unit|threads=28",
+            semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            operation_kind="NativeVNNIPrefillProjection",
+            bundle_signature="unit-fused-contract",
+            prepared_family_id="unit-prepared",
+            packing_abi="unit-packing",
+            runtime_codebook_id=0,
+            execution_mode=ExecutionMode.EAGER,
+            m=64,
+            aspect_bucket=AspectBucket.BALANCED,
+            all_aspects=True,
+        )
+        arguments = (
+            domain,
+            0,
+            heldout_groups,
+            FeaturePolicy.FULL_ROW_GRID_LAUNCH_GEOMETRY,
+            BoundaryPlacement.MIDPOINT,
+            segmented_policy.ProfilerInfluence.MEASURED_ONLY,
+            costs,
+            3,
+            2,
+        )
+        expected = segmented_policy._evaluate_placement_fold(arguments)
+
+        class FusedOnlyScorer:
+            """Expose only the compact ABI so tree-download use fails loudly."""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fit_tree_budgets_and_evaluate(self, *args, **kwargs):
+                self.calls += 1
+                heldout_count = len(kwargs["heldout_aggregate_n"])
+                self.feature_axes = kwargs["feature_axes"]
+                return tuple(
+                    segmented_policy.AcceleratedFoldEvaluation(
+                        selected_candidate_indices=(0,) * heldout_count,
+                        exact_candidate_indices=(0,) * heldout_count,
+                        covered_point_count=heldout_count,
+                        required_point_count=heldout_count,
+                    )
+                    for _ in range(kwargs["max_leaves"])
+                )
+
+        scorer = FusedOnlyScorer()
+        actual = segmented_policy._evaluate_placement_fold(arguments, scorer)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(scorer.calls, 1)
+        self.assertTrue(scorer.feature_axes)
+        self.assertTrue(all(
+            isinstance(
+                descriptor.operation,
+                segmented_policy.TreeThresholdOperation,
+            )
+            for descriptor in scorer.feature_axes
+        ))
+
+    def test_full_launch_geometry_policies_are_monotonic(self) -> None:
+        """Row-grid features extend rather than replace the proven N model."""
+
+        n_only_axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.FULL_LAUNCH_GEOMETRY
+        ]
+        row_grid_axes = segmented_policy.FEATURE_AXES_BY_POLICY[
+            FeaturePolicy.FULL_ROW_GRID_LAUNCH_GEOMETRY
+        ]
+        row_grid_only_axes = (
+            set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+        )
+
+        self.assertEqual(tuple(dict.fromkeys(n_only_axes)), n_only_axes)
+        self.assertEqual(tuple(dict.fromkeys(row_grid_axes)), row_grid_axes)
+        self.assertEqual(set(n_only_axes), set(FeatureAxis) - row_grid_only_axes)
+        self.assertEqual(set(row_grid_axes), set(FeatureAxis))
+        self.assertLessEqual(len(row_grid_axes), 64)
+
+    def test_tree_beam_prioritizes_segment_p95_over_failure_count(self) -> None:
+        """The same percentile used by installation must own beam ranking."""
+
+        costs = []
+        for point_index, n in enumerate((128, 256, 384, 512, 640)):
+            key = RuntimeKey(
+                backend=Backend.CPU,
+                architecture_class="unit-avx2",
+                semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                operation_kind="NativeVNNIPrefillProjection",
+                bundle_signature="unit-single-projection",
+                projection_n_vector=(n,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=0,
+                execution_mode=ExecutionMode.EAGER,
+                m=64,
+                aggregate_n=n,
+                k=2048,
+            )
+            for candidate, regret in (
+                ("candidate.one-outlier", 0.40 if point_index == 0 else 0.0),
+                ("candidate.four-failures", 0.06 if point_index < 4 else 0.0),
+            ):
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"multi-cliff-{point_index}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        fit = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=1,
+            min_shape_groups_per_leaf=2,
+        )[0]
+
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit.root.candidate_id, "candidate.four-failures")
+        self.assertEqual(fit.primary_objective, (1, 0.06))
+
+    def test_measured_leaf_p95_gate_precedes_maximum_surface_regret(self) -> None:
+        """A p95-safe candidate cannot lose to a low-maximum failing leaf.
+
+        This is the natural shape of the round-9 final-fit defect. The safe
+        candidate has one expensive source alias at every geometry but remains
+        below budget at p95. The other candidate has a lower maximum yet misses
+        the installation p95 at every geometry. Maximum-first fitting selected
+        the latter and only discovered the rejection after final rule emission.
+        """
+
+        costs = []
+        for point_index, n in enumerate((128, 160, 192, 224, 256, 288)):
+            key = RuntimeKey(
+                backend=Backend.CPU,
+                architecture_class="unit-avx2",
+                semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                operation_kind="NativeVNNIPrefillProjection",
+                bundle_signature="unit-single-projection",
+                projection_n_vector=(n,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=6,
+                execution_mode=ExecutionMode.EAGER,
+                m=64,
+                aggregate_n=n,
+                k=512,
+            )
+            for candidate, maximum, p95, mean in (
+                ("candidate.p95-safe", 0.10, 0.01, 0.02),
+                ("candidate.low-max-failing", 0.06, 0.06, 0.06),
+            ):
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"surface-p95-{point_index}",
+                    candidate_id=candidate,
+                    max_surface_regret=maximum,
+                    p95_surface_regret=p95,
+                    mean_surface_regret=mean,
+                ))
+
+        fit = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=1,
+            min_shape_groups_per_leaf=2,
+        )[0]
+
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit.root.candidate_id, "candidate.p95-safe")
+        self.assertEqual(fit.root.p95_regret, 0.01)
+        self.assertEqual(fit.root.measured_max_regret, 0.10)
+        self.assertEqual(fit.primary_objective[0], 0)
+
+    def test_tree_prefers_every_p95_safe_leaf_over_lower_global_max(self) -> None:
+        """Final-fit search must optimize the gate applied to emitted leaves.
+
+        A cut after three shapes produces a superficially attractive tree with
+        one 4% miss and a lower global maximum, but that three-shape leaf fails
+        p95. A balanced cut leaves one 10% diagnostic outlier among twenty
+        shapes and therefore passes nearest-rank p95 in both leaves. The former
+        count-then-maximum objective selected the rejected two-shape tree.
+        """
+
+        costs = []
+        for point_index in range(40):
+            n = 128 + point_index * 32
+            key = RuntimeKey(
+                backend=Backend.CPU,
+                architecture_class="unit-avx2",
+                semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                operation_kind="NativeVNNIPrefillProjection",
+                bundle_signature="unit-single-projection",
+                projection_n_vector=(n,),
+                prepared_family_id="unit-prepared",
+                packing_abi="unit-packing",
+                runtime_codebook_id=6,
+                execution_mode=ExecutionMode.EAGER,
+                m=64,
+                aggregate_n=n,
+                k=512,
+            )
+            candidate_regrets = {
+                "candidate.small-left": (
+                    0.06 if point_index == 0
+                    else 0.0 if point_index < 3
+                    else 0.50
+                ),
+                "candidate.large-right": (
+                    0.06 if point_index < 3 else 0.0
+                ),
+                "candidate.balanced-left": (
+                    0.10 if point_index == 0
+                    else 0.0 if point_index < 20
+                    else 0.50
+                ),
+            }
+            for candidate, regret in candidate_regrets.items():
+                costs.append(segmented_policy.CandidatePointCost(
+                    runtime_key=key,
+                    shape_group_id=f"leaf-gate-{point_index:02d}",
+                    candidate_id=candidate,
+                    max_surface_regret=regret,
+                    p95_surface_regret=regret,
+                    mean_surface_regret=regret,
+                ))
+
+        fit = segmented_policy._fit_tree_budgets(
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+        )[-1]
+
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit.leaf_count, 2)
+        self.assertEqual(fit.root.failed_leaf_count, 0)
+        self.assertLess(fit.root.worst_leaf_p95_regret, P95_REGRET_BUDGET)
+        self.assertIsInstance(fit.root, segmented_policy._SplitNode)
+        self.assertTrue(fit.root.threshold.matches_less_equal(736, 512))
+        self.assertFalse(fit.root.threshold.matches_less_equal(768, 512))
+
+    def test_leaf_capacity_experiment_does_not_change_production_default(self) -> None:
+        """Permit a reviewed 32-leaf study while defaulting production to 16."""
+
+        self.assertEqual(segmented_policy.DEFAULT_TREE_LEAVES, 16)
+        self.assertEqual(segmented_policy.MAX_TREE_LEAVES, 32)
+        self.assertEqual(
+            len(segmented_policy._fit_tree_budgets(
+                [],
+                max_leaves=32,
+                min_shape_groups_per_leaf=2,
+            )),
+            32,
+        )
+        with self.assertRaisesRegex(ValueError, "32 leaves"):
+            segmented_policy._fit_tree_budgets(
+                [],
+                max_leaves=33,
+                min_shape_groups_per_leaf=2,
+            )
+
     """Prove numerical filtering, robust regret, and sealed policy behavior."""
 
     def test_registry_matches_full_quantized_inventory_and_q8_alias_semantics(self) -> None:
@@ -220,13 +1426,58 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
     def test_candidate_registries_are_explicit_complete_and_digestible(self) -> None:
         rocm_moe = rocm_moe_grouped_prefill_registry()
         rocm_decode = rocm_native_vnni_decode_registry()
+        cpu_decode = cpu_native_vnni_decode_registry()
         cpu = cpu_native_vnni_verifier_registry()
+        cpu_prefill = cpu_native_vnni_prefill_registry()
         cuda = cuda_native_vnni_gemv_registry()
 
         self.assertEqual(len(rocm_moe.entries), 12)
         self.assertEqual(len(rocm_decode.entries), 65)
+        self.assertEqual(len(cpu_decode.entries), 5)
         self.assertEqual(len(cpu.entries), 2)
-        self.assertEqual(len(cuda.entries), 1801)
+        self.assertEqual(len(cpu_prefill.entries), 13)
+        self.assertEqual(
+            cpu_prefill.entries[0].candidate_id,
+            "cpu.nvnni.prefill.row_chunk_grid.full_k",
+        )
+        self.assertEqual(
+            {entry.config_json["k_tile_policy"] for entry in cpu_prefill.entries},
+            {"full_k", "inherit_serial_m1"},
+        )
+        self.assertEqual(
+            sum(
+                entry.config_json.get("route") == "two_row_pair_grid"
+                for entry in cpu_prefill.entries
+            ),
+            5,
+        )
+        self.assertEqual(len(cuda.entries), 4489)
+        self.assertEqual(
+            {
+                entry.config_json["n_block_chunks"]
+                for entry in cpu_decode.entries
+            },
+            {1, 2, 4, 8, 16},
+        )
+        self.assertEqual(
+            {
+                entry.config_json["k_partition_policy"]
+                for entry in cpu_decode.entries
+            },
+            {"frozen_serial_m1"},
+        )
+        self.assertTrue(all(
+            entry.supports_contract(SemanticContract.FAST)
+            for entry in cpu_decode.entries
+        ))
+        self.assertEqual(
+            sum(
+                entry.config_json.get("formula_kind")
+                == "canonical_target_blocks"
+                for entry in cuda.entries
+            ),
+            1120,
+        )
         self.assertTrue(candidate_registry_digest().startswith("sha256:"))
         with self.assertRaisesRegex(ValueError, "not an explicit candidate"):
             rocm_decode.resolve("AUTO")
@@ -265,6 +1516,88 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertFalse(cuda_verifier.uses_atomic_reduction)
         with self.assertRaisesRegex(ValueError, "unknown forceable candidate"):
             cuda.resolve("cuda.nvnni.kpar.tn256.cpt4.tw8.mkg4.kb4.phase2")
+
+        occupancy = cuda.resolve(
+            "cuda.nvnni.decode.fast_m1.kpar_formula."
+            "tn128.cpt1.tb328.mkg1"
+        )
+        canonical_occupancy = cuda.resolve(
+            "cuda.nvnni.decode.fast_m1.kpar_formula."
+            "tn128.cpt1.ctb328.mkg1"
+        )
+        groups_per_partition = cuda.resolve(
+            "cuda.nvnni.decode.fast_m1.kpar_formula."
+            "tn128.cpt1.bpp4"
+        )
+        self.assertEqual(resolve_cuda_formula_kb(occupancy, 192, 256), 8)
+        # K/32=83 is prime. The legacy even-split formula jumps to KB83,
+        # while the canonical uneven-width candidate retains the desired
+        # five K groups per partition and resolves to economical KB17.
+        self.assertEqual(resolve_cuda_formula_kb(occupancy, 2400, 2656), 83)
+        self.assertEqual(
+            resolve_cuda_formula_kb(canonical_occupancy, 2400, 2656),
+            17,
+        )
+        self.assertEqual(
+            resolve_cuda_formula_kb(groups_per_partition, 192, 256),
+            2,
+        )
+
+    def test_shape_resolved_cuda_evidence_remains_concrete_for_exact_policy(self) -> None:
+        """Formula evidence may train generic rules but cannot replace exact routes."""
+
+        concrete_id = "cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb8"
+        concrete = dataclasses.replace(
+            observation(
+                candidate=concrete_id,
+                family="cuda_public_m1_kpar",
+                n=192,
+                k=256,
+                m=1,
+                mode=ExecutionMode.GRAPH_CAPTURED,
+                contract=SemanticContract.FAST,
+            ),
+            backend=Backend.CUDA,
+            prepared_family_id=format_spec("Q4_0").prepared_family("cuda"),
+            packing_abi=format_spec("Q4_0").packing_abi("cuda"),
+            runtime_codebook_id=format_spec("Q4_0").runtime_codebook("cuda"),
+            observed_candidate_id=concrete_id,
+            config_json={
+                "family": "kpar",
+                "tile_n": 128,
+                "cpt": 1,
+                "exact_kb": 8,
+            },
+        )
+        projected = project_cuda_shape_resolved_candidates(
+            ObservationCorpus((concrete,))
+        )
+        for projected_row in projected:
+            projected_row.validate()
+        formula_id = (
+            "cuda.nvnni.decode.fast_m1.kpar_formula."
+            "tn128.cpt1.tb328.mkg1"
+        )
+        formulas = [row for row in projected if row.candidate_id == formula_id]
+
+        self.assertEqual(len(formulas), 1)
+        self.assertEqual(formulas[0].effective_candidate_id, concrete_id)
+        self.assertEqual(formulas[0].observed_candidate_id, concrete_id)
+        self.assertEqual(
+            formulas[0].timing_sample_hash,
+            concrete.timing_sample_hash,
+        )
+        exact = build_exact_winners(projected)
+        self.assertEqual(next(iter(exact.values())).candidate_id, concrete_id)
+        costs = build_candidate_point_costs(projected)
+        generic_candidates = {
+            cost.candidate_id for rows in costs.values() for cost in rows
+        }
+        self.assertIn(
+            formula_id,
+            generic_candidates,
+        )
+        self.assertNotIn(concrete_id, generic_candidates)
 
     @staticmethod
     def rocm_moe_raw_row(**overrides) -> dict[str, str]:
@@ -430,6 +1763,21 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "AUTO"):
             dataclasses.replace(observation(), candidate_id="AUTO").validate()
 
+    def test_current_learner_accepts_v8_measurements_but_rejects_unknown_versions(
+        self,
+    ) -> None:
+        """Search evolution may reuse immutable evidence, not unknown schemas."""
+
+        dataclasses.replace(
+            observation(),
+            learner_version="native-vnni-bounded-tree-beam-regret-v8",
+        ).validate()
+        with self.assertRaisesRegex(ValueError, "accepted observation versions"):
+            dataclasses.replace(
+                observation(),
+                learner_version="native-vnni-bounded-tree-beam-regret-v7",
+            ).validate()
+
     def test_one_ulp_candidate_is_ineligible_despite_perfect_diagnostics(self) -> None:
         one_ulp = observation(
             candidate="candidate.one_ulp",
@@ -464,6 +1812,45 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(winner.candidate_id, "candidate.compromise")
         self.assertAlmostEqual(winner.max_surface_regret, 0.2)
 
+    def test_eager_and_graph_captured_modes_publish_independent_exact_winners(self) -> None:
+        """Policy ABI v2 must retain launch-mode-specific economical schedules."""
+
+        rows = ObservationCorpus([
+            observation(
+                candidate="candidate.eager",
+                mode=ExecutionMode.EAGER,
+                latency_us=1.0,
+            ),
+            observation(
+                candidate="candidate.captured",
+                mode=ExecutionMode.EAGER,
+                latency_us=2.0,
+            ),
+            observation(
+                candidate="candidate.eager",
+                mode=ExecutionMode.GRAPH_CAPTURED,
+                latency_us=4.0,
+            ),
+            observation(
+                candidate="candidate.captured",
+                mode=ExecutionMode.GRAPH_CAPTURED,
+                latency_us=1.0,
+            ),
+        ])
+
+        winners = build_exact_winners(rows)
+
+        self.assertEqual(len(winners), 2)
+        by_mode = {key.execution_mode: winner for key, winner in winners.items()}
+        self.assertEqual(
+            by_mode[ExecutionMode.EAGER].candidate_id,
+            "candidate.eager",
+        )
+        self.assertEqual(
+            by_mode[ExecutionMode.GRAPH_CAPTURED].candidate_id,
+            "candidate.captured",
+        )
+
     def test_missing_alias_surface_cannot_win_or_quietly_fallback(self) -> None:
         rows = candidate_rows_for_aliases(
             "candidate.partial", {"Q4_1": 1.0}
@@ -479,24 +1866,32 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 current_serial_m1_hash=SERIAL_HASH,
             )
 
-    def test_regret_learner_rejects_high_modal_accuracy_with_one_large_miss(self) -> None:
+    def test_regret_learner_rejects_more_than_five_percent_large_misses(
+        self,
+    ) -> None:
         rows = []
+        large_miss_indices = {5, 25, 45, 65, 85, 99}
         for index in range(100):
             group = f"shape-{index:03d}"
-            a_latency = 1.0 if index < 97 else 1.40
+            n = 512 + 16 * index
+            a_latency = 1.40 if index in large_miss_indices else 1.0
             rows.append(observation(
                 candidate="candidate.modal",
                 family="modal",
                 shape_group=group,
+                n=n,
+                k=4 * n,
                 latency_us=a_latency,
             ))
             rows.append(observation(
                 candidate="candidate.robust",
                 family="robust",
                 shape_group=group,
+                n=n,
+                k=4 * n,
                 latency_us=1.02,
             ))
-        policy = fit_generic_policy(ObservationCorpus(rows), max_segments=1)
+        policy = fit_generic_policy(ObservationCorpus(rows), max_leaves=1)
         self.assertEqual(len(policy.rules), 1)
         self.assertEqual(policy.rules[0].candidate_id, "candidate.robust")
         self.assertLessEqual(policy.rules[0].development_max_regret, 0.02 + 1.0e-12)
@@ -505,29 +1900,39 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         rows = []
         for index in range(8):
             group = f"alternating-{index}"
+            n = 512 + 32 * index
             rows.extend([
                 observation(
                     candidate="candidate.a",
                     family="a",
                     shape_group=group,
+                    n=n,
+                    k=4 * n,
                     latency_us=1.0 if index % 2 == 0 else 1.02,
                 ),
                 observation(
                     candidate="candidate.b",
                     family="b",
                     shape_group=group,
+                    n=n,
+                    k=4 * n,
                     latency_us=1.02 if index % 2 == 0 else 1.0,
                 ),
                 observation(
                     candidate="candidate.never_exact",
                     family="stable",
                     shape_group=group,
+                    n=n,
+                    k=4 * n,
                     latency_us=1.01,
                 ),
             ])
-        policy = fit_generic_policy(ObservationCorpus(rows), max_segments=1)
+        policy = fit_generic_policy(ObservationCorpus(rows), max_leaves=1)
         self.assertEqual(policy.rules[0].candidate_id, "candidate.never_exact")
-        self.assertLess(policy.rules[0].development_max_regret, 0.03)
+        self.assertLess(
+            policy.rules[0].development_max_regret,
+            P95_REGRET_BUDGET,
+        )
 
     def test_single_shape_domain_remains_exact_only(self) -> None:
         corpus = ObservationCorpus([
@@ -538,10 +1943,304 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertFalse(policy.rules)
         self.assertEqual(len(policy.unpromoted_domains), 1)
 
-    def test_grouped_cv_selects_two_segments_and_uses_midpoint_boundary(self) -> None:
+    def test_failed_cv_domain_remains_explicitly_unpromoted(self) -> None:
+        rows = []
+        for index in range(6):
+            a_is_fast = index < 3
+            n = 512 + 64 * index
+            rows.extend([
+                observation(
+                    candidate="candidate.a",
+                    family="a",
+                    shape_group=f"rejected-cv-{index}",
+                    n=n,
+                    k=4 * n,
+                    latency_us=1.0 if a_is_fast else 2.0,
+                ),
+                observation(
+                    candidate="candidate.b",
+                    family="b",
+                    shape_group=f"rejected-cv-{index}",
+                    n=n,
+                    k=4 * n,
+                    latency_us=2.0 if a_is_fast else 1.0,
+                ),
+            ])
+
+        policy = fit_generic_policy(ObservationCorpus(rows), max_leaves=1)
+
+        self.assertFalse(policy.rules)
+        self.assertEqual(len(policy.unpromoted_domains), 1)
+        self.assertEqual(len(policy.cross_validation), 1)
+        rejected = policy.cross_validation[0]
+        self.assertEqual(rejected.selected_max_leaves, 1)
+        self.assertEqual(rejected.covered_point_count, rejected.required_point_count)
+        self.assertGreater(rejected.max_regret, P95_REGRET_BUDGET)
+        self.assertTrue(rejected.worst_shape_group_id.startswith("rejected-cv-"))
+        self.assertIn(
+            rejected.worst_selected_candidate_id,
+            {"candidate.a", "candidate.b"},
+        )
+        self.assertIn(
+            rejected.worst_exact_candidate_id,
+            {"candidate.a", "candidate.b"},
+        )
+        self.assertNotEqual(
+            rejected.worst_selected_candidate_id,
+            rejected.worst_exact_candidate_id,
+        )
+        self.assertEqual(len(rejected.cells), rejected.required_point_count)
+        self.assertEqual(len(policy.promotion_diagnostics), 1)
+        diagnostic = policy.promotion_diagnostics[0]
+        self.assertEqual(diagnostic.rejection_stage, "cross_validation_p95")
+        self.assertEqual(diagnostic.cv_p95_regret, rejected.p95_regret)
+        self.assertEqual(diagnostic.final_rule_count, 0)
+        self.assertIsNone(diagnostic.final_worst_p95_regret)
+        self.assertIsNone(diagnostic.final_worst_aggregate_n)
+
+        p95_pass = dataclasses.replace(
+            rejected,
+            max_regret=0.50,
+            p95_regret=0.049,
+        )
+        self.assertTrue(
+            segmented_policy.domain_cross_validation_is_promotable(p95_pass)
+        )
+        self.assertFalse(
+            segmented_policy.domain_cross_validation_is_promotable(
+                dataclasses.replace(
+                    p95_pass,
+                    p95_regret=P95_REGRET_BUDGET,
+                )
+            )
+        )
+        worst_cell = max(
+            rejected.cells,
+            key=lambda cell: (
+                cell.observed_broad_regret,
+                cell.shape_group_id,
+                cell.selected_candidate_id,
+            ),
+        )
+        self.assertEqual(
+            worst_cell.shape_group_id,
+            rejected.worst_shape_group_id,
+        )
+        self.assertEqual(
+            worst_cell.selected_candidate_id,
+            rejected.worst_selected_candidate_id,
+        )
+        self.assertEqual(
+            worst_cell.exact_candidate_id,
+            rejected.worst_exact_candidate_id,
+        )
+
+    def test_domain_promotion_quota_is_exactly_ninety_nine_percent(self) -> None:
+        """The corpus gate is inclusive while every domain gate stays strict."""
+
+        self.assertTrue(
+            segmented_policy.domain_promotion_quota_is_satisfied(99, 100)
+        )
+        self.assertTrue(
+            segmented_policy.domain_promotion_quota_is_satisfied(2494, 2501)
+        )
+        self.assertFalse(
+            segmented_policy.domain_promotion_quota_is_satisfied(98, 99)
+        )
+        self.assertFalse(
+            segmented_policy.domain_promotion_quota_is_satisfied(0, 0)
+        )
+        with self.assertRaisesRegex(ValueError, "outside the required domain"):
+            segmented_policy.domain_promotion_quota_is_satisfied(101, 100)
+
+    def test_ninety_nine_percent_policy_keeps_exception_domain_total(self) -> None:
+        """A permitted performance exception must still own a generic tree."""
+
+        rows = []
+        for m in range(1, 101):
+            shape_count = 6 if m == 100 else 3
+            for shape_index in range(shape_count):
+                exception_a_is_fast = shape_index < shape_count // 2
+                rows.extend((
+                    observation(
+                        candidate="candidate.a",
+                        family="a",
+                        shape_group=f"quota-{m}-{shape_index}",
+                        m=m,
+                        n=256 + 64 * shape_index,
+                        latency_us=(
+                            1.0
+                            if m != 100 or exception_a_is_fast
+                            else 2.0
+                        ),
+                    ),
+                    observation(
+                        candidate="candidate.b",
+                        family="b",
+                        shape_group=f"quota-{m}-{shape_index}",
+                        m=m,
+                        n=256 + 64 * shape_index,
+                        latency_us=(
+                            1.10
+                            if m != 100
+                            else (2.0 if exception_a_is_fast else 1.0)
+                        ),
+                    ),
+                ))
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            policy = fit_generic_policy(
+                ObservationCorpus(rows),
+                max_leaves=1,
+            )
+
+        self.assertFalse(policy.unpromoted_domains)
+        self.assertEqual(len(policy.promotion_diagnostics), 1)
+        exception = policy.promotion_diagnostics[0]
+        self.assertEqual(exception.domain.m, 100)
+        self.assertEqual(exception.rejection_stage, "cross_validation_p95")
+        self.assertEqual(len({rule.domain for rule in policy.rules}), 100)
+        self.assertIsNotNone(policy.resolve(exception.domain, 256, 2048))
+
+    def test_final_fit_p95_failure_retains_separate_diagnostic(self) -> None:
+        """A full-development leaf failure must not look like a CV miss."""
+
+        rows = []
+        for index, n in enumerate((256, 320, 384, 448, 512, 576)):
+            rows.extend((
+                observation(
+                    candidate="candidate.a",
+                    family="a",
+                    shape_group=f"final-diagnostic-{index}",
+                    n=n,
+                    latency_us=10.0,
+                ),
+                observation(
+                    candidate="candidate.b",
+                    family="b",
+                    shape_group=f"final-diagnostic-{index}",
+                    n=n,
+                    latency_us=11.0,
+                ),
+            ))
+        original = segmented_policy._fit_final_domain
+
+        def poison_final_p95(task, primary_scorer=None):
+            domain, rules, validation = original(task, primary_scorer)
+            return domain, tuple(
+                dataclasses.replace(
+                    rule,
+                    development_p95_regret=P95_REGRET_BUDGET,
+                    development_max_regret=0.07,
+                )
+                for rule in rules
+            ), validation
+
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ), mock.patch.object(
+            segmented_policy,
+            "_fit_final_domain",
+            side_effect=poison_final_p95,
+        ):
+            policy = fit_generic_policy(
+                ObservationCorpus(rows),
+                max_leaves=1,
+            )
+
+        self.assertFalse(policy.rules)
+        self.assertEqual(len(policy.unpromoted_domains), 1)
+        self.assertEqual(len(policy.promotion_diagnostics), 1)
+        diagnostic = policy.promotion_diagnostics[0]
+        self.assertEqual(diagnostic.rejection_stage, "final_fit_p95")
+        self.assertLess(diagnostic.cv_p95_regret, P95_REGRET_BUDGET)
+        self.assertEqual(diagnostic.final_rule_count, 1)
+        self.assertEqual(
+            diagnostic.final_worst_p95_regret,
+            P95_REGRET_BUDGET,
+        )
+        self.assertEqual(diagnostic.final_worst_max_regret, 0.07)
+        self.assertEqual(
+            diagnostic.final_worst_shape_group_id,
+            "final-diagnostic-5",
+        )
+        self.assertEqual(diagnostic.final_worst_aggregate_n, 576)
+        self.assertEqual(diagnostic.final_worst_k, 2048)
+        self.assertEqual(
+            diagnostic.final_worst_candidate_id,
+            "candidate.a",
+        )
+
+    def test_paired_ratio_corrects_broad_cost_without_absolute_clock_mix(self) -> None:
+        """Development pairing re-anchors a ratio to the same broad surface."""
+
+        rows = [
+            observation(
+                candidate="candidate.selected",
+                family="selected",
+                shape_group="paired-cost-shape",
+                latency_us=11.0,
+            ),
+            observation(
+                candidate="candidate.exact",
+                family="exact",
+                shape_group="paired-cost-shape",
+                latency_us=10.0,
+            ),
+        ]
+        corpus = ObservationCorpus(rows)
+        broad = next(iter(build_candidate_point_costs(corpus).values()))
+        broad_by_candidate = {cost.candidate_id: cost for cost in broad}
+        self.assertAlmostEqual(
+            broad_by_candidate["candidate.selected"].max_surface_regret,
+            0.10,
+        )
+
+        exemplar = rows[0]
+        pair_key = PairedCellKey(
+            backend=exemplar.backend.value,
+            source_format=exemplar.source_format,
+            source_codebook=exemplar.source_codebook_id,
+            execution_codebook=exemplar.runtime_codebook_id,
+            shape=exemplar.shape_name,
+            execution_mode=exemplar.execution_mode.value,
+            m=exemplar.m,
+            n=exemplar.aggregate_n,
+            k=exemplar.k,
+        )
+        paired = paired_timing_comparisons((PairedCellEvidence(
+            key=pair_key,
+            selected_candidate_id="candidate.selected",
+            exact_candidate_id="candidate.exact",
+            selected_latency_us=(9.0,) * 30,
+            exact_latency_us=(10.0,) * 30,
+            selected_first_count=15,
+            exact_first_count=15,
+        ),))
+        corrected = next(iter(build_candidate_point_costs(
+            corpus,
+            paired_comparisons=paired,
+        ).values()))
+        corrected_by_candidate = {
+            cost.candidate_id: cost for cost in corrected
+        }
+        self.assertEqual(
+            corrected_by_candidate["candidate.selected"].max_surface_regret,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            corrected_by_candidate["candidate.exact"].max_surface_regret,
+            1.0 / 0.9 - 1.0,
+        )
+
+    def test_grouped_cv_selects_two_leaves_and_uses_midpoint_boundary(self) -> None:
         rows = []
         lower_ns = (128, 160, 192)
-        upper_ns = (256, 320, 384)
+        upper_ns = (288, 320, 384)
         for index, n in enumerate((*lower_ns, *upper_ns)):
             group = f"cv-shape-{index}"
             lower = n in lower_ns
@@ -562,16 +2261,1203 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 ),
             ])
 
-        policy = fit_generic_policy(ObservationCorpus(rows), max_segments=2)
+        policy = fit_generic_policy(ObservationCorpus(rows), max_leaves=2)
         self.assertEqual(len(policy.rules), 2)
         self.assertEqual(len(policy.cross_validation), 1)
         cv = policy.cross_validation[0]
-        self.assertEqual(cv.selected_max_segments, 2)
+        self.assertEqual(cv.selected_max_leaves, 2)
+        self.assertEqual(
+            cv.selected_boundary_placement,
+            BoundaryPlacement.MIDPOINT,
+        )
+        self.assertEqual(
+            cv.selected_profiler_influence,
+            segmented_policy.ProfilerInfluence.MEASURED_ONLY,
+        )
         self.assertEqual(cv.fold_count, 6)
         self.assertEqual(cv.covered_point_count, cv.required_point_count)
-        expected_boundary = ((192 * 2048) + (256 * 2048)) // 2
-        self.assertEqual(policy.rules[0].max_work_items, expected_boundary)
-        self.assertEqual(policy.rules[1].min_work_items, expected_boundary + 1)
+        self.assertEqual(len(cv.cells), cv.required_point_count)
+        predicates = {
+            predicate
+            for rule in policy.rules
+            for predicate in rule.predicates
+        }
+        self.assertEqual(len(predicates), 2)
+        for predicate in predicates:
+            self.assertEqual(predicate.threshold.axis, FeatureAxis.AGGREGATE_N)
+            self.assertEqual(predicate.threshold.numerator, 240)
+            self.assertEqual(predicate.threshold.denominator, 1)
+        lower = next(rule for rule in policy.rules if rule.matches(192, 2048))
+        upper = next(rule for rule in policy.rules if rule.matches(288, 2048))
+        self.assertEqual(lower.candidate_id, "candidate.low")
+        self.assertEqual(upper.candidate_id, "candidate.high")
+
+    def test_final_publication_tree_distills_out_of_fold_candidates(self) -> None:
+        """Publication boundaries must be learned from non-leaking OOF labels."""
+
+        rows = []
+        for index, n in enumerate((128, 160, 192, 288, 320, 384)):
+            lower = n <= 192
+            rows.extend((
+                observation(
+                    candidate="candidate.low",
+                    family="low",
+                    shape_group=f"publication-oof-{index}",
+                    n=n,
+                    latency_us=10.0 if lower else 14.0,
+                ),
+                observation(
+                    candidate="candidate.high",
+                    family="high",
+                    shape_group=f"publication-oof-{index}",
+                    n=n,
+                    latency_us=14.0 if lower else 10.0,
+                ),
+            ))
+        corpus = ObservationCorpus(rows)
+        domain = corpus.generic_domains()[0]
+        costs = build_candidate_point_costs(corpus)[domain]
+        exact_by_point = {}
+        for cost in costs:
+            point = (cost.runtime_key, cost.shape_group_id)
+            previous = exact_by_point.get(point)
+            if previous is None or cost.max_surface_regret < previous.max_surface_regret:
+                exact_by_point[point] = cost
+        cells = tuple(
+            segmented_policy.CrossValidationCell(
+                runtime_key=key,
+                shape_group_id=shape_group,
+                selected_candidate_id=cost.candidate_id,
+                exact_candidate_id=cost.candidate_id,
+                observed_broad_regret=cost.max_surface_regret,
+            )
+            for (key, shape_group), cost in sorted(exact_by_point.items())
+        )
+        validation = segmented_policy.DomainCrossValidation(
+            domain=domain,
+            selected_feature_policy=FeaturePolicy.CONTINUOUS,
+            selected_max_leaves=2,
+            selected_boundary_placement=BoundaryPlacement.MIDPOINT,
+            selected_profiler_influence=(
+                segmented_policy.ProfilerInfluence.MEASURED_ONLY
+            ),
+            fold_count=6,
+            shape_group_count=6,
+            required_point_count=6,
+            covered_point_count=6,
+            max_regret=0.0,
+            p95_regret=0.0,
+            mean_regret=0.0,
+            worst_shape_group_id=cells[0].shape_group_id,
+            worst_aggregate_n=cells[0].runtime_key.aggregate_n,
+            worst_k=cells[0].runtime_key.k,
+            worst_selected_candidate_id=cells[0].selected_candidate_id,
+            worst_exact_candidate_id=cells[0].exact_candidate_id,
+            cells=cells,
+        )
+
+        rules, fitted_validation = (
+            segmented_policy._fit_cross_fitted_publication_rules(
+                domain,
+                costs,
+                rows,
+                validation,
+                max_leaves=2,
+                min_shape_groups_per_leaf=2,
+            )
+        )
+
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(fitted_validation.publication_oof_p95_regret, 0.0)
+        self.assertEqual(fitted_validation.publication_oof_mismatch_count, 0)
+        self.assertEqual(
+            fitted_validation.publication_boundary_placement,
+            BoundaryPlacement.MIDPOINT,
+        )
+        self.assertEqual(
+            next(rule for rule in rules if rule.matches(192, 2048)).candidate_id,
+            "candidate.low",
+        )
+        self.assertEqual(
+            next(rule for rule in rules if rule.matches(288, 2048)).candidate_id,
+            "candidate.high",
+        )
+
+    def test_grouped_cv_retains_competitive_model_edges_for_one_batch(self) -> None:
+        """The planner sees alternate model misses before the fit discards them."""
+
+        exemplar = observation(
+            backend=Backend.CUDA,
+            contract=SemanticContract.FAST,
+            mode=ExecutionMode.EAGER,
+            m=1,
+            candidate="candidate.exact",
+            shape_group="frontier-shape",
+        )
+        key = runtime_key(exemplar)
+        domain = generic_domain(exemplar)
+
+        def cost(candidate: str, regret: float):
+            return segmented_policy.CandidatePointCost(
+                runtime_key=key,
+                shape_group_id=exemplar.shape_group_id,
+                candidate_id=candidate,
+                max_surface_regret=regret,
+                p95_surface_regret=regret,
+                mean_surface_regret=regret,
+            )
+
+        exact = cost("candidate.exact", 0.0)
+        selected_a = cost("candidate.a", 0.06)
+        selected_b = cost("candidate.b", 0.07)
+
+        def fold_result(feature_policy, selected):
+            return segmented_policy._PlacementFoldResult(
+                domain=domain,
+                fold_index=0,
+                feature_policy=feature_policy,
+                placement=BoundaryPlacement.MIDPOINT,
+                profiler_influence=(
+                    segmented_policy.ProfilerInfluence.MEASURED_ONLY
+                ),
+                complexities=(segmented_policy._ComplexityFoldResult(
+                    complexity=1,
+                    decisions=((selected, exact),),
+                    uncovered=0,
+                    required=1,
+                ),),
+            )
+
+        fold_results = (
+            fold_result(FeaturePolicy.CONTINUOUS, selected_a),
+            fold_result(FeaturePolicy.TILE_32, selected_b),
+        )
+        frontier = segmented_policy._rank_domain_cross_validations(
+            domain,
+            [exact, selected_a, selected_b],
+            1,
+            fold_results,
+            max_leaves=1,
+        )
+        validation = frontier[0]
+
+        self.assertIsNotNone(validation)
+        self.assertEqual(
+            validation.cells[0].selected_candidate_id,
+            "candidate.a",
+        )
+        self.assertEqual(
+            {
+                cell.selected_candidate_id
+                for cell in validation.competitive_cells
+            },
+            {"candidate.a", "candidate.b"},
+        )
+        self.assertTrue(validation.cells)
+        self.assertTrue(all(not item.cells for item in frontier[1:]))
+        self.assertTrue(all(
+            item.competitive_cells == validation.competitive_cells
+            for item in frontier
+        ))
+
+        lean_frontier = segmented_policy._rank_domain_cross_validations(
+            domain,
+            [exact, selected_a, selected_b],
+            1,
+            fold_results,
+            max_leaves=1,
+            retain_model_cells=False,
+        )
+        self.assertTrue(all(not item.cells for item in lean_frontier))
+        self.assertTrue(all(
+            not item.competitive_cells for item in lean_frontier
+        ))
+        hydrated = segmented_policy._hydrate_cross_validation_cells(
+            lean_frontier[0],
+            fold_results,
+        )
+        self.assertEqual(hydrated.cells, validation.cells)
+
+    def test_final_fit_advances_to_next_cv_certified_model(self) -> None:
+        """A one-shot final partition miss must not discard a stable CV model."""
+
+        exemplar = observation(
+            backend=Backend.CPU,
+            contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            mode=ExecutionMode.EAGER,
+            m=64,
+            candidate="candidate.exact",
+            shape_group="final-frontier-shape",
+        )
+        key = runtime_key(exemplar)
+        domain = generic_domain(exemplar)
+
+        def cost(candidate: str, regret: float):
+            return segmented_policy.CandidatePointCost(
+                runtime_key=key,
+                shape_group_id=exemplar.shape_group_id,
+                candidate_id=candidate,
+                max_surface_regret=regret,
+                p95_surface_regret=regret,
+                mean_surface_regret=regret,
+            )
+
+        exact = cost("candidate.exact", 0.0)
+        selected_a = cost("candidate.a", 0.01)
+        selected_b = cost("candidate.b", 0.02)
+
+        def fold_result(feature_policy, selected):
+            return segmented_policy._PlacementFoldResult(
+                domain=domain,
+                fold_index=0,
+                feature_policy=feature_policy,
+                placement=BoundaryPlacement.MIDPOINT,
+                profiler_influence=(
+                    segmented_policy.ProfilerInfluence.MEASURED_ONLY
+                ),
+                complexities=(segmented_policy._ComplexityFoldResult(
+                    complexity=1,
+                    decisions=((selected, exact),),
+                    uncovered=0,
+                    required=1,
+                ),),
+            )
+
+        fold_results = (
+            fold_result(FeaturePolicy.CONTINUOUS, selected_a),
+            fold_result(FeaturePolicy.TILE_32, selected_b),
+        )
+        frontier = segmented_policy._rank_domain_cross_validations(
+            domain,
+            [exact, selected_a, selected_b],
+            1,
+            fold_results,
+            max_leaves=1,
+        )
+        self.assertEqual(
+            tuple(item.selected_feature_policy for item in frontier),
+            (FeaturePolicy.CONTINUOUS, FeaturePolicy.TILE_32),
+        )
+
+        def rule(candidate: str, p95: float):
+            return (GenericDispatchRule(
+                domain=domain,
+                predicates=(),
+                candidate_id=candidate,
+                arithmetic_fingerprint=exemplar.arithmetic_fingerprint,
+                development_shape_groups=(exemplar.shape_group_id,),
+                development_max_regret=max(p95, 0.05),
+                development_p95_regret=p95,
+                development_mean_regret=p95,
+            ),)
+
+        def fit_publication(
+            _domain,
+            _costs,
+            _observations,
+            validation,
+            **_kwargs,
+        ):
+            if validation.selected_feature_policy == FeaturePolicy.CONTINUOUS:
+                return rule("candidate.a", 0.01), dataclasses.replace(
+                    validation,
+                    publication_oof_p95_regret=P95_REGRET_BUDGET,
+                    publication_oof_mean_regret=P95_REGRET_BUDGET,
+                    publication_oof_mismatch_count=1,
+                )
+            return rule("candidate.b", 0.01), dataclasses.replace(
+                validation,
+                publication_oof_p95_regret=0.01,
+                publication_oof_mean_regret=0.01,
+                publication_oof_mismatch_count=0,
+            )
+
+        with mock.patch.object(
+            segmented_policy,
+            "_fit_cross_fitted_publication_rules",
+            side_effect=fit_publication,
+        ) as fit:
+            fitted_domain, rules, selected = segmented_policy._fit_final_domain((
+                domain,
+                [exact, selected_a, selected_b],
+                (exemplar,),
+                frontier,
+                fold_results,
+                1,
+                1,
+            ))
+
+        self.assertEqual(fitted_domain, domain)
+        self.assertEqual(rules[0].candidate_id, "candidate.b")
+        self.assertEqual(selected.selected_feature_policy, FeaturePolicy.TILE_32)
+        self.assertEqual(fit.call_count, 2)
+
+    def test_grouped_cv_selects_profiler_influence_only_when_helpful(self) -> None:
+        """Profiler economics cannot displace a better measured-only model."""
+
+        exemplar = observation(
+            backend=Backend.CUDA,
+            contract=SemanticContract.FAST,
+            mode=ExecutionMode.EAGER,
+            m=1,
+            candidate="candidate.exact",
+            shape_group="profiler-influence-shape",
+        )
+        key = runtime_key(exemplar)
+        domain = generic_domain(exemplar)
+
+        def cost(candidate: str, regret: float):
+            return segmented_policy.CandidatePointCost(
+                runtime_key=key,
+                shape_group_id=exemplar.shape_group_id,
+                candidate_id=candidate,
+                max_surface_regret=regret,
+                p95_surface_regret=regret,
+                mean_surface_regret=regret,
+            )
+
+        exact = cost("candidate.exact", 0.0)
+
+        def select(measured_regret: float, prior_regret: float):
+            measured = cost("candidate.measured", measured_regret)
+            prior = cost("candidate.profiler", prior_regret)
+
+            def result(influence, selected):
+                return segmented_policy._PlacementFoldResult(
+                    domain=domain,
+                    fold_index=0,
+                    feature_policy=FeaturePolicy.CONTINUOUS,
+                    placement=BoundaryPlacement.MIDPOINT,
+                    profiler_influence=influence,
+                    complexities=(segmented_policy._ComplexityFoldResult(
+                        complexity=1,
+                        decisions=((selected, exact),),
+                        uncovered=0,
+                        required=1,
+                    ),),
+                )
+
+            return segmented_policy._select_domain_cross_validation(
+                domain,
+                [exact, measured, prior],
+                1,
+                (
+                    result(
+                        segmented_policy.ProfilerInfluence.MEASURED_ONLY,
+                        measured,
+                    ),
+                    result(
+                        segmented_policy.ProfilerInfluence.BOUNDED_PRIOR,
+                        prior,
+                    ),
+                ),
+                max_leaves=1,
+            )
+
+        harmful = select(0.01, 0.20)
+        helpful = select(0.20, 0.01)
+        self.assertEqual(
+            harmful.selected_profiler_influence,
+            segmented_policy.ProfilerInfluence.MEASURED_ONLY,
+        )
+        self.assertEqual(
+            helpful.selected_profiler_influence,
+            segmented_policy.ProfilerInfluence.BOUNDED_PRIOR,
+        )
+
+    def test_cv_tree_evaluation_matches_flattened_production_rules(self) -> None:
+        """Observation-free CV traversal preserves every leaf decision exactly."""
+
+        rows = []
+        for index, n in enumerate((128, 160, 192, 288, 320, 384)):
+            lower = n <= 192
+            rows.extend([
+                observation(
+                    candidate="candidate.low",
+                    family="low",
+                    shape_group=f"tree-eval-{index}",
+                    n=n,
+                    latency_us=10.0 if lower else 14.0,
+                ),
+                observation(
+                    candidate="candidate.high",
+                    family="high",
+                    shape_group=f"tree-eval-{index}",
+                    n=n,
+                    latency_us=14.0 if lower else 10.0,
+                ),
+            ])
+        corpus = ObservationCorpus(rows)
+        domain = corpus.generic_domains()[0]
+        costs = build_candidate_point_costs(corpus)[domain]
+        fit = segmented_policy._fit_tree(
+            costs,
+            max_leaves=2,
+            min_shape_groups_per_leaf=2,
+            boundary_placement=BoundaryPlacement.MIDPOINT,
+            feature_policy=FeaturePolicy.CONTINUOUS,
+        )
+        exemplars = {row.candidate_id: row for row in rows}
+        rules = segmented_policy._flatten_rules(
+            domain, fit.root, exemplars
+        )
+
+        self.assertEqual(
+            segmented_policy._evaluate_tree(fit.root, costs),
+            segmented_policy._evaluate_rules(rules, costs),
+        )
+
+    def test_parallel_fold_and_reduction_are_identical_to_serial_fit(self) -> None:
+        """Forked fitting and domain reduction may never change policy bytes."""
+
+        rows = []
+        for mode in (
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ):
+            for source_format in ("Q4_0", "Q5_0"):
+                for index, n in enumerate((128, 160, 192, 288, 320, 384)):
+                    lower = n <= 192
+                    for candidate, latency in (
+                        ("candidate.low", 10.0 if lower else 14.0),
+                        ("candidate.high", 14.0 if lower else 10.0),
+                    ):
+                        rows.append(observation(
+                            source_format=source_format,
+                            candidate=candidate,
+                            family=candidate,
+                            shape_group=(
+                                f"parallel-cv-{mode.value}-{source_format}-"
+                                f"{index}"
+                            ),
+                            n=n,
+                            latency_us=latency,
+                            mode=mode,
+                        ))
+        corpus = ObservationCorpus(rows)
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            serial = fit_generic_policy(corpus, max_leaves=2)
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "8"},
+        ):
+            parallel = fit_generic_policy(corpus, max_leaves=2)
+        self.assertEqual(parallel, serial)
+        self.assertTrue(all(
+            validation.cells for validation in serial.cross_validation
+        ))
+        self.assertTrue(all(
+            not validation.competitive_cells
+            for validation in serial.cross_validation
+        ))
+
+    def test_fit_cache_retrains_only_the_domain_touched_by_paired_evidence(self) -> None:
+        """A new tournament edge cannot force unrelated mode domains to refit."""
+
+        rows = []
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for index, n in enumerate((128, 160, 192, 224, 256, 288)):
+                for candidate, latency in (
+                    ("candidate.low", 10.0),
+                    ("candidate.high", 11.0),
+                ):
+                    rows.append(observation(
+                        backend=Backend.CUDA,
+                        contract=SemanticContract.FAST,
+                        m=1,
+                        mode=mode,
+                        candidate=candidate,
+                        family=candidate,
+                        shape_group=f"cache-{mode.value}-{index}",
+                        n=n,
+                        latency_us=latency,
+                    ))
+        corpus = ObservationCorpus(rows)
+        eager_exemplar = next(
+            row
+            for row in rows
+            if row.execution_mode == ExecutionMode.EAGER
+            and row.candidate_id == "candidate.low"
+        )
+        paired_key = PairedCellKey(
+            backend=eager_exemplar.backend.value,
+            source_format=eager_exemplar.source_format,
+            source_codebook=eager_exemplar.source_codebook_id,
+            execution_codebook=eager_exemplar.runtime_codebook_id,
+            shape=eager_exemplar.shape_name,
+            execution_mode=eager_exemplar.execution_mode.value,
+            m=eager_exemplar.m,
+            n=eager_exemplar.aggregate_n,
+            k=eager_exemplar.k,
+        )
+        paired = paired_timing_comparisons((PairedCellEvidence(
+            key=paired_key,
+            selected_candidate_id="candidate.low",
+            exact_candidate_id="candidate.high",
+            selected_latency_us=(9.0,) * 30,
+            exact_latency_us=(10.0,) * 30,
+            selected_first_count=15,
+            exact_first_count=15,
+        ),))
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+            ):
+                def domain_corpus(domain):
+                    return ObservationCorpus._from_validated(
+                        corpus.rows_for_generic_domain(domain)
+                    )
+
+                fit_generic_policy(
+                    corpus,
+                    max_leaves=1,
+                    fit_final_rules=False,
+                    fit_cache=cache,
+                    domain_corpus_provider=domain_corpus,
+                    domain_corpus_digest_provider=lambda domain: (
+                        generic_domain_corpus_digest(corpus, domain)
+                    ),
+                )
+                cost_cache_files = tuple(
+                    (Path(directory) / "candidate-costs").glob("*.json")
+                )
+                self.assertEqual(len(cost_cache_files), 2)
+                for path in cost_cache_files:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    self.assertIn("candidate_ids", payload)
+                    self.assertIn("points", payload)
+                    self.assertNotIn("costs", payload)
+
+                evaluated_domains = []
+                projected_domains = []
+                original = segmented_policy._evaluate_placement_fold
+
+                def record_domain(task, primary_scorer=None):
+                    evaluated_domains.append(task[0])
+                    return original(task, primary_scorer)
+
+                def record_projection(domain):
+                    projected_domains.append(domain)
+                    return domain_corpus(domain)
+
+                with mock.patch.object(
+                    segmented_policy,
+                    "_evaluate_placement_fold",
+                    side_effect=record_domain,
+                ):
+                    paired_fit = fit_generic_policy(
+                        corpus,
+                        paired_comparisons=paired,
+                        max_leaves=1,
+                        fit_final_rules=False,
+                        fit_cache=cache,
+                        domain_corpus_provider=record_projection,
+                        domain_corpus_digest_provider=lambda domain: (
+                            generic_domain_corpus_digest(corpus, domain)
+                        ),
+                    )
+
+                self.assertTrue(evaluated_domains)
+                self.assertEqual(
+                    {domain.execution_mode for domain in evaluated_domains},
+                    {ExecutionMode.EAGER},
+                )
+                self.assertEqual(
+                    {domain.execution_mode for domain in projected_domains},
+                    {ExecutionMode.EAGER},
+                )
+
+                def fail_projection(_domain):
+                    raise AssertionError("cached domain was projected")
+
+                with mock.patch.object(
+                    segmented_policy,
+                    "_evaluate_placement_fold",
+                    side_effect=AssertionError("cached domain was refitted"),
+                ), mock.patch.object(
+                    PolicyFitCache,
+                    "load_costs",
+                    side_effect=AssertionError("cached costs were deserialized"),
+                ):
+                    cached_fit = fit_generic_policy(
+                        corpus,
+                        paired_comparisons=paired,
+                        max_leaves=1,
+                        fit_final_rules=False,
+                        fit_cache=cache,
+                        domain_corpus_provider=fail_projection,
+                        domain_corpus_digest_provider=lambda domain: (
+                            generic_domain_corpus_digest(corpus, domain)
+                        ),
+                    )
+                self.assertEqual(cached_fit, paired_fit)
+
+    def test_fit_cache_publishes_only_the_final_stable_cv_model(self) -> None:
+        """Immutable cache keys cannot first receive a provisional CV winner."""
+
+        rows = []
+        for index, n in enumerate((128, 160, 192, 224, 256, 288)):
+            for candidate, latency in (
+                ("candidate.low", 10.0),
+                ("candidate.high", 11.0),
+            ):
+                rows.append(observation(
+                    backend=Backend.CPU,
+                    contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                    mode=ExecutionMode.EAGER,
+                    m=64,
+                    candidate=candidate,
+                    family=candidate,
+                    shape_group=f"final-cache-{index}",
+                    n=n,
+                    latency_us=latency,
+                ))
+        corpus = ObservationCorpus(rows)
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            baseline = fit_generic_policy(corpus, max_leaves=1)
+        selected = baseline.cross_validation[0]
+        alternate = dataclasses.replace(
+            selected,
+            selected_feature_policy=FeaturePolicy.TILE_32,
+        )
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ), mock.patch.object(
+            segmented_policy,
+            "_rank_domain_cross_validations",
+            return_value=(selected, alternate),
+        ), mock.patch.object(
+            segmented_policy,
+            "_fit_final_domain",
+            return_value=(
+                selected.domain,
+                baseline.rules,
+                alternate,
+            ),
+        ) as final_fit:
+            cache = PolicyFitCache(Path(directory))
+            fitted = fit_generic_policy(
+                corpus,
+                max_leaves=1,
+                fit_cache=cache,
+            )
+
+            cache_files = tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )
+            self.assertEqual(len(cache_files), 1)
+            cached = json.loads(cache_files[0].read_text(encoding="utf-8"))
+
+            final_fit.reset_mock()
+            final_fit.side_effect = AssertionError(
+                "stable final publication tree was refitted"
+            )
+            with mock.patch.object(
+                PolicyFitCache,
+                "load_costs",
+                side_effect=AssertionError(
+                    "stable final publication costs were deserialized"
+                ),
+            ):
+                replay = fit_generic_policy(
+                    corpus,
+                    max_leaves=1,
+                    fit_cache=cache,
+                )
+
+        self.assertEqual(
+            fitted.cross_validation[0].selected_feature_policy,
+            FeaturePolicy.TILE_32,
+        )
+        self.assertEqual(
+            cached["validation"]["selected_feature_policy"],
+            FeaturePolicy.TILE_32.value,
+        )
+        self.assertEqual(len(cached["final_rules"]), len(baseline.rules))
+        self.assertEqual(replay, fitted)
+
+    def test_fit_cache_identity_changes_only_with_its_domain_rows(self) -> None:
+        """Appending targeted evidence must preserve unrelated cache keys."""
+
+        rows = []
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for candidate, latency in (
+                ("candidate.low", 10.0),
+                ("candidate.high", 11.0),
+            ):
+                rows.append(observation(
+                    backend=Backend.CUDA,
+                    contract=SemanticContract.FAST,
+                    mode=mode,
+                    candidate=candidate,
+                    family=candidate,
+                    shape_group=f"domain-digest-{mode.value}",
+                    n=256,
+                    latency_us=latency,
+                ))
+        baseline = ObservationCorpus(rows)
+        extension = [
+            observation(
+                backend=Backend.CUDA,
+                contract=SemanticContract.FAST,
+                mode=ExecutionMode.GRAPH_CAPTURED,
+                candidate=candidate,
+                family=candidate,
+                shape_group="domain-digest-graph-extension",
+                n=320,
+                latency_us=latency,
+            )
+            for candidate, latency in (
+                ("candidate.low", 12.0),
+                ("candidate.high", 10.0),
+            )
+        ]
+        extended = ObservationCorpus((*rows, *extension))
+        domains = {
+            domain.execution_mode: domain
+            for domain in baseline.generic_domains()
+        }
+        cache = PolicyFitCache(Path("unused-domain-cache"))
+
+        eager = domains[ExecutionMode.EAGER]
+        eager_before = generic_domain_corpus_digest(baseline, eager)
+        eager_after = generic_domain_corpus_digest(extended, eager)
+        self.assertEqual(eager_after, eager_before)
+        self.assertEqual(
+            cache.cost_key(
+                eager, eager_before, "sha256:paired", "sha256:serial"
+            ),
+            cache.cost_key(
+                eager, eager_after, "sha256:paired", "sha256:serial"
+            ),
+        )
+
+        graph = domains[ExecutionMode.GRAPH_CAPTURED]
+        graph_before = generic_domain_corpus_digest(baseline, graph)
+        graph_after = generic_domain_corpus_digest(extended, graph)
+        self.assertNotEqual(graph_after, graph_before)
+        self.assertNotEqual(
+            cache.cost_key(
+                graph, graph_before, "sha256:paired", "sha256:serial"
+            ),
+            cache.cost_key(
+                graph, graph_after, "sha256:paired", "sha256:serial"
+            ),
+        )
+
+    def test_fit_cache_domain_digest_ignores_global_corpus_identity(self) -> None:
+        """Aggregate relabeling must neither recompute nor refit one domain."""
+
+        rows = []
+        for point, n in enumerate((256, 320, 384, 448)):
+            for candidate, latency in (
+                ("candidate.low", 10.0),
+                ("candidate.high", 11.0),
+            ):
+                rows.append(observation(
+                    backend=Backend.CUDA,
+                    contract=SemanticContract.FAST,
+                    mode=ExecutionMode.EAGER,
+                    candidate=candidate,
+                    family=candidate,
+                    shape_group=f"corpus-label-cache-{point}",
+                    n=n,
+                    latency_us=latency,
+                ))
+        original = ObservationCorpus(rows)
+        relabeled = ObservationCorpus(
+            dataclasses.replace(
+                row,
+                corpus_id="sha256:larger-additive-aggregate",
+            )
+            for row in rows
+        )
+        domain = original.generic_domains()[0]
+        self.assertEqual(
+            generic_domain_corpus_digest(original, domain),
+            generic_domain_corpus_digest(relabeled, domain),
+        )
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            # Reproduce the aggregate-coupled key written by the first v15
+            # implementation, then prove both migration and future aggregate
+            # relabeling are lookup-only operations.
+            with mock.patch.object(
+                segmented_policy,
+                "generic_domain_corpus_digest",
+                side_effect=segmented_policy._legacy_generic_domain_corpus_digest,
+            ):
+                expected = fit_generic_policy(
+                    original,
+                    max_leaves=1,
+                    fit_cache=cache,
+                )
+
+            with mock.patch.object(
+                segmented_policy,
+                "build_domain_candidate_point_costs",
+                side_effect=AssertionError("legacy costs were recomputed"),
+            ), mock.patch.object(
+                segmented_policy,
+                "_evaluate_placement_fold",
+                side_effect=AssertionError("legacy validation was recomputed"),
+            ):
+                migrated = fit_generic_policy(
+                    original,
+                    max_leaves=1,
+                    fit_cache=cache,
+                )
+                relabeled_fit = fit_generic_policy(
+                    relabeled,
+                    max_leaves=1,
+                    fit_cache=cache,
+                )
+
+            self.assertEqual(migrated, expected)
+            self.assertEqual(relabeled_fit, expected)
+            # A cached final tree makes the candidate matrix unnecessary.
+            # Leave its old generation in place and migrate it lazily only if
+            # a later affected-pool refit actually needs the costs.
+            self.assertEqual(len(tuple(
+                (Path(directory) / "candidate-costs").glob("*.json")
+            )), 1)
+            self.assertEqual(len(tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )), 2)
+
+    def test_fit_cache_serial_hash_identity_is_domain_local(self) -> None:
+        """Changing one domain's serial oracle must not evict another domain."""
+
+        rows = []
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for point, n in enumerate((256, 320, 384)):
+                for candidate, latency in (
+                    ("candidate.low", 10.0),
+                    ("candidate.high", 11.0),
+                ):
+                    rows.append(observation(
+                        backend=Backend.CUDA,
+                        contract=SemanticContract.FAST,
+                        mode=mode,
+                        candidate=candidate,
+                        family=candidate,
+                        shape_group=f"serial-cache-{mode.value}-{point}",
+                        n=n,
+                        latency_us=latency,
+                    ))
+        corpus = ObservationCorpus(rows)
+        hashes = {
+            corpus.runtime_key_for(row): SERIAL_HASH for row in rows
+        }
+        graph_keys = {
+            corpus.runtime_key_for(row)
+            for row in rows
+            if row.execution_mode == ExecutionMode.GRAPH_CAPTURED
+        }
+        changed_hashes = {
+            key: (
+                "sha256:changed-graph-serial"
+                if key in graph_keys
+                else policy_hash
+            )
+            for key, policy_hash in hashes.items()
+        }
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            fit_generic_policy(
+                corpus,
+                serial_m1_hashes=hashes,
+                max_leaves=1,
+                fit_final_rules=False,
+                fit_cache=cache,
+            )
+            initial_costs = len(tuple(
+                (Path(directory) / "candidate-costs").glob("*.json")
+            ))
+            initial_validations = len(tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            ))
+
+            fit_generic_policy(
+                corpus,
+                serial_m1_hashes=changed_hashes,
+                max_leaves=1,
+                fit_final_rules=False,
+                fit_cache=cache,
+            )
+
+            self.assertEqual(initial_costs, 2)
+            self.assertEqual(initial_validations, 2)
+            self.assertEqual(len(tuple(
+                (Path(directory) / "candidate-costs").glob("*.json")
+            )), initial_costs + 1)
+            self.assertEqual(len(tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )), initial_validations + 1)
+
+    def test_fit_cache_cv_identity_includes_profiler_transfer_pool(self) -> None:
+        """Cross-format profiler training changes invalidate dependent CV."""
+
+        domain = generic_domain(observation())
+        cache = PolicyFitCache(Path("unused-profiler-pool-cache"))
+        arguments = {
+            "max_leaves": 4,
+            "min_shape_groups_per_leaf": 2,
+            "cross_validation_seed": "unit-profiler-pool",
+            "profiler_feature_catalog_digest": "sha256:catalog",
+            "fit_final_rules": True,
+        }
+        baseline = cache.validation_key(
+            domain,
+            "cost-key",
+            profiler_training_pool_digest="sha256:pool-a",
+            **arguments,
+        )
+        changed = cache.validation_key(
+            domain,
+            "cost-key",
+            profiler_training_pool_digest="sha256:pool-b",
+            **arguments,
+        )
+        legacy = cache.validation_key(
+            domain,
+            "cost-key",
+            **arguments,
+        )
+
+        self.assertNotEqual(changed, baseline)
+        self.assertNotEqual(legacy, baseline)
+
+    def test_fit_cache_separates_paired_planning_from_final_fitting(self) -> None:
+        """A selected planning model cannot truncate production's frontier."""
+
+        domain = generic_domain(observation())
+        cache = PolicyFitCache(Path("unused-selection-mode-cache"))
+        arguments = {
+            "max_leaves": 4,
+            "min_shape_groups_per_leaf": 2,
+            "cross_validation_seed": "unit-selection-mode",
+            "profiler_feature_catalog_digest": None,
+        }
+
+        production = cache.validation_key(
+            domain,
+            "cost-key",
+            fit_final_rules=True,
+            **arguments,
+        )
+        planning = cache.validation_key(
+            domain,
+            "cost-key",
+            fit_final_rules=False,
+            **arguments,
+        )
+
+        self.assertNotEqual(production, planning)
+
+    def test_planning_cache_cannot_satisfy_production_fit(self) -> None:
+        """Production writes its own final-frontier-selected cache record."""
+
+        rows = []
+        for point, n in enumerate((128, 160, 192, 224, 256, 288)):
+            for candidate, latency in (
+                ("candidate.low", 10.0),
+                ("candidate.high", 11.0),
+            ):
+                rows.append(observation(
+                    candidate=candidate,
+                    family=candidate,
+                    shape_group=f"cache-mode-{point}",
+                    n=n,
+                    latency_us=latency,
+                ))
+        corpus = ObservationCorpus(rows)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            fit_generic_policy(
+                corpus,
+                max_leaves=1,
+                fit_final_rules=False,
+                fit_cache=cache,
+            )
+            planning_records = tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )
+            production = fit_generic_policy(
+                corpus,
+                max_leaves=1,
+                fit_final_rules=True,
+                fit_cache=cache,
+            )
+            production_records = tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )
+
+        self.assertEqual(len(planning_records), 1)
+        self.assertEqual(len(production_records), 2)
+        self.assertTrue(production.cross_validation[0].cells)
+
+    def test_fit_cache_promotes_legacy_global_serial_hash_keys(self) -> None:
+        """Current v6 global-key records migrate without recomputing policy."""
+
+        rows = []
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for point, n in enumerate((256, 320, 384)):
+                for candidate, latency in (
+                    ("candidate.low", 10.0),
+                    ("candidate.high", 11.0),
+                ):
+                    rows.append(observation(
+                        backend=Backend.CUDA,
+                        contract=SemanticContract.FAST,
+                        mode=mode,
+                        candidate=candidate,
+                        family=candidate,
+                        shape_group=f"legacy-cache-{mode.value}-{point}",
+                        n=n,
+                        latency_us=latency,
+                    ))
+        corpus = ObservationCorpus(rows)
+        hashes = {
+            corpus.runtime_key_for(row): SERIAL_HASH for row in rows
+        }
+        digest = segmented_policy._serial_m1_hash_digest
+
+        def legacy_global_digest(serial_hashes, runtime_keys=None):
+            del runtime_keys
+            return digest(serial_hashes)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            with mock.patch.object(
+                segmented_policy,
+                "_serial_m1_hash_digest",
+                side_effect=legacy_global_digest,
+            ):
+                expected = fit_generic_policy(
+                    corpus,
+                    serial_m1_hashes=hashes,
+                    max_leaves=1,
+                    fit_cache=cache,
+                )
+
+            with mock.patch.object(
+                segmented_policy,
+                "build_domain_candidate_point_costs",
+                side_effect=AssertionError("legacy costs were recomputed"),
+            ), mock.patch.object(
+                segmented_policy,
+                "_evaluate_placement_fold",
+                side_effect=AssertionError("legacy validation was recomputed"),
+            ):
+                migrated = fit_generic_policy(
+                    corpus,
+                    serial_m1_hashes=hashes,
+                    max_leaves=1,
+                    fit_cache=cache,
+                )
+
+            self.assertEqual(migrated, expected)
+            # Both domains reuse their stable final trees, so their legacy
+            # candidate matrices remain lazy instead of being deserialized
+            # merely to republish an otherwise unused cache generation.
+            self.assertEqual(len(tuple(
+                (Path(directory) / "candidate-costs").glob("*.json")
+            )), 2)
+            self.assertEqual(len(tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )), 4)
+
+    def test_fit_cache_rejects_identity_mismatch_instead_of_refitting(self) -> None:
+        """A corrupt content-addressed entry is fatal, never a quiet cache miss."""
+
+        exemplar = observation()
+        domain = generic_domain(exemplar)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = PolicyFitCache(Path(directory))
+            content_key = cache.cost_key(
+                domain,
+                "sha256:" + "1" * 64,
+                "sha256:unit-paired",
+                "sha256:unit-serial",
+            )
+            path = cache._path("candidate-costs", content_key)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "schema_version": (
+                    segmented_policy.POLICY_FIT_CACHE_SCHEMA_VERSION
+                ),
+                "kind": "candidate-costs",
+                "content_key": "wrong-content-key",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                cache.load_costs(content_key, domain)
+
+    def test_equivalent_dimension_cuts_prefer_k_partition_axis(self) -> None:
+        """Correlated N must not hide the K dimension governing reduction."""
+
+        rows = []
+        lower_ns = (128, 160, 192)
+        upper_ns = (288, 320, 384)
+        for index, n in enumerate((*lower_ns, *upper_ns)):
+            lower = n in lower_ns
+            rows.extend([
+                observation(
+                    candidate="candidate.low-k",
+                    family="low-k",
+                    shape_group=f"correlated-k-{index}",
+                    n=n,
+                    k=n * 2,
+                    latency_us=10.0 if lower else 14.0,
+                ),
+                observation(
+                    candidate="candidate.high-k",
+                    family="high-k",
+                    shape_group=f"correlated-k-{index}",
+                    n=n,
+                    k=n * 2,
+                    latency_us=14.0 if lower else 10.0,
+                ),
+            ])
+
+        policy = fit_generic_policy(ObservationCorpus(rows), max_leaves=2)
+
+        self.assertEqual(len(policy.rules), 2)
+        predicates = {
+            predicate
+            for rule in policy.rules
+            for predicate in rule.predicates
+        }
+        self.assertEqual(len(predicates), 2)
+        self.assertTrue(
+            all(
+                predicate.threshold.axis == FeatureAxis.K
+                for predicate in predicates
+            )
+        )
 
     def test_shape_group_split_never_leaks_candidate_alias_or_m_rows(self) -> None:
         rows = []
@@ -642,6 +3528,379 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(compiled.certification.coverage, 1.0)
         self.assertEqual(compiled.certification.max_observed_regret, 0.0)
 
+    def test_explicit_freeze_boundary_accepts_no_sealed_rows(self) -> None:
+        """The two-process API binds a digest before certification can run."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="dev-a", n=256),
+            observation(
+                candidate="candidate.b", shape_group="dev-a", n=256,
+                latency_us=11.0,
+            ),
+            observation(candidate="candidate.a", shape_group="dev-b", n=384),
+            observation(
+                candidate="candidate.b", shape_group="dev-b", n=384,
+                latency_us=11.0,
+            ),
+            observation(candidate="candidate.a", shape_group="dev-c", n=448),
+            observation(
+                candidate="candidate.b", shape_group="dev-c", n=448,
+                latency_us=11.0,
+            ),
+        ])
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="sealed", n=512),
+            observation(
+                candidate="candidate.b", shape_group="sealed", n=512,
+                latency_us=11.0,
+            ),
+        ])
+
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        before = frozen.generic_digest
+        compiled = certify_frozen_policy(frozen, development, sealed)
+
+        self.assertEqual(compiled.certification.frozen_generic_policy_digest, before)
+        self.assertEqual(compiled.policy_ir.digest(generic_only=True), before)
+        self.assertEqual(compiled.certification.coverage, 1.0)
+
+    def test_certification_honors_collapsed_aspect_domain_projection(self) -> None:
+        """Sealed resolution must use the same cross-aspect view as fitting."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="dev-a", n=256),
+            observation(
+                candidate="candidate.b", shape_group="dev-a", n=256,
+                latency_us=11.0,
+            ),
+            observation(candidate="candidate.a", shape_group="dev-b", n=384),
+            observation(
+                candidate="candidate.b", shape_group="dev-b", n=384,
+                latency_us=11.0,
+            ),
+            observation(candidate="candidate.a", shape_group="dev-c", n=448),
+            observation(
+                candidate="candidate.b", shape_group="dev-c", n=448,
+                latency_us=11.0,
+            ),
+        ]).with_collapsed_aspect_domains()
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="sealed", n=512),
+            observation(
+                candidate="candidate.b", shape_group="sealed", n=512,
+                latency_us=11.0,
+            ),
+        ]).with_collapsed_aspect_domains()
+
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        compiled = certify_frozen_policy(frozen, development, sealed)
+
+        self.assertEqual(compiled.certification.coverage, 1.0)
+        self.assertEqual(compiled.certification.unexercised_rule_count, 0)
+        self.assertFalse(compiled.policy_ir.metadata["sealed_max_regret"])
+
+    def test_unpromoted_domains_remain_diagnostic_but_block_certification(self) -> None:
+        """Exact overlays cannot waive mandatory generic dispatch coverage."""
+
+        development_rows = []
+        for group, n in (("dev-a", 256), ("dev-b", 384), ("dev-c", 448)):
+            development_rows.extend((
+                observation(candidate="candidate.a", shape_group=group, n=n),
+                observation(
+                    candidate="candidate.b", shape_group=group, n=n,
+                    latency_us=11.0,
+                ),
+            ))
+        development_rows.extend((
+            observation(
+                candidate="candidate.a", shape_group="exact-only-dev", m=3,
+            ),
+            observation(
+                candidate="candidate.b", shape_group="exact-only-dev", m=3,
+                latency_us=11.0,
+            ),
+        ))
+        development = ObservationCorpus(development_rows)
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="generic-sealed", n=512),
+            observation(
+                candidate="candidate.b", shape_group="generic-sealed", n=512,
+                latency_us=11.0,
+            ),
+            observation(
+                candidate="candidate.a", shape_group="exact-only-sealed", m=3,
+            ),
+            observation(
+                candidate="candidate.b", shape_group="exact-only-sealed", m=3,
+                latency_us=11.0,
+            ),
+        ])
+
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        compiled = certify_frozen_policy(
+            frozen,
+            development,
+            sealed,
+            require_promotable=False,
+        )
+        report = compiled.certification
+
+        self.assertEqual(report.sealed_cell_count, 2)
+        self.assertEqual(report.required_cell_count, 1)
+        self.assertEqual(report.out_of_scope_cell_count, 1)
+        self.assertEqual(report.covered_cell_count, 1)
+        self.assertEqual(report.unpromoted_domain_count, 1)
+        with self.assertRaisesRegex(ValueError, "lack generic scope"):
+            report.require_promotable()
+        self.assertEqual(report.coverage, 1.0)
+
+    def test_installable_artifact_rejects_every_certificate_gate_failure(self) -> None:
+        """No backend may publish a coverage-only or over-budget policy."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="dev-a", n=256),
+            observation(candidate="candidate.b", shape_group="dev-a", n=256, latency_us=11.0),
+            observation(candidate="candidate.a", shape_group="dev-b", n=384),
+            observation(candidate="candidate.b", shape_group="dev-b", n=384, latency_us=11.0),
+            observation(candidate="candidate.a", shape_group="dev-c", n=448),
+            observation(candidate="candidate.b", shape_group="dev-c", n=448, latency_us=11.0),
+        ])
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="sealed", n=512),
+            observation(candidate="candidate.b", shape_group="sealed", n=512, latency_us=11.0),
+        ])
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        compiled = certify_frozen_policy(frozen, development, sealed)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy_path = root / "policy.json"
+            include_path = root / "policy.inc"
+            write_compiled_policy(policy_path, compiled)
+            include_path.write_text(
+                f"// Common policy digest: {compiled.policy_ir.digest()}\n"
+                f"// Frozen generic policy digest: {frozen.generic_digest}\n",
+                encoding="utf-8",
+            )
+            validate_installable_policy_artifact(
+                policy_path,
+                include_path=include_path,
+            )
+
+            pristine = json.loads(policy_path.read_text(encoding="utf-8"))
+            diagnostic_outlier = json.loads(json.dumps(pristine))
+            diagnostic_outlier["certification"]["max_observed_regret"] = 0.50
+            diagnostic_outlier["certification"][
+                "max_simultaneous_95pct_upper_regret"
+            ] = 0.60
+            diagnostic_outlier["certification"]["p95_observed_regret"] = 0.50
+            diagnostic_outlier["certification"][
+                "p95_simultaneous_95pct_upper_regret"
+            ] = 0.60
+            policy_path.write_text(
+                json.dumps(diagnostic_outlier),
+                encoding="utf-8",
+            )
+            validate_installable_policy_artifact(
+                policy_path,
+                include_path=include_path,
+            )
+
+            failures = {
+                "coverage": ("covered_cell_count", 0),
+                "byte equality": ("verifier_bitwise_failures", 1),
+                "rule exercise": ("unexercised_rule_count", 1),
+                "generic totality": ("unpromoted_domain_count", 1),
+                "domain count": ("required_domain_count", 0),
+                "passing domain count": ("passing_domain_count", 0),
+                "passing domain fraction": ("passing_domain_fraction", 0.0),
+                "domain quota": ("domain_promotion_quota_satisfied", False),
+            }
+            for label, (field, value) in failures.items():
+                with self.subTest(label=label):
+                    poisoned = json.loads(json.dumps(pristine))
+                    poisoned["certification"][field] = value
+                    policy_path.write_text(
+                        json.dumps(poisoned),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError):
+                        validate_installable_policy_artifact(
+                            policy_path,
+                            include_path=include_path,
+                        )
+
+            failed_domain = json.loads(json.dumps(pristine))
+            result = failed_domain["certification"]["domain_results"][0]
+            result["p95_observed_regret"] = P95_REGRET_BUDGET
+            result["passes_p95_budget"] = False
+            failed_domain["certification"]["passing_domain_count"] = 0
+            failed_domain["certification"]["passing_domain_fraction"] = 0.0
+            failed_domain["certification"][
+                "domain_promotion_quota_satisfied"
+            ] = False
+            policy_path.write_text(json.dumps(failed_domain), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not reach 99%"):
+                validate_installable_policy_artifact(
+                    policy_path,
+                    include_path=include_path,
+                )
+
+    def test_sealed_p95_allows_exactly_five_percent_diagnostic_outliers(self) -> None:
+        """Nearest-rank p95, not the maximum, owns the installation decision."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="dev-a", n=256),
+            observation(candidate="candidate.b", shape_group="dev-a", n=256, latency_us=11.0),
+            observation(candidate="candidate.a", shape_group="dev-b", n=384),
+            observation(candidate="candidate.b", shape_group="dev-b", n=384, latency_us=11.0),
+            observation(candidate="candidate.a", shape_group="dev-c", n=448),
+            observation(candidate="candidate.b", shape_group="dev-c", n=448, latency_us=11.0),
+        ])
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="sealed", n=512),
+            observation(candidate="candidate.b", shape_group="sealed", n=512, latency_us=11.0),
+        ])
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        report = certify_frozen_policy(frozen, development, sealed).certification
+        exemplar = report.cells[0]
+        cells = tuple(
+            dataclasses.replace(
+                exemplar,
+                shape_group_id=f"sealed-p95-{index}",
+                observed_worst_surface_regret=(0.50 if index >= 95 else 0.01),
+                simultaneous_95pct_upper_regret=(0.60 if index >= 95 else 0.02),
+            )
+            for index in range(100)
+        )
+        p95_pass = dataclasses.replace(
+            report,
+            cells=cells,
+            sealed_cell_count=100,
+            required_cell_count=100,
+            covered_cell_count=100,
+        )
+
+        self.assertEqual(p95_pass.p95_observed_regret, 0.01)
+        self.assertEqual(p95_pass.max_observed_regret, 0.50)
+        p95_pass.require_promotable()
+
+        six_outliers = dataclasses.replace(
+            p95_pass,
+            cells=(
+                *(
+                    dataclasses.replace(
+                        cell,
+                        observed_worst_surface_regret=0.50,
+                        simultaneous_95pct_upper_regret=0.60,
+                    )
+                    if index == 94 else cell
+                    for index, cell in enumerate(p95_pass.cells)
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "p95 observed regret"):
+            six_outliers.require_promotable()
+
+    def test_sealed_promotion_requires_ninety_nine_percent_of_domains(self) -> None:
+        """One of 100 over-budget domains is diagnostic; two block promotion."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="dev-a", n=256),
+            observation(
+                candidate="candidate.b",
+                shape_group="dev-a",
+                n=256,
+                latency_us=11.0,
+            ),
+            observation(candidate="candidate.a", shape_group="dev-b", n=384),
+            observation(
+                candidate="candidate.b",
+                shape_group="dev-b",
+                n=384,
+                latency_us=11.0,
+            ),
+            observation(candidate="candidate.a", shape_group="dev-c", n=448),
+            observation(
+                candidate="candidate.b",
+                shape_group="dev-c",
+                n=448,
+                latency_us=11.0,
+            ),
+        ])
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.a", shape_group="sealed", n=512),
+            observation(
+                candidate="candidate.b",
+                shape_group="sealed",
+                n=512,
+                latency_us=11.0,
+            ),
+        ])
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        report = certify_frozen_policy(frozen, development, sealed).certification
+        exemplar = report.cells[0]
+        cells = tuple(
+            dataclasses.replace(
+                exemplar,
+                domain=dataclasses.replace(exemplar.domain, m=index + 1),
+                shape_group_id=f"sealed-domain-{index + 1}",
+                observed_worst_surface_regret=(0.50 if index == 99 else 0.01),
+                simultaneous_95pct_upper_regret=(0.60 if index == 99 else 0.02),
+            )
+            for index in range(100)
+        )
+        ninety_nine_percent = dataclasses.replace(
+            report,
+            cells=cells,
+            sealed_cell_count=100,
+            required_cell_count=100,
+            covered_cell_count=100,
+        )
+
+        self.assertEqual(ninety_nine_percent.required_domain_count, 100)
+        self.assertEqual(ninety_nine_percent.passing_domain_count(), 99)
+        ninety_nine_percent.require_promotable()
+
+        ninety_eight_percent = dataclasses.replace(
+            ninety_nine_percent,
+            cells=tuple(
+                dataclasses.replace(
+                    cell,
+                    observed_worst_surface_regret=0.50,
+                    simultaneous_95pct_upper_regret=0.60,
+                )
+                if index == 98 else cell
+                for index, cell in enumerate(ninety_nine_percent.cells)
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "98/100.*does not reach 99%"):
+            ninety_eight_percent.require_promotable()
+
     def test_installable_compiler_rejects_short_timing_corpus(self) -> None:
         rows = []
         for group, n in (("dev-a", 256), ("dev-b", 384), ("sealed", 512)):
@@ -691,7 +3950,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             observation(candidate="candidate.slow", shape_group="dev-c", n=448, latency_us=14.0),
         ])
         exact = build_exact_winners(development)
-        generic = fit_generic_policy(development, max_segments=1)
+        generic = fit_generic_policy(development, max_leaves=1)
         poisoned_rule = dataclasses.replace(
             generic.rules[0], candidate_id="candidate.slow"
         )
@@ -706,8 +3965,79 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         ])
         report = certify_generic_policy(poisoned, sealed)
         self.assertAlmostEqual(report.max_observed_regret, 0.4)
+        self.assertEqual(len(report.rule_coverage), 1)
+        self.assertEqual(report.rule_coverage[0].sealed_hit_count, 1)
         with self.assertRaisesRegex(ValueError, "not promotable"):
             report.require_promotable()
+
+    def test_failed_certificate_writes_noninstallable_rule_diagnostics(self) -> None:
+        """A failed generic fit must retain cells without becoming publishable."""
+
+        development = ObservationCorpus([
+            observation(candidate="candidate.fast", shape_group="dev-a", n=256),
+            observation(
+                candidate="candidate.slow", shape_group="dev-a", n=256,
+                latency_us=14.0,
+            ),
+            observation(candidate="candidate.fast", shape_group="dev-b", n=384),
+            observation(
+                candidate="candidate.slow", shape_group="dev-b", n=384,
+                latency_us=14.0,
+            ),
+            observation(candidate="candidate.fast", shape_group="dev-c", n=448),
+            observation(
+                candidate="candidate.slow", shape_group="dev-c", n=448,
+                latency_us=14.0,
+            ),
+        ])
+        frozen = freeze_policy(
+            development,
+            sealed_commitment="sha256:sealed-shape-inventory",
+            split_manifest_digest="sha256:split-manifest",
+        )
+        poisoned_rule = dataclasses.replace(
+            frozen.policy_ir.generic_rules[0], candidate_id="candidate.slow"
+        )
+        poisoned = dataclasses.replace(
+            frozen,
+            policy_ir=dataclasses.replace(
+                frozen.policy_ir,
+                generic_rules=(poisoned_rule,),
+            ),
+        )
+        sealed = ObservationCorpus([
+            observation(candidate="candidate.fast", shape_group="sealed", n=512),
+            observation(
+                candidate="candidate.slow", shape_group="sealed", n=512,
+                latency_us=14.0,
+            ),
+        ])
+        compiled = certify_frozen_policy(
+            poisoned,
+            development,
+            sealed,
+            require_promotable=False,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "failed-certificate.json"
+            write_certification_diagnostic(path, compiled)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertFalse(payload["promotable"])
+            self.assertIn("p95 observed regret", payload["promotion_error"])
+            self.assertEqual(
+                payload["state"],
+                "sealed_certification_diagnostic_noninstallable",
+            )
+            self.assertEqual(
+                payload["certification"]["rule_coverage"][0][
+                    "sealed_hit_count"
+                ],
+                1,
+            )
+            with self.assertRaisesRegex(ValueError, "sealed_certified"):
+                validate_installable_policy_artifact(path)
 
     def test_inventory_validators_reject_missing_m_and_candidate_surface(self) -> None:
         corpus = ObservationCorpus([
@@ -718,6 +4048,370 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             require_verifier_m_matrix(corpus)
         with self.assertRaisesRegex(ValueError, "candidate matrix"):
             require_candidate_matrix_complete(corpus)
+
+
+    def test_cpp_predicates_match_python_for_every_axis_and_boundary(self) -> None:
+        """Every generated branch must preserve the learner's exact arithmetic."""
+
+        thresholds = {
+            FeatureAxis.AGGREGATE_N: (100, 1),
+            FeatureAxis.K: (160, 1),
+            FeatureAxis.WORK_ITEMS: (100000, 3),
+            FeatureAxis.ASPECT_RATIO: (5, 4),
+            FeatureAxis.N_TILES_32: (5, 2),
+            FeatureAxis.N_TILES_64: (5, 2),
+            FeatureAxis.N_TILES_128: (5, 2),
+            FeatureAxis.N_TILES_256: (5, 2),
+            FeatureAxis.N_TILES_512: (5, 2),
+            FeatureAxis.N_TILES_1024: (5, 2),
+            FeatureAxis.K_GROUPS_PER_N_TILE_32: (3, 2),
+            FeatureAxis.K_GROUPS_PER_N_TILE_64: (3, 2),
+            FeatureAxis.K_GROUPS_PER_N_TILE_128: (3, 2),
+            FeatureAxis.K_GROUPS_PER_N_TILE_256: (3, 2),
+            FeatureAxis.K_GROUPS_PER_N_TILE_512: (3, 2),
+            FeatureAxis.K_GROUPS_PER_N_TILE_1024: (3, 2),
+            FeatureAxis.N_FINAL_TILE_VALUES_32: (17, 1),
+            FeatureAxis.N_FINAL_TILE_VALUES_64: (33, 1),
+            FeatureAxis.N_FINAL_TILE_VALUES_128: (65, 1),
+            FeatureAxis.N_FINAL_TILE_VALUES_256: (129, 1),
+            FeatureAxis.N_FINAL_TILE_VALUES_512: (257, 1),
+            FeatureAxis.N_FINAL_TILE_VALUES_1024: (513, 1),
+            FeatureAxis.K_FINAL_TILE_VALUES_32: (17, 1),
+            FeatureAxis.K_FINAL_TILE_VALUES_64: (33, 1),
+            FeatureAxis.K_FINAL_TILE_VALUES_128: (65, 1),
+            FeatureAxis.K_FINAL_TILE_VALUES_256: (129, 1),
+            FeatureAxis.K_FINAL_TILE_VALUES_512: (257, 1),
+            FeatureAxis.K_FINAL_TILE_VALUES_1024: (513, 1),
+            FeatureAxis.N_TILE_UTILIZATION_32: (3, 4),
+            FeatureAxis.N_TILE_UTILIZATION_64: (3, 4),
+            FeatureAxis.N_TILE_UTILIZATION_128: (3, 4),
+            FeatureAxis.N_TILE_UTILIZATION_256: (3, 4),
+            FeatureAxis.N_TILE_UTILIZATION_512: (3, 4),
+            FeatureAxis.N_TILE_UTILIZATION_1024: (3, 4),
+            FeatureAxis.N_TILE_ALIGNED_32: (1, 2),
+            FeatureAxis.N_TILE_ALIGNED_64: (1, 2),
+            FeatureAxis.N_TILE_ALIGNED_128: (1, 2),
+            FeatureAxis.N_TILE_ALIGNED_256: (1, 2),
+            FeatureAxis.N_TILE_ALIGNED_512: (1, 2),
+            FeatureAxis.N_TILE_ALIGNED_1024: (1, 2),
+            FeatureAxis.N_PARALLEL_WAVES_64: (3, 1),
+            FeatureAxis.N_PARALLEL_WAVES_128: (3, 1),
+            FeatureAxis.N_PARALLEL_WAVES_256: (3, 1),
+            FeatureAxis.N_PARALLEL_WAVES_512: (3, 1),
+            FeatureAxis.N_PARALLEL_WAVES_1024: (3, 1),
+            FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_64: (4, 7),
+            FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_128: (4, 7),
+            FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_256: (4, 7),
+            FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_512: (4, 7),
+            FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_1024: (4, 7),
+            FeatureAxis.MN_PARALLEL_WAVES_64: (3, 1),
+            FeatureAxis.MN_FINAL_PARALLEL_WAVE_UTILIZATION_64: (4, 7),
+        }
+        self.assertEqual(set(thresholds), set(FeatureAxis))
+        wave_axes = (
+            set(segmented_policy.N_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+        )
+        mn_wave_axes = (
+            set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            | set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+        )
+        predicates = tuple(
+            FeaturePredicate(
+                FeatureThreshold(
+                    axis,
+                    numerator,
+                    denominator,
+                    28
+                    if axis in wave_axes
+                    else 1,
+                    64 if axis in mn_wave_axes else 1,
+                ),
+                require_less_equal,
+            )
+            for axis, (numerator, denominator) in thresholds.items()
+            for require_less_equal in (True, False)
+        )
+        points = (
+            (31, 32),
+            (32, 64),
+            (33, 96),
+            (127, 256),
+            (128, 128),
+            (129, 64),
+            (511, 2656),
+            (512, 2656),
+            (513, 2656),
+            (2400, 2656),
+            (42496, 2656),
+        )
+        source = ["int main() {"]
+        failure = 1
+        for predicate in predicates:
+            condition = predicate_condition(predicate)
+            for n, k in points:
+                expected = "true" if predicate.matches(n, k) else "false"
+                source.extend((
+                    "  {",
+                    f"    const int n = {n};",
+                    f"    const int k = {k};",
+                    "    const long long work_items =",
+                    "        static_cast<long long>(n) * static_cast<long long>(k);",
+                    f"    if (({condition}) != {expected}) return {failure};",
+                    "  }",
+                ))
+                failure += 1
+
+        aspect_points = (
+            (16, 1),
+            (159, 10),
+            (20, 10),
+            (19, 10),
+            (3, 4),
+            (2, 3),
+            (300, 400),
+        )
+        for n, k in aspect_points:
+            expected_bucket = classify_aspect(n, k)
+            for bucket in AspectBucket:
+                expected = "true" if bucket == expected_bucket else "false"
+                source.extend((
+                    "  {",
+                    f"    const int n = {n};",
+                    f"    const int k = {k};",
+                    (
+                        f"    if (({aspect_condition(bucket)}) != {expected}) "
+                        f"return {failure};"
+                    ),
+                    "  }",
+                ))
+                failure += 1
+        source.extend(("  return 0;", "}"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "predicate_equivalence"
+            compiled = subprocess.run(
+                ["g++", "-std=c++20", "-x", "c++", "-o", str(executable), "-"],
+                input="\n".join(source),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            executed = subprocess.run(
+                [str(executable)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                executed.returncode,
+                0,
+                f"generated predicate mismatch at check {executed.returncode}",
+            )
+
+    def test_parallel_wave_features_express_cpu_prefill_occupancy_transition(
+        self,
+    ) -> None:
+        """A low-utilization second wave must not alias a full first wave."""
+
+        threshold = FeatureThreshold(
+            FeatureAxis.N_FINAL_PARALLEL_WAVE_UTILIZATION_64,
+            4,
+            7,
+            28,
+        )
+
+        # N=896 has 14 tasks in its only wave. N=2080 has 33 tasks, so its
+        # second wave contains only five tasks. Both need the fine-grained row
+        # grid. N=1152 and N=4864 leave 18 and 20 active workers respectively
+        # in their final waves and can amortize the two-row kernel.
+        self.assertTrue(threshold.matches_less_equal(896, 896))
+        self.assertTrue(threshold.matches_less_equal(2080, 480))
+        self.assertFalse(threshold.matches_less_equal(1152, 896))
+        self.assertFalse(threshold.matches_less_equal(4864, 896))
+
+    def test_tile_alignment_expresses_tail_free_decode_grid(self) -> None:
+        """A full nbc8 grid must not interpolate onto a partial final task."""
+
+        partial_grid = FeatureThreshold(
+            FeatureAxis.N_TILE_ALIGNED_512,
+            1,
+            2,
+        )
+
+        # NBC8 owns eight adjacent 64-column chunks, hence one 512-column
+        # task tile. The failed CPU M1 holdout demonstrated that N=2048 can
+        # economically use NBC8 while N=1984 must retain NBC1. A continuous N
+        # threshold cannot infer that unseen boundary, but exact grid alignment
+        # is stable for every shape and is available before dispatch.
+        self.assertTrue(partial_grid.matches_less_equal(1920, 11008))
+        self.assertTrue(partial_grid.matches_less_equal(1984, 11008))
+        self.assertFalse(partial_grid.matches_less_equal(2048, 11008))
+        self.assertFalse(partial_grid.matches_less_equal(2560, 11008))
+
+    def test_k_final_tile_expresses_periodic_kpart_geometry(self) -> None:
+        """A generic tree must distinguish unseen K-partition tail widths."""
+
+        k_tail_at_most_192 = FeatureThreshold(
+            FeatureAxis.K_FINAL_TILE_VALUES_256,
+            192,
+            1,
+        )
+
+        # The sparse AVX512 k-part corpus contains the same N=2048 grid at
+        # neighboring K values whose winning launch families differ. A
+        # continuous K threshold cannot generalize that periodic boundary;
+        # the final 256-value tile is exact for every seen or unseen shape.
+        self.assertTrue(k_tail_at_most_192.matches_less_equal(2048, 10880))
+        self.assertTrue(k_tail_at_most_192.matches_less_equal(2048, 10944))
+        self.assertFalse(k_tail_at_most_192.matches_less_equal(2048, 11008))
+        self.assertTrue(k_tail_at_most_192.matches_less_equal(2048, 11072))
+        self.assertTrue(k_tail_at_most_192.matches_less_equal(2048, 11136))
+
+    def test_mn_parallel_wave_features_match_row_chunk_grid_geometry(
+        self,
+    ) -> None:
+        """Row-grid occupancy must include all M independently scheduled rows."""
+
+        threshold = FeatureThreshold(
+            FeatureAxis.MN_FINAL_PARALLEL_WAVE_UTILIZATION_64,
+            1,
+            2,
+            28,
+            64,
+        )
+
+        # Production RowChunkGrid schedules `M * ceil(N / 64)` OpenMP tasks.
+        # At M=64, N=4096 leaves eight of 28 workers in the final wave, while
+        # N=4160 leaves sixteen. The old N-only feature saw 64 and 65 tasks and
+        # therefore modeled a completely different occupancy boundary.
+        self.assertTrue(threshold.matches_less_equal(4096, 1024))
+        self.assertFalse(threshold.matches_less_equal(4160, 1024))
+
+        count_threshold = FeatureThreshold(
+            FeatureAxis.MN_PARALLEL_WAVES_64,
+            147,
+            1,
+            28,
+            64,
+        )
+        self.assertTrue(count_threshold.matches_less_equal(4096, 1024))
+        self.assertFalse(count_threshold.matches_less_equal(4160, 1024))
+
+    def test_generic_tree_partition_is_total_beyond_fitted_geometry(self) -> None:
+        """Complementary leaves must dispatch tiny and arbitrarily large shapes."""
+
+        domain = GenericDomain(
+            backend=Backend.CPU,
+            architecture_class="test|build=AVX512|runtime=AVX512|threads=28",
+            semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            operation_kind="NativeVNNIPrefillProjection",
+            bundle_signature="serial-full-k",
+            prepared_family_id="NativeVNNI_cpu_CB0",
+            packing_abi="native-vnni-cpu-cb0-v1",
+            runtime_codebook_id=0,
+            execution_mode=ExecutionMode.EAGER,
+            m=64,
+            aspect_bucket=AspectBucket.BALANCED,
+            all_aspects=True,
+        )
+        threshold = FeatureThreshold(
+            FeatureAxis.WORK_ITEMS,
+            896 * 896,
+        )
+
+        def rule(require_less_equal: bool, candidate: str) -> GenericDispatchRule:
+            return GenericDispatchRule(
+                domain=domain,
+                predicates=(FeaturePredicate(
+                    threshold,
+                    require_less_equal=require_less_equal,
+                ),),
+                candidate_id=candidate,
+                arithmetic_fingerprint="sha256:test",
+                development_shape_groups=("development:test",),
+                development_max_regret=0.0,
+                development_p95_regret=0.0,
+                development_mean_regret=0.0,
+            )
+
+        rules = (
+            rule(True, "small-work"),
+            rule(False, "large-work"),
+        )
+        validate_generic_rule_partition(rules)
+        for n, k in ((1, 32), (895, 896), (896, 896), (1 << 20, 1 << 20)):
+            self.assertEqual(
+                sum(item.matches(n, k) for item in rules),
+                1,
+                f"N={n} K={k} did not resolve exactly one generic leaf",
+            )
+
+        with self.assertRaisesRegex(ValueError, "unseen geometry uncovered"):
+            validate_generic_rule_partition((rules[0],))
+
+    def test_parallel_wave_policy_covers_every_cpu_two_row_schedule(self) -> None:
+        """Every forceable N-block candidate must expose its physical waves."""
+
+        expected_widths = {64, 128, 256, 512, 1024}
+        self.assertEqual(
+            set(segmented_policy.N_PARALLEL_WAVE_WIDTH_BY_AXIS.values()),
+            expected_widths,
+        )
+        self.assertEqual(
+            set(
+                segmented_policy.N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS.values()
+            ),
+            expected_widths,
+        )
+        axes = set(
+            segmented_policy.FEATURE_AXES_BY_POLICY[
+                FeaturePolicy.PARALLEL_WAVE_SCHEDULES
+            ]
+        )
+        self.assertTrue(
+            set(segmented_policy.N_PARALLEL_WAVE_WIDTH_BY_AXIS) <= axes
+        )
+        self.assertTrue(
+            set(segmented_policy.N_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS) <= axes
+        )
+        self.assertEqual(
+            set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS.values()),
+            {64},
+        )
+        self.assertEqual(
+            set(
+                segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS.values()
+            ),
+            {64},
+        )
+        self.assertTrue(
+            set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS).isdisjoint(
+                axes
+            )
+        )
+        self.assertTrue(
+            set(
+                segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS
+            ).isdisjoint(axes)
+        )
+        row_grid_axes = set(
+            segmented_policy.FEATURE_AXES_BY_POLICY[
+                FeaturePolicy.ROW_GRID_PARALLEL_WAVE_SCHEDULES
+            ]
+        )
+        self.assertTrue(
+            set(segmented_policy.MN_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            <= row_grid_axes
+        )
+        self.assertTrue(
+            set(segmented_policy.MN_FINAL_PARALLEL_WAVE_WIDTH_BY_AXIS)
+            <= row_grid_axes
+        )
 
 
 if __name__ == "__main__":

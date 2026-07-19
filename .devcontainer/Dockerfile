@@ -39,6 +39,7 @@ RUN MODE=build /tmp/install-scripts/install-system-deps.sh
 # graphics libs for GPU debug, linux-tools for `perf`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
+        git-lfs \
         ripgrep \
         bsdmainutils \
         htop \
@@ -63,6 +64,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zip \
     && rm -rf /var/lib/apt/lists/*
 
+# Register LFS filters system-wide. Repository-specific tracking rules remain
+# in .gitattributes so ordinary generated benchmark directories stay ignored.
+RUN git lfs install --system
+
 # Fix perf symlink for the Ubuntu 24.04 linux-tools-$(uname -r) bug.
 RUN KERNEL_VERSION=$(uname -r) && \
     INSTALLED_VERSION=$(ls -1 /usr/lib/linux-tools/ 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1) && \
@@ -77,7 +82,9 @@ ENV CUTLASS_DIR=/opt/cutlass
 
 # Conditional CUDA 13.
 RUN if [ "$INSTALL_CUDA" = "true" ]; then \
-        MODE=full /tmp/install-scripts/install-cuda.sh; \
+        INSTALL_CUDA_PROFILERS=1 MODE=full /tmp/install-scripts/install-cuda.sh; \
+        command -v ncu >/dev/null; \
+        ncu --version; \
     else \
         echo "Skipping CUDA installation"; \
     fi
